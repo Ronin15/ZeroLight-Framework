@@ -7,8 +7,6 @@
 //! realistic static+dynamic `mergeDrawList` group counts. CPU-only; no SDL_GPU.
 
 const std = @import("std");
-const AssetStore = @import("../assets/assets.zig").AssetStore;
-const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -23,11 +21,11 @@ const render_prep = @import("../game/render_prep.zig");
 const WorldDepth = render_depth.WorldDepth;
 const world_system = @import("../game/world_system.zig");
 const WorldSystem = world_system.WorldSystem;
-const TileId = world_system.TileId;
 const Renderer = @import("../render/renderer.zig");
 const mergeDrawList = Renderer.mergeDrawList;
 const resources = @import("../render/resources.zig");
 const sprite_batch = @import("../render/sprite_batch.zig");
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const render_game_prep_range_alignment_items: usize = 1;
@@ -36,14 +34,13 @@ const world_overscan_chunks: u16 = 1;
 const bench_viewport_w: f32 = 800;
 const bench_viewport_h: f32 = 450;
 const static_sprite_group_count: usize = 1;
-/// Slice 36 collapsed `submitStaticDenseGeometry`'s per-layer draws into at
-/// most `Renderer.k_max_dense_composite_draws` interleave-partitioned
-/// composite draws; this fixture has no sparse/entity content at non-active
-/// levels, so it always hits the common single-bucket case, i.e. exactly one
-/// retained `.tilemap` group regardless of dense window depth.
+/// `submitStaticDenseGeometry` emits at most one interleave-partitioned
+/// composite draw per resident layer; this fixture has no sparse/entity content
+/// at non-active levels, so it always hits the common single-bucket case, i.e.
+/// exactly one retained `.tilemap` group regardless of dense window depth.
 const tilemap_group_count: usize = 1;
 const max_static_group_count: usize = tilemap_group_count + static_sprite_group_count;
-/// Mid-depth play level for dense render-window bench variants (Slice 23B).
+/// Mid-depth play level for dense render-window bench variants.
 const bench_mid_player_level: u16 = 40;
 
 const FixtureConfig = struct {
@@ -59,20 +56,29 @@ const default_fixture_config = FixtureConfig{};
 
 pub const group = suite.BenchmarkGroup{
     .name = "render-game-prep",
+    .item_label = "render entities",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeRenderGamePrepWorkload,
+    .summary_focus = .production_adaptive,
 };
 
 pub const dense_surface_group = suite.BenchmarkGroup{
     .name = "render-game-prep-dense-surface",
+    .item_label = "render entities",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runDenseSurfaceCase,
+    .write_workload = writeRenderGamePrepWorkload,
+    .summary_focus = .production_adaptive,
 };
 
 pub const dense_deep_group = suite.BenchmarkGroup{
     .name = "render-game-prep-dense-deep",
+    .item_label = "render entities",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runDenseDeepCase,
+    .write_workload = writeRenderGamePrepWorkload,
+    .summary_focus = .production_adaptive,
 };
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
@@ -196,13 +202,7 @@ fn runCaseWithConfig(
     defer draw_list.deinit(allocator);
     try draw_list.ensureTotalCapacity(allocator, fixture.static_group_count + command_capacity);
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     if (suite.adaptiveTunerForCase(case, render_game_prep_range_alignment_items)) |tuner| {
@@ -246,7 +246,6 @@ fn runCaseWithConfig(
     var last_merged_groups: usize = 0;
     var last_merged_tilemap_groups: usize = 0;
     for (0..options.iterations) |_| {
-        const start_ns = suite.nowNs(io);
         const measured = try runMeasuredOnce(
             io,
             fixture,
@@ -257,8 +256,7 @@ fn runCaseWithConfig(
             case,
             allocator,
         );
-        const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), measured.stats.batch);
+        accumulator.record(measured.timed_ns, measured.stats.batch);
         phase_accumulator.record(measured.phases);
         last_prep = measured.stats;
         last_sparse_submitted = measured.sparse_submitted;
@@ -289,6 +287,8 @@ fn runCaseWithConfig(
 }
 
 const MeasuredGamePrep = struct {
+    // The frame's timed phases summed; excludes the untimed render window sets.
+    timed_ns: u64,
     stats: sprite_batch.SpritePrepStats,
     phases: suite.RenderGamePrepPhaseSummary,
     sparse_submitted: usize,
@@ -333,11 +333,18 @@ fn runMeasuredOnce(
 ) !MeasuredGamePrep {
     batch.beginFrame();
 
+    // The fixture moves the render window twice a frame (whole world for collect,
+    // camera for the sparse emit), which production never does, so the window sets
+    // stay out of every timed span; production's one window update per frame is
+    // measured by the `render-sparse-window-*` groups.
+    try setBenchCollectChunkVisibility(fixture);
     const collect_start_ns = suite.nowNs(io);
     try collectProductionDynamicRecords(fixture);
-    setBenchSparseEmitChunkVisibility(fixture);
-    const sparse_submitted = try emitLayeredCommands(fixture, batch);
     const collect_end_ns = suite.nowNs(io);
+    try setBenchSparseEmitChunkVisibility(fixture);
+    const emit_start_ns = suite.nowNs(io);
+    const sparse_submitted = try emitLayeredCommands(fixture, batch);
+    const emit_end_ns = suite.nowNs(io);
 
     const snapshot_start_ns = suite.nowNs(io);
     _ = batch.snapshotCommandsAssumeCapacity(resolver);
@@ -358,17 +365,19 @@ fn runMeasuredOnce(
     }
     const merge_end_ns = suite.nowNs(io);
 
+    const phases = suite.RenderGamePrepPhaseSummary{
+        .entity_collect_ns = suite.elapsedNs(collect_start_ns, collect_end_ns) + suite.elapsedNs(emit_start_ns, emit_end_ns),
+        .merge_ns = suite.elapsedNs(merge_start_ns, merge_end_ns),
+        .snapshot_ns = suite.elapsedNs(snapshot_start_ns, snapshot_end_ns),
+        .vertex_emit_ns = suite.elapsedNs(vertex_start_ns, vertex_end_ns),
+    };
     return .{
+        .timed_ns = phases.entity_collect_ns + phases.merge_ns + phases.snapshot_ns + phases.vertex_emit_ns,
         .stats = stats,
         .sparse_submitted = sparse_submitted,
         .merged_group_count = merged_group_count,
         .merged_tilemap_group_count = merged_tilemap_group_count,
-        .phases = .{
-            .entity_collect_ns = suite.elapsedNs(collect_start_ns, collect_end_ns),
-            .merge_ns = suite.elapsedNs(merge_start_ns, merge_end_ns),
-            .snapshot_ns = suite.elapsedNs(snapshot_start_ns, snapshot_end_ns),
-            .vertex_emit_ns = suite.elapsedNs(vertex_start_ns, vertex_end_ns),
-        },
+        .phases = phases,
     };
 }
 
@@ -391,13 +400,13 @@ fn emitVertices(
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(render_game_prep_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, render_game_prep_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, render_game_prep_range_alignment_items);
 }
 
+// Requires `setBenchCollectChunkVisibility` first: full-world visibility is an
+// upper-bound ceiling for entity_collect_ns, not the production camera/chunk/AABB
+// cull path.
 fn collectProductionDynamicRecords(fixture: *Fixture) !void {
-    // Full-world visibility is an upper-bound ceiling for entity_collect_ns, not
-    // the production camera/chunk/AABB cull path.
-    setBenchCollectChunkVisibility(fixture);
     const visible = benchCollectVisibleRect(fixture.world_width_px, fixture.world_height_px);
     try render_prep.collectDynamicRecords(
         &fixture.scene_prep,
@@ -410,18 +419,18 @@ fn collectProductionDynamicRecords(fixture: *Fixture) !void {
     std.debug.assert(fixture.last_collected_records == expectedBenchCollectedRecords(fixture.item_count));
 }
 
-fn setBenchCollectChunkVisibility(fixture: *Fixture) void {
-    fixture.world.setVisibleChunksForWorldRect(.{
+fn setBenchCollectChunkVisibility(fixture: *Fixture) !void {
+    try fixture.world.setVisibleChunksForWorldRect(.{
         .x = 0,
         .y = 0,
         .w = fixture.world_width_px,
         .h = fixture.world_height_px,
-    }, 0);
+    }, 0, fixture.player_level);
 }
 
-fn setBenchSparseEmitChunkVisibility(fixture: *Fixture) void {
+fn setBenchSparseEmitChunkVisibility(fixture: *Fixture) !void {
     const camera_rect = cameraWorldRect(fixture.world_width_px, fixture.world_height_px);
-    fixture.world.setVisibleChunksForWorldRect(camera_rect, world_overscan_chunks);
+    try fixture.world.setVisibleChunksForWorldRect(camera_rect, world_overscan_chunks, fixture.player_level);
 }
 
 /// Full-world pixel bounds for entity collect. Perf benches target the requested
@@ -436,16 +445,16 @@ fn benchCollectVisibleRect(world_width_px: f32, world_height_px: f32) render_pre
 }
 
 fn emitLayeredCommands(fixture: *Fixture, batch: *sprite_batch.SpriteBatch) !usize {
-    try fixture.world.ensureRenderDepthIndex();
+    const world = &fixture.world;
     var sparse_submitted: usize = 0;
-    var sparse_depth = fixture.world.firstVisibleSparseDepth();
+    var sparse_range: usize = 0;
     var dynamic_span_index: usize = 0;
     var dynamic_depth = nextDynamicDepthSpan(&fixture.scene_prep, &dynamic_span_index);
-    while (sparse_depth != null or dynamic_depth != null) {
-        if (sparse_depth) |depth| {
-            if (dynamic_depth == null or depth <= dynamic_depth.?) {
-                sparse_submitted += try fixture.world.submitVisibleSparseSprites(batch, fixture.tile_texture, depth);
-                sparse_depth = fixture.world.nextVisibleSparseDepthAfter(depth);
+    while (sparse_range < world.sparseDepthRangeCount() or dynamic_depth != null) {
+        if (sparse_range < world.sparseDepthRangeCount()) {
+            if (dynamic_depth == null or world.sparseDepthRangeAt(sparse_range) <= dynamic_depth.?) {
+                sparse_submitted += try world.submitVisibleSparseSprites(batch, fixture.tile_texture, sparse_range);
+                sparse_range += 1;
                 continue;
             }
         }
@@ -540,8 +549,8 @@ fn initFixture(
     // point), so `stage` starts past all three.
     var stage: InitStage = .scene_prep;
     errdefer {
-        if (@intFromEnum(stage) >= @intFromEnum(InitStage.world)) fixture.world.deinit();
-        if (@intFromEnum(stage) >= @intFromEnum(InitStage.tileset_meta)) fixture.tileset_meta.deinit();
+        if (@backingInt(stage) >= @backingInt(InitStage.world)) fixture.world.deinit();
+        if (@backingInt(stage) >= @backingInt(InitStage.tileset_meta)) fixture.tileset_meta.deinit();
         fixture.scene_prep.deinit();
         fixture.particles.deinit();
         fixture.data.deinit();
@@ -549,8 +558,7 @@ fn initFixture(
 
     fixture.static_group_count = benchStaticGroups(tile_texture, fixture_config, &fixture.static_groups);
 
-    const asset_store = AssetStore.init(allocator, io, "assets");
-    fixture.tileset_meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    fixture.tileset_meta = try fixtures.loadTilesetMeta(allocator, io);
     stage = .tileset_meta;
 
     const tile_size_px = fixture.tileset_meta.tileSize();
@@ -573,8 +581,10 @@ fn initFixture(
         _ = try fixture.world.addLevel(-@as(i32, @intCast(level_index)) * world_system.level_z_step);
     }
 
-    const deco = try requireTile(&fixture.tileset_meta, "deco_0");
-    const level: u16 = 0;
+    const deco = try fixture.world.requireTileByName(&fixture.tileset_meta, "deco_0");
+    // Sparse tiles sit on the player's level so both variants draw them: sparse
+    // tiles draw only on the render window's levels.
+    const level: u16 = fixture_config.player_level;
 
     for (0..sparse_tile_count) |index| {
         const x: u16 = @intCast((index % sparse_grid_side) * 2 + 4);
@@ -604,7 +614,7 @@ fn initFixture(
             .depth = benchmarkEntityDepth(index),
             .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         });
-        // Slice 25E render-prep culls non-player entities to their own world
+        // Render-prep culls non-player entities to their own world
         // level; deep-window fixtures (player_level > 0) must place entities
         // on that same level or collectDynamicRecords drops them all.
         if (fixture_config.player_level != 0) {
@@ -630,8 +640,7 @@ fn initFixture(
     fixture.dynamic_record_capacity = render_prep.dynamicRecordCapacity(scene);
 }
 
-/// Builds the static draw groups `submitStaticDenseGeometry` produces post
-/// Slice 36: one retained `.tilemap` composite draw ordered at the window's
+/// Builds the static draw groups `submitStaticDenseGeometry` produces: one retained `.tilemap` composite draw ordered at the window's
 /// own shallowest submitted layer (`start_level`, the common single-bucket
 /// case this fixture always hits) plus one static sprite accent group.
 fn benchStaticGroups(
@@ -648,7 +657,7 @@ fn benchStaticGroups(
         .order = sprite_batch.RenderOrder.world(benchDenseFloorDepth(start_level)),
         .first_vertex = 0,
         .vertex_count = 6,
-        .tile_data = @enumFromInt(0),
+        .tile_data = .{ .index = 0, .generation = 1 },
     };
     const sprite_index = tilemap_group_count;
     out[sprite_index] = .{
@@ -679,10 +688,6 @@ fn benchDenseFloorDepth(world_level: u16) i32 {
 fn benchAccentSpriteDepth(fixture_config: FixtureConfig) i32 {
     const top_level = benchWindowStartLevel(fixture_config.player_level);
     return benchDenseFloorDepth(top_level) + render_depth.worldZ(.actor) - render_depth.worldZ(.floor);
-}
-
-fn requireTile(meta: *const world_tileset_meta.WorldTilesetMeta, name: []const u8) !TileId {
-    return (meta.tileByName(name) orelse return error.TileNotFound).id;
 }
 
 fn sparseTileCount(item_count: usize) usize {
@@ -786,4 +791,19 @@ fn textureId(index: u32, generation: u32) sprite_batch.TextureId {
 
 fn u128ToU64Saturated(value: u128) u64 {
     return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
+}
+
+fn writeRenderGamePrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={}", .{
+        stats.candidate_pairs,
+        stats.output_count,
+        stats.deferred_count,
+        stats.sample_count,
+        stats.render_game_prep_sparse_submitted,
+        stats.render_game_prep_dynamic_records,
+        stats.render_game_prep_static_groups,
+        stats.render_game_prep_merged_tilemap_groups,
+    });
+    const phases = stats.render_game_prep_phases orelse return;
+    try writer.print(" phases entity_collect={f} merge={f} snapshot={f} vertex_emit={f}", .{ suite.formatDuration(phases.entity_collect_ns), suite.formatDuration(phases.merge_ns), suite.formatDuration(phases.snapshot_ns), suite.formatDuration(phases.vertex_emit_ns) });
 }

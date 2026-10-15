@@ -2,30 +2,30 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Pipeline-owned shared spatial index (Slice 28). Builds one uniform grid per
-//! fixed step from the cognition-scoped population and exposes a bounded,
+//! Pipeline-owned shared spatial index. Builds one uniform grid per
+//! fixed step from the unstaggered cognition-halo population and exposes a bounded,
 //! radius-parameterized neighbor-query API. Replaces the private per-step grid
-//! `AiSystem` used to build for separation and is the substrate future
-//! perception queries (Slice 29) reuse instead of building a second grid.
+//! `AiSystem` used to build for separation and is the substrate perception
+//! queries reuse instead of building a second grid.
 //! Collision broadphase is intentionally NOT ported onto this index: it runs a
 //! tuned sweep-and-prune order (`systems/collision.zig`) that is a different,
 //! already-tuned algorithm, not a duplicate grid build.
 //!
-//! Scope: indexes only the cognition-scoped population passed via
-//! `SpatialIndexConfig.scope_dense_indices` (halo + stagger gated), not every
-//! movement body — every current and planned consumer already gates on that
-//! same set, so indexing the full population would spend build cost on
-//! entities nothing queries this step. A future consumer that needs a broader
-//! candidate pool is the intentional widening point, not an oversight.
+//! Scope: indexes the cognition-halo population passed via
+//! `SpatialIndexConfig.scope_dense_indices` (tier + camera halo, **no** stagger),
+//! not every movement body. Perception candidates walk the same list; think-set
+//! observers/deciders are a stagger subset and map into these rows via
+//! `spatial_self_index`. Indexing the full movement population would spend
+//! build cost on entities nothing queries this step.
 //!
-//! Population-domain contract (also documented in `ai.zig`): `build`/`buildSerial`
-//! walk `scope_dense_indices` (or all ai agents) resolving
-//! `data.movementBodyDenseIndex(entity) orelse continue`, exactly mirroring
-//! `AiSystem.gatherAiData`'s selection. This is a deliberate duplicate gather
-//! (not shared code): it keeps both systems' call shapes independent while
-//! guaranteeing row-index equivalence by construction — index row `i` and
-//! `AiSystem.rows` row `i` refer to the same agent, so query results plug
-//! straight into AI's arrays with zero translation.
+//! Population-domain contract (also documented in `ai.zig`/`perception.zig`):
+//! `build`/`buildSerial` walk `scope_dense_indices` (or all ai agents) resolving
+//! `data.movementBodyDenseIndex(entity) orelse continue`, exactly mirroring the
+//! halo candidate walks. This is a deliberate duplicate gather (not shared
+//! code): index row `i` and each system's `candidates` row `i` refer to the
+//! same agent. Think rows are a subset and must not be used as spatial
+//! self-indices. Single-list callers (null halo, think == halo) keep the
+//! equal-length path.
 //!
 //! Determinism-critical: floating-point neighbor-direction summation is not
 //! associative, so callers that need bit-exact parity with a per-cell scan
@@ -41,8 +41,7 @@
 //! gather job. Cell assignment is deliberately deferred to a separate dense
 //! pass (`assignCellsDense`) over the merged, contiguous `rows` columns, run 4
 //! rows at a time through `simd.floorToI4` with a scalar tail: gather into
-//! packed SoA scratch, then vectorize the dense math, per
-//! `docs/coding-standards.md`'s SIMD section.
+//! packed SoA scratch, then vectorize the dense math.
 //!
 //! Populated-cell lookup: a row-major dense grid over a bounded,
 //! camera-relative window (`DenseCellLookup`), direct-indexed rather than
@@ -58,13 +57,15 @@ const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const cognition_halo_chunks = @import("../simulation_scope.zig").cognition_halo_chunks;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
-const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
-const rangeCount = @import("../../app/thread_system.zig").rangeCount;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
+const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
+const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
@@ -72,8 +73,6 @@ const EntityId = @import("../data_system.zig").EntityId;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 
 pub const spatial_index_range_alignment_items: usize = movement_range_alignment_items;
-
-const thread_shared_record_alignment: usize = 64;
 
 pub const SpatialCell = struct {
     x: i32,
@@ -157,9 +156,14 @@ pub const DenseCellLookup = struct {
     capacity_cells_x: u32 = 0,
     capacity_cells_y: u32 = 0,
 
-    fn reserve(self: *DenseCellLookup, allocator: std.mem.Allocator, width: u32, height: u32, population_capacity: usize) !void {
-        const total = @as(usize, width) * @as(usize, height);
+    /// Grow-only `touched` reserve (population-sized). Preserves the last build's
+    /// touched indices, so a population growth never re-memsets the window.
+    fn reserveTouched(self: *DenseCellLookup, allocator: std.mem.Allocator, population_capacity: usize) !void {
         try self.touched.ensureTotalCapacity(allocator, population_capacity);
+    }
+
+    fn reserveWindow(self: *DenseCellLookup, allocator: std.mem.Allocator, width: u32, height: u32) !void {
+        const total = @as(usize, width) * @as(usize, height);
 
         // Re-entrant: a second call with the same grid size must not append
         // another full window of zeros (would desync len from capacity and
@@ -219,7 +223,8 @@ pub const SpatialIndexConfig = struct {
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
     /// When non-null, only these dense ai-store indices participate this step
-    /// (mirrors `AiConfig.scope_dense_indices`). Null = all ai agents.
+    /// (the unstaggered cognition halo; mirrors perception's candidate list).
+    /// Null = all ai agents.
     scope_dense_indices: ?[]const u32 = null,
 };
 
@@ -461,7 +466,11 @@ pub const SpatialIndexSystem = struct {
     // Sized in `reserve` from the halo/world geometry; see `DenseCellLookup`'s
     // doc comment.
     dense_lookup: DenseCellLookup = .{},
-    gather_ranges: RowRangeSlotList = .empty,
+    // Threaded gather staging: range r writes only its own `[range.start, range.end)`
+    // window (at most one row per candidate) and its count into its padded tally; the
+    // main thread copies the windows into `rows` in range order.
+    gather_staging: RowStagingList = .empty,
+    gather_tallies: RowCountTallyList = .empty,
     build_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     cell_size: f32 = 32.0,
 
@@ -473,8 +482,8 @@ pub const SpatialIndexSystem = struct {
     }
 
     pub fn deinit(self: *SpatialIndexSystem) void {
-        for (self.gather_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
-        self.gather_ranges.deinit(self.allocator);
+        self.gather_tallies.deinit(self.allocator);
+        self.gather_staging.deinit(self.allocator);
         self.dense_lookup.deinit(self.allocator);
         self.ranges.deinit(self.allocator);
         self.entries.deinit(self.allocator);
@@ -484,9 +493,8 @@ pub const SpatialIndexSystem = struct {
 
     /// Pre-sizes `rows`/`entries`/`ranges`/`dense_lookup` to `capacity`
     /// movement bodies (worst case: one entity per cell) so the per-step
-    /// build is allocation-free after init. The threaded per-range gather
-    /// slots still warm on their first threaded step, same as
-    /// `SimulationScopeSystem.reserve`.
+    /// build is allocation-free after init, serial or threaded under any
+    /// partition (see `reserveRows`).
     ///
     /// `geometry` sizes the dense lookup window: the cognition-halo margin
     /// (`2 * cognition_halo_chunks * chunk_size_tiles * tile_size` world
@@ -498,16 +506,33 @@ pub const SpatialIndexSystem = struct {
     /// `max_dense_window_side_cells`'s doc comment for the headroom this
     /// leaves and the assumption it rests on.
     pub fn reserve(self: *SpatialIndexSystem, capacity: usize, geometry: DenseWindowGeometry) !void {
+        try self.reserveRows(capacity);
+        try self.reserveWindow(geometry);
+    }
+
+    /// Population-sized half of `reserve`: `rows`/`entries`/`ranges`/the dense
+    /// lookup's `touched` list, the gather staging (one window slot per candidate),
+    /// and the gather tallies (`maxRangeCount(capacity)`, every partition the tuner
+    /// can pick). Grow-only and never touches the dense window, so the pipeline's
+    /// population seam re-runs it without a re-memset.
+    pub fn reserveRows(self: *SpatialIndexSystem, capacity: usize) !void {
         try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(capacity));
         try self.entries.ensureTotalCapacity(self.allocator, capacity);
         try self.ranges.ensureTotalCapacity(self.allocator, capacity);
+        try self.dense_lookup.reserveTouched(self.allocator, capacity);
+        try self.gather_staging.ensureTotalCapacityPrecise(self.allocator, capacity);
+        try self.gather_tallies.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(capacity, spatial_index_range_alignment_items));
+    }
 
+    /// World-geometry half of `reserve`: sizes the dense lookup window (idempotent
+    /// for an unchanged window).
+    pub fn reserveWindow(self: *SpatialIndexSystem, geometry: DenseWindowGeometry) !void {
         const halo_world_units = 2.0 * @as(f32, @floatFromInt(cognition_halo_chunks)) *
             @as(f32, @floatFromInt(geometry.chunk_size_tiles)) * geometry.tile_size;
         const margin_cells: u32 = @intFromFloat(@ceil(halo_world_units / geometry.cell_size));
         const window_side = @min(margin_cells + max_expected_visible_window_cells, max_dense_window_side_cells);
 
-        try self.dense_lookup.reserve(self.allocator, window_side, window_side, capacity);
+        try self.dense_lookup.reserveWindow(self.allocator, window_side, window_side);
     }
 
     /// Read-only snapshot of the most recently built index.
@@ -530,8 +555,8 @@ pub const SpatialIndexSystem = struct {
     }
 
     /// Threaded build: gathers the scoped population into `rows` (per-range
-    /// compaction, merged in range order so threaded and serial output are
-    /// byte-identical), then sorts `entries` and derives `ranges` serially.
+    /// windows of `gather_staging`, copied in range order so threaded and serial
+    /// output are byte-identical), then sorts `entries` and derives `ranges` serially.
     pub fn build(
         self: *SpatialIndexSystem,
         ai_agents: ConstAiAgentSlice,
@@ -546,14 +571,22 @@ pub const SpatialIndexSystem = struct {
         if (n == 0) return .{};
 
         const owned_tuner = if (config.adaptive and config.items_per_range == null) &self.build_tuner else null;
-        const selection = selectStageWork(thread_system, n, config.items_per_range, config.max_worker_threads, config.adaptive, owned_tuner);
-        try prepareRowRangeBuffers(self.allocator, &self.gather_ranges, n, selection.items_per_range, selection.range_count);
+        const selection = thread_system.selectBatchProfile(owned_tuner, .{
+            .item_count = n,
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = spatial_index_range_alignment_items,
+            .adaptive = config.adaptive,
+        });
+        try self.prepareGatherStaging(n, selection.range_count);
         var context = SpatialGatherContext{
             .ai_entities = ai_agents.entities,
             .movement = movement,
             .data = data,
             .scope_dense_indices = config.scope_dense_indices,
-            .ranges = self.gather_ranges.items[0..selection.range_count],
+            .out = self.gather_staging.items,
+            .items_per_range = selection.items_per_range,
+            .tallies = self.gather_tallies.items,
             .item_count = n,
         };
         const batch = thread_system.parallelForWithOptions(n, &context, spatialGatherJob, .{
@@ -562,7 +595,7 @@ pub const SpatialIndexSystem = struct {
             .adaptive_tuner = selection.active_tuner,
             .selected_profile = selection.profile,
         });
-        try self.mergeRowRanges(self.gather_ranges.items[0..selection.range_count]);
+        try self.mergeRowWindows(selection.items_per_range);
 
         const gathered = self.rows.len;
         if (gathered == 0) return .{ .entity_count = 0, .batch = batch };
@@ -608,7 +641,7 @@ pub const SpatialIndexSystem = struct {
         if (gathered == 0) return .{};
         self.assignCellsDense();
         try self.buildEntriesAndRanges();
-        return .{ .entity_count = gathered, .batch = serialBatch(gathered) };
+        return .{ .entity_count = gathered, .batch = inlineBatch(gathered, spatial_index_range_alignment_items) };
     }
 
     fn clearWork(self: *SpatialIndexSystem) void {
@@ -617,14 +650,30 @@ pub const SpatialIndexSystem = struct {
         self.ranges.clearRetainingCapacity();
     }
 
-    fn mergeRowRanges(self: *SpatialIndexSystem, slots: []RowRangeSlot) !void {
+    /// Sizes the staging to `item_count` window slots and resets `range_count`
+    /// tallies. Main thread, before dispatch. Grow-only safety nets: after
+    /// `reserveRows` at the population seam they never allocate, whatever partition
+    /// the tuner picked.
+    fn prepareGatherStaging(self: *SpatialIndexSystem, item_count: usize, range_count: usize) !void {
+        try self.gather_staging.ensureTotalCapacity(self.allocator, item_count);
+        self.gather_staging.items.len = item_count;
+        try self.gather_tallies.ensureTotalCapacity(self.allocator, range_count);
+        self.gather_tallies.items.len = range_count;
+        for (self.gather_tallies.items) |*slot| slot.count = 0;
+    }
+
+    /// Copies each range's staging window (`count` rows at `r * items_per_range`) into
+    /// `rows` in range order, copying each row once.
+    fn mergeRowWindows(self: *SpatialIndexSystem, items_per_range: usize) !void {
         self.rows.clearRetainingCapacity();
         var total: usize = 0;
-        for (slots) |*slot| total += slot.buffer.rows.items.len;
+        for (self.gather_tallies.items) |*slot| total += slot.count;
         try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(total));
         var row_slice = self.rows.slice();
-        for (slots) |*slot| {
-            for (slot.buffer.rows.items) |record| {
+        const staging = self.gather_staging.items;
+        for (self.gather_tallies.items, 0..) |*slot, range_index| {
+            const window_start = range_index * items_per_range;
+            for (staging[window_start..][0..slot.count]) |record| {
                 appendSpatialRow(&self.rows, &row_slice, record);
             }
         }
@@ -633,7 +682,7 @@ pub const SpatialIndexSystem = struct {
     /// Derives every row's `SpatialCell` from its already-gathered, contiguous
     /// `pos_x`/`pos_y` columns: dense, uniform, branch-light float math over an
     /// SoA column, so it runs 4 rows at a time through `simd.floorToI4` with a
-    /// scalar tail, per `docs/coding-standards.md`'s SIMD section. Called after
+    /// scalar tail. Called after
     /// the scattered/branchy gather (`spatialGatherJob`/`buildSerial`'s loop)
     /// has finished — both leave `.cell` as a placeholder for this pass to fill.
     /// Uses `simd.divFloat4` (true division), not a precomputed reciprocal
@@ -780,51 +829,33 @@ fn entryLessThan(_: void, lhs: SpatialEntry, rhs: SpatialEntry) bool {
 
 // ---- Threaded gather ----------------------------------------------------------
 
-const RowRangeBuffer = struct {
-    rows: std.ArrayList(SpatialIndexRow) = .empty,
+/// Cache-line-aligned staging: with a 16-item range alignment every range's window
+/// starts on a cache-line boundary for 24-byte rows, so concurrent range writes never
+/// share a line.
+const RowStagingList = std.array_list.Aligned(SpatialIndexRow, .fromByteUnits(thread_shared_record_alignment));
 
-    fn reset(self: *RowRangeBuffer) void {
-        self.rows.clearRetainingCapacity();
-    }
-
-    fn deinit(self: *RowRangeBuffer, allocator: std.mem.Allocator) void {
-        self.rows.deinit(allocator);
-        self.* = undefined;
-    }
+/// One range's gathered-row count, written once by the range's job.
+const RowCountTally = struct {
+    // Padding keeps concurrently written tallies off shared cache lines.
+    count: usize = 0,
+    padding: [paddingForCacheLine(usize)]u8 = @splat(0),
 };
 
-const RowRangeSlot = struct {
-    // Padding keeps hot append state off shared cache lines across concurrently
-    // written range records.
-    buffer: RowRangeBuffer = .{},
-    padding: [paddingForCacheLine(RowRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(RowRangeBuffer),
-};
-
-const RowRangeSlotList = std.ArrayListAligned(RowRangeSlot, .fromByteUnits(thread_shared_record_alignment));
-
-fn prepareRowRangeBuffers(
-    allocator: std.mem.Allocator,
-    ranges: *RowRangeSlotList,
-    item_count: usize,
-    items_per_range: usize,
-    range_count: usize,
-) !void {
-    try ranges.ensureTotalCapacity(allocator, range_count);
-    while (ranges.items.len < range_count) ranges.appendAssumeCapacity(.{});
-    for (ranges.items[0..range_count], 0..) |*slot, range_index| {
-        slot.buffer.reset();
-        // Max one emitted row per scanned candidate → reserve the range length
-        // exactly, so the job only appends (no overflow, no replay).
-        try slot.buffer.rows.ensureTotalCapacity(allocator, rangeLenForIndex(item_count, items_per_range, range_index));
-    }
+comptime {
+    std.debug.assert(@sizeOf(RowCountTally) % thread_shared_record_alignment == 0);
 }
+
+const RowCountTallyList = std.array_list.Aligned(RowCountTally, .fromByteUnits(thread_shared_record_alignment));
 
 const SpatialGatherContext = struct {
     ai_entities: []const EntityId,
     movement: ConstMovementBodySlice,
     data: *const DataSystem,
     scope_dense_indices: ?[]const u32,
-    ranges: []RowRangeSlot,
+    /// Item-count staging; range r writes only its own `[range.start, range.end)` window.
+    out: []SpatialIndexRow,
+    items_per_range: usize,
+    tallies: []RowCountTally,
     /// Candidate count the dispatch was shaped for (scoped subset or full AI
     /// population); dual-asserted against `range.end` at job entry.
     item_count: usize,
@@ -835,67 +866,35 @@ const SpatialGatherContext = struct {
 /// body), so this stays scalar — the same shape as `AiSystem.gatherAiData`'s
 /// gather and `SimulationScopeSystem`'s AI gather job. Cell assignment is
 /// deliberately not done here; it runs afterward as one dense SIMD pass over
-/// the merged, contiguous `rows` columns (`assignCellsDense`), which is the
-/// "gather into packed SoA scratch, then vectorize the dense math" shape
-/// `docs/coding-standards.md`'s SIMD section calls for.
+/// the merged, contiguous `rows` columns (`assignCellsDense`): gather into
+/// packed SoA scratch, then vectorize the dense math.
 fn spatialGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *SpatialGatherContext = @ptrCast(@alignCast(context));
     // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs
     // dispatched range count AND range.end vs the candidate buffer this job walks.
-    // Guards the reserve-before-dispatch invariant: ranges was sized to this dispatch's range count.
-    std.debug.assert(range.index < job.ranges.len);
+    // Guards the reserve-before-dispatch invariant: the tallies were sized to this
+    // dispatch's range count, the range is the window the merge expects, and it stays
+    // inside the staging.
+    std.debug.assert(range.index < job.tallies.len);
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.item_count);
-    const buffer = &job.ranges[range.index].buffer;
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.end <= job.out.len);
+    const window = job.out[range.start..range.end];
+    var count: usize = 0;
     for (range.start..range.end) |k| {
         const i: usize = if (job.scope_dense_indices) |idx| idx[k] else k;
         const ent = job.ai_entities[i];
         const mi = job.data.movementBodyDenseIndex(ent) orelse continue;
-        buffer.rows.appendAssumeCapacity(.{
+        window[count] = .{
             .entity = ent,
             .pos_x = job.movement.previous_x[mi],
             .pos_y = job.movement.previous_y[mi],
             .cell = .{ .x = 0, .y = 0 },
-        });
+        };
+        count += 1;
     }
-}
-
-// ---- Work selection (mirrors ai.zig/simulation_scope.zig's selectStageWork) ---
-
-const StageWorkSelection = BatchSelection;
-
-fn selectStageWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    items_per_range_override: ?usize,
-    max_worker_threads_override: ?usize,
-    adaptive: bool,
-    adaptive_tuner: ?*AdaptiveWorkTuner,
-) StageWorkSelection {
-    // Shapes work through the single tuner-owned entry point so pre-sizing and
-    // dispatch (parallelForWithOptions) resolve an identical batch shape.
-    return thread_system.selectBatchProfile(adaptive_tuner, .{
-        .item_count = item_count,
-        .items_per_range = items_per_range_override,
-        .max_worker_threads = max_worker_threads_override,
-        .range_alignment_items = spatial_index_range_alignment_items,
-        .adaptive = adaptive,
-    });
-}
-
-fn paddingForCacheLine(comptime T: type) usize {
-    const rem = @sizeOf(T) % thread_shared_record_alignment;
-    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
-}
-
-fn rangeLenForIndex(item_count: usize, items_per_range: usize, range_index: usize) usize {
-    const start = range_index * items_per_range;
-    if (start >= item_count) return 0;
-    return @min(start + items_per_range, item_count) - start;
-}
-
-fn serialBatch(count: usize) BatchStats {
-    return .{ .ran_inline = true, .item_count = count, .range_count = 1, .items_per_range = count };
+    job.tallies[range.index].count = count;
 }
 
 // ---- Tests --------------------------------------------------------------------
@@ -1363,15 +1362,19 @@ test "SpatialIndexSystem empty population yields zero stats and touches nothing"
     try testing.expectEqual(@as(usize, 0), scoped_stats.entity_count);
 }
 
-test "SpatialIndexSystem has no steady-state allocation after warmup (FailingAllocator)" {
+test "after reserveRows, threaded builds at 32- then 16-item ranges allocate nothing" {
+    // No warm build: the population seam's reserve alone covers every partition the tuner
+    // can pick (item-count staging windows + maxRangeCount tallies), so a first threaded
+    // build and a retune to more ranges both allocate nothing.
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var fixture = try SpatialTestFixture.init(testing.allocator, 24);
+    const population: usize = 64;
+    var fixture = try SpatialTestFixture.init(testing.allocator, population);
     defer fixture.deinit();
     const ai_slice = fixture.data.aiAgentSliceConst();
     const move_slice = fixture.data.movementBodySliceConst();
 
-    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = 6 });
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
     // Without real workers the threaded build falls back to inline on the main
     // thread and this proof becomes a silent serial false pass.
@@ -1379,25 +1382,27 @@ test "SpatialIndexSystem has no steady-state allocation after warmup (FailingAll
 
     var sys = SpatialIndexSystem.init(testing.allocator);
     defer sys.deinit();
-    try sys.reserve(24, .{});
+    try sys.reserve(population, .{});
 
-    // Warmup: one threaded build (warms `gather_ranges`) and one serial build.
-    const warmup_stats = try sys.build(ai_slice, move_slice, &fixture.data, &threads, .{ .items_per_range = 6, .max_worker_threads = 2, .adaptive = false });
-    try testing.expect(!warmup_stats.batch.ran_inline);
-    try testing.expect(warmup_stats.batch.active_worker_threads > 0);
-    _ = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
+    var reference = SpatialIndexSystem.init(testing.allocator);
+    defer reference.deinit();
+    _ = try reference.buildSerial(ai_slice, move_slice, &fixture.data, .{});
 
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const original_allocator = sys.allocator;
     sys.allocator = failing.allocator();
     defer sys.allocator = original_allocator;
 
-    const threaded_stats = try sys.build(ai_slice, move_slice, &fixture.data, &threads, .{ .items_per_range = 6, .max_worker_threads = 2, .adaptive = false });
-    try testing.expectEqual(@as(usize, 24), threaded_stats.entity_count);
-    try testing.expect(!threaded_stats.batch.ran_inline);
-    try testing.expect(threaded_stats.batch.active_worker_threads > 0);
+    for ([_]usize{ 32, 16 }) |items_per_range| {
+        const stats = try sys.build(ai_slice, move_slice, &fixture.data, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
+        try testing.expectEqual(population, stats.entity_count);
+        try testing.expect(!stats.batch.ran_inline);
+        try testing.expectEqual(population / items_per_range, stats.batch.range_count);
+        try testing.expectEqualSlices(SpatialEntry, reference.entries.items, sys.entries.items);
+    }
     const serial_stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
-    try testing.expectEqual(@as(usize, 24), serial_stats.entity_count);
+    try testing.expectEqual(population, serial_stats.entity_count);
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
 
     var visitor = RecordingVisitor{};
     _ = sys.view().queryNeighbors(0, 0, null, 4, .{ .radius = 1000.0, .max_candidate_checks = 16 }, &visitor, RecordingVisitor.record);
@@ -1524,7 +1529,8 @@ test "buildEntriesAndRanges clamps the dense window and skips out-of-window cell
     defer sys.deinit();
     // Bypass reserve()'s own sizing (which would comfortably cover this case)
     // to directly force the undersized-window path this test targets.
-    try sys.dense_lookup.reserve(testing.allocator, 4, 4, 2);
+    try sys.dense_lookup.reserveTouched(testing.allocator, 2);
+    try sys.dense_lookup.reserveWindow(testing.allocator, 4, 4);
     sys.cell_size = 32.0;
 
     const ai_slice = data.aiAgentSliceConst();
@@ -1547,4 +1553,39 @@ test "buildEntriesAndRanges clamps the dense window and skips out-of-window cell
     var visitor = RecordingVisitor{};
     _ = view.queryNeighbors(0, 0, null, 1, .{ .radius = 10.0, .max_candidate_checks = 8 }, &visitor, RecordingVisitor.record);
     try testing.expectEqual(@as(usize, 1), visitor.count);
+}
+
+test "reserveRows grows population storage without touching the dense window" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(entity, .{ .active_behavior = .wander });
+
+    var sys = SpatialIndexSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.reserve(4, .{});
+    _ = try sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{});
+    const touched_len = sys.dense_lookup.touched.items.len;
+    try testing.expect(touched_len > 0);
+
+    const starts_ptr = sys.dense_lookup.starts.items.ptr;
+    const starts_len = sys.dense_lookup.starts.items.len;
+    const capacity_cells_x = sys.dense_lookup.capacity_cells_x;
+    // Sentinel in an untouched window slot: a re-memset would wipe it.
+    const sentinel_index = starts_len - 1;
+    sys.dense_lookup.starts.items[sentinel_index] = 7;
+
+    try sys.reserveRows(200);
+
+    try testing.expectEqual(starts_ptr, sys.dense_lookup.starts.items.ptr);
+    try testing.expectEqual(starts_len, sys.dense_lookup.starts.items.len);
+    try testing.expectEqual(capacity_cells_x, sys.dense_lookup.capacity_cells_x);
+    try testing.expectEqual(@as(u32, 7), sys.dense_lookup.starts.items[sentinel_index]);
+    try testing.expectEqual(touched_len, sys.dense_lookup.touched.items.len);
+    try testing.expect(sys.entries.capacity >= 200);
+    try testing.expect(sys.dense_lookup.touched.capacity >= 200);
+    try testing.expect(sys.gather_staging.capacity >= 200);
+    try testing.expect(sys.gather_tallies.capacity >= maxRangeCount(200, spatial_index_range_alignment_items));
+    sys.dense_lookup.starts.items[sentinel_index] = 0;
 }

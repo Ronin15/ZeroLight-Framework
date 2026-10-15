@@ -5,7 +5,13 @@
 const std = @import("std");
 const math = @import("math.zig");
 
-pub const lane_count: usize = 4;
+// Bytes in one vector register (SSE2, NEON); every lane count derives from it.
+const vector_bytes: usize = 16;
+/// Lanes of a 32-bit element type.
+pub const lane_count: usize = vector_bytes / @sizeOf(u32);
+// Lanes of a 16-bit element type.
+const u16_lane_count: usize = vector_bytes / @sizeOf(u16);
+const Uint16x8 = @Vector(u16_lane_count, u16);
 pub const Float4 = @Vector(lane_count, f32);
 pub const Int4 = @Vector(lane_count, i32);
 pub const Uint4 = @Vector(lane_count, u32);
@@ -59,6 +65,15 @@ pub fn storeFloat4Slice(values: []f32, vector: Float4) void {
     const stored = toFloatArray(vector);
     inline for (0..lane_count) |index| {
         values[index] = stored[index];
+    }
+}
+
+/// Stores the four lanes of `vector` into the first four values of `values`, in lane order;
+/// the rest of `values` is left as it was.
+pub fn storeUint4Slice(values: []u32, vector: Uint4) void {
+    std.debug.assert(values.len >= lane_count);
+    inline for (0..lane_count) |index| {
+        values[index] = vector[index];
     }
 }
 
@@ -128,6 +143,16 @@ pub fn worldPosToCell4(world_pos: Float4, tile_size: f32, max_cells: u32) Int4 {
     if (max_cells == 0) return splatInt4(0);
     const cells = floorToI4(divFloat4(world_pos, splatFloat4(tile_size)));
     return clampInt4(cells, splatInt4(0), splatInt4(@intCast(max_cells - 1)));
+}
+
+/// Vectorized counterpart of `math.lastCellOfSpan`, lane for lane: the last cell each
+/// half-open span `[min_pos, max_pos)` covers, clamped to `[0, max_cells - 1]`, never
+/// before the lane's min cell. Returns `i32` lanes like `worldPosToCell4`.
+pub fn lastCellOfSpan4(min_pos: Float4, max_pos: Float4, cell_size: f32, max_cells: u32) Int4 {
+    const first = worldPosToCell4(min_pos, cell_size, max_cells);
+    const end_cells = @ceil(divFloat4(max_pos, splatFloat4(cell_size)));
+    const last = worldPosToCell4(subFloat4(end_cells, splatFloat4(1)), 1, max_cells);
+    return selectInt4(greaterThanFloat4(max_pos, min_pos), maxInt4(first, last), first);
 }
 
 /// Vectorized counterpart of `math.floorToI32`: floors each lane to `i32`,
@@ -233,6 +258,74 @@ pub fn tailLen(item_count: usize) usize {
 
 pub fn hasTail(item_count: usize) bool {
     return tailLen(item_count) != 0;
+}
+
+/// Counts positions `index` where `lhs[index] != rhs[index]`; the slices have equal
+/// length. Whole registers, then a scalar tail.
+pub fn countUnequalU16(lhs: []const u16, rhs: []const u16) u32 {
+    std.debug.assert(lhs.len == rhs.len);
+    const vector_end = lhs.len - lhs.len % u16_lane_count;
+    var count: u32 = 0;
+    var index: usize = 0;
+    while (index < vector_end) : (index += u16_lane_count) {
+        const lhs_lanes: Uint16x8 = lhs[index..][0..u16_lane_count].*;
+        const rhs_lanes: Uint16x8 = rhs[index..][0..u16_lane_count].*;
+        count += @reduce(.Add, @as(@Vector(u16_lane_count, u8), @intFromBool(lhs_lanes != rhs_lanes)));
+    }
+    return count + countUnequalU16Scalar(lhs[vector_end..], rhs[vector_end..]);
+}
+
+/// Scalar form of `countUnequalU16`.
+pub fn countUnequalU16Scalar(lhs: []const u16, rhs: []const u16) u32 {
+    std.debug.assert(lhs.len == rhs.len);
+    var count: u32 = 0;
+    for (lhs, rhs) |lhs_value, rhs_value| count += @intFromBool(lhs_value != rhs_value);
+    return count;
+}
+
+/// Subtracts one from every value, stopping at zero. Whole registers, then a scalar tail.
+pub fn decrementSaturatingU16(values: []u16) void {
+    const vector_end = values.len - values.len % u16_lane_count;
+    const one: Uint16x8 = @splat(1);
+    var index: usize = 0;
+    while (index < vector_end) : (index += u16_lane_count) {
+        const lanes: Uint16x8 = values[index..][0..u16_lane_count].*;
+        values[index..][0..u16_lane_count].* = lanes -| one;
+    }
+    decrementSaturatingU16Scalar(values[vector_end..]);
+}
+
+/// Scalar form of `decrementSaturatingU16`.
+pub fn decrementSaturatingU16Scalar(values: []u16) void {
+    for (values) |*value| value.* -|= 1;
+}
+
+/// Per-axis lanes of `math.normalizeOrZeroFinite`, equal to it bit for bit in every lane: zero
+/// for a lane whose input, squared length, or ratio is non-finite or whose squared length is
+/// at or below `epsilon`.
+pub fn normalizeOrZeroFinite2Float4(x: Float4, y: Float4, epsilon: f32) Vec2x4 {
+    return lengthDirection2Float4(x, y, epsilon).direction;
+}
+
+/// Per-axis lanes of `math.normalizeOrDefaultFinite`, equal to it bit for bit in every lane:
+/// the lane of `default` wherever the scalar form returns its default.
+pub fn normalizeOrDefaultFinite2Float4(x: Float4, y: Float4, epsilon: f32, default: Vec2x4) Vec2x4 {
+    const finite_max = splatFloat4(std.math.floatMax(f32));
+    const len2 = lengthSquared2Float4(x, y);
+    const inputs_valid = finiteAboveEpsilon(x, y, len2, epsilon);
+    const inv = splatFloat4(1) / @sqrt(len2);
+    const normal_x = x * inv;
+    const normal_y = y * inv;
+    const valid = inputs_valid & (@abs(normal_x) <= finite_max) & (@abs(normal_y) <= finite_max);
+    return .{ .x = selectFloat4(valid, normal_x, default.x), .y = selectFloat4(valid, normal_y, default.y) };
+}
+
+// Lanes where the scalar finite forms normalize: `x`, `y`, and the squared length `len2`
+// finite, and `len2` above `epsilon`.
+fn finiteAboveEpsilon(x: Float4, y: Float4, len2: Float4, epsilon: f32) Mask4 {
+    const finite_max = splatFloat4(std.math.floatMax(f32));
+    // `@abs(v) <= floatMax` is false for inf and NaN lanes.
+    return (@abs(x) <= finite_max) & (@abs(y) <= finite_max) & (@abs(len2) <= finite_max) & greaterThanFloat4(len2, splatFloat4(epsilon));
 }
 
 /// Per-lane pair of 2D components (one `Float4` per axis).
@@ -341,6 +434,28 @@ pub fn normalizeOrZero2Float4(x: Float4, y: Float4, epsilon: f32) Vec2x4 {
     };
 }
 
+/// Per-lane length paired with the unit direction.
+pub const LengthDirection4 = struct {
+    length: Float4,
+    direction: Vec2x4,
+};
+
+/// Per-lane length and unit direction of `(x, y)` from one `@sqrt`: SIMD counterpart of
+/// `math.lengthDirection`, equal to it bit for bit in every lane, including the zero
+/// length and direction of a lane whose input or squared length is non-finite or whose
+/// squared length is at or below `epsilon`.
+pub fn lengthDirection2Float4(x: Float4, y: Float4, epsilon: f32) LengthDirection4 {
+    const len2 = lengthSquared2Float4(x, y);
+    const valid = finiteAboveEpsilon(x, y, len2, epsilon);
+    const len = @sqrt(len2);
+    const inv = splatFloat4(1) / len;
+    const zero = splatFloat4(0);
+    return .{
+        .length = selectFloat4(valid, len, zero),
+        .direction = .{ .x = selectFloat4(valid, x * inv, zero), .y = selectFloat4(valid, y * inv, zero) },
+    };
+}
+
 /// Per-lane linear interpolation of 2D vectors between `start` and `end` by
 /// `amount`. SIMD counterpart of `math.lerpVec2`.
 pub fn lerpVec2Float4(start: Vec2x4, end: Vec2x4, amount: Float4) Vec2x4 {
@@ -412,6 +527,15 @@ test "uint load and equal match scalar results, including the u32-max lane" {
     inline for (0..lane_count) |lane| {
         try std.testing.expectEqual(lhs_source[lane] == rhs_source[lane], mask[lane]);
     }
+}
+
+test "storeUint4Slice round-trips loadUint4 and writes exactly four words" {
+    const source = [_]u32{ 1, std.math.maxInt(u32), 0, 0x8000_0001 };
+    var stored = [_]u32{ 9, 9, 9, 9, 9, 9 };
+    storeUint4Slice(stored[1..], loadUint4(&source));
+    try std.testing.expectEqualSlices(u32, &source, stored[1..5]);
+    try std.testing.expectEqual(@as(u32, 9), stored[0]);
+    try std.testing.expectEqual(@as(u32, 9), stored[5]);
 }
 
 test "float operations match scalar results" {
@@ -494,6 +618,120 @@ test "tail helpers cover empty partial exact and multi lane counts" {
     try std.testing.expect(hasTail(11));
 }
 
+test "countUnequalU16 matches its scalar form over every tail length and random, equal, and different data" {
+    var prng = std.Random.DefaultPrng.init(0x00c0_0e16);
+    const random = prng.random();
+    var lhs: [33]u16 = undefined;
+    var rhs: [33]u16 = undefined;
+    for (0..lhs.len + 1) |len| {
+        for (0..8) |_| {
+            // A small value range so equal and unequal lanes both occur.
+            for (lhs[0..len], rhs[0..len]) |*left, *right| {
+                left.* = random.uintLessThan(u16, 3);
+                right.* = random.uintLessThan(u16, 3);
+            }
+            try std.testing.expectEqual(countUnequalU16Scalar(lhs[0..len], rhs[0..len]), countUnequalU16(lhs[0..len], rhs[0..len]));
+        }
+        @memset(lhs[0..len], 0xBEEF);
+        try std.testing.expectEqual(@as(u32, 0), countUnequalU16(lhs[0..len], lhs[0..len]));
+        for (rhs[0..len], 0..) |*right, index| right.* = @intCast(index);
+        @memset(lhs[0..len], std.math.maxInt(u16));
+        try std.testing.expectEqual(@as(u32, @intCast(len)), countUnequalU16(lhs[0..len], rhs[0..len]));
+    }
+    // Overlapping views, as a chain of adjacent cells is compared.
+    for (&lhs) |*value| value.* = random.uintLessThan(u16, 2);
+    try std.testing.expectEqual(countUnequalU16Scalar(lhs[0..32], lhs[1..33]), countUnequalU16(lhs[0..32], lhs[1..33]));
+}
+
+test "decrementSaturatingU16 matches its scalar form over every tail length, stopping at zero" {
+    var prng = std.Random.DefaultPrng.init(0x0dec_0016);
+    const random = prng.random();
+    var lanes: [33]u16 = undefined;
+    var scalar: [33]u16 = undefined;
+    for (0..lanes.len + 1) |len| {
+        for (lanes[0..len], 0..) |*value, index| {
+            // Zero, one, the maximum, and random values.
+            value.* = switch (index % 4) {
+                0 => 0,
+                1 => 1,
+                2 => std.math.maxInt(u16),
+                else => random.int(u16),
+            };
+        }
+        @memcpy(scalar[0..len], lanes[0..len]);
+        decrementSaturatingU16(lanes[0..len]);
+        decrementSaturatingU16Scalar(scalar[0..len]);
+        try std.testing.expectEqualSlices(u16, scalar[0..len], lanes[0..len]);
+        for (lanes[0..len], 0..) |value, index| {
+            const expected: u16 = switch (index % 4) {
+                0, 1 => 0,
+                2 => std.math.maxInt(u16) - 1,
+                else => value,
+            };
+            try std.testing.expectEqual(expected, value);
+        }
+    }
+}
+
+// Finite, zero, at and just past epsilon, overflowing squares, NaN, and inf lanes; with
+// epsilon 0.25, (0.5, 0) sits exactly at epsilon.
+const finite_normalize_cases = [_][2]f32{
+    .{ 3, 4 },                              .{ -0.75, 12.5 },           .{ 0, 0 },                 .{ -0.0, 0 },
+    .{ 0.5, 0 },                            .{ 0.5001, 0 },             .{ 1e-3, 0 },              .{ 1e-20, -1e-20 },
+    .{ std.math.floatMax(f32), 0 },         .{ 1e20, 1e20 },            .{ std.math.nan(f32), 1 }, .{ 1, std.math.nan(f32) },
+    .{ std.math.inf(f32), 0 },              .{ 0, -std.math.inf(f32) }, .{ 7, -24 },               .{ std.math.floatMin(f32), 0 },
+    .{ std.math.floatTrueMin(f32), 1e-30 }, .{ -1e19, 1e19 },           .{ 0.1, -0.2 },            .{ -0.0, -0.0 },
+};
+
+test "normalizeOrZeroFinite2Float4 matches math.normalizeOrZeroFinite in every lane" {
+    for ([_]f32{ 0, 0.0001, 0.25 }) |epsilon| {
+        var index: usize = 0;
+        while (index < finite_normalize_cases.len) : (index += lane_count) {
+            var xs: [lane_count]f32 = undefined;
+            var ys: [lane_count]f32 = undefined;
+            for (finite_normalize_cases[index..][0..lane_count], &xs, &ys) |case, *x, *y| {
+                x.* = case[0];
+                y.* = case[1];
+            }
+            const lanes = normalizeOrZeroFinite2Float4(loadFloat4(&xs), loadFloat4(&ys), epsilon);
+            const out_x = toFloatArray(lanes.x);
+            const out_y = toFloatArray(lanes.y);
+            for (0..lane_count) |lane| {
+                const expected = math.normalizeOrZeroFinite(xs[lane], ys[lane], epsilon);
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(out_x[lane])));
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(out_y[lane])));
+            }
+        }
+    }
+}
+
+test "normalizeOrDefaultFinite2Float4 matches math.normalizeOrDefaultFinite in every lane" {
+    // Per-lane defaults, one of them NaN, so a wrong lane pick shows.
+    const default_x = float4(0.6, -1, std.math.nan(f32), 0);
+    const default_y = float4(0.8, 0, 2, -1);
+    for ([_]f32{ 0, 0.0001, 0.25 }) |epsilon| {
+        var index: usize = 0;
+        while (index < finite_normalize_cases.len) : (index += lane_count) {
+            var xs: [lane_count]f32 = undefined;
+            var ys: [lane_count]f32 = undefined;
+            for (finite_normalize_cases[index..][0..lane_count], &xs, &ys) |case, *x, *y| {
+                x.* = case[0];
+                y.* = case[1];
+            }
+            const lanes = normalizeOrDefaultFinite2Float4(loadFloat4(&xs), loadFloat4(&ys), epsilon, .{ .x = default_x, .y = default_y });
+            const out_x = toFloatArray(lanes.x);
+            const out_y = toFloatArray(lanes.y);
+            const defaults_x = toFloatArray(default_x);
+            const defaults_y = toFloatArray(default_y);
+            for (0..lane_count) |lane| {
+                const expected = math.normalizeOrDefaultFinite(xs[lane], ys[lane], epsilon, .{ .x = defaults_x[lane], .y = defaults_y[lane] });
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(out_x[lane])));
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(out_y[lane])));
+            }
+        }
+    }
+}
+
 test "gather and scatter move lanes through sparse indices" {
     const source = [_]f32{ 10, 11, 12, 13, 14, 15 };
     const gathered = gatherFloat4(&source, .{ 5, 0, 3, 1 });
@@ -534,6 +772,41 @@ test "normalize or zero matches scalar and zeroes short lanes" {
             try std.testing.expectApproxEqAbs(xs[lane] * inv, x_out[lane], 0.001);
             try std.testing.expectApproxEqAbs(ys[lane] * inv, y_out[lane], 0.001);
             try std.testing.expectApproxEqAbs(@as(f32, 1), x_out[lane] * x_out[lane] + y_out[lane] * y_out[lane], 0.001);
+        }
+    }
+}
+
+test "lengthDirection2Float4 matches math.lengthDirection in every lane" {
+    const inf = std.math.inf(f32);
+    const nan = std.math.nan(f32);
+    const max = std.math.floatMax(f32);
+    // Finite, zero, at and just past epsilon, overflowing squares, NaN, and inf lanes.
+    const cases = [_][2]f32{
+        .{ 3, 4 },   .{ -0.75, 12.5 }, .{ 0, 0 },       .{ -0.0, 0 },
+        .{ 0.5, 0 }, .{ 0.5001, 0 },   .{ 1e-3, 0 },    .{ 1e-20, -1e-20 },
+        .{ max, 0 }, .{ max, max },    .{ 1e20, 1e20 }, .{ nan, 1 },
+        .{ 1, nan }, .{ inf, 0 },      .{ 0, -inf },    .{ 7, -24 },
+    };
+    // 0.25 makes (0.5, 0) a lane exactly at epsilon.
+    for ([_]f32{ 0, 0.25 }) |epsilon| {
+        var index: usize = 0;
+        while (index < cases.len) : (index += lane_count) {
+            var xs: [lane_count]f32 = undefined;
+            var ys: [lane_count]f32 = undefined;
+            for (cases[index..][0..lane_count], &xs, &ys) |case, *x, *y| {
+                x.* = case[0];
+                y.* = case[1];
+            }
+            const lanes = lengthDirection2Float4(loadFloat4(&xs), loadFloat4(&ys), epsilon);
+            const lengths = toFloatArray(lanes.length);
+            const directions_x = toFloatArray(lanes.direction.x);
+            const directions_y = toFloatArray(lanes.direction.y);
+            for (0..lane_count) |lane| {
+                const expected = math.lengthDirection(xs[lane], ys[lane], epsilon);
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.length)), @as(u32, @bitCast(lengths[lane])));
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.direction.x)), @as(u32, @bitCast(directions_x[lane])));
+                try std.testing.expectEqual(@as(u32, @bitCast(expected.direction.y)), @as(u32, @bitCast(directions_y[lane])));
+            }
         }
     }
 }
@@ -629,6 +902,53 @@ test "worldPosToCell4 matches math.worldPosToCell lane-for-lane" {
     try std.testing.expectEqual(
         @as(i32, @intCast(math.worldPosToCell(100, tile_size, 1))),
         toIntArray(worldPosToCell4(splatFloat4(100), tile_size, 1))[0],
+    );
+}
+
+test "lastCellOfSpan4 matches math.lastCellOfSpan lane-for-lane" {
+    const cells: u32 = 4096;
+    const inf = std.math.inf(f32);
+    const nan = std.math.nan(f32);
+    const up = struct {
+        fn f(value: f32) f32 {
+            return std.math.nextAfter(f32, value, std.math.inf(f32));
+        }
+    }.f;
+    const down = struct {
+        fn f(value: f32) f32 {
+            return std.math.nextAfter(f32, value, -std.math.inf(f32));
+        }
+    }.f;
+    // (min, max) pairs: boundaries and one ulp either side near 0, 32768, and 65536;
+    // empty, inverted, NaN, infinite, and off-grid spans.
+    const spans = [_][2]f32{
+        .{ 0, 32 },                .{ 0, up(32) },            .{ 0, down(32) },          .{ 0, 0.001 },
+        .{ 32_768, 32_800 },       .{ 32_768, up(32_800) },   .{ 32_768, down(32_800) }, .{ 35_296, 35_328 },
+        .{ 35_296, up(35_328) },   .{ 35_296, down(35_328) }, .{ 65_536, 65_568 },       .{ 65_536, up(65_568) },
+        .{ 65_536, down(65_568) }, .{ 32_768, 33_280 },       .{ 35_296, 35_296 },       .{ 35_328, 35_328 },
+        .{ 35_296, 100 },          .{ 35_296, nan },          .{ nan, 35_328 },          .{ 0, inf },
+        .{ -inf, 32 },             .{ -100, -40 },            .{ 0, 1.0e9 },             .{ 35_328, 35_328.001 },
+    };
+    comptime std.debug.assert(spans.len % lane_count == 0);
+    var start: usize = 0;
+    while (start < spans.len) : (start += lane_count) {
+        var mins: [lane_count]f32 = undefined;
+        var maxs: [lane_count]f32 = undefined;
+        for (0..lane_count) |lane| {
+            mins[lane] = spans[start + lane][0];
+            maxs[lane] = spans[start + lane][1];
+        }
+        const simd_result = toIntArray(lastCellOfSpan4(loadFloat4(&mins), loadFloat4(&maxs), 32, cells));
+        for (0..lane_count) |lane| {
+            try std.testing.expectEqual(
+                @as(i32, @intCast(math.lastCellOfSpan(mins[lane], maxs[lane], 32, cells))),
+                simd_result[lane],
+            );
+        }
+    }
+    try std.testing.expectEqual(
+        @as(i32, @intCast(math.lastCellOfSpan(0, 100, 32, 0))),
+        toIntArray(lastCellOfSpan4(splatFloat4(0), splatFloat4(100), 32, 0))[0],
     );
 }
 

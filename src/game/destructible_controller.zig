@@ -2,7 +2,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Pipeline-owned domain controller: first Slice 40 `action_intents` consumer.
+//! Pipeline-owned domain controller: an `action_intents` consumer.
 //! Resolves interact/attack intents against `Destructible` entities, applies
 //! same-step multi-hit damage in a fixed scratch, and queues deferred
 //! structural commands + a `destructible_destroyed` domain event. Never mutates
@@ -130,6 +130,8 @@ pub const DestructibleController = struct {
         // Preflight event + structural capacity before queuing so a full budget
         // cannot leave partial outputs (dig pattern).
         if (event_count > 0) {
+            const event_budget = @import("simulation.zig").maxEventsPerStep(.action_react, .{});
+            std.debug.assert(event_count <= event_budget);
             try frame.events.ensureEventAppendCapacity(event_count);
         }
         if (command_count > 0) {
@@ -630,11 +632,11 @@ test "destructible_destroyed event payload is scalar-only" {
     // Payload purity: every field is a scalar or enum (no pointers/handles/slices).
     comptime {
         const Payload = simulation.DestructibleDestroyedEvent;
-        for (@typeInfo(Payload).@"struct".fields) |field| {
-            const T = field.type;
+        const info = @typeInfo(Payload).@"struct";
+        for (info.field_names, info.field_types) |field_name, T| {
             switch (@typeInfo(T)) {
                 .int, .float, .bool, .@"enum", .@"struct" => {},
-                else => @compileError("destructible_destroyed field not scalar/enum: " ++ field.name),
+                else => @compileError("destructible_destroyed field not scalar/enum: " ++ field_name),
             }
         }
     }
@@ -763,7 +765,7 @@ test "DestructibleController explicit non-destructible target does not fall thro
     try std.testing.expect(data.isAlive(decoy));
 }
 
-test "DestructibleController destroy emits static-nav entity_destroyed with obstacle rect" {
+test "DestructibleController destroy emits a static-nav entity_destroyed with its level" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var world = makeMinimalWorld();
@@ -800,10 +802,6 @@ test "DestructibleController destroy emits static-nav entity_destroyed with obst
         const destroyed = event.payload.entity_destroyed;
         if (destroyed.entity.index != crate.index) continue;
         try std.testing.expect(destroyed.was_static_navigation_obstacle);
-        try std.testing.expect(destroyed.obstacle_world_rect != null);
-        const rect = destroyed.obstacle_world_rect.?;
-        try std.testing.expect(rect.max_x > rect.min_x);
-        try std.testing.expect(rect.max_y > rect.min_y);
         try std.testing.expectEqual(@as(u16, 0), destroyed.level);
         saw_nav_destroy = true;
     }

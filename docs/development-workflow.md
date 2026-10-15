@@ -7,9 +7,9 @@ zig build           # build and install the app, runtime assets, and shaders
 zig build run       # build, install assets/shaders, and run the app
 zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game, GPU smoke, and benchmark executables
-zig build test      # run Zig unit tests
+zig build test      # run Zig unit tests (-Dtest-filter=<text> runs only matching tests)
 zig build bench     # run CPU gameplay and render-prep benchmarks
-zig build verify    # run check, test, shader compilation, atlas + idiom lint
+zig build verify    # run check, test, shader compilation, atlas + idiom lint, fmt check
 zig build package   # install selected-mode binaries and runtime assets
 ```
 
@@ -23,11 +23,10 @@ zig build assets-lint # lint runtime atlases and source sprite consistency
 zig build idiom-lint # lint Zig naming, stdlib currency, and unsafe catch unreachable
 ```
 
-`zig build idiom-lint` (`tools/lint_idioms.py`, also part of `verify`) enforces
-the naming/currency/`catch unreachable` rules from `docs/coding-standards.md`:
-snake_case fields/params, `k_snake_case` constants, current stdlib spellings, and
-`catch`/`orelse unreachable` only on a sanctioned handle constructor, inside a
-`test` block, or with a `// lint:allow catch-unreachable: <reason>` annotation.
+`zig build idiom-lint` (`tools/lint_idioms.py`, also part of `verify`) checks
+the mechanical subset of `.claude/rules/zig-style.md` and
+`.claude/rules/memory-performance.md`; the script's docstring lists exactly what
+it enforces.
 
 `zig build package` installs the selected-mode game binary and runtime assets.
 It does not install the `gpu-smoke` development executable.
@@ -35,7 +34,7 @@ It does not install the `gpu-smoke` development executable.
 On Windows, `package`, `run`, `dev`, and normal build steps install the required
 `SDL3.dll`, `SDL3_ttf.dll`, and `SDL3_mixer.dll` beside the app binary when
 using the pinned package SDL path. Optional SDL_mixer codec DLLs are not copied
-by this slice because current runtime audio assets are WAV-based.
+because current runtime audio assets are WAV-based.
 
 `run`, `dev`, and `gpu-smoke` launch from the installed binary directory, so the
 default asset root resolves copied runtime assets and generated shader files
@@ -49,14 +48,13 @@ current working directory; (2) the same relative root resolved from the
 directory containing the executable (exe-relative fallback). The fallback fires
 only when the configured root directory does not exist at all, not when
 individual files are missing. To use it, place a full `assets/` tree beside
-the binary. The asset root must stay a **relative**, traversal-safe path
-(default `assets`); `AppConfig` rejects absolute roots at startup.
+the binary. The asset root is a relative, traversal-safe path (default
+`assets`); `AppConfig` rejects absolute roots at startup.
 
 ## Release Modes
 
-The default optimize mode is `Debug`, matching standard Zig build behavior. Use
-an explicit release mode only when preparing a release candidate or shipping
-build:
+The default optimize mode is `Debug`. Release modes (when to use them:
+`.claude/rules/build-validation.md`):
 
 ```sh
 zig build --release=safe
@@ -65,26 +63,29 @@ zig build --release=small
 zig build -Doptimize=ReleaseFast
 ```
 
-Release builds use the same pinned Zig package cache as Debug builds. They do
+Release builds use the same pinned packages in `zig-pkg/` as Debug builds. They do
 not download SDL again unless a required package is missing and Zig fetching is
 enabled by the current `--fetch` mode.
 
-**Packaged builds ship `ReleaseFast`.** That mode strips the debug assert
-backing every `assumeCapacity`/`addOneAssumeCapacity` call and disables
-bounds/overflow safety checks — see `docs/coding-standards.md`'s allocator
-discipline rules for the `FailingAllocator` proof-test coverage this requires
-before hot-path code can rely on it safely. On non-Mach-O targets
-(Linux/Windows), `build.zig` enables full link-time optimization (`-flto=full`)
-for the shipped **app executable only** in `ReleaseFast` and forces the LLVM
-backend plus LLD, which LTO requires. `gpu-smoke`, benchmarks, and unit-test
-binaries do not get LTO. Mach-O targets (macOS) skip LTO in Zig 0.16 because
-LLD cannot link Mach-O. Debug / ReleaseSafe / ReleaseSmall leave LTO off so
-local iteration and size-focused builds stay predictable. Before cutting a
-ReleaseFast release candidate, run an extended soak session in
-`--release=safe` (not just `zig build test`) across realistic-to-extreme
-entity counts and spawn/despawn churn. A clean multi-hour ReleaseSafe run is
-the actual release gate: ReleaseFast itself will not report a capacity or
-bounds violation if one exists, it will just corrupt memory silently.
+**Packaged builds ship `ReleaseFast`** (no safety checks; why reserves need
+proofs: `.claude/rules/memory-performance.md`).
+
+CPU floor: every release mode (ReleaseSafe soaks included) defaults to the
+shipped CPU minimum, `x86_64_v2` (SSE4.2, POPCNT) on x86-64, `apple_m1` on
+macOS arm64, and the baseline model (NEON) on other aarch64, so gates and
+soaks test what ships. Debug builds for the native CPU. `-Dcpu` or `-Dtarget` overrides; moving the floor
+(for example to v3) is a deliberate decision.
+
+LTO: on Linux (ELF), `build.zig` enables `-flto=full` for the shipped **app
+executable only** in `ReleaseFast`, explicitly selecting LLVM + LLD (which LTO
+requires). `gpu-smoke`, benchmarks, and tests get no LTO and use Zig's default
+backend and linker. macOS skips LTO (LLD cannot link Mach-O in Zig 0.17);
+Windows skips it (under Zig 0.17, LTO with libc fails at `lld-link` on mingw
+libc/libm symbols, while non-LTO ReleaseFast links and emits its PDB). Debug,
+ReleaseSafe, and ReleaseSmall leave LTO off.
+
+**Release gate:** a multi-hour `--release=safe` soak precedes every ReleaseFast
+release candidate (`.claude/rules/build-validation.md`).
 
 ## Build Options
 
@@ -118,9 +119,11 @@ On Windows, the shader pipeline is GLSL to SPIR-V with `glslc`, SPIR-V to HLSL
 with `spirv-cross --hlsl --shader-model 60`, and HLSL to DXIL with `dxc` using
 `vs_6_0` or `ps_6_0` targets. Installed Windows shader files end in `.dxil`.
 
-On native **Linux GNU** targets, `build.zig` forces LLVM and LLD for the game,
-benchmark, test, and GPU-smoke executables. This is a temporary Debug-build
-workaround; other targets use Zig's default backend selection.
+`build.zig` uses Zig's default backend and linker selection for every target.
+On x86_64 Linux, Debug builds use Zig's self-hosted backend and linker, which
+compile much faster; release builds use LLVM and LLD. The one explicit override is the app
+executable in `ReleaseFast` with LTO, which always sets LLVM and LLD because
+LTO requires them.
 
 ## Windows SDL Packages
 
@@ -141,11 +144,30 @@ Use this once on a Windows machine, or any time you want to validate the cache:
 zig build fetch-sdl
 ```
 
-The default `--fetch=needed` behavior fetches only missing lazy packages, then
-re-runs the build with package paths available. After that, normal builds are
-offline and deterministic unless the package cache is removed. Pass
+The default `--fetch=needed` behavior fetches only missing lazy packages into the
+project-local `zig-pkg/` directory (Zig 0.17's package location, gitignored),
+then re-runs the build with package paths available. After that, normal builds
+are offline and deterministic unless `zig-pkg/` is removed. Pass
 `-Dsystem-sdl=true` to use globally installed SDL libraries instead, or
 `-Dsdl-root=<path>` for custom extracted SDL archives.
+
+Each required SDL header, import library, and DLL is validated by its own
+`CheckFile` step named `check Windows <file> (<fix-it hint>)`; compile steps, the
+shared SDL translate-c step, the DLL installs, and `fetch-sdl` all depend on
+them, so a missing or wrong `-Dsdl-root` fails on that step line instead of on a
+later translate-c or link error. SDL headers are translated once per build from
+`src/platform/sdl_c.h` (Zig 0.17 removed `@cImport`) and imported as the
+`sdl_c` module.
+
+On a Windows host, the `run`, `test`, `bench`, and `gpu-smoke` steps prepend the
+absolute SDL DLL directories to the launched process's `PATH` (Zig 0.17 removed
+`Run.addPathDir`). That value is computed from the configure-time environment,
+which Zig 0.17's configure cache does not key on, so `build.zig` poisons the
+configure cache on Windows hosts and the configure phase re-runs on every
+`zig build` there. Non-Windows hosts, including Windows cross-builds, are
+unaffected.
+
+## Diagnostics And Log Levels
 
 SDL_GPU debug validation is enabled by default in Debug builds. Override it with:
 
@@ -164,12 +186,41 @@ Runtime diagnostics use Zig `std.log` filtering. The default `auto` level is:
 **Fix cycles:** Debug — `zig build dev` / `zig build run`. Fast compile, full
 safety, behavior and unit work. Not the authority for scale timing.
 
-**Soaking / scale perf:** ReleaseSafe — `zig build run -Doptimize=ReleaseSafe`,
-one 60s dump after load when you deliberately want ranking and absolute numbers.
-Longer compile; do not use for every edit. Multi-cycle soaks only when comparing
-settle vs load, not as the default.
+**Soaks and stage ranking:** ReleaseSafe — `zig build run -Doptimize=ReleaseSafe`,
+one 60s dump after load when you want a stage ranking (diagnostic trend data,
+not a perf claim; `.claude/rules/tests-benchmarks.md`). Longer compile; usage
+limits are in `.claude/rules/build-validation.md`.
 
 **Ship:** ReleaseFast packages (runtime perf fully compiled out).
+
+The dump's batch stages (`runtime_perf_log.BatchStage`) are the per-step load
+stages plus each change path's cost driver (`.claude/rules/threading.md`); every
+other stage is bench-only (`--details`):
+
+- per-step load: `spatial_index_build`, `perception`, `ai_separation`,
+  `ai_intent`, `steering`, `path_solve`, `path_intake` (the request load),
+  `path_registry_flush` (the pathfinding update's registry flush, shrinks
+  included), `movement`, `chunk_derive`, `collision_broadphase`,
+  `collision_narrowphase`, `particles`, `sprite_prep`;
+- dig/build and dense terrain change: `nav_remask` (the reaction's chunk remask,
+  level-build remasks included), `nav_connect` (the connectivity flood, its rounds
+  summed), `nav_closure` (the one-way closure rows), `nav_evict` (the path-cache
+  eviction halo walk), `static_collider_splice` (the commit seam's collider
+  chunk-list splice);
+- capacity resize: `path_resize_copy` (the pathfinding update's shrink copy).
+
+Movement-intent apply, plane-entry gather, and collision-response gather/apply
+are bench-only. Pathfinding metrics include `path_solved_requests` (searches that
+ended in a result; an `.unavailable` answered at solve is not one),
+`path_solve_admissions`, `path_admission_deferred_requests`, `path_partial_results`,
+`path_goal_projected` (accepted requests whose goal cell was blocked),
+`path_group_field_evictions`, and `path_max_distinct_group_keys`. Pipeline timings include `path_goals` (`pipeline_path_goals`, the
+goal resolve), and the `steering_setup` line reports select, snapshot, directions,
+and the agent grid (`steering_grid`) separately. The `pathfinding` line's
+`resize_avg_ms`/`resize_max_ms` time the update's own elastic resize (a shrink, or a
+grow after a failed population seam), recorded only on steps that resized; pipeline
+init and the population seam do the grows, and a seam grow shows in
+`gameplay_structural`.
 
 Debug logs can include detailed startup and fallback context, but warning and
 error logs should stay rare and actionable. Override the level when you need a
@@ -252,138 +303,265 @@ intent); dig and move keep their existing keyboard / stick bindings — see
 
 ## Testing
 
-Tests follow Zig conventions: small unit tests live beside the code they cover
-as `test` blocks. Run them with:
+Unit tests live beside the code they cover as `test` blocks. Run them with
+`zig build test`. `-Dtest-filter=<text>` (repeatable) compiles and runs only
+tests whose names contain the text; names carry their module path, so
+`-Dtest-filter=systems.pathfinding` selects the pathfinding modules. Test
+rules: `.claude/rules/tests-benchmarks.md`.
 
-```sh
-zig build test
-```
+## Validation Cadence
 
-For a broader local check before sharing changes:
-
-```sh
-zig build shaders
-zig build check
-zig build test
-zig build verify
-```
-
-`verify` runs compile coverage, unit tests, shader compilation, atlas lint, and
-idiom lint.
-
-Coding style, performance standards, comment policy, test standards, and
-generated-output rules live in `docs/coding-standards.md`.
+The cadence (which step when) is `.claude/rules/build-validation.md`.
+`zig build verify` runs compile coverage, unit tests, shader compilation, atlas
+lint, idiom lint, and a `zig fmt --check` over `build.zig`, `build.zig.zon`, and
+`src/` (files edited outside the format hook fail here; `zig build fmt` fixes
+them).
 
 ## Benchmarks
 
-`zig build bench` pins its own default log level to `warn` regardless of
-optimize mode (Debug included), rather than inheriting the game's `auto`
-default — per-case debug logging (e.g. `ThreadSystem` re-init chatter) adds
-real overhead across many bench cases/items and isn't useful in a benchmark
-table. Pass `-Dlog-level=debug` to override this explicitly for
-troubleshooting.
+`zig build bench` pins its default log level to `warn` in every optimize mode
+(per-case debug chatter adds overhead across many cases); pass
+`-Dlog-level=debug` when troubleshooting.
 
-`zig build bench` runs non-interactive CPU benchmarks for movement bodies,
-transient particle rows, AI agents, steering agents, dense collision bodies,
-sparse collision bodies, collision-response contacts, scoped simulation gathers,
-incremental nav rebuilds, and renderer sprite CPU prep, plus pathfinding
-open-list, common-goal, cached-result, hard-fallback, and production-scale nav
-workloads. The default run exercises one serial baseline, fixed-worker, fixed
-small-range, fixed large-range, and adaptive cases so the full processor flow can
-be checked for regressions.
+It runs non-interactive CPU benchmarks for movement bodies and movement intents,
+particles, AI, memory, affect, perception, the spatial index, scoped simulation,
+steering, collision and collision response, plane traversal, nav updates,
+chunk-owned terrain and its nav reaction, pathfinding (request load and nav
+scaling), and render prep. Each case set has a serial baseline, fixed-worker,
+fixed small/large-range, and adaptive cases.
 `thread-adaptive-fixed-range` isolates adaptive worker-count selection with a
-fixed range size, while `thread-adaptive-tuned-range` uses the same
-processor-owned adaptive worker and range tuner path as production systems. The
-fixed cases are controls for scheduler overhead, worker-count scaling, and
-range-size effects. Gameplay processor and render-prep benchmarks use a shared
-event-scale count ladder so each system shows a performance curve across small,
-medium, and high counts: quick runs 1,024, 4,096, and 10,000 items; standard
-adds 25,000 and 50,000; stress keeps the high-count 10,000, 25,000, and 50,000
-signal points.
-AI separation uses a transient spatial grid with bounded neighbor and candidate
-samples, then intent emission runs as its own stage.
-Collision output includes candidate-pair and contact counts so dense stress
-cases can be compared against sparse gameplay-shaped distributions. Detail rows
-also report narrowphase as `narrow=inline` or `narrow=worker_threads/items_per_range`
-because collision has independently tuned broadphase and narrowphase stages. AI
-detail rows similarly report intent-stage worker/range tuning, while AI output
-reports bounded separation checks and emitted navigation-intent counts.
-Steering output reports bounded avoidance candidate checks, accepted avoidance
-samples, and emitted movement-intent counts. Steering movement emission is a
-threaded processor stage with serial fallback, per-system adaptive tuning, and
-deterministic range-owned output.
-Render-prep output reports draw commands, valid sprites, skipped invalid
-resources, generated vertices, draw groups, worker usage, range size, and the
-render-owned adaptive tuner state. It is a CPU-only render-prep benchmark and
-does not open a window or submit SDL_GPU command buffers. Each measured
-iteration submits an already ordered sprite stream into the same `SpriteBatch`
-command storage, then snapshots, emits vertices, and builds draw groups.
-`render-game-prep` extends that coverage with production-shaped game render
-work: dynamic record collection and depth-bucket sparse/dynamic emit, sparse
-visible-tile submission through `WorldSystem`, realistic static+dynamic
-`mergeDrawList` group counts, and phase timings for entity_collect, merge,
-snapshot, and vertex_emit.
-Current production world rendering submits already ordered commands from
-explicit z-layer passes instead of a separate general ordering queue. The
-benchmark owns its phase timers around that shared path and reports ordered
-submission, snapshot, vertex-emission, and draw-group timings; the production
-renderer does not run those benchmark timers.
-For runtime performance judgment, read the adaptive rows as the production-style
-scheduling signal: they start from measured inline work and only use workers
-when the adaptive tuner finds a batch large enough and a threaded profile that
-wins. The fixed-thread rows are forced controls for scheduler/range behavior,
-not evidence that runtime rendering will force worker participation for cheap
-sprite/rect prep.
+fixed range size; `thread-adaptive-tuned-range` uses the production
+processor-owned worker and range tuner. Fixed cases are controls for scheduler
+overhead, worker scaling, and range size. Some groups take their sizes from the
+profile: the processor and render-prep groups share a count ladder
+(quick 1,024, 4,096, and 10,000; standard adds 25,000 and 50,000; stress 10,000,
+25,000, and 50,000), and most pathfinding request-load groups keep their own lists
+per profile. Every other group (the item-code groups and the right-sized stage
+and scaling groups below) runs one fixed config list, so `--profile` does not
+change it; `--items N` runs one config of any group.
 
-Benchmark output is grouped by workload and count. Each block prints an aligned
-plain-text table with per-case timing, speedup, throughput, worker-thread use,
-and status, then ends with a concise validation summary. The summary reports
-what the run proved, such as which path won, whether adaptive stayed inline or
-used worker threads, the adaptive tuner phase and selected profile, and whether
-the expected flows were measured or skipped. It is not an entity-count or
-batching recommendation.
+Each group's doc comment, beside its `BenchmarkGroup` in `src/benchmarks/`, is
+the full statement of its fixture, what one sample times, its item code, its pass
+shape, and its `--details` fields; the list below indexes them. An item code packs
+a config's fields in decimal, most significant first, and the report header prints
+the group's layout (`suite.ItemCode`).
 
-The `worker_threads` column is `active/available` background workers. It does
-not include the main thread, which can also process ranges while waiting for the
-synchronous batch to complete. For example, `1/10` means one background worker
-was active out of ten available workers; if the main thread also processed
-ranges, the batch had two executing CPU participants. `0/10` means the adaptive
-path stayed inline through the ThreadSystem. That can still be slower than
-`serial-direct` in very small ReleaseFast movement workloads because
-`serial-direct` is the raw single-thread control path with no ThreadSystem
-submission overhead.
+What rows report:
 
-For regression checking, adaptive benchmark cases first run the explicit
-`--warmup` iterations, then run a bounded adaptive settle phase before the
-timed measurement loop. This keeps the adaptive rows focused on the selected
-steady-state profile instead of averaging the tuner search cost into the mean.
-If the tuner still fails to settle within that budget, the detail table reports
-the probing phase and selected candidate so the run is treated as an adaptive
-coverage failure, not a clean steady-state timing.
-Use `--details` when you need scheduler ranges, wait time, items-per-range,
-tuning phase, and workload counters. In adaptive cases, processors may stay
-inline until measured completion time shows that active worker threads are worth
-the synchronization cost; fixed worker/range cases are benchmark controls only,
-not production scheduling policy. Inline batches are timing samples for that
-batch only and do not reset adaptive work-tuner state for later processors.
-For multi-stage systems, read each stage independently: an adaptive row can have
-a threaded primary batch while a secondary batch still reports `inline`, or both
-stages can settle on separate threaded profiles. This is expected when the
-stages have different work shapes. Pathfinding follows this same rule: request
-preparation/grid marking can use SIMD lane batches, while the branch-heavy A*
-solve stage owns its own pathfinding tuner and benchmark row instead of sharing
-another system's profile. Hard-fallback pathfinding rows expose true fallback
-requests, fallback requests deferred by the per-step budget, total pending work,
-results, and cache evictions so rare A* cost stays visible instead of being
-hidden by cache-shaped or field-reuse workloads. Use
-`pathfinding-hard-fallback` for raw true-A* throughput and
-`pathfinding-hard-fallback-budget` for budget-pressure regression tracking; the
-budgeted group uses the same hard fixture but caps fallback solves at the runtime
-frame budget so solved fallback count and total `deferred` backlog are expected
-signals under larger request counts. `--items N` overrides the registered profile counts for
-the selected group, and `--fallback-budget N` lets ReleaseFast tuning compare
-candidate hard-fallback caps against the runtime default.
-Use other optional arguments only to narrow or scale the run:
+- AI: bounded separation checks (transient spatial grid, bounded neighbor and
+  candidate samples), emitted navigation intents, and intent-stage worker/range
+  tuning.
+- Collision: candidate-pair and contact counts, and narrowphase as
+  `narrow=inline` or `narrow=worker_threads/items_per_range` (broadphase and
+  narrowphase tune independently).
+- Steering: avoidance candidate checks, accepted samples, emitted movement
+  intents (a threaded stage with serial fallback and range-owned output).
+- Render-prep (CPU only, no window or GPU submission): draw commands, valid
+  sprites, skipped invalid resources, vertices, draw groups, worker usage, range
+  size, tuner state. Each iteration submits an ordered sprite stream into one
+  `SpriteBatch`, then snapshots, emits vertices, and builds draw groups.
+  `render-game-prep` adds production-shaped work: dynamic record collection,
+  depth-bucket emit, sparse visible-tile submission through `WorldSystem`,
+  realistic `mergeDrawList` group counts, and phase timings (entity_collect,
+  merge, snapshot, vertex_emit). The benchmark owns those phase timers; the
+  production renderer does not run them.
+- Threaded stages under `--details`: each stage's busiest shape, and the
+  main-thread time and share (the iteration minus its off-main stage time). The
+  tuner cell adds ` probes=N demotes=M` in Debug and ReleaseSafe.
+
+Reading results:
+
+- Output is grouped by workload and count: an aligned table (timing, speedup,
+  throughput, worker use, status) and a validation summary of what the run
+  proved (winning path, whether adaptive stayed inline, tuner phase and
+  profile, measured or skipped flows). It is not an entity-count or batching
+  recommendation.
+- Adaptive rows are the production scheduling signal: they start inline and use
+  workers only when the tuner finds a batch large enough and a threaded profile
+  that wins. Fixed-thread rows are forced controls, not evidence that runtime
+  will use workers for cheap prep.
+- `worker_threads` is `active/available` background workers, excluding the main
+  thread (which also processes ranges). `0/10` means adaptive stayed inline; it
+  can still trail `serial-direct` in tiny ReleaseFast movement workloads because
+  `serial-direct` has no ThreadSystem submission overhead.
+- Adaptive cases run `--warmup` iterations, then a bounded settle phase before
+  timing, so the mean excludes tuner search. A tuner that fails to settle shows
+  its probing phase and candidate: an adaptive coverage failure, not a clean
+  timing. Inline batches do not reset tuner state for later processors.
+- Multi-stage systems are read per stage: a primary batch may thread while a
+  secondary stays `inline`. Pathfinding's request preparation can use SIMD lane
+  batches while the A* solve stage owns its own tuner and row.
+- `--details` adds scheduler ranges, wait time, items-per-range, tuning phase,
+  and workload counters. `--items N` overrides the profile counts for the
+  selected group; `--group-prefix P` runs every group whose name starts with
+  `P` (a family such as `chunk-scale-`); `--fallback-budget N` compares
+  hard-fallback caps against the runtime default in ReleaseFast tuning.
+
+Stage groups (counts 1,024, 4,096, and 16,384 unless noted; each passes linear in
+its count, the adaptive case judged against its controls):
+
+- `movement-apply-intents`: one AI movement intent per moving agent in a scattered
+  row order; `movement-apply-intents-sorted` is the same stream in row order, its
+  control for worker ranges writing scattered rows.
+- `collision-response-stage`: one response step over a contact stream where every
+  body sits in several contacts as `a` and `b`; `--details` prints intents,
+  triggers, the gather and apply shapes, and the main time outside the stage
+  batches. The `collision-response-solid`/`-bounce`/`-trigger`/`-mixed` groups run
+  the serial case only.
+- `plane-traversal` (no traversals), `-falls` (a fixed 64 falls per step), and
+  `-dense-falls` (every 4th agent falls): the plane stage's entry gather, reserve,
+  and commit with its carve batch; `plane-traversal-dense-falls-banded` fixes 4,096
+  agents and varies the landing level's dense bands (4, 32, 256), passing when
+  main time per entry is flat in bands.
+- `steering` (profile counts 128 to 10,000), `-shuffled`, `-corridor`,
+  `-cluster-outlier`: one steering step on a grid, in shuffled creation order, in
+  one cell-row corridor, and in a cluster with one far outlier; navigation intents
+  are written untimed. `--details`
+  prints each prepare stage, `band_max=`, `bucket=`, and `sort=`.
+- `steering-static-change` (10, 1,000, or 10,000 statics; flat) and
+  `steering-static-dense` (4, 16, or 64 statics per chunk): a static moved through
+  the commit seam then a steering step, and a steering step among dense statics.
+
+Terrain and nav scaling groups (a config the bench's nav size limit, 512 MiB, cannot
+hold fails with its figure, never skips; every nav group checks each part of the
+nav's bytes against its production byte bound after the build and at run end):
+
+- `chunk-scale-*` time one fixed terrain change at every level side (256, 1024,
+  2048 at 8 levels) and depth (8, 32, 128 levels at 256²), one axis at a time; each
+  code ends in `level side * 1000 + levels`. `-dig` (64 single-cell digs and
+  refills), `-ramp` (64 ramp digs with their exits and links), and the GPU sync
+  groups run serial only; `-cave-in` and `-explosion-fill` time one batched edit
+  over 4, 64, or 256 chunks at 256² × 8 (the scale axes at 64), plus one
+  explosion case with 32 blocking sparse props per chunk; all flat in side and
+  depth, the batched ones linear in region chunks.
+- `chunk-scale-gpu-sync-dig` (the dig workload plus a GPU sync; a window-edge axis
+  of 2, 6, or 14 chunks, and a batched-change axis at 2, 8, or 32 resident written
+  layers at 256² × 128), `-level-enter`, and `-pan` (a 2-, 6-, or 14-chunk window
+  panning one chunk; the pan and level-enter groups also run 8 and 32 resident
+  layers), against a headless store; upload counts are checked.
+- `chunk-scale-nav-*` add the post-commit nav reaction over every level: `-dig`,
+  `-ramp`, `-cave-in`, `-explosion-fill`, `-enclose` (P pockets of 4×4 chunks, one
+  pocket of edge E, or a one-chunk tunnel of L chunks, each walled off by one
+  doorway that one edit fills and the next reopens: linear in P, in the pocket's
+  area, and in L, flat in side), and `-level-add` (a level added with a solid band,
+  depth growing by one per iteration; its replace case, item prefix `1 * 10^7`,
+  times a blocking band added to the newest walkable level). `--details` prints the
+  terrain stages, the reaction's stage shapes, its connectivity and closure block,
+  and `main_split=` (the reaction's main time by section: mark, plan, reserve,
+  commit, conn_merge, conn_layout, flood, closure, evict; `inline:` for the stages
+  the tuner kept inline, a serial run's flood and closure rounds included;
+  `rest:` for O(1) glue).
+- `nav-update-scattered` (16 to 1,000 digs over 256 chunks) and
+  `nav-update-multichunk` (one compact block of 256 to 16,384 cells): a dirty
+  footprint toggled open then blocked through the terrain-writer record, linear in
+  dirty chunks. `nav-update-entity-obstacles` (10, 1,000, or 10,000 other statics)
+  and `nav-update-static-population` (1,000, 10,000, or 50,000 dynamic bodies): one
+  static moved through the commit seam, flat. `nav-update-static-dense` and
+  `-dense-tail` (64, 1,024, or 16,384 statics changed in one commit): linear.
+- `pathfinding-level-size` (side 256, 1024, 2048; flat in side),
+  `-cross-level-depth` (256² of 8, 32, or 128 levels; flat in depth),
+  `-cross-level-shaft` (a ramp shaft plus an unusable one-way teleport; flat in
+  depth), and `-cross-level-teleport` (the depth configs with one far teleport,
+  then three teleport layouts: 0 a border band of 64, 256, or 1,024 teleports at
+  256², flat in count; 1 a strip mirrored to the deepest level at sides 256, 1024,
+  2048, flat in side; 2 random pads of 16, 64, or 256, judged at 16 and 64, 256
+  reported; code `layout * 10^12 + teleports * 10^7 + side * 1000 + levels`) time
+  one cold step of 64 routes. The level-size and depth groups fail unless every
+  route solves within the step; the teleport and shaft groups count a route whose
+  search exhausted its budget as unsolved (`routes solved= unsolved=` under
+  `--details`).
+- `pathfinding-long-path`: one far goal per route length on the flat chunk-portal
+  search (`variant * 10^7 + layout * 10^6 + parameter`). Layouts: 0 serpentine
+  (2048², a wall every 128 rows), 1 open diagonal (2048²), 2 descent (128 levels of
+  256²), 3 depth (a 4-level descent on stacks of the parameter's levels), 4 wide
+  descent (3 levels of side S), 5 seeded blob caves (2048²), 6 deep wide descent
+  (1024² levels). Variants: 0 library caps; 1 a probe raising only the tier-1
+  abstract cap (fails if it still saturates); 2 a 32-request fold check; 3 a walk
+  of one agent through partial hops (open diagonal, cave, serpentine; a sample is
+  the whole walk, which must arrive); 4 a hop chain for the cross-level layouts
+  (descent, wide, deep wide; restarts at each partial's end, a dropped hop fails
+  the case). Three route lengths per layout per variant, serial only. `--details`
+  prints, per attempt, abstract claims, corridor nodes, stitched cells, segments,
+  `settles=` and `frozen=` (the crossing search), the outcome (`abstract_partial`
+  is a saturated tier-1 search published toward its least-estimate node), and the
+  step time; a walk prints steps, held steps, solves, partial and full results,
+  escalations, and claims; a hop chain prints hops (`least_hops`), solves,
+  escalations, and claims.
+- `pathfinding-link-fold`: one reaction applying 64 random pads on a 512² × 8
+  world; a uniform axis (1,024, 8,192, or 32,768 background pads) and a probe axis
+  fixing endpoints per touched chunk (preload 16 over three backgrounds, then 4 and
+  64 over 8,192). Passes when the `commit` section is flat per pad, the reaction is
+  flat in background pads at a fixed preload, and at most linear in endpoints per
+  touched chunk.
+- `pathfinding-evict`: one dig on a 256² level holding 1,000, 10,000, or 50,000
+  cached short paths (flat), then a chunk-aligned square of 4, 16, or 64 chunks at
+  10,000 results (linear in region chunks and the registrations visited); items/s is
+  registry entries visited. `--details` prints `evict_count=`, `evict=`,
+  `evict_flush=`, and the reaction's main time.
+- `pathfinding-elastic-ramp` (the agent count ramps to 1,000, 4,000, or 16,000;
+  linear with no re-solve) and `pathfinding-elastic-shrink` (the same ramp, then a
+  drop to the youngest eighth; the timed step shrinks the capacity, passing at most
+  linear in the capacity it shrinks from; `--details` adds the hold step,
+  `resize_copy=`, and `resize_main=`).
+- `pathfinding-negative-steady` (256, 1,024, or 4,096 requests to a sealed pocket;
+  linear), `pathfinding-negative-dig` (`side * 1000 + requests`: 256064, 256128,
+  256256, 1024064, 2048064; a far toggle plus the reaction and update; flat in side,
+  linear in requests), and `pathfinding-negative-burst` (1,024, 4,096, or 12,288
+  unreachable requests in one step over four pockets; variant 1, code `10^6 + N`,
+  is a blocked crowd with four projections, labelled `projections=`/`fallbacks=`):
+  intake answers every request unavailable from reach, with no search and nothing
+  pending or cached (`unavailable=`).
+- `pathfinding-connectivity-split`: a gap chunk blocked then reopened, sealing a
+  room of edge² chunks (2, 8, 32 at side 1024; 8 at 256 and 2048), cutting a ring
+  without splitting it (edges 2, 8, 32), or sealing a one-chunk tunnel (8, 32, 62 at
+  1024; 8 at 256 and 2048). Passes when no config grows faster than its room,
+  ring, or tunnel and every config is flat in side; `--details` prints the flood's
+  rounds, searches per round, its tuner, and `build_visits=`.
+- `pathfinding-connectivity-oneway` (`variant * 10^10 + terminals * 10^5 +
+  systems`): locality (16, 256, 2,048 systems of 8 terminals; flat), tail and head
+  toggles of one 64-, 512-, or 4,096-terminal chain (head at most linear, tail at
+  most terminals² / 32), a far dig (flat), shrunk (a chain cut to 64 rooms, peak
+  512, 2,048, 4,096; flat in peak), fan (64, 128, 256; at most terminals² / 32),
+  dense (2, 8, 32 merged systems; at most their merged rows; block resizes and the
+  reserve ratio reported), and ballast (variant 7 at 64, 512, 2,048 background
+  systems: a ballast block retired untimed before every sample; the timed toggle
+  must land, allocate, and free no block, its reserve and closure stages flat in
+  systems). `--details` prints the closure stages and, for ballast, the retire (the
+  reopen's landing and tail use, the close's free) and the timed block reaction's
+  split (reserve, closure stages, landing, rest).
+- `render-sparse-window-frame`, `-pan`, and `-add` time one frame's sparse-tile
+  prep on a 2048² world of 8 levels holding 1,000, 16,000, or 256,000 sparse tiles
+  (exactly 256 inside a fixed 1280×720 window): a still frame, a one-chunk pan and
+  back, and one tile added outside the window. Serial only; flat.
+
+Pathfinding request-load groups run world-backed nav at one fixed level side, so
+only the request count varies (escalated-detour keeps level side as its axis, at
+most quadratic in side): `pathfinding` (a cold step of distinct goals, linear to
+the per-step solve ceiling and flat past it), `-shared-goal` (one goal, one solve;
+the field threshold sits above the count), `-drain` (a carried queue of at least
+two ceilings; flat in depth), `-cache-open` and `-cache-detour` (warm hits),
+`-hard-fallback` and `-hard-fallback-budget` (cold hard routes, the latter at a
+capped admission; `--fallback-budget` overrides it), `-escalated-detour` (one
+tier-1 detour per level side), `-query` (per-agent status against a warm cache),
+`-group-field-detour` and its `-moving` and `-moving-hysteresis` variants (a pack
+sampling a ready field), `-group-field-packs` (1, 4, or 16 packs of 16 agents, each
+field building at once; `--details` prints coverage, blocks, resident bytes, and
+pool growths), and `-group-field-tunnel` (four fields on a 1-wide corridor lattice
+capped at 2,048, 16,384, or 65,536 cells; linear in the cap). Their `--details`
+prints the update's stages (`publish_copy=`, `registry_flush=`, whose item counts
+are flush work units, not the 16 shards) and the main time per phase; a configured
+range size (the fixed controls, `PathfindingConfig.items_per_range`) counts flush
+units too. `candidates` on route groups includes the tier-1 pool.
+
+The nav memory estimate (`suite.navStorageParts`) only sums production byte bounds:
+each nav structure and the request side (`requestStorageBytesBound`) owns an
+`@sizeOf`-based worst-case bound beside it, fed by the built world's content
+(`NavGraph.storageContentOf`), with `runs_per_result` defaulting to one run per
+stored cell; `checkNavBytes` asserts every part's live bytes stay within its charge.
+
+Optional arguments narrow or scale the run. Day-to-day runs target a group
+(`.claude/rules/tests-benchmarks.md`); the full-suite forms (`--profile`, bare
+`--details`) are for requested sweeps:
 
 ```sh
 zig build bench -- --profile quick
@@ -399,12 +577,20 @@ zig build bench -- --group pathfinding-hard-fallback-budget --items 256 --detail
 zig build bench -- --group nav-update-scattered --details
 zig build bench -- --group nav-update-multichunk --details
 zig build bench -- --group scope --details
-zig build -Doptimize=ReleaseFast bench -- --group pathfinding-hard-fallback-budget --items 2000 --fallback-budget 128 --case thread-adaptive-tuned-range --details
+zig build bench -- --group-prefix chunk-scale- --case serial-direct
+zig build bench -- --group-prefix render-sparse-window- --case serial-direct
+zig build bench -- --group pathfinding-hard-fallback-budget --items 2000 --fallback-budget 128 --case thread-adaptive-tuned-range --details
 zig build bench -- --details
 ```
 
-For scripted benchmark capture with timestamped output under `benchmark_outputs/`,
-use `tools/bench_run.py` (see [tools/README.md](../tools/README.md)).
+Before/after comparisons use `tools/bench_ab.py`: targeted groups only, a base
+ref vs the working tree, one Debug run per side (`--reps 3` confirms a slower
+case with medians and spread). Each side's runs are
+cached by its build inputs (`src/`, `build.zig*`, `assets/`) for six hours, so
+a landing's measured tree is reused as the next landing's base; `--fresh`
+reruns both sides interleaved. Full-suite
+capture with timestamped output under `benchmark_outputs/` uses
+`tools/bench_run.py`. Both: [tools/README.md](../tools/README.md).
 
 ## GPU Smoke
 

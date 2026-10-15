@@ -19,10 +19,10 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const StructuralChange = @import("data_system.zig").StructuralChange;
-const ObstacleWorldRect = @import("data_system.zig").ObstacleWorldRect;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralPlanScratch = @import("data_system.zig").StructuralPlanScratch;
 const AiAffectDrive = @import("data_system.zig").AiAffectDrive;
+const max_structural_events_per_create = @import("data_system.zig").max_structural_events_per_create;
 
 pub const SimulationPhase = enum {
     idle,
@@ -41,6 +41,72 @@ pub const SimulationEventStage = enum {
     structural_commit,
     domain_reaction,
 };
+
+/// Producers that append to `frame.events` within one fixed step: stages during
+/// `update`, the structural commit (`.structural_commit`), and the post-commit nav
+/// reaction (`.nav_reaction`). The switch in `maxEventsPerStep` is exhaustive, so a
+/// new producer does not compile until it has a fixed budget.
+pub const EventProducerId = enum {
+    dig_world_edit,
+    perception_update,
+    affect_update,
+    plane_traversal,
+    action_react,
+    structural_commit,
+    nav_reaction,
+};
+
+/// Most perception events one observer emits per step: an identity swap emits
+/// `entity_lost` + `entity_perceived`.
+pub const perception_events_per_observer_max: usize = 2;
+
+/// Most `affect_threshold_crossed` events one `AiAffect` row emits per step: one per
+/// drive, so a new drive widens the share automatically.
+pub const affect_events_per_row_max: usize = @typeInfo(AiAffectDrive).@"enum".field_names.len;
+
+pub const EventBudgetInputs = struct {
+    perception_max_events_per_step: usize = 0,
+    affect_max_events_per_step: usize = 0,
+    movement_body_capacity: usize = 0,
+    /// The caller-owned part of the `.structural_commit` event share, in events
+    /// (`structuralEventHeadroom`); `maxEventsPerStep` adds the pipeline's own
+    /// `pipeline_structural_event_share` on top. See
+    /// `SimulationPipelineConfig.structural_headroom`.
+    structural_headroom: usize = 0,
+};
+
+/// Sizes a `.structural_commit` event share from fixed per-step producer budgets: a
+/// `create_entity` emits up to `max_structural_events_per_create` events (one
+/// `entity_created` plus one `component_changed` per template component); a
+/// `destroy_entity` or `set_*` command emits one. `set_simulation_tier` emits none, so
+/// tier changes need no share.
+pub fn structuralEventHeadroom(creates_per_step: usize, single_event_commands_per_step: usize) usize {
+    return creates_per_step * max_structural_events_per_create + single_event_commands_per_step;
+}
+
+/// The pipeline-owned part of the `.structural_commit` share: the `action_react` stage
+/// (`DestructibleController.process`) queues at most one single-event structural command
+/// (`destroy_entity` / `set_destructible`) per live action intent. Always counted, so a
+/// caller's `structural_headroom` covers only the commands the caller itself queues.
+pub const pipeline_structural_event_share: usize = structuralEventHeadroom(0, action_intent_live_capacity);
+
+pub fn maxEventsPerStep(producer: EventProducerId, budgets: EventBudgetInputs) usize {
+    return switch (producer) {
+        // The dug cell, plus a ramp exit's obstacle change.
+        .dig_world_edit => 2,
+        .perception_update => budgets.perception_max_events_per_step,
+        .affect_update => budgets.affect_max_events_per_step,
+        .plane_traversal => budgets.movement_body_capacity + 1,
+        .action_react => action_intent_live_capacity,
+        // A fixed per-step share sized in events; tier changes emit no structural
+        // event, so the share never follows population. Enforced on its own by the
+        // budgeted commit (`StructuralCommitBudget`). The pipeline's own destructible
+        // share plus the caller's headroom.
+        .structural_commit => pipeline_structural_event_share + budgets.structural_headroom,
+        // The single post-commit `nav_region_invalidated`.
+        .nav_reaction => 1,
+    };
+}
 
 pub const NavInvalidationReason = enum {
     static_obstacle_changed,
@@ -73,13 +139,7 @@ pub const ComponentChangedEvent = struct {
     component: Component,
     was_static_navigation_obstacle: bool = false,
     is_static_navigation_obstacle: bool = false,
-    // World-space obstacle rect before/after this change, when the entity was/is a static
-    // navigation obstacle. Lets the post-commit nav reaction localize invalidation to the
-    // covered nav cells instead of the whole level.
-    old_obstacle_world_rect: ?ObstacleWorldRect = null,
-    new_obstacle_world_rect: ?ObstacleWorldRect = null,
-    /// World/level plane at change time (`world_level`, else 0). Multi-level nav readiness;
-    /// defaults 0 when missing so level-0 demos stay correct.
+    /// World/level plane at change time (`world_level`, else 0).
     level: u16 = 0,
 };
 
@@ -87,11 +147,7 @@ pub const EntityDestroyedEvent = struct {
     entity: EntityId,
     component_mask: ComponentMask,
     was_static_navigation_obstacle: bool = false,
-    // World-space obstacle rect at destroy time, when the entity was a static navigation
-    // obstacle. Lets the post-commit nav reaction localize invalidation to the vacated cells.
-    obstacle_world_rect: ?ObstacleWorldRect = null,
-    /// World/level plane at destroy time (`world_level`, else 0). Multi-level nav readiness;
-    /// defaults 0 when missing so level-0 demos stay correct.
+    /// World/level plane at destroy time (`world_level`, else 0).
     level: u16 = 0,
 };
 
@@ -113,8 +169,8 @@ pub const AffectThresholdCrossedEvent = struct {
 
 /// Emitted at `domain_reaction` by `DestructibleController` while the target is
 /// still alive (before the deferred `destroy_entity` structural commit). Scalar
-/// payload only — no pointers/handles. Commit still emits `entity_destroyed`
-/// for nav local re-mask of static obstacles.
+/// payload only — no pointers/handles. Commit still emits `entity_destroyed`,
+/// whose change the static-collider capture reads.
 pub const DestructibleDestroyedEvent = struct {
     entity: EntityId,
     level: u16,
@@ -330,10 +386,32 @@ pub const SimulationEvents = struct {
     }
 
     pub fn ensureCanAppend(self: *const SimulationEvents, count: usize) !void {
-        const limit = self.capacity_limit orelse return;
-        if (count > limit or self.stream.mergedItems().len > limit - count) {
-            return error.EventCapacityExceeded;
-        }
+        if (!self.withinLimit(count)) return error.EventCapacityExceeded;
+    }
+
+    // Whether `count` more events fit under the capacity limit.
+    fn withinLimit(self: *const SimulationEvents, count: usize) bool {
+        const limit = self.capacity_limit orelse return true;
+        return count <= limit and self.stream.mergedItems().len <= limit - count;
+    }
+
+    /// Appends one range of `count` events and returns its writer; the caller writes
+    /// `count` events, then calls `finish()` and `finishWrite()` once. Allocation-free
+    /// after `ensureEventAppendCapacity(n)` with `n >= count` and no append since.
+    pub fn appendReservedRange(self: *SimulationEvents, count: usize) RangeWriter {
+        std.debug.assert(count > 0);
+        std.debug.assert(self.withinLimit(count));
+        const range = self.stream.counts.items.len;
+        std.debug.assert(self.stream.counts.capacity > range);
+        std.debug.assert(self.stream.offsets.capacity > range);
+        std.debug.assert(self.stream.write_offsets.capacity > range);
+        std.debug.assert(self.range_stats.capacity > range);
+        std.debug.assert(self.stream.values.capacity >= self.appendValueBase() + count);
+        _ = self.stream.appendRangeCountsAssumeCapacity(1);
+        self.range_stats.appendAssumeCapacity(.{});
+        self.stream.addCount(range, count);
+        self.stream.prefixAppendedRangesAssumeCapacity(range);
+        return self.rangeWriter(range);
     }
 
     /// Preflights the capacity limit and buffer growth for `count` more events
@@ -360,11 +438,13 @@ pub const SimulationEvents = struct {
         try self.stream.write_offsets.ensureTotalCapacity(self.stream.allocator, new_range_count);
         try self.range_stats.ensureTotalCapacity(self.stream.allocator, new_range_count);
 
-        const new_value_count = if (self.stream.prefix_ready)
-            self.stream.mergedItems().len + value_count
-        else
-            self.pendingCountFrom(0) + value_count;
-        try self.stream.values.ensureTotalCapacity(self.stream.allocator, new_value_count);
+        try self.stream.values.ensureTotalCapacity(self.stream.allocator, self.appendValueBase() + value_count);
+    }
+
+    // The values an append prefixes behind: the merged events, or every pending count
+    // before the first prefix.
+    fn appendValueBase(self: *const SimulationEvents) usize {
+        return if (self.stream.prefix_ready) self.stream.mergedItems().len else self.pendingCountFrom(0);
     }
 
     fn rebuildStatsFromRanges(self: *SimulationEvents) void {
@@ -384,15 +464,33 @@ const StructuralChangeSink = struct {
     }
 };
 
+/// Event budget for one structural commit.
+pub const StructuralCommitBudget = struct {
+    /// Events appended after the commit in the same step (the post-commit nav
+    /// reaction's slot), preflighted with the commit.
+    extra_required_events: usize = 0,
+    /// The commit's own `.structural_commit` share
+    /// (`maxEventsPerStep(.structural_commit, ...)`). A commit needing more fails
+    /// before mutation, whatever other producers appended this step. Null checks only
+    /// the shared `capacity_limit`.
+    structural_event_share: ?usize = null,
+};
+
 const StructuralCommitPreparer = struct {
     frame: *SimulationFrame,
     changes: *std.ArrayList(StructuralChange),
-    extra_required_events: usize,
+    budget: StructuralCommitBudget,
     structural_event_count: usize = 0,
 
     pub fn prepare(self: *StructuralCommitPreparer, structural_event_count: usize) !void {
         self.structural_event_count = structural_event_count;
-        const required_event_count = try std.math.add(usize, structural_event_count, self.extra_required_events);
+        // The structural share is enforced on its own first, so an overrun fails at
+        // this boundary deterministically instead of borrowing other producers' idle
+        // shares through the shared bound.
+        if (self.budget.structural_event_share) |share| {
+            if (structural_event_count > share) return error.EventCapacityExceeded;
+        }
+        const required_event_count = try std.math.add(usize, structural_event_count, self.budget.extra_required_events);
         try self.frame.events.ensureCanAppend(required_event_count);
         try self.frame.reserveStructuralEvents(required_event_count);
         try self.changes.ensureTotalCapacity(self.frame.events.stream.allocator, structural_event_count);
@@ -503,7 +601,7 @@ pub const CollisionContact = struct {
 /// cross-plane link to climb up.
 pub const DigIntent = enum { none, hole, ramp, down };
 
-/// Closed sensory-bus kind enum (Slice 39). Append tags when a real producer
+/// Closed sensory-bus kind enum. Append tags when a real producer
 /// exists — no speculative empty tags, no strings. Kind is bus/metadata only
 /// for the AI path today: perception still writes position-only heard columns.
 pub const StimulusKind = enum {
@@ -546,14 +644,17 @@ pub const stimulus_deferred_capacity: usize = 16;
 pub const stimulus_max_impacts_per_step: usize = 8;
 
 /// Pipeline-owned sticky one-shot dig/impact linger slots (world-size independent).
-/// One-shots linger `cognition_stagger_n` hearing windows so each stagger cohort
-/// gets a chance; footsteps stay live-bus only.
-pub const stimulus_sticky_capacity: usize = 16;
+/// One dig plus the per-step impact cap, held for `cognition_stagger_n - 1`
+/// hearing windows so each other stagger cohort gets a chance. Footsteps stay
+/// live-bus only. A full deferred-buffer drain in one step can still drop;
+/// that drop is counted (`stimuli_sticky_dropped`).
+pub const stimulus_sticky_capacity: usize = (stimulus_max_impacts_per_step + 1) *
+    (@as(usize, @import("simulation_scope.zig").cognition_stagger_n) - 1);
 
 /// A transient per-step positional stimulus AI hearing can sense. Cleared
 /// every step on the live bus, so it carries no entity identity and is not a
-/// `SimulationEvent`. `intensity` is relative loudness used by hearing ranking
-/// (Slice 39); `kind` is producer metadata on the bus (not a perception column).
+/// `SimulationEvent`. `intensity` is relative loudness used by hearing ranking;
+/// `kind` is producer metadata on the bus (not a perception column).
 pub const WorldStimulus = struct {
     position: math.Vec2,
     intensity: f32,
@@ -572,6 +673,8 @@ pub const SimulationFrame = struct {
     events: SimulationEvents,
     navigation_intents: RangeOutputStream(NavigationIntent),
     action_intents: RangeOutputStream(ActionIntent),
+    /// At most one `.movement` intent per entity per step; consumers write the
+    /// entities' rows in parallel on this.
     intents: RangeOutputStream(SimulationIntent),
     path_requests: RangeOutputStream(PathRequest),
     contacts: RangeOutputStream(CollisionContact),
@@ -582,9 +685,6 @@ pub const SimulationFrame = struct {
     // Reused across commits so a structural-mutating frame stays allocation-free
     // after warmup; cleared (capacity retained) at the start of each commit.
     structural_changes_scratch: std.ArrayList(StructuralChange) = .empty,
-    // Reused by plane-traversal to batch fall-landing tile events into one
-    // finishWrite (see publishWorldTileChanges); cleared each beginStep.
-    world_tile_changes_scratch: std.ArrayList(WorldTileChangedEvent) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) SimulationFrame {
         return .{
@@ -603,7 +703,6 @@ pub const SimulationFrame = struct {
     }
 
     pub fn deinit(self: *SimulationFrame) void {
-        self.world_tile_changes_scratch.deinit(self.allocator);
         self.structural_changes_scratch.deinit(self.allocator);
         self.structural_plan_scratch.deinit();
         self.stimuli.deinit();
@@ -636,7 +735,6 @@ pub const SimulationFrame = struct {
         self.stimuli.clearRetainingCapacity();
         self.structural_plan_scratch.clearRetainingCapacity();
         self.structural_changes_scratch.clearRetainingCapacity();
-        self.world_tile_changes_scratch.clearRetainingCapacity();
     }
 
     pub fn reserveStreams(
@@ -657,7 +755,7 @@ pub const SimulationFrame = struct {
         try self.structural_commands.reserve(range_count, structural_command_capacity);
     }
 
-    /// Preflights buffer growth for one `appendStimulus` (one range, `value_count`
+    /// Preflights buffer growth for one `writeLiveStimulus` (one range, `value_count`
     /// values) so a capacity miss cannot leave a dig tile changed without a
     /// matching stimulus. Call before any world mutate that must emit one.
     pub fn ensureStimulusAppendCapacity(self: *SimulationFrame, value_count: usize) !void {
@@ -679,12 +777,6 @@ pub const SimulationFrame = struct {
         try self.stimuli.values.ensureTotalCapacity(alloc, new_value_count);
     }
 
-    /// Warms the plane-traversal tile-change batch buffer. Sized for the worst
-    /// case of player + every AI agent falling in one step (`mover_count + 1`).
-    pub fn reserveWorldTileChangesScratch(self: *SimulationFrame, capacity: usize) !void {
-        try self.world_tile_changes_scratch.ensureTotalCapacity(self.allocator, capacity);
-    }
-
     /// Live stimulus count already written this step (after any `prefix`/finish).
     pub fn stimulusLiveCount(self: *const SimulationFrame) usize {
         if (self.stimuli.prefix_ready) return self.stimuli.mergedItems().len;
@@ -693,14 +785,12 @@ pub const SimulationFrame = struct {
         return pending;
     }
 
-    /// Single-value append for main-thread producers (dig is not threaded).
-    /// Multi-producer bus (Slice 39): dig, footstep, and promoted deferred
-    /// impacts share this path. Dig preflights via `ensureStimulusAppendCapacity`
-    /// before world mutate; optional emitters use `tryAppendStimulus` so a full
-    /// bus drops sensory noise without failing the step. Demo/pipeline warm
+    /// Unchecked single-value append. The live-bus cap lives in `SensoryBus.emit`:
+    /// a required emit fails before the caller mutates the world, an optional
+    /// emit increments the drop counter and returns false. Demo/pipeline warm
     /// with `stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity)`
     /// (one range per append).
-    pub fn appendStimulus(self: *SimulationFrame, stimulus: WorldStimulus) !void {
+    pub fn writeLiveStimulus(self: *SimulationFrame, stimulus: WorldStimulus) !void {
         const first_range = try self.stimuli.appendRangeCounts(1);
         self.stimuli.addCount(first_range, 1);
         try self.stimuli.prefixAppendedRanges(first_range);
@@ -708,16 +798,6 @@ pub const SimulationFrame = struct {
         writer.write(stimulus);
         writer.finish();
         self.stimuli.finishWrite();
-    }
-
-    /// Capacity-aware optional append: drops when live count is already at
-    /// `capacity` (fixed budget, not map-scaled). Returns false when dropped
-    /// or when buffer growth fails after warmup (should not happen if reserved).
-    pub fn tryAppendStimulus(self: *SimulationFrame, stimulus: WorldStimulus, capacity: usize) bool {
-        if (capacity == 0 or self.stimulusLiveCount() >= capacity) return false;
-        self.ensureStimulusAppendCapacity(1) catch return false;
-        self.appendStimulus(stimulus) catch return false;
-        return true;
     }
 
     pub fn reservePathRequests(self: *SimulationFrame, range_count: usize, request_capacity: usize) !void {
@@ -785,13 +865,15 @@ pub const SimulationFrame = struct {
     }
 
     pub fn applyStructuralCommands(self: *SimulationFrame, data: *DataSystem) !StructuralCommitStats {
-        return try self.applyStructuralCommandsWithExtraEvents(data, 0);
+        return try self.applyStructuralCommandsBudgeted(data, .{});
     }
 
-    pub fn applyStructuralCommandsWithExtraEvents(
+    /// Commits the merged structural commands all-or-fail against `budget`: the
+    /// preflight rejects an over-share or over-limit commit before any mutation.
+    pub fn applyStructuralCommandsBudgeted(
         self: *SimulationFrame,
         data: *DataSystem,
-        extra_required_events: usize,
+        budget: StructuralCommitBudget,
     ) !StructuralCommitStats {
         self.phase = .commit_structural;
         const commands = self.structural_commands.mergedItems();
@@ -800,7 +882,7 @@ pub const SimulationFrame = struct {
         var preparer = StructuralCommitPreparer{
             .frame = self,
             .changes = changes,
-            .extra_required_events = extra_required_events,
+            .budget = budget,
         };
         var sink = StructuralChangeSink{ .changes = changes };
         const stats = try data.applyStructuralCommandsPrepared(commands, &self.structural_plan_scratch, &preparer, &sink);
@@ -840,7 +922,6 @@ pub const SimulationFrame = struct {
                         .entity = destroyed.entity,
                         .component_mask = destroyed.component_mask,
                         .was_static_navigation_obstacle = destroyed.was_static_navigation_obstacle,
-                        .obstacle_world_rect = destroyed.obstacle_world_rect,
                         .level = destroyed.level,
                     } },
                 },
@@ -851,8 +932,6 @@ pub const SimulationFrame = struct {
                         .component = changed.component,
                         .was_static_navigation_obstacle = changed.was_static_navigation_obstacle,
                         .is_static_navigation_obstacle = changed.is_static_navigation_obstacle,
-                        .old_obstacle_world_rect = changed.old_obstacle_world_rect,
-                        .new_obstacle_world_rect = changed.new_obstacle_world_rect,
                         .level = changed.level,
                     } },
                 },
@@ -866,13 +945,16 @@ pub const SimulationFrame = struct {
     /// finishWrite. Mirrors publishStructuralChanges so N plane-traversal carves
     /// stay O(N) rather than O(N^2) from per-event appendRequired.
     pub fn publishWorldTileChanges(self: *SimulationFrame, changes: []const WorldTileChangedEvent) !void {
+        try self.events.ensureEventAppendCapacity(changes.len);
+        self.publishWorldTileChangesAssumeCapacity(changes);
+    }
+
+    /// `publishWorldTileChanges` after `events.ensureEventAppendCapacity(n)` with
+    /// `n >= changes.len` and no append since: allocation-free and infallible, so a writer
+    /// can publish what it wrote on an error path.
+    pub fn publishWorldTileChangesAssumeCapacity(self: *SimulationFrame, changes: []const WorldTileChangedEvent) void {
         if (changes.len == 0) return;
-        try self.events.ensureCanAppend(changes.len);
-        try self.events.reserveAppendCapacity(1, changes.len);
-        const first_range = try self.events.appendRangeCounts(1);
-        self.events.addCount(first_range, changes.len);
-        try self.events.prefixAppendedRanges(first_range);
-        var writer = self.events.rangeWriter(first_range);
+        var writer = self.events.appendReservedRange(changes.len);
         for (changes) |changed| {
             writer.write(.{
                 .stage = .structural_commit,
@@ -930,12 +1012,17 @@ pub fn RangeOutputStream(comptime T: type) type {
         }
 
         pub fn appendRangeCounts(self: *Self, range_count: usize) !usize {
+            try self.counts.ensureTotalCapacity(self.allocator, self.counts.items.len + range_count);
+            return self.appendRangeCountsAssumeCapacity(range_count);
+        }
+
+        /// `appendRangeCounts` into reserved count capacity.
+        pub fn appendRangeCountsAssumeCapacity(self: *Self, range_count: usize) usize {
             if (self.prefix_ready) {
                 std.debug.assert(self.offsets.items.len == self.counts.items.len);
                 std.debug.assert(self.write_offsets.items.len == self.counts.items.len);
             }
             const first_range = self.counts.items.len;
-            try self.counts.ensureTotalCapacity(self.allocator, first_range + range_count);
             for (0..range_count) |_| {
                 self.counts.appendAssumeCapacity(0);
             }
@@ -952,20 +1039,20 @@ pub fn RangeOutputStream(comptime T: type) type {
             self.write_offsets.clearRetainingCapacity();
             try self.offsets.ensureTotalCapacity(self.allocator, self.counts.items.len);
             try self.write_offsets.ensureTotalCapacity(self.allocator, self.counts.items.len);
-
-            var running_total: usize = 0;
-            for (self.counts.items) |count| {
-                self.offsets.appendAssumeCapacity(running_total);
-                self.write_offsets.appendAssumeCapacity(running_total);
-                running_total += count;
-            }
-
+            const running_total = self.appendRangeOffsets(0, 0);
             self.values.clearRetainingCapacity();
             try self.values.ensureTotalCapacity(self.allocator, running_total);
-            for (0..running_total) |_| {
-                self.values.appendAssumeCapacity(undefined);
-            }
-            self.merged_len = running_total;
+            self.extendValues(running_total);
+            self.prefix_ready = true;
+        }
+
+        /// `prefix` into reserved offset and value capacity (counts' length, and their sum).
+        pub fn prefixAssumeCapacity(self: *Self) void {
+            self.offsets.clearRetainingCapacity();
+            self.write_offsets.clearRetainingCapacity();
+            const running_total = self.appendRangeOffsets(0, 0);
+            self.values.clearRetainingCapacity();
+            self.extendValues(running_total);
             self.prefix_ready = true;
         }
 
@@ -979,15 +1066,38 @@ pub fn RangeOutputStream(comptime T: type) type {
             std.debug.assert(first_range == self.write_offsets.items.len);
             try self.offsets.ensureTotalCapacity(self.allocator, self.counts.items.len);
             try self.write_offsets.ensureTotalCapacity(self.allocator, self.counts.items.len);
+            const running_total = self.appendRangeOffsets(first_range, self.merged_len);
+            try self.values.ensureTotalCapacity(self.allocator, running_total);
+            self.extendValues(running_total);
+        }
 
-            var running_total = self.merged_len;
+        /// `prefixAppendedRanges` into reserved offset and value capacity.
+        pub fn prefixAppendedRangesAssumeCapacity(self: *Self, first_range: usize) void {
+            if (!self.prefix_ready) {
+                self.prefixAssumeCapacity();
+                return;
+            }
+
+            std.debug.assert(first_range == self.offsets.items.len);
+            std.debug.assert(first_range == self.write_offsets.items.len);
+            const running_total = self.appendRangeOffsets(first_range, self.merged_len);
+            self.extendValues(running_total);
+        }
+
+        // Appends the offsets of ranges `first_range..` starting at `start`; returns the
+        // running total past them. Needs offset capacity for every range.
+        fn appendRangeOffsets(self: *Self, first_range: usize, start: usize) usize {
+            var running_total = start;
             for (self.counts.items[first_range..]) |count| {
                 self.offsets.appendAssumeCapacity(running_total);
                 self.write_offsets.appendAssumeCapacity(running_total);
                 running_total += count;
             }
+            return running_total;
+        }
 
-            try self.values.ensureTotalCapacity(self.allocator, running_total);
+        // Extends the values to `running_total` slots in reserved capacity.
+        fn extendValues(self: *Self, running_total: usize) void {
             while (self.values.items.len < running_total) {
                 self.values.appendAssumeCapacity(undefined);
             }
@@ -1584,12 +1694,12 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
 }
 
-test "SimulationFrame.appendStimulus writes into frame.stimuli, mergedItems reflects it immediately" {
+test "SimulationFrame.writeLiveStimulus writes into frame.stimuli, mergedItems reflects it immediately" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
-    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
-    try frame.appendStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 1 });
+    try frame.writeLiveStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try frame.writeLiveStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 1 });
 
     const merged = frame.stimuli.mergedItems();
     try std.testing.expectEqual(@as(usize, 2), merged.len);
@@ -1605,27 +1715,6 @@ test "stimulusHearingScore prefers nearer equal intensities and louder equal dis
     try std.testing.expect(stimulusHearingScore(1.0, 20 * 20) > stimulusHearingScore(1.0, 40 * 40));
     try std.testing.expect(stimulusHearingScore(1.0, 30 * 30) > stimulusHearingScore(0.35, 30 * 30));
     try std.testing.expect(stimulusHearingScore(0, 0) < 0);
-}
-
-test "tryAppendStimulus drops when live capacity is full" {
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-    try frame.stimuli.reserve(1, 4);
-
-    try std.testing.expect(frame.tryAppendStimulus(.{
-        .position = .{ .x = 0, .y = 0 },
-        .intensity = 1,
-        .kind = .dig,
-        .level = 0,
-    }, 1));
-    try std.testing.expect(!frame.tryAppendStimulus(.{
-        .position = .{ .x = 1, .y = 0 },
-        .intensity = 1,
-        .kind = .footstep,
-        .level = 0,
-    }, 1));
-    try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
-    try std.testing.expectEqual(StimulusKind.dig, frame.stimuli.mergedItems()[0].kind);
 }
 
 test "SimulationFrame.publishWorldTileChanges writes N events in a single range" {
@@ -1645,18 +1734,59 @@ test "SimulationFrame.publishWorldTileChanges writes N events in a single range"
     try std.testing.expectEqual(@as(usize, 3), frame.events.stats.world_tile_changed);
 }
 
+test "a reserved world-tile publish allocates nothing as a step's first range or after another (FailingAllocator)" {
+    const changes = [_]WorldTileChangedEvent{
+        .{ .level = 1, .x = 2, .y = 3, .old_tile_id = 1, .new_tile_id = 2, .old_blocks_movement = true, .new_blocks_movement = false },
+        .{ .level = 1, .x = 4, .y = 5, .old_tile_id = 1, .new_tile_id = 2, .old_blocks_movement = true, .new_blocks_movement = false },
+        .{ .level = 2, .x = 0, .y = 1, .old_tile_id = 3, .new_tile_id = 4, .old_blocks_movement = true, .new_blocks_movement = false },
+        .{ .level = 2, .x = 6, .y = 7, .old_tile_id = 3, .new_tile_id = 4, .old_blocks_movement = false, .new_blocks_movement = true },
+    };
+    for ([_]bool{ false, true }) |after_other_range| {
+        // The full reservation, and fewer events than reserved.
+        for ([_]usize{ changes.len, changes.len - 1 }) |count| {
+            var frame = SimulationFrame.init(std.testing.allocator);
+            defer frame.deinit();
+            frame.beginStep();
+            if (after_other_range) try frame.events.appendRequired(entityCreatedEvent(7));
+            const ranges_before = frame.events.rangeCount();
+            const merged_before = frame.events.mergedItems().len;
+            frame.events.setCapacityLimit(merged_before + changes.len);
+            try frame.events.ensureEventAppendCapacity(changes.len);
+
+            const real_allocator = frame.events.stream.allocator;
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+            frame.events.stream.allocator = failing.allocator();
+            frame.publishWorldTileChangesAssumeCapacity(changes[0..count]);
+            frame.events.stream.allocator = real_allocator;
+
+            try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(ranges_before + 1, frame.events.rangeCount());
+            const published = frame.events.mergedItems()[merged_before..];
+            try std.testing.expectEqual(count, published.len);
+            for (published, changes[0..count]) |event, change| {
+                try std.testing.expectEqual(SimulationEventStage.structural_commit, event.stage);
+                try std.testing.expectEqual(change, event.payload.world_tile_changed);
+            }
+            try std.testing.expectEqual(count, frame.events.stats.world_tile_changed);
+            try std.testing.expectEqual(@as(usize, @intFromBool(after_other_range)), frame.events.stats.entity_created);
+            try std.testing.expectEqual(merged_before + count, frame.events.stats.total);
+        }
+    }
+}
+
 test "SimulationFrame.clearRetainingCapacity clears stimuli" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
-    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try frame.writeLiveStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
     try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
 
     frame.clearRetainingCapacity();
     try std.testing.expectEqual(@as(usize, 0), frame.stimuli.mergedItems().len);
 }
 
-test "SimulationFrame.appendStimulus has no steady-state allocation after warmup (FailingAllocator)" {
+test "SimulationFrame.writeLiveStimulus has no steady-state allocation after warmup (FailingAllocator)" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
@@ -1668,11 +1798,11 @@ test "SimulationFrame.appendStimulus has no steady-state allocation after warmup
     frame.stimuli.allocator = failing_allocator.allocator();
     defer frame.stimuli.allocator = original_allocator;
 
-    try frame.appendStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try frame.writeLiveStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 0 });
     try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
 }
 
-test "SimulationFrame.ensureStimulusAppendCapacity then appendStimulus is allocation-free (FailingAllocator)" {
+test "SimulationFrame.ensureStimulusAppendCapacity then writeLiveStimulus is allocation-free (FailingAllocator)" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
@@ -1683,11 +1813,11 @@ test "SimulationFrame.ensureStimulusAppendCapacity then appendStimulus is alloca
     frame.stimuli.allocator = failing.allocator();
     defer frame.stimuli.allocator = original_stimuli;
 
-    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try frame.writeLiveStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
     try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
 }
 
-test "SimulationFrame multi-appendStimulus after live-bus reserve is allocation-free (FailingAllocator)" {
+test "SimulationFrame multi-writeLiveStimulus after live-bus reserve is allocation-free (FailingAllocator)" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
@@ -1702,7 +1832,7 @@ test "SimulationFrame multi-appendStimulus after live-bus reserve is allocation-
     // Representative multi-producer step: promoted impact + dig + footstep.
     const kinds = [_]StimulusKind{ .impact, .dig, .footstep };
     for (kinds, 0..) |kind, i| {
-        try frame.appendStimulus(.{
+        try frame.writeLiveStimulus(.{
             .position = .{ .x = @floatFromInt(i), .y = 0 },
             .intensity = 1,
             .kind = kind,
@@ -1712,72 +1842,17 @@ test "SimulationFrame multi-appendStimulus after live-bus reserve is allocation-
     try std.testing.expectEqual(@as(usize, 3), frame.stimuli.mergedItems().len);
 }
 
-test "tryAppendStimulus returns false at live capacity without allocating (FailingAllocator)" {
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-
-    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
-    frame.clearRetainingCapacity();
-
-    const original_stimuli = frame.stimuli.allocator;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    frame.stimuli.allocator = failing.allocator();
-    defer frame.stimuli.allocator = original_stimuli;
-
-    for (0..stimulus_live_capacity) |i| {
-        try std.testing.expect(frame.tryAppendStimulus(.{
-            .position = .{ .x = @floatFromInt(i), .y = 0 },
-            .intensity = 1,
-            .kind = .footstep,
-            .level = 0,
-        }, stimulus_live_capacity));
-    }
-    try std.testing.expectEqual(@as(usize, stimulus_live_capacity), frame.stimuli.mergedItems().len);
-    try std.testing.expect(!frame.tryAppendStimulus(.{
-        .position = .{ .x = 99, .y = 0 },
-        .intensity = 1,
-        .kind = .footstep,
-        .level = 0,
-    }, stimulus_live_capacity));
-}
-
-test "SimulationFrame.world_tile_changes_scratch reserved-then-push is allocation-free (FailingAllocator)" {
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-
-    try frame.reserveWorldTileChangesScratch(2);
-
-    const original = frame.allocator;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    frame.allocator = failing.allocator();
-    defer frame.allocator = original;
-
-    const change = WorldTileChangedEvent{
-        .level = 1,
-        .x = 2,
-        .y = 3,
-        .old_tile_id = 1,
-        .new_tile_id = 2,
-        .old_blocks_movement = true,
-        .new_blocks_movement = false,
-    };
-    frame.world_tile_changes_scratch.appendAssumeCapacity(change);
-    frame.world_tile_changes_scratch.appendAssumeCapacity(change);
-    try std.testing.expectEqual(@as(usize, 2), frame.world_tile_changes_scratch.items.len);
-}
-
 test "ActionIntent fields are scalar or enum only" {
     comptime {
-        const fields = @typeInfo(ActionIntent).@"struct".fields;
-        for (fields) |field| {
-            const info = @typeInfo(field.type);
-            const allowed: bool = switch (info) {
+        const struct_info = @typeInfo(ActionIntent).@"struct";
+        for (struct_info.field_names, struct_info.field_types) |field_name, field_type| {
+            const allowed: bool = switch (@typeInfo(field_type)) {
                 .int, .float, .bool => true,
                 .@"enum" => true,
-                .@"struct" => field.type == EntityId,
+                .@"struct" => field_type == EntityId,
                 else => false,
             };
-            if (!allowed) @compileError("ActionIntent field has non-scalar type: " ++ field.name);
+            if (!allowed) @compileError("ActionIntent field has non-scalar type: " ++ field_name);
         }
     }
 }

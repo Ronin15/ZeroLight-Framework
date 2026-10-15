@@ -9,7 +9,6 @@ const std = @import("std");
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
-const Faction = @import("data_system.zig").Faction;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const render_depth = @import("render_depth.zig");
 
@@ -42,8 +41,8 @@ pub const Player = struct {
         try data.setPrimitiveVisual(entity, playerVisual());
         try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });
         try data.setFaction(entity, .player);
-        // Pre-attach surface world_level so the first plane-traversal fall cannot
-        // OOM on component growth after carveLandingCell has already mutated a tile.
+        // Pre-attach surface world_level so the player's first plane traversal needs no
+        // world_level growth in the plane stage's reserve.
         try data.setWorldLevel(entity, 0);
 
         return .{ .entity = entity };

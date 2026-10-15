@@ -11,7 +11,6 @@ const types = @import("types.zig");
 const EntityId = types.EntityId;
 const Facing = types.Facing;
 const FacingData = types.FacingData;
-const FacingSlice = types.FacingSlice;
 const ConstFacingSlice = types.ConstFacingSlice;
 const PrimitiveVisual = types.PrimitiveVisual;
 const ConstPrimitiveVisualSlice = types.ConstPrimitiveVisualSlice;
@@ -105,11 +104,6 @@ pub const FacingStore = struct {
         const moved_entity = if (index != last) s.items(.entity)[last] else null;
         self.rows.swapRemove(index);
         return moved_entity;
-    }
-
-    pub fn slice(self: *FacingStore) FacingSlice {
-        const s = self.rows.slice();
-        return .{ .entities = s.items(.entity), .directions = s.items(.direction) };
     }
 
     pub fn sliceConst(self: *const FacingStore) ConstFacingSlice {
@@ -220,14 +214,14 @@ pub const PrimitiveVisualStore = struct {
                 .b = s.items(.color_b)[index],
                 .a = s.items(.color_a)[index],
             },
-            .depth = @enumFromInt(s.items(.depth_value)[index]),
+            .depth = @fromBackingInt(@intCast(s.items(.depth_value)[index])),
             .marker_color = .{
                 .r = s.items(.marker_color_r)[index],
                 .g = s.items(.marker_color_g)[index],
                 .b = s.items(.marker_color_b)[index],
                 .a = s.items(.marker_color_a)[index],
             },
-            .marker_depth_band = @enumFromInt(s.items(.marker_depth_value)[index]),
+            .marker_depth_band = @fromBackingInt(@intCast(s.items(.marker_depth_value)[index])),
             .marker_length = s.items(.marker_length)[index],
             .marker_depth = s.items(.marker_depth)[index],
             .marker_margin = s.items(.marker_margin)[index],

@@ -1,6 +1,6 @@
 # ZeroLight Framework
 
-A lean 2D game framework built with **Zig 0.16**, **SDL3**, and **SDL_GPU**.
+A lean 2D game framework built with **Zig 0.17**, **SDL3**, and **SDL_GPU**.
 It targets predictable runtime flow, data-oriented gameplay, and a clear split
 between app coordination, rendering, assets, and simulation.
 
@@ -17,26 +17,26 @@ simulation, richer emergent AI, and production-friendly asset workflows.
   leaves gameplay.
 - **SDL_GPU rendering** — sprites, multi-level tilemaps, camera transforms,
   text, and ordered world drawing behind a small game-facing render API.
-- **Worlds and tilemaps** — procedural multi-level worlds, chunk visibility,
-  dig and plane traversal between floors, and tile edits that feed navigation
-  and gameplay.
-- **Fixed-step simulation** — 60Hz gameplay with a pipeline of movement,
-  collision, AI, pathfinding, particles, and small domain controllers (dig,
-  audio, early interactables).
-- **Emergent AI (in progress)** — early substrate, not a finished AI game
-  layer. Agents can see and hear, keep short-term memory, carry simple emotion
-  drives, and choose among a few locomotion behaviors; personalities and
-  interest points are data-authored. Hearing digs/footsteps/impacts and
-  investigate markers are wired; combat AI, deeper goals, coupled feelings, and
-  broader world reactions are still on the roadmap.
-- **Action intents and destructibles (early)** — a typed interact/attack bus
-  with a first consumer (smashable crates that open navigation). Not a full
-  combat or interaction system yet.
+- **Worlds and tilemaps** — large procedural multi-level worlds built from
+  chunks, dig and plane traversal between floors, and tile edits that feed
+  navigation and gameplay.
+- **Fixed-step simulation** — 60Hz gameplay with AI, steering, pathfinding,
+  movement, collision, particles, and small domain controllers (dig, audio,
+  interactables).
+- **Scoped simulation** — full detail near the view, cheaper tiers farther
+  out.
+- **Dig-aware pathfinding** — NPCs path across levels and long distances and
+  use newly dug tunnels and ramps right away.
+- **Emergent AI (in progress)** — agents see, hear, remember, and react with
+  simple emotions and data-authored personalities. Combat AI and deeper goals
+  are on the roadmap.
+- **Destruction and construction (in progress)** — digging, ramps, and
+  destructible objects today, built toward large-scale destruction and building.
 - **Atlas-backed assets** — packed runtime atlases with stable IDs so art and
   audio can be swapped without rewriting game code.
-- **Performance discipline** — threaded processors, benchmarks, and tests that
-  keep hot paths allocation-free and behavior deterministic as the framework
-  grows.
+- **Multithreaded and deterministic** — threaded systems with identical
+  serial and threaded results, memory that scales with the world,
+  allocation-free hot paths, and benchmarks that track scaling.
 
 For design detail and ownership boundaries, start with
 [architecture](docs/architecture.md). Topic guides cover
@@ -47,10 +47,12 @@ For design detail and ownership boundaries, start with
 
 ## Requirements
 
-- Zig 0.16.0 or a compatible 0.16.x build
+- Zig 0.17.0 or a compatible 0.17.x build
 - SDL3, SDL3_ttf, and SDL3_mixer
 - Shader toolchain: `glslc`; `spirv-cross` on macOS; `spirv-cross` and `dxc`
   on Windows
+- Python 3 for the lint steps in `zig build verify` (Pillow only for atlas
+  packing and art tools)
 
 Linux and macOS use system development packages. Windows can fetch pinned SDL
 packages through the build. See [setup](docs/setup.md) for platform notes.
@@ -83,7 +85,7 @@ zig build check     # compile game, benchmark, and GPU smoke executables
 zig build test      # run unit tests
 zig build bench     # run CPU gameplay and render-prep benchmarks
 zig build verify    # check + test + shaders + atlas + idiom lint (local gate)
-zig build package   # install binaries and runtime assets for the selected mode
+zig build package   # install selected-mode binaries and runtime assets
 zig build gpu-smoke # display-gated renderer pipeline smoke test
 ```
 
@@ -121,8 +123,10 @@ Generated output lives under `zig-out/` and should not be committed.
 - [Rendering, Assets, And Shaders](docs/rendering-assets-shaders.md)
 - [Atlas Asset Workflow](docs/atlas-asset-workflow.md)
 - [Simulation Tiers And Pipeline](docs/simulation-tiers-and-pipeline.md)
+- [Rules](.claude/rules/) (coding standards, one file per topic)
+- [Roadmap](docs/framework-implementation-slices.md) (implementation slices)
+- [Changelogs](docs/changelogs/) and [module reviews](docs/reviews/)
 
 ## License
-
 
 MIT — see [LICENSE](LICENSE).

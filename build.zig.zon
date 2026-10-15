@@ -10,7 +10,7 @@
     // Regenerate this when renaming the project.
     .fingerprint = 0xf8699fde2a9a0aef, // Changing this has security and trust implications.
     // Earliest Zig version this project supports.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // Add project dependencies here as the game grows.
     .dependencies = .{
         .sdl3_windows_vc = .{

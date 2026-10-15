@@ -20,8 +20,8 @@ const log = logging.perf;
 // compile — not every edit). Emit uses `log.debug`; both modes' `auto` log
 // level includes debug.
 pub const enabled = switch (builtin.mode) {
-    .Debug, .ReleaseSafe => true,
-    .ReleaseFast, .ReleaseSmall => false,
+    .debug, .safe => true,
+    .fast, .small => false,
 };
 pub const interval_ns: u64 = 60 * std.time.ns_per_s;
 
@@ -52,6 +52,7 @@ pub const Metric = enum {
     sprite_skipped_invalid,
     sprite_vertices,
     sprite_draw_groups,
+    sprite_command_overflow_grows,
     ai_entities,
     ai_intents,
     ai_navigation_intents,
@@ -81,12 +82,12 @@ pub const Metric = enum {
     path_duplicate_requests,
     path_pending_requests,
     path_solved_requests,
-    path_fallback_requests,
+    path_solve_admissions,
     path_available_results,
+    path_partial_results,
     path_unavailable_results,
     path_dropped_requests,
-    path_deferred_requests,
-    path_fallback_deferred_requests,
+    path_admission_deferred_requests,
     path_cache_hits,
     path_cache_evictions,
     path_budget_exhausted,
@@ -99,12 +100,16 @@ pub const Metric = enum {
     path_group_field_samples,
     path_max_stitch_segments,
     path_max_distinct_group_keys,
+    path_group_field_evictions,
     nav_dirty_chunks,
     nav_incremental_rebuilds,
-    nav_full_relabel,
-    nav_version_bumps,
     nav_chunks_patched,
-    nav_edge_cap_fallback,
+    nav_levels_built,
+    nav_records_patched,
+    dig_plane_scratch_grown,
+    plane_entry_windows_grown,
+    collision_pair_bound_exceeded,
+    population_capacity_grows,
     movement_bodies,
     collision_bodies,
     collision_candidate_pairs,
@@ -174,6 +179,7 @@ pub const Timing = enum {
     pipeline_ai_memory,
     pipeline_ai_affect,
     pipeline_ai,
+    pipeline_path_goals,
     pipeline_steering,
     pipeline_pathfinding,
     pipeline_apply_intents,
@@ -189,16 +195,21 @@ pub const Timing = enum {
     gameplay_structural,
     // Pathfinding sub-stages: a breakdown of pipeline_pathfinding into request
     // accept/dedup, group-field service/build, individual+abstract solve+stitch,
-    // and result publish/compact, so the dominant phase is visible.
+    // and result publish/compact, so the dominant phase is visible. `pathfinding_resize`
+    // is the update's elastic resize (shrinks, and a grow after a failed population seam),
+    // recorded only on a step that resized, so its average is per resize.
     pathfinding_accept,
     pathfinding_group_service,
     pathfinding_solve,
     pathfinding_publish,
-    // Steering prepareUpdate breakdown (main-thread setup before the avoidance
-    // batch). Compare against batch steering avg_ms to isolate serial overhead.
+    pathfinding_resize,
+    // Steering prepare stages before the avoidance batch: wall time of selection, of the
+    // agents stage with its rekey, of directions, and of the agent grid, each inline or
+    // dispatched to workers.
     steering_select,
     steering_snapshot,
     steering_directions,
+    steering_grid,
     // Collision update breakdown before/around the broadphase batch.
     collision_gather,
     collision_sort,
@@ -217,11 +228,25 @@ pub const BatchStage = enum {
     ai_separation,
     ai_intent,
     steering,
-    path_fallback,
+    path_solve,
+    path_intake,
+    // The pathfinding update's registry flush, shrinks included; not the eviction flush.
+    path_registry_flush,
+    // The pathfinding update's resize copy: a capacity shrink's byte moves, its cost driver.
+    path_resize_copy,
     movement,
     chunk_derive,
     collision_broadphase,
     collision_narrowphase,
+    static_collider_splice,
+    nav_remask,
+    // The nav reaction's connectivity flood, its rounds summed: the removal-shaped share of a
+    // dig, fill, or dense terrain change.
+    nav_connect,
+    // The nav reaction's one-way closure rows, round 0 and its rounds summed: the cost of a
+    // change to a one-way system.
+    nav_closure,
+    nav_evict,
     particles,
     sprite_prep,
 };
@@ -234,9 +259,9 @@ pub const FrameSample = struct {
     sprite_prep: SpritePrepStats = .{},
 };
 
-const metric_count = std.meta.fields(Metric).len;
-const timing_count = std.meta.fields(Timing).len;
-const batch_stage_count = std.meta.fields(BatchStage).len;
+const metric_count = @typeInfo(Metric).@"enum".field_names.len;
+const timing_count = @typeInfo(Timing).@"enum".field_names.len;
+const batch_stage_count = @typeInfo(BatchStage).@"enum".field_names.len;
 
 pub const RuntimePerfLog = if (enabled) EnabledRuntimePerfLog else DisabledRuntimePerfLog;
 
@@ -333,30 +358,30 @@ const DisabledRuntimePerfLog = struct {
 const EnabledRuntimePerfLog = struct {
     interval_start_ns: u64,
     frames: u64 = 0,
-    metrics: [metric_count]u64 = [_]u64{0} ** metric_count,
-    timings: [timing_count]TimingAggregate = [_]TimingAggregate{.{}} ** timing_count,
-    batches: [batch_stage_count]BatchAggregate = [_]BatchAggregate{.{}} ** batch_stage_count,
+    metrics: [metric_count]u64 = @splat(0),
+    timings: [timing_count]TimingAggregate = @splat(.{}),
+    batches: [batch_stage_count]BatchAggregate = @splat(.{}),
 
     pub fn init(now_ns: u64) EnabledRuntimePerfLog {
         return .{ .interval_start_ns = now_ns };
     }
 
     pub fn recordMetric(self: *EnabledRuntimePerfLog, metric_id: Metric, value: u64) void {
-        self.metrics[@intFromEnum(metric_id)] += value;
+        self.metrics[@backingInt(metric_id)] += value;
     }
 
     pub fn recordMetricMax(self: *EnabledRuntimePerfLog, metric_id: Metric, value: u64) void {
-        const slot = &self.metrics[@intFromEnum(metric_id)];
+        const slot = &self.metrics[@backingInt(metric_id)];
         slot.* = @max(slot.*, value);
     }
 
     pub fn recordTiming(self: *EnabledRuntimePerfLog, timing_id: Timing, duration_ns: u64) void {
-        self.timings[@intFromEnum(timing_id)].record(duration_ns);
+        self.timings[@backingInt(timing_id)].record(duration_ns);
     }
 
     pub fn recordBatch(self: *EnabledRuntimePerfLog, stage: BatchStage, stats: BatchStats) void {
         if (stats.item_count == 0 and stats.range_count == 0 and stats.batch_duration_ns == 0) return;
-        self.batches[@intFromEnum(stage)].record(stats);
+        self.batches[@backingInt(stage)].record(stats);
     }
 
     pub fn recordFrame(self: *EnabledRuntimePerfLog, now_ns: u64, sample: FrameSample) void {
@@ -383,15 +408,16 @@ const EnabledRuntimePerfLog = struct {
         self.recordMetric(.sprite_skipped_invalid, stats.skipped_invalid_count);
         self.recordMetric(.sprite_vertices, stats.vertex_count);
         self.recordMetric(.sprite_draw_groups, stats.draw_group_count);
+        self.recordMetric(.sprite_command_overflow_grows, stats.command_overflow_grows);
         self.recordBatch(.sprite_prep, stats.batch);
     }
 
     fn reset(self: *EnabledRuntimePerfLog, now_ns: u64) void {
         self.interval_start_ns = now_ns;
         self.frames = 0;
-        self.metrics = [_]u64{0} ** metric_count;
-        self.timings = [_]TimingAggregate{.{}} ** timing_count;
-        self.batches = [_]BatchAggregate{.{}} ** batch_stage_count;
+        self.metrics = @splat(0);
+        self.timings = @splat(.{});
+        self.batches = @splat(.{});
     }
 
     fn emit(self: *const EnabledRuntimePerfLog, elapsed_ns: u64) void {
@@ -464,6 +490,7 @@ const EnabledRuntimePerfLog = struct {
         const pipeline_ai_memory_timing = self.timingValue(.pipeline_ai_memory);
         const pipeline_ai_affect_timing = self.timingValue(.pipeline_ai_affect);
         const pipeline_ai_timing = self.timingValue(.pipeline_ai);
+        const pipeline_path_goals_timing = self.timingValue(.pipeline_path_goals);
         const pipeline_steering_timing = self.timingValue(.pipeline_steering);
         const pipeline_pathfinding_timing = self.timingValue(.pipeline_pathfinding);
         const pipeline_apply_intents_timing = self.timingValue(.pipeline_apply_intents);
@@ -473,7 +500,7 @@ const EnabledRuntimePerfLog = struct {
         const pipeline_collision_response_timing = self.timingValue(.pipeline_collision_response);
         const pipeline_chunk_derive_timing = self.timingValue(.pipeline_chunk_derive);
         log.debug(
-            "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} perception_avg_ms={d:.3} perception_max_ms={d:.3} ai_memory_avg_ms={d:.3} ai_memory_max_ms={d:.3} ai_affect_avg_ms={d:.3} ai_affect_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3} chunk_derive_avg_ms={d:.3} chunk_derive_max_ms={d:.3}",
+            "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} perception_avg_ms={d:.3} perception_max_ms={d:.3} ai_memory_avg_ms={d:.3} ai_memory_max_ms={d:.3} ai_affect_avg_ms={d:.3} ai_affect_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} path_goals_avg_ms={d:.3} path_goals_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3} chunk_derive_avg_ms={d:.3} chunk_derive_max_ms={d:.3}",
             .{
                 elapsed_s,
                 millis(pipeline_spatial_index_timing.averageNs()),
@@ -486,6 +513,8 @@ const EnabledRuntimePerfLog = struct {
                 millis(pipeline_ai_affect_timing.max_ns),
                 millis(pipeline_ai_timing.averageNs()),
                 millis(pipeline_ai_timing.max_ns),
+                millis(pipeline_path_goals_timing.averageNs()),
+                millis(pipeline_path_goals_timing.max_ns),
                 millis(pipeline_steering_timing.averageNs()),
                 millis(pipeline_steering_timing.max_ns),
                 millis(pipeline_pathfinding_timing.averageNs()),
@@ -529,8 +558,9 @@ const EnabledRuntimePerfLog = struct {
         const pathfinding_group_timing = self.timingValue(.pathfinding_group_service);
         const pathfinding_solve_timing = self.timingValue(.pathfinding_solve);
         const pathfinding_publish_timing = self.timingValue(.pathfinding_publish);
+        const pathfinding_resize_timing = self.timingValue(.pathfinding_resize);
         log.debug(
-            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3} max_stitch_segments={} group_built={} group_reuses={} group_throttled={} group_samples={} max_distinct_group_keys={}",
+            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3} resize_avg_ms={d:.3} resize_max_ms={d:.3} max_stitch_segments={} group_built={} group_reuses={} group_throttled={} group_samples={} max_distinct_group_keys={} group_evictions={}",
             .{
                 elapsed_s,
                 millis(pathfinding_accept_timing.averageNs()),
@@ -541,19 +571,23 @@ const EnabledRuntimePerfLog = struct {
                 millis(pathfinding_solve_timing.max_ns),
                 millis(pathfinding_publish_timing.averageNs()),
                 millis(pathfinding_publish_timing.max_ns),
+                millis(pathfinding_resize_timing.averageNs()),
+                millis(pathfinding_resize_timing.max_ns),
                 self.metricValue(.path_max_stitch_segments),
                 self.metricValue(.path_group_fields_built),
                 self.metricValue(.path_group_field_reuses),
                 self.metricValue(.path_group_field_rebuild_throttled),
                 self.metricValue(.path_group_field_samples),
                 self.metricValue(.path_max_distinct_group_keys),
+                self.metricValue(.path_group_field_evictions),
             },
         );
         const steering_select_timing = self.timingValue(.steering_select);
         const steering_snapshot_timing = self.timingValue(.steering_snapshot);
         const steering_directions_timing = self.timingValue(.steering_directions);
+        const steering_grid_timing = self.timingValue(.steering_grid);
         log.debug(
-            "perf {d:.1}s steering_setup select_avg_ms={d:.3} select_max_ms={d:.3} snapshot_avg_ms={d:.3} snapshot_max_ms={d:.3} directions_avg_ms={d:.3} directions_max_ms={d:.3}",
+            "perf {d:.1}s steering_setup select_avg_ms={d:.3} select_max_ms={d:.3} snapshot_avg_ms={d:.3} snapshot_max_ms={d:.3} directions_avg_ms={d:.3} directions_max_ms={d:.3} grid_avg_ms={d:.3} grid_max_ms={d:.3}",
             .{
                 elapsed_s,
                 millis(steering_select_timing.averageNs()),
@@ -562,6 +596,8 @@ const EnabledRuntimePerfLog = struct {
                 millis(steering_snapshot_timing.max_ns),
                 millis(steering_directions_timing.averageNs()),
                 millis(steering_directions_timing.max_ns),
+                millis(steering_grid_timing.averageNs()),
+                millis(steering_grid_timing.max_ns),
             },
         );
         const collision_gather_timing = self.timingValue(.collision_gather);
@@ -578,7 +614,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s dispatch state_updates={} state_renders={} render_enqueue_avg_ms={d:.3} render_enqueue_max_ms={d:.3} overlay_avg_ms={d:.3} overlay_max_ms={d:.3} end_frame_avg_ms={d:.3} end_frame_max_ms={d:.3} sprites commands={} valid={} skipped={} sprites_per_frame={d:.1} vertices={} groups={}",
+            "perf {d:.1}s dispatch state_updates={} state_renders={} render_enqueue_avg_ms={d:.3} render_enqueue_max_ms={d:.3} overlay_avg_ms={d:.3} overlay_max_ms={d:.3} end_frame_avg_ms={d:.3} end_frame_max_ms={d:.3} sprites commands={} valid={} skipped={} sprites_per_frame={d:.1} vertices={} groups={} overflow_grows={}",
             .{
                 elapsed_s,
                 self.metricValue(.state_updates),
@@ -595,6 +631,7 @@ const EnabledRuntimePerfLog = struct {
                 averagePer(self.metricValue(.sprite_commands), rendered_frame_count),
                 self.metricValue(.sprite_vertices),
                 self.metricValue(.sprite_draw_groups),
+                self.metricValue(.sprite_command_overflow_grows),
             },
         );
         log.debug(
@@ -684,19 +721,19 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} fallback={} available={} unavailable={} dropped={} deferred={} fallback_deferred={} cache_hits={} evictions={} budget_exhausted={} escalated={} escalated_deferred={} goal_projected={} group_built={} group_reuses={} group_throttled={} group_samples={}",
+            "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} solve_admissions={} available={} partial={} unavailable={} dropped={} admission_deferred={} cache_hits={} evictions={} budget_exhausted={} escalated={} escalated_deferred={} goal_projected={} group_built={} group_reuses={} group_throttled={} group_samples={}",
             .{
                 elapsed_s,
                 self.metricValue(.path_accepted_requests),
                 self.metricValue(.path_duplicate_requests),
                 self.metricValue(.path_pending_requests),
                 self.metricValue(.path_solved_requests),
-                self.metricValue(.path_fallback_requests),
+                self.metricValue(.path_solve_admissions),
                 self.metricValue(.path_available_results),
+                self.metricValue(.path_partial_results),
                 self.metricValue(.path_unavailable_results),
                 self.metricValue(.path_dropped_requests),
-                self.metricValue(.path_deferred_requests),
-                self.metricValue(.path_fallback_deferred_requests),
+                self.metricValue(.path_admission_deferred_requests),
                 self.metricValue(.path_cache_hits),
                 self.metricValue(.path_cache_evictions),
                 self.metricValue(.path_budget_exhausted),
@@ -710,16 +747,19 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} full_relabel={} version_bumps={} chunks_patched={} edge_cap_fallback={} region_invalidated={}",
+            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} chunks_patched={} levels_built={} records_patched={} region_invalidated={} dig_plane_scratch_grown={} plane_entry_windows_grown={} collision_pair_bound_exceeded={} population_capacity_grows={}",
             .{
                 elapsed_s,
                 self.metricValue(.nav_dirty_chunks),
                 self.metricValue(.nav_incremental_rebuilds),
-                self.metricValue(.nav_full_relabel),
-                self.metricValue(.nav_version_bumps),
                 self.metricValue(.nav_chunks_patched),
-                self.metricValue(.nav_edge_cap_fallback),
+                self.metricValue(.nav_levels_built),
+                self.metricValue(.nav_records_patched),
                 self.metricValue(.simulation_events_nav_region_invalidated),
+                self.metricValue(.dig_plane_scratch_grown),
+                self.metricValue(.plane_entry_windows_grown),
+                self.metricValue(.collision_pair_bound_exceeded),
+                self.metricValue(.population_capacity_grows),
             },
         );
         log.debug(
@@ -744,15 +784,14 @@ const EnabledRuntimePerfLog = struct {
             },
         );
 
-        inline for (std.meta.fields(BatchStage)) |field| {
-            const stage: BatchStage = @enumFromInt(field.value);
+        inline for (comptime std.meta.tags(BatchStage)) |stage| {
             const batch_stats = self.batchValue(stage);
             if (batch_stats.calls != 0) {
                 log.debug(
                     "perf {d:.1}s batch {s} calls={} items={} ranges={} inline={} threaded={} max_workers={} avg_ms={d:.3} max_ms={d:.3} wait_avg_ms={d:.3} wait_on_max_ms={d:.3} worker_util_avg={d:.1}%",
                     .{
                         elapsed_s,
-                        field.name,
+                        @tagName(stage),
                         batch_stats.calls,
                         batch_stats.items,
                         batch_stats.ranges,
@@ -771,15 +810,15 @@ const EnabledRuntimePerfLog = struct {
     }
 
     fn metricValue(self: *const EnabledRuntimePerfLog, value: Metric) u64 {
-        return self.metrics[@intFromEnum(value)];
+        return self.metrics[@backingInt(value)];
     }
 
     fn timingValue(self: *const EnabledRuntimePerfLog, value: Timing) TimingAggregate {
-        return self.timings[@intFromEnum(value)];
+        return self.timings[@backingInt(value)];
     }
 
     fn batchValue(self: *const EnabledRuntimePerfLog, value: BatchStage) BatchAggregate {
-        return self.batches[@intFromEnum(value)];
+        return self.batches[@backingInt(value)];
     }
 };
 

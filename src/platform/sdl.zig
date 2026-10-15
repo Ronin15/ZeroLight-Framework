@@ -6,11 +6,9 @@ const std = @import("std");
 const logging = @import("../core/logging.zig");
 const log = logging.platform;
 
-pub const c = @cImport({
-    @cInclude("SDL3/SDL.h");
-    @cInclude("SDL3_ttf/SDL_ttf.h");
-    @cInclude("SDL3_mixer/SDL_mixer.h");
-});
+// SDL3, SDL3_ttf and SDL3_mixer C API, translated from `sdl_c.h` by the shared
+// build-graph TranslateC step (Zig 0.17 removed `@cImport`).
+pub const c = @import("sdl_c");
 
 pub const SdlContext = struct {
     pub fn init(flags: c.SDL_InitFlags) !SdlContext {

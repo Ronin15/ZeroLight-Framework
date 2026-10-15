@@ -214,7 +214,7 @@ fn sdlError(comptime operation: []const u8) error{SdlError} {
 }
 
 test "texture pixel validation rejects invalid dimensions pitch and length" {
-    const valid_pixels = [_]u8{255} ** 16;
+    const valid_pixels: [16]u8 = @splat(255);
 
     try std.testing.expectError(error.InvalidTexturePixels, validatePixels(valid_pixels[0..], 0, 1, 4));
     try std.testing.expectError(error.InvalidTexturePixels, validatePixels(valid_pixels[0..], 1, 0, 4));
@@ -224,8 +224,8 @@ test "texture pixel validation rejects invalid dimensions pitch and length" {
 }
 
 test "texture pixel validation accepts tightly packed and padded rows" {
-    const tight_pixels = [_]u8{255} ** 16;
-    const padded_pixels = [_]u8{255} ** 24;
+    const tight_pixels: [16]u8 = @splat(255);
+    const padded_pixels: [24]u8 = @splat(255);
 
     try validatePixels(tight_pixels[0..], 2, 2, 8);
     try validatePixels(padded_pixels[0..], 2, 2, 12);

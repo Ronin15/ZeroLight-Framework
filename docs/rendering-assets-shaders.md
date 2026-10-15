@@ -1,7 +1,8 @@
 # Rendering, Assets, And Shaders
 
-The app uses SDL_GPU directly and does not call Vulkan or Metal APIs itself.
-SDL chooses the backend from the formats and drivers available at runtime.
+The app uses SDL_GPU directly and calls no Vulkan or Metal APIs itself. SDL
+chooses the backend from the formats and drivers available at runtime. Rules:
+`.claude/rules/render.md` and `.claude/rules/assets-audio.md`.
 
 ## Shader Build
 
@@ -49,9 +50,8 @@ To add a new GPU material (shader + pipeline):
 6. Call `create{Name}Pipeline()` in `Renderer.init()`.
 7. Add a bind case to the `switch (group.material)` in `Renderer.endFrame()`.
 
-Rule: game-facing draw calls reference `Material` enum tags only. No SDL_GPU
-handles, pipeline pointers, or shader format strings cross the renderer boundary
-into game code.
+Game-facing draw calls reference `Material` enum tags only; no SDL_GPU handles,
+pipeline pointers, or shader format strings cross the renderer boundary.
 
 ## Sprite Rendering
 
@@ -128,98 +128,211 @@ source rectangles. Tilemap batching follows the same stable-ID model rather than
 creating one texture per tile, storing atlas names in hot gameplay data, or
 persisting live renderer handles/source rectangles in `DataSystem`.
 
-Large sprite, tile, or particle scenes should reserve or surface render-prep and
-sprite-batch capacity before relying on allocation-free render frames. The
-warmed path avoids per-frame allocation only inside the currently reserved
+Large sprite, tile, or particle scenes reserve render-prep and sprite-batch
+capacity ahead of submission. The warmed path avoids per-frame allocation only inside the currently reserved
 ordered-command, prepared-command, vertex, and draw-group capacity.
+
+`drawSprite` never refuses. A submit past the batch's physical capacity grows the
+command list geometrically on the main thread. `Renderer.reserveSpriteCommands`
+marks the frame reserved at its grow-only `command_high_water`; a reserved frame
+whose submits exceed that reservation is counted once
+(`SpriteBatch.command_overflow_grows`, perf metric `sprite_command_overflow_grows`)
+and warned through `logging.render` (1st, 2nd, 4th, ... drifting frame), whether or
+not the command list's rounded-up capacity absorbed the overshoot. The comparison is
+against the reservation because that is the bound past which
+`ensureFrameBatchCapacity` grows prepared/vertex/group storage and the GPU streams.
+A short reservation formula shows up as a counter instead of exiting the app.
+
+GPU buffer growth never drains the device. The dynamic vertex streams
+(`ensureBatchCapacity`) and the retained static streams (`ensureStaticCapacity`)
+grow geometrically by creating the new stream set before releasing the old one, so
+a creation failure leaves the live streams untouched, and SDL frees the old set
+once in-flight frames finish; the tile store and its upload transfer grow the same
+way (GPU-Driven Tilemap). Each growth is counted (`batch_stream_grows`,
+`static_stream_grows`, `tile_store_grows`, `tile_upload_transfer_grows`) and logged
+once; an unreserved batch-stream growth warns.
 
 ## GPU-Driven Tilemap
 
-Dense world tiles are not emitted as per-tile vertices. Every dense layer's tile ids
-are concatenated into one flat array (`WorldSystem.dense_tile_ids`) and uploaded
-once, in one pass, to a single combined GPU **storage buffer**
-(`GRAPHICS_STORAGE_READ`, one `u32` per cell, row-major — via
-`WorldSystem.uploadDenseTileDataBuffer` / `Renderer.createTileDataBuffer`).
+Dense world tiles are not emitted as per-tile vertices. Each rendered world owns
+one renderer-side **GPU tile store** (`Renderer.createTileStore`, a
+`GRAPHICS_STORAGE_READ` storage buffer) holding only its **render window**: the
+dense layers of the levels in the vertical window (`DenseLayerRenderWindow`),
+each over the camera's chunk window, chunk by chunk like the CPU terrain
+(`world_terrain.zig`). The world keeps only the store's handle and a mirror of
+its layout (`WorldSystem.gpu_tiles`, `world_gpu_tiles.zig`).
 
-The world draws its dense render window as a small, bounded number of **composite**
-draws, not one draw per dense layer. `WorldSystem.submitStaticDenseGeometry` takes
-`GameplayScene.player_level` as `active_level`, collects the in-window dense layers
-back-to-front (`collectDenseSubmitLayers`, unchanged contract), then cuts that
-depth-ascending list into composite-draw buckets at every **interleave depth** —
-a depth something else needs to render strictly between two dense layers this
-frame (`partitionDenseCompositeBuckets`). Interleave depths come from three
-sources, gathered by `render_prep.collectDenseInterleaveDepths` before the submit
-call: `active_level`'s own actor depth (always included — this is what makes the
-common case, no sandwiched content, behave exactly like a single draw), every
-distinct dynamic entity/particle depth this frame, and every depth a sparse tile
-is registered at **anywhere in the world**, not just `active_level` — closing what
-would otherwise be a real gap: a whole-layer composite draw has no per-cell cull,
-so a sparse tile (an ore vein, a pickup seen through a dug shaft) at *any*
-in-window level must still get its own sandwich point the moment one exists, not
-just the active level's. Depths are filtered to the dense window's own depth span
-(`WorldSystem.denseWindowDepthSpan`) before partitioning, since anything outside it
-cannot cut a boundary.
+Layout (documented at `renderer.zig`'s `tile_store_uniform_bit`, shared with
+`tilemap.frag.glsl`): one `u32` buffer, two allocation classes at absolute
+element offsets from one bump high water, each with a free list:
 
-Each bucket becomes one retained world-space quad (`Renderer.beginStaticGeometry` /
-`appendStaticTilemapSpan`) ordered at that bucket's own shallowest layer's real
-`denseLayerOrder`, tagged `DrawGroup.material = .tilemap` and carrying a
-`Renderer.TilemapWindowLayers` — up to `Renderer.k_max_tilemap_window_layers`
-topmost-first element offsets into the combined buffer
-(`WorldSystem.buildWindowLayers` reverses `collectDenseSubmitLayers`'s
-deepest-first bucket slice, since the shader composites top-down). The tilemap
-fragment shader maps each screen pixel to a world cell, then loops its window
-topmost-first — `tile_ids[layer_offsets[i] + cell_index]` — stopping at the first
-non-`invalid_tile_id` hit (or discarding if every composited layer is empty at
-that pixel), derives the atlas cell from the tight grid (`col = id % columns`,
-`row = id / columns`; enforced for every tile at meta load by
-`validateGridEntry`), and samples the atlas. The loop's trip count
-(`TilemapUniform.layer_meta.x`) is the same for every fragment in one draw
-(dynamically uniform), so this is an ordinary bounded GLSL loop with no
-toolchain risk. Draw count scales with how many interleave points exist this
-frame (`Renderer.k_max_dense_composite_draws = 32` is the defensive cap; the
-shipped default config always resolves to 1), never with window depth — cost
-still scales with the **screen**, not the world: ~0.5 MB/layer of tile data and a
-handful of draw calls regardless of world size or render-window depth.
+- **Directory** per resident layer: `side * side` toroidal words, chunk
+  (cx, cy) at `(cy & (side - 1)) * side + (cx & (side - 1))`, then one **link
+  word** holding the next deeper resident layer's directory start
+  (`tile_store_no_link` for the deepest). A word with `tile_store_uniform_bit`
+  set is a uniform chunk whose tile is its low 16 bits; any other word is the
+  absolute offset of the chunk's block. `side` is a power of two covering any
+  chunk window the camera rect can touch (`WorldSystem.render_side`: the rect's
+  chunk span plus one for alignment and the overscan, clamped to the level's
+  grid), so a pan keeps the layout.
+- **Block** per resident mixed chunk-layer: the chunk's tiles in local
+  row-major order, packed two 16-bit ids per `u32` (`packTileData`), 512 B at
+  16-cell chunks. `u32` elements keep the layout free of 16-bit storage
+  extensions.
+
+`TilemapParams` (`sprite_batch.zig`, 80 B, std140, the same field order as the
+shader's `TilemapUniform`) carries the grid and atlas, the chunk shift and
+`side` (`layer_meta.z`/`.w`), the resident chunk window (`window`, moved by
+`Renderer.setTileStoreWindow`), and per draw the layer count, shallowest flag,
+and topmost directory (`layer_meta.x`/`.y`, `chain.x`, from
+`Renderer.applyWindowLayers`). The store records its chunk shift and side at
+creation (`TileStoreDesc.chunk_shift`, `side`; validated there). The shader discards pixels whose chunk is
+outside the window; directory words of chunks outside it are never read. The
+shader and the store layout take the window per draw; the renderer and the
+mirror hold one window per store today.
+`WorldSystem` owns the `@bitSizeOf(TileId) == 16` assert the packing depends on.
+
+GPU memory is at most `L × side² × (E²/2 + 1) × 4 B` for `L` resident layers and
+chunk edge `E`, independent of level size, depth, and world count (derived:
+about 1 MiB for 32 layers at side 8 and 16-cell chunks). The store's only width
+limit is SDL's `u32` byte size: `world_gpu_tiles.residentLayerFit` bounds the
+layers whose directories and a block per window chunk fit, and the sync draws
+only that many, dropping the deepest and logging once. The directory side is
+capped at `tile_store_max_side` (2^14, the largest side whose one directory
+fits); a chunk window wider than that is clipped to it, logged once. No world, level, layer,
+or terrain change is refused (`.claude/rules/budgets-capacities.md`); the store
+reports its resident bytes once per world.
+
+The world draws its resident layers as a small number of **composite** draws,
+not one per layer. `WorldSystem.submitStaticDenseGeometry` cuts the resident
+layers (deepest first, `dense_render.layers`) into buckets at every
+**interleave depth**: a depth something else needs to render strictly between
+two dense layers this frame (`partitionDenseCompositeBuckets`). Interleave
+depths come from `render_prep.collectDenseInterleaveDepths`: `active_level`'s
+own actor depth (always), every distinct dynamic entity/particle depth this
+frame, and every depth of the render window's sparse tiles, since a
+whole-layer composite draw has no per-cell cull and a sparse tile at any
+in-window level needs its own sandwich point; a sparse tile outside the window
+cuts nothing. Candidates dedupe by the gap they
+would cut and drop outside the resident layers' depth span
+(`denseWindowDepthSpan`), so they fit one slot per gap in the world's scratch.
+
+Each bucket becomes one retained world-space quad (`Renderer.beginStaticGeometry`
+/ `appendStaticTilemapSpan`) ordered at the bucket's shallowest layer's
+`denseLayerOrder`, tagged `DrawGroup.material = .tilemap`, with a
+`Renderer.TilemapWindowLayers` naming its topmost directory and layer count
+(`WorldSystem.buildWindowLayers`). The resident layers chain topmost-first, so
+the walk from a bucket's topmost directory visits exactly its layers. The
+fragment shader maps each pixel to a world cell, checks its chunk is in the
+window, then walks the chain: `tileAt` reads the cell's toroidal word and, for a
+mixed chunk, the cell from its block; after a miss it follows the link word. It
+stops at the first non-`invalid_tile_id` hit (or discards when every chained
+layer is empty), derives the atlas cell from the tight grid (`col = id %
+columns`, `row = id / columns`; enforced at meta load by `validateGridEntry`),
+and samples the atlas. The loop's trip count and chain are the same for every
+fragment of a draw (dynamically uniform). Draw count scales with interleave
+points this frame (the shipped default config resolves to 1), never window
+depth or world size; the window table and static spans are reserved to one per
+resident layer.
 
 The fragment shader also applies a fixed-margin rim-darkening (contact-shadow)
 pass on the surface tile's rim where it overhangs a hole: it reads neighboring
-cells' top-layer tile ids from the same tile-data buffer and subtracts a
-falloff from `out_color.rgb` near the edge. This is deliberately not
-derivative-based (`fwidth`) — see the in-shader comment in
-`tilemap.frag.glsl` for why that was rejected.
+cells' top-layer tiles (only for resident chunks) from the same store and
+subtracts a falloff from `out_color.rgb` near the edge. This is deliberately not
+derivative-based (`fwidth`); see the in-shader comment for why.
 
-The camera lives in the vertex shader (Sprite Rendering's `position_transform`), so
-a **pan uploads nothing** — the full-world quads are unchanged. The quads re-submit
-on a structural change (`dense_quads_dirty`), an `active_level`/window change, or
-an interleave-depth-set change (a newly relevant sandwich point) — never on a pan
-alone.
+The camera lives in the vertex shader (Sprite Rendering's `position_transform`),
+so a pan never re-submits vertices: the quads are full-world and the chunk
+window is a store uniform. The quads re-submit on a layer or store change
+(`dense_quads_dirty`), an `active_level`/window change, or an interleave-depth
+change (`.claude/rules/render.md`).
 
-A **dig/build** (`setDenseTile`) writes the CPU tile field — the source of truth for
-collision and gameplay — and queues a single-cell GPU edit. `flushDenseTileEdits`
-applies all of a frame's queued edits in one batched copy pass
-(`Renderer.uploadTileDataEdits`) at the render boundary: a dig is one storage-buffer
-element write, no full re-upload and no vertex work.
+`WorldSystem.syncDenseTileStore` runs once per frame in render prep, on the
+main thread before `ensureStaticGeometryCapacity`, `submitStaticDenseGeometry`,
+and swapchain acquisition. It plans first (`GpuTileMirror.plan` sizes every span
+and reserves every growth, the frame's dense render scratch included, changing
+nothing a retry depends on), then commits and queues one upload batch
+(`Renderer.queueTileStoreUploads`) recorded in the frame's one copy pass. The queue
+cannot fail once `reserveTileStoreUploads` covered its counts (it returns `void`),
+so the mirror commits its side before queueing; it validates the batch's spans
+once, and `recordStorageSpansInPass` only asserts. Spans
+are whole units (a directory, a word, a link, a block), so a batch
+carried from a skipped frame folds into the next (`mergeTileStoreSpans`), newer
+values winning. `Renderer.reserveTileStoreUploads` reserves the CPU upload lists
+before it grows the store's GPU buffer, so any reserve failure (`OutOfMemory`,
+`GpuBufferTooLarge`, `SdlError`) leaves the store's capacity, pending batch, and
+growth source unchanged for retry.
+
+- **Residency.** When the active level, the level window, the chunk window, the
+  side, or the layer set changed (an unchanged window skips the staying layers'
+  rederive): layers leaving free their directory and
+  window blocks; staying layers free the blocks of chunks leaving the window and
+  upload each entering chunk's word and, when mixed, its block; entering layers
+  upload their directory and their mixed window chunks' blocks; a staying layer
+  whose next deeper layer changed rewrites its link word. A side change (a
+  viewport crossing a power of two) lays the window out anew in a new store;
+  the old one is swept. A layer added in play on an in-window level enters at
+  the next sync.
+- **Edits.** A dig/build (`setDenseTile`, or a batched `applyDenseCellWrites`)
+  writes the CPU chunk store, the source of truth, which marks each block it
+  takes or changes (`BlockFill.changed`, render-only, never saved). A change on a
+  resident layer also flags the layer (`render_changed`) and the world
+  (`resident_layers_changed`); edits hold no GPU-side memory, so a world nobody renders
+  pays nothing for them. The next sync scans each flagged layer's chunks in the
+  window and compares the CPU form with the uploaded directory word: a chunk
+  that split takes a block and uploads its word and whole block, one that
+  returned to a single tile frees its block and uploads its word, a uniform
+  chunk at a new tile uploads its word, and a mixed chunk whose block is marked
+  uploads the whole block once. Every uploaded block's mark and every resident
+  flag clear at commit. A change on a chunk outside the window, or on a layer
+  not resident, uploads nothing; the chunk uploads whole when it enters.
+- **Cost.** Steady frame O(resident layers): the plan's per-slot scan and the
+  interleave collect. Pan across a chunk boundary O(L × Wc) CPU (`Wc`
+  window chunks) and O(L × e) uploads (`e` window edge in chunks), GPU memory
+  flat (`chunk-scale-gpu-sync-pan`, which also varies L at 2, 8, and 32).
+  Active level change O(L × Wc + the entering layer's mixed window blocks)
+  (`chunk-scale-gpu-sync-level-enter`, flat across level size and depth, L at
+  2, 8, and 32). One dig: an O(Wc) scan of its layer and one word or block
+  upload (`chunk-scale-gpu-sync-dig`, measured `639f55d`: flat across level size
+  and depth, linear in window chunks at about 82 ns per window chunk per flagged
+  layer, Debug). A batched change over many resident layers: one scan and its
+  uploads per written layer (measured linear in written layers, about 61 µs per
+  layer, upload-bound, Debug). Never dependent on chunks or levels
+  outside the window. Serial render-boundary work, O(window).
+
+The world holds only a non-owning, generational `TileDataId` (slot index plus
+generation, the `TextureId` pattern); no game teardown releases the store.
+`syncDenseTileStore` claims it every frame (`Renderer.claimTileStore`), and the
+first statement of `Renderer.endFrame` sweeps the stores: a live store nobody
+claimed since the previous sweep is retired, its slot's generation advances so
+every issued id goes stale, and SDL frees the buffer once in-flight frames
+finish (no device drain). So a destroyed or replaced world's store goes at the
+next `endFrame`, as does the store of a world whose state stops rendering
+(`render_below = false`) or loses the camera. Retained tilemap draws naming a
+stale id resolve to no store and are skipped. When a claim fails, the world
+resets its mirror (no layer resident, no layout, empty allocator, capacity
+kept) and the next sync re-uploads the window into a new store. Cost (derived):
+O(1) claim per frame; the sweep walks the store-slot high water, O(stores) per
+frame; a reset re-uploads O(L × side² + mixed window blocks).
+`Renderer.deinit` releases any stores still live.
 
 Two pipelines share the ordered draw list. The renderer binds the **sprite** or
-**tilemap** pipeline on a `DrawGroup.material` change; tilemap groups additionally
-bind the (now shared) tile-data storage buffer (rebound per group, covering a
-Metal storage-slot shift) and a small grid/atlas/composited-layer-window fragment
-uniform (`Renderer.applyWindowLayers`, keyed by `DrawGroup.window_slot` into a
-per-frame side table populated by `appendStaticTilemapSpan`). Only sprite groups
-coalesce — every tilemap group is its own draw, distinguished by its composited
-layer window rather than a distinct buffer. Multi-z is native: a composite draw's
-order is its bucket's shallowest layer, and the order-merged draw list interleaves
-it with dynamic entities and sparse tiles, so an actor in a dug pit — or a sparse
-tile on any in-window level — renders between the floor below and walls above.
+**tilemap** pipeline on a `DrawGroup.material` change; tilemap groups
+additionally bind the world's tile store (rebound per group, covering a Metal
+storage-slot shift) and push the store's params with the draw's chain
+(`Renderer.applyWindowLayers`, keyed by `DrawGroup.window_slot` into the side
+table `appendStaticTilemapSpan` fills). Only sprite groups coalesce. Multi-z is
+native: a composite draw's order is its bucket's shallowest layer, and the
+order-merged draw list interleaves it with dynamic entities and sparse tiles, so
+an actor in a dug pit, or a sparse tile on any in-window level, renders between
+the floor below and walls above.
 
 ### Dense render window policy (Slice 23B)
 
-Vertical scale is a **submit/draw** policy problem, not a per-tile vertex or
-full-buffer residency problem. Every authored dense layer's cells still land in
-the one combined GPU tile-data storage buffer at load
-(`uploadDenseTileDataBuffer`); memory scales with total level count × cell count.
-The render window bounds how many of those layers become static tilemap draw
-groups each frame.
+The render window sets which dense layers are resident in the world's GPU tile
+store and drawn each frame; the camera's chunk window sets which of their chunks
+are resident. GPU memory follows the window's layers times its chunks, never
+the level's area, the world's depth, or the levels outside the window.
 
 Default `DenseLayerRenderWindow` (`world_system.zig`):
 
@@ -228,42 +341,35 @@ Default `DenseLayerRenderWindow` (`world_system.zig`):
 | `levels_below` | `6` | Submit `active_level` through `active_level + 6` (inclusive). |
 | `ceiling_when_underground` | `false` | Opt-in only: redraws the full ceiling plane and breaks player-level follow. Surface hole see-through uses `levels_below` while `active_level == 0`. |
 
-`world_system.zig`'s struct default is conservative for arbitrary callers, but
-composite-draw bucketing (below) decouples fragment cost from window depth, so
-`game_demo_state.zig`'s procedural world config now widens `levels_below` to
-`procedural_underground_count` (the full authored 31-level underground stack) —
-`1 + levels_below` exactly fills `k_max_dense_submit_stack_cap = 32`, checked by
-a `comptime` assert alongside `validateDenseRenderBudget`. Widening the window
-no longer costs extra fragment invocations in the common case (still 1 composite
-draw); it does not change the GPU tile-data memory bound, which already sizes
-for every authored layer regardless of window depth.
+`game_demo_state.zig`'s procedural world widens `levels_below` to the full
+authored underground stack: composite bucketing keeps fragment cost off window
+depth in the common case (one draw), and the chain carries any number of
+layers. `collectDenseSubmitLayers` visits only the window's levels through their
+band lists, sorts back-to-front, and lists them topmost-first for the chain.
+Nothing caps the window's layers except the store width fit above.
+`render_prep.staticGeometryCapacity` reserves one span per resident layer
+(`WorldSystem.maxDenseSubmitDrawCount`), the most composite draws a frame can
+cut.
 
-`collectDenseSubmitLayers` filters by `levelInWindow`, then sorts back-to-front
-before append — this contract is unchanged by composite-draw bucketing.
-`maxDenseSubmitLayerCount` derives the **layer** cap from the window and
-`max_dense_bands_per_level`; `validateDenseRenderBudget` fails at world build if
-the window exceeds `k_max_dense_submit_stack_cap` or optional
-`WorldBuildConfig.max_dense_tile_gpu_bytes` — this bounds GPU tile-data memory
-and the depth-ascending collection buffer, not draw count. The separate
-**draw**-count cap is `WorldSystem.maxDenseSubmitDrawCount()`
-(`Renderer.k_max_dense_composite_draws`): the actual bucket count is
-data-dependent per frame (how many interleave points exist), so this is the
-worst case. `render_prep.staticGeometryCapacity` sources its span/vertex
-reservation from `maxDenseSubmitDrawCount()` (the fixed composite-draw bound),
-not `maxDenseSubmitLayerCount()` — reservation stays flat regardless of window
-depth, since every direct `appendStaticTilemapSpan` caller now builds one span
-per bucket rather than one per layer.
-
-**Sparse/dense boundary:** chunk visibility (`setVisibleChunksForWorldRect`)
-still culls sparse tiles and sizes dynamic sparse prep (`reserveRenderRecords`);
-it does not drive dense floor submit or bucketing — a sparse tile becomes an
-interleave point purely by being *registered* at some depth
-(`WorldSystem.sparseDepthRangeCount`/`sparseDepthRangeAt` walk every registered
-depth, not only the currently visible ones), independent of camera position.
-Each dense composite draw is one full-world quad regardless of camera
-pan — panning uploads nothing. Sparse overlays and dense composite draws
-interleave in the merged draw list by `RenderOrder`; per-entity depth cull
-(Slice 25E) is separate from this floor window.
+**Sparse/dense boundary:** the window update (`setVisibleChunksForWorldRect`,
+which also takes the active level and sets `render_side`) builds the window's
+sparse list: the sparse tiles on the render window's levels, in its chunks
+(through the per-chunk sparse index) and inside its tile bounds, sorted by
+(depth, cell, tile id) with one range per distinct depth. It counts, reserves,
+then fills, so work and memory follow the tiles in the window (O(window levels
+× window chunks + V log V)), never the world's sparse count, level size, or
+depth; an allocation failure leaves the previous window and list in place and
+the next call retries. A still camera or sub-tile pan returns early.
+`addSparseTile` is O(1) and marks the list for rebuild only when the tile lands
+inside the current window; a sparse tile removal (a ramp exit clear) marks it
+when the removed tile is inside the window or the removal moves a listed row to
+a new index. Nothing is listed before a window is set. Dynamic
+sparse prep reserves `reserveRenderRecords` (the list's length);
+`sparseDepthRangeCount`/`sparseDepthRangeAt` give the window's sparse depths
+for interleave points, and `submitVisibleSparseRange` submits one range. Draw
+order never depends on a tile's storage index. Sparse overlays and dense
+composite draws interleave in the merged draw list by `RenderOrder`;
+per-entity depth cull (Slice 25E) is separate from this floor window.
 
 ### Dynamic entity collect (Slice 24B)
 
@@ -289,7 +395,7 @@ Gates before interpolation and `PreparedDraw` construction (in order):
 **Simulation tier is not consulted.** Slice 24 LOD (`dormant`/`kinematic`/etc.)
 controls fixed-step processor participation only. Render visibility is camera
 policy only — an on-screen `dormant` row still draws; an off-screen `cognition`
-row does not. Do not add `allowsRender`-style predicates on `SimulationTier`.
+row does not.
 
 **Dense floors (separate cost model):** in-window dense layers submit as a small,
 bounded number of composite tilemap quads (see GPU-Driven Tilemap), not one draw
@@ -299,7 +405,7 @@ is a future optimization if profiling requires it.
 
 A pre-built visible movement dense-index list (parallel to scoped simulation
 gathers) is tracked under **Scaling Gaps And Hardening Frontier** in
-`docs/framework-implementation-slices.md`.
+[`docs/roadmap/scaling-gaps.md`](roadmap/scaling-gaps.md).
 
 ### Tile storage upload `cycle` policy (Slice 23A)
 
@@ -311,26 +417,29 @@ not.** The fixed loop does not fence between frames, so any buffer touched on
 frame N+1 while frame N's copy is still in flight must cycle to rotate to fresh
 backing, or the new write lands on memory the in-flight copy is still reading.
 
-- The combined tile-data storage buffer is retained and written partially (one
-  cell per dig edit), so its destination upload passes `cycle=false`. Cycling it
-  would ping-pong GPU storage and flip visible tiles while CPU state stays
-  correct.
-- The renderer's pooled tile-edit transfer buffer is reused across frames and
+- A world's GPU tile store is retained and written partially (one directory
+  word or one whole block per changed chunk), so its span uploads and growth
+  copies pass `cycle=false`. Cycling it would ping-pong GPU storage and flip
+  visible tiles while CPU state stays correct.
+- The renderer's pooled tile-upload transfer buffer is reused across frames and
   fully re-staged each frame, so its source map passes `cycle=true`, exactly like
-  the vertex-stream staging in `stageVertices`.
-- A one-shot transfer buffer allocated for a single upload
-  (`uploadStorageRegions`) is never reused, so its source map passes
-  `cycle=false`.
+  the vertex-stream staging in `stageVertices`. A frame whose staged values
+  outgrow it replaces it pre-acquire with one at least twice its size (clamped to
+  the `u32` byte width): the new transfer is created first and the old one
+  released to SDL, which frees it after in-flight copies, so growth never drains
+  the device. Replacements count in `Renderer.tile_upload_transfer_grows`; the
+  first logs once at info. If the doubled transfer cannot be created, one retry
+  creates it at exactly the frame's size.
 
 | Resource | `cycle` on upload / map |
 | --- | --- |
 | Dynamic/static **vertex** streams (per-frame ring) | `true` on the last **vertex** upload in the copy pass |
-| **Tile-data storage** buffer (combined, retained) | destination upload **always `false`** |
-| Tile-edit transfer buffer, pooled (`stageStorageRegions`) | source map **`true`** |
-| Tile-edit transfer buffer, one-shot (`uploadStorageRegions`) | source map `false` |
+| **Tile store** (per world, retained) | span upload and growth copy **always `false`** |
+| Tile-upload transfer buffer, pooled (`stageTileStoreUploads`) | source map **`true`** |
 
-Tile edits are excluded from the vertex upload `cycle` counter; they are batched
-in the post-acquire copy pass via `recordStorageRegionsInPass`.
+Tile-store uploads are excluded from the vertex upload `cycle` counter; they are
+staged pre-acquire and recorded in the post-acquire copy pass
+(`recordStorageSpansInPass`, `recordStorageCopyInPass`).
 
 Digging authors two kinds of tile edit. A *hole* clears the cell to
 `invalid_tile_id`, which the tilemap fragment shader discards (see-through to the
@@ -395,8 +504,8 @@ metadata sidecars are required even when optional character/item textures fall
 back to primitive rendering; missing or invalid sidecars fail startup instead
 of leaving partial metadata behind.
 
-`GameDemoState` owns `WorldSystem`, which stores tile IDs, atlas source-rect
-columns, level z columns, and chunk/visibility columns in SoA form. World
+`GameDemoState` owns `WorldSystem`, which stores tile IDs (dense layers per
+chunk), atlas source-rect columns, and level z columns. World
 construction requires `.world_tileset` metadata, and world render enqueue
 requires the `.world_tileset` texture; missing world atlas data is an error, not
 a primitive rectangle fallback. The runtime loading path builds the procedural
@@ -430,9 +539,7 @@ Asset paths are relative to the configured asset root and reject empty paths,
 absolute paths, `.` components, and `..` traversal.
 
 PNG image loading uses core SDL3 `SDL_LoadPNG` support in the asset layer; this
-project does not require `SDL3_image`. Do not add `SDL3_image` unless that
-dependency is explicitly chosen for a feature that core SDL3 PNG loading cannot
-reasonably cover.
+project does not use `SDL3_image` (`.claude/rules/engine-design.md`).
 
 The asset cache maps validated relative PNG paths to renderer `TextureId`
 values. Loading the same path decodes PNG data through `AssetStore`, uploads
@@ -441,11 +548,11 @@ acquires, and increments a retain count. `TextureLease` is a non-owning retained
 texture token; it does not store an `AssetCache` pointer or renderer/backend
 context. It still carries enough identity for the cache to reject stale,
 forged, or wrong-owner releases before retiring a slot. Owners that hold leases
-release them through `AssetCache.releaseTexture(renderer, &lease)` before
-renderer teardown. Gameplay and render prep should store or pass
-`SpriteAssetId`, not paths, `TextureId`, `TextureLease`, or prepared sprite
-records. Cache lookup and retain/release are setup-time operations; per-frame
-rendering should use the startup catalog and retained IDs directly.
+release them through `AssetCache.releaseTextureWithContext(backend_context, &lease)`
+before renderer teardown; `RuntimeAssets` is the owner that does so for startup
+sprites. Gameplay and render prep pass `SpriteAssetId`; cache
+lookup and retain/release happen at setup, and per-frame rendering uses the
+startup catalog and retained IDs directly.
 
 `RuntimeAssets` owns startup sprite leases. Missing declared content marks that
 asset unavailable and keeps startup moving; fatal preload errors release partial
@@ -486,17 +593,50 @@ pipeline module, such as `src/render/gpu/sprite_pipeline.zig` (or
 `tilemap_pipeline.zig` for the storage-buffer example), while keeping `Renderer`
 as the game-facing facade.
 
-Keep shader resource bindings aligned with SDL_GPU's layout rules:
+Shader resource bindings follow SDL_GPU's layout:
 
+- vertex sampled textures/samplers, then storage textures, then storage buffers:
+  set 0
 - vertex uniform buffers: set 1
-- fragment sampled textures/samplers: set 2, then fragment storage buffers in the
-  same set after the samplers (so one sampler + one storage buffer are bindings 0
-  and 1, bound via separate `SDL_BindGPUFragmentSamplers` / `…StorageBuffers` slots)
+- fragment sampled textures/samplers, then storage textures, then storage
+  buffers: set 2 (so one sampler + one storage buffer are bindings 0 and 1,
+  bound via separate `SDL_BindGPUFragmentSamplers` / `…StorageBuffers` slots)
 - fragment uniform buffers: set 3
 
-The build converts those SPIR-V bindings to SDL-compatible MSL resource bindings
-for macOS through `spirv-cross`. Windows DXIL uses the HLSL generated by
-`spirv-cross` and compiled with `dxc -E main -T vs_6_0` or `ps_6_0`.
+The build converts those SPIR-V bindings to MSL for macOS through `spirv-cross
+--msl-decoration-binding`, so each resource's MSL index is its SPIR-V binding
+rather than an order spirv-cross infers from the shader's code shape. Decoration
+binding drops the descriptor set, so a stage's storage buffers and uniform
+buffers share one `[[buffer]]` namespace, and SDL_GPU's Metal backend binds that
+namespace as uniform buffers first, then storage buffers. For each stage that
+has storage buffers (vertex: set 0 against set 1 uniform buffers; fragment:
+set 2 against set 3 uniform buffers), the first storage buffer's SPIR-V binding
+(the samplers and storage textures before it) must equal that stage's
+uniform-buffer count. SDL binds vertex buffers at `[[buffer(14)]]` and up, so
+vertex-stage buffer bindings must stay below 14.
+
+Declare samplers as combined `sampler2D`. Separate `texture2D`/`sampler` objects
+each take their own SPIR-V binding, so the texture and sampler indices diverge
+and SDL's pairing of sampler `n` with texture `n` breaks.
+
+A shader whose layout cannot meet those rules needs explicit MSL resource
+remapping; the installed `spirv-cross` CLI has no resource-remap option. The
+options are SDL_shadercross (SDL-aware reflection; not a current build
+dependency) or a small build-time tool that drives the `spirv-cross` C API's MSL
+resource-binding calls (`spvc_compiler_msl_add_resource_binding`).
+
+Each `shader_programs` stage sets `msl_entry_signature`: the exact generated MSL
+entry-point parameter list, from `main0(` through the closing `)`. spirv-cross
+emits it on one line, so an added, removed, reordered, or re-indexed resource
+changes it, and the build's check-file step then fails `zig build shaders`. A
+comptime check in `build.zig` requires every stage to set it. This guard exists
+because Metal binds a mismatched slot silently and only rejects duplicate
+indices at shader creation. When a shader's resources change, confirm the new
+layout follows the rules above, then copy the new signature from the generated
+`.msl`.
+
+Windows DXIL uses the HLSL generated by `spirv-cross` and compiled with
+`dxc -E main -T vs_6_0` or `ps_6_0`.
 
 ## Debug Overlay
 

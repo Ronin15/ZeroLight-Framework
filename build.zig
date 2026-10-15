@@ -43,11 +43,13 @@ const shader_programs = [_]ShaderProgram{
                 .stage = .vertex,
                 .source_path = "assets/shaders/sprite.vert.glsl",
                 .output_stem = "sprite.vert",
+                .msl_entry_signature = "main0(main0_in in [[stage_in]], constant FrameUniform& u [[buffer(0)]])",
             },
             .{
                 .stage = .fragment,
                 .source_path = "assets/shaders/sprite.frag.glsl",
                 .output_stem = "sprite.frag",
+                .msl_entry_signature = "main0(main0_in in [[stage_in]], texture2d<float> sprite_texture [[texture(0)]], sampler sprite_textureSmplr [[sampler(0)]])",
             },
         },
     },
@@ -58,23 +60,32 @@ const shader_programs = [_]ShaderProgram{
                 .stage = .vertex,
                 .source_path = "assets/shaders/tilemap.vert.glsl",
                 .output_stem = "tilemap.vert",
+                .msl_entry_signature = "main0(main0_in in [[stage_in]], constant FrameUniform& u [[buffer(0)]])",
             },
             .{
                 .stage = .fragment,
                 .source_path = "assets/shaders/tilemap.frag.glsl",
                 .output_stem = "tilemap.frag",
+                .msl_entry_signature = "main0(main0_in in [[stage_in]], constant TilemapUniform& tm [[buffer(0)]], const device TileData& tiles [[buffer(1)]], texture2d<float> atlas_texture [[texture(0)]], sampler atlas_textureSmplr [[sampler(0)]])",
             },
         },
     },
 };
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Release modes default to the shipped CPU floor (x86-64-v2: SSE4.2 and
+    // POPCNT, which the chunk bit ops use; apple_m1 on macOS arm64; otherwise
+    // the arch baseline, NEON on aarch64); Debug stays native. -Dtarget/-Dcpu
+    // override.
+    const target = b.standardTargetOptions(.{ .default_target = switch (optimize) {
+        .safe, .fast, .small => shippedCpuFloor(b.graph.host.result),
+        .debug => .{},
+    } });
     const app_name = b.option([]const u8, "app-name", "Executable name") orelse "my-sdl3-game";
     const window_title = b.option([]const u8, "window-title", "SDL window title") orelse "SDL3 Zig Game";
     const asset_root = b.option([]const u8, "asset-root", "Runtime asset directory") orelse "assets";
-    const gpu_debug = b.option(bool, "gpu-debug", "Enable SDL_GPU debug validation") orelse (optimize == .Debug);
+    const gpu_debug = b.option(bool, "gpu-debug", "Enable SDL_GPU debug validation") orelse (optimize == .debug);
     const shader_compiler = b.option([]const u8, "shader-compiler", "GLSL to SPIR-V compiler") orelse "glslc";
     const shader_cross_compiler = b.option([]const u8, "shader-cross-compiler", "SPIR-V to platform shader compiler") orelse "spirv-cross";
     const dxil_compiler = b.option([]const u8, "dxil-compiler", "HLSL to DXIL compiler") orelse "dxc";
@@ -88,13 +99,14 @@ pub fn build(b: *std.Build) void {
     // uses threads) adds real overhead across the many cases/items a bench run sweeps and isn't
     // useful for reading a benchmark table. An explicit -Dlog-level=debug still overrides this
     // for bench troubleshooting, same as it does for the game build.
-    const bench_log_level = parseLogLevel(log_level_arg, .ReleaseFast);
+    const bench_log_level = parseLogLevel(log_level_arg, .fast);
     const gpu_shader_formats = shaderFormatsForTarget(target.result.os.tag);
-    // Full LTO needs LLVM+LLD. Zig 0.16 rejects LLD for Mach-O, so Darwin
-    // ReleaseFast stays without LTO; Linux/Windows ship with `-flto=full`.
-    const release_lto = optimize == .ReleaseFast and ltoSupportedForTarget(target.result);
-    const force_llvm_lld: ?bool = if (release_lto) true else forceLlvmLldForTarget(target);
+    // Full LTO needs LLVM+LLD. Linux ships with `-flto=full`; Darwin and
+    // Windows do not (see `ltoSupportedForTarget`).
+    // Every other artifact and mode uses Zig's default backend/linker selection.
+    const release_lto = optimize == .fast and ltoSupportedForTarget(target.result);
     const windows_sdl = configureWindowsSdl(b, target.result, system_sdl, sdl_root);
+    const windows_sdl_checks = windowsSdlValidateSteps(windows_sdl);
 
     const buildOptions = b.addOptions();
     buildOptions.addOption([]const u8, "app_name", app_name);
@@ -102,7 +114,7 @@ pub fn build(b: *std.Build) void {
     buildOptions.addOption([]const u8, "asset_root", asset_root);
     buildOptions.addOption(bool, "gpu_debug", gpu_debug);
     buildOptions.addOption(bool, "debug_overlay", debug_overlay);
-    buildOptions.addOption(u8, "log_level", @intFromEnum(log_level));
+    buildOptions.addOption(u8, "log_level", @backingInt(log_level));
     buildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
 
     const benchBuildOptions = b.addOptions();
@@ -111,49 +123,53 @@ pub fn build(b: *std.Build) void {
     benchBuildOptions.addOption([]const u8, "asset_root", asset_root);
     benchBuildOptions.addOption(bool, "gpu_debug", gpu_debug);
     benchBuildOptions.addOption(bool, "debug_overlay", debug_overlay);
-    benchBuildOptions.addOption(u8, "log_level", @intFromEnum(bench_log_level));
+    benchBuildOptions.addOption(u8, "log_level", @backingInt(bench_log_level));
     benchBuildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
 
-    const fetch_sdl_step = b.step("fetch-sdl", "Fetch pinned Windows SDL packages into Zig's package cache");
+    const fetch_sdl_step = b.step("fetch-sdl", "Fetch pinned Windows SDL packages into zig-pkg/ and validate them");
     if (target.result.os.tag != .windows) {
         fetch_sdl_step.dependOn(&b.addFail("fetch-sdl is only needed for Windows targets").step);
     } else switch (windows_sdl) {
-        .packages => |packages| fetch_sdl_step.dependOn(packages.validate_step),
+        .packages => for (windows_sdl_checks) |check| fetch_sdl_step.dependOn(check),
         .pending => {},
         .local => fetch_sdl_step.dependOn(&b.addFail("fetch-sdl is bypassed when -Dsdl-root is provided").step),
         .system => fetch_sdl_step.dependOn(&b.addFail("fetch-sdl is only needed for Windows package SDL; remove -Dsystem-sdl=true").step),
     }
 
-    const exeModule = createGameModule(b, target, optimize, buildOptions, windows_sdl);
+    // One shared TranslateC step for the SDL headers (Zig 0.17 removed `@cImport`); every
+    // SDL-linked module imports the same translated `sdl_c` module.
+    const sdl_translate_c = createSdlTranslateC(b, target, optimize, windows_sdl);
+    const sdl_c_module = sdl_translate_c.createModule();
+
+    const exeModule = createGameModule(b, target, optimize, buildOptions, windows_sdl, sdl_c_module);
 
     const exe = b.addExecutable(.{
         .name = app_name,
         .root_module = exeModule,
-        .use_llvm = force_llvm_lld,
-        .use_lld = force_llvm_lld,
+        // LTO requires LLVM+LLD; force them explicitly rather than relying on
+        // the ReleaseFast default. Otherwise use Zig's default selection.
+        .use_llvm = if (release_lto) true else null,
+        .use_lld = if (release_lto) true else null,
     });
 
-    const gpuSmokeModule = createSdlModule(b, target, optimize, buildOptions, "src/gpu_smoke.zig", windows_sdl);
+    const gpuSmokeModule = createSdlModule(b, target, optimize, buildOptions, "src/gpu_smoke.zig", windows_sdl, sdl_c_module);
     const gpu_smoke_exe = b.addExecutable(.{
         .name = "gpu-smoke",
         .root_module = gpuSmokeModule,
-        .use_llvm = force_llvm_lld,
-        .use_lld = force_llvm_lld,
     });
 
-    const benchModule = createSdlModule(b, target, optimize, benchBuildOptions, "src/benchmark_runner.zig", windows_sdl);
+    const benchModule = createSdlModule(b, target, optimize, benchBuildOptions, "src/benchmark_runner.zig", windows_sdl, sdl_c_module);
     const bench_exe = b.addExecutable(.{
         .name = "benchmarks",
         .root_module = benchModule,
-        .use_llvm = force_llvm_lld,
-        .use_lld = force_llvm_lld,
     });
 
-    const unitTestsModule = createSdlModule(b, target, optimize, buildOptions, "src/tests.zig", windows_sdl);
+    const unitTestsModule = createSdlModule(b, target, optimize, buildOptions, "src/tests.zig", windows_sdl, sdl_c_module);
+    // Repeatable; only tests whose names contain one of these texts compile and run.
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
     const unit_tests = b.addTest(.{
         .root_module = unitTestsModule,
-        .use_llvm = force_llvm_lld,
-        .use_lld = force_llvm_lld,
+        .filters = test_filters,
     });
 
     // Ship/package mode: full LTO (`-flto=full`) for cross-module inlining and
@@ -163,7 +179,8 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
-    const windows_sdl_runtime = addWindowsSdlRuntimeDependencies(b, windows_sdl, &.{
+    const windows_sdl_runtime = addWindowsSdlRuntimeDependencies(b, windows_sdl, windows_sdl_checks, &.{
+        &sdl_translate_c.step,
         &exe.step,
         &gpu_smoke_exe.step,
         &bench_exe.step,
@@ -184,14 +201,14 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&gpu_smoke_exe.step);
     check_step.dependOn(&bench_exe.step);
 
+    const fmt_paths: []const std.Build.LazyPath = &.{
+        b.path("build.zig"),
+        b.path("build.zig.zon"),
+        b.path("src"),
+    };
     const fmt_step = b.step("fmt", "Format Zig source files");
-    fmt_step.dependOn(&b.addFmt(.{
-        .paths = &.{
-            "build.zig",
-            "build.zig.zon",
-            "src",
-        },
-    }).step);
+    fmt_step.dependOn(&b.addFmt(.{ .paths = fmt_paths }).step);
+    const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
 
     const shaders_step = b.step("shaders", "Compile and install platform GPU shaders");
     for (shader_outputs.install_steps) |install_step| {
@@ -202,10 +219,8 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     addWindowsSdlRunRuntime(run_cmd, windows_sdl_runtime);
-    run_cmd.setCwd(.{ .cwd_relative = b.getInstallPath(.bin, "") });
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.setCwd(.{ .relative = .{ .base = .install_bin } });
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
@@ -219,9 +234,7 @@ pub fn build(b: *std.Build) void {
 
     const bench_run = b.addRunArtifact(bench_exe);
     addWindowsSdlRunRuntime(bench_run, windows_sdl_runtime);
-    if (b.args) |args| {
-        bench_run.addArgs(args);
-    }
+    bench_run.addPassthruArgs();
     const bench_step = b.step("bench", "Run CPU gameplay processor benchmarks");
     bench_step.dependOn(&bench_run.step);
 
@@ -239,6 +252,7 @@ pub fn build(b: *std.Build) void {
     verify_step.dependOn(shaders_step);
     verify_step.dependOn(&assets_lint_cmd.step);
     verify_step.dependOn(&idiom_lint_cmd.step);
+    verify_step.dependOn(&fmt_check.step);
 
     const gpu_smoke_run = b.addRunArtifact(gpu_smoke_exe);
     addWindowsSdlRunRuntime(gpu_smoke_run, windows_sdl_runtime);
@@ -248,7 +262,7 @@ pub fn build(b: *std.Build) void {
     for (shader_outputs.install_steps) |install_step| {
         gpu_smoke_run.step.dependOn(install_step);
     }
-    gpu_smoke_run.setCwd(.{ .cwd_relative = b.getInstallPath(.bin, "") });
+    gpu_smoke_run.setCwd(.{ .relative = .{ .base = .install_bin } });
     const gpu_smoke_step = b.step("gpu-smoke", "Create an SDL_GPU device and submit one frame");
     gpu_smoke_step.dependOn(&gpu_smoke_run.step);
 
@@ -258,21 +272,68 @@ pub fn build(b: *std.Build) void {
 
 fn createGameModule(
     b: *std.Build,
-    target: anytype,
-    optimize: std.builtin.OptimizeMode,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
     build_options: *std.Build.Step.Options,
     windows_sdl: WindowsSdlConfig,
+    sdl_c_module: *std.Build.Module,
 ) *std.Build.Module {
-    return createSdlModule(b, target, optimize, build_options, "src/main.zig", windows_sdl);
+    return createSdlModule(b, target, optimize, build_options, "src/main.zig", windows_sdl, sdl_c_module);
+}
+
+/// Translates `src/platform/sdl_c.h` (SDL3, SDL3_ttf, SDL3_mixer) once for the whole build.
+/// Header search paths and C macros live here, not on the Zig modules: since Zig 0.17
+/// replaced `@cImport` with a build-graph TranslateC step, no module compiles C itself.
+fn createSdlTranslateC(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    windows_sdl: WindowsSdlConfig,
+) *std.Build.Step.TranslateC {
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/platform/sdl_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (target.result.os.tag == .windows) {
+        // Zig's Windows GNU target uses bundled MinGW-w64 headers; their release-mode
+        // fortify wrappers do not translate cleanly through translate-c.
+        translate_c.defineCMacro("_FORTIFY_SOURCE", "0");
+    }
+    switch (windows_sdl) {
+        .local => |local| {
+            for (windows_sdl_dependencies) |dependency| {
+                translate_c.addIncludePath(windowsSdlLocalPath(b, local.root, dependency.root_dir, "include"));
+            }
+        },
+        .packages => |packages| {
+            for (packages.packages) |package| {
+                translate_c.addIncludePath(windowsSdlPackagePath(package, "include"));
+            }
+        },
+        .system => {
+            // System SDL headers may only be reachable through pkg-config `--cflags`
+            // (custom prefix + PKG_CONFIG_PATH, MacPorts, Homebrew). TranslateC applies
+            // pkg-config only for libraries linked on the step itself. Limited to `.system`:
+            // pkg-config has no cross-target guard, so the Windows `.local`/`.packages` arms
+            // would leak host include paths into a cross translation.
+            translate_c.linkSystemLibrary("SDL3", .{});
+            translate_c.linkSystemLibrary("SDL3_ttf", .{});
+            translate_c.linkSystemLibrary("SDL3_mixer", .{});
+        },
+        .pending => {},
+    }
+    return translate_c;
 }
 
 fn createSdlModule(
     b: *std.Build,
-    target: anytype,
-    optimize: std.builtin.OptimizeMode,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
     build_options: *std.Build.Step.Options,
     root_source_file: []const u8,
     windows_sdl: WindowsSdlConfig,
+    sdl_c_module: *std.Build.Module,
 ) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path(root_source_file),
@@ -281,21 +342,15 @@ fn createSdlModule(
         .link_libc = true,
     });
     mod.addOptions("build_options", build_options);
-    if (target.result.os.tag == .windows) {
-        // Zig's Windows GNU target uses bundled MinGW-w64 headers; their release-mode
-        // fortify wrappers do not translate cleanly through @cImport in Zig 0.16.
-        mod.addCMacro("_FORTIFY_SOURCE", "0");
-    }
+    mod.addImport("sdl_c", sdl_c_module);
     switch (windows_sdl) {
         .local => |local| {
             for (windows_sdl_dependencies) |dependency| {
-                mod.addIncludePath(windowsSdlLocalPath(b, local.root, dependency.root_dir, "include"));
                 mod.addLibraryPath(windowsSdlLocalLibPath(b, local, dependency));
             }
         },
         .packages => |packages| {
             for (packages.packages) |package| {
-                mod.addIncludePath(windowsSdlPackagePath(package, "include"));
                 mod.addLibraryPath(windowsSdlPackageLibPath(b, package, packages.arch_subdir));
             }
         },
@@ -330,13 +385,13 @@ const WindowsSdlDependency = struct {
 const WindowsSdlLocalConfig = struct {
     root: []const u8,
     arch_subdir: []const u8,
-    validate_step: *std.Build.Step,
+    validate_steps: []const *std.Build.Step,
 };
 
 const WindowsSdlPackageConfig = struct {
     arch_subdir: []const u8,
     packages: []const WindowsSdlPackage,
-    validate_step: *std.Build.Step,
+    validate_steps: []const *std.Build.Step,
 };
 
 const WindowsSdlPackage = struct {
@@ -346,7 +401,9 @@ const WindowsSdlPackage = struct {
 
 const WindowsSdlRuntimeDependencies = struct {
     install_steps: []const *std.Build.Step,
-    path_dirs: []const []const u8,
+    /// Full PATH value for Run steps (SDL DLL dirs prepended), or null when the host is
+    /// not Windows or SDL comes from the system.
+    path_env: ?[]const u8,
 };
 
 const WindowsSdlValidationEntry = struct {
@@ -354,46 +411,35 @@ const WindowsSdlValidationEntry = struct {
     path: std.Build.LazyPath,
 };
 
-const ValidateWindowsSdlStep = struct {
-    step: std.Build.Step,
+// Fix-it hints carried in each check step's name, so a missing file fails on a step line
+// that says how to recover instead of on a later translate-c/link error.
+const windows_sdl_package_hint = "if missing: run 'zig build fetch-sdl', or pass -Dsystem-sdl=true or -Dsdl-root=<path>";
+const windows_sdl_local_hint = "if missing: fix -Dsdl-root=<path>, or pass -Dsystem-sdl=true";
+
+/// One `CheckFile` step per required header/import library/DLL. Zig 0.17 has no custom
+/// build steps (`Step.init` takes a closed tag set with no `makeFn`), so the old single
+/// validation step is expressed as stock CheckFile steps that fail when the file is missing.
+fn createWindowsSdlFileChecks(
+    b: *std.Build,
     entries: []const WindowsSdlValidationEntry,
-
-    fn create(b: *std.Build, name: []const u8, entries: []const WindowsSdlValidationEntry) *ValidateWindowsSdlStep {
-        const validate = b.allocator.create(ValidateWindowsSdlStep) catch @panic("OOM");
-        validate.* = .{
-            .step = std.Build.Step.init(.{
-                .id = .custom,
-                .name = name,
-                .owner = b,
-                .makeFn = make,
-            }),
-            .entries = entries,
-        };
-        for (entries) |entry| {
-            entry.path.addStepDependencies(&validate.step);
-        }
-        return validate;
+    hint: []const u8,
+) []const *std.Build.Step {
+    const checks = b.allocator.alloc(*std.Build.Step, entries.len) catch @panic("OOM");
+    for (entries, checks) |entry, *check_step| {
+        const check = b.addCheckFile(entry.path, .{});
+        check.setName(b.fmt("check Windows {s} ({s})", .{ entry.name, hint }));
+        check_step.* = &check.step;
     }
+    return checks;
+}
 
-    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
-        _ = options;
-        const validate: *ValidateWindowsSdlStep = @fieldParentPtr("step", step);
-        const b = step.owner;
-        const io = b.graph.io;
-        const cwd = std.Io.Dir.cwd();
-
-        for (validate.entries) |entry| {
-            const path = entry.path.getPath2(b, step);
-            var file = cwd.openFile(io, path, .{ .allow_directory = false }) catch |err| {
-                return step.fail(
-                    "Windows SDL dependency is incomplete. Missing {s} at {s}: {t}\nRun 'zig build fetch-sdl', pass '-Dsystem-sdl=true', or pass '-Dsdl-root=<path>'.",
-                    .{ entry.name, path, err },
-                );
-            };
-            file.close(io);
-        }
-    }
-};
+fn windowsSdlValidateSteps(windows_sdl: WindowsSdlConfig) []const *std.Build.Step {
+    return switch (windows_sdl) {
+        .local => |local| local.validate_steps,
+        .packages => |packages| packages.validate_steps,
+        .system, .pending => &.{},
+    };
+}
 
 fn configureWindowsSdl(
     b: *std.Build,
@@ -407,11 +453,10 @@ fn configureWindowsSdl(
 
     const arch_subdir = windowsSdlArchSubdir(target.cpu.arch);
     if (sdl_root) |root| {
-        const validate_step = createWindowsSdlLocalValidationStep(b, root, arch_subdir);
         return .{ .local = .{
             .root = b.dupe(root),
             .arch_subdir = arch_subdir,
-            .validate_step = validate_step,
+            .validate_steps = createWindowsSdlLocalChecks(b, root, arch_subdir),
         } };
     }
 
@@ -432,11 +477,10 @@ fn configureWindowsSdl(
         return .pending;
     }
 
-    const validate_step = createWindowsSdlPackageValidationStep(b, packages, arch_subdir);
     return .{ .packages = .{
         .arch_subdir = arch_subdir,
         .packages = packages,
-        .validate_step = validate_step,
+        .validate_steps = createWindowsSdlPackageChecks(b, packages, arch_subdir),
     } };
 }
 
@@ -449,7 +493,7 @@ fn windowsSdlArchSubdir(arch: std.Target.Cpu.Arch) []const u8 {
     };
 }
 
-fn createWindowsSdlLocalValidationStep(b: *std.Build, root: []const u8, arch_subdir: []const u8) *std.Build.Step {
+fn createWindowsSdlLocalChecks(b: *std.Build, root: []const u8, arch_subdir: []const u8) []const *std.Build.Step {
     const entries = b.allocator.alloc(WindowsSdlValidationEntry, windowsSdlValidationEntryCount()) catch @panic("OOM");
     var index: usize = 0;
     for (windows_sdl_dependencies) |dependency| {
@@ -471,14 +515,14 @@ fn createWindowsSdlLocalValidationStep(b: *std.Build, root: []const u8, arch_sub
         };
         index += 1;
     }
-    return &ValidateWindowsSdlStep.create(b, b.fmt("validate Windows SDL root ({s})", .{root}), entries).step;
+    return createWindowsSdlFileChecks(b, entries, windows_sdl_local_hint);
 }
 
-fn createWindowsSdlPackageValidationStep(
+fn createWindowsSdlPackageChecks(
     b: *std.Build,
     packages: []const WindowsSdlPackage,
     arch_subdir: []const u8,
-) *std.Build.Step {
+) []const *std.Build.Step {
     const entries = b.allocator.alloc(WindowsSdlValidationEntry, windowsSdlValidationEntryCount()) catch @panic("OOM");
     var index: usize = 0;
     for (packages) |package| {
@@ -502,7 +546,7 @@ fn createWindowsSdlPackageValidationStep(
         };
         index += 1;
     }
-    return &ValidateWindowsSdlStep.create(b, "validate pinned Windows SDL packages", entries).step;
+    return createWindowsSdlFileChecks(b, entries, windows_sdl_package_hint);
 }
 
 fn windowsSdlValidationEntryCount() usize {
@@ -519,7 +563,7 @@ fn windowsSdlLocalPath(
     dependency_root: []const u8,
     sub_path: []const u8,
 ) std.Build.LazyPath {
-    return .{ .cwd_relative = b.pathJoin(&.{ root, dependency_root, sub_path }) };
+    return b.graph.cwdRelativePath(b.pathJoin(&.{ root, dependency_root, sub_path }));
 }
 
 fn windowsSdlPackagePath(package: WindowsSdlPackage, sub_path: []const u8) std.Build.LazyPath {
@@ -545,16 +589,16 @@ fn windowsSdlPackageLibPath(
 fn addWindowsSdlRuntimeDependencies(
     b: *std.Build,
     windows_sdl: WindowsSdlConfig,
-    compile_steps: []const *std.Build.Step,
+    validate_steps: []const *std.Build.Step,
+    sdl_consumer_steps: []const *std.Build.Step,
 ) WindowsSdlRuntimeDependencies {
-    const validate_step = switch (windows_sdl) {
-        .local => |local| local.validate_step,
-        .packages => |packages| packages.validate_step,
-        .system, .pending => return .{ .install_steps = &.{}, .path_dirs = &.{} },
-    };
+    switch (windows_sdl) {
+        .local, .packages => {},
+        .system, .pending => return .{ .install_steps = &.{}, .path_env = null },
+    }
 
-    for (compile_steps) |compile_step| {
-        compile_step.dependOn(validate_step);
+    for (sdl_consumer_steps) |consumer_step| {
+        for (validate_steps) |check| consumer_step.dependOn(check);
     }
 
     const install_steps = b.allocator.alloc(*std.Build.Step, windows_sdl_dependencies.len) catch @panic("OOM");
@@ -567,19 +611,19 @@ fn addWindowsSdlRuntimeDependencies(
                     windowsSdlLocalPath(b, local.root, dependency.root_dir, b.pathJoin(&.{ "lib", local.arch_subdir, dependency.dll })),
                     dependency.dll,
                 );
-                install_dll.step.dependOn(validate_step);
+                for (validate_steps) |check| install_dll.step.dependOn(check);
                 b.getInstallStep().dependOn(&install_dll.step);
                 install_steps[index] = &install_dll.step;
             }
         },
         .packages => |packages| {
             for (packages.packages, 0..) |package, index| {
-                path_dirs[index] = package.dependency.builder.pathFromRoot(b.pathJoin(&.{ "lib", packages.arch_subdir }));
+                path_dirs[index] = package.dependency.builder.root.joinString(b.allocator, b.pathJoin(&.{ "lib", packages.arch_subdir })) catch @panic("OOM");
                 const install_dll = b.addInstallBinFile(
                     windowsSdlPackagePath(package, b.pathJoin(&.{ "lib", packages.arch_subdir, package.metadata.dll })),
                     package.metadata.dll,
                 );
-                install_dll.step.dependOn(validate_step);
+                for (validate_steps) |check| install_dll.step.dependOn(check);
                 b.getInstallStep().dependOn(&install_dll.step);
                 install_steps[index] = &install_dll.step;
             }
@@ -587,15 +631,42 @@ fn addWindowsSdlRuntimeDependencies(
         .system, .pending => unreachable,
     }
 
-    return .{ .install_steps = install_steps, .path_dirs = path_dirs };
+    return .{ .install_steps = install_steps, .path_env = windowsSdlRunPath(b, path_dirs) };
+}
+
+/// PATH for Run steps that load the SDL DLLs straight from their source dirs, or null when
+/// the host is not Windows (cross builds never run the binaries; DLLs are also installed
+/// next to the executables). Zig 0.17 removed `Run.addPathDir`, and
+/// `Run.setEnvironmentVariable` snapshots the configure-time environment into the step, so
+/// the full PATH is computed here. The configure cache key does not include the environment,
+/// so reading PATH and the cwd poisons the configure cache: Windows hosts re-run build.zig
+/// on every `zig build` invocation.
+fn windowsSdlRunPath(b: *std.Build, dirs: []const []const u8) ?[]const u8 {
+    if (b.graph.host.result.os.tag != .windows) return null;
+    b.graph.poisonCache();
+
+    const cwd = std.process.currentPathAlloc(b.graph.io, b.allocator) catch |err|
+        std.debug.panic("unable to read the current directory for the SDL DLL PATH: {t}", .{err});
+    var path_env: std.ArrayList(u8) = .empty;
+    for (dirs) |dir| {
+        const absolute_dir = std.fs.path.resolveAlloc(b.allocator, &.{ cwd, dir }) catch @panic("OOM");
+        path_env.appendSlice(b.allocator, absolute_dir) catch @panic("OOM");
+        path_env.append(b.allocator, ';') catch @panic("OOM");
+    }
+    if (b.graph.environ_map.get("PATH")) |existing_path| {
+        path_env.appendSlice(b.allocator, existing_path) catch @panic("OOM");
+    } else {
+        _ = path_env.pop();
+    }
+    return path_env.items;
 }
 
 fn addWindowsSdlRunRuntime(run: *std.Build.Step.Run, runtime: WindowsSdlRuntimeDependencies) void {
     for (runtime.install_steps) |install_step| {
         run.step.dependOn(install_step);
     }
-    for (runtime.path_dirs) |path_dir| {
-        run.addPathDir(path_dir);
+    if (runtime.path_env) |path_env| {
+        run.setEnvironmentVariable("PATH", path_env);
     }
 }
 
@@ -608,6 +679,11 @@ const ShaderStageSource = struct {
     stage: ShaderStage,
     source_path: []const u8,
     output_stem: []const u8,
+    /// Exact generated MSL entry-point parameter list, `main0(` through `)`. Pins
+    /// SDL_GPU's Metal slot layout (uniform buffers, then storage buffers, in
+    /// [[buffer]]; textures/samplers from 0): Metal binds a mismatched slot silently
+    /// and only rejects duplicate indices at shader creation.
+    msl_entry_signature: []const u8,
 };
 
 const ShaderStage = enum {
@@ -657,26 +733,45 @@ comptime {
     }
 }
 
-fn forceLlvmLldForTarget(target: std.Build.ResolvedTarget) ?bool {
-    if (target.query.isNative() and target.result.os.tag == .linux and target.result.abi.isGnu()) {
-        return true;
+comptime {
+    for (shader_programs) |program| {
+        for (program.stages) |stage_source| {
+            if (!std.mem.startsWith(u8, stage_source.msl_entry_signature, "main0("))
+                @compileError("msl_entry_signature must be the generated MSL entry-point parameter list starting with main0(: " ++ stage_source.output_stem);
+        }
     }
-
-    return null;
 }
 
-/// Zig 0.16 LTO requires LLD; LLD cannot link Mach-O object files.
+fn shippedCpuFloor(host: std.Target) std.Target.Query {
+    return switch (host.cpu.arch) {
+        .x86_64 => .{ .cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v2 } },
+        .aarch64 => if (host.os.tag == .macos)
+            .{ .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.apple_m1 } }
+        else
+            .{ .cpu_model = .baseline },
+        else => .{ .cpu_model = .baseline },
+    };
+}
+
+/// Zig 0.17 LTO requires LLD; LLD cannot link Mach-O object files.
+/// Windows (COFF) is also excluded: under Zig 0.17, full and thin LTO with
+/// `link_libc` fail at `lld-link` with undefined mingw libc/libm symbols
+/// (`frexpf`, `lrintl`, `modfl`, `wmemcpy`, `strndup`, ...) for x86_64 and
+/// aarch64 windows-gnu. Without LTO, ReleaseFast links and emits the PDB.
 fn ltoSupportedForTarget(target: std.Target) bool {
-    return target.ofmt != .macho;
+    return switch (target.ofmt) {
+        .macho, .coff => false,
+        else => true,
+    };
 }
 
-fn parseLogLevel(value: []const u8, optimize: std.builtin.OptimizeMode) std.log.Level {
+fn parseLogLevel(value: []const u8, optimize: std.builtin.Optimize) std.log.Level {
     if (std.mem.eql(u8, value, "auto")) {
         return switch (optimize) {
             // Debug + ReleaseSafe: full diagnostics and runtime perf dumps (see
             // runtime_perf_log.enabled). Fast/Small stay quiet for ship/package.
-            .Debug, .ReleaseSafe => .debug,
-            .ReleaseFast, .ReleaseSmall => .warn,
+            .debug, .safe => .debug,
+            .fast, .small => .warn,
         };
     }
     if (std.mem.eql(u8, value, "err")) return .err;
@@ -744,9 +839,12 @@ fn addMslShaderSteps(
 
             const msl_cmd = b.addSystemCommand(&.{shader_cross_compiler});
             msl_cmd.addFileArg(spv);
-            msl_cmd.addArgs(&.{ "--msl", "--stage", stage_source.stage.spirvCrossArg(), "--output" });
+            // Decoration binding pins MSL indices to the SPIR-V bindings. Without it
+            // spirv-cross numbers [[buffer(n)]] by SPIR-V id order, which drifts with
+            // shader code shape and can put a storage buffer in SDL's uniform slot.
+            msl_cmd.addArgs(&.{ "--msl", "--msl-decoration-binding", "--stage", stage_source.stage.spirvCrossArg(), "--output" });
             const msl = msl_cmd.addOutputFileArg(b.fmt("{s}.msl", .{stage_source.output_stem}));
-            const check = b.addCheckFile(msl, .{});
+            const check = b.addCheckFile(msl, .{ .expected_matches = &.{stage_source.msl_entry_signature} });
             const install = b.addInstallBinFile(msl, b.fmt("{s}/shaders/{s}.msl", .{ asset_root, stage_source.output_stem }));
             install.step.dependOn(&check.step);
             install_steps[install_index] = &install.step;

@@ -34,11 +34,7 @@ pub fn clamp(value: f32, min: f32, max: f32) f32 {
 /// Guards `@intFromFloat`, which is illegal behavior on NaN/inf/out-of-range
 /// floats — grid-cell helpers feed it integrated positions that can diverge.
 pub fn floorToI32(value: f32) i32 {
-    if (std.math.isNan(value)) return 0;
-    const floored = @floor(value);
-    if (floored <= @as(f32, @floatFromInt(std.math.minInt(i32)))) return std.math.minInt(i32);
-    if (floored >= @as(f32, @floatFromInt(std.math.maxInt(i32)))) return std.math.maxInt(i32);
-    return @intFromFloat(floored);
+    return std.math.lossyCast(i32, @floor(value));
 }
 
 /// World-space coordinate → tile/cell index, clamped to `[0, max_cells - 1]`.
@@ -49,6 +45,18 @@ pub fn worldPosToCell(world_pos: f32, tile_size: f32, max_cells: u32) u32 {
     const cell = floorToI32(world_pos / tile_size);
     if (cell < 0) return 0;
     return @min(@as(u32, @intCast(cell)), max_cells - 1);
+}
+
+/// The last cell the half-open world span `[min_pos, max_pos)` covers, clamped like
+/// `worldPosToCell`: a max edge exactly on a cell boundary excludes the cell starting
+/// there, at any f32 magnitude. Never before `min_pos`'s cell, so an empty, inverted, or
+/// NaN span gives `min_pos`'s cell.
+pub fn lastCellOfSpan(min_pos: f32, max_pos: f32, cell_size: f32, max_cells: u32) u32 {
+    const first = worldPosToCell(min_pos, cell_size, max_cells);
+    if (!(max_pos > min_pos)) return first;
+    // A whole-cell count: `end_cells - 1` is exact wherever a cell index is.
+    const end_cells = @ceil(max_pos / cell_size);
+    return @max(first, worldPosToCell(end_cells - 1, 1, max_cells));
 }
 
 /// Linearly interpolates between `start` and `end` by `amount`. Scalar
@@ -195,6 +203,40 @@ test "worldPosToCell clamps and saturates before narrowing" {
     try std.testing.expectEqual(@as(u32, 0), worldPosToCell(std.math.nan(f32), 32, 10));
     try std.testing.expectEqual(@as(u32, 0), worldPosToCell(100, 32, 0)); // no cells
     try std.testing.expectEqual(@as(u32, 0), worldPosToCell(100, 32, 1)); // single cell
+}
+
+test "lastCellOfSpan excludes the cell a max edge lands on, at every f32 magnitude" {
+    const cells: u32 = 4096;
+    // Cell-aligned spans one cell wide near 0, 32768, and 65536 (f32 spacing 2^-8 and
+    // 2^-7 there).
+    for ([_]u32{ 0, 1, 1023, 1024, 1103, 2047, 2048, 4095 }) |cell| {
+        const min_pos: f32 = @floatFromInt(cell * 32);
+        try std.testing.expectEqual(cell, lastCellOfSpan(min_pos, min_pos + 32, 32, cells));
+        // Off the boundary the max corner's own cell is the last.
+        try std.testing.expectEqual(cell, lastCellOfSpan(min_pos, min_pos + 31.5, 32, cells));
+        try std.testing.expectEqual(cell, lastCellOfSpan(min_pos + 0.5, min_pos + 16, 32, cells));
+    }
+    // One f32 step past a boundary takes the next cell.
+    const edge: f32 = 35_328; // between cells 1103 and 1104
+    try std.testing.expectEqual(@as(u32, 1104), lastCellOfSpan(35_296, std.math.nextAfter(f32, edge, std.math.inf(f32)), 32, cells));
+    const far_edge: f32 = 65_536 + 32; // between cells 2048 and 2049
+    try std.testing.expectEqual(@as(u32, 2048), lastCellOfSpan(65_536, far_edge, 32, cells));
+    try std.testing.expectEqual(@as(u32, 2049), lastCellOfSpan(65_536, std.math.nextAfter(f32, far_edge, std.math.inf(f32)), 32, cells));
+    // Multi-cell span ending on a boundary.
+    try std.testing.expectEqual(@as(u32, 1039), lastCellOfSpan(32_768, 32_768 + 512, 32, cells));
+    // Empty, inverted, and NaN spans give the min corner's cell; a sliver keeps its cell.
+    try std.testing.expectEqual(@as(u32, 1103), lastCellOfSpan(35_296, 35_296, 32, cells));
+    try std.testing.expectEqual(@as(u32, 1104), lastCellOfSpan(edge, edge, 32, cells));
+    try std.testing.expectEqual(@as(u32, 1103), lastCellOfSpan(35_296, 100, 32, cells));
+    try std.testing.expectEqual(@as(u32, 1103), lastCellOfSpan(35_296, std.math.nan(f32), 32, cells));
+    try std.testing.expectEqual(@as(u32, 1104), lastCellOfSpan(edge, edge + 0.001, 32, cells));
+    try std.testing.expectEqual(@as(u32, 0), lastCellOfSpan(0, 0.001, 32, cells));
+    // Clamped to the grid on both ends.
+    try std.testing.expectEqual(@as(u32, 0), lastCellOfSpan(-100, -40, 32, cells));
+    try std.testing.expectEqual(@as(u32, 0), lastCellOfSpan(-100, 32, 32, cells));
+    try std.testing.expectEqual(cells - 1, lastCellOfSpan(0, 1.0e9, 32, cells));
+    try std.testing.expectEqual(cells - 1, lastCellOfSpan(0, std.math.inf(f32), 32, cells));
+    try std.testing.expectEqual(@as(u32, 0), lastCellOfSpan(0, 100, 32, 0));
 }
 
 test "lerpVec2 interpolates between points" {

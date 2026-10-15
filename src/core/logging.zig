@@ -6,11 +6,11 @@ const std = @import("std");
 const build_options = @import("build_options");
 
 pub const std_options = std.Options{
-    .log_level = @enumFromInt(build_options.log_level),
+    .log_level = @fromBackingInt(@intCast(build_options.log_level)),
 };
 
 pub fn enabled(comptime level: std.log.Level) bool {
-    return @intFromEnum(level) <= build_options.log_level;
+    return @backingInt(level) <= build_options.log_level;
 }
 
 pub const app = std.log.scoped(.app);

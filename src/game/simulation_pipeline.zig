@@ -8,22 +8,36 @@
 //! global scheduler or dynamic system registry.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../core/math.zig");
+const logging = @import("../core/logging.zig");
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const AdaptiveWorkProfile = @import("../app/thread_system.zig").AdaptiveWorkProfile;
+const rangeCount = @import("../app/thread_system.zig").rangeCount;
+const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
 const DataSystem = @import("data_system.zig").DataSystem;
+const hotStoreCapacity = @import("data_system.zig").hotStoreCapacity;
+const PopulationRowCounts = @import("data_system.zig").PopulationRowCounts;
+const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
 const EntityId = @import("data_system.zig").EntityId;
+const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
+const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
 const Faction = @import("data_system.zig").Faction;
-const MovementBodyPtr = @import("data_system.zig").MovementBodyPtr;
-const MovementBodySlice = @import("data_system.zig").MovementBodySlice;
-const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const DigConfig = @import("dig_controller.zig").DigConfig;
 const DigController = @import("dig_controller.zig").DigController;
+const DigEdit = @import("dig_controller.zig").DigController.DigEdit;
+const DigEditError = @import("dig_controller.zig").DigEditError;
+const DigIntent = @import("simulation.zig").DigIntent;
 const facedCellForEntity = @import("dig_controller.zig").facedCellForEntity;
 const DestructibleController = @import("destructible_controller.zig").DestructibleController;
+const DestructibleProcessStats = @import("destructible_controller.zig").DestructibleProcessStats;
 const AudioController = @import("audio_controller.zig").AudioController;
+const SensoryBus = @import("sensory_bus.zig").SensoryBus;
+const StimulusConfig = @import("sensory_bus.zig").StimulusConfig;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;
@@ -39,28 +53,42 @@ const CollisionStats = @import("systems/collision.zig").CollisionStats;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
 const CollisionResponseStats = @import("systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("systems/collision_response.zig").CollisionResponseSystem;
+const estimateTriggerCapacity = @import("systems/collision_response.zig").estimateTriggerCapacity;
+const MovementIntentStats = @import("systems/movement.zig").MovementIntentStats;
 const MovementStats = @import("systems/movement.zig").MovementStats;
 const MovementSystem = @import("systems/movement.zig").MovementSystem;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
+const GoalResolveStats = @import("systems/pathfinding.zig").GoalResolveStats;
+const NavigationIntent = @import("simulation.zig").NavigationIntent;
 const PerceptionStats = @import("systems/perception.zig").PerceptionStats;
 const PerceptionSystem = @import("systems/perception.zig").PerceptionSystem;
 const PlayerPerceptionCandidate = @import("systems/perception.zig").PlayerPerceptionCandidate;
+const PlaneEntrySystem = @import("systems/plane_entry.zig").PlaneEntrySystem;
 const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
-const CollisionContact = @import("simulation.zig").CollisionContact;
+const steering_range_alignment_items = @import("systems/steering.zig").steering_range_alignment_items;
+const ai_range_alignment_items = @import("systems/ai.zig").ai_range_alignment_items;
+const scope_range_alignment_items = @import("systems/simulation_scope.zig").scope_range_alignment_items;
+const StaticColliderSystem = @import("systems/static_colliders.zig").StaticColliderSystem;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
+const EventBudgetInputs = @import("simulation.zig").EventBudgetInputs;
+const StructuralCommitBudget = @import("simulation.zig").StructuralCommitBudget;
+const SimulationEvent = @import("simulation.zig").SimulationEvent;
+const structuralEventHeadroom = @import("simulation.zig").structuralEventHeadroom;
+const EventProducerId = @import("simulation.zig").EventProducerId;
+const maxEventsPerStep = @import("simulation.zig").maxEventsPerStep;
+const perception_events_per_observer_max = @import("simulation.zig").perception_events_per_observer_max;
+const affect_events_per_row_max = @import("simulation.zig").affect_events_per_row_max;
 const ActionIntent = @import("simulation.zig").ActionIntent;
 const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
-const WorldStimulus = @import("simulation.zig").WorldStimulus;
+const pipeline_structural_event_share = @import("simulation.zig").pipeline_structural_event_share;
 const defaultStimulusIntensity = @import("simulation.zig").defaultStimulusIntensity;
 const stimulus_deferred_capacity = @import("simulation.zig").stimulus_deferred_capacity;
 const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const stimulus_max_impacts_per_step = @import("simulation.zig").stimulus_max_impacts_per_step;
-const stimulus_sticky_capacity = @import("simulation.zig").stimulus_sticky_capacity;
-const cognition_stagger_n = @import("simulation_scope.zig").cognition_stagger_n;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const SimulationScope = @import("simulation_scope.zig").SimulationScope;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
@@ -71,6 +99,8 @@ const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSyst
 const SpatialIndexDenseWindowGeometry = @import("systems/spatial_index.zig").DenseWindowGeometry;
 const CellCoord = @import("world_system.zig").CellCoord;
 const WorldSystem = @import("world_system.zig").WorldSystem;
+const Rect = @import("../render/renderer.zig").Rect;
+const world_gate = @import("systems/world_gate.zig");
 
 /// Coarse per-step data resources stages read/write, for the stage-ordering
 /// contract below. Some tags bundle several SoA columns owned by one system
@@ -78,10 +108,28 @@ const WorldSystem = @import("world_system.zig").WorldSystem;
 /// columns together) rather than tracking every field individually.
 const PipelineResource = enum {
     world_tiles,
-    events,
-    ai_scope_indices,
+    /// `entity_perceived` / `entity_lost`. A dig write of `world_events` does not satisfy this.
+    perception_events,
+    /// `affect_threshold_crossed`.
+    affect_events,
+    /// World-domain payloads: tile/obstacle/nav changes and `destructible_destroyed`.
+    world_events,
+    /// `entity_created` / `entity_destroyed` / `component_changed`, emitted at structural commit
+    /// after `update`. External to the stage graph.
+    structural_events,
+    /// Live `frame.stimuli` bus (promote, dig, footstep) read by perception the same step.
+    stimuli,
+    /// `AiAgent.active_behavior`. Written by `ai_decide`; `affect_update` carries the previous step.
+    ai_behavior,
+    /// `WorldSystem` interest markers. Authored outside the step; `ai_decide` carries them.
+    interest_markers,
+    ai_halo_indices,
+    ai_cognition_indices,
     spatial_index,
     navigation_intents,
+    /// `PathfindingSystem.goals`: the step's live projection per distinct blocked goal of
+    /// `navigation_intents`, read by steering's status queries and the pathfinding update.
+    path_goals,
     action_intents,
     movement_intents,
     path_requests,
@@ -105,13 +153,13 @@ fn resources(comptime items: []const PipelineResource) ResourceSet {
 
 const StageId = enum {
     dig_world_edit,
-    action_intent_capture,
     scope_advance_and_ai_gather,
     spatial_index_build,
     perception_update,
     ai_memory_update,
     affect_update,
     ai_decide,
+    path_goal_resolve,
     steering_update,
     pathfinding_update,
     apply_ai_movement_intents,
@@ -126,37 +174,57 @@ const StageId = enum {
     tier_policy,
 };
 
-const StageContract = struct { reads: ResourceSet, writes: ResourceSet };
+const StageContract = struct {
+    reads: ResourceSet = .empty,
+    writes: ResourceSet = .empty,
+    /// Consumed this step, but not written by an earlier stage. Either produced
+    /// outside `update` (`external_resources`) or written by a later stage for
+    /// the next step's reader. Disjoint from `reads` and `writes`.
+    carried: ResourceSet = .empty,
+};
+
+/// Resources produced outside `stage_order`: input capture, world authoring, or
+/// the post-`update` structural commit.
+const external_resources = resources(&.{ .action_intents, .interest_markers, .structural_events });
 
 /// Declares each stage's resource reads/writes against `stage_order` below.
 /// Checked at comptime: a stage cannot read a resource no earlier stage in
-/// `stage_order` writes.
+/// `stage_order` writes. `carried` is the exception for values that arrive from
+/// outside this step's graph.
 fn stageContract(stage: StageId) StageContract {
     return switch (stage) {
-        .dig_world_edit => .{ .reads = .empty, .writes = resources(&.{ .world_tiles, .events }) },
-        // Contract-only resource handoff — NOT a wall-clock stage body.
-        // Wall-clock emit: `main_thread_inputs` → `captureActionIntent` before
-        // `update()` (before dig). `stage_order` may list this tag after dig for
-        // graph bookkeeping only; do not schedule dig-dependent action logic
-        // as if capture runs after dig process.
-        .action_intent_capture => .{ .reads = .empty, .writes = resources(&.{.action_intents}) },
-        .scope_advance_and_ai_gather => .{ .reads = .empty, .writes = resources(&.{.ai_scope_indices}) },
-        .spatial_index_build => .{ .reads = resources(&.{.ai_scope_indices}), .writes = resources(&.{.spatial_index}) },
-        // Queries the spatial index for hostile candidates and writes sensed state; also
-        // emits acquisition/loss transition events (Slice 29).
-        // Reads world_tiles for line-of-sight / occlusion against the dig-authored
-        // floor state from dig_world_edit earlier this step.
-        .perception_update => .{ .reads = resources(&.{ .ai_scope_indices, .spatial_index, .world_tiles }), .writes = resources(&.{ .perception_sensed, .events }) },
-        // Refreshes from this step's perception transition events (Slice 30),
+        // Stimulus writes (promote, dig append, footstep) run inside this stage,
+        // before perception reads the live bus.
+        .dig_world_edit => .{ .reads = .empty, .writes = resources(&.{ .world_tiles, .world_events, .stimuli }) },
+        .scope_advance_and_ai_gather => .{ .reads = .empty, .writes = resources(&.{ .ai_halo_indices, .ai_cognition_indices }) },
+        .spatial_index_build => .{ .reads = resources(&.{.ai_halo_indices}), .writes = resources(&.{.spatial_index}) },
+        // Queries the spatial index for hostile candidates (halo) and writes sensed
+        // state for this step's observers (think set); also emits acquisition/loss
+        // transition events. Reads world_tiles for line-of-sight /
+        // occlusion against the dig-authored floor state from dig_world_edit.
+        // Reads `stimuli` authored at dig_world_edit (live bus + hearing scratch).
+        .perception_update => .{ .reads = resources(&.{ .ai_halo_indices, .ai_cognition_indices, .spatial_index, .world_tiles, .stimuli }), .writes = resources(&.{ .perception_sensed, .perception_events }) },
+        // Refreshes from this step's perception transition events,
         // reading the acquired target's last-seen position from perception_sensed.
-        .ai_memory_update => .{ .reads = resources(&.{ .ai_scope_indices, .events, .perception_sensed }), .writes = resources(&.{.ai_memory}) },
+        .ai_memory_update => .{ .reads = resources(&.{ .ai_cognition_indices, .perception_events, .perception_sensed }), .writes = resources(&.{.ai_memory}) },
         // Appraises this step's just-written perception + memory columns into drives
-        // (Slice 31); arbitration (Slice 32), wired into ai_decide below, is the
-        // first affect_drives reader.
-        .affect_update => .{ .reads = resources(&.{ .ai_scope_indices, .perception_sensed, .ai_memory }), .writes = resources(&.{ .affect_drives, .events }) },
-        .ai_decide => .{ .reads = resources(&.{ .ai_scope_indices, .spatial_index, .perception_sensed, .ai_memory, .affect_drives }), .writes = resources(&.{.navigation_intents}) },
-        .steering_update => .{ .reads = resources(&.{.navigation_intents}), .writes = resources(&.{ .movement_intents, .path_requests }) },
-        .pathfinding_update => .{ .reads = resources(&.{.path_requests}), .writes = .empty },
+        // Carries `ai_behavior` from the previous step; `ai_decide`
+        // writes the new mode later in this step.
+        .affect_update => .{
+            .reads = resources(&.{ .ai_cognition_indices, .perception_sensed, .ai_memory }),
+            .writes = resources(&.{ .affect_drives, .affect_events }),
+            .carried = resources(&.{.ai_behavior}),
+        },
+        .ai_decide => .{
+            .reads = resources(&.{ .ai_cognition_indices, .ai_halo_indices, .spatial_index, .perception_sensed, .ai_memory, .affect_drives }),
+            .writes = resources(&.{ .navigation_intents, .ai_behavior }),
+            .carried = resources(&.{.interest_markers}),
+        },
+        // One projection per distinct blocked goal of this step's intents, before every
+        // reader of a live goal.
+        .path_goal_resolve => .{ .reads = resources(&.{.navigation_intents}), .writes = resources(&.{.path_goals}) },
+        .steering_update => .{ .reads = resources(&.{ .navigation_intents, .path_goals }), .writes = resources(&.{ .movement_intents, .path_requests }) },
+        .pathfinding_update => .{ .reads = resources(&.{ .path_requests, .path_goals }), .writes = .empty },
         .apply_ai_movement_intents => .{ .reads = resources(&.{.movement_intents}), .writes = resources(&.{.movement_positions}) },
         // Movement integrates the full contiguous range (non-moving rows are
         // zero-velocity no-ops), so there is no movement scope filter to read.
@@ -176,16 +244,18 @@ fn stageContract(stage: StageId) StageContract {
         .collision_detect => .{ .reads = resources(&.{ .movement_positions, .collision_scope_indices }), .writes = resources(&.{.contacts}) },
         .collision_respond => .{ .reads = resources(&.{.contacts}), .writes = resources(&.{ .movement_positions, .collision_triggers }) },
         // Reads hole/ramp walkability from world_tiles; may carve landing cells
-        // (writes world_tiles + events) and snaps body x/y/z on fall
+        // (writes world_tiles + world_events) and snaps body x/y/z on fall
         // (writes movement_positions + world_level).
-        .plane_traversal => .{ .reads = resources(&.{ .movement_positions, .world_tiles }), .writes = resources(&.{ .world_tiles, .world_level, .events, .movement_positions }) },
-        // DestructibleController consumes merged action intents and queues
-        // structural commands + domain events. Target resolve reads settled poses
+        .plane_traversal => .{ .reads = resources(&.{ .movement_positions, .world_tiles }), .writes = resources(&.{ .world_tiles, .world_level, .world_events, .movement_positions }) },
+        // DestructibleController consumes action intents captured before `update`
+        // (`carried`, not written by a stage) and queues structural commands plus
+        // `destructible_destroyed` world events. Target resolve reads settled poses
         // and world_level columns. tier_policy also writes structural_commands
         // afterward via RangeOutputStream multi-producer append.
         .action_react => .{
-            .reads = resources(&.{ .action_intents, .movement_positions, .world_level }),
-            .writes = resources(&.{ .structural_commands, .events }),
+            .reads = resources(&.{ .movement_positions, .world_level }),
+            .writes = resources(&.{ .structural_commands, .world_events }),
+            .carried = resources(&.{.action_intents}),
         },
         .tier_policy => .{ .reads = resources(&.{ .movement_positions, .chunk_columns }), .writes = resources(&.{.structural_commands}) },
     };
@@ -221,13 +291,13 @@ fn stageDerivations(stage: StageId) []const Derivation {
 /// walkable for movement + gate. Bounds clamp shares the gate stage.
 const stage_order = [_]StageId{
     .dig_world_edit,
-    .action_intent_capture,
     .scope_advance_and_ai_gather,
     .spatial_index_build,
     .perception_update,
     .ai_memory_update,
     .affect_update,
     .ai_decide,
+    .path_goal_resolve,
     .steering_update,
     .pathfinding_update,
     .apply_ai_movement_intents,
@@ -243,13 +313,65 @@ const stage_order = [_]StageId{
 };
 
 comptime {
-    var produced: ResourceSet = .empty;
+    // EnumSet insert/union/intersect each walk the resource bits. One cached
+    // contract per stage plus the carried checks exceed the default 1000.
+    @setEvalBranchQuota(4000);
+    if (stage_order.len != @typeInfo(StageId).@"enum".field_names.len) {
+        @compileError("SimulationPipeline stage_order must list every StageId exactly once");
+    }
+    var seen: [stage_order.len]bool = @splat(false);
     for (stage_order) |stage| {
-        const contract = stageContract(stage);
+        const index = @backingInt(stage);
+        if (seen[index]) {
+            @compileError("SimulationPipeline stage_order lists '" ++ @tagName(stage) ++ "' more than once");
+        }
+        seen[index] = true;
+    }
+
+    // One `stageContract` evaluation per stage. Repeating it inside the
+    // freshness walk rebuilds EnumSets and blows the comptime branch quota.
+    var contracts: [stage_order.len]StageContract = undefined;
+    for (stage_order, 0..) |stage, index| contracts[index] = stageContract(stage);
+
+    // Writes of every stage after index i, so a carried input can be checked
+    // against "a later stage writes this" without a resource×stage scan.
+    var later_writes: [stage_order.len]ResourceSet = @splat(.empty);
+    {
+        var later: ResourceSet = .empty;
+        var index = stage_order.len;
+        while (index > 0) {
+            index -= 1;
+            later_writes[index] = later;
+            later.setUnion(contracts[index].writes);
+        }
+    }
+
+    var produced: ResourceSet = .empty;
+    for (stage_order, 0..) |stage, stage_index| {
+        const contract = contracts[stage_index];
+        if (contract.carried.intersectWith(contract.reads).count() != 0 or
+            contract.carried.intersectWith(contract.writes).count() != 0)
+        {
+            @compileError("SimulationPipeline stage '" ++ @tagName(stage) ++
+                "' carries a resource it also reads or writes — carried is disjoint from both");
+        }
         const unmet = contract.reads.differenceWith(produced);
         if (unmet.count() != 0) {
             @compileError("SimulationPipeline stage '" ++ @tagName(stage) ++
                 "' reads a resource no earlier stage writes — fix stage_order or stageContract()");
+        }
+        if (contract.carried.intersectWith(produced).count() != 0) {
+            @compileError("SimulationPipeline stage '" ++ @tagName(stage) ++
+                "' carries a resource an earlier stage writes — declare it as a read");
+        }
+        const unjustified = contract.carried.differenceWith(external_resources).differenceWith(later_writes[stage_index]);
+        if (unjustified.count() != 0) {
+            for (std.meta.tags(PipelineResource)) |resource| {
+                if (!unjustified.contains(resource)) continue;
+                @compileError("SimulationPipeline stage '" ++ @tagName(stage) ++
+                    "' carries '" ++ @tagName(resource) ++
+                    "', which is neither external nor written by a later stage");
+            }
         }
         produced.setUnion(contract.writes);
     }
@@ -260,13 +382,13 @@ comptime {
     // consumer reads a value computed from superseded inputs.
     for (stage_order, 0..) |producer_stage, producer_i| {
         for (stageDerivations(producer_stage)) |derivation| {
-            for (stage_order[producer_i + 1 ..], producer_i + 1..) |consumer_stage, consumer_i| {
-                if (!stageContract(consumer_stage).reads.contains(derivation.output)) continue;
-                for (stage_order[producer_i + 1 .. consumer_i]) |between_stage| {
-                    if (stageContract(between_stage).writes.intersectWith(derivation.inputs).count() != 0) {
+            for (producer_i + 1..stage_order.len) |consumer_i| {
+                if (!contracts[consumer_i].reads.contains(derivation.output)) continue;
+                for (producer_i + 1..consumer_i) |between_i| {
+                    if (contracts[between_i].writes.intersectWith(derivation.inputs).count() != 0) {
                         @compileError("SimulationPipeline: derived resource '" ++ @tagName(derivation.output) ++
                             "' from '" ++ @tagName(producer_stage) ++ "' is stale before consumer '" ++
-                            @tagName(consumer_stage) ++ "': stage '" ++ @tagName(between_stage) ++
+                            @tagName(stage_order[consumer_i]) ++ "': stage '" ++ @tagName(stage_order[between_i]) ++
                             "' overwrites an input in between — move the deriving stage after the last input writer that precedes the consumer");
                     }
                 }
@@ -278,29 +400,32 @@ comptime {
 /// Construction policy for the state-owned simulation pipeline.
 /// Capacities are reserved up front so the fixed-step hot path can stay warm.
 pub const SimulationPipelineConfig = struct {
-    steering_agent_capacity: usize = 0,
-    static_obstacle_capacity: usize = 0,
     contact_capacity: usize = 0,
-    /// Movement-body count the scope system pre-sizes its gather/tier scratch to,
-    /// so the per-step scope passes are allocation-free after init.
+    /// Initial population size for every population-sized capacity (scope, spatial
+    /// index, collision, steering, cognition gathers, plane scratch, event shares).
+    /// `init` raises it to the committed `DataSystem` rows; afterwards only
+    /// `SimulationPipeline.syncPopulationCapacity` grows it.
     movement_body_capacity: usize = 0,
     pathfinding: PathfindingCapacity = .{},
+    /// Nav cell size for a world-less nav build. With `navigation_world`, nav cells are
+    /// its tiles and nav chunks its chunks.
     nav_cell_size: f32 = 32.0,
     navigation_world: ?*const WorldSystem = null,
     /// When set, the one-time static nav build fans mask/abstract work across levels.
     nav_build_thread_system: ?*ThreadSystem = null,
     dig: DigConfig = .{},
-    /// This state's reserved share of `frame.events`'s `capacity_limit` (see
-    /// `SimulationFrame.reserveStreams`), passed through as
-    /// `PerceptionConfig.max_events_per_step`. Sized by the caller against its
-    /// own event-capacity budget, same as `contact_capacity`/
-    /// `static_obstacle_capacity`; defaults to 0.
-    perception_max_events_per_step: usize = 0,
-    /// This state's reserved share of `frame.events`'s `capacity_limit`,
-    /// passed through as `AffectConfig.max_events_per_step`. Sized by the
-    /// caller against its own event-capacity budget, same as
-    /// `perception_max_events_per_step`; defaults to 0.
-    affect_max_events_per_step: usize = 0,
+    /// The caller's part of the per-step `.structural_commit` event share, in events:
+    /// size it with `structuralEventHeadroom(creates, destroys + component sets)` from
+    /// the caller's own fixed per-step producer budgets (a create costs up to
+    /// `max_structural_events_per_create`; tier changes cost none). Covers only
+    /// commands the caller queues: the pipeline adds its own `action_react`
+    /// destructible share (`pipeline_structural_event_share`) on top. The total is
+    /// enforced on its own at the commit (`structuralCommitBudget`), never borrowed
+    /// from other producers, and sizes the structural-command stream beyond one tier
+    /// command per body (`structuralCommandHeadroom`) and its range count beyond the
+    /// pipeline's own ranges, one range per event.
+    structural_headroom: usize = 0,
+    stimuli: StimulusConfig = .{},
 };
 
 /// Borrowed per-step inputs for pipeline update.
@@ -320,9 +445,34 @@ pub const SimulationPipelineUpdateContext = struct {
     /// Borrowed runtime perf sink. Stage timers are zero-cost when perf
     /// logging is disabled at comptime, so the hot path stays clean.
     perf: runtime_perf_log.Context = .{},
-    /// Optional particle system for soft-drop destroy bursts (Slice 45).
+    /// Optional particle system for soft-drop destroy bursts.
     particles: ?*ParticleSystem = null,
+    /// Fixed-step camera rect the simulation derives scope from (cognition
+    /// halo, stagger, tier bands) via `simViewRegion` /
+    /// `cognitionRegionForWorldRect`. Never the render visibility window, which
+    /// follows the interpolated render camera and so depends on frame pacing.
+    /// Required: a missing view would silently disable scope gating and run every
+    /// entity at full cost. A world with no chunks yields no region, which keeps
+    /// the full-active fallback (no halo, no stagger, no tier demotion).
+    sim_view: Rect,
 };
+
+/// Chunk overscan applied to `sim_view` for simulation scope. Equals the demo's
+/// render overscan (comptime-asserted in `game_demo_state.zig`) so the sim
+/// region matches the render window at interpolation alpha 1.
+pub const sim_view_overscan_chunks: u16 = 1;
+
+/// The one scope-band source for pipeline stages: the fixed-step `sim_view`
+/// chunk region anchored at the player's level. Later scope-band readers must
+/// call this rather than reading any world visibility state.
+fn simViewRegion(context: SimulationPipelineUpdateContext) ?ActiveRegion {
+    var region = context.world.chunkRegionForWorldRect(
+        context.sim_view,
+        sim_view_overscan_chunks,
+    ) orelse return null;
+    region.level = context.player.current_level;
+    return region;
+}
 
 /// Aggregated outputs from one pipeline step. Runtime perf and tests consume
 /// these counters without adding a separate timing path to gameplay code.
@@ -334,14 +484,19 @@ pub const SimulationPipelineStats = struct {
     affect: AffectStats = .{},
     ai: AiStats = .{},
     steering: SteeringStats = .{},
+    /// The step's goal resolve (`path_goal_resolve`).
+    path_goals: GoalResolveStats = .{},
     pathfinding: PathfindingStats = .{},
+    apply_intents: MovementIntentStats = .{},
     movement: MovementStats = .{},
     chunk_derive: BatchStats = .{},
+    /// The plane stage's NPC cell-entry gather.
+    plane_entry: BatchStats = .{},
     collision: CollisionStats = .{},
     collision_response: CollisionResponseStats = .{},
     /// Live-bus stimuli dropped this step (promote and footstep optional
     /// appends when `stimulus_live_capacity` is full). Dig uses required
-    /// `appendStimulus`, not soft drop.
+    /// `writeLiveStimulus`, not soft drop.
     stimuli_live_dropped: usize = 0,
     /// Deferred impact stimuli dropped this step when the pipeline buffer is full.
     stimuli_deferred_dropped: usize = 0,
@@ -357,6 +512,12 @@ pub const SimulationPipelineStats = struct {
     destructibles_destroyed: usize = 0,
     /// Destructible entities hit but not destroyed this step.
     destructibles_hit: usize = 0,
+    /// Plane-traversal landing-carve scratch growths this step (reservation short of the
+    /// live population; zero in steady state).
+    dig_plane_scratch_grown: usize = 0,
+    /// Plane-entry gather window growths this step (reservation short of the live AI
+    /// rows; zero in steady state).
+    plane_entry_windows_grown: usize = 0,
 
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
         const scope_stats = self.scope.stats;
@@ -418,17 +579,18 @@ pub const SimulationPipelineStats = struct {
         perf.recordTiming(.steering_select, steering_stats.select_ns);
         perf.recordTiming(.steering_snapshot, steering_stats.snapshot_ns);
         perf.recordTiming(.steering_directions, steering_stats.directions_ns);
+        perf.recordTiming(.steering_grid, steering_stats.grid_ns);
 
         perf.recordMetric(.path_accepted_requests, metric(pathfinding_stats.accepted_requests));
         perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.duplicate_requests));
         perf.recordMetric(.path_pending_requests, metric(pathfinding_stats.pending_requests));
         perf.recordMetric(.path_solved_requests, metric(pathfinding_stats.solved_requests));
-        perf.recordMetric(.path_fallback_requests, metric(pathfinding_stats.fallback_requests));
+        perf.recordMetric(.path_solve_admissions, metric(pathfinding_stats.solve_admissions));
         perf.recordMetric(.path_available_results, metric(pathfinding_stats.available_results));
+        perf.recordMetric(.path_partial_results, metric(pathfinding_stats.partial_results));
         perf.recordMetric(.path_unavailable_results, metric(pathfinding_stats.unavailable_results));
         perf.recordMetric(.path_dropped_requests, metric(pathfinding_stats.dropped_requests));
-        perf.recordMetric(.path_deferred_requests, metric(pathfinding_stats.deferred_requests));
-        perf.recordMetric(.path_fallback_deferred_requests, metric(pathfinding_stats.fallback_deferred_requests));
+        perf.recordMetric(.path_admission_deferred_requests, metric(pathfinding_stats.admission_deferred_requests));
         perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.cache_hits));
         perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.cache_evictions));
         perf.recordMetric(.path_budget_exhausted, metric(pathfinding_stats.budget_exhausted));
@@ -440,11 +602,20 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.path_group_field_rebuild_throttled, metric(pathfinding_stats.group_field_rebuild_throttled));
         perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.group_field_samples));
         perf.recordMetricMax(.path_max_stitch_segments, metric(pathfinding_stats.max_stitch_segments_observed));
-        perf.recordBatch(.path_fallback, pathfinding_stats.fallback_batch);
+        perf.recordMetricMax(.path_max_distinct_group_keys, metric(pathfinding_stats.distinct_group_keys));
+        perf.recordMetric(.path_group_field_evictions, metric(pathfinding_stats.group_field_evictions));
+        perf.recordBatch(.path_solve, pathfinding_stats.solve_batch);
+        perf.recordBatch(.path_intake, pathfinding_stats.intake_batch);
+        perf.recordBatch(.path_registry_flush, pathfinding_stats.registry_flush_batch);
         perf.recordTiming(.pathfinding_accept, pathfinding_stats.accept_ns);
         perf.recordTiming(.pathfinding_group_service, pathfinding_stats.group_service_ns);
         perf.recordTiming(.pathfinding_solve, pathfinding_stats.solve_ns);
         perf.recordTiming(.pathfinding_publish, pathfinding_stats.publish_ns);
+        // Only a step that resized records its resize, so the timing averages per resize.
+        if (pathfinding_stats.resize_ns != 0) {
+            perf.recordTiming(.pathfinding_resize, pathfinding_stats.resize_ns);
+            perf.recordBatch(.path_resize_copy, pathfinding_stats.resize_copy_batch);
+        }
 
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
         perf.recordBatch(.movement, movement_stats.batch);
@@ -455,6 +626,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_contacts, metric(collision_stats.contact_count));
         perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
         if (collision_stats.used_full_sort) perf.recordMetric(.collision_full_sorts, 1);
+        if (collision_stats.pair_bound_exceeded) perf.recordMetric(.collision_pair_bound_exceeded, 1);
         perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
         perf.recordBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
         perf.recordTiming(.collision_gather, collision_stats.gather_ns);
@@ -472,6 +644,8 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.action_intents_dropped, metric(self.action_intents_dropped));
         perf.recordMetric(.destructibles_destroyed, metric(self.destructibles_destroyed));
         perf.recordMetric(.destructibles_hit, metric(self.destructibles_hit));
+        perf.recordMetric(.dig_plane_scratch_grown, metric(self.dig_plane_scratch_grown));
+        perf.recordMetric(.plane_entry_windows_grown, metric(self.plane_entry_windows_grown));
     }
 };
 
@@ -479,169 +653,21 @@ fn metric(value: usize) u64 {
     return @intCast(value);
 }
 
-/// Squared speed threshold for emitting one player footstep per step.
-const footstep_velocity_sq_threshold: f32 = 1.0;
-
-/// Minimum penetration before a zero-velocity contact may still enqueue impact
-/// (only when relative velocity is also non-trivial).
-const impact_min_penetration: f32 = 1.0;
-
-const hearing_stimuli_scratch_capacity: usize = stimulus_live_capacity + stimulus_sticky_capacity;
-
-comptime {
-    // sticky_remaining stores the per-entry linger count in a u8.
-    std.debug.assert(cognition_stagger_n - 1 <= std.math.maxInt(u8));
+/// The population seam's geometric growth target: 1.5x plus one 16-row alignment
+/// block, hot-store aligned (e.g. 12 -> 48, 37 -> 80, 7 -> 32).
+fn grownPopulationCapacity(rows: usize) usize {
+    return hotStoreCapacity(rows + rows / 2 + movement_range_alignment_items);
 }
 
-fn contactInvolvesEntity(contact: CollisionContact, entity: EntityId) bool {
-    return contact.a.eql(entity) or contact.b.eql(entity);
-}
+/// What one `syncPopulationCapacity` call did. All-false on the O(1) fast path.
+pub const PopulationSyncStats = struct {
+    /// A tracked population capacity grew this call.
+    grew: bool = false,
 
-fn contactStimulusPosition(data: *const DataSystem, contact: CollisionContact) ?math.Vec2 {
-    const a = data.movementBodyConst(contact.a) orelse return null;
-    const b = data.movementBodyConst(contact.b) orelse return null;
-    return .{
-        .x = (a.position.x + b.position.x) * 0.5,
-        .y = (a.position.y + b.position.y) * 0.5,
-    };
-}
-
-fn impactStimulusIntensity(contact: CollisionContact) f32 {
-    const scale = std.math.clamp(contact.penetration / 18.0, 0.25, 1.0);
-    return defaultStimulusIntensity(.impact) * scale;
-}
-
-fn contactEligibleForImpactStimulus(contact: CollisionContact) bool {
-    // Velocity comes from the contact's pre-response snapshot; reading the live
-    // movement columns here would see the approach axis already zeroed by
-    // collision response, silencing head-on hits.
-    if (contact.pre_response_max_speed_sq >= footstep_velocity_sq_threshold) return true;
-    if (contact.penetration < impact_min_penetration) return false;
-    return contact.pre_response_relative_speed_sq >= footstep_velocity_sq_threshold;
-}
-
-/// Moves pipeline-deferred impacts onto the live per-step bus before perception.
-fn promoteDeferredStimuli(
-    pipeline: *SimulationPipeline,
-    frame: *SimulationFrame,
-    live_dropped: *usize,
-) usize {
-    const pending = pipeline.deferred_stimulus_count;
-    var promoted: usize = 0;
-    var retained: usize = 0;
-    for (pipeline.deferred_stimuli[0..pending]) |stimulus| {
-        if (frame.tryAppendStimulus(stimulus, stimulus_live_capacity)) {
-            promoted += 1;
-        } else {
-            pipeline.deferred_stimuli[retained] = stimulus;
-            retained += 1;
-            live_dropped.* += 1;
-        }
+    pub fn recordTo(self: PopulationSyncStats, perf: runtime_perf_log.Context) void {
+        perf.recordMetric(.population_capacity_grows, @intFromBool(self.grew));
     }
-    pipeline.deferred_stimulus_count = retained;
-    return promoted;
-}
-
-fn rebuildHearingStimuliScratch(pipeline: *SimulationPipeline, frame: *const SimulationFrame) []const WorldStimulus {
-    const live = frame.stimuli.mergedItems();
-    var len: usize = 0;
-    for (live) |stimulus| {
-        std.debug.assert(len < hearing_stimuli_scratch_capacity);
-        pipeline.hearing_stimuli_scratch[len] = stimulus;
-        len += 1;
-    }
-    for (0..pipeline.sticky_count) |i| {
-        if (pipeline.sticky_remaining[i] == 0) continue;
-        std.debug.assert(len < hearing_stimuli_scratch_capacity);
-        pipeline.hearing_stimuli_scratch[len] = pipeline.sticky_stimuli[i];
-        len += 1;
-    }
-    return pipeline.hearing_stimuli_scratch[0..len];
-}
-
-/// Ages one-shot sticky stimuli one stagger step, then captures this step's
-/// dig/impact stimuli into freed slots. The age-before-capture order is internal
-/// so it cannot be reordered by a caller; captures past the fixed sticky
-/// capacity are dropped and counted rather than silently discarded.
-fn advanceStickyStimuli(pipeline: *SimulationPipeline, frame: *const SimulationFrame, sticky_dropped: *usize) void {
-    var write: usize = 0;
-    for (0..pipeline.sticky_count) |i| {
-        const remaining = pipeline.sticky_remaining[i];
-        if (remaining <= 1) continue;
-        pipeline.sticky_stimuli[write] = pipeline.sticky_stimuli[i];
-        pipeline.sticky_remaining[write] = remaining - 1;
-        write += 1;
-    }
-    pipeline.sticky_count = write;
-
-    const linger = cognition_stagger_n - 1;
-    if (linger == 0) return;
-    for (frame.stimuli.mergedItems()) |stimulus| {
-        switch (stimulus.kind) {
-            .dig, .impact => {},
-            .footstep => continue,
-        }
-        if (pipeline.sticky_count >= stimulus_sticky_capacity) {
-            sticky_dropped.* += 1;
-            continue;
-        }
-        pipeline.sticky_stimuli[pipeline.sticky_count] = stimulus;
-        pipeline.sticky_remaining[pipeline.sticky_count] = linger;
-        pipeline.sticky_count += 1;
-    }
-}
-
-/// At most one footstep when the player's movement body carries non-trivial velocity.
-fn tryAppendPlayerFootstepStimulus(
-    frame: *SimulationFrame,
-    data: *const DataSystem,
-    player: Player,
-    live_dropped: *usize,
-) void {
-    const body = data.movementBodyConst(player.entity) orelse return;
-    const vel_sq = body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y;
-    if (vel_sq < footstep_velocity_sq_threshold) return;
-    const appended = frame.tryAppendStimulus(.{
-        .position = body.position,
-        .intensity = defaultStimulusIntensity(.footstep),
-        .kind = .footstep,
-        .level = player.current_level,
-    }, stimulus_live_capacity);
-    if (!appended) live_dropped.* += 1;
-}
-
-/// Enqueues player-involving collision contacts as next-step impact stimuli.
-fn enqueuePlayerCollisionImpactsToDeferred(
-    pipeline: *SimulationPipeline,
-    frame: *const SimulationFrame,
-    data: *const DataSystem,
-    player_entity: EntityId,
-    player_level: u16,
-    deferred_dropped: *usize,
-) void {
-    var enqueued: usize = 0;
-    for (frame.contacts.mergedItems()) |contact| {
-        if (!contactInvolvesEntity(contact, player_entity)) continue;
-        if (!contactEligibleForImpactStimulus(contact)) continue;
-        if (enqueued >= stimulus_max_impacts_per_step) {
-            deferred_dropped.* += 1;
-            continue;
-        }
-        const position = contactStimulusPosition(data, contact) orelse continue;
-        if (pipeline.deferred_stimulus_count >= stimulus_deferred_capacity) {
-            deferred_dropped.* += 1;
-            continue;
-        }
-        pipeline.deferred_stimuli[pipeline.deferred_stimulus_count] = .{
-            .position = position,
-            .intensity = impactStimulusIntensity(contact),
-            .kind = .impact,
-            .level = player_level,
-        };
-        pipeline.deferred_stimulus_count += 1;
-        enqueued += 1;
-    }
-}
+};
 
 /// Fixed-step simulation owner for one gameplay state instance.
 /// This owns reusable systems and concrete stage order; it is not a global
@@ -653,46 +679,59 @@ pub const SimulationPipeline = struct {
     ai: AiSystem,
     steering: SteeringSystem,
     pathfinding: PathfindingSystem,
-    /// Backbone scope system: recomputes chunks, gates AI/movement/collision by
-    /// tier + camera cognition halo + stagger, and drives auto tier wake/sleep.
+    /// Static navigation obstacles as shared rows on nav's cell grid, changed only at the
+    /// commit seam (`reserveStaticColliders`, `captureStaticColliderChanges`,
+    /// `syncStaticColliders`); nav and steering read them.
+    static_colliders: StaticColliderSystem,
+    /// Backbone scope system: recomputes chunks, gathers the unstaggered
+    /// cognition halo and the stagger-filtered think set, and drives auto tier
+    /// wake/sleep.
     scope: SimulationScopeSystem,
-    /// Shared per-step spatial index (Slice 28), built once from the same
-    /// cognition-scoped population the scope system selects for AI. AI
-    /// separation queries it read-only; future perception stages reuse it too.
+    /// Shared per-step spatial index, built once from the unstaggered
+    /// cognition halo. Perception candidates and AI separation/cohere query it
+    /// read-only; think rows map in via `spatial_self_index`.
     spatial_index: SpatialIndexSystem,
-    /// AI perception substrate (Slice 29): queries the shared spatial index for
-    /// hostile candidates within vision/FOV/line-of-sight and writes sensed
-    /// state to `PerceptionStore` for the cognition-scoped `AiPerception` subset.
+    /// AI perception substrate: queries the shared spatial index for
+    /// hostile candidates (halo) within vision/FOV/line-of-sight and writes
+    /// sensed state to `PerceptionStore` for this step's think-set observers.
     perception: PerceptionSystem,
     /// AI short-term memory: decays staleness/familiarity/ring contacts for the
-    /// cognition-scoped `AiPerception` + `AiMemory` subset and refreshes from
+    /// think-set `AiPerception` + `AiMemory` subset and refreshes from
     /// this step's perception acquisition events, feeding `AiSystem`'s
     /// memory-aware cold-pursue retarget.
     ai_memory: AiMemorySystem,
     /// Emotion-drive appraisal (fear/curiosity/aggression/fatigue): appraises
     /// this step's just-refreshed `AiPerception`/`AiMemory` state (both
     /// optional per row) plus each agent's own `AiAgent.active_behavior` into
-    /// the cognition-scoped `AiAffect` subset. `AiConfig.affect_slice` threads
-    /// the resulting drives into arbitration (Slice 32) one stage later; this
+    /// the think-set `AiAffect` subset. `AiConfig.affect_slice` threads
+    /// the resulting drives into arbitration one stage later; this
     /// stage only appraises and decays them.
     affect: AffectSystem,
     dig: DigController,
+    /// The plane stage's NPC cell-entry gather; the dig controller's plane reserve and
+    /// commit visit only its entries. Its windows follow the population seam.
+    plane_entry: PlaneEntrySystem,
     destructible: DestructibleController,
     audio_controller: AudioController,
-    nav_cell_size: f32,
-    /// See `SimulationPipelineConfig.perception_max_events_per_step`.
+    /// Tracked logical population capacity: every population-sized pipeline capacity is
+    /// reserved to it. Grown only by `syncPopulationCapacity` at the commit seam.
+    movement_body_capacity: usize,
+    /// Telemetry: population seam growths (perf metric `population_capacity_grows`).
+    population_capacity_grows: u64 = 0,
+    /// Once-only flag for the first-growth log.
+    population_growth_logged: bool = false,
+    /// This pipeline's share of `frame.events`' `capacity_limit` for perception,
+    /// passed through as `PerceptionConfig.max_events_per_step`. Derived share
+    /// (`perception_events_per_observer_max` x tracked `AiPerception` rows), exact at
+    /// init and grown only at the population seam, so the merge cap never truncates.
     perception_max_events_per_step: usize,
-    /// See `SimulationPipelineConfig.affect_max_events_per_step`.
+    /// Affect's derived share (`affect_events_per_row_max` x tracked `AiAffect` rows),
+    /// passed through as `AffectConfig.max_events_per_step`; grown only at the seam.
     affect_max_events_per_step: usize,
-    /// Pipeline-owned deferred impact buffer (Slice 39): survives `beginStep`
-    /// until promoted before perception on the next `update`.
-    deferred_stimuli: [stimulus_deferred_capacity]WorldStimulus = undefined,
-    deferred_stimulus_count: usize = 0,
-    /// One-shot dig/impact linger for cognition stagger (not cleared on `beginStep`).
-    sticky_stimuli: [stimulus_sticky_capacity]WorldStimulus = undefined,
-    sticky_remaining: [stimulus_sticky_capacity]u8 = undefined,
-    sticky_count: usize = 0,
-    hearing_stimuli_scratch: [hearing_stimuli_scratch_capacity]WorldStimulus = undefined,
+    /// See `SimulationPipelineConfig.structural_headroom`.
+    structural_headroom: usize,
+    /// Deferred impacts, sticky linger, and the hearing scratch. Survives `beginStep`.
+    sensory: SensoryBus,
     /// Rising-edge latch for `Action.interact` (one press per fixed step).
     /// Advanced only after a successful append so a soft-dropped press can retry.
     interact_held_last: bool = false,
@@ -708,49 +747,73 @@ pub const SimulationPipeline = struct {
         bounds_height: f32,
         config: SimulationPipelineConfig,
     ) !SimulationPipeline {
+        // `data` at init is authoritative: the tracked capacities start at least at
+        // the committed rows, so `tracked >= rows` holds from construction.
+        const rows = data.populationRowCounts();
+        const population = @max(config.movement_body_capacity, rows.population());
         var ai = AiSystem.init(allocator);
         errdefer ai.deinit();
         var steering = SteeringSystem.init(allocator);
         errdefer steering.deinit();
-        try steering.reserveForCapacity(config.steering_agent_capacity, config.static_obstacle_capacity);
+        try steering.reserve(population);
         var pathfinding = PathfindingSystem.init(allocator);
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
-        try pathfinding.rebuildStaticNavGridWithWorld(data, config.navigation_world, bounds_width, bounds_height, config.nav_cell_size, config.nav_build_thread_system);
+        try pathfinding.reserveGoals(population);
+        // The elastic pools cover the committed steering agents now, so the first update has
+        // nothing to grow. A failure here or later frees them with the system.
+        try growPathfindingForAgents(&pathfinding, rows.steering_agents);
+        // With a world, nav covers its levels at its own tile and chunk dimensions; the
+        // bounds and `nav_cell_size` shape only a world-less build. The colliders build first,
+        // on nav's cell grid, and nav reads them.
+        const nav_extent = if (config.navigation_world) |world|
+            PathfindingSystem.worldNavExtent(world)
+        else
+            pathfinding.boundsNavExtent(bounds_width, bounds_height, config.nav_cell_size);
+        var static_colliders = StaticColliderSystem.init(allocator);
+        errdefer static_colliders.deinit();
+        try static_colliders.rebuild(data, try nav_extent.colliderGeometry());
+        try pathfinding.rebuildNavFromColliders(&static_colliders, nav_extent, if (config.navigation_world != null) config.nav_build_thread_system else null);
         var collision = CollisionSystem.init(allocator);
         errdefer collision.deinit();
         var collision_response = CollisionResponseSystem.init(allocator);
         errdefer collision_response.deinit();
-        try collision_response.reserveForContacts(config.contact_capacity);
+        // The response reserves follow the collision pair bound over the population, like
+        // `collision.reserve`; `reserve` sizes the frame's contact streams to the same bound.
+        try collision_response.reserveForContacts(@max(config.contact_capacity, CollisionSystem.estimateContactCapacity(population)));
+        try collision.reserve(population);
         var scope = SimulationScopeSystem.init(allocator);
         errdefer scope.deinit();
-        try scope.reserve(config.movement_body_capacity);
+        try scope.reserve(population);
         var spatial_index = SpatialIndexSystem.init(allocator);
         errdefer spatial_index.deinit();
         const spatial_geometry: SpatialIndexDenseWindowGeometry = if (config.navigation_world) |world|
             .{ .chunk_size_tiles = world.chunk_size_tiles, .tile_size = world.tile_size }
         else
             .{};
-        try spatial_index.reserve(config.movement_body_capacity, spatial_geometry);
-        // No reserve method: PerceptionSystem lazily ensureTotalCapacity's its
-        // gather buffers on first use, same as AiSystem.
+        try spatial_index.reserve(population, spatial_geometry);
+        // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
         var perception = PerceptionSystem.init(allocator);
         errdefer perception.deinit();
-        // Pays every level's first-ever `level_blocked` cache build once here,
-        // alongside pathfinding's own static grid build above, instead of
-        // scattered across whichever live steps first put an observer on each
-        // level (see `PerceptionSystem.prebuildLevelCaches`'s doc comment).
-        if (config.navigation_world) |world| {
-            try perception.prebuildLevelCaches(world);
-        }
-        // No reserve method: AiMemorySystem lazily ensureTotalCapacity's its
-        // gather buffer on first use, same as PerceptionSystem/AiSystem.
+        // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
         var ai_memory = AiMemorySystem.init(allocator);
         errdefer ai_memory.deinit();
-        // No reserve method: AffectSystem lazily ensureTotalCapacity's its
-        // gather buffer on first use, same as AiMemorySystem/PerceptionSystem.
+        // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
         var affect = AffectSystem.init(allocator);
         errdefer affect.deinit();
+        var dig = DigController.init(config.dig);
+        errdefer dig.deinit();
+        try dig.reservePlaneScratch(allocator, maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = population }));
+        // The plane-traversal stage records its carves into nav; its record room follows the
+        // same bound.
+        try pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = population }));
+        var plane_entry = PlaneEntrySystem.init(allocator);
+        errdefer plane_entry.deinit();
+        try plane_entry.reserve(population);
+        try ai.reserve(population);
+        try perception.reserve(population);
+        try ai_memory.reserve(population);
+        try affect.reserve(population);
 
         return .{
             .movement = MovementSystem.init(),
@@ -759,28 +822,242 @@ pub const SimulationPipeline = struct {
             .ai = ai,
             .steering = steering,
             .pathfinding = pathfinding,
+            .static_colliders = static_colliders,
             .scope = scope,
             .spatial_index = spatial_index,
             .perception = perception,
             .ai_memory = ai_memory,
             .affect = affect,
-            .dig = DigController.init(config.dig),
+            .dig = dig,
+            .plane_entry = plane_entry,
             .destructible = DestructibleController.init(),
             .audio_controller = AudioController.init(),
-            .nav_cell_size = config.nav_cell_size,
-            .perception_max_events_per_step = config.perception_max_events_per_step,
-            .affect_max_events_per_step = config.affect_max_events_per_step,
+            .movement_body_capacity = population,
+            .perception_max_events_per_step = perception_events_per_observer_max * rows.ai_perceptions,
+            .affect_max_events_per_step = affect_events_per_row_max * rows.ai_affects,
+            .structural_headroom = config.structural_headroom,
+            .sensory = SensoryBus.init(config.stimuli),
         };
+    }
+
+    /// Tops up frame events to the sum of producer budgets (`eventCapacitySum`),
+    /// reserves cognition gather scratch for `pop`, and reserves the contact-dependent
+    /// streams to the collision pair bound over the tracked `movement_body_capacity`
+    /// (`reserveContactStreams`). Does not lower an existing higher event limit. The
+    /// production entry: state init calls it after `reserveStreams`.
+    pub fn reserve(self: *SimulationPipeline, frame: *SimulationFrame, pop: usize) !void {
+        try self.ai.reserve(pop);
+        try self.perception.reserve(pop);
+        try self.ai_memory.reserve(pop);
+        try self.affect.reserve(pop);
+        try self.reserveContactStreams(frame);
+        const sum = self.eventCapacitySum();
+        try frame.events.reserve(sum, sum);
+        if (frame.events.capacity_limit) |limit| {
+            if (limit < sum) frame.events.setCapacityLimit(sum);
+        } else {
+            frame.events.setCapacityLimit(sum);
+        }
+    }
+
+    /// Reserves `frame.contacts`, `frame.collision_triggers` and the response's intent,
+    /// order, trigger, observer, and gather-range staging to `CollisionSystem.estimateContactCapacity(movement_body_capacity)`,
+    /// the pair bound `collision.reserve` sizes the collision stores to (contacts are a
+    /// subset of candidate pairs, triggers of contacts). Every scene within that bound
+    /// runs `collision_detect` and `collision_respond` allocation-free under every
+    /// partition; past it the main-thread grow paths run, counted by the collision
+    /// system's `pair_bound_overflows`. Grow-only.
+    fn reserveContactStreams(self: *SimulationPipeline, frame: *SimulationFrame) !void {
+        const contact_capacity = CollisionSystem.estimateContactCapacity(self.movement_body_capacity);
+        try CollisionSystem.reserveContactStream(&frame.contacts, self.movement_body_capacity);
+        // Response writes the trigger stream as one range.
+        try frame.collision_triggers.reserve(1, estimateTriggerCapacity(contact_capacity));
+        try self.collision_response.reserveForContacts(contact_capacity);
+    }
+
+    /// The most ranges steering's avoidance pass appends to `frame.intents` and to
+    /// `frame.path_requests` in one step at the tracked population (one of each per pass
+    /// range): the range count to reserve both streams to.
+    pub fn steeringStreamRangeCount(self: *const SimulationPipeline) usize {
+        return maxRangeCount(self.movement_body_capacity, steering_range_alignment_items);
+    }
+
+    // The most ranges `ai_decide` appends to `frame.navigation_intents` in one step at the
+    // tracked population.
+    fn navigationIntentRangeCount(self: *const SimulationPipeline) usize {
+        return maxRangeCount(self.movement_body_capacity, ai_range_alignment_items);
+    }
+
+    // The most ranges one step appends to `frame.structural_commands` at the tracked
+    // population: the tier policy's ranges, the destructible controller's one, and the
+    // caller's queued ranges, at most one per event of its `structural_headroom` (each
+    // range holds at least one command).
+    fn structuralCommandRangeCount(self: *const SimulationPipeline) usize {
+        return maxRangeCount(self.movement_body_capacity, scope_range_alignment_items) + 1 + self.structural_headroom;
+    }
+
+    /// The per-step `frame.events` bound: the exhaustive sum of `maxEventsPerStep`
+    /// over every `EventProducerId` under this pipeline's budgets.
+    pub fn eventCapacitySum(self: *const SimulationPipeline) usize {
+        const budgets = self.eventBudgets();
+        var sum: usize = 0;
+        inline for (comptime std.meta.tags(EventProducerId)) |producer| {
+            sum += maxEventsPerStep(producer, budgets);
+        }
+        return sum;
+    }
+
+    /// The budget for this step's structural commit: the whole `.structural_commit`
+    /// share (the pipeline's destructible share plus the caller's
+    /// `structural_headroom`), plus `extra_required_events` preflighted for after it.
+    pub fn structuralCommitBudget(self: *const SimulationPipeline, extra_required_events: usize) StructuralCommitBudget {
+        return .{
+            .extra_required_events = extra_required_events,
+            .structural_event_share = maxEventsPerStep(.structural_commit, self.eventBudgets()),
+        };
+    }
+
+    /// Structural-command stream room beyond one `set_simulation_tier` per body: the
+    /// whole `.structural_commit` event share. Every non-tier command emits at least one
+    /// event, so the event share bounds the command count.
+    pub fn structuralCommandHeadroom(self: *const SimulationPipeline) usize {
+        return maxEventsPerStep(.structural_commit, self.eventBudgets());
+    }
+
+    pub fn eventBudgets(self: *const SimulationPipeline) EventBudgetInputs {
+        return .{
+            .perception_max_events_per_step = self.perception_max_events_per_step,
+            .affect_max_events_per_step = self.affect_max_events_per_step,
+            .movement_body_capacity = self.movement_body_capacity,
+            .structural_headroom = self.structural_headroom,
+        };
+    }
+
+    /// Population growth seam. Main thread, `merge_outputs`, right after
+    /// the structural commit and before the post-commit reactions. O(1) fast path; on
+    /// growth, re-reserves every population-sized pipeline capacity, the frame streams
+    /// and event bound, and the pathfinding elastic pools. The only population growth
+    /// point: the fixed-step stages stay allocation-free between seams. Grow-only; the
+    /// trigger and the grown sizes are pure functions of committed row counts, so
+    /// capacity never changes behavior. After an error the tracked values are restored
+    /// and the next seam retries (every reserve is idempotent).
+    pub fn syncPopulationCapacity(
+        self: *SimulationPipeline,
+        frame: *SimulationFrame,
+        data: *const DataSystem,
+    ) !PopulationSyncStats {
+        const rows = data.populationRowCounts();
+        const population = rows.population();
+        if (population <= self.movement_body_capacity and
+            rows.ai_perceptions * perception_events_per_observer_max <= self.perception_max_events_per_step and
+            rows.ai_affects * affect_events_per_row_max <= self.affect_max_events_per_step and
+            self.pathfinding.coversAgentCount(rows.steering_agents))
+        {
+            return .{};
+        }
+        return self.growPopulationCapacity(frame, rows);
+    }
+
+    fn growPopulationCapacity(
+        self: *SimulationPipeline,
+        frame: *SimulationFrame,
+        rows: PopulationRowCounts,
+    ) !PopulationSyncStats {
+        @branchHint(.cold);
+        var stats: PopulationSyncStats = .{};
+        const population = rows.population();
+        const old_body = self.movement_body_capacity;
+        const body = if (population > old_body) grownPopulationCapacity(population) else old_body;
+        const old_perception_share = self.perception_max_events_per_step;
+        const old_affect_share = self.affect_max_events_per_step;
+        const perception_share = if (rows.ai_perceptions * perception_events_per_observer_max > old_perception_share)
+            perception_events_per_observer_max * grownPopulationCapacity(rows.ai_perceptions)
+        else
+            old_perception_share;
+        const affect_share = if (rows.ai_affects * affect_events_per_row_max > old_affect_share)
+            affect_events_per_row_max * grownPopulationCapacity(rows.ai_affects)
+        else
+            old_affect_share;
+        // `collision.reserve` raises its declared pair bound; a later failure (the contact
+        // streams in `reserve`) must not leave it declaring streams that were never sized.
+        const old_pair_bound = self.collision.reserved_pair_bound;
+        errdefer {
+            self.collision.reserved_pair_bound = old_pair_bound;
+            self.movement_body_capacity = old_body;
+            self.perception_max_events_per_step = old_perception_share;
+            self.affect_max_events_per_step = old_affect_share;
+        }
+
+        const body_grew = body != old_body;
+        if (body_grew) {
+            try self.scope.reserve(body);
+            try self.plane_entry.reserve(body);
+            try self.spatial_index.reserveRows(body);
+            try self.collision.reserve(body);
+            try self.dig.ensurePlaneScratchReserve(body + 1);
+            try self.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = body }));
+            try self.steering.reserve(body);
+            try self.pathfinding.reserveGoals(body);
+        }
+
+        self.movement_body_capacity = body;
+        const shares_grew = perception_share != old_perception_share or affect_share != old_affect_share;
+        self.perception_max_events_per_step = perception_share;
+        self.affect_max_events_per_step = affect_share;
+
+        if (body_grew or shares_grew) {
+            // Each stream's range count is the most ranges its writers dispatch at `body`.
+            try frame.navigation_intents.reserve(self.navigationIntentRangeCount(), body);
+            try frame.intents.reserve(self.steeringStreamRangeCount(), body);
+            try frame.structural_commands.reserve(self.structuralCommandRangeCount(), body + self.structuralCommandHeadroom());
+            try frame.reservePathRequests(self.steeringStreamRangeCount(), body);
+            // Raises the event limit, re-runs the cognition reserves and the contact
+            // streams + response reserves to the grown pair bound (and every other
+            // reserve attached to `reserve`).
+            try self.reserve(frame, body);
+        }
+
+        try growPathfindingForAgents(&self.pathfinding, rows.steering_agents);
+
+        if (body_grew or shares_grew) {
+            stats.grew = true;
+            self.population_capacity_grows += 1;
+            if (!self.population_growth_logged) {
+                self.population_growth_logged = true;
+                if (comptime logging.enabled(.info) and !builtin.is_test) logging.game.info(
+                    "population seam grew pipeline capacity to {d} bodies",
+                    .{body},
+                );
+            }
+        }
+        return stats;
+    }
+
+    // Sizes pathfinding's elastic pools for `steering_agents`, raising its agent ceiling
+    // geometrically when the crowd passes it; O(1) when they already cover it. Shared by init
+    // (the committed rows) and the population seam. An error restores the ceiling, and the
+    // pools keep the fallback limits their resize installs.
+    fn growPathfindingForAgents(pathfinding: *PathfindingSystem, steering_agents: usize) error{OutOfMemory}!void {
+        if (pathfinding.coversAgentCount(steering_agents)) return;
+        const old_agent_budget = pathfinding.capacity.max_agent_budget;
+        errdefer pathfinding.capacity.max_agent_budget = old_agent_budget;
+        if (steering_agents > pathfinding.agentBudget()) {
+            pathfinding.raiseAgentBudget(grownPopulationCapacity(steering_agents));
+        }
+        try pathfinding.growForAgentCount(steering_agents);
     }
 
     /// Releases owned processor/controller state. Borrowed gameplay data and
     /// frame storage stay owned by the gameplay state.
     pub fn deinit(self: *SimulationPipeline) void {
+        self.plane_entry.deinit();
+        self.dig.deinit();
         self.affect.deinit();
         self.ai_memory.deinit();
         self.perception.deinit();
         self.spatial_index.deinit();
         self.scope.deinit();
+        self.static_colliders.deinit();
         self.pathfinding.deinit();
         self.steering.deinit();
         self.ai.deinit();
@@ -789,94 +1066,57 @@ pub const SimulationPipeline = struct {
         self.* = undefined;
     }
 
-    /// Rebuilds the state-local static navigation grid after committed domain
-    /// changes invalidate obstacle occupancy.
-    pub fn rebuildStaticNavigation(
-        self: *SimulationPipeline,
-        data: *const DataSystem,
-        bounds_width: f32,
-        bounds_height: f32,
-    ) !void {
-        try self.pathfinding.rebuildStaticNavGrid(data, bounds_width, bounds_height, self.nav_cell_size);
+    /// The commit seam's collider reserve, before the structural commit: sizes the static
+    /// colliders' dirty list to every entity index this step's commands can produce, so the
+    /// capture after the commit allocates nothing, and nav's static marks to every change
+    /// the next collider sync can record (the pending changes plus one per command). An
+    /// error commits nothing.
+    pub fn reserveStaticColliders(self: *SimulationPipeline, frame: *const SimulationFrame, data: *const DataSystem) !void {
+        const command_count = frame.structural_commands.mergedItems().len;
+        try self.static_colliders.reserveForCommit(data, command_count);
+        try self.pathfinding.reserveStaticColliderMarks(self.static_colliders.pendingChangeCount() + command_count);
     }
 
-    pub fn rebuildStaticNavigationWithWorld(
-        self: *SimulationPipeline,
-        data: *const DataSystem,
-        world: *const WorldSystem,
-        bounds_width: f32,
-        bounds_height: f32,
-    ) !void {
-        try self.pathfinding.rebuildStaticNavGridWithWorld(data, world, bounds_width, bounds_height, self.nav_cell_size, null);
+    /// Right after the structural commit: records the step's static changes into the
+    /// colliders' persistent dirty list. Allocation-free; never fails, so a later seam
+    /// failure cannot lose them.
+    pub fn captureStaticColliderChanges(self: *SimulationPipeline, frame: *const SimulationFrame) void {
+        self.static_colliders.capture(frame);
     }
 
-    /// Clears the pathfinding system's dirty nav-cell buffer. Call once before a step's
-    /// marking pass so a skipped apply never leaks stale edits into the next step.
-    pub fn clearNavDirty(self: *SimulationPipeline) void {
-        self.pathfinding.clearNavDirty();
+    /// Applies the captured static changes to the collider rows, then records them for nav
+    /// into the marks `reserveStaticColliders` reserved, whether or not nav applies this
+    /// step. Main work is O(1) per changed static and per footprint chunk entering or
+    /// leaving; the per-chunk sorted placement threads under `thread_system`. On error the
+    /// rows are unchanged, nothing is recorded, and the changes stay for the next sync.
+    pub fn syncStaticColliders(self: *SimulationPipeline, data: *const DataSystem, thread_system: ?*ThreadSystem) !void {
+        try self.static_colliders.sync(data, thread_system);
+        self.pathfinding.recordStaticColliderChanges(self.static_colliders.changesThisStep());
     }
 
-    /// Records one changed nav cell (from a structural event) for the next incremental
-    /// update. The system-owned buffer grows rather than drops, so any number of edits in
-    /// one step reach the nav graph.
-    pub fn markNavDirty(self: *SimulationPipeline, level: u16, x: u16, y: u16) !void {
-        try self.pathfinding.markNavDirty(level, x, y);
-    }
-
-    /// Marks a whole level for re-derivation next update, for changes that cannot be reduced to
-    /// specific cells (e.g. a destroyed static obstacle whose nav cell is no longer resolvable).
-    pub fn markNavLevelDirty(self: *SimulationPipeline, level: u16) !void {
-        try self.pathfinding.markNavLevelDirty(level);
-    }
-
-    /// Whether any dirty nav cell or whole-level request is buffered for this step.
-    pub fn hasPendingNavUpdates(self: *const SimulationPipeline) bool {
-        return self.pathfinding.hasPendingNavUpdates();
-    }
-
-    /// Folds the buffered static-obstacle edits into the existing nav graph incrementally
-    /// (affected levels only, single `nav_version` bump) rather than rebuilding the whole
-    /// world, then clears the buffer. The whole-world build path stays init-only.
-    pub fn applyNavUpdates(
-        self: *SimulationPipeline,
-        data: *const DataSystem,
-        world: *const WorldSystem,
-        thread_system: ?*ThreadSystem,
-    ) !NavUpdateStats {
-        return self.pathfinding.applyBufferedNavUpdates(data, world, thread_system);
+    /// Records the last collider sync's chunk-list splice batch. Every sync resets it, so
+    /// after the commit seam it is this step's, empty (and not recorded) when no static
+    /// changed.
+    pub fn recordStaticColliderSyncTo(self: *const SimulationPipeline, perf: runtime_perf_log.Context) void {
+        perf.recordBatch(.static_collider_splice, self.static_colliders.last_splice_batch);
     }
 
     /// Orchestrates the post-commit nav reaction by delegating to the nav-owning
-    /// `PathfindingSystem`, which interprets nav-invalidating events into dirty
-    /// cells, applies the incremental update, and emits the invalidation event.
+    /// `PathfindingSystem`, which applies every recorded nav change and emits the
+    /// invalidation event. Runs after `syncStaticColliders` succeeded this step.
     pub fn reactToPostCommitNavEvents(
         self: *SimulationPipeline,
         frame: *SimulationFrame,
-        data: *const DataSystem,
         world: *const WorldSystem,
         thread_system: ?*ThreadSystem,
     ) !NavUpdateStats {
-        return self.pathfinding.reactToPostCommitNavEvents(frame, data, world, thread_system);
+        return self.pathfinding.reactToPostCommitNavEvents(frame, &self.static_colliders, world, thread_system);
     }
 
-    /// Orchestrates the post-commit perception-cache reaction by delegating to
-    /// the cache-owning `PerceptionSystem`, which records localized dirty
-    /// rects for its LOS-blocked bitmap cache from the same committed events
-    /// `reactToPostCommitNavEvents` reacts to — a fully independent side
-    /// effect on disjoint state, so call order between the two does not
-    /// matter.
-    pub fn reactToPostCommitPerceptionEvents(
-        self: *SimulationPipeline,
-        frame: *SimulationFrame,
-        world: *const WorldSystem,
-    ) !void {
-        return self.perception.reactToPostCommitPerceptionEvents(frame, world);
-    }
-
-    /// Orchestrates the post-commit static-obstacle spatial invalidation for
-    /// steering local avoidance. Same structural_commit event family as nav/
-    /// perception; call order among the three post-commit reactions does not
-    /// matter (disjoint state).
+    /// Orchestrates steering's post-commit reaction: its movement-index cache follows the
+    /// step's entity changes. Steering reads the synced collider rows directly, so no
+    /// static change reaches it here. Disjoint state, so it runs even when the nav
+    /// reaction fails.
     pub fn reactToPostCommitSteeringEvents(
         self: *SimulationPipeline,
         frame: *const SimulationFrame,
@@ -884,16 +1124,12 @@ pub const SimulationPipeline = struct {
         self.steering.reactToPostCommitSteeringEvents(frame);
     }
 
-    /// Whether any pending structural command may invalidate navigation once
-    /// applied. Delegates to `PathfindingSystem`; used for the pre-commit event
-    /// capacity preflight.
-    pub fn structuralCommandsMayInvalidateNavigation(data: *const DataSystem, frame: *const SimulationFrame) bool {
-        return PathfindingSystem.structuralCommandsMayInvalidateNavigation(data, frame);
-    }
-
-    /// Whether any queued structural-commit event will drive a nav invalidation.
-    pub fn pendingEventsMayInvalidateNavigation(frame: *const SimulationFrame) bool {
-        return PathfindingSystem.pendingEventsMayInvalidateNavigation(frame);
+    /// Whether the post-commit nav reaction may emit its event this step: a pending
+    /// structural command may change nav, a failed collider sync left static changes for
+    /// this step's sync, or nav has recorded marks, levels, links, or a content revision
+    /// still to apply. Used for the pre-commit event capacity preflight.
+    pub fn navReactionMayEmit(self: *const SimulationPipeline, data: *const DataSystem, frame: *const SimulationFrame, world: *const WorldSystem) bool {
+        return self.static_colliders.hasPendingChanges() or self.pathfinding.navReactionMayEmit(data, frame, world);
     }
 
     /// Queues ambient audio (music + movement-gated jet loop) through the owned
@@ -904,9 +1140,11 @@ pub const SimulationPipeline = struct {
     }
 
     /// Queues collision SFX for this step's contacts through the owned audio
-    /// controller. Only contacts involving `player.entity` play a sound.
+    /// controller. Only contacts involving `player.entity` play a sound; they are the
+    /// collision response's observer contacts, so this runs after `update` on the same
+    /// frame.
     pub fn queueCollisionAudio(self: *SimulationPipeline, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, player: Player, delta_seconds: f32) void {
-        self.audio_controller.queueCollision(audio, frame, data, player.entity, delta_seconds);
+        self.audio_controller.queueCollision(audio, frame, data, self.collision_response.observerContacts(frame, player.entity), delta_seconds);
     }
 
     /// Flags the active jet loop to stop on resume (no command buffer at pause time).
@@ -937,7 +1175,7 @@ pub const SimulationPipeline = struct {
                 .entity = player.entity,
                 .kind = .interact,
             };
-            // Same faced-cell probe as dig so Slice 45 consumers match dig targeting.
+            // Same faced-cell probe as dig so action-intent consumers match dig targeting.
             if (facedCellForEntity(world, data, player.entity)) |cell| {
                 intent.level = player.current_level;
                 intent.cell_x = cell.x;
@@ -962,60 +1200,197 @@ pub const SimulationPipeline = struct {
         self.movement.syncPreviousPositions(&movement_slice);
     }
 
-    /// Runs the current full-active fixed-step stage order and returns stage
-    /// stats. Scope selection uses the live camera cognition halo + stagger; chunk
+    /// Per-step values produced by one stage and read by a later stage or by
+    /// `finish`. Not persistent. Indices alias scope scratch owned by the pipeline.
+    const StepState = struct {
+        context: SimulationPipelineUpdateContext,
+        stimuli_live_dropped: usize = 0,
+        stimuli_deferred_dropped: usize = 0,
+        stimuli_sticky_dropped: usize = 0,
+        stimuli_promoted: usize = 0,
+        action_intents_dropped: usize = 0,
+        dig_plane_scratch_grown: usize = 0,
+        plane_entry_windows_grown: usize = 0,
+        cognition_region: ?ActiveRegion = null,
+        ai_halo_indices: []const u32 = &[_]u32{},
+        ai_cognition_indices: []const u32 = &[_]u32{},
+        collision_scope_indices: ?[]const u32 = null,
+        spatial_index: SpatialIndexStats = .{},
+        perception: PerceptionStats = .{},
+        ai_memory: AiMemoryStats = .{},
+        affect: AffectStats = .{},
+        ai: AiStats = .{},
+        steering: SteeringStats = .{},
+        path_goals: GoalResolveStats = .{},
+        pathfinding: PathfindingStats = .{},
+        apply_intents: MovementIntentStats = .{},
+        movement: MovementStats = .{},
+        chunk_derive: BatchStats = .{},
+        plane_entry: BatchStats = .{},
+        collision: CollisionStats = .{},
+        collision_response: CollisionResponseStats = .{},
+        destructible: DestructibleProcessStats = .{},
+
+        fn init(pipeline: *SimulationPipeline, context: SimulationPipelineUpdateContext) StepState {
+            const dropped = pipeline.action_intents_dropped_step;
+            pipeline.action_intents_dropped_step = 0;
+            var step = StepState{
+                .context = context,
+                .action_intents_dropped = dropped,
+            };
+            step.context.frame.phase = .processors;
+            return step;
+        }
+
+        fn finish(self: StepState, pipeline: *const SimulationPipeline) SimulationPipelineStats {
+            const scope = pipeline.buildScopeStats(
+                self.context.data,
+                self.cognition_region,
+                self.ai_cognition_indices,
+                self.collision_scope_indices,
+                self.steering,
+            );
+            return .{
+                .scope = scope,
+                .spatial_index = self.spatial_index,
+                .perception = self.perception,
+                .ai_memory = self.ai_memory,
+                .affect = self.affect,
+                .ai = self.ai,
+                .steering = self.steering,
+                .path_goals = self.path_goals,
+                .pathfinding = self.pathfinding,
+                .apply_intents = self.apply_intents,
+                .movement = self.movement,
+                .chunk_derive = self.chunk_derive,
+                .plane_entry = self.plane_entry,
+                .collision = self.collision,
+                .collision_response = self.collision_response,
+                .stimuli_live_dropped = self.stimuli_live_dropped,
+                .stimuli_deferred_dropped = self.stimuli_deferred_dropped,
+                .stimuli_sticky_dropped = self.stimuli_sticky_dropped,
+                .stimuli_promoted = self.stimuli_promoted,
+                .action_intents_consumed = self.destructible.intents_consumed,
+                .action_intents_dropped = self.action_intents_dropped,
+                .destructibles_destroyed = self.destructible.destroyed,
+                .destructibles_hit = self.destructible.hits,
+                .dig_plane_scratch_grown = self.dig_plane_scratch_grown,
+                .plane_entry_windows_grown = self.plane_entry_windows_grown,
+            };
+        }
+    };
+
+    /// Runs `stage_order` and returns stage stats. Scope selection uses the
+    /// fixed-step `sim_view` cognition halo (index/candidates) plus stagger (think
+    /// set); chunk
     /// columns are derived in their own late stage after positions settle.
+    /// Action intents are already on the frame from `captureActionIntent`.
     pub fn update(self: *SimulationPipeline, context: SimulationPipelineUpdateContext) !SimulationPipelineStats {
-        const data = context.data;
-        const frame = context.frame;
+        var step = StepState.init(self, context);
+        inline for (stage_order) |id| try self.runStage(id, &step);
+        return step.finish(self);
+    }
 
-        frame.phase = .processors;
-        var stimuli_live_dropped: usize = 0;
-        var stimuli_deferred_dropped: usize = 0;
-        var stimuli_sticky_dropped: usize = 0;
-        // Capture-phase soft-drops accumulate on the pipeline field before update;
-        // fold into this step's stats and clear for the next input phase.
-        const action_intents_dropped = self.action_intents_dropped_step;
-        self.action_intents_dropped_step = 0;
-        const stimuli_promoted = promoteDeferredStimuli(self, frame, &stimuli_live_dropped);
-        // Player-authored world edit. Runs after deferred promote; its
-        // world_tile_changed event is deferred and re-masks navigation in
-        // merge_outputs regardless of order.
-        try self.dig.process(context.world, data, context.player.*, frame);
-        tryAppendPlayerFootstepStimulus(frame, data, context.player.*, &stimuli_live_dropped);
-        // `action_intent_capture` is a contract-only stage: intents were already
-        // appended in `main_thread_inputs` (before this function).
+    fn runStage(self: *SimulationPipeline, comptime id: StageId, step: *StepState) !void {
+        switch (id) {
+            .dig_world_edit => try self.stageDigWorldEdit(step),
+            .scope_advance_and_ai_gather => try self.stageScopeAdvanceAndAiGather(step),
+            .spatial_index_build => try self.stageSpatialIndexBuild(step),
+            .perception_update => try self.stagePerceptionUpdate(step),
+            .ai_memory_update => try self.stageAiMemoryUpdate(step),
+            .affect_update => try self.stageAffectUpdate(step),
+            .ai_decide => try self.stageAiDecide(step),
+            .path_goal_resolve => try self.stagePathGoalResolve(step),
+            .steering_update => try self.stageSteeringUpdate(step),
+            .pathfinding_update => try self.stagePathfindingUpdate(step),
+            .apply_ai_movement_intents => self.stageApplyAiMovementIntents(step),
+            .movement_integrate => self.stageMovementIntegrate(step),
+            .collision_scope_gather => try self.stageCollisionScopeGather(step),
+            .collision_detect => try self.stageCollisionDetect(step),
+            .collision_respond => try self.stageCollisionRespond(step),
+            .bounds_and_tile_gate => try self.stageBoundsAndTileGate(step),
+            .plane_traversal => try self.stagePlaneTraversal(step),
+            .chunk_derive => self.stageChunkDerive(step),
+            .action_react => try self.stageActionReact(step),
+            .tier_policy => try self.stageTierPolicy(step),
+        }
+    }
 
-        // Backbone scope pass. Advance the stagger clock, derive the camera
-        // cognition halo, and select the cognition (AI/steering) subset for this
-        // step. Chunk columns are derived later in `chunk_derive` from each body's
-        // final settled position (after integrate, collision, tile gate, and plane
-        // traversal) — not in-pass during movement. The AI gather reads the chunk
-        // written last step (the body's current pre-move cell). Movement/collision
-        // gate on tier only (no chunk filter), so they keep running off-screen;
-        // cognition gates on the halo + stagger.
+    fn stageDigWorldEdit(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        // The dig is planned and its world growth (tile storage, a ramp's exit
+        // clear and link) reserved once, before the promote, so an OOM fails the
+        // stage with the deferred impacts still queued; the promote writes no world
+        // state.
+        const dig_edit = try self.reserveDigWorldEdit(context.world, context.data, context.player.*, context.frame.dig_intent);
+        // Promote, then dig, then at most one footstep, before perception reads stimuli.
+        step.stimuli_promoted = try self.sensory.promote(context.frame, &step.stimuli_live_dropped);
+        if (dig_edit) |edit| try self.commitDigWorldEdit(context.world, edit, context.frame);
+        try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
+    }
+
+    /// Plans `intent`'s dig and reserves its world growth and its nav record, so an OOM
+    /// fails before anything is written. Returns the edit for `commitDigWorldEdit`, with
+    /// no world write between them, or null when the intent does nothing.
+    pub fn reserveDigWorldEdit(self: *SimulationPipeline, world: *WorldSystem, data: *const DataSystem, player: Player, intent: DigIntent) DigEditError!?DigEdit {
+        const edit = (try self.dig.reserveWorldEdit(world, data, player, intent)) orelse return null;
+        try self.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.dig_world_edit, .{}));
+        return edit;
+    }
+
+    /// Writes a player-authored edit `reserveDigWorldEdit` reserved, plus a ramp's exit
+    /// cleared walkable on the level above, and records its `world_tile_changed` event
+    /// (and the exit's `world_obstacle_changed`) as nav marks; the commit seam applies
+    /// them. Every write that landed is recorded, error included.
+    pub fn commitDigWorldEdit(self: *SimulationPipeline, world: *WorldSystem, edit: DigEdit, frame: *SimulationFrame) DigEditError!void {
+        const first_event = frame.events.mergedItems().len;
+        const written = DigController.commitWorldEdit(world, edit, frame);
+        // Earlier events keep their positions, so the tail is the edit's own events.
+        self.pathfinding.recordTerrainNavEvents(frame.events.mergedItems()[first_event..], world, null);
+        try written;
+    }
+
+    /// Advance the stagger clock, derive the cognition halo from the fixed-step
+    /// `sim_view` (never the render window), and select the
+    /// two cognition populations for this step: unstaggered halo (spatial index +
+    /// perception candidates) and the stagger-filtered think set. Chunk columns are
+    /// derived later in `chunk_derive`. The AI gather reads the chunk written last
+    /// step. Movement/collision gate on tier only, so they keep running off-screen.
+    fn stageScopeAdvanceAndAiGather(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         self.scope.advanceStep();
-        const cognition_region: ?ActiveRegion = context.world.cognitionActiveRegion(cognition_halo_chunks);
+        step.cognition_region = context.world.cognitionRegionForWorldRect(context.sim_view, sim_view_overscan_chunks, cognition_halo_chunks);
         const stagger_step = self.scope.staggerStep();
-        const ai_indices = (try self.scope.gatherAiAgentIndices(data, cognition_region, stagger_step, context.thread_system, .{})).indices;
+        const ai_pops = try self.scope.gatherAiPopulations(context.data, step.cognition_region, stagger_step, context.thread_system, .{});
+        step.ai_halo_indices = ai_pops.halo;
+        step.ai_cognition_indices = ai_pops.cognition;
+    }
 
-        const ai_slice = data.aiAgentSliceConst();
-        const move_slice = data.movementBodySliceConst();
-
-        // Shared spatial index (Slice 28): built once from the same cognition-scoped
-        // population, from the same prior positions AI's own gather reads, so index
-        // row `i` and AiSystem row `i` refer to the same agent (see spatial_index.zig
-        // and ai.zig's cross-file population-domain contract). AI separation queries
-        // it read-only below; future perception stages will reuse it too.
+    /// Shared spatial index: built once from the unstaggered halo, from
+    /// the same prior positions the candidate walks read. Index row `i` matches
+    /// PerceptionSystem/AiSystem candidate row `i`; think rows map via
+    /// `spatial_self_index`.
+    fn stageSpatialIndexBuild(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        const data = context.data;
         var spatial_index_timer = StageTimer.start();
-        const spatial_index_stats = try self.spatial_index.build(ai_slice, move_slice, data, context.thread_system, .{ .scope_dense_indices = ai_indices });
+        step.spatial_index = try self.spatial_index.build(
+            data.aiAgentSliceConst(),
+            data.movementBodySliceConst(),
+            data,
+            context.thread_system,
+            .{ .scope_dense_indices = step.ai_halo_indices },
+        );
         spatial_index_timer.stop(context.perf, .pipeline_spatial_index);
+    }
 
-        // Perception substrate (Slice 29): queries the just-built spatial index
-        // for hostile candidates within vision/FOV/line-of-sight, over the same
-        // cognition-scoped `ai_indices` population, writing sensed state to
-        // `PerceptionStore` before AI reads it. The player is folded in as an
-        // extra hostile candidate alongside spatial-index neighbors.
+    /// Perception: hostile candidates within vision/FOV/line-of-sight
+    /// over the halo, writing sensed state only for this step's think-set observers.
+    /// The player is folded in as an extra hostile candidate. Sticky dig/impact
+    /// stimuli advance after this step's hearing read.
+    fn stagePerceptionUpdate(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        const data = context.data;
         const perception_player_candidate: ?PlayerPerceptionCandidate = if (data.movementBodyConst(context.player.entity)) |pbody|
             .{
                 .entity = context.player.entity,
@@ -1027,242 +1402,243 @@ pub const SimulationPipeline = struct {
         else
             null;
 
-        const hearing_stimuli = rebuildHearingStimuliScratch(self, frame);
+        const hearing_stimuli = self.sensory.hearingSlice(context.frame);
         var perception_timer = StageTimer.start();
-        const perception_stats = try self.perception.update(ai_slice, move_slice, self.spatial_index.view(), context.world, data, &frame.events, context.thread_system, .{
-            .scope_dense_indices = ai_indices,
-            .player_candidate = perception_player_candidate,
-            .stimuli = hearing_stimuli,
-            .max_events_per_step = self.perception_max_events_per_step,
-        });
+        step.perception = try self.perception.update(
+            data.aiAgentSliceConst(),
+            data.movementBodySliceConst(),
+            self.spatial_index.view(),
+            context.world,
+            data,
+            &context.frame.events,
+            context.thread_system,
+            .{
+                .scope_dense_indices = step.ai_cognition_indices,
+                .candidate_dense_indices = step.ai_halo_indices,
+                .player_candidate = perception_player_candidate,
+                .stimuli = hearing_stimuli,
+                .max_events_per_step = maxEventsPerStep(.perception_update, self.eventBudgets()),
+            },
+        );
         perception_timer.stop(context.perf, .pipeline_perception);
-        advanceStickyStimuli(self, frame, &stimuli_sticky_dropped);
+        self.sensory.advanceSticky(context.frame, &step.stimuli_sticky_dropped);
+    }
 
-        // Decays staleness/familiarity/ring contacts and refreshes from this
-        // step's perception acquisition events, over the same cognition-scoped
-        // `ai_indices` population, before AI reads it for the cold-pursue
-        // retarget below.
+    /// Decays staleness/familiarity/ring contacts and refreshes from this step's
+    /// perception acquisition events, over the think set, before AI reads memory.
+    fn stageAiMemoryUpdate(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var ai_memory_timer = StageTimer.start();
-        const ai_memory_stats = try self.ai_memory.update(ai_slice, data, frame, context.thread_system, .{
-            .scope_dense_indices = ai_indices,
+        step.ai_memory = try self.ai_memory.update(context.data.aiAgentSliceConst(), context.data, context.frame, context.thread_system, .{
+            .scope_dense_indices = step.ai_cognition_indices,
         });
         ai_memory_timer.stop(context.perf, .pipeline_ai_memory);
+    }
 
-        // Appraises this step's just-written perception + memory state into
-        // fear/curiosity/aggression/fatigue, over the same cognition-scoped
-        // `ai_indices` population. Must run after both perception and
-        // ai_memory (it reads their this-step hot columns) and before
-        // arbitration (Slice 32), wired below via `AiConfig.affect_slice`,
-        // reads the resulting drives.
+    /// Appraises this step's perception + memory into drives over the think set.
+    /// Must run after both producers and before `ai_decide` reads the drives.
+    fn stageAffectUpdate(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var affect_timer = StageTimer.start();
-        const affect_stats = try self.affect.update(ai_slice, data, &frame.events, context.thread_system, .{
-            .scope_dense_indices = ai_indices,
-            .max_events_per_step = self.affect_max_events_per_step,
+        step.affect = try self.affect.update(context.data.aiAgentSliceConst(), context.data, &context.frame.events, context.thread_system, .{
+            .scope_dense_indices = step.ai_cognition_indices,
+            .max_events_per_step = maxEventsPerStep(.affect_update, self.eventBudgets()),
         });
         affect_timer.stop(context.perf, .pipeline_ai_affect);
+    }
 
-        // The player's plane is deliberately NOT propagated into the AI goal level:
-        // NPCs stay on the surface (goal_level 0) until autonomous descent lands.
-        // Seeding the player's underground plane here would make them request
-        // cross-level paths they cannot walk (start_level is pinned to 0), piling
-        // them at the ramp mouth. `player_target` only ever feeds the opt-in
-        // pursue fallback below, never a goal level, so this stays a flat (x,y).
+    fn stageAiDecide(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        const data = context.data;
+        // The player's plane is deliberately not propagated into the AI goal level:
+        // NPCs stay on the surface until autonomous descent lands. Seeding the
+        // player's underground plane here would make them request cross-level paths
+        // they cannot walk, piling them at the ramp mouth. `player_target` only
+        // feeds the opt-in pursue fallback, never a goal level.
         const player_target = if (data.movementBodyConst(context.player.entity)) |pbody|
             pbody.previous_position
         else
             math.Vec2{ .x = 400, .y = 225 };
 
         var ai_timer = StageTimer.start();
-        const ai_stats = try self.ai.update(ai_slice, move_slice, self.spatial_index.view(), data, frame, context.thread_system, context.delta_seconds, .{
-            .intent_seed = 0xfeedf00d,
-            .step = self.scope.currentStep(),
-            // Last-resort fallback (see AiConfig.focus_target's doc comment):
-            // arbitration only reaches for this when a row's own perception/
-            // memory produced no goal and its gain_pursue > 0. Most rows
-            // resolve their goal from their own sensed/remembered/felt state
-            // instead and never touch this pair.
-            .focus_target = player_target,
-            // Ties the pursue fallback's identity to the actual entity
-            // `player_target` represents, so a row falling back to this
-            // signal only ever targets this same entity.
-            .focus_entity = context.player.entity,
-            // Throttles how often the fallback target re-keys as the player
-            // moves continuously, since local separation/steering closes the
-            // small gap between path updates. Without this, the goal re-keys
-            // (and triggers one bounded escalated solve) roughly every nav
-            // cell the player crosses.
-            .goal_requantization_hysteresis_distance = default_goal_requantization_hysteresis_distance,
-            // Ceiling only: arbitration currently resolves every behavior's
-            // goal to `.individual` (each row's goal is agent-specific), so
-            // this has no observable effect today. `.individual` is still the
-            // correct default going forward -- a future group-goal upgrade
-            // (e.g. cohere's shared quantized cell) would otherwise silently
-            // turn back on the moment it lands.
-            .nav_request_kind = .individual,
-            .navigation_intents = &frame.navigation_intents,
-            // Cognition halo + stagger selection. Steering inherits this scope
-            // transitively: it only acts on the navigation intents AI emits here.
-            .scope_dense_indices = ai_indices,
-            // Cold-perception agents with fresh memory retarget seek toward
-            // their last-known position instead of losing the goal.
-            .perception_slice = data.aiPerceptionSliceConst(),
-            .memory_slice = data.aiMemorySliceConst(),
-            // Emotion drives (Slice 31/32): arbitration scores each row's
-            // behaviors partly off these, so feelings can change which
-            // behavior wins independent of what's perceived/remembered.
-            .affect_slice = data.aiAffectSliceConst(),
-            .interest_markers = &context.world.interest_markers,
-        });
+        step.ai = try self.ai.update(
+            data.aiAgentSliceConst(),
+            data.movementBodySliceConst(),
+            self.spatial_index.view(),
+            data,
+            context.frame,
+            context.thread_system,
+            context.delta_seconds,
+            .{
+                .intent_seed = 0xfeedf00d,
+                .step = self.scope.currentStep(),
+                // Last-resort fallback: arbitration reaches for this only when a
+                // row's own perception/memory produced no goal and its gain_pursue > 0.
+                .focus_target = player_target,
+                .focus_entity = context.player.entity,
+                .goal_requantization_hysteresis_distance = default_goal_requantization_hysteresis_distance,
+                // Ceiling only: arbitration resolves every behavior's goal to
+                // `.individual`, so this has no observable effect today.
+                .nav_request_kind = .individual,
+                .navigation_intents = &context.frame.navigation_intents,
+                .scope_dense_indices = step.ai_cognition_indices,
+                .spatial_population_indices = step.ai_halo_indices,
+                .perception_slice = data.aiPerceptionSliceConst(),
+                .memory_slice = data.aiMemorySliceConst(),
+                .affect_slice = data.aiAffectSliceConst(),
+                .interest_markers = &context.world.interest_markers,
+            },
+        );
         ai_timer.stop(context.perf, .pipeline_ai);
+    }
 
+    fn stagePathGoalResolve(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        var path_goals_timer = StageTimer.start();
+        step.path_goals = try self.pathfinding.resolveGoals(NavigationIntent, context.frame.navigation_intents.mergedItems(), context.thread_system, .{});
+        path_goals_timer.stop(context.perf, .pipeline_path_goals);
+    }
+
+    fn stageSteeringUpdate(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var steering_timer = StageTimer.start();
-        const steering_stats = try self.steering.update(data, frame, context.thread_system, &self.pathfinding, .{});
+        step.steering = try self.steering.update(context.data, context.frame, context.thread_system, &self.pathfinding, &self.static_colliders, .{});
         steering_timer.stop(context.perf, .pipeline_steering);
+    }
 
+    fn stagePathfindingUpdate(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var pathfinding_timer = StageTimer.start();
-        // Drive elastic pathfinding capacity off the live steering-agent crowd (the
-        // entities that consume paths), so pools grow for battles and shrink after.
-        const path_agent_count = data.steeringAgentSliceConst().entities.len;
-        const pathfinding_stats = try self.pathfinding.update(&frame.path_requests, path_agent_count, context.thread_system, .{});
+        // Elastic pathfinding capacity tracks the live steering-agent crowd.
+        const path_agent_count = context.data.steeringAgentSliceConst().entities.len;
+        step.pathfinding = try self.pathfinding.update(&context.frame.path_requests, path_agent_count, context.thread_system, .{});
         pathfinding_timer.stop(context.perf, .pipeline_pathfinding);
+    }
 
+    fn stageApplyAiMovementIntents(self: *SimulationPipeline, step: *StepState) void {
+        // Steering is the stream's only writer, one intent per steering row; the
+        // threaded apply's disjoint row writes rely on it.
+        std.debug.assert(step.context.frame.intents.mergedItems().len == step.steering.movement_intent_count);
         var apply_intents_timer = StageTimer.start();
-        applyAiMovementIntents(data, frame);
-        apply_intents_timer.stop(context.perf, .pipeline_apply_intents);
+        step.apply_intents = self.movement.applyIntents(step.context.data, step.context.frame, step.context.thread_system, .{});
+        apply_intents_timer.stop(step.context.perf, .pipeline_apply_intents);
+    }
 
-        // Movement is a pure position integrator over the full contiguous SoA range:
-        // non-moving rows carry zero velocity (DataSystem zeros it on entry to a
-        // non-moving tier) so they integrate as no-ops — no scattered skip-path.
-        // Chunk maintenance is deliberately NOT here: chunk columns are consumed by
-        // tier policy (LOD) and render prep, not by movement, and must reflect the
-        // final settled position after collision response, bounds/tile gating, and
-        // plane traversal — so it runs as its own late pass (action_react may sit
-        // between chunk_derive and tier_policy; neither rewrites chunk columns).
-        var movement_slice = data.movementBodySlice();
+    /// Movement integrates the full contiguous range. Non-moving rows carry zero
+    /// velocity, so they integrate as no-ops. Chunk maintenance is `chunk_derive`,
+    /// after collision, the tile gate, and plane traversal have settled positions.
+    fn stageMovementIntegrate(self: *SimulationPipeline, step: *StepState) void {
+        const context = step.context;
+        var movement_slice = context.data.movementBodySlice();
         var movement_timer = StageTimer.start();
-        const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
+        step.movement = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
         movement_timer.stop(context.perf, .pipeline_movement);
+    }
 
-        // Collision also gates on tier only (no chunk filter): off-screen entities
-        // keep colliding with geometry. Null = full-active. Runs before the tile
-        // gate so a contact push into solid underground dirt is corrected by the
-        // gate before plane_traversal / chunk_derive observe the pose.
-        const collision_scope_indices = (try self.scope.gatherCollisionBoundsIndices(data, context.thread_system, .{})).indices;
+    /// Collision gates on tier only (no chunk filter): off-screen entities keep
+    /// colliding. Null indices mean full-active.
+    fn stageCollisionScopeGather(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        step.collision_scope_indices = (try self.scope.gatherCollisionBoundsIndices(context.data, context.thread_system, .{})).indices;
+    }
+
+    fn stageCollisionDetect(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var collision_timer = StageTimer.start();
-        const collision_stats = try self.collision.update(data, &frame.contacts, context.thread_system, .{
-            .scope_dense_indices = collision_scope_indices,
+        step.collision = try self.collision.update(context.data, &context.frame.contacts, context.thread_system, .{
+            .scope_dense_indices = step.collision_scope_indices,
         });
         collision_timer.stop(context.perf, .pipeline_collision);
+    }
 
+    fn stageCollisionRespond(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var collision_response_timer = StageTimer.start();
-        const collision_response_stats = try self.collision_response.update(data, frame);
+        step.collision_response = try self.collision_response.update(context.data, context.frame, context.player.entity, context.thread_system, .{});
         collision_response_timer.stop(context.perf, .pipeline_collision_response);
-        enqueuePlayerCollisionImpactsToDeferred(
-            self,
-            frame,
-            data,
-            context.player.entity,
+        self.sensory.enqueuePlayerImpacts(
+            context.frame,
+            context.data,
+            self.collision_response.observerContacts(context.frame, context.player.entity),
             context.player.current_level,
-            &stimuli_deferred_dropped,
+            &step.stimuli_deferred_dropped,
         );
+    }
 
+    fn stageBoundsAndTileGate(_: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var clamp_timer = StageTimer.start();
-        clampAiEntitiesToBounds(data, context.bounds_width, context.bounds_height);
-        try context.player.clampToBounds(data, context.bounds_width, context.bounds_height);
-        // Gate against solid world tiles on the current plane (mining: underground
-        // dirt is solid until dug). After collision response so contact corrections
-        // cannot leave a body embedded in solid tiles. NPCs skip dormant-tier
-        // (they don't move this step, so gating them would be dead work).
-        gatePlayerToWalkableTiles(context.world, data, context.player.*);
-        gateNpcEntitiesToWalkableTiles(context.world, data);
+        try world_gate.apply(context.world, context.data, context.player, context.bounds_width, context.bounds_height);
         clamp_timer.stop(context.perf, .pipeline_clamp_bounds);
+    }
 
-        // After movement/collision/gate settle positions, update planes: follow a
-        // ramp on cell entry, fall one level per step when standing over a hole.
-        // Player + NPCs route through `DigController.applyEntityPlaneTraversal`;
-        // fall landing carves are batched into one event range (single finishWrite).
-        try applyPlaneTraversalStage(&self.dig, context.world, data, context.player, frame);
+    /// After positions settle: follow a ramp on cell entry, or fall one level when
+    /// standing over a hole. The NPC cell entries are gathered on workers first; the
+    /// reserve and commit visit only them. Landing carves are one event range, recorded
+    /// as nav marks right after the write into room reserved before it.
+    fn stagePlaneTraversal(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        const grown_before = self.dig.plane_scratch_grown;
+        const windows_grown_before = self.plane_entry.windows_grown;
+        const entries = try self.plane_entry.gather(context.data, context.world, context.player.entity, self.dig.tunnel_tile, context.thread_system);
+        step.plane_entry = self.plane_entry.last_batch;
+        step.plane_entry_windows_grown = @intCast(self.plane_entry.windows_grown - windows_grown_before);
+        const reservation = try self.dig.reservePlaneTraversalStage(context.world, context.data, context.player, context.frame, entries, context.thread_system);
+        // The record room follows the carves the preflight counted, which may exceed the
+        // tracked population's budget until a failed population seam succeeds.
+        if (reservation.carves != 0) try self.pathfinding.reserveTerrainNavRecord(reservation.carves);
+        const first_event = context.frame.events.mergedItems().len;
+        const traversed = self.dig.commitPlaneTraversalStage(context.world, context.data, context.player, context.frame, reservation, context.thread_system);
+        // Earlier events keep their positions, so the tail is the stage's own events.
+        self.pathfinding.recordTerrainNavEvents(context.frame.events.mergedItems()[first_event..], context.world, context.thread_system);
+        try traversed;
+        step.dig_plane_scratch_grown = @intCast(self.dig.plane_scratch_grown - grown_before);
+    }
 
-        // Chunk maintenance: recompute each body's (chunk_x, chunk_y) from its now
-        // settled position. Positions are final here — all of movement, collision
-        // response, bounds/tile gating, and plane traversal have run. Consumers are
-        // tier_policy (LOD banding; action_react may run between this pass and it)
-        // and render prep; movement never reads it. Own timer keeps this scope
-        // work out of the movement stage.
+    /// Recompute each body's chunk from its settled position. Consumers are tier
+    /// policy and render prep. `action_react` may sit between this and tier policy;
+    /// neither rewrites chunk columns.
+    fn stageChunkDerive(self: *SimulationPipeline, step: *StepState) void {
+        const context = step.context;
         var chunk_derive_timer = StageTimer.start();
-        const chunk_derive_stats = self.scope.deriveChunks(data, context.thread_system, .{
+        step.chunk_derive = self.scope.deriveChunks(context.data, context.thread_system, .{
             .tile_size = context.world.tile_size,
             .chunk_size_tiles = context.world.chunk_size_tiles,
             .width = context.world.width,
             .height = context.world.height,
         }, .{});
         chunk_derive_timer.stop(context.perf, .pipeline_chunk_derive);
+    }
 
-        // action_react: first domain consumer of merged action intents (destructibles).
-        // Queues structural_commands + domain events; tier_policy may append more
-        // structural_commands afterward (RangeOutputStream multi-producer).
-        const destructible_stats = try self.destructible.process(
-            frame,
-            data,
+    /// First domain consumer of action intents carried from input capture.
+    fn stageActionReact(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        step.destructible = try self.destructible.process(
+            context.frame,
+            context.data,
             context.world,
             context.particles,
         );
-
-        // Simulation-LOD tier policy: each entity is assigned cognition/locomotion/
-        // kinematic/dormant by its cube distance from the visible region, applied
-        // via deferred structural commands on the frame stream for the commit seam.
-        // Uses the raw visible region (not the cognition halo) so all four bands
-        // are measured from the same origin, anchored at the camera/player level so
-        // off-level entities demote. Queues nothing when no tier changed.
-        var visible_region = context.world.visibleChunkRegion();
-        if (visible_region) |*region| region.level = context.player.current_level;
-        _ = try self.scope.queueTierChanges(data, visible_region, &frame.structural_commands, context.thread_system, .{});
-
-        const scope = self.buildScopeStats(
-            data,
-            cognition_region,
-            ai_indices,
-            collision_scope_indices,
-            steering_stats,
-        );
-
-        return .{
-            .scope = scope,
-            .spatial_index = spatial_index_stats,
-            .perception = perception_stats,
-            .ai_memory = ai_memory_stats,
-            .affect = affect_stats,
-            .ai = ai_stats,
-            .steering = steering_stats,
-            .pathfinding = pathfinding_stats,
-            .movement = movement_stats,
-            .chunk_derive = chunk_derive_stats,
-            .collision = collision_stats,
-            .collision_response = collision_response_stats,
-            .stimuli_live_dropped = stimuli_live_dropped,
-            .stimuli_deferred_dropped = stimuli_deferred_dropped,
-            .stimuli_sticky_dropped = stimuli_sticky_dropped,
-            .stimuli_promoted = stimuli_promoted,
-            .action_intents_consumed = destructible_stats.intents_consumed,
-            .action_intents_dropped = action_intents_dropped,
-            .destructibles_destroyed = destructible_stats.destroyed,
-            .destructibles_hit = destructible_stats.hits,
-        };
     }
 
-    /// Builds the per-step scope stats: tier histograms and full-active baselines
-    /// from `DataSystem`, with stage entity counts overridden to the actually-scoped
-    /// participation and the stagger/chunk-filter counters from this step.
+    /// Assign cognition/locomotion/kinematic/dormant by cube distance from the
+    /// fixed-step sim-view region. Commands are deferred. The anchor level is the
+    /// player's, so off-level entities demote. Queues nothing when no tier changed.
+    fn stageTierPolicy(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        _ = try self.scope.queueTierChanges(context.data, simViewRegion(context), &context.frame.structural_commands, context.thread_system, .{});
+    }
+
     fn buildScopeStats(
         self: *const SimulationPipeline,
         data: *const DataSystem,
         cognition_region: ?ActiveRegion,
-        ai_indices: []const u32,
+        ai_cognition_indices: []const u32,
         collision_scope_indices: ?[]const u32,
         steering_stats: SteeringStats,
     ) SimulationScope {
         var stats = data.simulationScopeStatsFullActive();
-        stats.ai_stage_entities = ai_indices.len;
+        stats.ai_stage_entities = ai_cognition_indices.len;
         // Steering is transitively scoped via AI's intents; its real participation
         // is the count of movement intents it actually emitted this step.
         stats.steering_stage_entities = steering_stats.movement_intent_count;
@@ -1276,274 +1652,38 @@ pub const SimulationPipeline = struct {
     }
 };
 
-const StageTimer = runtime_perf_log.StageTimer;
-
-fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void {
-    for (frame.intents.mergedItems()) |item| {
-        if (item != .movement) continue;
-        const movement_intent = item.movement;
-        if (!data.isAlive(movement_intent.entity)) continue;
-        if (data.aiAgentConst(movement_intent.entity) == null) continue;
-        if (data.movementBodyPtr(movement_intent.entity)) |body| {
-            const speed = if (body.speed.* > 0) body.speed.* else 40.0;
-            body.velocity_x.* = movement_intent.direction_x * speed;
-            body.velocity_y.* = movement_intent.direction_y * speed;
-        }
-    }
-}
-
-/// Stops one dense movement row from moving into solid world tiles on `level`.
-/// No-op on level 0 (the surface is fully walkable and pre-existing decos/water
-/// are intentionally pass-through there). Resolves X then Y independently against
-/// the pre-move position so a diagonal push into a wall slides along it. The body
-/// is one tile wide; sampling the four AABB corners (with an epsilon so a flush
-/// right/bottom edge stays in the covered cell) is exact for the sub-tile motion
-/// this produces. Allocation-free, scalar. Shared by the player and NPC gates.
-fn gateBodyColumnsToWalkableTiles(
-    world: *const WorldSystem,
-    level: u16,
-    movement: *MovementBodySlice,
-    movement_index: usize,
-    size_x: f32,
-    size_y: f32,
-) void {
-    if (level == 0) return;
-    const pre_x = movement.previous_x[movement_index];
-    const pre_y = movement.previous_y[movement_index];
-    const post_x = movement.position_x[movement_index];
-    const post_y = movement.position_y[movement_index];
-
-    var resolved_x = post_x;
-    if (rectOverlapsSolidTile(world, level, post_x, pre_y, size_x, size_y)) resolved_x = pre_x;
-    var resolved_y = post_y;
-    if (rectOverlapsSolidTile(world, level, resolved_x, post_y, size_x, size_y)) resolved_y = pre_y;
-
-    if (resolved_x != post_x) movement.velocity_x[movement_index] = 0;
-    if (resolved_y != post_y) movement.velocity_y[movement_index] = 0;
-    movement.position_x[movement_index] = resolved_x;
-    movement.position_y[movement_index] = resolved_y;
-}
-
-/// Pointer wrapper for the single-entity player gate (same math as the dense path).
-fn gateBodyToWalkableTiles(world: *const WorldSystem, level: u16, body: MovementBodyPtr, visual: PrimitiveVisual) void {
-    if (level == 0) return;
-    const w = visual.size.x;
-    const h = visual.size.y;
-    const pre_x = body.previous_x.*;
-    const pre_y = body.previous_y.*;
-    const post_x = body.position_x.*;
-    const post_y = body.position_y.*;
-
-    var resolved_x = post_x;
-    if (rectOverlapsSolidTile(world, level, post_x, pre_y, w, h)) resolved_x = pre_x;
-    var resolved_y = post_y;
-    if (rectOverlapsSolidTile(world, level, resolved_x, post_y, w, h)) resolved_y = pre_y;
-
-    if (resolved_x != post_x) body.velocity_x.* = 0;
-    if (resolved_y != post_y) body.velocity_y.* = 0;
-    body.position_x.* = resolved_x;
-    body.position_y.* = resolved_y;
-}
-
-fn gateNpcEntitiesToWalkableTiles(world: *const WorldSystem, data: *DataSystem) void {
-    const ai_slice = data.aiAgentSliceConst();
-    const scope_columns = data.scopeColumnsSliceConst();
-    const visuals = data.primitiveVisualSliceConst();
-    var movement = data.movementBodySlice();
-    // One slot resolve per AI → dense columns. Tier/level come from the movement
-    // scope row (kept in sync with world_level), not extra entity lookups.
-    for (ai_slice.entities) |entity| {
-        const indices = data.movementVisualDenseIndices(entity) orelse continue;
-        const mi = indices.movement;
-        // Dormant NPCs never move this step (movement itself skips writing their
-        // position), so gating them against world tiles is dead work — skip.
-        if (!scope_columns.tier[mi].allowsMovement()) continue;
-        gateBodyColumnsToWalkableTiles(
-            world,
-            scope_columns.level[mi],
-            &movement,
-            mi,
-            visuals.size_x[indices.visual],
-            visuals.size_y[indices.visual],
-        );
-    }
-}
-
-/// Player + NPC plane traversal for one step. Preflights event capacity, dense
-/// GPU edit capacity, and `world_level` attaches for every cell-entry candidate
-/// **before** any world mutate, then applies transitions (collecting tile
-/// changes) and publishes all carves in a single event range with one
-/// finishWrite — O(N) rather than per-fall appendRequired O(N²). Mid-loop
-/// attach OOM cannot leave earlier landings carved without events.
-fn applyPlaneTraversalStage(
-    dig: *DigController,
-    world: *WorldSystem,
-    data: *DataSystem,
-    player: *Player,
-    frame: *SimulationFrame,
-) !void {
-    const scratch = &frame.world_tile_changes_scratch;
-    scratch.clearRetainingCapacity();
-
-    const ai_slice = data.aiAgentSliceConst();
-    const scope_columns = data.scopeColumnsSliceConst();
-    try scratch.ensureTotalCapacity(frame.allocator, 1 + ai_slice.entities.len);
-
-    // Read-only preflight: count landing carves and missing world_level attaches
-    // so capacity is reserved before any world mutate.
-    var pending_carves: usize = 0;
-    var missing_world_level: usize = 0;
-    const player_entry = playerCellEntry(dig, world, data, player.*);
-    if (player_entry) |entry| {
-        if (dig.wouldCarveLandingCell(world, entry.level, entry.cell)) pending_carves += 1;
-        if (data.worldLevelConst(player.entity) == null) missing_world_level += 1;
-    }
-    for (ai_slice.entities) |entity| {
-        if (npcCellEntry(world, data, scope_columns, entity)) |entry| {
-            if (dig.wouldCarveLandingCell(world, entry.level, entry.cell)) pending_carves += 1;
-            if (data.worldLevelConst(entity) == null) missing_world_level += 1;
-        }
-    }
-    // Event capacity + dense GPU edit queue (when live) reserved before any
-    // carve so a mid-stage OOM cannot leave earlier falls published to world
-    // without world_tile_changed / GPU edits (multi-fall atomicity).
-    try frame.events.ensureEventAppendCapacity(pending_carves);
-    try world.ensureDenseTileEditCapacity(pending_carves);
-
-    // Attach world_level for every cell-entry candidate that lacks it before the
-    // first carve. Capacity for all missing rows is reserved first so a partial
-    // attach loop cannot leave some entities leveled and others mid-growth, then
-    // carves still safe: applyEntityPlaneTraversal's attach becomes a no-op.
-    if (missing_world_level > 0) {
-        try data.world_levels.ensureCapacity(data.allocator, data.world_levels.len() + missing_world_level);
-        if (player_entry) |entry| {
-            if (data.worldLevelConst(player.entity) == null) {
-                try data.setWorldLevel(player.entity, entry.level);
-            }
-        }
-        for (ai_slice.entities) |entity| {
-            if (npcCellEntry(world, data, scope_columns, entity)) |entry| {
-                if (data.worldLevelConst(entity) == null) {
-                    try data.setWorldLevel(entity, entry.level);
-                }
-            }
-        }
-    }
-
-    if (try dig.applyPlaneTraversal(world, data, player)) |change| {
-        scratch.appendAssumeCapacity(change);
-    }
-    for (ai_slice.entities) |entity| {
-        const entry = npcCellEntry(world, data, scope_columns, entity) orelse continue;
-        const result = try dig.applyEntityPlaneTraversal(world, data, entity, entry.level, entry.cell);
-        if (result.tile_change) |change| {
-            scratch.appendAssumeCapacity(change);
-        }
-    }
-    try frame.publishWorldTileChanges(scratch.items);
-}
-
-const NpcCellEntry = struct {
-    level: u16,
-    cell: CellCoord,
-};
-
-/// Player cell-entry probe for preflight: new cell this step (vs `player_last_cell`).
-fn playerCellEntry(
-    dig: *const DigController,
-    world: *const WorldSystem,
-    data: *const DataSystem,
-    player: Player,
-) ?NpcCellEntry {
-    const body = data.movementBodyConst(player.entity) orelse return null;
-    const visual = data.primitiveVisualConst(player.entity) orelse return null;
-    const center_x = body.position.x + visual.size.x * 0.5;
-    const center_y = body.position.y + visual.size.y * 0.5;
-    const target = world.cellContaining(center_x, center_y) orelse return null;
-    const cell = CellCoord{ .x = target.x, .y = target.y };
-    if (dig.player_last_cell) |last| {
-        if (last.x == cell.x and last.y == cell.y) return null;
-    }
-    return .{ .level = player.current_level, .cell = cell };
-}
-
-/// NPC cell-entry probe: previous vs current body centers, skipping dormant tiers.
-/// Returns null when the NPC did not enter a new cell this step. Prefers the
-/// `world_level` component; falls back to the movement-scope level so a missing
-/// component can still be pre-attached before any carve (multi-entity safety).
-fn npcCellEntry(
-    world: *const WorldSystem,
-    data: *const DataSystem,
-    scope_columns: ConstScopeColumnsSlice,
-    entity: EntityId,
-) ?NpcCellEntry {
-    const dense_index = data.movementBodyDenseIndex(entity) orelse return null;
-    if (!scope_columns.tier[dense_index].allowsMovement()) return null;
-    const level = data.worldLevelConst(entity) orelse scope_columns.level[dense_index];
-    const body = data.movementBodyConst(entity) orelse return null;
-    const visual = data.primitiveVisualConst(entity) orelse return null;
-    const prev_center_x = body.previous_position.x + visual.size.x * 0.5;
-    const prev_center_y = body.previous_position.y + visual.size.y * 0.5;
-    const center_x = body.position.x + visual.size.x * 0.5;
-    const center_y = body.position.y + visual.size.y * 0.5;
-    const prev_cell = world.cellContaining(prev_center_x, prev_center_y) orelse return null;
-    const cell = world.cellContaining(center_x, center_y) orelse return null;
-    if (prev_cell.x == cell.x and prev_cell.y == cell.y) return null;
-    return .{ .level = level, .cell = CellCoord{ .x = cell.x, .y = cell.y } };
-}
-
-fn gatePlayerToWalkableTiles(world: *const WorldSystem, data: *DataSystem, player: Player) void {
-    const body = data.movementBodyPtr(player.entity) orelse return;
-    const visual = data.primitiveVisualConst(player.entity) orelse return;
-    gateBodyToWalkableTiles(world, player.current_level, body, visual);
-}
-
-/// Whether an axis-aligned body rect overlaps any movement-blocking tile on `level`.
-/// Off-world corners read as blocked (fail-closed), matching `levelBlocksMovement`.
-fn rectOverlapsSolidTile(world: *const WorldSystem, level: u16, x: f32, y: f32, w: f32, h: f32) bool {
-    const edge_epsilon: f32 = 0.5;
-    const sample_xs = [_]f32{ x, x + w - edge_epsilon };
-    const sample_ys = [_]f32{ y, y + h - edge_epsilon };
-    for (sample_ys) |sy| {
-        for (sample_xs) |sx| {
-            const cell = world.cellContaining(sx, sy) orelse return true;
-            if (world.levelBlocksMovement(level, cell.x, cell.y)) return true;
-        }
-    }
-    return false;
-}
-
-fn clampAiEntitiesToBounds(data: *DataSystem, bounds_width: f32, bounds_height: f32) void {
-    const ai_slice = data.aiAgentSliceConst();
-    const scope_columns = data.scopeColumnsSliceConst();
-    // Size columns only — no PrimitiveVisual struct rebuild per entity.
-    const visuals = data.primitiveVisualSliceConst();
-    var movement = data.movementBodySlice();
-    // One slot resolve per AI → dense movement/visual indices, then pure SoA
-    // column writes. Matches the tile-gate path so bounds + gate share the same
-    // index resolve shape (not dual movementBodyPtr + visual index lookups).
-    for (ai_slice.entities) |entity| {
-        const indices = data.movementVisualDenseIndices(entity) orelse continue;
-        const mi = indices.movement;
-        // Dormant rows did not integrate this step; re-clamping settled poses is
-        // dead work (same skip policy as gateNpcEntitiesToWalkableTiles).
-        if (!scope_columns.tier[mi].allowsMovement()) continue;
-
-        const max_x = bounds_width - visuals.size_x[indices.visual];
-        const new_x = math.clamp(movement.position_x[mi], 0, max_x);
-        if (new_x != movement.position_x[mi]) movement.velocity_x[mi] = 0;
-        movement.position_x[mi] = new_x;
-
-        const max_y = bounds_height - visuals.size_y[indices.visual];
-        const new_y = math.clamp(movement.position_y[mi], 0, max_y);
-        if (new_y != movement.position_y[mi]) movement.velocity_y[mi] = 0;
-        movement.position_y[mi] = new_y;
-    }
-}
+const StageTimer = @import("../app/runtime_perf_log.zig").StageTimer;
 
 test "stageContract(.ai_decide) reads affect_drives, written by affect_update one stage earlier" {
     const contract = stageContract(.ai_decide);
     try std.testing.expect(contract.reads.contains(.affect_drives));
+}
+
+test "stage contracts split event families and carry out-of-graph inputs" {
+    const memory = stageContract(.ai_memory_update);
+    try std.testing.expect(memory.reads.contains(.perception_events));
+    try std.testing.expect(!memory.reads.contains(.world_events));
+    try std.testing.expect(!memory.reads.contains(.affect_events));
+    try std.testing.expect(!memory.reads.contains(.structural_events));
+
+    const affect = stageContract(.affect_update);
+    try std.testing.expect(affect.writes.contains(.affect_events));
+    try std.testing.expect(affect.carried.contains(.ai_behavior));
+    try std.testing.expect(!affect.reads.contains(.ai_behavior));
+
+    const decide = stageContract(.ai_decide);
+    try std.testing.expect(decide.writes.contains(.ai_behavior));
+    try std.testing.expect(decide.writes.contains(.navigation_intents));
+    try std.testing.expect(decide.carried.contains(.interest_markers));
+
+    const react = stageContract(.action_react);
+    try std.testing.expect(react.carried.contains(.action_intents));
+    try std.testing.expect(!react.reads.contains(.action_intents));
+    try std.testing.expect(react.writes.contains(.world_events));
+
+    try std.testing.expect(stageContract(.dig_world_edit).writes.contains(.stimuli));
+    try std.testing.expect(stageContract(.perception_update).reads.contains(.stimuli));
+    try std.testing.expect(external_resources.contains(.structural_events));
 }
 
 test "pipeline updates full active player-only state through serial path" {
@@ -1567,17 +1707,10 @@ test "pipeline updates full active player-only state through serial path" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -1592,6 +1725,7 @@ test "pipeline updates full active player-only state through serial path" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     try std.testing.expectEqual(@as(usize, 1), stats.scope.stats.total_entities);
@@ -1650,20 +1784,15 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
     defer frame.deinit();
     try frame.reserveStreams(4, 8, 8, 8, 8, 8);
     try frame.reservePathRequests(2, 2);
-    try frame.reserveWorldTileChangesScratch(4);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
+        .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -1679,6 +1808,7 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // The NPC crossed from (5,3) into the just-dug hole cell (6,3) and fell to
@@ -1688,7 +1818,169 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
     // until next step and the NPC would not fall yet.
     try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
     const floor1 = world.denseFloorLayerForLevel(1).?;
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 6, 3));
+}
+
+test "pipeline update after reserve allocates nothing on frame streams with dig, fall, and contact" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // Same dig-then-fall fixture as the causal order test, plus an overlapping
+    // pair at the origin so collision writes a contact. The pair sits off the
+    // dug cell, so the fall still lands. Frame streams are reserved, then
+    // swapped to a failing allocator; world and data allocators stay real
+    // because the dig and the landing carve mutate tiles.
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try testMinimalMultiLevelWorld(&meta);
+    defer world.deinit();
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 0;
+    placePlayerFlush(&data, player, .{ 5, 3 });
+    data.facingPtr(player.entity).?.* = .right;
+
+    const npc = try data.createEntity();
+    try data.setMovementBody(npc, .{});
+    try data.setPrimitiveVisual(npc, .{
+        .size = .{ .x = 32, .y = 32 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+    try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(npc, 0);
+    try data.setSimulationTier(npc, .locomotion);
+    {
+        const body = data.movementBodyPtr(npc).?;
+        body.previous_x.* = 5 * 32;
+        body.previous_y.* = 3 * 32;
+        body.position_x.* = 5 * 32;
+        body.position_y.* = 3 * 32;
+        body.velocity_x.* = 2000;
+        body.velocity_y.* = 0;
+    }
+
+    const bumper = try data.createEntity();
+    try data.setMovementBody(bumper, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setCollisionBounds(bumper, .{ .size = .{ .x = 32, .y = 32 } });
+    try data.setCollisionResponse(bumper, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+    try data.setWorldLevel(bumper, 0);
+    try data.setSimulationTier(bumper, .locomotion);
+
+    const wall = try data.createEntity();
+    try data.setMovementBody(wall, .{
+        .position = .{ .x = 16, .y = 0 },
+        .previous_position = .{ .x = 16, .y = 0 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setCollisionBounds(wall, .{ .size = .{ .x = 32, .y = 32 } });
+    try data.setCollisionResponse(wall, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    try data.setWorldLevel(wall, 0);
+    try data.setSimulationTier(wall, .locomotion);
+
+    const dig_config = try DigConfig.fromMeta(&meta);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(16, 128, 32, 32, 16, 16);
+    try frame.reservePathRequests(4, 8);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(4, 4);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 8,
+        .dig = dig_config,
+        .movement_body_capacity = 8,
+        .pathfinding = .{
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+        },
+    });
+    defer pipeline.deinit();
+    try pipeline.reserve(&frame, 8);
+
+    frame.beginStep();
+    frame.dig_intent = .hole;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const fail_alloc = failing.allocator();
+    const saved_events = frame.events.stream.allocator;
+    const saved_stimuli = frame.stimuli.allocator;
+    const saved_contacts = frame.contacts.allocator;
+    const saved_structural = frame.structural_commands.allocator;
+    const saved_intents = frame.intents.allocator;
+    const saved_nav = frame.navigation_intents.allocator;
+    const saved_paths = frame.path_requests.allocator;
+    const saved_triggers = frame.collision_triggers.allocator;
+    const saved_actions = frame.action_intents.allocator;
+    frame.events.stream.allocator = fail_alloc;
+    frame.stimuli.allocator = fail_alloc;
+    frame.contacts.allocator = fail_alloc;
+    frame.structural_commands.allocator = fail_alloc;
+    frame.intents.allocator = fail_alloc;
+    frame.navigation_intents.allocator = fail_alloc;
+    frame.path_requests.allocator = fail_alloc;
+    frame.collision_triggers.allocator = fail_alloc;
+    frame.action_intents.allocator = fail_alloc;
+    defer {
+        frame.events.stream.allocator = saved_events;
+        frame.stimuli.allocator = saved_stimuli;
+        frame.contacts.allocator = saved_contacts;
+        frame.structural_commands.allocator = saved_structural;
+        frame.intents.allocator = saved_intents;
+        frame.navigation_intents.allocator = saved_nav;
+        frame.path_requests.allocator = saved_paths;
+        frame.collision_triggers.allocator = saved_triggers;
+        frame.action_intents.allocator = saved_actions;
+    }
+
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
+    try std.testing.expect(frame.contacts.mergedItems().len > 0);
+    try std.testing.expect(frame.stimuli.mergedItems().len > 0);
+}
+
+test "eventCapacitySum equals capacity_limit after reserve" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 8,
+        .structural_headroom = 4,
+        .pathfinding = .{
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+        },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(4, 0, 4, 4, 4, 4);
+    try pipeline.reserve(&frame, 8);
+
+    // dig 2 + perception 0 + affect 0 (no AiPerception/AiAffect rows) + plane (8 + 1) +
+    // action_react 64 + structural (pipeline destructible 64 + caller 4) + nav 1.
+    try std.testing.expectEqual(@as(usize, 144), pipeline.eventCapacitySum());
+    try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
 }
 
 test "pipeline resamples AI wander direction across fixed steps" {
@@ -1716,24 +2008,17 @@ test "pipeline resamples AI wander direction across fixed steps" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
 
-    // A bare WorldSystem never gets a visibility window set, so
-    // `cognitionActiveRegion()` returns null and the AI gather falls back to
-    // full-active with no stagger gating — the wanderer runs every step.
+    // The world has no chunks, so the full-world `sim_view` yields no cognition
+    // region and the AI gather falls back to full-active with no stagger gating —
+    // the wanderer runs every step.
     frame.beginStep();
     const stats1 = try pipeline.update(.{
         .data = &data,
@@ -1744,6 +2029,7 @@ test "pipeline resamples AI wander direction across fixed steps" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expectEqual(@as(usize, 1), stats1.ai.entity_count);
     const step1 = frame.navigation_intents.mergedItems()[0];
@@ -1763,6 +2049,7 @@ test "pipeline resamples AI wander direction across fixed steps" {
             .delta_seconds = 0.016,
             .bounds_width = 800,
             .bounds_height = 450,
+            .sim_view = fullWorldSimView(&world),
         });
     }
     const step_after_epoch = frame.navigation_intents.mergedItems()[0];
@@ -1827,17 +2114,10 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -1852,6 +2132,7 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // Both stages ran over the same scoped agent this step (observable stage
@@ -1910,17 +2191,10 @@ test "pipeline does not retarget a cold agent toward memory of an entity other t
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -1935,6 +2209,7 @@ test "pipeline does not retarget a cold agent toward memory of an entity other t
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // Memory is fresh and valid, but belongs to `other_target`, not the
@@ -1978,9 +2253,12 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
         .chunk_size_tiles = 1,
     };
     defer world.deinit();
-    // A level must exist or PerceptionSystem's LOS-blocked cache treats every
-    // observer as fail-closed (blocked), never reporting a target visible.
+    // A level must exist or line of sight fails closed (an invalid level
+    // blocks every cell), never reporting a target visible.
     _ = try world.addLevel(0);
+    // The level gives the world a chunk, so the full-world `sim_view` applies
+    // stagger: keep both agents thinking this step.
+    try markAllAlwaysActive(&data);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 4, 4, 4, 4, 4);
@@ -1988,17 +2266,10 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2013,6 +2284,7 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // Both perception and affect ran this step over the observer (the only
@@ -2027,6 +2299,223 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
     const affect_after = data.aiAffectConst(observer).?;
     try std.testing.expect(affect_after.fear > 0);
     try std.testing.expect(affect_after.aggression > 0);
+}
+
+test "pipeline fear selects flee before movement, not only a positive drive" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+
+    const observer = try data.createEntity();
+    try data.setMovementBody(observer, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(observer, .{
+        .active_behavior = .wander,
+        .wander_amplitude = 0,
+        .gain_flee = 1,
+        .gain_pursue = 0,
+        .gain_wander = 0,
+    });
+    try data.setFaction(observer, .player);
+    try data.setAiPerception(observer, .{});
+    try data.setAiAffect(observer, .{});
+
+    const hostile = try data.createEntity();
+    try data.setMovementBody(hostile, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(hostile, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(hostile, .hostile);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    // The level gives the world a chunk, so the full-world `sim_view` applies
+    // stagger: pin the observer thinking on this single step (not a stagger test).
+    try markAllAlwaysActive(&data);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = 4,
+        .pathfinding = .{
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+        },
+    });
+    defer pipeline.deinit();
+    try pipeline.reserve(&frame, 4);
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    });
+
+    try std.testing.expectEqual(@import("data_system.zig").AiBehavior.flee, data.aiAgentConst(observer).?.active_behavior);
+}
+
+test "pipeline perception acquire refreshes memory last_known the same step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+
+    const observer = try data.createEntity();
+    try data.setMovementBody(observer, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(observer, .player);
+    try data.setAiPerception(observer, .{});
+    try data.setAiMemory(observer, .{
+        .last_known_target = player.entity,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    const hostile = try data.createEntity();
+    try data.setMovementBody(hostile, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(hostile, .{ .active_behavior = .wander });
+    try data.setFaction(hostile, .hostile);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    // The level gives the world a chunk, so the full-world `sim_view` applies
+    // stagger: pin the observer thinking on this single step (not a stagger test).
+    try markAllAlwaysActive(&data);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = 4,
+        .pathfinding = .{
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    });
+
+    const memory = data.aiMemoryConst(observer).?;
+    try std.testing.expect(memory.last_known_target.eql(hostile));
+    try std.testing.expectApproxEqAbs(@as(f32, 10), memory.last_known_x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), memory.last_known_y, 0.01);
+}
+
+test "chunk_derive matches the pose after a contact push crosses a chunk boundary" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    const body = data.movementBodyPtr(player.entity).?;
+    body.previous_x.* = 20;
+    body.previous_y.* = 0;
+    body.position_x.* = 20;
+    body.position_y.* = 0;
+    body.velocity_x.* = 0;
+    body.velocity_y.* = 0;
+    try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
+    try data.setCollisionResponse(player.entity, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+    try data.setWorldLevel(player.entity, 0);
+
+    const wall = try data.createEntity();
+    try data.setMovementBody(wall, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setCollisionBounds(wall, .{ .size = .{ .x = 32, .y = 32 } });
+    try data.setCollisionResponse(wall, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    try data.setWorldLevel(wall, 0);
+    try data.setSimulationTier(wall, .locomotion);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 128,
+        .height = 64,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 128, 64, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = 4,
+        .pathfinding = .{
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 128,
+        .bounds_height = 64,
+        .sim_view = fullWorldSimView(&world),
+    });
+
+    const settled = data.movementBodyConst(player.entity).?;
+    const mi = data.movementBodyDenseIndex(player.entity).?;
+    const chunk = data.scopeColumnsSliceConst().chunk_x[mi];
+    const expected: i32 = @intFromFloat(@floor(settled.position.x / 32.0));
+    try std.testing.expectEqual(expected, chunk);
+    try std.testing.expect(settled.position.x >= 32);
 }
 
 test "pipeline resolves an aggressive non-player entity's pursue goal to another non-player entity, not the player" {
@@ -2067,9 +2556,12 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
         .chunk_size_tiles = 1,
     };
     defer world.deinit();
-    // A level must exist or PerceptionSystem's LOS-blocked cache treats every
-    // observer as fail-closed (blocked), never reporting a target visible.
+    // A level must exist or line of sight fails closed (an invalid level
+    // blocks every cell), never reporting a target visible.
     _ = try world.addLevel(0);
+    // The level gives the world a chunk, so the full-world `sim_view` applies
+    // stagger: pin the pursuer thinking on this single step (not a stagger test).
+    try markAllAlwaysActive(&data);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 4, 4, 4, 4, 4);
@@ -2077,17 +2569,10 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2102,6 +2587,7 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // The pursuer's real perception saw `target` (close, hostile stance) this
@@ -2123,6 +2609,19 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+const GridCell = @import("systems/pathfinding/types.zig").GridCell;
+const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
+const lane_count = @import("../core/simd.zig").lane_count;
+const plane_entry_range_alignment_items = @import("systems/plane_entry.zig").plane_entry_range_alignment_items;
+const warmLandingTerrain = @import("world_test_support.zig").warmLandingTerrain;
+const denseTileBlocksMovement = @import("world_test_support.zig").denseTileBlocksMovement;
+const InterestMarkerId = @import("world_interest.zig").InterestMarkerId;
+const nav_test_support = @import("systems/pathfinding/test_support.zig");
+const PathRequest = @import("simulation.zig").PathRequest;
+const RangeOutputStream = @import("simulation.zig").RangeOutputStream;
+const AiAgent = @import("data_system.zig").AiAgent;
+const MovementBody = @import("data_system.zig").MovementBody;
+const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 
 /// Minimal multi-level grass/dirt world for dig/plane/gate pipeline tests.
 /// 8×8 tiles cover cell fixtures around (3..6, 3) without full 320 demo paint.
@@ -2142,6 +2641,15 @@ fn gateTestWorld(meta: *const world_tileset_meta.WorldTilesetMeta, carve: []cons
         _ = try world.setDenseTile(floor1, cell[0], cell[1], cave_0);
     }
     return world;
+}
+
+// One plane stage's dig half: a serial entry gather, the reserve, then the commit.
+fn testPlaneTraversalStage(dig: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player, frame: *SimulationFrame) !void {
+    var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
+    defer plane_entry.deinit();
+    const entries = try plane_entry.gather(data, world, player.entity, dig.tunnel_tile, null);
+    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries, null);
+    try dig.commitPlaneTraversalStage(world, data, player, frame, reservation, null);
 }
 
 fn placePlayerFlush(data: *DataSystem, player: Player, cell: [2]u16) void {
@@ -2174,7 +2682,7 @@ test "player tile gate slides along solid dirt and is a no-op on the surface" {
     body.velocity_x.* = 100;
     body.velocity_y.* = 100;
 
-    gatePlayerToWalkableTiles(&world, &data, player);
+    world_gate.gatePlayerToWalkableTiles(&world, &data, player);
 
     // X reverted (wall), velocity_x zeroed; Y allowed (open pocket), velocity_y kept.
     try std.testing.expectEqual(@as(f32, 3 * 32), body.position_x.*);
@@ -2187,7 +2695,7 @@ test "player tile gate slides along solid dirt and is a no-op on the surface" {
     placePlayerFlush(&data, player, .{ 3, 3 });
     body.position_x.* = 3 * 32 + 6;
     body.position_y.* = 3 * 32 + 6;
-    gatePlayerToWalkableTiles(&world, &data, player);
+    world_gate.gatePlayerToWalkableTiles(&world, &data, player);
     try std.testing.expectEqual(@as(f32, 3 * 32 + 6), body.position_x.*);
     try std.testing.expectEqual(@as(f32, 3 * 32 + 6), body.position_y.*);
 }
@@ -2216,14 +2724,10 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
+        .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2293,6 +2797,7 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // Dormant NPC never transitioned: the tier gate skipped it despite straddling
@@ -2304,7 +2809,7 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
     // hole cell, landed on level 1, and its landing cell was carved walkable.
     try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(active_npc));
     const floor1 = world.denseFloorLayerForLevel(1).?;
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 6, 3));
 }
 
 test "pipeline runs the perception stage scoped to cognition-tier ai agents without perturbing movement/ai" {
@@ -2314,14 +2819,14 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     defer data.deinit();
     var player = try Player.spawn(&data);
 
-    // Cognition-tier observer (default tier): included in `ai_indices`, so it
-    // becomes both an AI gather row and a perception gather row.
+    // Cognition-tier observer (default tier): included in the halo and think
+    // lists, so it becomes both an AI gather row and a perception gather row.
     const observer = try data.createEntity();
     try data.setMovementBody(observer, .{ .position = .{ .x = 50, .y = 50 }, .previous_position = .{ .x = 50, .y = 50 }, .velocity = .{}, .speed = 20 });
     try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setAiPerception(observer, .{ .vision_range = 100 });
 
-    // Locomotion-tier: `gatherAiAgentIndices` excludes it (tier.allowsCognition()
+    // Locomotion-tier: `gatherAiPopulations` excludes it (tier.allowsCognition()
     // is false), so it must never enter perception's gather either — proves
     // perception shares AI's exact scoped population rather than its own.
     const out_of_scope = try data.createEntity();
@@ -2345,17 +2850,10 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2370,11 +2868,13 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // Scoping: perception's gather ran only over the cognition-tier ai agent,
-    // matching AI's own scoped population (both read the same `ai_indices`)
-    // even though two entities in `DataSystem` carry `AiPerception`.
+    // matching AI's own scoped population (both read the same think list)
+    // even though two entities in `DataSystem` carry `AiPerception`. With a
+    // struct-literal world (`cognition_region == null`) halo == think.
     try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
     try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
     try std.testing.expectEqual(@as(usize, 1), stats.perception.candidate_population_count);
@@ -2395,68 +2895,222 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     try std.testing.expectEqual(@as(usize, 3), stats.movement.body_count);
 }
 
-test "pipeline perception events truncate instead of throwing when the shared event capacity is tight" {
+const scope_render_test_agent_count = 4;
+const scope_render_test_steps = 4;
+
+const ScopeRenderTraceStep = struct {
+    cognition_region: ?ActiveRegion,
+    ai_entity_count: usize,
+    stagger_skips: usize,
+    tier_commands: [scope_render_test_agent_count + 1]?StructuralCommand,
+};
+
+const ScopeRenderTrace = struct {
+    steps: [scope_render_test_steps]ScopeRenderTraceStep,
+    bodies: [scope_render_test_agent_count]MovementBody,
+    agents: [scope_render_test_agent_count]AiAgent,
+};
+
+/// Runs `scope_render_test_steps` pipeline steps with one fixed `sim_view` on a
+/// 64×16-tile, chunk-16 world (4 chunks) with one AI agent per chunk. When
+/// `render_cadence` is set, the render visibility window is rewritten between
+/// steps (varying rects, call counts, and a far rect) as interpolated render
+/// frames would; otherwise it is never set.
+fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 0;
+
+    const chunk_pixels: f32 = 16 * 32;
+    var agents: [scope_render_test_agent_count]EntityId = undefined;
+    for (&agents, 0..) |*agent, i| {
+        const x = @as(f32, @floatFromInt(i)) * chunk_pixels + 100;
+        agent.* = try data.createEntity();
+        try data.setMovementBody(agent.*, .{
+            .position = .{ .x = x, .y = 200 },
+            .previous_position = .{ .x = x, .y = 200 },
+            .velocity = .{ .x = 10, .y = 0 },
+            .speed = 20,
+        });
+        try data.setAiAgent(agent.*, .{ .active_behavior = .wander, .gain_pursue = 0 });
+        try data.setAiPerception(agent.*, .{});
+        // Agent 2 starts a band low so the tier policy has a promotion to queue.
+        try data.setSimulationMetadata(agent.*, .{
+            .tier = if (i == 2) .locomotion else .cognition,
+            .chunk = .{ .x = @intCast(i), .y = 0 },
+            .stagger_phase = @intCast(i),
+        });
+    }
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 64,
+        .height = 16,
+        .tile_size = 32,
+        .chunk_size_tiles = 16,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 16, 16, 16, 16, 16);
+    try frame.reservePathRequests(4, 4);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 512, .{
+        .contact_capacity = 8,
+        .pathfinding = .{
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+        },
+    });
+    defer pipeline.deinit();
+
+    // Fixed-step view over chunk 1 → overscan-1 region chunks [0,3).
+    const sim_view = Rect{ .x = 600, .y = 0, .w = 400, .h = 256 };
+    // Per-step render frames: differing alpha-lerped rects, call counts, and a
+    // far rect over chunk 3, including a step with no render at all.
+    const render_rects = [scope_render_test_steps][]const Rect{
+        &.{ .{ .x = 0, .y = 0, .w = 256, .h = 256 }, .{ .x = 37.5, .y = 0, .w = 256, .h = 256 } },
+        &.{.{ .x = 1800, .y = 200, .w = 200, .h = 200 }},
+        &.{},
+        &.{ .{ .x = 1500, .y = 0, .w = 256, .h = 256 }, .{ .x = 1700, .y = 64, .w = 256, .h = 256 }, .{ .x = 1900, .y = 100, .w = 128, .h = 128 } },
+    };
+
+    var trace: ScopeRenderTrace = undefined;
+    for (&trace.steps, render_rects) |*out, rects| {
+        if (render_cadence) {
+            for (rects) |rect| try world.setVisibleChunksForWorldRect(rect, sim_view_overscan_chunks, 0);
+        }
+        frame.beginStep();
+        const stats = try pipeline.update(.{
+            .data = &data,
+            .frame = &frame,
+            .world = &world,
+            .player = &player,
+            .thread_system = &threads,
+            .delta_seconds = 1.0 / 60.0,
+            .bounds_width = 2048,
+            .bounds_height = 512,
+            .sim_view = sim_view,
+        });
+        out.* = .{
+            .cognition_region = stats.scope.active_region,
+            .ai_entity_count = stats.ai.entity_count,
+            .stagger_skips = stats.scope.stats.stagger_skips,
+            .tier_commands = @splat(null),
+        };
+        const commands = frame.structural_commands.mergedItems();
+        try std.testing.expect(commands.len <= out.tier_commands.len);
+        for (commands, 0..) |command, i| out.tier_commands[i] = command;
+    }
+    if (render_cadence) {
+        // The render window really did leave the sim view (else the comparison
+        // would be vacuous).
+        const render_region = world.visibleChunkRegion() orelse return error.TestExpectedRenderWindow;
+        try std.testing.expect(!std.meta.eql(render_region, world.chunkRegionForWorldRect(sim_view, sim_view_overscan_chunks).?));
+    } else {
+        try std.testing.expect(world.visibleChunkRegion() == null);
+    }
+    for (agents, 0..) |agent, i| {
+        trace.bodies[i] = data.movementBodyConst(agent).?;
+        trace.agents[i] = data.aiAgentConst(agent).?;
+    }
+
+    // Scope came from the sim view: halo region, stagger gating, and the
+    // queued promotion of the locomotion-seeded agent.
+    const expected_cognition = world.cognitionRegionForWorldRect(sim_view, sim_view_overscan_chunks, cognition_halo_chunks).?;
+    for (trace.steps) |step| {
+        try std.testing.expectEqual(@as(?ActiveRegion, expected_cognition), step.cognition_region);
+        try std.testing.expect(step.stagger_skips > 0);
+        const promote = (step.tier_commands[0] orelse return error.TestExpectedTierCommand).set_simulation_tier;
+        try std.testing.expectEqual(agents[2], promote.entity);
+        try std.testing.expectEqual(SimulationTier.cognition, promote.tier);
+    }
+    return trace;
+}
+
+test "simulation scope region ignores the render visibility window" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // Run A rewrites the render window between steps as varying-alpha render
+    // frames would; run B never renders. Cognition region, think set, stagger
+    // skips, queued tier commands, and movement/AI columns must be identical.
+    const with_render = try runScopeRenderWindowScenario(true);
+    const without_render = try runScopeRenderWindowScenario(false);
+    try std.testing.expectEqualDeep(without_render, with_render);
+}
+
+test "pipeline dual-list perception: think observer acquires off-phase halo hostile" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
 
-    // Two observer/hostile pairs. Each observer is closer to its own hostile
-    // than to the other pair's, so nearest-threat selection locks each onto
-    // its own target; both newly perceive their hostile this step, so
-    // perception emits two events.
-    const observer_a = try data.createEntity();
-    try data.setMovementBody(observer_a, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{ .x = 10, .y = 0 }, .speed = 20 });
-    try data.setAiAgent(observer_a, .{ .active_behavior = .wander, .gain_pursue = 0 });
-    try data.setFaction(observer_a, .player);
-    try data.setAiPerception(observer_a, .{});
-    const hostile_a = try data.createEntity();
-    try data.setMovementBody(hostile_a, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
-    try data.setAiAgent(hostile_a, .{ .active_behavior = .wander, .gain_pursue = 0 });
-    try data.setFaction(hostile_a, .hostile);
+    // First pipeline.update advances step_count to 1 → stagger_step 1. The
+    // ally thinks this step; the hostile is halo-only (phase 0).
+    const ally = try data.createEntity();
+    try data.setMovementBody(ally, .{
+        .position = .{ .x = 8, .y = 16 },
+        .previous_position = .{ .x = 8, .y = 16 },
+        .velocity = .{ .x = 100, .y = 0 },
+        .speed = 20,
+    });
+    try data.setAiAgent(ally, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(ally, .ally);
+    try data.setAiPerception(ally, .{});
+    try data.setSimulationMetadata(ally, .{
+        .tier = .cognition,
+        .chunk = .{ .x = 0, .y = 0 },
+        .stagger_phase = 1,
+    });
 
-    const observer_b = try data.createEntity();
-    try data.setMovementBody(observer_b, .{ .position = .{ .x = 100, .y = 0 }, .previous_position = .{ .x = 100, .y = 0 }, .velocity = .{ .x = 10, .y = 0 }, .speed = 20 });
-    try data.setAiAgent(observer_b, .{ .active_behavior = .wander, .gain_pursue = 0 });
-    try data.setFaction(observer_b, .player);
-    try data.setAiPerception(observer_b, .{});
-    const hostile_b = try data.createEntity();
-    try data.setMovementBody(hostile_b, .{ .position = .{ .x = 110, .y = 0 }, .previous_position = .{ .x = 110, .y = 0 }, .velocity = .{}, .speed = 0 });
-    try data.setAiAgent(hostile_b, .{ .active_behavior = .wander, .gain_pursue = 0 });
-    try data.setFaction(hostile_b, .hostile);
+    const hostile = try data.createEntity();
+    try data.setMovementBody(hostile, .{
+        .position = .{ .x = 24, .y = 16 },
+        .previous_position = .{ .x = 24, .y = 16 },
+        .velocity = .{ .x = -100, .y = 0 },
+        .speed = 20,
+    });
+    try data.setAiAgent(hostile, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(hostile, .hostile);
+    try data.setAiPerception(hostile, .{});
+    try data.setSimulationMetadata(hostile, .{
+        .tier = .cognition,
+        .chunk = .{ .x = 0, .y = 0 },
+        .stagger_phase = 0,
+    });
 
     var world = WorldSystem{
         .allocator = std.testing.allocator,
-        .width = 8,
+        .width = 1,
         .height = 1,
         .tile_size = 32,
-        .chunk_size_tiles = 8,
+        .chunk_size_tiles = 1,
     };
     defer world.deinit();
     _ = try world.addLevel(0);
+    // Migrated from a render window at overscan 0: on this single-chunk world
+    // the sim view's overscan-1 region clamps to the same chunk [0,1).
+    const sim_view = Rect{ .x = 0, .y = 0, .w = 32, .h = 32 };
+    const expected_view = ActiveRegion{ .min = .{ .x = 0, .y = 0 }, .max_exclusive = .{ .x = 1, .y = 1 } };
+    try std.testing.expectEqual(expected_view, world.chunkRegionForWorldRect(sim_view, sim_view_overscan_chunks).?);
+
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
-    // Real per-step event budget of 1 — tighter than the two events this
-    // step's perceptions produce.
-    try frame.reserveStreams(4, 1, 4, 4, 4, 4);
+    try frame.reserveStreams(4, 4, 4, 4, 4, 4);
     try frame.reservePathRequests(2, 2);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
-        .perception_max_events_per_step = 1,
     });
     defer pipeline.deinit();
 
@@ -2470,11 +3124,273 @@ test "pipeline perception events truncate instead of throwing when the shared ev
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = sim_view,
     });
 
-    try std.testing.expectEqual(@as(usize, 1), stats.perception.perceived_events + stats.perception.lost_events);
-    try std.testing.expectEqual(@as(usize, 1), stats.perception.dropped_events);
-    try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
+    const h: i32 = cognition_halo_chunks;
+    try std.testing.expectEqual(ActiveRegion{
+        .min = .{ .x = -h, .y = -h },
+        .max_exclusive = .{ .x = 1 + h, .y = 1 + h },
+    }, stats.scope.active_region.?);
+    try std.testing.expectEqual(@as(usize, 2), stats.perception.candidate_population_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
+
+    const ally_perception = data.aiPerceptionConst(ally).?;
+    try std.testing.expect(ally_perception.target_visible);
+    try std.testing.expectEqual(hostile.index, ally_perception.nearest_threat.index);
+
+    const hostile_perception = data.aiPerceptionConst(hostile).?;
+    try std.testing.expect(!hostile_perception.target_visible);
+    try std.testing.expectEqual(EntityId.invalid, hostile_perception.nearest_threat);
+}
+
+const share_test_pathfinding: PathfindingCapacity = .{
+    .max_group_fields = 1,
+    .worker_participant_count = 1,
+};
+
+fn addShareTestAgent(data: *DataSystem, x: f32, faction: Faction, observer: bool) !EntityId {
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = x, .y = 0 }, .previous_position = .{ .x = x, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(entity, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(entity, faction);
+    if (observer) {
+        try data.setAiPerception(entity, .{});
+        try data.setAiMemory(entity, .{});
+    }
+    return entity;
+}
+
+fn moveShareTestAgent(data: *DataSystem, entity: EntityId, x: f32) void {
+    const body = data.movementBodyPtr(entity).?;
+    body.previous_x.* = x;
+    body.position_x.* = x;
+    body.previous_y.* = 0;
+    body.position_y.* = 0;
+}
+
+fn shareTestWorld() !WorldSystem {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 64,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 16,
+    };
+    errdefer world.deinit();
+    _ = try world.addLevel(0);
+    return world;
+}
+
+fn countPerceptionEvents(frame: *const SimulationFrame) struct { perceived: usize, lost: usize } {
+    var perceived: usize = 0;
+    var lost: usize = 0;
+    for (frame.events.mergedItems()) |event| switch (event.payload) {
+        .entity_perceived => perceived += 1,
+        .entity_lost => lost += 1,
+        else => {},
+    };
+    return .{ .perceived = perceived, .lost = lost };
+}
+
+test "default-config pipeline publishes every perception acquisition and refreshes memory" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    // Two observer/hostile pairs, each observer nearest its own hostile.
+    const observer_a = try addShareTestAgent(&data, 0, .player, true);
+    const hostile_a = try addShareTestAgent(&data, 10, .hostile, false);
+    const observer_b = try addShareTestAgent(&data, 300, .player, true);
+    const hostile_b = try addShareTestAgent(&data, 310, .hostile, false);
+
+    var world = try shareTestWorld();
+    defer world.deinit();
+    // Every observer acquires in one step (the share's worst case), so opt out of
+    // the full-world `sim_view`'s stagger.
+    try markAllAlwaysActive(&data);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    // Production order: init derives the shares, then the frame takes the bound.
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{ .pathfinding = share_test_pathfinding });
+    defer pipeline.deinit();
+    try std.testing.expectEqual(@as(usize, 4), pipeline.perception_max_events_per_step);
+    try frame.reserveStreams(4, 0, 4, 4, 4, 4);
+    try frame.reservePathRequests(2, 2);
+    try pipeline.reserve(&frame, 5);
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 2048,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), countPerceptionEvents(&frame).perceived);
+    try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
+    try std.testing.expect(data.aiMemoryConst(observer_a).?.last_known_target.eql(hostile_a));
+    try std.testing.expect(data.aiMemoryConst(observer_b).?.last_known_target.eql(hostile_b));
+}
+
+test "derived perception share covers an identity swap for every observer" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    var near: [3]EntityId = undefined;
+    var far: [3]EntityId = undefined;
+    for (0..3) |index| {
+        const base: f32 = @floatFromInt(index * 300);
+        _ = try addShareTestAgent(&data, base, .player, true);
+        near[index] = try addShareTestAgent(&data, base + 20, .hostile, false);
+        far[index] = try addShareTestAgent(&data, base + 60, .hostile, false);
+    }
+
+    var world = try shareTestWorld();
+    defer world.deinit();
+    // Every observer swaps in one step (the share's worst case), so opt out of the
+    // full-world `sim_view`'s stagger.
+    try markAllAlwaysActive(&data);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{ .pathfinding = share_test_pathfinding });
+    defer pipeline.deinit();
+    try std.testing.expectEqual(@as(usize, 6), pipeline.perception_max_events_per_step);
+    try frame.reserveStreams(4, 0, 10, 10, 10, 10);
+    try frame.reservePathRequests(2, 2);
+    try pipeline.reserve(&frame, 10);
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 2048,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    try std.testing.expectEqual(@as(usize, 3), countPerceptionEvents(&frame).perceived);
+
+    // The far hostile steps in front of the near one: every observer swaps identity
+    // (lost + perceived) in one step.
+    for (0..3) |index| {
+        const base: f32 = @floatFromInt(index * 300);
+        moveShareTestAgent(&data, far[index], base + 8);
+    }
+    frame.beginStep();
+    const stats = try pipeline.update(context);
+    const counts = countPerceptionEvents(&frame);
+    try std.testing.expectEqual(@as(usize, 3), counts.perceived);
+    try std.testing.expectEqual(@as(usize, 3), counts.lost);
+    try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
+}
+
+test "derived affect share is the drive count times AiAffect rows" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..2) |index| {
+        const entity = try addShareTestAgent(&data, @floatFromInt(index * 300), .player, false);
+        try data.setAiAffect(entity, .{});
+    }
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{ .pathfinding = share_test_pathfinding });
+    defer pipeline.deinit();
+    try std.testing.expectEqual(@as(usize, 2 * affect_events_per_row_max), pipeline.affect_max_events_per_step);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.perception_max_events_per_step);
+}
+
+test "perception share grows at the seam so newly created observers never truncate" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    var observers: [7]EntityId = undefined;
+    for (0..3) |index| {
+        const base: f32 = @floatFromInt(index * 300);
+        observers[index] = try addShareTestAgent(&data, base, .player, true);
+        _ = try addShareTestAgent(&data, base + 10, .hostile, false);
+    }
+
+    var world = try shareTestWorld();
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{
+        .pathfinding = share_test_pathfinding,
+        .structural_headroom = 64,
+    });
+    defer pipeline.deinit();
+    try std.testing.expectEqual(@as(usize, 6), pipeline.perception_max_events_per_step);
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 7, 7, 7, 7 + 64);
+    try frame.reservePathRequests(2, 2);
+    try pipeline.reserve(&frame, 7);
+
+    // Four observer + hostile pairs created through structural commands.
+    var commands: [8]StructuralCommand = undefined;
+    for (0..4) |index| {
+        const base: f32 = @floatFromInt((index + 3) * 300);
+        commands[index * 2] = .{ .create_entity = .{
+            .movement_body = .{ .position = .{ .x = base, .y = 0 }, .previous_position = .{ .x = base, .y = 0 }, .velocity = .{}, .speed = 0 },
+            .ai_agent = .{ .active_behavior = .wander, .gain_pursue = 0 },
+            .faction = .player,
+            .ai_perception = .{},
+            .ai_memory = .{},
+        } };
+        commands[index * 2 + 1] = .{ .create_entity = .{
+            .movement_body = .{ .position = .{ .x = base + 10, .y = 0 }, .previous_position = .{ .x = base + 10, .y = 0 }, .velocity = .{}, .speed = 0 },
+            .ai_agent = .{ .active_behavior = .wander, .gain_pursue = 0 },
+            .faction = .hostile,
+        } };
+    }
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &commands);
+    const sync = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    try std.testing.expect(sync.grew);
+    try std.testing.expectEqual(@as(usize, 7), data.populationRowCounts().ai_perceptions);
+    try std.testing.expectEqual(perception_events_per_observer_max * grownPopulationCapacity(7), pipeline.perception_max_events_per_step);
+    try std.testing.expectEqual(@as(usize, 64), pipeline.perception_max_events_per_step);
+    try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
+
+    // Every observer acquires in the same step: 7 events, none truncated. Opt the
+    // whole committed population out of the full-world `sim_view`'s stagger so the
+    // share's worst case is what runs.
+    try markAllAlwaysActive(&data);
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 2048,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    });
+    try std.testing.expectEqual(@as(usize, 7), countPerceptionEvents(&frame).perceived);
+    try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
 }
 
 test "pipeline commits the dig stage's world edit before the tile gate reads walkability in the same step" {
@@ -2534,14 +3450,10 @@ test "pipeline commits the dig stage's world edit before the tile gate reads wal
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
+        .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2557,6 +3469,7 @@ test "pipeline commits the dig stage's world edit before the tile gate reads wal
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // The dig mined (6,3) walkable this step, so the gate let the NPC keep its
@@ -2628,13 +3541,8 @@ test "pipeline tile gate after collision response rejects contact push into soli
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 8,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2656,11 +3564,12 @@ test "pipeline tile gate after collision response rejects contact push into soli
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     const body = data.movementBodyConst(player.entity).?;
     // End-of-step pose must not overlap solid tiles on level 1.
-    try std.testing.expect(!rectOverlapsSolidTile(&world, 1, body.position.x, body.position.y, 32, 32));
+    try std.testing.expect(!world_gate.rectOverlapsSolidTile(&world, 1, body.position.x, body.position.y, 32, 32));
     // And should remain in/near the carved pocket rather than deep in solid dirt.
     const cell = world.cellContaining(body.position.x + 16, body.position.y + 16).?;
     try std.testing.expectEqual(@as(u16, 3), cell.x);
@@ -2676,10 +3585,10 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
-    // 16 tiles wide × default chunk_size 8 → two chunks on X. Surface (level 0)
+    // 16 tiles wide × chunk_size 8 → two chunks on X. Surface (level 0)
     // is fully walkable so the tile gate cannot undo the contact push.
     const tile_size = meta.tileSize();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, tile_size * 16, tile_size * 8);
+    var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 8);
     defer world.deinit();
     try std.testing.expectEqual(@as(u16, 8), world.chunk_size_tiles);
 
@@ -2723,13 +3632,8 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 8,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2749,6 +3653,7 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
         .delta_seconds = 0.016,
         .bounds_width = tile_size * 16,
         .bounds_height = tile_size * 8,
+        .sim_view = fullWorldSimView(&world),
     });
 
     const body = data.movementBodyConst(player.entity).?;
@@ -2758,6 +3663,73 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
     try std.testing.expectEqual(settled.y, meta_after.chunk.y);
     // Contact must have crossed the chunk-0 / chunk-1 boundary (cell 8 = chunk 1).
     try std.testing.expect(settled.x >= 1);
+}
+
+test "pipeline scope chunks and nav chunks are the world's chunks" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    // 16 x 8 tiles in 4-tile chunks: a 4 x 2 chunk grid.
+    const tile_size = meta.tileSize();
+    var world = try WorldSystem.initDemoFromMetaWithChunkSize(std.testing.allocator, &meta, tile_size * 16, tile_size * 8, 4);
+    defer world.deinit();
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 0;
+    try data.setWorldLevel(player.entity, 0);
+    placePlayerFlush(&data, player, .{ 9, 5 });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    // The world-less nav knobs and bounds differ from the world on purpose; the world wins.
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, tile_size * 25, tile_size * 3, .{
+        .contact_capacity = 8,
+        .nav_cell_size = tile_size / 4,
+        .navigation_world = &world,
+        .pathfinding = .{
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .nav_chunk_tiles = 16,
+        },
+    });
+    defer pipeline.deinit();
+    try std.testing.expectEqual(world.chunk_size_tiles, pipeline.pathfinding.graph.geometry.chunk_tiles);
+    try std.testing.expectEqual(world.tile_size, pipeline.pathfinding.graph.cell_size);
+    try std.testing.expectEqual(@as(usize, world.width), pipeline.pathfinding.graph.geometry.width);
+    try std.testing.expectEqual(@as(usize, world.height), pipeline.pathfinding.graph.geometry.height);
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = tile_size * 16,
+        .bounds_height = tile_size * 8,
+        .sim_view = fullWorldSimView(&world),
+    });
+
+    const body = data.movementBodyConst(player.entity).?;
+    const world_chunk = world.chunkCoordForWorldPos(body.position.x, body.position.y);
+    try std.testing.expectEqual(@as(i32, 2), world_chunk.x);
+    try std.testing.expectEqual(@as(i32, 1), world_chunk.y);
+    const scope_chunk = data.simulationMetadata(player.entity).?.chunk;
+    try std.testing.expectEqual(world_chunk.x, scope_chunk.x);
+    try std.testing.expectEqual(world_chunk.y, scope_chunk.y);
+    const nav_grid = pipeline.pathfinding.graph.grid(0).?;
+    const nav_cell = nav_grid.indexForCell(nav_grid.worldToCellClamped(body.position)).?;
+    const world_chunk_index: u32 = @intCast(world_chunk.y * @as(i32, world.chunksX()) + world_chunk.x);
+    try std.testing.expectEqual(world_chunk_index, nav_grid.geometry.chunkOfCell(nav_cell));
 }
 
 test "pipeline plane traversal batches fall landing tile events into one range" {
@@ -2813,20 +3785,15 @@ test "pipeline plane traversal batches fall landing tile events into one range" 
     defer frame.deinit();
     try frame.reserveStreams(4, 16, 8, 8, 8, 8);
     try frame.reservePathRequests(2, 2);
-    try frame.reserveWorldTileChangesScratch(4);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
+        .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -2841,6 +3808,7 @@ test "pipeline plane traversal batches fall landing tile events into one range" 
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     var tile_events: usize = 0;
@@ -2851,7 +3819,7 @@ test "pipeline plane traversal batches fall landing tile events into one range" 
         }
     }
     try std.testing.expectEqual(@as(usize, 2), tile_events);
-    // Strong M7 contract: both landing carves share one events range (batched
+    // Both landing carves share one events range (batched
     // publishWorldTileChanges), not two appendRequired ranges of one each.
     var batch_ranges: usize = 0;
     for (frame.events.range_stats.items) |range_stat| {
@@ -2861,8 +3829,8 @@ test "pipeline plane traversal batches fall landing tile events into one range" 
     try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
 
     const floor1 = world.denseFloorLayerForLevel(1).?;
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 4, 3));
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 4, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 6, 3));
 }
 
 test "plane traversal event capacity miss leaves landing tiles unchanged" {
@@ -2878,7 +3846,7 @@ test "plane traversal event capacity miss leaves landing tiles unchanged" {
     _ = try world.clearDenseTile(floor0, 4, 3);
     const floor1 = world.denseFloorLayerForLevel(1).?;
     const landing_before = world.denseTile(floor1, 4, 3);
-    try std.testing.expect(world.denseTileBlocksMovement(floor1, 4, 3));
+    try std.testing.expect(denseTileBlocksMovement(&world, floor1, 4, 3));
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2906,22 +3874,23 @@ test "plane traversal event capacity miss leaves landing tiles unchanged" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 0, 8, 8, 8, 8);
-    try frame.reserveWorldTileChangesScratch(4);
     frame.beginStep();
     frame.events.setCapacityLimit(0);
 
     var dig = DigController.init(dig_config);
+    try dig.reservePlaneScratch(std.testing.allocator, 4);
+    defer dig.deinit();
     try std.testing.expectError(
         error.EventCapacityExceeded,
-        applyPlaneTraversalStage(&dig, &world, &data, &player, &frame),
+        testPlaneTraversalStage(&dig, &world, &data, &player, &frame),
     );
     try std.testing.expectEqual(landing_before, world.denseTile(floor1, 4, 3));
-    try std.testing.expect(world.denseTileBlocksMovement(floor1, 4, 3));
+    try std.testing.expect(denseTileBlocksMovement(&world, floor1, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
 }
 
 test "plane traversal multi-entity world_level attach OOM leaves landings uncarved" {
-    // M8: two NPCs missing world_level over holes. Stage reserves attach capacity
+    // Two NPCs missing world_level over holes. Stage reserves attach capacity
     // and attaches both before any carve — so OOM on capacity leaves both landings
     // solid (no mid-loop carve without matching events). Avoid Player.spawn: it
     // pre-grows world_levels and can hide the attach allocation.
@@ -2953,6 +3922,8 @@ test "plane traversal multi-entity world_level attach OOM leaves landings uncarv
     // Seed last_cell so the parked player is not a cell-entry candidate.
     const dig_config = try DigConfig.fromMeta(&meta);
     var dig = DigController.init(dig_config);
+    try dig.reservePlaneScratch(std.testing.allocator, 4);
+    defer dig.deinit();
     dig.player_last_cell = .{ .x = 1, .y = 1 };
 
     try std.testing.expectEqual(@as(usize, 0), data.world_levels.len());
@@ -2978,7 +3949,6 @@ test "plane traversal multi-entity world_level attach OOM leaves landings uncarv
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 16, 8, 8, 8, 8);
-    try frame.reserveWorldTileChangesScratch(4);
     frame.beginStep();
 
     // Fail the first data allocation (world_levels ensureCapacity / attach).
@@ -2989,16 +3959,14 @@ test "plane traversal multi-entity world_level attach OOM leaves landings uncarv
 
     try std.testing.expectError(
         error.OutOfMemory,
-        applyPlaneTraversalStage(&dig, &world, &data, &player, &frame),
+        testPlaneTraversalStage(&dig, &world, &data, &player, &frame),
     );
     try std.testing.expectEqual(landing_a, world.denseTile(floor1, 4, 3));
     try std.testing.expectEqual(landing_b, world.denseTile(floor1, 6, 3));
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.world_tile_changed);
 }
 
-test "plane traversal multi-fall after scratch reserve is allocation-free (FailingAllocator)" {
-    // M9: warm scratch + event capacity, arm FA at index 0, two falls publish
-    // with zero further allocations on the frame / events / data paths used.
+test "plane traversal multi-fall after its reserve commits and publishes allocation-free (FailingAllocator)" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
@@ -3036,36 +4004,51 @@ test "plane traversal multi-fall after scratch reserve is allocation-free (Faili
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 16, 8, 8, 8, 8);
-    try frame.reserveWorldTileChangesScratch(4);
-    // Warm the exact event append path the stage preflights + publishes through.
-    try frame.events.ensureEventAppendCapacity(2);
     frame.beginStep();
-    // beginStep clears counts but retains capacity — re-warm event value capacity
-    // after clear so ensureEventAppendCapacity(2) inside the stage is free.
-    try frame.events.ensureEventAppendCapacity(2);
+
+    var dig = DigController.init(dig_config);
+    try dig.reservePlaneScratch(std.testing.allocator, 4);
+    defer dig.deinit();
+    // The reserve covers the scratch, the events, and the world_level rows; with the
+    // landing chunk's batch scratch and pools warm, the commit allocates from none of them.
+    try warmLandingTerrain(&world, dig.tunnel_tile, 1, .{ 4, 3 });
+    var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
+    defer plane_entry.deinit();
+    const entries = try plane_entry.gather(&data, &world, player.entity, dig.tunnel_tile, null);
+    const reservation = try dig.reservePlaneTraversalStage(&world, &data, &player, &frame, entries, null);
+    try std.testing.expectEqual(@as(usize, 2), reservation.carves);
 
     const original_frame = frame.allocator;
     const original_events = frame.events.stream.allocator;
     const original_data = data.allocator;
+    const original_world = world.allocator;
+    const original_dig = dig.scratch_allocator.?;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const fail_alloc = failing.allocator();
     frame.allocator = fail_alloc;
     frame.events.stream.allocator = fail_alloc;
     data.allocator = fail_alloc;
+    world.allocator = fail_alloc;
+    dig.scratch_allocator = fail_alloc;
     defer {
         frame.allocator = original_frame;
         frame.events.stream.allocator = original_events;
         data.allocator = original_data;
+        world.allocator = original_world;
+        dig.scratch_allocator = original_dig;
     }
 
-    var dig = DigController.init(dig_config);
-    try applyPlaneTraversalStage(&dig, &world, &data, &player, &frame);
+    try dig.commitPlaneTraversalStage(&world, &data, &player, &frame, reservation, null);
 
-    try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+    // Each landing carve is published once, in one range.
+    try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
+    try std.testing.expectEqual(@as(usize, 2), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 1), frame.events.rangeCount());
     const floor1 = world.denseFloorLayerForLevel(1).?;
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 4, 3));
-    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 4, 3));
+    try std.testing.expect(!denseTileBlocksMovement(&world, floor1, 6, 3));
 }
 
 test "pipeline commits the dig stage's stimulus before perception reads it in the same step" {
@@ -3099,6 +4082,9 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
     try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(observer, 0);
     try data.setAiPerception(observer, .{ .hearing_range = 1000 });
+    // The chunked world's full-world `sim_view` applies stagger: pin the observer
+    // thinking on this single step (dig-before-perception order, not stagger).
+    try markAllAlwaysActive(&data);
 
     // Sanity: the observer does not hear anything before the step runs.
     try std.testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
@@ -3114,15 +4100,10 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
-        .perception_max_events_per_step = 4,
+        .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -3138,6 +4119,7 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     // The observer heard this step's dig, which is only possible if dig produced
@@ -3185,27 +4167,21 @@ test "pipeline promotes deferred impacts before perception on the following step
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .movement_body_capacity = 4,
-        .perception_max_events_per_step = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
 
     // Simulate a collision impact deferred at the end of the prior step.
-    pipeline.deferred_stimuli[0] = .{
+    pipeline.sensory.deferred_stimuli[0] = .{
         .position = .{ .x = impact_x, .y = impact_y },
         .intensity = defaultStimulusIntensity(.impact),
         .kind = .impact,
         .level = 0,
     };
-    pipeline.deferred_stimulus_count = 1;
+    pipeline.sensory.deferred_stimulus_count = 1;
 
     frame.beginStep();
     _ = try pipeline.update(.{
@@ -3217,13 +4193,14 @@ test "pipeline promotes deferred impacts before perception on the following step
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     const perception = data.aiPerceptionConst(observer).?;
     try std.testing.expect(perception.heard_stimulus);
     try std.testing.expectApproxEqAbs(impact_x, perception.heard_stimulus_x, 0.01);
     try std.testing.expectApproxEqAbs(impact_y, perception.heard_stimulus_y, 0.01);
-    try std.testing.expectEqual(@as(usize, 0), pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.sensory.deferred_stimulus_count);
 }
 
 test "pipeline defers player collision impacts until the next step" {
@@ -3282,15 +4259,9 @@ test "pipeline defers player collision impacts until the next step" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 8,
         .movement_body_capacity = 8,
-        .perception_max_events_per_step = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -3305,10 +4276,11 @@ test "pipeline defers player collision impacts until the next step" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expect(stats.collision.contact_count > 0);
-    try std.testing.expectEqual(@as(usize, 1), pipeline.deferred_stimulus_count);
-    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.deferred_stimuli[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.sensory.deferred_stimulus_count);
+    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.sensory.deferred_stimuli[0].kind);
     try std.testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
 
     frame.beginStep();
@@ -3321,6 +4293,7 @@ test "pipeline defers player collision impacts until the next step" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
 }
@@ -3375,15 +4348,9 @@ test "head-on player impact enqueues even after collision response zeroes approa
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 8,
         .movement_body_capacity = 8,
-        .perception_max_events_per_step = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -3399,14 +4366,15 @@ test "head-on player impact enqueues even after collision response zeroes approa
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     try std.testing.expect(stats.collision.contact_count > 0);
     // Response ran and zeroed the approach axis; the old post-response read would
     // see this and drop the impact. The snapshot-based gate must not.
     try std.testing.expectEqual(@as(f32, 0), data.movementBodyConst(player.entity).?.velocity.x);
-    try std.testing.expectEqual(@as(usize, 1), pipeline.deferred_stimulus_count);
-    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.deferred_stimuli[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.sensory.deferred_stimulus_count);
+    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.sensory.deferred_stimuli[0].kind);
 }
 
 test "pipeline emits player footstep stimulus before perception in the same step" {
@@ -3454,15 +4422,9 @@ test "pipeline emits player footstep stimulus before perception in the same step
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .movement_body_capacity = 4,
-        .perception_max_events_per_step = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -3478,6 +4440,7 @@ test "pipeline emits player footstep stimulus before perception in the same step
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
 
     const perception = data.aiPerceptionConst(observer).?;
@@ -3526,29 +4489,103 @@ test "deferred impact enqueue drops newest when deferred buffer is full" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
-    pipeline.deferred_stimulus_count = stimulus_deferred_capacity;
+    pipeline.sensory.deferred_stimulus_count = stimulus_deferred_capacity;
 
     var deferred_dropped: usize = 0;
-    enqueuePlayerCollisionImpactsToDeferred(
-        &pipeline,
+    var player_contacts: [16]u32 = undefined;
+    pipeline.sensory.enqueuePlayerImpacts(
         &frame,
         &data,
-        player.entity,
+        contactsNaming(&frame, player.entity, &player_contacts),
         0,
         &deferred_dropped,
     );
     try std.testing.expectEqual(@as(usize, 1), deferred_dropped);
-    try std.testing.expectEqual(stimulus_deferred_capacity, pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(stimulus_deferred_capacity, pipeline.sensory.deferred_stimulus_count);
+}
+
+test "dig stage reserves its world edit before promoting, so a failed reserve keeps the deferred impacts" {
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try testMinimalMultiLevelWorld(&meta);
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 1;
+    try data.setWorldLevel(player.entity, 1);
+    // Cell (3,3), facing right: the ramp goes into level 1's solid cell (4,3).
+    placePlayerFlush(&data, player, .{ 3, 3 });
+    data.facingPtr(player.entity).?.* = .right;
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 256, 256, .{
+        .dig = try DigConfig.fromMeta(&meta),
+        .pathfinding = .{
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+        },
+    });
+    defer pipeline.deinit();
+    pipeline.sensory.deferred_stimuli[0] = .{
+        .position = .{ .x = 40, .y = 40 },
+        .intensity = defaultStimulusIntensity(.impact),
+        .kind = .impact,
+        .level = 1,
+    };
+    pipeline.sensory.deferred_stimulus_count = 1;
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 256,
+        .bounds_height = 256,
+        .sim_view = fullWorldSimView(&world),
+    };
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    const before = world.denseTile(floor1, 4, 3);
+
+    frame.beginStep();
+    frame.dig_intent = .ramp;
+    {
+        // The ramp needs a tile block, a bits slot, and link storage: the first fails.
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+        var step = SimulationPipeline.StepState.init(&pipeline, context);
+        try std.testing.expectError(error.OutOfMemory, pipeline.stageDigWorldEdit(&step));
+    }
+    // Nothing moved: the impact is still deferred, the bus and world untouched.
+    try std.testing.expectEqual(@as(usize, 1), pipeline.sensory.deferred_stimulus_count);
+    try std.testing.expectEqual(@as(usize, 0), frame.stimuli.mergedItems().len);
+    try std.testing.expectEqual(before, world.denseTile(floor1, 4, 3));
+    try std.testing.expectEqual(@as(usize, 0), world.levelLinks().len);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+
+    // The retry promotes the impact and digs the ramp.
+    frame.beginStep();
+    frame.dig_intent = .ramp;
+    var step = SimulationPipeline.StepState.init(&pipeline, context);
+    try pipeline.stageDigWorldEdit(&step);
+    try std.testing.expectEqual(@as(usize, 1), step.stimuli_promoted);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.sensory.deferred_stimulus_count);
+    try std.testing.expectEqual(pipeline.dig.ramp_tile, world.denseTile(floor1, 4, 3));
+    try std.testing.expectEqual(@as(?u16, 0), world.rampLinkOtherLevel(1, .{ .x = 4, .y = 3 }));
+    try std.testing.expectEqual(@as(usize, 2), frame.stimuli.mergedItems().len);
 }
 
 test "promote drops deferred impacts when live bus is already full" {
@@ -3559,7 +4596,7 @@ test "promote drops deferred impacts when live bus is already full" {
     try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
 
     for (0..stimulus_live_capacity) |i| {
-        try frame.appendStimulus(.{
+        try frame.writeLiveStimulus(.{
             .position = .{ .x = @floatFromInt(i), .y = 0 },
             .intensity = 1,
             .kind = .dig,
@@ -3569,29 +4606,24 @@ test "promote drops deferred impacts when live bus is already full" {
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
-    pipeline.deferred_stimuli[0] = .{
+    pipeline.sensory.deferred_stimuli[0] = .{
         .position = .{ .x = 200, .y = 0 },
         .intensity = defaultStimulusIntensity(.impact),
         .kind = .impact,
         .level = 0,
     };
-    pipeline.deferred_stimulus_count = 1;
+    pipeline.sensory.deferred_stimulus_count = 1;
 
     var live_dropped: usize = 0;
-    const promoted = promoteDeferredStimuli(&pipeline, &frame, &live_dropped);
+    const promoted = try pipeline.sensory.promote(&frame, &live_dropped);
     try std.testing.expectEqual(@as(usize, 0), promoted);
     try std.testing.expectEqual(@as(usize, 1), live_dropped);
-    try std.testing.expectEqual(@as(usize, 1), pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.sensory.deferred_stimulus_count);
     try std.testing.expectEqual(stimulus_live_capacity, frame.stimuli.mergedItems().len);
 }
 
@@ -3607,7 +4639,7 @@ test "player footstep drops when live bus is full" {
     defer frame.deinit();
     try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
     for (0..stimulus_live_capacity) |i| {
-        try frame.appendStimulus(.{
+        try frame.writeLiveStimulus(.{
             .position = .{ .x = @floatFromInt(i), .y = 0 },
             .intensity = 1,
             .kind = .dig,
@@ -3616,7 +4648,8 @@ test "player footstep drops when live bus is full" {
     }
 
     var live_dropped: usize = 0;
-    tryAppendPlayerFootstepStimulus(&frame, &data, player, &live_dropped);
+    const bus = SensoryBus.init(.{});
+    try bus.appendFootstep(&frame, &data, player, &live_dropped);
     try std.testing.expectEqual(@as(usize, 1), live_dropped);
     try std.testing.expectEqual(stimulus_live_capacity, frame.stimuli.mergedItems().len);
 }
@@ -3670,31 +4703,26 @@ test "player collision impacts enqueue at most stimulus_max_impacts_per_step per
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
 
     var deferred_dropped: usize = 0;
-    enqueuePlayerCollisionImpactsToDeferred(
-        &pipeline,
+    var player_contacts: [16]u32 = undefined;
+    pipeline.sensory.enqueuePlayerImpacts(
         &frame,
         &data,
-        player.entity,
+        contactsNaming(&frame, player.entity, &player_contacts),
         0,
         &deferred_dropped,
     );
-    try std.testing.expectEqual(stimulus_max_impacts_per_step, pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(stimulus_max_impacts_per_step, pipeline.sensory.deferred_stimulus_count);
     try std.testing.expectEqual(@as(usize, 4), deferred_dropped);
-    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.deferred_stimuli[0].kind);
+    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.sensory.deferred_stimuli[0].kind);
     // First contact in merged order wins the first deferred slot (midpoint x = 10).
-    try std.testing.expectApproxEqAbs(@as(f32, 10), pipeline.deferred_stimuli[0].position.x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), pipeline.sensory.deferred_stimuli[0].position.x, 0.01);
 }
 
 test "action_react consumer reports zero intents when no action producers ran" {
@@ -3756,13 +4784,8 @@ test "captureActionIntent appends interact on rising edge only and does not dual
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -3809,13 +4832,8 @@ test "captureActionIntent stamps faced cell matching dig targeting" {
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 256, 256, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -3864,13 +4882,8 @@ test "captureActionIntent keeps latch open when tryAppend soft-drops" {
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -3909,17 +4922,10 @@ test "captureActionIntent then pipeline.update reports action_intents_consumed" 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -3939,6 +4945,7 @@ test "captureActionIntent then pipeline.update reports action_intents_consumed" 
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expectEqual(@as(usize, 1), stats.action_intents_consumed);
     try std.testing.expectEqual(@as(usize, 0), stats.action_intents_dropped);
@@ -3962,13 +4969,8 @@ test "captureActionIntent soft-drop recovers after beginStep while held" {
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
@@ -4009,17 +5011,10 @@ test "pipeline.update reports action_intents_dropped after capture soft-drop" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -4041,6 +5036,7 @@ test "pipeline.update reports action_intents_dropped after capture soft-drop" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expectEqual(@as(usize, 1), stats.action_intents_dropped);
 }
@@ -4080,20 +5076,16 @@ test "standing player collision does not enqueue deferred impact without motion"
 
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .pathfinding = .{
-            .max_frame_requests = 1,
-            .max_pending_requests = 1,
-            .max_cached_results = 1,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 1,
-            .max_fallback_requests_per_step = 1,
         },
     });
     defer pipeline.deinit();
 
     var deferred_dropped: usize = 0;
-    enqueuePlayerCollisionImpactsToDeferred(&pipeline, &frame, &data, player.entity, 0, &deferred_dropped);
-    try std.testing.expectEqual(@as(usize, 0), pipeline.deferred_stimulus_count);
+    var player_contacts: [16]u32 = undefined;
+    pipeline.sensory.enqueuePlayerImpacts(&frame, &data, contactsNaming(&frame, player.entity, &player_contacts), 0, &deferred_dropped);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.sensory.deferred_stimulus_count);
 }
 
 test "sticky dig linger reaches every stagger phase within the linger window" {
@@ -4104,7 +5096,14 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
     defer meta.deinit();
     var world = try testMinimalMultiLevelWorld(&meta);
     defer world.deinit();
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 800, .h = 450 }, cognition_halo_chunks);
+    // Migrated from a render window at overscan `cognition_halo_chunks`: the
+    // 8×8-tile world is one chunk, so the sim view's overscan-1 region clamps
+    // to the same chunk [0,1) and the cognition halo is unchanged.
+    const sim_view = Rect{ .x = 0, .y = 0, .w = 800, .h = 450 };
+    try std.testing.expectEqual(
+        ActiveRegion{ .min = .{ .x = 0, .y = 0 }, .max_exclusive = .{ .x = 1, .y = 1 } },
+        world.chunkRegionForWorldRect(sim_view, sim_view_overscan_chunks).?,
+    );
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4167,15 +5166,10 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
-        .perception_max_events_per_step = 8,
+        .movement_body_capacity = 4,
         .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
             .max_group_fields = 1,
             .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
         },
     });
     defer pipeline.deinit();
@@ -4189,6 +5183,7 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
         .delta_seconds = 0.016,
         .bounds_width = 800,
         .bounds_height = 450,
+        .sim_view = sim_view,
     };
 
     // Next advance lands on stagger slot 0 (phase-0 cohort); dig once there.
@@ -4221,4 +5216,2384 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
     try std.testing.expect(data.aiPerceptionConst(observer_phase3).?.heard_stimulus);
     try std.testing.expectApproxEqAbs(dig_stimulus_x, data.aiPerceptionConst(observer_phase3).?.heard_stimulus_x, 1.0);
     try std.testing.expectApproxEqAbs(dig_stimulus_y, data.aiPerceptionConst(observer_phase3).?.heard_stimulus_y, 1.0);
+}
+
+/// The allocators of everything a pipeline step can reach: frame streams, data, world,
+/// pipeline systems, pathfinding, the static colliders and both their list tiers, dig
+/// scratch, and the thread system. `install` swaps
+/// them all (to one failing allocator for a zero-allocation proof, or per-owner
+/// counters to see which owner allocated) and returns the originals for `restore`.
+/// Test-only local fixture.
+const TestAllocatorSwap = struct {
+    frame: std.mem.Allocator = undefined,
+    events: std.mem.Allocator = undefined,
+    navigation_intents: std.mem.Allocator = undefined,
+    action_intents: std.mem.Allocator = undefined,
+    intents: std.mem.Allocator = undefined,
+    path_requests: std.mem.Allocator = undefined,
+    contacts: std.mem.Allocator = undefined,
+    collision_triggers: std.mem.Allocator = undefined,
+    structural_commands: std.mem.Allocator = undefined,
+    stimuli: std.mem.Allocator = undefined,
+    data: std.mem.Allocator = undefined,
+    world: std.mem.Allocator = undefined,
+    collision: std.mem.Allocator = undefined,
+    collision_response: std.mem.Allocator = undefined,
+    ai: std.mem.Allocator = undefined,
+    steering: std.mem.Allocator = undefined,
+    pathfinding: std.mem.Allocator = undefined,
+    graph: std.mem.Allocator = undefined,
+    static_colliders: std.mem.Allocator = undefined,
+    collider_chunk_lists: std.mem.Allocator = undefined,
+    collider_query_lists: std.mem.Allocator = undefined,
+    scope: std.mem.Allocator = undefined,
+    spatial_index: std.mem.Allocator = undefined,
+    perception: std.mem.Allocator = undefined,
+    ai_memory: std.mem.Allocator = undefined,
+    affect: std.mem.Allocator = undefined,
+    dig: ?std.mem.Allocator = null,
+    plane_entry: std.mem.Allocator = undefined,
+    threads: std.mem.Allocator = undefined,
+
+    const Targets = struct {
+        pipeline: *SimulationPipeline,
+        frame: *SimulationFrame,
+        data: *DataSystem,
+        world: *WorldSystem,
+        threads: *ThreadSystem,
+    };
+
+    const owner_names = @typeInfo(TestAllocatorSwap).@"struct".field_names;
+    const owner_count = owner_names.len;
+
+    /// Every owner set to `allocator`.
+    fn uniform(allocator: std.mem.Allocator) TestAllocatorSwap {
+        var out: TestAllocatorSwap = .{};
+        inline for (owner_names) |name| @field(out, name) = allocator;
+        return out;
+    }
+
+    fn install(self: *TestAllocatorSwap, targets: Targets, to: TestAllocatorSwap) void {
+        self.* = get(targets);
+        set(targets, to);
+    }
+
+    fn restore(self: *const TestAllocatorSwap, targets: Targets) void {
+        set(targets, self.*);
+    }
+
+    fn get(t: Targets) TestAllocatorSwap {
+        return .{
+            .frame = t.frame.allocator,
+            .events = t.frame.events.stream.allocator,
+            .navigation_intents = t.frame.navigation_intents.allocator,
+            .action_intents = t.frame.action_intents.allocator,
+            .intents = t.frame.intents.allocator,
+            .path_requests = t.frame.path_requests.allocator,
+            .contacts = t.frame.contacts.allocator,
+            .collision_triggers = t.frame.collision_triggers.allocator,
+            .structural_commands = t.frame.structural_commands.allocator,
+            .stimuli = t.frame.stimuli.allocator,
+            .data = t.data.allocator,
+            .world = t.world.allocator,
+            .collision = t.pipeline.collision.allocator,
+            .collision_response = t.pipeline.collision_response.allocator,
+            .ai = t.pipeline.ai.allocator,
+            .steering = t.pipeline.steering.allocator,
+            .pathfinding = t.pipeline.pathfinding.allocator,
+            .graph = t.pipeline.pathfinding.graph.allocator,
+            .static_colliders = t.pipeline.static_colliders.allocator,
+            .collider_chunk_lists = t.pipeline.static_colliders.chunk_lists.allocator,
+            .collider_query_lists = t.pipeline.static_colliders.query_lists.allocator,
+            .scope = t.pipeline.scope.allocator,
+            .spatial_index = t.pipeline.spatial_index.allocator,
+            .perception = t.pipeline.perception.allocator,
+            .ai_memory = t.pipeline.ai_memory.allocator,
+            .affect = t.pipeline.affect.allocator,
+            .dig = t.pipeline.dig.scratch_allocator,
+            .plane_entry = t.pipeline.plane_entry.allocator,
+            .threads = t.threads.allocator,
+        };
+    }
+
+    fn set(t: Targets, to: TestAllocatorSwap) void {
+        t.frame.allocator = to.frame;
+        t.frame.events.stream.allocator = to.events;
+        t.frame.navigation_intents.allocator = to.navigation_intents;
+        t.frame.action_intents.allocator = to.action_intents;
+        t.frame.intents.allocator = to.intents;
+        t.frame.path_requests.allocator = to.path_requests;
+        t.frame.contacts.allocator = to.contacts;
+        t.frame.collision_triggers.allocator = to.collision_triggers;
+        t.frame.structural_commands.allocator = to.structural_commands;
+        t.frame.stimuli.allocator = to.stimuli;
+        t.data.allocator = to.data;
+        t.world.allocator = to.world;
+        t.pipeline.collision.allocator = to.collision;
+        t.pipeline.collision_response.allocator = to.collision_response;
+        t.pipeline.ai.allocator = to.ai;
+        t.pipeline.steering.allocator = to.steering;
+        t.pipeline.pathfinding.allocator = to.pathfinding;
+        t.pipeline.pathfinding.graph.allocator = to.graph;
+        t.pipeline.static_colliders.allocator = to.static_colliders;
+        t.pipeline.static_colliders.chunk_lists.allocator = to.collider_chunk_lists;
+        t.pipeline.static_colliders.query_lists.allocator = to.collider_query_lists;
+        t.pipeline.scope.allocator = to.scope;
+        t.pipeline.spatial_index.allocator = to.spatial_index;
+        t.pipeline.perception.allocator = to.perception;
+        t.pipeline.ai_memory.allocator = to.ai_memory;
+        t.pipeline.affect.allocator = to.affect;
+        // Dig scratch stays unset (null) until the plane scratch is reserved.
+        if (t.pipeline.dig.scratch_allocator != null) t.pipeline.dig.scratch_allocator = to.dig;
+        t.pipeline.plane_entry.allocator = to.plane_entry;
+        t.threads.allocator = to.threads;
+    }
+};
+
+const contactsNaming = @import("systems/collision_response_test_support.zig").contactsNaming;
+
+/// Pins every pipeline batch tuner to one settled threaded `profile` that never
+/// re-probes, demotes, or resets on item-count drift, so the multi-worker path runs a
+/// deterministic multi-range partition. The tuners would otherwise keep this small
+/// test workload inline (below `threaded_batch_ns`). The tuners are found by walking the
+/// pipeline's fields at comptime, so a tuner a system adds is pinned with it.
+/// Test-only local fixture.
+fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveWorkProfile) void {
+    pinTunersIn(SimulationPipeline, pipeline, profile);
+}
+
+// Pins every `AdaptiveWorkTuner` `value` holds by value: itself, or in a struct field, an
+// array element, or a set optional, at any depth. A single pointer is not owned, so it is
+// not walked. Test-only local fixture.
+fn pinTunersIn(comptime T: type, value: *T, profile: AdaptiveWorkProfile) void {
+    if (T == AdaptiveWorkTuner) return pinThreadedProfile(value, profile);
+    switch (@typeInfo(T)) {
+        .@"struct" => |info| inline for (info.field_names, info.field_types) |name, Field| {
+            if (comptime holdsTuner(Field)) pinTunersIn(Field, &@field(value, name), profile);
+        },
+        .array => |info| for (value) |*element| pinTunersIn(info.child, element, profile),
+        .optional => |info| if (value.*) |*payload| pinTunersIn(info.child, payload, profile),
+        else => {},
+    }
+}
+
+// Whether a `T` holds an `AdaptiveWorkTuner` where `pinTunersIn` walks. A tuner the walk
+// cannot reach fails the build: in a union (which variant is live), behind a slice or
+// many-item pointer (owned heap rows), or in an error-union payload.
+fn holdsTuner(comptime T: type) bool {
+    @setEvalBranchQuota(100_000);
+    if (T == AdaptiveWorkTuner) return true;
+    return switch (@typeInfo(T)) {
+        .@"struct" => |info| for (info.field_types) |Field| {
+            if (holdsTuner(Field)) break true;
+        } else false,
+        .array => |info| holdsTuner(info.child),
+        .optional => |info| holdsTuner(info.child),
+        .@"union" => |info| for (info.field_types) |Field| {
+            if (holdsTuner(Field)) @compileError("pinTunersIn cannot walk a tuner in union " ++ @typeName(T));
+        } else false,
+        .pointer => |info| switch (info.size) {
+            .one => false,
+            .slice, .many, .c => if (holdsTuner(info.child)) @compileError("pinTunersIn cannot walk a tuner behind " ++ @typeName(T)) else false,
+        },
+        .error_union => |info| if (holdsTuner(info.payload)) @compileError("pinTunersIn cannot walk a tuner in error union " ++ @typeName(T)) else false,
+        else => false,
+    };
+}
+
+/// Pins one tuner as `pinPipelineThreadedProfiles` does. Test-only local fixture.
+fn pinThreadedProfile(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void {
+    tuner.config.threaded_batch_ns = 0;
+    tuner.config.retune_after_settled_windows = std.math.maxInt(usize);
+    tuner.config.item_count_reset_percent = std.math.maxInt(u8);
+    tuner.phase = .settled;
+    tuner.has_threaded_profile = true;
+    tuner.current_profile = profile;
+    tuner.best_profile = profile;
+    tuner.candidate_profile = null;
+    // Forget the pre-pin item count so the first pinned batch does not reset.
+    tuner.learned_item_count = 0;
+}
+
+/// One non-failing counting allocator per `TestAllocatorSwap` owner, to see which
+/// owners allocate during a step. Counts fresh allocations plus in-place
+/// resizes/remaps (a grown list can remap without a fresh allocation). Test-only
+/// local fixture.
+const TestAllocatorCounters = struct {
+    counters: [TestAllocatorSwap.owner_count]std.testing.FailingAllocator,
+
+    fn init() TestAllocatorCounters {
+        var self: TestAllocatorCounters = undefined;
+        for (&self.counters) |*counter| counter.* = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        return self;
+    }
+
+    fn allocators(self: *TestAllocatorCounters) TestAllocatorSwap {
+        var out: TestAllocatorSwap = .{};
+        inline for (TestAllocatorSwap.owner_names, 0..) |name, index| @field(out, name) = self.counters[index].allocator();
+        return out;
+    }
+
+    fn countAt(self: *const TestAllocatorCounters, index: usize) usize {
+        return self.counters[index].allocations + self.counters[index].resize_index;
+    }
+
+    /// Fails naming the first owner outside `allowed` that allocated.
+    fn expectOnlyOwnersAllocated(self: *const TestAllocatorCounters, comptime allowed: []const []const u8) !void {
+        inline for (TestAllocatorSwap.owner_names, 0..) |name, index| {
+            const is_allowed = comptime blk: {
+                for (allowed) |owner| {
+                    if (std.mem.eql(u8, owner, name)) break :blk true;
+                }
+                break :blk false;
+            };
+            if (!is_allowed and self.countAt(index) != 0) {
+                std.debug.print("unexpected allocations on owner '{s}': {d}\n", .{ name, self.countAt(index) });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+};
+
+/// Test-only `sim_view` covering the whole world extent: every chunk of the
+/// player's level is in view, so nothing on that level leaves the cognition halo
+/// or demotes. A chunkless world yields no region (the full-active fallback).
+fn fullWorldSimView(world: *const WorldSystem) Rect {
+    return .{ .x = 0, .y = 0, .w = world.worldWidthPixels(), .h = world.worldHeightPixels() };
+}
+
+/// Test-only: opts every movement body out of cognition stagger. A full-world
+/// `sim_view` on a chunked world applies stagger (each agent thinks one step in
+/// `cognition_stagger_n`); tests whose subject is the whole population thinking in
+/// one step (a worst-case event share, a stage-order read) mark it always-active.
+fn markAllAlwaysActive(data: *DataSystem) !void {
+    for (data.movementBodySliceConst().entities) |entity| {
+        var metadata = data.simulationMetadata(entity).?;
+        metadata.always_active = true;
+        try data.setSimulationMetadata(entity, metadata);
+    }
+}
+
+/// Mirrors `GameDemoState.applyStructuralCommandsAndPostCommitEvents`: the collider and
+/// static mark reserve, the commit with the nav-reaction slot reserved, the collider
+/// capture, the population seam, the collider sync and its nav record, then the post-commit
+/// reactions (nav apply only after a successful population seam and collider sync; steering
+/// always), returning the first error.
+fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {
+    const extra_event_count: usize = if (pipeline.navReactionMayEmit(data, frame, world)) maxEventsPerStep(.nav_reaction, .{}) else 0;
+    try pipeline.reserveStaticColliders(frame, data);
+    _ = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
+    pipeline.captureStaticColliderChanges(frame);
+    const sync = pipeline.syncPopulationCapacity(frame, data);
+    const colliders = pipeline.syncStaticColliders(data, null);
+    const nav_update = if (sync) |_| (if (colliders) |_| pipeline.reactToPostCommitNavEvents(frame, world, null) else |err| err) else |err| err;
+    pipeline.reactToPostCommitSteeringEvents(frame);
+    const sync_stats = try sync;
+    try colliders;
+    _ = try nav_update;
+    return sync_stats;
+}
+
+fn writeStructuralCommands(frame: *SimulationFrame, commands: []const StructuralCommand) !void {
+    try frame.structural_commands.prepareRangeCounts(1);
+    frame.structural_commands.addCount(0, commands.len);
+    try frame.structural_commands.prefix();
+    var writer = frame.structural_commands.rangeWriter(0);
+    for (commands) |command| writer.write(command);
+    writer.finish();
+    frame.structural_commands.finishWrite();
+}
+
+fn cellBody(cell: [2]u16) MovementBody {
+    const position = math.Vec2{ .x = @as(f32, @floatFromInt(cell[0])) * 32, .y = @as(f32, @floatFromInt(cell[1])) * 32 };
+    return .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 };
+}
+
+const growth_npc_visual: PrimitiveVisual = .{
+    .size = .{ .x = 32, .y = 32 },
+    .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+};
+
+fn growthNpcTemplate(cell: [2]u16) StructuralCommand {
+    return .{ .create_entity = .{
+        .movement_body = cellBody(cell),
+        .primitive_visual = growth_npc_visual,
+        .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
+        .collision_response = .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
+        .ai_agent = .{ .active_behavior = .wander, .gain_pursue = 0 },
+        .world_level = 0,
+    } };
+}
+
+fn growthSteeringTemplate(cell: [2]u16) StructuralCommand {
+    return .{ .create_entity = .{
+        .movement_body = cellBody(cell),
+        .steering_agent = .{
+            .agent_radius = 8,
+            .waypoint_tolerance = 4,
+            .avoidance_radius = 48,
+            .avoidance_weight = 1.5,
+            .max_neighbor_samples = 8,
+            .stuck_step_threshold = 3,
+            .replan_cooldown_steps = 4,
+            .unavailable_backoff_steps = 12,
+        },
+        .world_level = 0,
+    } };
+}
+
+const GrowthScenarioResult = struct {
+    positions: [24][2]f32 = undefined,
+    world_tile_changed: usize = 0,
+};
+
+/// Builds a minimal 3-level world at population 4, grows it to 37 rows through
+/// structural creates and the population seam, runs one stationary step, then one
+/// step where all 24 NPCs fall through dug holes. The 3 initial NPCs and the first 2
+/// created ones carry `AiPerception` + `AiAffect`, so the perception and affect
+/// stages run (and their derived event shares grow at the seam) on every step. `max_worker_threads > 0` pins a
+/// multi-range partition (2 workers, 16-item ranges; 32-item ranges when `retune` is
+/// set). With `prove_zero_alloc`, the first step counts allocations per owner (none,
+/// serial or multi-worker: the seam reserved every partition) and the falling step
+/// runs with every allocator, the world's included, failing. A non-null `retune`
+/// re-pins that partition after the first step and runs one more stationary step
+/// under the failing allocators: a partition change never allocates in-stage.
+fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool, retune: ?AdaptiveWorkProfile) !GrowthScenarioResult {
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try testMinimalMultiLevelWorld(&meta);
+    defer world.deinit();
+    // 24 holes on the surface: rows 0..5 at x in {1, 3, 5, 7}. Each NPC starts on the
+    // hole's west neighbor (x in {0, 2, 4, 6}).
+    const floor0 = world.denseFloorLayerForLevel(0).?;
+    var start_cells: [24][2]u16 = undefined;
+    for (0..6) |row| {
+        for (0..4) |column| {
+            const hole_x: u16 = @intCast(column * 2 + 1);
+            _ = try world.clearDenseTile(floor0, hole_x, @intCast(row));
+            start_cells[row * 4 + column] = .{ hole_x - 1, @intCast(row) };
+        }
+    }
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 0;
+    placePlayerFlush(&data, player, .{ 1, 7 });
+    for (start_cells[0..3]) |cell| {
+        const npc = try data.createEntity();
+        try data.setMovementBody(npc, cellBody(cell));
+        try data.setPrimitiveVisual(npc, growth_npc_visual);
+        try data.setCollisionBounds(npc, .{ .size = .{ .x = 16, .y = 16 } });
+        try data.setCollisionResponse(npc, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+        try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
+        try data.setAiPerception(npc, .{});
+        try data.setAiAffect(npc, .{});
+        try data.setWorldLevel(npc, 0);
+    }
+
+    const dig_config = try DigConfig.fromMeta(&meta);
+    try warmLandingTerrain(&world, dig_config.tunnel_tile, 1, start_cells[0]);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = max_worker_threads });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 256, 256, .{
+        .contact_capacity = 4,
+        .dig = dig_config,
+        .movement_body_capacity = 4,
+        .structural_headroom = 200,
+        .navigation_world = &world,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = 1 },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + 200);
+    try frame.reservePathRequests(1, 4);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 4);
+    try std.testing.expectEqual(@as(usize, 4), pipeline.movement_body_capacity);
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 256,
+        .bounds_height = 256,
+        .sim_view = fullWorldSimView(&world),
+    };
+    // Warm step at the initial population.
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+
+    // Growth: 19 NPCs (7 commit events each) + 2 NPCs that also carry AiPerception and
+    // AiAffect (9 each) + 12 steering-only agents parked on rows 6-7 (4 events each) =
+    // 133 + 18 + 48 = 199 events within the caller's 200-event `structural_headroom`
+    // (the pipeline's own action-react share sits on top of it).
+    var commands: [33]StructuralCommand = undefined;
+    for (start_cells[3..], 0..) |cell, index| commands[index] = growthNpcTemplate(cell);
+    for (commands[0..2]) |*command| {
+        command.create_entity.ai_perception = .{};
+        command.create_entity.ai_affect = .{};
+    }
+    for (0..12) |index| {
+        const cell = [2]u16{ @intCast(index % 8), @intCast(6 + index / 8) };
+        commands[21 + index] = growthSteeringTemplate(cell);
+    }
+    const init_perception_share = pipeline.perception_max_events_per_step;
+    const init_affect_share = pipeline.affect_max_events_per_step;
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &commands);
+    const sync = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    try std.testing.expect(sync.grew);
+    // 3 -> 5 perception/affect rows: the seam's share-growth arm ran too.
+    try std.testing.expectEqual(@as(usize, 5), data.ai_perceptions.len());
+    try std.testing.expectEqual(@as(usize, 5), data.ai_affects.len());
+    try std.testing.expect(pipeline.perception_max_events_per_step > init_perception_share);
+    try std.testing.expect(pipeline.affect_max_events_per_step > init_affect_share);
+
+    // Every tracked capacity followed the committed rows.
+    try std.testing.expectEqual(@as(usize, 37), data.populationRowCounts().population());
+    try std.testing.expectEqual(grownPopulationCapacity(37), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 80), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
+    try std.testing.expect(maxEventsPerStep(.plane_traversal, pipeline.eventBudgets()) >= 25);
+    try std.testing.expect(pipeline.pathfinding.effective_agent_capacity >= 12);
+    try std.testing.expect(pipeline.population_capacity_grows >= 1);
+
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    // Multi-worker runs pin a 2-worker, 16-item partition (3 movement ranges at 37
+    // bodies), or 32-item (2 ranges) ahead of a retune; the tuners would keep this
+    // small workload inline. (A 64-item range is inline at 37 bodies, so the retune
+    // that adds ranges is 32 -> 16.)
+    const first_items_per_range: usize = if (retune != null) 32 else 16;
+    if (max_worker_threads > 0) pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = first_items_per_range });
+
+    // First post-growth step, stationary. Every run takes it, so serial and
+    // multi-worker runs stay step-for-step identical.
+    frame.beginStep();
+    var counters = TestAllocatorCounters.init();
+    var counting_swap: TestAllocatorSwap = .{};
+    if (prove_zero_alloc) counting_swap.install(targets, counters.allocators());
+    const first_result = pipeline.update(context);
+    if (prove_zero_alloc) counting_swap.restore(targets);
+    const first_stats = try first_result;
+    // The zero-allocation proof covers perception and affect only if they ran: the
+    // 5 observers' stagger phases cover all four, so every step thinks at least one.
+    try std.testing.expect(first_stats.perception.observer_count >= 1);
+    try std.testing.expect(first_stats.affect.processed_count >= 1);
+    if (max_worker_threads > 0) {
+        try std.testing.expect(!first_stats.movement.batch.ran_inline);
+        try std.testing.expectEqual(rangeCount(37, first_items_per_range), first_stats.movement.batch.range_count);
+    }
+    // The seam reserved every capacity for every partition (per-range
+    // outputs are item-count windows, tallies and broadphase slots are reserved to
+    // `maxRangeCount`), so the first post-growth step allocates nothing on any owner.
+    if (prove_zero_alloc) try counters.expectOnlyOwnersAllocated(&.{});
+
+    if (retune) |profile| {
+        // A partition retune to more ranges, with every allocator failing.
+        pinPipelineThreadedProfiles(&pipeline, profile);
+        frame.beginStep();
+        var retune_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        var retune_swap: TestAllocatorSwap = .{};
+        if (prove_zero_alloc) retune_swap.install(targets, .uniform(retune_failing.allocator()));
+        const retune_result = pipeline.update(context);
+        if (prove_zero_alloc) retune_swap.restore(targets);
+        const retune_stats = try retune_result;
+        try std.testing.expectEqual(rangeCount(37, profile.items_per_range), retune_stats.movement.batch.range_count);
+        try std.testing.expect(retune_stats.perception.observer_count >= 1);
+        try std.testing.expect(retune_stats.affect.processed_count >= 1);
+        try std.testing.expectEqual(@as(usize, 0), retune_failing.allocations);
+    }
+
+    // All 24 NPCs step east into their hole this step.
+    const ai_entities = data.aiAgentSliceConst().entities;
+    try std.testing.expectEqual(@as(usize, 24), ai_entities.len);
+    for (ai_entities) |npc| {
+        try data.setSimulationTier(npc, .locomotion);
+        const body = data.movementBodyPtr(npc).?;
+        body.velocity_x.* = 2000;
+        body.velocity_y.* = 0;
+    }
+
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    if (prove_zero_alloc) swap.install(targets, .uniform(failing.allocator()));
+    const result = pipeline.update(context);
+    if (prove_zero_alloc) swap.restore(targets);
+    const fall_stats = try result;
+    if (max_worker_threads > 0) {
+        // The 24 AI rows' cell-entry gather ran on the pinned partition.
+        try std.testing.expect(!fall_stats.plane_entry.ran_inline);
+        try std.testing.expectEqual(rangeCount(24, 16), fall_stats.plane_entry.range_count);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fall_stats.plane_entry_windows_grown);
+
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
+    try std.testing.expectEqual(@as(usize, 24), frame.events.stats.world_tile_changed);
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    var out: GrowthScenarioResult = .{ .world_tile_changed = frame.events.stats.world_tile_changed };
+    for (ai_entities, 0..) |npc, index| {
+        try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
+        const position = data.movementBodyConst(npc).?.position;
+        const cell = world.cellContaining(position.x + 16, position.y + 16).?;
+        try std.testing.expect(!denseTileBlocksMovement(&world, floor1, cell.x, cell.y));
+        out.positions[index] = .{ position.x, position.y };
+    }
+    try std.testing.expectEqual(@as(u64, 0), pipeline.dig.plane_scratch_grown);
+    try std.testing.expectEqual(@as(u64, 0), pipeline.plane_entry.windows_grown);
+    return out;
+}
+
+test "population seam grows every pipeline capacity so the next step allocates nothing" {
+    _ = try runPopulationGrowthScenario(0, true, null);
+}
+
+test "population growth on the multi-worker path allocates nothing on the first step after growth" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    _ = try runPopulationGrowthScenario(2, true, null);
+}
+
+test "a partition retune after population growth allocates nothing" {
+    // 2 workers at 32-item ranges, then re-pinned to 16-item ranges (2 -> 3 ranges at
+    // 37 bodies): no per-range output warms in-stage on the new partition.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    _ = try runPopulationGrowthScenario(2, true, .{ .worker_threads = 2, .items_per_range = 16 });
+}
+
+test "population growth scenario is identical on the serial and multi-worker paths" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const serial = try runPopulationGrowthScenario(0, false, null);
+    const threaded = try runPopulationGrowthScenario(2, false, null);
+    try std.testing.expectEqual(serial.world_tile_changed, threaded.world_tile_changed);
+    for (serial.positions, threaded.positions) |a, b| {
+        try std.testing.expectEqual(a[0], b[0]);
+        try std.testing.expectEqual(a[1], b[1]);
+    }
+}
+
+// The pathing crowd: more agents than one 16-item range, each investigating its own
+// marker on a distinct blocked cell, so the goal scan and projection, path intake, and
+// registry flush each span several ranges on a 16-item partition.
+const pathing_crowd_count: usize = 22;
+// Cells between crowd columns: each agent's nearest marker is its own, before and after
+// the markers shift one cell east.
+const pathing_crowd_column_cells: u16 = 4;
+// The crowd's row; the markers sit on the blocked row 0 above it.
+const pathing_crowd_row: u16 = 4;
+
+fn pathingCrowdCellX(column: usize) u16 {
+    // The crowd's columns fit a test world's u16 width.
+    return @intCast(1 + column * pathing_crowd_column_cells);
+}
+
+fn pathingCrowdTemplate(column: usize) StructuralCommand {
+    const position = math.Vec2{ .x = @as(f32, @floatFromInt(pathingCrowdCellX(column))) * 32, .y = @as(f32, @floatFromInt(pathing_crowd_row)) * 32 };
+    return .{
+        .create_entity = .{
+            .movement_body = .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 32 },
+            .ai_agent = .{ .active_behavior = .investigate, .gain_wander = 0, .gain_investigate = 1, .wander_amplitude = 0 },
+            // No replan cooldown: a moved goal is requested the step it moves.
+            .steering_agent = .{
+                .agent_radius = 8,
+                .waypoint_tolerance = 4,
+                .avoidance_radius = 48,
+                .avoidance_weight = 1.5,
+                .max_neighbor_samples = 8,
+                .stuck_step_threshold = 3,
+                .replan_cooldown_steps = 0,
+                .unavailable_backoff_steps = 12,
+            },
+            .world_level = 0,
+        },
+    };
+}
+
+// Places one investigate marker on row 0 of each crowd column, `shift` cells east.
+fn placePathingCrowdMarkers(world: *WorldSystem, ids: []InterestMarkerId, shift: u16) !void {
+    for (ids, 0..) |*id, column| {
+        id.* = try world.addInterestMarker(.{
+            .kind = .investigate,
+            .level = 0,
+            .x = @as(f32, @floatFromInt(pathingCrowdCellX(column) + shift)) * 32 + 16,
+            .y = 16,
+            .radius = 16,
+        });
+    }
+}
+
+/// Grows a 2-body population (the player and a static wall over row 0) by the pathing
+/// crowd through structural creates and the population seam, pins every pipeline tuner to
+/// a 2-worker partition of `first_items_per_range` items, and runs the first post-growth
+/// step under per-owner counting allocators: only pathfinding allocates, its path registry
+/// growing at its counted publish seam for the step's new path content, while its agent
+/// capacity and its goal-table, nav-mark, eviction and group-field pool growth counts
+/// hold. Then it shifts every marker, so each agent
+/// asks for a new goal, re-pins the tuners to `second`, and runs one more step with every
+/// allocator failing: nothing allocates, and the goal scan and projection, path intake,
+/// and registry flush run threaded.
+fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: AdaptiveWorkProfile) !void {
+    const width_cells = pathingCrowdCellX(pathing_crowd_count);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = width_cells,
+        .height = pathing_crowd_row + 2,
+        .tile_size = 32,
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    var markers: [pathing_crowd_count]InterestMarkerId = undefined;
+    try placePathingCrowdMarkers(&world, &markers, 0);
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    placePlayerFlush(&data, player, .{ 0, pathing_crowd_row + 1 });
+    try addStaticBox(&data, .{ .x = 0, .y = 0 }, .{ .x = @as(f32, @floatFromInt(width_cells)) * 32, .y = 32 });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    const headroom: usize = 16 * pathing_crowd_count;
+    const bounds_width = world.worldWidthPixels();
+    const bounds_height = world.worldHeightPixels();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, bounds_width, bounds_height, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = headroom,
+        .navigation_world = &world,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + headroom);
+    try frame.reservePathRequests(pipeline.steeringStreamRangeCount(), 4);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 4);
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = bounds_width,
+        .bounds_height = bounds_height,
+        .sim_view = fullWorldSimView(&world),
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+
+    var commands: [pathing_crowd_count]StructuralCommand = undefined;
+    for (&commands, 0..) |*command, column| command.* = pathingCrowdTemplate(column);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &commands);
+    const sync = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    try std.testing.expect(sync.grew);
+    try markAllAlwaysActive(&data);
+
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = first_items_per_range });
+    // Population-sized pathfinding storage the seam grew: the agent capacity and every
+    // counted growth but the registry's path content.
+    const PathfindingSeamState = struct { agent_capacity: usize, goal_table: u64, nav_mark: u64, evict: u64, group_field_pool: u64 };
+    const seam_state = struct {
+        fn of(pathfinding: *const PathfindingSystem) PathfindingSeamState {
+            return .{
+                .agent_capacity = pathfinding.effective_agent_capacity,
+                .goal_table = pathfinding.goal_table_growth.count,
+                .nav_mark = pathfinding.nav_mark_growth.count,
+                .evict = pathfinding.evict_growth.count,
+                .group_field_pool = pathfinding.group_field_pool_growth.count,
+            };
+        }
+    }.of;
+    const seam_before = seam_state(&pipeline.pathfinding);
+    const registry_growths = pipeline.pathfinding.registry_growth.count;
+    frame.beginStep();
+    var counters = TestAllocatorCounters.init();
+    var counting_swap: TestAllocatorSwap = .{};
+    counting_swap.install(targets, counters.allocators());
+    const first_result = pipeline.update(context);
+    counting_swap.restore(targets);
+    const first_stats = try first_result;
+    try std.testing.expectEqual(pathing_crowd_count, first_stats.steering.path_request_count);
+    // On a 16-item partition the projection is threaded on this step too.
+    try std.testing.expectEqual(rangeCount(pathing_crowd_count, first_items_per_range), first_stats.path_goals.project_batch.range_count);
+    try counters.expectOnlyOwnersAllocated(&.{"pathfinding"});
+    try std.testing.expectEqual(seam_before, seam_state(&pipeline.pathfinding));
+    try std.testing.expect(pipeline.pathfinding.registry_growth.count > registry_growths);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+
+    for (markers) |id| try std.testing.expect(world.interest_markers.removeMarker(id));
+    try placePathingCrowdMarkers(&world, &markers, 1);
+    pinPipelineThreadedProfiles(&pipeline, second);
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var failing_swap: TestAllocatorSwap = .{};
+    failing_swap.install(targets, .uniform(failing.allocator()));
+    const second_result = pipeline.update(context);
+    failing_swap.restore(targets);
+    const second_stats = try second_result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(pathing_crowd_count, second_stats.path_goals.distinct);
+    try std.testing.expectEqual(pathing_crowd_count, second_stats.steering.path_request_count);
+    for ([_]BatchStats{ second_stats.path_goals.scan_batch, second_stats.path_goals.project_batch, second_stats.pathfinding.intake_batch, second_stats.pathfinding.registry_flush_batch }) |batch| {
+        try std.testing.expect(!batch.ran_inline);
+        try std.testing.expect(batch.range_count > 1);
+    }
+}
+
+test "a pathing crowd grown at the population seam keeps its first step's growth to the counted path registry, then runs goal resolve, path intake and registry flush threaded allocating nothing" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    try runPathingCrowdGrowthScenario(16, .{ .worker_threads = 2, .items_per_range = 16 });
+}
+
+test "a partition retune after a pathing crowd grows runs goal resolve, path intake and registry flush threaded allocating nothing" {
+    // 22 items: one 32-item range, then two 16-item ranges.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    try runPathingCrowdGrowthScenario(32, .{ .worker_threads = 2, .items_per_range = 16 });
+}
+
+// A pursuer of the sealed player (`addSealedGoalBoxes`) for the range-binding scenario:
+// AI and steering run every step, and the goal stays unavailable, so no path is solved.
+fn sealedPursuerTemplate(index: usize) StructuralCommand {
+    // Rows 12-14 of a 25-cell-wide world, outside the sealing ring.
+    const position = math.Vec2{ .x = @floatFromInt(32 * (index % 25)), .y = @floatFromInt(32 * (12 + index / 25)) };
+    return .{ .create_entity = .{
+        .movement_body = .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 32 },
+        .ai_agent = .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 },
+        .steering_agent = .{
+            .agent_radius = 8,
+            .waypoint_tolerance = 4,
+            .avoidance_radius = 48,
+            .avoidance_weight = 1.5,
+            .max_neighbor_samples = 8,
+            .stuck_step_threshold = 3,
+            .replan_cooldown_steps = 4,
+            .unavailable_backoff_steps = 12,
+        },
+        .world_level = 0,
+    } };
+}
+
+// The player's goal cell (12, 7) under a 3x3 block, inside a wall ring at cells x 9..15,
+// y 4..10 that seals the open cells holding its projection.
+fn addSealedGoalBoxes(data: *DataSystem) !void {
+    try addStaticBox(data, .{ .x = 352, .y = 192 }, .{ .x = 96, .y = 96 });
+    try addStaticBox(data, .{ .x = 288, .y = 128 }, .{ .x = 224, .y = 32 });
+    try addStaticBox(data, .{ .x = 288, .y = 320 }, .{ .x = 224, .y = 32 });
+    try addStaticBox(data, .{ .x = 288, .y = 160 }, .{ .x = 32, .y = 160 });
+    try addStaticBox(data, .{ .x = 480, .y = 160 }, .{ .x = 32, .y = 160 });
+}
+
+test "after population growth the seam's stream range counts are the binding reserve and every producer fills them without allocating" {
+    // The frame reserves one range per stream at init, so only the population seam sizes
+    // the ranges. Seven bodies (player, five walls, a crate) grow by 25 pursuers to 32
+    // rows (capacity 64), then 32 more fill the capacity without another growth, so on a
+    // 16-item partition every producer appends its bound's ranges.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 25,
+        .height = 15,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    placePlayerFlush(&data, player, .{ 12, 7 });
+    try addSealedGoalBoxes(&data);
+    const crate = try data.createEntity();
+    try data.setMovementBody(crate, .{ .position = .{ .x = 0, .y = 0 } });
+    try data.setDestructible(crate, .{ .hit_points = 1 });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    const headroom: usize = 256;
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .movement_body_capacity = 8,
+        .structural_headroom = headroom,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(1, 0, 8, 8, 8, 8 + pipeline.structuralCommandHeadroom());
+    try frame.reservePathRequests(1, 8);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 8);
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+
+    var commands: [32]StructuralCommand = undefined;
+    for (commands[0..25], 0..) |*command, index| command.* = sealedPursuerTemplate(index);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, commands[0..25]);
+    try std.testing.expect((try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    try std.testing.expectEqual(@as(usize, 64), pipeline.movement_body_capacity);
+    for (&commands, 25..) |*command, index| command.* = sealedPursuerTemplate(index);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &commands);
+    try std.testing.expect(!(try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    try std.testing.expectEqual(@as(usize, 64), data.movementBodySliceConst().entities.len);
+    try markAllAlwaysActive(&data);
+    // The crate alone is tier-policed, and its tier is wrong: the policy changes it, so
+    // the tier stage appends every range.
+    var crate_metadata = data.simulationMetadata(crate).?;
+    crate_metadata.always_active = false;
+    crate_metadata.tier = .dormant;
+    try data.setSimulationMetadata(crate, crate_metadata);
+    pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(targets, .uniform(failing.allocator()));
+    // The caller queues its whole headroom as single-command ranges, and the player hits
+    // the crate.
+    const caller_result = blk: {
+        for (0..headroom) |_| {
+            const range = frame.structural_commands.appendRangeCounts(1) catch |err| break :blk err;
+            frame.structural_commands.addCount(range, 1);
+            frame.structural_commands.prefixAppendedRanges(range) catch |err| break :blk err;
+            var writer = frame.structural_commands.rangeWriter(range);
+            writer.write(.{ .set_simulation_tier = .{ .entity = player.entity, .tier = .cognition } });
+            writer.finish();
+            frame.structural_commands.finishWrite();
+        }
+        frame.appendActionIntent(.{ .entity = player.entity, .kind = .interact, .target = crate }) catch |err| break :blk err;
+        break :blk {};
+    };
+    const result = if (caller_result) |_| pipeline.update(context) else |err| err;
+    swap.restore(targets);
+    const stats = try result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 1), stats.destructibles_destroyed);
+    // Each stream's writers appended exactly its seam bound.
+    try std.testing.expectEqual(pipeline.navigationIntentRangeCount(), frame.navigation_intents.counts.items.len);
+    try std.testing.expectEqual(pipeline.steeringStreamRangeCount(), frame.intents.counts.items.len);
+    try std.testing.expectEqual(pipeline.steeringStreamRangeCount(), frame.path_requests.counts.items.len);
+    try std.testing.expectEqual(pipeline.structuralCommandRangeCount(), frame.structural_commands.counts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), stats.steering.path_request_count);
+}
+
+const apply_intents_agent_count: usize = 20;
+
+const ApplyIntentsScenarioResult = struct {
+    // The player's row plus one per agent.
+    velocity_x: [apply_intents_agent_count + 1]f32 = undefined,
+    velocity_y: [apply_intents_agent_count + 1]f32 = undefined,
+};
+
+/// `apply_intents_agent_count` wandering agents, each with a movement body, an AI agent,
+/// and a steering agent, so steering emits one movement intent each step. A chunkless
+/// world keeps every agent thinking every step. `max_worker_threads > 0` pins a
+/// 2-worker, 16-item partition (2 apply ranges). A warm step, then a step with every
+/// allocator failing; returns that step's velocities.
+fn runApplyIntentsScenario(max_worker_threads: usize) !ApplyIntentsScenarioResult {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    for (0..apply_intents_agent_count) |index| {
+        const position = math.Vec2{
+            .x = 40 + @as(f32, @floatFromInt(index % 5)) * 140,
+            .y = 40 + @as(f32, @floatFromInt(index / 5)) * 90,
+        };
+        const agent = try data.createEntity();
+        // Every 4th agent has no speed, so the apply's default speed runs too.
+        const speed: f32 = if (index % 4 == 0) 0 else 10 + @as(f32, @floatFromInt(index));
+        try data.setMovementBody(agent, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = speed });
+        try data.setAiAgent(agent, .{ .active_behavior = .wander, .wander_amplitude = 30, .gain_pursue = 0 });
+        try data.setSteeringAgent(agent, growthSteeringTemplate(.{ 0, 0 }).create_entity.steering_agent.?);
+    }
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = max_worker_threads });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = apply_intents_agent_count + 1,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, apply_intents_agent_count, 4, 4, 4);
+    try frame.reservePathRequests(1, apply_intents_agent_count);
+    try pipeline.reserve(&frame, 4);
+    if (max_worker_threads > 0) pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(targets, .uniform(failing.allocator()));
+    const result = pipeline.update(context);
+    swap.restore(targets);
+    const stats = try result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    try std.testing.expectEqual(apply_intents_agent_count, stats.steering.movement_intent_count);
+    try std.testing.expectEqual(stats.steering.movement_intent_count, stats.apply_intents.intent_count);
+    if (max_worker_threads > 0) {
+        try std.testing.expect(!stats.apply_intents.batch.ran_inline);
+        try std.testing.expectEqual(rangeCount(apply_intents_agent_count, 16), stats.apply_intents.batch.range_count);
+    }
+
+    const slice = data.movementBodySliceConst();
+    try std.testing.expectEqual(apply_intents_agent_count + 1, slice.entities.len);
+    var out: ApplyIntentsScenarioResult = .{};
+    @memcpy(&out.velocity_x, slice.velocity_x);
+    @memcpy(&out.velocity_y, slice.velocity_y);
+    return out;
+}
+
+test "the AI movement intent apply runs on workers in the pipeline, allocation-free and matching the serial step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const serial = try runApplyIntentsScenario(0);
+    const threaded = try runApplyIntentsScenario(2);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_x), std.mem.sliceAsBytes(&threaded.velocity_x));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_y), std.mem.sliceAsBytes(&threaded.velocity_y));
+}
+
+/// Adds dynamic collision bodies `first..end` of a row-major chain: 21 per row, 10 px
+/// apart, 22 px square, rows 40 px apart. Each body overlaps its next two neighbours in
+/// the row, so a full row of 21 yields 2 * 21 - 3 = 39 contacts.
+fn addContactChainBodies(data: *DataSystem, first: usize, end: usize, mode: CollisionResponseMode) !void {
+    for (first..end) |index| {
+        const column: f32 = @floatFromInt(index % 21);
+        const row: f32 = @floatFromInt(index / 21);
+        const position = math.Vec2{ .x = 20 + column * 10, .y = 20 + row * 40 };
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 22, .y = 22 } });
+        try data.setCollisionResponse(entity, .{ .mode = mode, .mobility = .dynamic, .restitution = 0 });
+    }
+}
+
+/// The contact stream, the trigger stream and the response reserves follow
+/// the collision pair bound (4 per body of capacity) through `reserve` and the seam, so a
+/// population that fills its grown capacity at ~2 contacts per body runs
+/// `collision_detect` and `collision_respond` on a real 2-worker partition with every
+/// allocator failing. `mode` picks the response path: `.solid` emits two intents per
+/// contact, `.trigger` one trigger event per contact.
+fn runContactBoundScenario(mode: CollisionResponseMode) !void {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = 4,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4);
+    try frame.reservePathRequests(1, 4);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 4);
+    var player_state = player;
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player_state,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    };
+    // Warm step at the initial population.
+    frame.beginStep();
+    _ = try pipeline.update(context);
+
+    // 31 bodies + the player grow the tracked capacity to 64; 32 more fill it without
+    // another growth. 3 full rows: 117 contacts over 64 bodies.
+    try addContactChainBodies(&data, 0, 31, mode);
+    try std.testing.expect((try pipeline.syncPopulationCapacity(&frame, &data)).grew);
+    try std.testing.expectEqual(@as(usize, 64), pipeline.movement_body_capacity);
+    try addContactChainBodies(&data, 31, 63, mode);
+    try std.testing.expect(!(try pipeline.syncPopulationCapacity(&frame, &data)).grew);
+    const population = data.populationRowCounts().population();
+    try std.testing.expectEqual(@as(usize, 64), population);
+
+    pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(targets, .uniform(failing.allocator()));
+    const result = pipeline.update(context);
+    swap.restore(targets);
+    const stats = try result;
+
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!stats.collision.broadphase_batch.ran_inline);
+    try std.testing.expect(!stats.collision.narrowphase_batch.ran_inline);
+    try std.testing.expect(!stats.collision_response.gather_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 3 * (2 * 21 - 3)), stats.collision.contact_count);
+    try std.testing.expect(stats.collision.contact_count > population);
+    try std.testing.expectEqual(stats.collision.contact_count, stats.collision_response.contact_count);
+    switch (mode) {
+        .solid, .bounce => try std.testing.expectEqual(2 * stats.collision.contact_count, stats.collision_response.intent_count),
+        .trigger => {
+            try std.testing.expectEqual(stats.collision.contact_count, stats.collision_response.trigger_count);
+            try std.testing.expectEqual(stats.collision.contact_count, frame.collision_triggers.mergedItems().len);
+        },
+    }
+    try std.testing.expect(!stats.collision.pair_bound_exceeded);
+    try std.testing.expectEqual(@as(u64, 0), pipeline.collision.pair_bound_overflows);
+}
+
+test "after population growth, ~2 solid contacts per body on the multi-worker path allocate nothing" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    try runContactBoundScenario(.solid);
+}
+
+test "after population growth, ~2 trigger contacts per body on the multi-worker path allocate nothing" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    try runContactBoundScenario(.trigger);
+}
+
+const respond_scenario_bodies: usize = 63;
+// The bodies plus the player.
+const respond_scenario_rows: usize = respond_scenario_bodies + 1;
+// 3 full chain rows of 21 before any correction.
+const respond_scenario_contacts: usize = 3 * (2 * 21 - 3);
+
+/// `addContactChainBodies` with the response by index (solid or bounce dynamic, a dynamic
+/// trigger, a static solid) and nonzero velocities of mixed sign on the dynamic bodies,
+/// small enough that the chain overlaps hold after one movement step.
+fn addMixedContactChainBodies(data: *DataSystem, first: usize, end: usize) !void {
+    for (first..end) |index| {
+        const column: f32 = @floatFromInt(index % 21);
+        const row: f32 = @floatFromInt(index / 21);
+        const position = math.Vec2{ .x = 20 + column * 10, .y = 20 + row * 40 };
+        const response: @import("data_system.zig").CollisionResponse = switch (index % 8) {
+            3 => .{ .mode = .trigger, .mobility = .dynamic, .restitution = 0 },
+            5 => .{ .mode = .solid, .mobility = .static, .restitution = 0 },
+            1, 6 => .{ .mode = .bounce, .mobility = .dynamic, .restitution = 0.5 },
+            else => .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
+        };
+        const speed_x: f32 = 4 + @as(f32, @floatFromInt(index % 5));
+        const speed_y: f32 = 3 + @as(f32, @floatFromInt(index % 3));
+        const velocity: math.Vec2 = if (response.mobility == .static) .{} else .{
+            .x = if (index % 2 == 0) speed_x else -speed_x,
+            .y = if (index % 3 == 0) -speed_y else speed_y,
+        };
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = position, .previous_position = position, .velocity = velocity, .speed = 0 });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 22, .y = 22 } });
+        try data.setCollisionResponse(entity, response);
+    }
+}
+
+const CollisionRespondScenarioResult = struct {
+    position_x: [respond_scenario_rows]f32 = undefined,
+    position_y: [respond_scenario_rows]f32 = undefined,
+    velocity_x: [respond_scenario_rows]f32 = undefined,
+    velocity_y: [respond_scenario_rows]f32 = undefined,
+    triggers: [respond_scenario_contacts]@import("simulation.zig").CollisionTriggerEvent = undefined,
+    trigger_count: usize = 0,
+    intent_count: usize = 0,
+};
+
+/// The mixed chain over 63 bodies plus the player, with the pipeline reserved for its 64
+/// rows. `max_worker_threads > 0` pins a 2-worker, 16-contact gather (8 ranges) and a
+/// one-band-per-range apply (4 bands). A warm step, then a step with every allocator
+/// failing; returns that step's movement columns and triggers.
+fn runCollisionRespondScenario(max_worker_threads: usize) !CollisionRespondScenarioResult {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    try addMixedContactChainBodies(&data, 0, respond_scenario_bodies);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = max_worker_threads });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = respond_scenario_rows,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4);
+    try frame.reservePathRequests(1, 4);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 4);
+    if (max_worker_threads > 0) {
+        pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+        pinThreadedProfile(&pipeline.collision_response.apply_tuner, .{ .worker_threads = 2, .items_per_range = 1 });
+    }
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(targets, .uniform(failing.allocator()));
+    const result = pipeline.update(context);
+    swap.restore(targets);
+    const stats = try result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    const response = stats.collision_response;
+    // The warm step's corrections separate some pairs; several gather ranges remain.
+    try std.testing.expect(response.contact_count <= respond_scenario_contacts);
+    try std.testing.expect(response.contact_count > 4 * 16);
+    try std.testing.expect(response.intent_count > 0);
+    try std.testing.expect(response.trigger_count > 0);
+    if (max_worker_threads > 0) {
+        try std.testing.expect(!response.gather_batch.ran_inline);
+        try std.testing.expectEqual(rangeCount(response.contact_count, 16), response.gather_batch.range_count);
+        try std.testing.expect(!response.apply_batch.ran_inline);
+        try std.testing.expectEqual(@as(usize, respond_scenario_rows / 16), response.apply_batch.item_count);
+    }
+
+    const slice = data.movementBodySliceConst();
+    try std.testing.expectEqual(respond_scenario_rows, slice.entities.len);
+    var out: CollisionRespondScenarioResult = .{ .trigger_count = response.trigger_count, .intent_count = response.intent_count };
+    @memcpy(&out.position_x, slice.position_x);
+    @memcpy(&out.position_y, slice.position_y);
+    @memcpy(&out.velocity_x, slice.velocity_x);
+    @memcpy(&out.velocity_y, slice.velocity_y);
+    @memcpy(out.triggers[0..response.trigger_count], frame.collision_triggers.mergedItems());
+    return out;
+}
+
+test "collision response runs on workers in the pipeline, allocation-free and matching the serial step" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const serial = try runCollisionRespondScenario(0);
+    const threaded = try runCollisionRespondScenario(2);
+    try std.testing.expectEqual(serial.intent_count, threaded.intent_count);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.position_x), std.mem.sliceAsBytes(&threaded.position_x));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.position_y), std.mem.sliceAsBytes(&threaded.position_y));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_x), std.mem.sliceAsBytes(&threaded.velocity_x));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_y), std.mem.sliceAsBytes(&threaded.velocity_y));
+    try std.testing.expectEqual(serial.trigger_count, threaded.trigger_count);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial.triggers[0..serial.trigger_count]), std.mem.sliceAsBytes(threaded.triggers[0..threaded.trigger_count]));
+}
+
+fn minimalSyncWorld() !WorldSystem {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    errdefer world.deinit();
+    _ = try world.addLevel(0);
+    return world;
+}
+
+const sync_test_pathfinding: PathfindingCapacity = .{ .max_group_fields = 1, .worker_participant_count = 1 };
+
+test "population sync at an unchanged population allocates nothing and never re-memsets the spatial window" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 4,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4);
+    try pipeline.reserve(&frame, 4);
+
+    // Rows added directly (test-only path), past the initial reserve.
+    for (0..30) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    }
+
+    const lookup = &pipeline.spatial_index.dense_lookup;
+    const starts_ptr = lookup.starts.items.ptr;
+    const capacity_cells_x = lookup.capacity_cells_x;
+    lookup.starts.items[0] = 7;
+    const grown = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expect(grown.grew);
+    try std.testing.expectEqual(grownPopulationCapacity(30), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(starts_ptr, lookup.starts.items.ptr);
+    try std.testing.expectEqual(capacity_cells_x, lookup.capacity_cells_x);
+    try std.testing.expectEqual(@as(u32, 7), lookup.starts.items[0]);
+    lookup.starts.items[0] = 0;
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads }, .uniform(failing.allocator()));
+    const unchanged = pipeline.syncPopulationCapacity(&frame, &data);
+    swap.restore(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads });
+    try std.testing.expect(!(try unchanged).grew);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "a population growth that fails after the collision reserve restores the declared pair bound" {
+    // The response allocator fails, so growth errors in `reserveContactStreams`, after
+    // `collision.reserve(body)` succeeded. The tracked capacity and the collision's
+    // declared pair bound both roll back to the old capacity's, so overflow telemetry
+    // keeps matching the streams actually reserved; the retry then raises both.
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 4,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4);
+    try pipeline.reserve(&frame, 4);
+    const old_pair_bound = pipeline.collision.reserved_pair_bound;
+    try std.testing.expectEqual(CollisionSystem.estimateContactCapacity(4), old_pair_bound);
+
+    for (0..30) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    }
+
+    const response_allocator = pipeline.collision_response.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    pipeline.collision_response.allocator = failing.allocator();
+    const failed = pipeline.syncPopulationCapacity(&frame, &data);
+    pipeline.collision_response.allocator = response_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expectEqual(@as(usize, 4), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(old_pair_bound, pipeline.collision.reserved_pair_bound);
+
+    const grown = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expect(grown.grew);
+    try std.testing.expectEqual(grownPopulationCapacity(30), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(CollisionSystem.estimateContactCapacity(pipeline.movement_body_capacity), pipeline.collision.reserved_pair_bound);
+}
+
+test "population sync that runs out of memory growing pathfinding keeps the old agent ceiling and the retry grows it" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pathfinding = sync_test_pathfinding;
+    pathfinding.max_agent_budget = 8;
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{ .pathfinding = pathfinding });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 0, 0, 0, 0);
+    try pipeline.reserve(&frame, 0);
+
+    for (0..12) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+    }
+
+    // An OOM during the pathfinding grow keeps the old ceiling and pools; the retry lands.
+    const real_allocator = pipeline.pathfinding.allocator;
+    var failing = std.testing.FailingAllocator.init(real_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    pipeline.pathfinding.allocator = failing.allocator();
+    const failed = pipeline.syncPopulationCapacity(&frame, &data);
+    pipeline.pathfinding.allocator = real_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expectEqual(@as(usize, 8), pipeline.pathfinding.agentBudget());
+    try std.testing.expectEqual(@as(usize, 8), pipeline.pathfinding.effective_agent_capacity);
+    try std.testing.expect(!pipeline.pathfinding.coversAgentCount(12));
+
+    _ = try pipeline.syncPopulationCapacity(&frame, &data);
+    try std.testing.expectEqual(grownPopulationCapacity(12), pipeline.pathfinding.agentBudget());
+    try std.testing.expectEqual(@as(usize, 48), pipeline.pathfinding.agentBudget());
+    // max(12, 2 x the floor 8).
+    try std.testing.expectEqual(@as(usize, 16), pipeline.pathfinding.effective_agent_capacity);
+    try std.testing.expect(pipeline.pathfinding.coversAgentCount(12));
+}
+
+// `count` steering agents with movement bodies, committed before a pipeline is built.
+fn addSteeringAgents(data: *DataSystem, count: usize) !void {
+    for (0..count) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setSteeringAgent(entity, .{ .agent_radius = 4 });
+    }
+}
+
+test "a pipeline built over steering agents sizes pathfinding for them, so its first update allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 8 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    const agent_count = 40;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try addSteeringAgents(&data, agent_count);
+    var pathfinding = sync_test_pathfinding;
+    pathfinding.worker_participant_count = threads.participantSlotCount();
+    // World-less nav over 16x16 open cells.
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 512, 512, .{ .pathfinding = pathfinding });
+    defer pipeline.deinit();
+    const system = &pipeline.pathfinding;
+    try std.testing.expect(system.coversAgentCount(agent_count));
+    try std.testing.expect(system.effective_agent_capacity >= agent_count);
+    const capacity_at_init = system.effective_agent_capacity;
+    const bytes_at_init = system.requestResidentBytes();
+
+    // One distinct goal per agent, so intake keeps every request.
+    var requests: [agent_count]PathRequest = undefined;
+    for (&requests, data.steeringAgentSliceConst().entities, 0..) |*request, entity, index| {
+        const goal_x: f32 = @floatFromInt(8 + index % 8);
+        const goal_y: f32 = @floatFromInt(index / 8);
+        request.* = .{ .entity = entity, .start = .{ .x = 48, .y = 48 }, .goal = .{ .x = goal_x * 32 + 16, .y = goal_y * 32 + 16 } };
+    }
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    const range_base = try stream.appendRangeCounts(1);
+    stream.addCount(range_base, requests.len);
+    try stream.prefixAppendedRanges(range_base);
+    var writer = stream.rangeWriter(range_base);
+    for (requests) |request| writer.write(request);
+    writer.finish();
+    stream.finishWrite();
+
+    // The first update, with no admission, so the step has no path content to publish: every
+    // allocation fails (the system, its graph, its registry shards with their owner heads,
+    // and the thread system), and the whole crowd's intake lands in the pools init sized.
+    // Driven on the system rather than the pipeline's step, whose path requests come only
+    // from AI navigation intents through steering; the whole first step after a seam growth
+    // has its own every-owner proof.
+    const real_allocator = system.allocator;
+    const threads_allocator = threads.allocator;
+    const failing = std.testing.failing_allocator;
+    system.allocator = failing;
+    system.graph.allocator = failing;
+    for (&system.path_index) |*shard| shard.allocator = failing;
+    threads.allocator = failing;
+    const first = system.update(&stream, agent_count, &threads, .{ .adaptive = false, .items_per_range = 8, .max_solve_admissions_per_step = 0 });
+    system.allocator = real_allocator;
+    system.graph.allocator = real_allocator;
+    for (&system.path_index) |*shard| shard.allocator = real_allocator;
+    threads.allocator = threads_allocator;
+    const intake_stats = try first;
+    try std.testing.expect(!intake_stats.intake_batch.ran_inline);
+    try std.testing.expect(intake_stats.intake_batch.range_count > 1);
+    try std.testing.expectEqual(@as(usize, agent_count), intake_stats.accepted_requests);
+    try std.testing.expectEqual(@as(usize, agent_count), intake_stats.pending_requests);
+    try std.testing.expectEqual(@as(usize, 0), intake_stats.dropped_requests);
+    try std.testing.expectEqual(@as(u64, 0), intake_stats.resize_ns);
+    try std.testing.expectEqual(capacity_at_init, system.effective_agent_capacity);
+
+    // The first solving update: only path content grows (registry runs and long blocks);
+    // every elastic pool keeps its init size.
+    stream.clearRetainingCapacity();
+    const solve_stats = try system.update(&stream, agent_count, &threads, .{ .adaptive = false, .items_per_range = 8 });
+    try std.testing.expectEqual(@as(usize, agent_count), solve_stats.available_results);
+    try std.testing.expectEqual(capacity_at_init, system.effective_agent_capacity);
+    const bytes_after = system.requestResidentBytes();
+    try std.testing.expectEqual(bytes_at_init.queues, bytes_after.queues);
+    try std.testing.expectEqual(bytes_at_init.search, bytes_after.search);
+    try std.testing.expectEqual(bytes_at_init.tier1, bytes_after.tier1);
+    try std.testing.expectEqual(bytes_at_init.change_scratch, bytes_after.change_scratch);
+}
+
+test "a pipeline init that runs out of memory at any allocation frees everything; one that completes covers its steering agents" {
+    const agent_count = 12;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try addSteeringAgents(&data, agent_count);
+    // Below the crowd, so init raises the ceiling as well as growing the pools.
+    var pathfinding = sync_test_pathfinding;
+    pathfinding.max_agent_budget = 8;
+    const config: SimulationPipelineConfig = .{ .pathfinding = pathfinding };
+    // Hand-rolled: `std.testing.checkAllAllocationFailures` never fails a resize; this sweep does.
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
+        if (SimulationPipeline.init(failing.allocator(), &data, 256, 256, config)) |built| {
+            var pipeline = built;
+            defer pipeline.deinit();
+            try std.testing.expect(pipeline.pathfinding.coversAgentCount(agent_count));
+            try std.testing.expectEqual(grownPopulationCapacity(agent_count), pipeline.pathfinding.agentBudget());
+            if (!failing.has_induced_failure) break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+    }
+}
+
+fn responderTemplate(index: usize, mobility: CollisionResponseMobility) StructuralCommand {
+    // 64 px apart on one row, so no two responders overlap (no contacts).
+    const position = math.Vec2{ .x = @as(f32, @floatFromInt(index)) * 64, .y = 0 };
+    return .{ .create_entity = .{
+        .movement_body = .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 },
+        .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
+        .collision_response = .{ .mode = .solid, .mobility = mobility, .restitution = 0 },
+    } };
+}
+
+test "a collider sync that runs out of memory keeps its change and the next step's seam reserves the nav event for it" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = 128,
+        .pathfinding = sync_test_pathfinding,
+        .navigation_world = &world,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + 128);
+    try pipeline.reserve(&frame, 4);
+
+    // A static created over the one cell; its collider sync runs out of memory.
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &.{responderTemplate(0, .static)});
+    try pipeline.reserveStaticColliders(&frame, &data);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    pipeline.static_colliders.allocator = failing.allocator();
+    pipeline.static_colliders.chunk_lists.allocator = failing.allocator();
+    pipeline.static_colliders.query_lists.allocator = failing.allocator();
+    const failed = commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    pipeline.static_colliders.allocator = std.testing.allocator;
+    pipeline.static_colliders.chunk_lists.allocator = std.testing.allocator;
+    pipeline.static_colliders.query_lists.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expect(!pipeline.pathfinding.graph.grid(0).?.isBlockedCell(.{ .x = 0, .y = 0 }));
+
+    // A step with no command: the kept change still makes the nav reaction emit, so the
+    // seam reserves its event, and the retried sync blocks the cell.
+    frame.beginStep();
+    try std.testing.expect(pipeline.navReactionMayEmit(&data, &frame, &world));
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    try std.testing.expectEqual(@as(usize, 1), frame.events.stats.nav_region_invalidated);
+    try std.testing.expect(pipeline.pathfinding.graph.grid(0).?.isBlockedCell(.{ .x = 0, .y = 0 }));
+    try std.testing.expect(!pipeline.navReactionMayEmit(&data, &frame, &world));
+}
+
+// World-backed nav over the minimal three-level world: a player at (5,3) facing right, so a
+// dig hits (6,3), stepped through `update` and the demo seam. On level 0 a dig is a hole
+// (walkable either way); `underground` puts the player on level 1's solid dirt, where a dig
+// mines a walkable tunnel and so changes nav.
+const NavSeamFixture = struct {
+    meta: world_tileset_meta.WorldTilesetMeta,
+    world: WorldSystem,
+    data: DataSystem,
+    frame: SimulationFrame,
+    threads: ThreadSystem,
+    player: Player,
+    pipeline: SimulationPipeline,
+
+    const Options = struct {
+        tiles_per_side: u32 = 8,
+        worker_threads: usize = 0,
+        structural_headroom: usize = 16,
+        pathfinding: PathfindingCapacity = sync_test_pathfinding,
+    };
+
+    fn init(self: *NavSeamFixture, options: Options) !void {
+        const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+        self.meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+        errdefer self.meta.deinit();
+        const bounds = self.meta.tileSize() * @as(f32, @floatFromInt(options.tiles_per_side));
+        self.world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &self.meta, bounds, bounds);
+        errdefer self.world.deinit();
+        self.data = DataSystem.init(std.testing.allocator);
+        errdefer self.data.deinit();
+        self.player = try Player.spawn(&self.data);
+        self.player.current_level = 0;
+        placePlayerFlush(&self.data, self.player, .{ 5, 3 });
+        self.data.facingPtr(self.player.entity).?.* = .right;
+        self.frame = SimulationFrame.init(std.testing.allocator);
+        errdefer self.frame.deinit();
+        try self.frame.reserveStreams(4, 8, 8, 8, 8, 8);
+        try self.frame.reservePathRequests(2, 2);
+        self.threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+            .max_worker_threads = options.worker_threads,
+            .items_per_range = if (options.worker_threads == 0) (ThreadSystemConfig{}).items_per_range else 1,
+        });
+        errdefer self.threads.deinit();
+        self.pipeline = try SimulationPipeline.init(std.testing.allocator, &self.data, 256, 256, .{
+            .dig = try DigConfig.fromMeta(&self.meta),
+            .movement_body_capacity = 4,
+            .structural_headroom = options.structural_headroom,
+            .pathfinding = options.pathfinding,
+            .navigation_world = &self.world,
+        });
+        errdefer self.pipeline.deinit();
+        try self.frame.reserveStreams(self.pipeline.eventCapacitySum(), 8, 8, 8, 8, 8 + options.structural_headroom);
+        try self.pipeline.reserve(&self.frame, 4);
+    }
+
+    fn underground(self: *NavSeamFixture) void {
+        self.player.current_level = 1;
+    }
+
+    fn deinit(self: *NavSeamFixture) void {
+        self.pipeline.deinit();
+        self.threads.deinit();
+        self.frame.deinit();
+        self.data.deinit();
+        self.world.deinit();
+        self.meta.deinit();
+    }
+
+    // One step's stages with `intent`, without the commit seam.
+    fn update(self: *NavSeamFixture, intent: DigIntent) !void {
+        self.frame.beginStep();
+        self.frame.dig_intent = intent;
+        _ = try self.pipeline.update(.{
+            .data = &self.data,
+            .frame = &self.frame,
+            .world = &self.world,
+            .player = &self.player,
+            .thread_system = &self.threads,
+            .delta_seconds = 0.016,
+            .bounds_width = 256,
+            .bounds_height = 256,
+            .sim_view = fullWorldSimView(&self.world),
+        });
+    }
+
+    fn seam(self: *NavSeamFixture) !void {
+        _ = try commitAndSyncLikeDemo(&self.pipeline, &self.frame, &self.data, &self.world);
+    }
+
+    fn navBlocked(self: *const NavSeamFixture, level: u16, x: i32, y: i32) bool {
+        return self.pipeline.pathfinding.graph.grid(level).?.isBlockedCell(.{ .x = x, .y = y });
+    }
+
+    // Fills the recorded marks to their capacity, so the next mark reserve must grow.
+    fn fillNavMarks(self: *NavSeamFixture) void {
+        const marks = &self.pipeline.pathfinding.nav_marks;
+        while (marks.items.len < marks.capacity) marks.appendAssumeCapacity(.{ .level = 0, .kind = .tile_box, .min_x = 0, .min_y = 0, .max_x = 0, .max_y = 0 });
+    }
+
+    // Nav holds no pending change and equals a fresh build of the world and statics.
+    fn expectNavMatchesRebuild(self: *const NavSeamFixture) !void {
+        const live = &self.pipeline.pathfinding.graph;
+        try std.testing.expect(!self.pipeline.pathfinding.hasPendingNavUpdates(&self.world));
+        var rebuilt = PathfindingSystem.init(std.testing.allocator);
+        defer rebuilt.deinit();
+        try rebuilt.reserve(sync_test_pathfinding);
+        try rebuilt.rebuildStaticNavGridWithWorld(&self.data, &self.world, null);
+        try std.testing.expectEqual(rebuilt.graph.levelCount(), live.levelCount());
+        for (0..live.levelCount()) |level_index| {
+            const level: u16 = @intCast(level_index);
+            for (0..self.world.height) |y| for (0..self.world.width) |x| {
+                const cell = GridCell{ .x = @intCast(x), .y = @intCast(y) };
+                try std.testing.expectEqual(rebuilt.graph.grid(level).?.isBlockedCell(cell), live.grid(level).?.isBlockedCell(cell));
+            };
+            try std.testing.expectEqual(rebuilt.graph.levelGraph(level).?.recordCount(), live.levelGraph(level).?.recordCount());
+        }
+        try std.testing.expectEqual(nav_test_support.totalPortals(&rebuilt.graph), nav_test_support.totalPortals(live));
+    }
+};
+
+test "a nav-mark reserve OOM before a dig leaves world and nav intact and the retry applies it" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    fixture.underground();
+    const floor1 = fixture.world.denseFloorLayerForLevel(1).?;
+    const tile_before = fixture.world.denseTile(floor1, 6, 3);
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    fixture.fillNavMarks();
+    const nav_allocator = fixture.pipeline.pathfinding.allocator;
+    var failing = std.testing.FailingAllocator.init(nav_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.pathfinding.allocator = failing.allocator();
+    const failed = fixture.update(.hole);
+    fixture.pipeline.pathfinding.allocator = nav_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    // Nothing was written or promoted, and nav is as it was.
+    try std.testing.expectEqual(tile_before, fixture.world.denseTile(floor1, 6, 3));
+    try std.testing.expectEqual(@as(usize, 0), fixture.frame.events.mergedItems().len);
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    // The re-issued dig writes, records, and the seam applies it.
+    try fixture.update(.hole);
+    try std.testing.expect(fixture.world.denseTile(floor1, 6, 3) != tile_before);
+    try fixture.seam();
+    try std.testing.expect(!fixture.navBlocked(1, 6, 3));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a nav-mark reserve OOM before plane traversal leaves world and nav intact and the retry applies it" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    // A hole at (6,3); the player then stands over it.
+    try fixture.update(.hole);
+    try fixture.seam();
+    const floor1 = fixture.world.denseFloorLayerForLevel(1).?;
+    try std.testing.expect(denseTileBlocksMovement(&fixture.world, floor1, 6, 3));
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    // Control: a quiet step allocates nothing from nav, so the next failure is the
+    // traversal's record reserve.
+    const nav_allocator = fixture.pipeline.pathfinding.allocator;
+    var quiet = std.testing.FailingAllocator.init(nav_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.pathfinding.allocator = quiet.allocator();
+    try fixture.update(.none);
+    fixture.pipeline.pathfinding.allocator = nav_allocator;
+    try fixture.seam();
+
+    placePlayerFlush(&fixture.data, fixture.player, .{ 6, 3 });
+    fixture.fillNavMarks();
+    var failing = std.testing.FailingAllocator.init(nav_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.pathfinding.allocator = failing.allocator();
+    const failed = fixture.update(.none);
+    fixture.pipeline.pathfinding.allocator = nav_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    // No fall and no landing carve, and nav is as it was.
+    try std.testing.expectEqual(@as(u16, 0), fixture.player.current_level);
+    try std.testing.expect(denseTileBlocksMovement(&fixture.world, floor1, 6, 3));
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    // The retried step falls and carves the landing; the seam applies it.
+    try fixture.update(.none);
+    try std.testing.expectEqual(@as(u16, 1), fixture.player.current_level);
+    try std.testing.expect(!denseTileBlocksMovement(&fixture.world, floor1, 6, 3));
+    try fixture.seam();
+    try std.testing.expect(!fixture.navBlocked(1, 6, 3));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a plane traversal past a failed population seam reserves its nav record from its carves and the seam then matches a rebuild" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{
+        .tiles_per_side = 16,
+        .worker_threads = 2,
+        .structural_headroom = 128,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = 1 },
+    });
+    defer fixture.deinit();
+    const pathfinding = &fixture.pipeline.pathfinding;
+    pathfinding.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
+    fixture.pipeline.plane_entry.config = .{ .items_per_range = plane_entry_range_alignment_items, .adaptive = false };
+    const spare_marks = pathfinding.nav_marks.capacity - pathfinding.nav_marks.items.len;
+    // Past the spare marks and staging, and across at least two `nav_mark` ranges.
+    const npc_count = @max(8 * lane_count, spare_marks, pathfinding.nav_mark_staging.capacity) + 1;
+
+    // Each NPC enters its own surface hole from the west this step; level 1 below is solid.
+    const floor0 = fixture.world.denseFloorLayerForLevel(0).?;
+    const floor1 = fixture.world.denseFloorLayerForLevel(1).?;
+    var landings: std.ArrayList(CellCoord) = .empty;
+    defer landings.deinit(std.testing.allocator);
+    var y: u16 = 0;
+    fill: while (y < 16) : (y += 1) {
+        var x: u16 = 1;
+        while (x < 16) : (x += 1) {
+            if (landings.items.len == npc_count) break :fill;
+            if (x == 5 and y == 3) continue; // the player's cell
+            try std.testing.expect(denseTileBlocksMovement(&fixture.world, floor1, x, y));
+            _ = try fixture.world.clearDenseTile(floor0, x, y);
+            try landings.append(std.testing.allocator, .{ .x = x, .y = y });
+            const npc = try fixture.data.createEntity();
+            try fixture.data.setMovementBody(npc, .{});
+            try fixture.data.setPrimitiveVisual(npc, growth_npc_visual);
+            try fixture.data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
+            try fixture.data.setWorldLevel(npc, 0);
+            try fixture.data.setSimulationTier(npc, .locomotion);
+            const body = fixture.data.movementBodyPtr(npc).?;
+            body.previous_x.* = @as(f32, @floatFromInt(x - 1)) * 32;
+            body.previous_y.* = @as(f32, @floatFromInt(y)) * 32;
+            body.position_x.* = @as(f32, @floatFromInt(x)) * 32;
+            body.position_y.* = @as(f32, @floatFromInt(y)) * 32;
+        }
+    }
+    try std.testing.expectEqual(npc_count, landings.items.len);
+    fixture.pipeline.dig.player_last_cell = .{ .x = 5, .y = 3 };
+
+    // The population seam runs out of memory at its first reserve, so every population-sized
+    // reserve, the nav record's included, stays at the old capacity.
+    const old_capacity = fixture.pipeline.movement_body_capacity;
+    const scope_allocator = fixture.pipeline.scope.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.scope.allocator = failing.allocator();
+    const failed = fixture.pipeline.syncPopulationCapacity(&fixture.frame, &fixture.data);
+    fixture.pipeline.scope.allocator = scope_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expectEqual(old_capacity, fixture.pipeline.movement_body_capacity);
+    try std.testing.expect(npc_count > maxEventsPerStep(.plane_traversal, fixture.pipeline.eventBudgets()));
+    try std.testing.expect(npc_count > pathfinding.nav_marks.capacity - pathfinding.nav_marks.items.len);
+    try std.testing.expect(npc_count > pathfinding.nav_mark_staging.capacity);
+
+    fixture.frame.beginStep();
+    var step = SimulationPipeline.StepState.init(&fixture.pipeline, .{
+        .data = &fixture.data,
+        .frame = &fixture.frame,
+        .world = &fixture.world,
+        .player = &fixture.player,
+        .thread_system = &fixture.threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 256,
+        .bounds_height = 256,
+        .sim_view = fullWorldSimView(&fixture.world),
+    });
+    try fixture.pipeline.stagePlaneTraversal(&step);
+    try std.testing.expect(pathfinding.last_mark_batch.range_count >= 2 and !pathfinding.last_mark_batch.ran_inline);
+    // The gather's windows were short of the AI rows too: grown once on main, then dispatched.
+    try std.testing.expectEqual(@as(u64, 1), fixture.pipeline.plane_entry.windows_grown);
+    try std.testing.expectEqual(@as(usize, 1), step.plane_entry_windows_grown);
+    try std.testing.expect(step.plane_entry.range_count >= 2 and !step.plane_entry.ran_inline);
+    try std.testing.expectEqual(npc_count, fixture.frame.events.stats.world_tile_changed);
+    try std.testing.expectEqual(@as(usize, 1), fixture.frame.events.range_stats.items.len);
+    for (landings.items) |cell| try std.testing.expect(!denseTileBlocksMovement(&fixture.world, floor1, cell.x, cell.y));
+
+    // The retried seam grows, and nav applies every recorded carve.
+    try fixture.seam();
+    try std.testing.expect(fixture.pipeline.movement_body_capacity > old_capacity);
+    for (landings.items) |cell| try std.testing.expect(!fixture.navBlocked(1, cell.x, cell.y));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a dig whose step fails before the commit seam reaches nav at the next seam" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    fixture.underground();
+    // The dig's stages run, then the step stops before its seam (a later stage failed).
+    try fixture.update(.hole);
+    try std.testing.expect(!fixture.world.levelBlocksMovement(1, 6, 3));
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    // The next step's events no longer hold the dig; its seam still applies it.
+    try fixture.update(.none);
+    try fixture.seam();
+    try std.testing.expect(!fixture.navBlocked(1, 6, 3));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a collider-sync OOM in a dig step still applies the dig the next step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    fixture.underground();
+    try fixture.update(.hole);
+    try writeStructuralCommands(&fixture.frame, &.{responderTemplate(1, .static)});
+    // The seam's collider reserve holds; the sync after the commit runs out of memory.
+    try fixture.pipeline.reserveStaticColliders(&fixture.frame, &fixture.data);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.static_colliders.allocator = failing.allocator();
+    fixture.pipeline.static_colliders.chunk_lists.allocator = failing.allocator();
+    fixture.pipeline.static_colliders.query_lists.allocator = failing.allocator();
+    const failed = fixture.seam();
+    fixture.pipeline.static_colliders.allocator = std.testing.allocator;
+    fixture.pipeline.static_colliders.chunk_lists.allocator = std.testing.allocator;
+    fixture.pipeline.static_colliders.query_lists.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expectEqual(@as(usize, 0), fixture.pipeline.static_colliders.rowCount());
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+
+    // A step with no dig and no command: the retried sync and the kept dig marks apply.
+    try fixture.update(.none);
+    try fixture.seam();
+    try std.testing.expect(fixture.navBlocked(0, 2, 0));
+    try std.testing.expect(!fixture.navBlocked(1, 6, 3));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a static nav-mark reserve OOM commits nothing and the retried commit reaches nav" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    try fixture.update(.none);
+    try writeStructuralCommands(&fixture.frame, &.{responderTemplate(1, .static)});
+    const entities_before = fixture.data.movementBodySliceConst().entities.len;
+    fixture.fillNavMarks();
+    const nav_allocator = fixture.pipeline.pathfinding.allocator;
+    var failing = std.testing.FailingAllocator.init(nav_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.pathfinding.allocator = failing.allocator();
+    const failed = fixture.pipeline.reserveStaticColliders(&fixture.frame, &fixture.data);
+    fixture.pipeline.pathfinding.allocator = nav_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    // Nothing committed: no entity, no row, and nav unchanged.
+    try std.testing.expectEqual(entities_before, fixture.data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.pipeline.static_colliders.rowCount());
+    try std.testing.expect(!fixture.navBlocked(0, 2, 0));
+
+    // The retried seam commits the same commands; nav takes the static.
+    try fixture.seam();
+    try std.testing.expectEqual(@as(usize, 1), fixture.pipeline.static_colliders.rowCount());
+    try std.testing.expect(fixture.navBlocked(0, 2, 0));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "a nav apply OOM keeps the step's dig and static marks and the next step applies both" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var fixture: NavSeamFixture = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    fixture.underground();
+    try fixture.update(.hole);
+    try writeStructuralCommands(&fixture.frame, &.{responderTemplate(1, .static)});
+    const graph_allocator = fixture.pipeline.pathfinding.graph.allocator;
+    var failing = std.testing.FailingAllocator.init(graph_allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    fixture.pipeline.pathfinding.graph.allocator = failing.allocator();
+    const failed = fixture.seam();
+    fixture.pipeline.pathfinding.graph.allocator = graph_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expect(!fixture.navBlocked(0, 2, 0));
+    try std.testing.expect(fixture.navBlocked(1, 6, 3));
+    try std.testing.expect(fixture.pipeline.pathfinding.hasPendingNavUpdates(&fixture.world));
+
+    try fixture.update(.none);
+    try fixture.seam();
+    try std.testing.expect(fixture.navBlocked(0, 2, 0));
+    try std.testing.expect(!fixture.navBlocked(1, 6, 3));
+    try fixture.expectNavMatchesRebuild();
+}
+
+test "statics committed at the seam leave the next step allocation-free" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 4096, 64, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = 128,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + 128);
+    try frame.reservePathRequests(1, 4);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 4);
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 4096,
+        .bounds_height = 64,
+        .sim_view = fullWorldSimView(&world),
+    };
+
+    // First growth: 12 dynamic responders and 1 static.
+    var commands: [20]StructuralCommand = undefined;
+    for (commands[0..12], 0..) |*command, index| command.* = responderTemplate(index, .dynamic);
+    commands[12] = responderTemplate(12, .static);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, commands[0..13]);
+    try std.testing.expect((try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    frame.beginStep();
+    _ = try pipeline.update(context);
+
+    // 20 more statics within the population capacity: the seam syncs them into the rows.
+    for (&commands, 0..) |*command, index| command.* = responderTemplate(13 + index, .static);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &commands);
+    try std.testing.expect(!(try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    try std.testing.expectEqual(@as(usize, 21), pipeline.static_colliders.rowCount());
+
+    // The next step reads the synced rows and allocates nothing on any owner.
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads }, .uniform(failing.allocator()));
+    const result = pipeline.update(context);
+    swap.restore(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads });
+    _ = try result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+// Writes one navigation intent for `agent` heading +x, runs the steering stage alone, and
+// returns the agent's lateral (y) direction from the stage's last intent for it.
+fn steeringStageLateralForTest(pipeline: *SimulationPipeline, context: SimulationPipelineUpdateContext, agent: EntityId) !f32 {
+    const frame = context.frame;
+    try frame.navigation_intents.prepareRangeCounts(1);
+    frame.navigation_intents.addCount(0, 1);
+    try frame.navigation_intents.prefix();
+    var writer = frame.navigation_intents.rangeWriter(0);
+    writer.write(.{ .entity = agent, .goal = .{ .x = 600, .y = 96 }, .direct_direction_x = 1 });
+    writer.finish();
+    frame.navigation_intents.finishWrite();
+    var step = SimulationPipeline.StepState.init(pipeline, context);
+    try pipeline.runStage(.steering_update, &step);
+    var lateral: ?f32 = null;
+    for (frame.intents.mergedItems()) |intent| {
+        if (intent.movement.entity.eql(agent)) lateral = intent.movement.direction_y;
+    }
+    return lateral orelse error.TestExpectedEqual;
+}
+
+test "a static committed at the seam pushes steering agents on the next step" {
+    // The commit seam's collider sync writes the static rows the steering stage reads,
+    // outside the stage graph. Steering run between the commit and the sync still sees
+    // the box parked; after the sync it pushes away from the box.
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    const agent_position = math.Vec2{ .x = 96, .y = 96 };
+    const agent = try data.createEntity();
+    try data.setMovementBody(agent, .{ .position = agent_position, .previous_position = agent_position, .velocity = .{}, .speed = 32 });
+    try data.setSteeringAgent(agent, .{
+        .agent_radius = 8,
+        .waypoint_tolerance = 4,
+        .avoidance_radius = 48,
+        .avoidance_weight = 1.5,
+        .max_neighbor_samples = 8,
+        .stuck_step_threshold = 3,
+        .replan_cooldown_steps = 4,
+        .unavailable_backoff_steps = 12,
+    });
+    const parked = math.Vec2{ .x = 96, .y = 600 };
+    const box = try data.createEntity();
+    try data.setMovementBody(box, .{ .position = parked, .previous_position = parked, .velocity = .{}, .speed = 0 });
+    try data.setCollisionBounds(box, .{ .size = .{ .x = 20, .y = 20 } });
+    try data.setCollisionResponse(box, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 640, 640, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = 16,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 4, 4, 4, 4, 4 + 16);
+    try frame.reservePathRequests(1, 4);
+    try pipeline.reserve(&frame, 4);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.static_colliders.rowCount());
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 640,
+        .bounds_height = 640,
+        .sim_view = fullWorldSimView(&world),
+    };
+
+    // The commit moves the box just above the agent; the sync has not run yet.
+    frame.beginStep();
+    const beside = math.Vec2{ .x = agent_position.x + 8, .y = agent_position.y - 32 };
+    try writeStructuralCommands(&frame, &.{.{ .set_movement_body = .{ .entity = box, .body = .{ .position = beside, .previous_position = beside, .velocity = .{}, .speed = 0 } } }});
+    try pipeline.reserveStaticColliders(&frame, &data);
+    _ = try frame.applyStructuralCommands(&data);
+    pipeline.captureStaticColliderChanges(&frame);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), try steeringStageLateralForTest(&pipeline, context, agent), 0.001);
+
+    // After the seam's sync, the stage pushes the agent away from the box (+y).
+    try pipeline.syncStaticColliders(&data, null);
+    pipeline.reactToPostCommitSteeringEvents(&frame);
+    try std.testing.expect(try steeringStageLateralForTest(&pipeline, context, agent) > 0.05);
+}
+
+test "a static move's collider splice reaches the perf log, and a seam with no static change records none" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const parked = math.Vec2{ .x = 96, .y = 600 };
+    const box = try data.createEntity();
+    try data.setMovementBody(box, .{ .position = parked, .previous_position = parked, .velocity = .{}, .speed = 0 });
+    try data.setCollisionBounds(box, .{ .size = .{ .x = 20, .y = 20 } });
+    try data.setCollisionResponse(box, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 640, 640, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = 16,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 4, 4, 4, 4, 4 + 16);
+    var perf = runtime_perf_log.RuntimePerfLog.init(0);
+    const splice_stage = @backingInt(runtime_perf_log.BatchStage.static_collider_splice);
+
+    // The box moves onto a chunk corner: the sync splices more chunk-list keys than
+    // query-list keys, so the two splice batches differ.
+    frame.beginStep();
+    const moved = math.Vec2{ .x = 500, .y = 500 };
+    try writeStructuralCommands(&frame, &.{.{ .set_movement_body = .{ .entity = box, .body = .{ .position = moved, .previous_position = moved, .velocity = .{}, .speed = 0 } } }});
+    try pipeline.reserveStaticColliders(&frame, &data);
+    _ = try frame.applyStructuralCommands(&data);
+    pipeline.captureStaticColliderChanges(&frame);
+    try pipeline.syncStaticColliders(&data, null);
+    const splice = pipeline.static_colliders.last_splice_batch;
+    try std.testing.expect(splice.item_count > 0);
+    try std.testing.expect(splice.item_count != pipeline.static_colliders.last_query_splice_batch.item_count);
+    pipeline.recordStaticColliderSyncTo(runtime_perf_log.Context.bind(&perf));
+    try std.testing.expectEqual(@as(u64, 1), perf.batches[splice_stage].calls);
+    try std.testing.expectEqual(@as(u64, splice.item_count), perf.batches[splice_stage].items);
+
+    // A seam with no static change resets the batch, so nothing more is recorded.
+    frame.beginStep();
+    try pipeline.reserveStaticColliders(&frame, &data);
+    _ = try frame.applyStructuralCommands(&data);
+    pipeline.captureStaticColliderChanges(&frame);
+    try pipeline.syncStaticColliders(&data, null);
+    pipeline.recordStaticColliderSyncTo(runtime_perf_log.Context.bind(&perf));
+    try std.testing.expectEqual(@as(u64, 1), perf.batches[splice_stage].calls);
+}
+
+test "pipeline stats record the path intake and registry flush batches under their own perf stages, the most distinct group keys, and the group-field evictions" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+    var perf = runtime_perf_log.RuntimePerfLog.init(0);
+    const stats = SimulationPipelineStats{ .pathfinding = .{
+        .solve_batch = .{ .item_count = 3 },
+        .intake_batch = .{ .item_count = 5 },
+        .registry_flush_batch = .{ .item_count = 7 },
+        .distinct_group_keys = 6,
+        .group_field_evictions = 2,
+    } };
+    stats.recordTo(runtime_perf_log.Context.bind(&perf));
+    const intake = perf.batches[@backingInt(runtime_perf_log.BatchStage.path_intake)];
+    const flush = perf.batches[@backingInt(runtime_perf_log.BatchStage.path_registry_flush)];
+    try std.testing.expectEqual(@as(u64, 1), intake.calls);
+    try std.testing.expectEqual(@as(u64, 5), intake.items);
+    try std.testing.expectEqual(@as(u64, 1), flush.calls);
+    try std.testing.expectEqual(@as(u64, 7), flush.items);
+    try std.testing.expectEqual(@as(u64, 6), perf.metrics[@backingInt(runtime_perf_log.Metric.path_max_distinct_group_keys)]);
+    try std.testing.expectEqual(@as(u64, 2), perf.metrics[@backingInt(runtime_perf_log.Metric.path_group_field_evictions)]);
+}
+
+test "pipeline stats record the steering grid build under its own timing, apart from the snapshot" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+    var perf = runtime_perf_log.RuntimePerfLog.init(0);
+    const stats = SimulationPipelineStats{ .steering = .{ .snapshot_ns = 3, .grid_ns = 11 } };
+    stats.recordTo(runtime_perf_log.Context.bind(&perf));
+    try std.testing.expectEqual(@as(u64, 11), perf.timings[@backingInt(runtime_perf_log.Timing.steering_grid)].total_ns);
+    try std.testing.expectEqual(@as(u64, 3), perf.timings[@backingInt(runtime_perf_log.Timing.steering_snapshot)].total_ns);
+}
+
+const StructuralBurstOutcome = struct {
+    failed: bool,
+    bodies: usize,
+};
+
+const structural_burst_max_creates: usize = 20;
+
+/// Commits `create_count` 4-event creates against the structural share of a
+/// `structuralEventHeadroom(1, 0)` caller headroom (15) plus the pipeline's own
+/// `pipeline_structural_event_share` (64) = 79 events, on a minimal pipeline with 2
+/// perception/affect observers. With `saturate_other_producers`, every other producer's share is filled
+/// first, so only the structural share is left in the shared bound.
+fn commitStructuralBurst(create_count: usize, saturate_other_producers: bool) !StructuralBurstOutcome {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var observers: [2]EntityId = undefined;
+    for (&observers, 0..) |*observer, index| {
+        observer.* = try data.createEntity();
+        try data.setMovementBody(observer.*, .{ .position = .{ .x = @floatFromInt(index * 64), .y = 64 } });
+        try data.setAiPerception(observer.*, .{});
+        try data.setAiAffect(observer.*, .{});
+    }
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    const headroom = structuralEventHeadroom(1, 0);
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 4096, 128, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = headroom,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + pipeline.structuralCommandHeadroom());
+    try pipeline.reserve(&frame, 4);
+    const structural_share = maxEventsPerStep(.structural_commit, pipeline.eventBudgets());
+    try std.testing.expectEqual(pipeline_structural_event_share + headroom, structural_share);
+    try std.testing.expectEqual(@as(usize, 79), structural_share);
+    try std.testing.expect(pipeline.perception_max_events_per_step > 0 and pipeline.affect_max_events_per_step > 0);
+
+    frame.beginStep();
+    if (saturate_other_producers) {
+        const filler: SimulationEvent = .{
+            .stage = .domain_reaction,
+            .payload = .{ .affect_threshold_crossed = .{ .entity = observers[0], .drive = .fear, .rising = true } },
+        };
+        for (0..pipeline.eventCapacitySum() - structural_share) |_| try frame.events.appendRequired(filler);
+    }
+    var commands: [structural_burst_max_creates]StructuralCommand = undefined;
+    std.debug.assert(create_count <= commands.len);
+    for (commands[0..create_count], 0..) |*command, index| command.* = responderTemplate(index, .dynamic);
+    try writeStructuralCommands(&frame, commands[0..create_count]);
+    const events_before = frame.events.mergedItems().len;
+    const bodies_before = data.movementBodySliceConst().entities.len;
+
+    _ = commitAndSyncLikeDemo(&pipeline, &frame, &data, &world) catch |err| {
+        try std.testing.expectEqual(error.EventCapacityExceeded, err);
+        // Rejected before mutation: no rows, no events.
+        try std.testing.expectEqual(bodies_before, data.movementBodySliceConst().entities.len);
+        try std.testing.expectEqual(events_before, frame.events.mergedItems().len);
+        return .{ .failed = true, .bodies = data.movementBodySliceConst().entities.len };
+    };
+    return .{ .failed = false, .bodies = data.movementBodySliceConst().entities.len };
+}
+
+test "a structural burst over its own event share fails the same whether other producers are idle or saturated" {
+    // 20 creates x 4 events = 80 > 79: rejected at the structural boundary in both cases,
+    // never admitted by borrowing idle perception/affect/action shares.
+    const over_idle = try commitStructuralBurst(20, false);
+    const over_saturated = try commitStructuralBurst(20, true);
+    try std.testing.expect(over_idle.failed);
+    try std.testing.expectEqual(over_idle, over_saturated);
+
+    // 19 creates x 4 events = 76 <= 79 commits in both cases.
+    const within_idle = try commitStructuralBurst(19, false);
+    const within_saturated = try commitStructuralBurst(19, true);
+    try std.testing.expect(!within_idle.failed);
+    try std.testing.expectEqual(@as(usize, 21), within_idle.bodies);
+    try std.testing.expectEqual(within_idle, within_saturated);
+}
+
+test "a destructible destroy commits through structuralCommitBudget with zero caller structural headroom" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const crate = try data.createEntity();
+    try data.setMovementBody(crate, .{ .position = .{ .x = 0, .y = 0 } });
+    try data.setDestructible(crate, .{ .hit_points = 1 });
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = 0,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + pipeline.structuralCommandHeadroom());
+    try pipeline.reserve(&frame, 4);
+    // The caller budgets nothing; the share is the pipeline's own destructible part.
+    try std.testing.expectEqual(pipeline_structural_event_share, maxEventsPerStep(.structural_commit, pipeline.eventBudgets()));
+
+    frame.beginStep();
+    try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .interact, .target = crate });
+    // The pipeline's own `action_react` producer (what `stageActionReact` runs).
+    const stats = try pipeline.destructible.process(&frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.destroyed);
+    try std.testing.expect(data.isAlive(crate));
+
+    _ = try frame.applyStructuralCommandsBudgeted(&data, pipeline.structuralCommitBudget(0));
+    try std.testing.expect(!data.isAlive(crate));
+}
+
+test "a full-template create costs max_structural_events_per_create events" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    const position = math.Vec2{ .x = 0, .y = 0 };
+    try writeStructuralCommands(&frame, &.{.{ .create_entity = .{
+        .movement_body = .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 },
+        .facing = .{ .direction = .down },
+        .primitive_visual = growth_npc_visual,
+        .asset_reference = .{ .sprite = .demo_tile },
+        .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
+        .collision_response = .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
+        .ai_agent = .{ .active_behavior = .wander },
+        .steering_agent = .{ .agent_radius = 4 },
+        .world_level = 0,
+        .faction = .hostile,
+        .ai_perception = .{},
+        .ai_memory = .{},
+        .ai_affect = .{},
+        .destructible = .{},
+    } }});
+    // Exactly the per-create share: one more event would not fit.
+    const share = structuralEventHeadroom(1, 0);
+    try std.testing.expectError(error.EventCapacityExceeded, frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = share - 1 }));
+    _ = try frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = share });
+    try std.testing.expectEqual(share, frame.events.mergedItems().len);
+}
+
+test "the goal resolve stage writes path_goals, read by steering's status queries and the pathfinding update after it" {
+    const resolve = stageContract(.path_goal_resolve);
+    try std.testing.expect(resolve.reads.contains(.navigation_intents));
+    try std.testing.expect(resolve.writes.contains(.path_goals));
+    try std.testing.expect(stageContract(.steering_update).reads.contains(.path_goals));
+    try std.testing.expect(stageContract(.pathfinding_update).reads.contains(.path_goals));
+    const resolve_at = std.mem.indexOfScalar(StageId, &stage_order, .path_goal_resolve).?;
+    try std.testing.expect(std.mem.indexOfScalar(StageId, &stage_order, .ai_decide).? < resolve_at);
+    try std.testing.expect(resolve_at < std.mem.indexOfScalar(StageId, &stage_order, .steering_update).?);
+}
+
+// A static solid box of `size` from its min corner `position`.
+fn addStaticBox(data: *DataSystem, position: math.Vec2, size: math.Vec2) !void {
+    const box = try data.createEntity();
+    try data.setMovementBody(box, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 });
+    try data.setCollisionBounds(box, .{ .size = size });
+    try data.setCollisionResponse(box, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+}
+
+test "a crowd pursuing a blocked goal whose projection is sealed reads it unavailable on the first step, with one shared projection and no request" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // The crowd's goal: the focus target, the player at (400, 225), nav cell (12, 7). A 3x3
+    // block covers cells (11..13, 6..8); a wall ring at cells x 9..15, y 4..10 seals the
+    // ring of open cells between them, which holds the goal's projection.
+    var player = try Player.spawn(&data);
+    try addStaticBox(&data, .{ .x = 352, .y = 192 }, .{ .x = 96, .y = 96 });
+    try addStaticBox(&data, .{ .x = 288, .y = 128 }, .{ .x = 224, .y = 32 });
+    try addStaticBox(&data, .{ .x = 288, .y = 320 }, .{ .x = 224, .y = 32 });
+    try addStaticBox(&data, .{ .x = 288, .y = 160 }, .{ .x = 32, .y = 160 });
+    try addStaticBox(&data, .{ .x = 480, .y = 160 }, .{ .x = 32, .y = 160 });
+    const crowd = 6;
+    for (0..crowd) |index| {
+        const agent = try data.createEntity();
+        const position = math.Vec2{ .x = 48 + 96 * @as(f32, @floatFromInt(index)), .y = 400 };
+        try data.setMovementBody(agent, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 32 });
+        try data.setAiAgent(agent, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 });
+        try data.setSteeringAgent(agent, .{
+            .agent_radius = 8,
+            .waypoint_tolerance = 4,
+            .avoidance_radius = 48,
+            .avoidance_weight = 1.5,
+            .max_neighbor_samples = 8,
+            .stuck_step_threshold = 3,
+            .replan_cooldown_steps = 4,
+            .unavailable_backoff_steps = 12,
+        });
+    }
+    try markAllAlwaysActive(&data);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 25,
+        .height = 15,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .movement_body_capacity = 16,
+        .structural_headroom = 16,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 16, 16, 16, 16, 16 + 16);
+    try frame.reservePathRequests(1, 16);
+    try pipeline.reserve(&frame, 16);
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    });
+    try std.testing.expectEqual(@as(usize, crowd), frame.navigation_intents.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, crowd), stats.path_goals.blocked);
+    try std.testing.expectEqual(@as(usize, 1), stats.path_goals.distinct);
+    try std.testing.expectEqual(@as(usize, crowd), stats.steering.path_unavailable_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.steering.path_request_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.pathfinding.goal_fallbacks + stats.pathfinding.accepted_requests);
 }

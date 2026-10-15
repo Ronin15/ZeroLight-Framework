@@ -13,7 +13,7 @@ const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
 const InputState = @import("../app/input.zig").InputState;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const inputFile = @import("../app/input.zig");
+const input_file = @import("../app/input.zig");
 const menu_view = @import("menu_view.zig");
 const text = @import("../render/text.zig");
 const PreparedText = text.PreparedText;
@@ -51,7 +51,7 @@ pub const SettingsMenuState = struct {
     selected: usize = 0,
     pending_adjust: i32 = 0,
     title_text: PreparedText = .invalid,
-    item_texts: [item_count]PreparedText = [_]PreparedText{PreparedText.invalid} ** item_count,
+    item_texts: [item_count]PreparedText = @splat(PreparedText.invalid),
     text_dirty: bool = true,
 
     const item_count = 4;
@@ -88,7 +88,7 @@ pub const SettingsMenuState = struct {
     }
 
     pub fn handleEvent(self: *SettingsMenuState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
-        const action = inputFile.actionForPressEvent(event) orelse return false;
+        const action = input_file.actionForPressEvent(event) orelse return false;
         switch (action) {
             .menu_up => {
                 self.changeSelection(-1);
@@ -162,6 +162,10 @@ pub const SettingsMenuState = struct {
     }
 
     pub fn onPause(self: *SettingsMenuState) void {
+        _ = self;
+    }
+
+    pub fn onResume(self: *SettingsMenuState) void {
         _ = self;
     }
 
@@ -380,8 +384,8 @@ test "settings quit action requests exactly one pop not quit" {
     try std.testing.expectEqualStrings("pop", @tagName(transitions.requests.items[0]));
 }
 
-fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
-    for (inputFile.default_key_bindings) |binding| {
+fn keyEventForAction(action: input_file.Action) c.SDL_Event {
+    for (input_file.default_key_bindings) |binding| {
         if (binding.action == action) {
             return c.SDL_Event{ .key = .{
                 .type = c.SDL_EVENT_KEY_DOWN,
@@ -401,8 +405,8 @@ fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
     unreachable;
 }
 
-fn gamepadButtonEventForAction(action: inputFile.Action) c.SDL_Event {
-    for (inputFile.default_gamepad_bindings) |binding| {
+fn gamepadButtonEventForAction(action: input_file.Action) c.SDL_Event {
+    for (input_file.default_gamepad_bindings) |binding| {
         if (binding.action == action) {
             return c.SDL_Event{ .gbutton = .{
                 .type = c.SDL_EVENT_GAMEPAD_BUTTON_DOWN,

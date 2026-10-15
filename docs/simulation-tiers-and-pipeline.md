@@ -3,23 +3,27 @@
 This document describes the implemented fixed-step simulation support in
 `src/game/simulation.zig`. It is a current-code contract for
 `SimulationFrame`, typed transient streams, structural command publication, and
-domain events. Future pipeline/tier roadmap status belongs in
-`docs/framework-implementation-slices.md`; durable ownership guidance belongs in
-`docs/architecture.md`.
+domain events. Rules: `.claude/rules/simulation.md` and
+`.claude/rules/threading.md`. Roadmap status is in the roadmap (index
+`docs/framework-implementation-slices.md`; the planned merged `stage_order` is
+Table T4 in `docs/roadmap/tracks/voidlight-port.md`).
 
 Related docs:
 
 - [architecture.md](architecture.md) for durable frame flow, ownership, and
   future pipeline/tier direction.
-- [framework-implementation-slices.md](framework-implementation-slices.md) for
-  roadmap status and acceptance checklists.
+- [framework-implementation-slices.md](framework-implementation-slices.md) (roadmap
+  index) and the per-slice files under [roadmap/slices/](roadmap/slices/) for
+  roadmap status and acceptance checklists; cross-slice stage order,
+  save, and checksum version tables are in
+  [roadmap/tracks/voidlight-port.md](roadmap/tracks/voidlight-port.md).
 
 ## Module Role
 
 `simulation.zig` owns state-local transient fixed-step data. The state-owned
 `SimulationPipeline` owns fixed-step processor orchestration and reusable
-systems. Persistent gameplay facts stay in `DataSystem`; app, render, audio,
-SDL, allocator, and thread service ownership stay outside simulation payloads.
+systems. Persistent gameplay facts live in `DataSystem`; app, render, audio,
+SDL, allocator, and thread services are never part of simulation payloads.
 
 The module currently provides:
 
@@ -39,7 +43,7 @@ calls `beginStep()`, runs main-thread input writes, delegates ordered processor
 dispatch to its state-owned `SimulationPipeline`, and applies deferred
 structural commands at the explicit commit point.
 
-`SimulationFrame` is transient. Callers should expect stream contents to be
+`SimulationFrame` is transient. Stream contents are
 valid only for the current fixed step after the producing stage has finished
 and before the next `beginStep()`.
 
@@ -59,13 +63,13 @@ commit/domain reactions, and render-prep reservation at the state boundary; it
 passes the borrowed audio command buffer through the pipeline-owned
 `AudioController` rather than holding audio policy itself.
 `SimulationPipeline` opens each step with the backbone **scope pass** (stagger
-advance and the tier/halo/stagger gathers that select which entities enter each
-stage; chunk columns are derived later in a dedicated `chunk_derive` stage from
-each body's final settled position — not in-pass during movement), builds the
-shared **spatial index** (`SpatialIndexSystem`, Slice 28) from that same
-cognition-scoped population for AI separation queries, runs the
-**perception stage** (`PerceptionSystem`, Slice 29) over the cognition-scoped
-`AiPerception` subset against that same spatial index (range/FOV/line-of-sight,
+advance and the two-population gather: unstaggered cognition halo plus the
+stagger-filtered think set; chunk columns are derived later in a dedicated
+`chunk_derive` stage from each body's final settled position — not in-pass
+during movement), builds the shared **spatial index** (`SpatialIndexSystem`,
+Slice 28) from the unstaggered halo for neighbor queries, runs the
+**perception stage** (`PerceptionSystem`, Slice 29) with halo **candidates**
+and think-set **observers** against that same spatial index (range/FOV/line-of-sight,
 writing sensed state to `PerceptionStore`), then the **memory stage**
 (`AiMemorySystem`, Slice 30) over the cognition-scoped `AiPerception`+`AiMemory`
 subset (decaying staleness/familiarity/ring contacts and refreshing from this
@@ -78,7 +82,8 @@ mechanism needed), then the **affect stage**
 (appraising this step's just-written perception/memory state, both
 independently optional per row, plus each agent's own `AiAgent.behavior`, into
 four drives — fear, curiosity, aggression, fatigue — decayed toward per-entity
-baselines), then owns AI navigation-intent production, steering/path status,
+baselines), then owns AI navigation-intent production, the step's goal table
+(`path_goal_resolve`), steering/path status,
 pathfinding, sparse movement-intent application, movement, collision detection,
 collision response, bounds clamp + world-tile gating, and plane traversal — AI,
 movement, and collision run scope-gated through a `scope_dense_indices` option.
@@ -87,15 +92,38 @@ consuming the spatial index (see `docs/architecture.md`). It closes with
 `chunk_derive`, then `action_react` (destructible / action-intent consumer),
 then the **simulation-LOD tier policy**, which assigns each entity a
 cognition/locomotion/kinematic/dormant tier by cube distance and emits deferred
-`set_simulation_tier` commands at the commit seam. See `docs/architecture.md`
-for scope/tier ownership and the gating rules per stage.
+`set_simulation_tier` commands at the commit seam (the Target Model keeps
+`dormant` for inert things only). See `docs/architecture.md` for scope/tier
+ownership and the gating rules per stage.
+
+**Sim-view rule (Slice 49).** Every scope band (cognition halo, tier policy,
+and later coast/spawn bands) derives from the fixed-step
+`SimulationPipelineUpdateContext.sim_view` rect: the scope pass uses
+`WorldSystem.cognitionRegionForWorldRect(sim_view, sim_view_overscan_chunks,
+cognition_halo_chunks)` and the tier policy (and any later scope-band reader)
+uses the pipeline's `simViewRegion(context)`. `GameDemoState.simViewRect()` is
+the only sim-view source (`camera_current`, the camera computed at the end of
+the previous step). No simulation path reads `WorldSystem.visibleChunkRegion()`
+— that window is set by `render` from the interpolated camera for draw culling
+only. `sim_view` is required (a non-optional `Rect`), so no caller can silently
+skip scope gating. Only a world with no chunks yields no region, which keeps the
+full-active fallback (no halo, no stagger filter, no tier changes); pipeline tests
+pass a full-world-extent rect, and a test whose subject is the whole population
+thinking in one step on a chunked world marks it `always_active`.
 
 Late-stage pose order (after movement integrate):
 
 1. `collision_scope_gather` → `collision_detect` → `collision_respond`
 2. `bounds_and_tile_gate` (world bounds clamp + solid-tile gate)
-3. `plane_traversal` (ramp follow / one-level fall; batches landing-cell tile
-   events into one `finishWrite`)
+3. `plane_traversal` (ramp follow / one-level fall): `PlaneEntrySystem` gathers
+   and classifies the step's NPC cell entries on workers into windows reserved at
+   init and at the population seam (a shortfall grows on main before dispatch,
+   counted in `plane_entry_windows_grown`); the reserve decides every traversal in
+   commit order, O(1) per entry, and reserves the carves' write scratch (a carve
+   count past the declared reservation is counted in `dig_plane_scratch_grown`);
+   the carves write as one batched `applyDenseCellWrites` (all or nothing, on the
+   world's terrain-edit tuners under `DigController.carve_controls`), their
+   landing-cell tile events published as one event range and recorded for nav
 4. `chunk_derive` → `action_react` → `tier_policy`
 
 The tile gate runs **after** collision response so a contact push into solid
@@ -105,16 +133,16 @@ movement and the gate. The gate resolves X then Y against the pre-move position
 (wall-sliding) and is a no-op on level 0 (surface is fully walkable there).
 
 NPCs carry a `world_level` component in `DataSystem` (Slice 25E). After movement,
-collision, and the tile gate settle, plane traversal mirrors the player
-ramp/fall cell-entry policy for NPCs and commits level changes on the main
-thread. Off-surface entities are gated by `gateNpcEntitiesToWalkableTiles`
+collision, and the tile gate settle, plane traversal applies the player's
+ramp/fall cell-entry policy (one shared `planeTarget`) to NPCs and commits level
+changes on the main thread. Off-surface entities are gated by `gateNpcEntitiesToWalkableTiles`
 against solid tiles on their current plane; NPC gate and plane-traversal both
 skip dormant-tier entities, since movement never moves them. Steering and
 pathfinding read each entity's `world_level` for `start_level`; level transitions
 at link crossings are committed by plane traversal against physical-cell world
 geometry, not by a path-view field (a `PathView.next_cell_level` field was tried
-and removed as an unused duplicate — see archive Slice 25E in
-`docs/framework-implementation-slices-archive.md`).
+and removed as an unused duplicate — see archive
+[Slice 25E](roadmap/archive/slice-25e.md)).
 
 ## Stage Ordering Contract
 
@@ -127,29 +155,40 @@ before it is written fails the build instead of silently corrupting behavior.
   movement body state, and similar). Some tags bundle several SoA columns one
   system owns together rather than tracking every field.
 - `StageId` names each concrete stage in `update()`.
-- `stageContract(stage)` declares each stage's reads and writes over
-  `PipelineResource`.
-- `stage_order` is the concrete order `update()` runs stages in.
+- `stageContract(stage)` declares each stage's reads, writes, and carried
+  inputs over `PipelineResource`.
+- `stage_order` is a permutation of `StageId`: every tag once, in the order
+  `update()` runs.
 - A `comptime` block walks `stage_order`, accumulating the resources written
   so far, and fails the build (`@compileError`) if any stage's declared reads
   are not a subset of what an earlier stage already wrote.
+- `carried` lists inputs no earlier stage writes. It is disjoint from that
+  stage's reads and writes. Allowed sources are `external_resources`
+  (`action_intents` from input capture, `interest_markers` from world
+  authoring, `structural_events` from the post-step commit) or a later stage's
+  write consumed as previous-step state (`affect_update` carries `ai_behavior`,
+  which `ai_decide` writes later in the same step). A carried resource that an
+  earlier stage writes is a compile error; declare it as a read.
+- Event payloads are four tags. `perception_events` (`entity_perceived`,
+  `entity_lost`) is written by `perception_update` and read by
+  `ai_memory_update`. `affect_events` is `affect_threshold_crossed`.
+  `world_events` covers tile, obstacle, nav, and `destructible_destroyed`
+  payloads. `structural_events` covers `entity_created`, `entity_destroyed`,
+  and `component_changed`. A stage-0 write of `world_events` does not satisfy
+  a later read of a different event tag. The `SimulationEvents` stream is
+  still one buffer; the tags are the ordering contract.
+- `stimuli` is written by `dig_world_edit` (promote, dig append, footstep) and
+  read by `perception_update`. `interest_markers` is carried by `ai_decide`.
 - A stage's `stageContract` lists **every** live resource it touches, including
   this-step values an earlier stage authored: `bounds_and_tile_gate`,
   `plane_traversal`, and `perception_update` all read the dig-authored
   `world_tiles`, and `plane_traversal` also writes `movement_positions` via the
   fall snap. An under-declared read or write leaves a real dependency invisible
   to the comptime check, so a reorder compiles clean.
-- Not every real ordering dependency is expressible as a `PipelineResource`
-  read/write — two stages can depend on call order while sharing no tracked
-  resource, and a transient stream with no `PipelineResource` tag at all (e.g.
-  the `WorldStimulus` values producers write into `frame.stimuli` and
-  `perception_update` reads the same step) carries a producer→consumer
-  dependency the comptime check cannot see. Durable world interest markers
-  (Slice 41) are read-only inputs on `ai_decide` via `WorldSystem.interest_markers`
-  — not frame streams and not `PipelineResource`-tagged. Every such untagged same-step
-  dependency is pinned by a causal-effect test co-located in
-  `simulation_pipeline.zig`: each sets up a scenario where the wrong order
-  produces an observably different result and asserts the correct one. See
+- Ordering the resource tags cannot see is pinned by a causal-effect test
+  co-located in `simulation_pipeline.zig`: each sets up a scenario where the
+  wrong order produces an observably different result and asserts the correct
+  one. See
   "pipeline commits the dig stage's world edit before the tile gate reads
   walkability in the same step", "pipeline commits the dig stage's stimulus
   before perception reads it in the same step", "pipeline emits player footstep
@@ -166,10 +205,12 @@ Checklist for adding or reordering a stage:
    tags already cover them.
 2. Insert its `StageId` into `stage_order` at the position its real
    dependencies require.
-3. Add its `stageContract()` arm.
-4. Add the real call in `update()` at the position `stage_order` requires. If
-   the dependency isn't expressible via `PipelineResource`, add a
-   causal-effect test proving the real call order.
+3. Add its `stageContract()` arm, including `carried` when the input is
+   external or previous-step state.
+4. Add the stage method `runStage` dispatches to. `update()` is an `inline for`
+   over `stage_order` and does not call systems itself. If the dependency
+   isn't expressible via `PipelineResource`, add a causal-effect test proving
+   the real call order.
 5. `zig build check` fails at comptime if a `PipelineResource` dependency is
    missing; a causal-effect test fails if the stages run out of order for a
    dependency the comptime check can't see.
@@ -186,11 +227,9 @@ threaded and serial processors:
 5. Finish writes and consume `mergedItems()`.
 
 Output order comes from range index and per-range write order, not worker
-timing or worker IDs. Producers must finish all writes for a stream before any
-later system consumes it.
-
-Writers assert that the producer writes exactly the count it declared. This is
-part of the contract: count and write phases must stay consistent.
+timing or worker IDs. Producers finish all writes for a stream before any
+later system consumes it, and writers assert that the producer writes exactly
+the count it declared.
 
 ## Frame Streams
 
@@ -217,16 +256,16 @@ part of the contract: count and write phases must stay consistent.
   `.use`/`.signal`. Structural + event capacity is preflighted before queuing
   (dig pattern). `tier_policy` may append more `structural_commands` afterward
   via `RangeOutputStream` multi-producer append — action_react does not own the
-  stream exclusively. The `action_intent_capture` stage is a **contract-only**
-  resource handoff (writes declared so `action_react` can read); wall-clock
-  appends happen in `main_thread_inputs` before `update`. Capacity is the fixed
+  stream exclusively. Action intents are **carried** into `action_react`:
+  wall-clock appends happen in `main_thread_inputs` via `captureActionIntent`
+  before `update`, and no stage writes the stream. Capacity is the fixed
   constant `action_intent_live_capacity` in `simulation.zig` (64), not
   map-scaled. Callers warm with
   `reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity)`
   (one range slot per sequential append, same shape as stimuli). Optional
   producers use `tryAppendActionIntent` so a full bus drops cleanly.
 - `intents`: movement intents (`SimulationIntent.movement` only). Non-locomotion
-  producers must use `action_intents` — never dual-write here.
+  producers use `action_intents` instead.
 - `path_requests`: frame-delayed pathfinding requests.
 - `contacts`: collision contacts for same-step response.
 - `collision_triggers`: collision trigger records.
@@ -234,27 +273,30 @@ part of the contract: count and write phases must stay consistent.
 - `stimuli`: transient per-step positional sensory bus AI hearing can sense,
   read by `PerceptionSystem`. Cleared every `beginStep` and never promoted to
   an event, since a stimulus carries no stable entity identity to transition
-  against. **Producer phase (before `perception_update`):** the pipeline
-  promotes deferred impacts from the prior step, then `DigController.process`
-  may append `.dig`, then the pipeline may append at most one `.footstep`
-  when the player's movement body carries non-trivial velocity. **Deferred
-  producer:** player-involving collision contacts with non-trivial relative
-  motion (or penetration plus relative velocity above fixed thresholds) enqueue
-  `.impact` into a pipeline-owned fixed buffer after `collision_respond`; they
-  are promoted onto the live bus at the start of the *next* step so perception
-  never reads same-step impacts. **Sticky one-shots:** after `perception_update`,
-  the pipeline captures live `.dig` and `.impact` into a fixed sticky buffer for
-  `cognition_stagger_n - 1` additional steps (feeds a hearing scratch merged
-  with the live bus before perception). Footsteps are live-only. Capacities are
-  fixed constants (`stimulus_live_capacity`, `stimulus_sticky_capacity`,
+  against. **Producer phase (before `perception_update`):** `SensoryBus`
+  promotes deferred impacts, `DigController.commitWorldEdit` emits a required
+  `.dig` (a full live bus returns `StimulusCapacityExceeded` and leaves the
+  tile unchanged), then `SensoryBus.appendFootstep` may emit one optional
+  `.footstep`. **Deferred producer:** `SensoryBus.enqueuePlayerImpacts` after
+  `collision_respond` reads the response's observer contacts (the contacts naming
+  the player, merged in range order) and writes `.impact` into the bus's fixed
+  deferred buffer;
+  promote runs on the next step's `dig_world_edit`, so perception never reads
+  same-step impacts. **Sticky one-shots:** `advanceSticky` after perception
+  captures live `.dig` and `.impact` for `cognition_stagger_n - 1` further
+  steps (hearing scratch is live bus plus still-lingering sticky). Footsteps
+  are live-only. Live writes go through `SensoryBus.emit`. Required fails;
+  optional increments the drop counter and returns false. `writeLiveStimulus`
+  is the unchecked frame append under that cap. Sticky and deferred overflow
+  is a counted drop, not a bigger buffer. Capacities are fixed constants
+  (`stimulus_live_capacity`, `stimulus_sticky_capacity`,
   `stimulus_deferred_capacity`, `stimulus_max_impacts_per_step` in
-  `simulation.zig`); overflow drops newest optional/live entries
-  deterministically. Callers warm `stimuli` to `stimulus_live_capacity` during
+  `simulation.zig`). Callers warm `stimuli` to `stimulus_live_capacity` during
   state init (demo/pipeline), not scene-scale-derived counts.
 
-High-volume data should stay in its specialized stream. Do not collapse
-contacts, movement intents, navigation intents, path requests, render-prep
-commands, or structural commands into generic events just for uniformity.
+High-volume data stays in its specialized stream: contacts, movement intents,
+navigation intents, path requests, render-prep commands, and structural
+commands are not events.
 
 Use `reserveStreams`, `reservePathRequests`, `reserveNavigationIntents`, and
 `reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity)`
@@ -291,44 +333,56 @@ Current event stages are:
 - `structural_commit`
 - `domain_reaction`
 
-Events carry stable IDs, enum tags, and small value payloads only. They must not
-carry pointers, app/render/audio handles, asset paths, allocators, loaded
-resources, or service references.
+Events carry stable IDs, enum tags, and small value payloads only
+(`.claude/rules/simulation.md`).
 
 World tile and obstacle events carry compact level/cell regions plus old/new
 tile and obstacle flags. They wake explicit reaction points such as pathfinding
 or future world-collision refreshes; they are not immediate callbacks from
 `WorldSystem`.
 
-Entity-driven obstacle events (`component_changed` on `movement_body`/
-`collision_bounds`/`collision_response`, and `entity_destroyed`) also carry an
-optional `ObstacleWorldRect` — the changed entity's world-space collision AABB,
-before and/or after the change, when it was/is a static navigation obstacle.
-Pathfinding resolves that rect to a nav-cell span (`markNavObstacleRectDirty`)
-and patches only the affected chunks, the same incremental mechanism tile edits
-already use, instead of invalidating the whole level. A null rect (component
-data insufficient to derive one) falls back to a whole-level nav dirty mark.
+Static obstacles reach nav through the static-collider sync, not events: the
+commit seam captures the step's entity changes, `StaticColliderSystem.sync`
+applies them from the entities' final state, and pathfinding records each
+change's old and new cell spans as marks for the same step's nav reaction, which
+patches only those chunks.
 
 `appendRequired` fails if the configured event capacity cannot hold the event.
 `appendDiagnostic` drops on capacity failure and increments dropped stats. Use
 required events for data needed to keep downstream state correct; use
 diagnostic events only for optional observability.
 
+**Per-step bound (Slice 72).** `capacity_limit` is the exhaustive sum of
+`maxEventsPerStep` over every `EventProducerId` (`SimulationPipeline.eventCapacitySum()`),
+set by `SimulationPipeline.reserve` at state init. A new producer adds one arm. A
+required-append failure means a producer exceeded its declared budget, which is a bug, not
+a capacity condition. The `.structural_commit` arm is the pipeline's own share
+(`pipeline_structural_event_share`: one single-event `destroy_entity`/`set_destructible`
+per live action intent from the `action_react` stage) plus the caller's
+`SimulationPipelineConfig.structural_headroom`, which covers only the structural commands
+the caller itself queues. `structural_headroom` also sizes the structural-command
+stream past one tier command per body and its range count past the pipeline's own
+ranges, one range per event.
+
 Events are for low-volume notable changes and transitions, not high-volume
 per-frame per-entity data. Dense per-step results — for example AI separation,
 or perception/memory/affect state — belong in component columns or transient
 range streams; only state transitions (such as acquiring or losing a target,
 or a drive crossing a threshold) become events. This keeps the event stream
-bounded and the per-frame data path allocation-free. New signal payloads must
-still follow the scalar-only rule above and emit through the per-range writers
-so merge order stays deterministic.
+bounded and the per-frame data path allocation-free. Emission order rules are
+in `.claude/rules/threading.md`.
 
 ## Structural Commands
 
 Structural mutation is deferred. Worker ranges and hot processors write
 `StructuralCommand` records into `SimulationFrame.structural_commands`; the
 gameplay state commits them through `SimulationFrame.applyStructuralCommands`
-or `applyStructuralCommandsWithExtraEvents`.
+or `applyStructuralCommandsBudgeted`, which takes a `StructuralCommitBudget`
+(usually `SimulationPipeline.structuralCommitBudget(extra_required_events)`). The
+budgeted commit is all-or-fail: its preflight rejects, before any mutation, a
+commit whose events exceed its own `.structural_commit` share or that, together
+with the `extra_required_events` reserved for after it (the post-commit nav
+reaction), would not fit the shared event bound.
 
 Commit behavior:
 
@@ -339,28 +393,62 @@ Commit behavior:
   structural events.
 - Extra required event capacity can be preflighted before side effects that
   need domain-reaction events in the same step.
+- After publication the state calls `SimulationPipeline.syncPopulationCapacity`
+  (main thread, outside `stage_order`). It is an O(1) compare of committed row
+  counts against tracked logical capacities, and on growth a geometric
+  (`rows + rows/2 + 16`, hot-store aligned) re-reserve of every
+  population-sized pipeline capacity, frame stream, the event bound, and the
+  pathfinding elastic pools. It is the only population growth point. Each frame
+  stream reserves the range count its writers can produce at the tracked
+  population: `navigation_intents` the `ai_decide` ranges, `intents` and
+  `path_requests` steering's avoidance ranges (`steeringStreamRangeCount`), and
+  `structural_commands` the tier-policy ranges, one destructible range, and one
+  per `structural_headroom` event. The
+  contact-dependent capacities (`frame.contacts`, `frame.collision_triggers`, the
+  collision-response intents, band order, trigger pairs, observer contacts, and
+  gather-range staging) are reserved in
+  `SimulationPipeline.reserve`, which the seam re-runs, to the collision pair bound
+  (`CollisionSystem.estimateContactCapacity`: 4 candidate pairs per body of capacity,
+  the bound the collision stores use; each broadphase range slot holds 4 pairs per
+  item it can cover). A step past it, in total or inside one range, grows them on
+  the main thread with identical output and is counted once
+  (`collision_pair_bound_exceeded`).
 
 This keeps partial structural mutations from leaking when validation or event
 capacity fails.
 
 ## Post-Commit Reactions
 
-After structural commit and event publication, `GameDemoState` calls two
-independent `SimulationPipeline` reactions against the same committed event
-stream:
+The commit seam (`GameDemoState`'s `commitStructuralAndReact`) runs, in order:
+`reserveStaticColliders` (collider rows and static nav marks, before the commit),
+the budgeted commit, `captureStaticColliderChanges` (the step's entity changes into
+the collider's persistent dirty list), `syncPopulationCapacity`,
+`syncStaticColliders` (run even when the growth seam failed, so the step's static
+changes land and reach nav; it records their nav marks), then two independent
+reactions against the same committed state:
 
-- `reactToPostCommitNavEvents` delegates to `PathfindingSystem`, interpreting
-  nav-invalidating committed events (`world_tile_changed`,
-  `world_obstacle_changed`, entity-driven obstacle changes) into dirty nav
-  cells, applying the incremental nav-graph patch, and emitting
-  `nav_region_invalidated`.
-- `reactToPostCommitPerceptionEvents` delegates to `PerceptionSystem`,
-  recording localized dirty rects from the same `world_tile_changed`/
-  `world_obstacle_changed` events to incrementally patch its per-level
-  LOS-blocked bitmap cache. It emits no event of its own.
+- `reactToPostCommitNavEvents` delegates to `PathfindingSystem`, which applies
+  every pending nav change (marks the terrain writers and the collider sync
+  recorded, and the world's level, link, and content-revision gaps) as one
+  transaction per step and emits one `nav_region_invalidated` when the graph
+  changed. It runs only after a successful growth seam and collider sync; else
+  every mark stays for the next step.
+- `reactToPostCommitSteeringEvents` delegates to `SteeringSystem`, marking its
+  steering-to-movement index cache stale when the commit renumbered dense rows.
+  Steering reads the synced collider rows directly, so a static change rebuilds
+  nothing steering-side. It always runs.
 
-Both reactions are side effects on fully disjoint state, so call order
-between them does not matter.
+The reactions are side effects on fully disjoint state. The first growth,
+collider, or nav error is returned only after the steering reaction has run. A
+growth or nav failure still leaves steering on the committed statics; a failed
+collider sync keeps steering on the pre-commit rows and keeps its changes for the
+next step's sync. Perception has no reaction: line of sight reads the world's
+chunk terrain directly.
+
+Nav, the static-collider splice, and the terrain edit stages take their range
+controls as one `StageControls` each (`PathfindingSystem.nav_controls`,
+`StaticColliderSystem.splice_controls`, `TerrainEditThreads.controls`), like every
+other threaded stage; production leaves them at their defaults.
 
 ## Current Integration
 
@@ -370,9 +458,9 @@ between them does not matter.
 - starts each fixed step with `beginStep()`;
 - writes player input and audio commands at the main-thread boundary;
 - delegates reusable fixed-step systems and stage order to `SimulationPipeline`;
-- consumes structural/domain/world events to rebuild navigation when static
-  obstacle-affecting changes require it;
-- applies structural commands at the fixed-step commit boundary;
+- applies structural commands at the fixed-step commit boundary and runs the
+  commit seam above (collider sync, population seam, nav and steering
+  reactions);
 - reserves renderer command capacity after structural commits and before render
   submission.
 
@@ -398,13 +486,19 @@ pipeline-owned controller modules.
 
 ## Test Expectations
 
-Tests for this module should prove the stream contracts directly:
+Tests for this module prove the stream contracts directly:
 
 - range streams merge in stable range order;
-- range writers must write the declared count;
+- range writers write the declared count;
 - appended ranges preserve existing merged data;
 - event stats are deterministic by type and stage;
 - capacity overflow distinguishes required events from diagnostic drops;
 - structural command commits publish events only after successful `DataSystem`
   mutation;
-- no test-only payload tags or fake stages are added to production contracts.
+- no test-only payload tags or fake stages in production contracts
+  (`.claude/rules/tests-benchmarks.md`).
+
+The pipeline's threaded-profile tests pin every stage tuner through a comptime
+walk of `SimulationPipeline`'s fields (`pinPipelineThreadedProfiles`): a tuner
+behind a slice, many-item pointer, error union, or union fails the build, so a new
+tuner cannot be missed.

@@ -16,31 +16,38 @@
 //!     tier_policy (same step) and next-step gathers see final world positions.
 //!     Movement/collision gate on tier only — no chunk filter.
 //!
-//! Stage participation rules (Slice 24):
+//! Stage participation rules:
 //!   movement   — tier.allowsMovement()  — no chunk filter
 //!   collision  — tier.allowsCollision() — no chunk filter
-//!   ai/steering — tier.allowsCognition() AND chunk inside cognition halo
-//!                 AND stagger_phase == step % cognition_stagger_n
-//!                 (always_active entities bypass halo and stagger)
+//!   spatial index / perception candidates — cognition halo, no stagger
+//!   ai / perception observers / memory / affect / decide —
+//!                 halo ∩ (stagger_phase == step % cognition_stagger_n)
+//!                 (always_active entities bypass halo and stagger;
+//!                 `cognition_region == null` applies neither halo nor stagger)
 //!
-//! Each O(N)-per-step pass threads like the other processors: the gathers are
-//! stream-compactions (per-range index buffers merged in range order); the tier
-//! policy is a variable-output producer (per-range command buffers merged into
-//! the frame's structural-command stream). Each pass owns an `AdaptiveWorkTuner`
-//! and exposes a `*Serial` variant for the serial bench/test path. Threaded and
-//! serial produce identical results (range-ordered merge preserves scan order).
+//! Each O(N)-per-step pass threads like the other processors. Every pass emits at
+//! most one record per input row, so each range writes into its own
+//! `[range.start, range.end)` window of one item-count-sized output buffer and
+//! stores its count in a cache-line-padded tally; the main thread then compacts the
+//! windows in range order (the gathers) or streams them into the frame's
+//! structural-command stream (the tier policy). No per-range buffers exist, so the
+//! population seam's `reserve` covers every partition the tuner can pick. Each pass
+//! owns an `AdaptiveWorkTuner` and exposes a `*Serial` variant for the serial
+//! bench/test path. Threaded and serial produce identical results (range-ordered
+//! compaction preserves scan order).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const simd = @import("../../core/simd.zig");
 const math = @import("../../core/math.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
-const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const rangeCount = @import("../../app/thread_system.zig").rangeCount;
+const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const ConstScopeColumnsSlice = @import("../data_system.zig").ConstScopeColumnsSlice;
@@ -61,8 +68,6 @@ const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
 /// so worker ranges land on aligned SoA boundaries.
 pub const scope_range_alignment_items: usize = movement_range_alignment_items;
 
-const thread_shared_record_alignment: usize = 64;
-
 /// Per-step threading knobs for the scope passes. Mirrors the other systems:
 /// null `items_per_range` + `adaptive` lets each pass train its own tuner; an
 /// explicit `items_per_range` pins the range size and opts out of the tuner.
@@ -80,10 +85,14 @@ pub const ScopeGatherResult = struct {
     batch: BatchStats = .{},
 };
 
-/// Threaded gather result for the AI pass. Unlike movement/collision it never
-/// short-circuits to full-active, so `indices` is always the merged list.
-pub const AiGatherResult = struct {
-    indices: []const u32,
+/// Threaded gather result for the two AI populations. Unlike movement/collision
+/// it never short-circuits to full-active. `halo` is the unstaggered cognition
+/// set (spatial index + perception candidates); `cognition` is the stagger
+/// subset that thinks this step (observers, memory, affect, AI decide). When
+/// `cognition_region` is null the two slices are identical (no halo, no stagger).
+pub const AiPopulationGatherResult = struct {
+    halo: []const u32,
+    cognition: []const u32,
     batch: BatchStats = .{},
 };
 
@@ -92,21 +101,26 @@ pub const SimulationScopeSystem = struct {
     /// Step counter incremented at the top of each fixed step. Drives stagger.
     step_count: u32,
     /// Warmed collision dense-index list. null return = full-active (no dormant/kinematic with bounds).
-    collision_indices: std.ArrayList(u32) = .empty,
-    /// Warmed AI agent dense-index list (cognition halo + stagger filtered).
-    /// Steering scopes transitively off the navigation intents AI emits for these
-    /// agents, so there is no separate steering gather (a second filter would
-    /// double-gate the already-scoped intents).
-    ai_indices: std.ArrayList(u32) = .empty,
+    /// The threaded gather writes per-range windows into it, then compacts them in place.
+    collision_indices: IndexList = .empty,
+    /// Warmed AI agent dense-index list: cognition-tier agents inside the
+    /// fixed-step `sim_view` cognition halo (no stagger). Spatial index and perception candidates consume this.
+    /// `always_active` agents are included even outside the halo. The threaded gather
+    /// writes per-range windows into it, then compacts them in place.
+    ai_halo_indices: IndexList = .empty,
+    /// Warmed think-set subset of `ai_halo_indices` (stagger_phase == this step,
+    /// plus `always_active`). Perception observers, memory, affect, and AI decide
+    /// consume this. Steering scopes transitively off the navigation intents AI
+    /// emits for these agents, so there is no separate steering gather.
+    ai_cognition_indices: std.ArrayList(u32) = .empty,
     /// Warmed scratch for the per-step auto wake/sleep tier commands this system
-    /// produces. Owned here beside the other scratch, written into the frame's
-    /// structural-command stream by queueTierChangesSerial.
-    scope_tier_commands: std.ArrayList(StructuralCommand) = .empty,
-    /// Per-range index/command scratch for the threaded passes. Each worker writes
-    /// only its assigned slot; the main thread merges serially afterward.
-    collision_gather_ranges: IndexRangeSlotList = .empty,
-    ai_gather_ranges: IndexRangeSlotList = .empty,
-    tier_command_ranges: CommandRangeSlotList = .empty,
+    /// produces (per-range windows on the threaded path). Owned here beside the other
+    /// scratch, streamed into the frame's structural-command stream.
+    scope_tier_commands: CommandList = .empty,
+    /// Per-range tallies (count + diagnostics) for the threaded passes, one padded
+    /// record per range. Each worker writes only its own record; the main thread reads
+    /// them after the batch. The three passes run sequentially, so they share it.
+    range_tallies: GatherTallyList = .empty,
     /// One adaptive tuner per independently-timed threaded pass.
     chunk_derive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     collision_gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -131,24 +145,24 @@ pub const SimulationScopeSystem = struct {
     }
 
     pub fn deinit(self: *SimulationScopeSystem) void {
-        for (self.tier_command_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
-        self.tier_command_ranges.deinit(self.allocator);
-        for (self.ai_gather_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
-        self.ai_gather_ranges.deinit(self.allocator);
-        for (self.collision_gather_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
-        self.collision_gather_ranges.deinit(self.allocator);
+        self.range_tallies.deinit(self.allocator);
         self.scope_tier_commands.deinit(self.allocator);
-        self.ai_indices.deinit(self.allocator);
+        self.ai_cognition_indices.deinit(self.allocator);
+        self.ai_halo_indices.deinit(self.allocator);
         self.collision_indices.deinit(self.allocator);
     }
 
     /// Pre-sizes the per-step scratch index/command lists to `capacity` movement
-    /// bodies so the serial gathers and tier policy are allocation-free after init.
-    /// The threaded per-range slot buffers still warm on their first threaded step.
+    /// bodies and the range tallies to `maxRangeCount(capacity)`, so the serial and
+    /// threaded gathers and tier policy are allocation-free after init under every
+    /// partition the tuner can pick (the outputs are item-count windows, not per-range
+    /// buffers). Grow-only; re-run by the pipeline's population seam.
     pub fn reserve(self: *SimulationScopeSystem, capacity: usize) !void {
         try self.collision_indices.ensureTotalCapacity(self.allocator, capacity);
-        try self.ai_indices.ensureTotalCapacity(self.allocator, capacity);
+        try self.ai_halo_indices.ensureTotalCapacity(self.allocator, capacity);
+        try self.ai_cognition_indices.ensureTotalCapacity(self.allocator, capacity);
         try self.scope_tier_commands.ensureTotalCapacity(self.allocator, capacity);
+        try self.range_tallies.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(capacity, scope_range_alignment_items));
     }
 
     /// Increment the step counter. Call once at the top of each fixed step.
@@ -254,13 +268,21 @@ pub const SimulationScopeSystem = struct {
         if (data.tierCount(.dormant) + data.tierCount(.kinematic) == 0) return .{ .indices = null };
 
         const scope = data.scopeColumnsSliceConst();
-        const selection = selectGatherWork(thread_system, n, config, &self.collision_gather_tuner);
-        try prepareIndexRangeBuffers(self.allocator, &self.collision_gather_ranges, n, selection.items_per_range, selection.range_count);
+        const selection = thread_system.selectBatchProfile(&self.collision_gather_tuner, .{
+            .item_count = n,
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = scope_range_alignment_items,
+            .adaptive = config.adaptive,
+        });
+        try self.prepareRangeWindows(u32, &self.collision_indices, n, selection.range_count);
         var context = CollisionGatherContext{
             .data = data,
             .bounds_entities = bounds.entities,
             .tier = scope.tier,
-            .ranges = self.collision_gather_ranges.items[0..selection.range_count],
+            .out = self.collision_indices.items,
+            .items_per_range = selection.items_per_range,
+            .tallies = self.range_tallies.items,
         };
         const batch = thread_system.parallelForWithOptions(n, &context, collisionGatherJob, .{
             .max_worker_threads = selection.worker_threads,
@@ -268,7 +290,7 @@ pub const SimulationScopeSystem = struct {
             .adaptive_tuner = selection.active_tuner,
             .selected_profile = selection.profile,
         });
-        const merged = try self.mergeIndexRanges(&self.collision_indices, self.collision_gather_ranges.items[0..selection.range_count]);
+        const merged = compactIndexWindows(&self.collision_indices, self.range_tallies.items, selection.items_per_range);
         return .{ .indices = if (merged.any_excluded) self.collision_indices.items else null, .batch = batch };
     }
 
@@ -296,39 +318,49 @@ pub const SimulationScopeSystem = struct {
         return if (any_excluded) self.collision_indices.items else null;
     }
 
-    // ---- AI gather (threaded compaction + diagnostics) -----------------------
+    // ---- AI gather (threaded halo compaction + serial think compact) ---------
 
-    /// Build the AI agent dense-index list. Filters by cognition tier, chunk inside
-    /// cognition halo, and stagger cadence. always_active entities bypass halo +
-    /// stagger. Accumulates stagger_skips and chunk_filtered_entities per range,
-    /// summed on merge for diagnostics.
-    pub fn gatherAiAgentIndices(
+    /// Build the two AI populations for this step. The threaded job writes the
+    /// unstaggered halo (cognition tier + region; `always_active` included).
+    /// A main-thread compact then copies the stagger-matching subset into the
+    /// think list. `cognition_region == null` copies halo into cognition with
+    /// no stagger filter (preserves the full-active fallback).
+    pub fn gatherAiPopulations(
         self: *SimulationScopeSystem,
         data: *const DataSystem,
         cognition_region: ?ActiveRegion,
         stagger_step: u8,
         thread_system: *ThreadSystem,
         config: ScopeConfig,
-    ) !AiGatherResult {
+    ) !AiPopulationGatherResult {
         const ai = data.aiAgentSliceConst();
         const n = ai.entities.len;
         self.stagger_skips = 0;
         self.chunk_filtered_entities = 0;
         if (n == 0) {
-            self.ai_indices.clearRetainingCapacity();
-            return .{ .indices = self.ai_indices.items };
+            self.ai_halo_indices.clearRetainingCapacity();
+            self.ai_cognition_indices.clearRetainingCapacity();
+            return .{ .halo = self.ai_halo_indices.items, .cognition = self.ai_cognition_indices.items };
         }
 
         const scope = data.scopeColumnsSliceConst();
-        const selection = selectGatherWork(thread_system, n, config, &self.ai_gather_tuner);
-        try prepareIndexRangeBuffers(self.allocator, &self.ai_gather_ranges, n, selection.items_per_range, selection.range_count);
+        const selection = thread_system.selectBatchProfile(&self.ai_gather_tuner, .{
+            .item_count = n,
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = scope_range_alignment_items,
+            .adaptive = config.adaptive,
+        });
+        try self.prepareRangeWindows(u32, &self.ai_halo_indices, n, selection.range_count);
         var context = AiGatherContext{
             .data = data,
             .ai_entities = ai.entities,
             .scope = scope,
             .cognition_region = cognition_region,
-            .stagger_step = stagger_step,
-            .ranges = self.ai_gather_ranges.items[0..selection.range_count],
+            .item_count = n,
+            .out = self.ai_halo_indices.items,
+            .items_per_range = selection.items_per_range,
+            .tallies = self.range_tallies.items,
         };
         const batch = thread_system.parallelForWithOptions(n, &context, aiGatherJob, .{
             .max_worker_threads = selection.worker_threads,
@@ -336,31 +368,39 @@ pub const SimulationScopeSystem = struct {
             .adaptive_tuner = selection.active_tuner,
             .selected_profile = selection.profile,
         });
-        const merged = try self.mergeIndexRanges(&self.ai_indices, self.ai_gather_ranges.items[0..selection.range_count]);
-        self.stagger_skips = merged.stagger_skips;
+        const merged = compactIndexWindows(&self.ai_halo_indices, self.range_tallies.items, selection.items_per_range);
         self.chunk_filtered_entities = merged.chunk_filtered;
-        return .{ .indices = self.ai_indices.items, .batch = batch };
+        try self.compactCognitionFromHalo(data, stagger_step, cognition_region != null);
+        return .{
+            .halo = self.ai_halo_indices.items,
+            .cognition = self.ai_cognition_indices.items,
+            .batch = batch,
+        };
     }
 
-    pub fn gatherAiAgentIndicesSerial(
+    pub fn gatherAiPopulationsSerial(
         self: *SimulationScopeSystem,
         data: *const DataSystem,
         cognition_region: ?ActiveRegion,
         stagger_step: u8,
-    ) ![]const u32 {
+    ) !AiPopulationGatherResult {
         const ai = data.aiAgentSliceConst();
-        self.ai_indices.clearRetainingCapacity();
+        self.ai_halo_indices.clearRetainingCapacity();
+        self.ai_cognition_indices.clearRetainingCapacity();
         self.stagger_skips = 0;
         self.chunk_filtered_entities = 0;
-        if (ai.entities.len == 0) return self.ai_indices.items;
-        try self.ai_indices.ensureTotalCapacity(self.allocator, ai.entities.len);
+        if (ai.entities.len == 0) {
+            return .{ .halo = self.ai_halo_indices.items, .cognition = self.ai_cognition_indices.items };
+        }
+        try self.ai_halo_indices.ensureTotalCapacity(self.allocator, ai.entities.len);
+        try self.ai_cognition_indices.ensureTotalCapacity(self.allocator, ai.entities.len);
 
         const scope = data.scopeColumnsSliceConst();
         for (ai.entities, 0..) |ent, i| {
             const di = data.movementBodyDenseIndex(ent) orelse continue;
             if (!scope.tier[di].allowsCognition()) continue;
             if (scope.always_active[di]) {
-                self.ai_indices.appendAssumeCapacity(@intCast(i));
+                self.ai_halo_indices.appendAssumeCapacity(@intCast(i));
                 continue;
             }
             if (cognition_region) |region| {
@@ -368,23 +408,52 @@ pub const SimulationScopeSystem = struct {
                     self.chunk_filtered_entities += 1;
                     continue;
                 }
-                if (scope.stagger_phase[di] != stagger_step) {
-                    self.stagger_skips += 1;
-                    continue;
-                }
             }
-            self.ai_indices.appendAssumeCapacity(@intCast(i));
+            self.ai_halo_indices.appendAssumeCapacity(@intCast(i));
         }
-        return self.ai_indices.items;
+        try self.compactCognitionFromHalo(data, stagger_step, cognition_region != null);
+        return .{ .halo = self.ai_halo_indices.items, .cognition = self.ai_cognition_indices.items };
+    }
+
+    /// Compacts `ai_halo_indices` into `ai_cognition_indices`. When `apply_stagger`
+    /// is false (null cognition region) the lists are identical. `stagger_skips`
+    /// counts in-halo agents whose phase does not match this step.
+    fn compactCognitionFromHalo(
+        self: *SimulationScopeSystem,
+        data: *const DataSystem,
+        stagger_step: u8,
+        apply_stagger: bool,
+    ) !void {
+        const halo = self.ai_halo_indices.items;
+        self.ai_cognition_indices.clearRetainingCapacity();
+        try self.ai_cognition_indices.ensureTotalCapacity(self.allocator, halo.len);
+        if (!apply_stagger) {
+            self.ai_cognition_indices.items.len = halo.len;
+            if (halo.len != 0) @memcpy(self.ai_cognition_indices.items, halo);
+            return;
+        }
+
+        const ai = data.aiAgentSliceConst();
+        const scope = data.scopeColumnsSliceConst();
+        for (halo) |ai_index| {
+            const ent = ai.entities[ai_index];
+            const di = data.movementBodyDenseIndex(ent) orelse continue;
+            if (scope.always_active[di] or scope.stagger_phase[di] == stagger_step) {
+                self.ai_cognition_indices.appendAssumeCapacity(ai_index);
+            } else {
+                self.stagger_skips += 1;
+            }
+        }
     }
 
     // ---- Simulation-LOD tier policy (threaded variable-output producer) -------
 
     /// Runs the per-step tier policy and writes the resulting set_simulation_tier
     /// commands into the frame's structural-command stream. Threads the dense scan
-    /// into per-range command buffers, then merges them into the stream via the
-    /// append protocol so it coexists with any other structural-command producer.
-    /// No-op (no stream touch) when nothing changes. Returns the pass batch.
+    /// into per-range windows of `scope_tier_commands`, then streams each window in
+    /// range order via the append protocol so it coexists with any other
+    /// structural-command producer. No-op (no stream touch) when nothing changes.
+    /// Returns the pass batch.
     pub fn queueTierChanges(
         self: *SimulationScopeSystem,
         data: *const DataSystem,
@@ -398,12 +467,20 @@ pub const SimulationScopeSystem = struct {
         const n = scope.entities.len;
         if (n == 0) return .{};
 
-        const selection = selectGatherWork(thread_system, n, config, &self.tier_policy_tuner);
-        try prepareCommandRangeBuffers(self.allocator, &self.tier_command_ranges, n, selection.items_per_range, selection.range_count);
+        const selection = thread_system.selectBatchProfile(&self.tier_policy_tuner, .{
+            .item_count = n,
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = scope_range_alignment_items,
+            .adaptive = config.adaptive,
+        });
+        try self.prepareRangeWindows(StructuralCommand, &self.scope_tier_commands, n, selection.range_count);
         var context = TierPolicyContext{
             .scope = scope,
             .region = region,
-            .ranges = self.tier_command_ranges.items[0..selection.range_count],
+            .out = self.scope_tier_commands.items,
+            .items_per_range = selection.items_per_range,
+            .tallies = self.range_tallies.items,
         };
         const batch = thread_system.parallelForWithOptions(n, &context, tierPolicyJob, .{
             .max_worker_threads = selection.worker_threads,
@@ -412,21 +489,23 @@ pub const SimulationScopeSystem = struct {
             .selected_profile = selection.profile,
         });
 
+        const tallies = self.range_tallies.items;
         var total: usize = 0;
-        const slots = self.tier_command_ranges.items[0..selection.range_count];
-        for (slots) |*slot| total += slot.buffer.commands.items.len;
+        for (tallies) |*slot| total += slot.tally.count;
         // No tier crossed a band this step → leave the stream untouched so other
         // structural producers' append protocol is unaffected.
         if (total == 0) return batch;
 
-        const range_base = try stream.appendRangeCounts(selection.range_count);
-        for (slots, 0..) |*slot, range_index| {
-            stream.addCount(range_base + range_index, slot.buffer.commands.items.len);
+        const windows = self.scope_tier_commands.items;
+        const range_base = try stream.appendRangeCounts(tallies.len);
+        for (tallies, 0..) |*slot, range_index| {
+            stream.addCount(range_base + range_index, slot.tally.count);
         }
         try stream.prefixAppendedRanges(range_base);
-        for (slots, 0..) |*slot, range_index| {
+        for (tallies, 0..) |*slot, range_index| {
             var writer = stream.rangeWriter(range_base + range_index);
-            for (slot.buffer.commands.items) |command| writer.write(command);
+            const window_start = range_index * selection.items_per_range;
+            for (windows[window_start..][0..slot.tally.count]) |command| writer.write(command);
             writer.finish();
         }
         stream.finishWrite();
@@ -464,130 +543,94 @@ pub const SimulationScopeSystem = struct {
     pub fn collectChunkTierChanges(
         data: *const DataSystem,
         visible_region: ?ActiveRegion,
-        out: *std.ArrayList(StructuralCommand),
+        out: *CommandList,
         allocator: std.mem.Allocator,
     ) !void {
         out.clearRetainingCapacity();
         const region = visible_region orelse return;
         const scope = data.scopeColumnsSliceConst();
-        try out.ensureTotalCapacity(allocator, scope.entities.len);
-        scanTierPolicy(scope, region, 0, scope.entities.len, out);
+        const n = scope.entities.len;
+        try out.ensureTotalCapacity(allocator, n);
+        out.items.len = n;
+        out.items.len = scanTierPolicy(scope, region, 0, n, out.items);
     }
 
     // ---- Shared threading helpers --------------------------------------------
 
-    fn mergeIndexRanges(
+    /// Sizes `out` to `item_count` window slots (range r owns `[r * items_per_range,
+    /// ...)`) and resets `range_count` tallies. Main thread, before dispatch. The ensures
+    /// are grow-only safety nets: after `reserve` at the population seam they never
+    /// allocate, whatever partition the tuner picked (`maxRangeCount`).
+    fn prepareRangeWindows(
         self: *SimulationScopeSystem,
-        out: *std.ArrayList(u32),
-        slots: []IndexRangeSlot,
-    ) !IndexMergeResult {
-        out.clearRetainingCapacity();
-        var result = IndexMergeResult{};
-        var total: usize = 0;
-        for (slots) |*slot| {
-            total += slot.buffer.indices.items.len;
-            if (slot.buffer.any_excluded) result.any_excluded = true;
-            result.stagger_skips += slot.buffer.stagger_skips;
-            result.chunk_filtered += slot.buffer.chunk_filtered;
-        }
-        try out.ensureTotalCapacity(self.allocator, total);
-        for (slots) |*slot| {
-            const start = out.items.len;
-            const len = slot.buffer.indices.items.len;
-            out.items.len = start + len;
-            @memcpy(out.items[start..][0..len], slot.buffer.indices.items);
-        }
-        return result;
+        comptime T: type,
+        out: *std.array_list.Aligned(T, .fromByteUnits(thread_shared_record_alignment)),
+        item_count: usize,
+        range_count: usize,
+    ) !void {
+        try out.ensureTotalCapacity(self.allocator, item_count);
+        out.items.len = item_count;
+        try self.range_tallies.ensureTotalCapacity(self.allocator, range_count);
+        self.range_tallies.items.len = range_count;
+        for (self.range_tallies.items) |*slot| slot.tally = .{};
     }
 };
 
 const IndexMergeResult = struct {
     any_excluded: bool = false,
-    stagger_skips: usize = 0,
     chunk_filtered: usize = 0,
 };
 
-// ---- Per-range scratch buffers ----------------------------------------------
+// ---- Per-range windows and tallies ------------------------------------------
 
-const IndexRangeBuffer = struct {
-    indices: std.ArrayList(u32) = .empty,
+/// Cache-line-aligned output lists: with a 16-item range alignment, every range's
+/// window starts on a cache-line boundary for u32 rows, so concurrent range writes
+/// never share a line.
+const IndexList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
+const CommandList = std.array_list.Aligned(StructuralCommand, .fromByteUnits(thread_shared_record_alignment));
+
+/// One range's output count and diagnostics, written once by the range's job.
+const GatherTally = struct {
+    count: usize = 0,
     // Movement/collision null decision: set when any scanned row was excluded.
     any_excluded: bool = false,
-    // AI diagnostics accumulated per range, summed on merge.
-    stagger_skips: usize = 0,
+    // AI diagnostics accumulated per range, summed on compaction.
     chunk_filtered: usize = 0,
-
-    fn reset(self: *IndexRangeBuffer) void {
-        self.indices.clearRetainingCapacity();
-        self.any_excluded = false;
-        self.stagger_skips = 0;
-        self.chunk_filtered = 0;
-    }
-
-    fn deinit(self: *IndexRangeBuffer, allocator: std.mem.Allocator) void {
-        self.indices.deinit(allocator);
-        self.* = undefined;
-    }
 };
 
-const IndexRangeSlot = struct {
-    // Padding keeps hot append state off shared cache lines across concurrently
-    // written range records.
-    buffer: IndexRangeBuffer = .{},
-    padding: [paddingForCacheLine(IndexRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(IndexRangeBuffer),
+const GatherTallySlot = struct {
+    // Padding keeps concurrently written tallies off shared cache lines.
+    tally: GatherTally = .{},
+    padding: [paddingForCacheLine(GatherTally)]u8 = @splat(0),
 };
 
-const CommandRangeBuffer = struct {
-    commands: std.ArrayList(StructuralCommand) = .empty,
-
-    fn reset(self: *CommandRangeBuffer) void {
-        self.commands.clearRetainingCapacity();
-    }
-
-    fn deinit(self: *CommandRangeBuffer, allocator: std.mem.Allocator) void {
-        self.commands.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-const CommandRangeSlot = struct {
-    buffer: CommandRangeBuffer = .{},
-    padding: [paddingForCacheLine(CommandRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(CommandRangeBuffer),
-};
-
-const IndexRangeSlotList = std.ArrayListAligned(IndexRangeSlot, .fromByteUnits(thread_shared_record_alignment));
-const CommandRangeSlotList = std.ArrayListAligned(CommandRangeSlot, .fromByteUnits(thread_shared_record_alignment));
-
-fn prepareIndexRangeBuffers(
-    allocator: std.mem.Allocator,
-    ranges: *IndexRangeSlotList,
-    item_count: usize,
-    items_per_range: usize,
-    range_count: usize,
-) !void {
-    try ranges.ensureTotalCapacity(allocator, range_count);
-    while (ranges.items.len < range_count) ranges.appendAssumeCapacity(.{});
-    for (ranges.items[0..range_count], 0..) |*slot, range_index| {
-        slot.buffer.reset();
-        // Max one emitted index per scanned row → reserve the range length exactly,
-        // so jobs only append (no overflow, no replay).
-        try slot.buffer.indices.ensureTotalCapacity(allocator, rangeLenForIndex(item_count, items_per_range, range_index));
-    }
+comptime {
+    std.debug.assert(@sizeOf(GatherTallySlot) % thread_shared_record_alignment == 0);
 }
 
-fn prepareCommandRangeBuffers(
-    allocator: std.mem.Allocator,
-    ranges: *CommandRangeSlotList,
-    item_count: usize,
-    items_per_range: usize,
-    range_count: usize,
-) !void {
-    try ranges.ensureTotalCapacity(allocator, range_count);
-    while (ranges.items.len < range_count) ranges.appendAssumeCapacity(.{});
-    for (ranges.items[0..range_count], 0..) |*slot, range_index| {
-        slot.buffer.reset();
-        try slot.buffer.commands.ensureTotalCapacity(allocator, rangeLenForIndex(item_count, items_per_range, range_index));
+const GatherTallyList = std.array_list.Aligned(GatherTallySlot, .fromByteUnits(thread_shared_record_alignment));
+
+/// Compacts the per-range windows of `list` (range r's `count` records at
+/// `r * items_per_range`) into one contiguous prefix in range order and sums the
+/// tallies. The destination never passes the source (each window starts at or after
+/// the running total), so a forward copy is safe, and a step where no range excluded
+/// anything copies nothing.
+fn compactIndexWindows(list: *IndexList, tallies: []const GatherTallySlot, items_per_range: usize) IndexMergeResult {
+    var result: IndexMergeResult = .{};
+    var dst: usize = 0;
+    for (tallies, 0..) |*slot, range_index| {
+        const tally = slot.tally;
+        if (tally.any_excluded) result.any_excluded = true;
+        result.chunk_filtered += tally.chunk_filtered;
+        const src = range_index * items_per_range;
+        std.debug.assert(dst <= src);
+        if (dst != src and tally.count != 0) {
+            @memmove(list.items[dst..][0..tally.count], list.items[src..][0..tally.count]);
+        }
+        dst += tally.count;
     }
+    list.items.len = dst;
+    return result;
 }
 
 // ---- Job contexts and functions ---------------------------------------------
@@ -638,17 +681,20 @@ fn deriveChunkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 /// Vectorized tier-policy scan over a contiguous entity range: computes each
 /// entity's cube LOD distance and target tier four lanes at a time (chebyshev
 /// chunk distance floored by the per-level penalty, then the `tierForChunkDistance`
-/// band ladder via masked selects), then emits a set_simulation_tier command for
-/// every non-pinned entity whose current tier differs. Shared by the serial core
-/// and the threaded job so both stay SIMD; the scalar tail mirrors the scalar
-/// `lodDistance`/`tierForChunkDistance` exactly.
+/// band ladder via masked selects), then writes a set_simulation_tier command for
+/// every non-pinned entity whose current tier differs into `out` (at most one per
+/// scanned row, so `out.len >= end - start`) and returns the count. Shared by the
+/// serial core and the threaded job so both stay SIMD; the scalar tail mirrors the
+/// scalar `lodDistance`/`tierForChunkDistance` exactly.
 fn scanTierPolicy(
     scope: ConstScopeColumnsSlice,
     region: ActiveRegion,
     start: usize,
     end: usize,
-    out: *std.ArrayList(StructuralCommand),
-) void {
+    out: []StructuralCommand,
+) usize {
+    std.debug.assert(out.len >= end - start);
+    var count: usize = 0;
     const min_x = simd.splatInt4(region.min.x);
     const min_y = simd.splatInt4(region.min.y);
     const max_x = simd.splatInt4(region.max_exclusive.x - 1);
@@ -689,7 +735,8 @@ fn scanTierPolicy(
             if (over_loco[lane] > 0) correct_tier = .kinematic;
             if (over_kin[lane] > 0) correct_tier = .dormant;
             if (!scope.always_active[idx] and scope.tier[idx] != correct_tier) {
-                out.appendAssumeCapacity(.{ .set_simulation_tier = .{ .entity = scope.entities[idx], .tier = correct_tier } });
+                out[count] = .{ .set_simulation_tier = .{ .entity = scope.entities[idx], .tier = correct_tier } };
+                count += 1;
             }
         }
     }
@@ -698,31 +745,48 @@ fn scanTierPolicy(
         const distance = region.lodDistance(.{ .x = scope.chunk_x[i], .y = scope.chunk_y[i] }, scope.level[i]);
         const correct_tier = tierForChunkDistance(distance);
         if (scope.tier[i] != correct_tier) {
-            out.appendAssumeCapacity(.{ .set_simulation_tier = .{ .entity = scope.entities[i], .tier = correct_tier } });
+            out[count] = .{ .set_simulation_tier = .{ .entity = scope.entities[i], .tier = correct_tier } };
+            count += 1;
         }
     }
+    return count;
 }
 
 const CollisionGatherContext = struct {
     data: *const DataSystem,
     bounds_entities: []const EntityId,
     tier: []const SimulationTier,
-    ranges: []IndexRangeSlot,
+    /// Item-count output; range r writes only its own `[range.start, range.end)` window.
+    out: []u32,
+    items_per_range: usize,
+    tallies: []GatherTallySlot,
 };
+
+/// Asserts the reserve-before-dispatch invariant shared by every window job: the
+/// range index is within the dispatched tally count, the range is the window the
+/// main-thread compaction expects, and it stays inside the output buffer.
+fn assertRangeWindow(range: ParallelRange, items_per_range: usize, tally_count: usize, out_len: usize) void {
+    std.debug.assert(range.index < tally_count);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.start == range.index * items_per_range);
+    std.debug.assert(range.end <= out_len);
+}
 
 fn collisionGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *CollisionGatherContext = @ptrCast(@alignCast(context));
-    // Guards the reserve-before-dispatch invariant: ranges was sized to this dispatch's range count.
-    std.debug.assert(range.index < job.ranges.len);
-    const buffer = &job.ranges[range.index].buffer;
+    assertRangeWindow(range, job.items_per_range, job.tallies.len, job.out.len);
+    const window = job.out[range.start..range.end];
+    var tally: GatherTally = .{};
     for (range.start..range.end) |i| {
         const di = job.data.movementBodyDenseIndex(job.bounds_entities[i]) orelse continue;
         if (job.tier[di].allowsCollision()) {
-            buffer.indices.appendAssumeCapacity(@intCast(i));
+            window[tally.count] = @intCast(i);
+            tally.count += 1;
         } else {
-            buffer.any_excluded = true;
+            tally.any_excluded = true;
         }
     }
+    job.tallies[range.index].tally = tally;
 }
 
 const AiGatherContext = struct {
@@ -730,81 +794,56 @@ const AiGatherContext = struct {
     ai_entities: []const EntityId,
     scope: ConstScopeColumnsSlice,
     cognition_region: ?ActiveRegion,
-    stagger_step: u8,
-    ranges: []IndexRangeSlot,
+    item_count: usize,
+    /// Item-count output; range r writes only its own `[range.start, range.end)` window.
+    out: []u32,
+    items_per_range: usize,
+    tallies: []GatherTallySlot,
 };
 
 fn aiGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *AiGatherContext = @ptrCast(@alignCast(context));
-    // Guards the reserve-before-dispatch invariant: ranges was sized to this dispatch's range count.
-    std.debug.assert(range.index < job.ranges.len);
-    const buffer = &job.ranges[range.index].buffer;
+    // Window asserts plus range.end vs the candidate count this job walks.
+    assertRangeWindow(range, job.items_per_range, job.tallies.len, job.out.len);
+    std.debug.assert(range.end <= job.item_count);
+    const window = job.out[range.start..range.end];
+    var tally: GatherTally = .{};
     const scope = job.scope;
     for (range.start..range.end) |i| {
         const ent = job.ai_entities[i];
         const di = job.data.movementBodyDenseIndex(ent) orelse continue;
         if (!scope.tier[di].allowsCognition()) continue;
         if (scope.always_active[di]) {
-            buffer.indices.appendAssumeCapacity(@intCast(i));
+            window[tally.count] = @intCast(i);
+            tally.count += 1;
             continue;
         }
         if (job.cognition_region) |region| {
             if (!region.containsChunk(.{ .x = scope.chunk_x[di], .y = scope.chunk_y[di] })) {
-                buffer.chunk_filtered += 1;
-                continue;
-            }
-            if (scope.stagger_phase[di] != job.stagger_step) {
-                buffer.stagger_skips += 1;
+                tally.chunk_filtered += 1;
                 continue;
             }
         }
-        buffer.indices.appendAssumeCapacity(@intCast(i));
+        window[tally.count] = @intCast(i);
+        tally.count += 1;
     }
+    job.tallies[range.index].tally = tally;
 }
 
 const TierPolicyContext = struct {
     scope: ConstScopeColumnsSlice,
     region: ActiveRegion,
-    ranges: []CommandRangeSlot,
+    /// Item-count output; range r writes only its own `[range.start, range.end)` window.
+    out: []StructuralCommand,
+    items_per_range: usize,
+    tallies: []GatherTallySlot,
 };
 
 fn tierPolicyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *TierPolicyContext = @ptrCast(@alignCast(context));
-    // Guards the reserve-before-dispatch invariant: ranges was sized to this dispatch's range count.
-    std.debug.assert(range.index < job.ranges.len);
-    const buffer = &job.ranges[range.index].buffer;
-    scanTierPolicy(job.scope, job.region, range.start, range.end, &buffer.commands);
-}
-
-// ---- Work selection ---------------------------------------------------------
-
-/// Resolves the pass's owned tuner and selects the batch shape through the single
-/// tuner-owned entry point (`ThreadSystem.selectBatchProfile`), so every scope pass
-/// shapes work identically to the downstream systems and `parallelForWithOptions`.
-fn selectGatherWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    config: ScopeConfig,
-    owned_tuner: *AdaptiveWorkTuner,
-) BatchSelection {
-    return thread_system.selectBatchProfile(owned_tuner, .{
-        .item_count = item_count,
-        .items_per_range = config.items_per_range,
-        .max_worker_threads = config.max_worker_threads,
-        .range_alignment_items = scope_range_alignment_items,
-        .adaptive = config.adaptive,
-    });
-}
-
-fn paddingForCacheLine(comptime T: type) usize {
-    const rem = @sizeOf(T) % thread_shared_record_alignment;
-    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
-}
-
-fn rangeLenForIndex(item_count: usize, items_per_range: usize, range_index: usize) usize {
-    const start = range_index * items_per_range;
-    if (start >= item_count) return 0;
-    return @min(start + items_per_range, item_count) - start;
+    assertRangeWindow(range, job.items_per_range, job.tallies.len, job.out.len);
+    const count = scanTierPolicy(job.scope, job.region, range.start, range.end, job.out[range.start..range.end]);
+    job.tallies[range.index].tally = .{ .count = count };
 }
 
 // ---- Tests ------------------------------------------------------------------
@@ -838,9 +877,11 @@ test "SimulationScopeSystem AI gather filters halo and stagger" {
     defer sys.deinit();
 
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
-    const indices = try sys.gatherAiAgentIndicesSerial(&data, region, 0);
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, 0);
 
-    try std.testing.expectEqual(@as(usize, 1), indices.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.cognition.len);
+    try std.testing.expectEqual(pops.halo[0], pops.cognition[0]);
     try std.testing.expectEqual(@as(usize, 1), sys.chunk_filtered_entities);
     try std.testing.expectEqual(@as(usize, 0), sys.stagger_skips);
 }
@@ -863,8 +904,9 @@ test "SimulationScopeSystem AI stagger skips wrong phase" {
     defer sys.deinit();
 
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
-    const indices = try sys.gatherAiAgentIndicesSerial(&data, region, 1);
-    try std.testing.expectEqual(@as(usize, 0), indices.len);
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, 1);
+    try std.testing.expectEqual(@as(usize, 1), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 0), pops.cognition.len);
     try std.testing.expectEqual(@as(usize, 1), sys.stagger_skips);
 }
 
@@ -887,10 +929,106 @@ test "SimulationScopeSystem always_active bypasses halo and stagger" {
     defer sys.deinit();
 
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
-    const indices = try sys.gatherAiAgentIndicesSerial(&data, region, 0);
-    try std.testing.expectEqual(@as(usize, 1), indices.len);
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, 0);
+    try std.testing.expectEqual(@as(usize, 1), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.cognition.len);
     try std.testing.expectEqual(@as(usize, 0), sys.chunk_filtered_entities);
     try std.testing.expectEqual(@as(usize, 0), sys.stagger_skips);
+}
+
+test "AI halo includes off-phase agents; cognition excludes them" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+
+    const phase0 = try data.createEntity();
+    try data.setMovementBody(phase0, .{});
+    try data.setAiAgent(phase0, .{});
+    try data.setSimulationMetadata(phase0, .{
+        .tier = .cognition,
+        .chunk = .{ .x = 1, .y = 1 },
+        .stagger_phase = 0,
+    });
+
+    const phase1 = try data.createEntity();
+    try data.setMovementBody(phase1, .{});
+    try data.setAiAgent(phase1, .{});
+    try data.setSimulationMetadata(phase1, .{
+        .tier = .cognition,
+        .chunk = .{ .x = 1, .y = 1 },
+        .stagger_phase = 1,
+    });
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+
+    const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, 0);
+    try std.testing.expectEqual(@as(usize, 2), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.cognition.len);
+    try std.testing.expectEqual(@as(u32, 0), pops.cognition[0]);
+    try std.testing.expectEqual(@as(usize, 1), sys.stagger_skips);
+    try std.testing.expectEqual(@as(usize, 0), sys.chunk_filtered_entities);
+}
+
+test "null cognition region keeps halo identical to cognition with no stagger" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+
+    const phase0 = try data.createEntity();
+    try data.setMovementBody(phase0, .{});
+    try data.setAiAgent(phase0, .{});
+    try data.setSimulationMetadata(phase0, .{
+        .tier = .cognition,
+        .chunk = .{ .x = 1, .y = 1 },
+        .stagger_phase = 0,
+    });
+
+    const phase1 = try data.createEntity();
+    try data.setMovementBody(phase1, .{});
+    try data.setAiAgent(phase1, .{});
+    try data.setSimulationMetadata(phase1, .{
+        .tier = .cognition,
+        .chunk = .{ .x = 99, .y = 99 },
+        .stagger_phase = 1,
+    });
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+
+    const pops = try sys.gatherAiPopulationsSerial(&data, null, 0);
+    try std.testing.expectEqual(@as(usize, 2), pops.halo.len);
+    try std.testing.expectEqualSlices(u32, pops.halo, pops.cognition);
+    try std.testing.expectEqual(@as(usize, 0), sys.stagger_skips);
+    try std.testing.expectEqual(@as(usize, 0), sys.chunk_filtered_entities);
+}
+
+test "think budget is one stagger slot of an in-halo four-phase set" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+
+    for (0..4) |phase| {
+        const e = try data.createEntity();
+        try data.setMovementBody(e, .{});
+        try data.setAiAgent(e, .{});
+        try data.setSimulationMetadata(e, .{
+            .tier = .cognition,
+            .chunk = .{ .x = 0, .y = 0 },
+            .stagger_phase = @intCast(phase),
+        });
+    }
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+
+    const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 1, .y = 1 });
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, 2);
+    try std.testing.expectEqual(@as(usize, 4), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.cognition.len);
+    try std.testing.expectEqual(@as(u32, 2), pops.cognition[0]);
+    try std.testing.expectEqual(@as(usize, 3), sys.stagger_skips);
 }
 
 test "collectChunkTierChanges assigns all four LOD tiers by distance band" {
@@ -913,7 +1051,7 @@ test "collectChunkTierChanges assigns all four LOD tiers by distance band" {
     _ = try makeScoped(&data, .cognition, .{ .x = 2, .y = 2 }, false); // dist 0, already cognition → no change
     _ = try makeScoped(&data, .cognition, .{ .x = dorm_x, .y = 0 }, true); // always_active far → pinned, skipped
 
-    var out: std.ArrayList(StructuralCommand) = .empty;
+    var out: CommandList = .empty;
     defer out.deinit(allocator);
 
     const visible = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 });
@@ -947,7 +1085,7 @@ test "collectChunkTierChanges demotes off-level entities by the cube distance" {
     try data.setMovementBody(off_level, .{});
     try data.setSimulationMetadata(off_level, .{ .tier = .cognition, .chunk = .{ .x = 1, .y = 1 }, .level = 2 });
 
-    var out: std.ArrayList(StructuralCommand) = .empty;
+    var out: CommandList = .empty;
     defer out.deinit(allocator);
 
     var visible = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 });
@@ -969,7 +1107,7 @@ test "collectChunkTierChanges is a no-op without a visible region" {
     try data.setMovementBody(e, .{});
     try data.setSimulationMetadata(e, .{ .tier = .cognition, .chunk = .{ .x = 99, .y = 99 } });
 
-    var out: std.ArrayList(StructuralCommand) = .empty;
+    var out: CommandList = .empty;
     defer out.deinit(allocator);
 
     try SimulationScopeSystem.collectChunkTierChanges(&data, null, &out, allocator);
@@ -1144,10 +1282,11 @@ test "scoped AI emits navigation intents only for in-halo, on-phase agents" {
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
-    const indices = try sys.gatherAiAgentIndicesSerial(&data, region, sys.staggerStep());
+    const pops = try sys.gatherAiPopulationsSerial(&data, region, sys.staggerStep());
 
-    // Only the in-halo, phase-0 agent survives the gather at step 0.
-    try std.testing.expectEqual(@as(usize, 1), indices.len);
+    // Halo keeps the in-halo off-phase agent; cognition is the on-phase subset.
+    try std.testing.expectEqual(@as(usize, 2), pops.halo.len);
+    try std.testing.expectEqual(@as(usize, 1), pops.cognition.len);
     try std.testing.expectEqual(@as(usize, 1), sys.chunk_filtered_entities);
     try std.testing.expectEqual(@as(usize, 1), sys.stagger_skips);
 
@@ -1162,11 +1301,14 @@ test "scoped AI emits navigation intents only for in-halo, on-phase agents" {
     const ai_slice = data.aiAgentSliceConst();
     const movement_slice = data.movementBodySliceConst();
     try spatial_sys.reserve(ai_slice.entities.len, .{});
-    _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &data, .{ .scope_dense_indices = indices });
+    _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &data, .{ .scope_dense_indices = pops.halo });
 
     var ai_sys = ai.AiSystem.init(allocator);
     defer ai_sys.deinit();
-    _ = try ai_sys.updateSerial(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .scope_dense_indices = indices });
+    _ = try ai_sys.updateSerial(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .scope_dense_indices = pops.cognition,
+        .spatial_population_indices = pops.halo,
+    });
 
     // Exactly one navigation intent, for the selected agent — steering downstream
     // inherits this scoping with no separate gather.
@@ -1285,9 +1427,10 @@ test "threaded ai gather matches serial including diagnostics" {
     defer threaded_sys.deinit();
 
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
-    const serial = try serial_sys.gatherAiAgentIndicesSerial(&data, region, 0);
-    const threaded = (try threaded_sys.gatherAiAgentIndices(&data, region, 0, &threads, .{})).indices;
-    try std.testing.expectEqualSlices(u32, serial, threaded);
+    const serial = try serial_sys.gatherAiPopulationsSerial(&data, region, 0);
+    const threaded = try threaded_sys.gatherAiPopulations(&data, region, 0, &threads, .{});
+    try std.testing.expectEqualSlices(u32, serial.halo, threaded.halo);
+    try std.testing.expectEqualSlices(u32, serial.cognition, threaded.cognition);
     try std.testing.expectEqual(serial_sys.stagger_skips, threaded_sys.stagger_skips);
     try std.testing.expectEqual(serial_sys.chunk_filtered_entities, threaded_sys.chunk_filtered_entities);
 }
@@ -1350,7 +1493,7 @@ test "real worker threads match serial across every scope pass" {
         try data.setMovementBody(e, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
         try data.setCollisionBounds(e, .{ .size = .{ .x = 8, .y = 8 } });
         try data.setAiAgent(e, .{ .active_behavior = if (index % 2 == 0) .pursue else .wander });
-        try data.setSimulationMetadata(e, .{ .tier = @enumFromInt(index % 4), .chunk = .{ .x = @intCast(index % 20), .y = 0 }, .level = @intCast(index % 5), .stagger_phase = @intCast(index % cognition_stagger_n) });
+        try data.setSimulationMetadata(e, .{ .tier = @fromBackingInt(@intCast(index % 4)), .chunk = .{ .x = @intCast(index % 20), .y = 0 }, .level = @intCast(index % 5), .stagger_phase = @intCast(index % cognition_stagger_n) });
     }
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = scope_range_alignment_items });
@@ -1371,9 +1514,10 @@ test "real worker threads match serial across every scope pass" {
     try std.testing.expectEqualSlices(u32, col_serial, col_threaded);
 
     // AI gather (with diagnostics).
-    const ai_serial = try serial_sys.gatherAiAgentIndicesSerial(&data, region, 0);
-    const ai_threaded = (try threaded_sys.gatherAiAgentIndices(&data, region, 0, &threads, fixed)).indices;
-    try std.testing.expectEqualSlices(u32, ai_serial, ai_threaded);
+    const ai_serial = try serial_sys.gatherAiPopulationsSerial(&data, region, 0);
+    const ai_threaded = try threaded_sys.gatherAiPopulations(&data, region, 0, &threads, fixed);
+    try std.testing.expectEqualSlices(u32, ai_serial.halo, ai_threaded.halo);
+    try std.testing.expectEqualSlices(u32, ai_serial.cognition, ai_threaded.cognition);
     try std.testing.expectEqual(serial_sys.stagger_skips, threaded_sys.stagger_skips);
     try std.testing.expectEqual(serial_sys.chunk_filtered_entities, threaded_sys.chunk_filtered_entities);
 
@@ -1396,9 +1540,8 @@ test "real worker threads match serial across every scope pass" {
     }
 }
 
-test "thread-written scope range scratch uses cache-line sized slots" {
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(IndexRangeSlot) % thread_shared_record_alignment);
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(CommandRangeSlot) % thread_shared_record_alignment);
+test "thread-written scope range tallies use cache-line sized slots" {
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(GatherTallySlot) % thread_shared_record_alignment);
 }
 
 test "warmed scope threaded gathers and tier policy do not allocate (FailingAllocator)" {
@@ -1419,7 +1562,7 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
         try data.setCollisionBounds(e, .{ .size = .{ .x = 8, .y = 8 } });
         try data.setAiAgent(e, .{ .active_behavior = if (index % 2 == 0) .pursue else .wander });
         try data.setSimulationMetadata(e, .{
-            .tier = @enumFromInt(index % 4),
+            .tier = @fromBackingInt(@intCast(index % 4)),
             .chunk = .{ .x = @intCast(index % 20), .y = 0 },
             .level = @intCast(index % 5),
             // Fixed at 0 (not `index % cognition_stagger_n`): that modulus shares a
@@ -1449,8 +1592,9 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
     // step's shape (data does not change afterward, so re-running is identical).
     const warm_collision = try sys.gatherCollisionBoundsIndices(&data, &threads, .{});
     try std.testing.expect(warm_collision.indices != null);
-    const warm_ai = try sys.gatherAiAgentIndices(&data, ai_region, 0, &threads, .{});
-    try std.testing.expect(warm_ai.indices.len > 0);
+    const warm_ai = try sys.gatherAiPopulations(&data, ai_region, 0, &threads, .{});
+    try std.testing.expect(warm_ai.halo.len > 0);
+    try std.testing.expect(warm_ai.cognition.len > 0);
     _ = try sys.queueTierChanges(&data, visible_region, &stream, &threads, .{});
     try std.testing.expect(stream.mergedItems().len > 0);
 
@@ -1473,8 +1617,150 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
 
     const collision = try sys.gatherCollisionBoundsIndices(&data, &threads, .{});
     try std.testing.expectEqualSlices(u32, warm_collision.indices.?, collision.indices.?);
-    const ai_result = try sys.gatherAiAgentIndices(&data, ai_region, 0, &threads, .{});
-    try std.testing.expectEqualSlices(u32, warm_ai.indices, ai_result.indices);
+    const ai_result = try sys.gatherAiPopulations(&data, ai_region, 0, &threads, .{});
+    try std.testing.expectEqualSlices(u32, warm_ai.halo, ai_result.halo);
+    try std.testing.expectEqualSlices(u32, warm_ai.cognition, ai_result.cognition);
     _ = try sys.queueTierChanges(&data, visible_region, &stream, &threads, .{});
     try std.testing.expect(stream.mergedItems().len > 0);
+}
+
+test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges allocate nothing and match serial" {
+    // `reserve` alone (no warm pass) covers every partition the tuner can
+    // pick, because each pass writes per-range windows of one item-count buffer and the
+    // tallies are reserved to maxRangeCount. A retune to more ranges allocates nothing.
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    // Rotating starting tiers (as in the real-worker parity test) so every gather leaves
+    // its full-active fast path and the tier policy emits a dense command stream. Not a
+    // range multiple, so the last range is a short tail.
+    const population = scope_range_alignment_items * 8 + 3;
+    for (0..population) |index| {
+        const e = try data.createEntity();
+        try data.setMovementBody(e, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setCollisionBounds(e, .{ .size = .{ .x = 8, .y = 8 } });
+        try data.setAiAgent(e, .{ .active_behavior = if (index % 2 == 0) .pursue else .wander });
+        try data.setSimulationMetadata(e, .{ .tier = @fromBackingInt(@intCast(index % 4)), .chunk = .{ .x = @intCast(index % 20), .y = 0 }, .level = @intCast(index % 5), .stagger_phase = 0 });
+    }
+
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    const ai_region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
+    var visible_region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 2, .y = 8 });
+    visible_region.level = 0;
+
+    // Serial reference.
+    var serial_sys = SimulationScopeSystem.init(allocator);
+    defer serial_sys.deinit();
+    const col_serial = (try serial_sys.gatherCollisionBoundsIndicesSerial(&data)).?;
+    const ai_serial = try serial_sys.gatherAiPopulationsSerial(&data, ai_region, 0);
+    var serial_stream = RangeOutputStream(StructuralCommand).init(allocator);
+    defer serial_stream.deinit();
+    try serial_sys.queueTierChangesSerial(&data, visible_region, &serial_stream);
+    const tier_serial = serial_stream.mergedItems();
+    try std.testing.expect(tier_serial.len > 0);
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    try sys.reserve(population);
+    var stream = RangeOutputStream(StructuralCommand).init(allocator);
+    defer stream.deinit();
+    try stream.reserve(maxRangeCount(population, scope_range_alignment_items), population);
+
+    const original_sys_allocator = sys.allocator;
+    const original_thread_allocator = threads.allocator;
+    const original_stream_allocator = stream.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    sys.allocator = failing_allocator.allocator();
+    threads.allocator = failing_allocator.allocator();
+    stream.allocator = failing_allocator.allocator();
+    defer {
+        sys.allocator = original_sys_allocator;
+        threads.allocator = original_thread_allocator;
+        stream.allocator = original_stream_allocator;
+    }
+
+    for ([_]usize{ 32, 16 }) |items_per_range| {
+        const config = ScopeConfig{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false };
+        const collision = try sys.gatherCollisionBoundsIndices(&data, &threads, config);
+        try std.testing.expect(!collision.batch.ran_inline);
+        try std.testing.expectEqual((population + items_per_range - 1) / items_per_range, collision.batch.range_count);
+        try std.testing.expectEqualSlices(u32, col_serial, collision.indices.?);
+
+        const ai_result = try sys.gatherAiPopulations(&data, ai_region, 0, &threads, config);
+        try std.testing.expectEqualSlices(u32, ai_serial.halo, ai_result.halo);
+        try std.testing.expectEqualSlices(u32, ai_serial.cognition, ai_result.cognition);
+        try std.testing.expectEqual(serial_sys.chunk_filtered_entities, sys.chunk_filtered_entities);
+
+        stream.clearRetainingCapacity();
+        _ = try sys.queueTierChanges(&data, visible_region, &stream, &threads, config);
+        const tier_threaded = stream.mergedItems();
+        try std.testing.expectEqual(tier_serial.len, tier_threaded.len);
+        for (tier_serial, tier_threaded) |want, got| {
+            try std.testing.expectEqual(want.set_simulation_tier.entity.index, got.set_simulation_tier.entity.index);
+            try std.testing.expectEqual(want.set_simulation_tier.tier, got.set_simulation_tier.tier);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
+}
+
+test "scope reserve makes the first single-range threaded gathers and tier policy allocation-free" {
+    const allocator = std.testing.allocator;
+
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    // Same rotating-tier shape as the warmed proof above, so every pass leaves its
+    // full-active fast path, at a population that is not a range multiple.
+    const population: usize = 40;
+    for (0..population) |index| {
+        const e = try data.createEntity();
+        try data.setMovementBody(e, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setCollisionBounds(e, .{ .size = .{ .x = 8, .y = 8 } });
+        try data.setAiAgent(e, .{ .active_behavior = .wander });
+        try data.setSimulationMetadata(e, .{
+            .tier = @fromBackingInt(@intCast(index % 4)),
+            .chunk = .{ .x = @intCast(index % 20), .y = 0 },
+            .level = @intCast(index % 5),
+            .stagger_phase = 0,
+        });
+    }
+
+    // 0 workers: the whole population runs as one inline range (slot 0).
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    try sys.reserve(population);
+    var stream = RangeOutputStream(StructuralCommand).init(allocator);
+    defer stream.deinit();
+    try stream.reserve(1, population);
+
+    const ai_region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
+    var visible_region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 2, .y = 8 });
+    visible_region.level = 0;
+
+    const original_sys_allocator = sys.allocator;
+    const original_thread_allocator = threads.allocator;
+    const original_stream_allocator = stream.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    sys.allocator = failing_allocator.allocator();
+    threads.allocator = failing_allocator.allocator();
+    stream.allocator = failing_allocator.allocator();
+    defer {
+        sys.allocator = original_sys_allocator;
+        threads.allocator = original_thread_allocator;
+        stream.allocator = original_stream_allocator;
+    }
+
+    const collision = try sys.gatherCollisionBoundsIndices(&data, &threads, .{});
+    try std.testing.expect(collision.indices != null);
+    const ai_result = try sys.gatherAiPopulations(&data, ai_region, 0, &threads, .{});
+    try std.testing.expect(ai_result.halo.len > 0);
+    _ = try sys.queueTierChanges(&data, visible_region, &stream, &threads, .{});
+    try std.testing.expect(stream.mergedItems().len > 0);
+    try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
 }

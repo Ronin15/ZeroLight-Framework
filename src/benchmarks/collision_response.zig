@@ -3,6 +3,10 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const CollisionResponse = @import("../game/data_system.zig").CollisionResponse;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -10,32 +14,40 @@ const movement_range_alignment_items = @import("../game/data_system.zig").moveme
 const CollisionResponseStats = @import("../game/systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("../game/systems/collision_response.zig").CollisionResponseSystem;
 const simulation = @import("../game/simulation.zig");
-const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 pub const solid_group = suite.BenchmarkGroup{
     .name = "collision-response-solid",
+    .item_label = "contacts",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runSolidCase,
+    .write_workload = writeResponseWorkload,
 };
 
 pub const bounce_group = suite.BenchmarkGroup{
     .name = "collision-response-bounce",
+    .item_label = "contacts",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runBounceCase,
+    .write_workload = writeResponseWorkload,
 };
 
 pub const trigger_group = suite.BenchmarkGroup{
     .name = "collision-response-trigger",
+    .item_label = "contacts",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runTriggerCase,
+    .write_workload = writeResponseWorkload,
 };
 
 pub const mixed_group = suite.BenchmarkGroup{
     .name = "collision-response-mixed",
+    .item_label = "contacts",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runMixedCase,
+    .write_workload = writeResponseWorkload,
 };
 
 const FixtureMode = enum {
@@ -60,14 +72,6 @@ pub fn defaultItemCounts(profile: suite.Profile) []const usize {
     return suite.eventScaleCounts(profile);
 }
 
-pub fn createSolidFixture(allocator: std.mem.Allocator, contact_count: usize) !Fixture {
-    return createFixture(allocator, contact_count, .solid_static);
-}
-
-pub fn createMixedFixture(allocator: std.mem.Allocator, contact_count: usize) !Fixture {
-    return createFixture(allocator, contact_count, .mixed);
-}
-
 fn runSolidCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runCaseWithMode(allocator, io, options, case, item_count, .solid_static);
 }
@@ -85,7 +89,7 @@ fn runMixedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 }
 
 fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, mode: FixtureMode) !suite.RunStats {
-    if (case.usesThreadSystem()) return suite.RunStats.skipped("collision response v1 has deterministic serial apply");
+    if (case.usesThreadSystem()) return suite.RunStats.skipped("threaded response is benched by collision-response-stage");
 
     var fixture = try createFixture(allocator, item_count, mode);
     defer fixture.deinit();
@@ -101,9 +105,9 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     for (0..options.iterations) |_| {
         prepareFrameForRun(&fixture, mode);
         const start_ns = suite.nowNs(io);
-        last_stats = try system.update(&fixture.data, &fixture.frame);
+        last_stats = try system.updateSerial(&fixture.data, &fixture.frame, EntityId.invalid);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), suite.serialBatch(item_count, movement_range_alignment_items));
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), inlineBatch(item_count, movement_range_alignment_items));
     }
 
     var stats = accumulator.finish();
@@ -114,7 +118,7 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
 fn runOnce(system: *CollisionResponseSystem, fixture: *Fixture, mode: FixtureMode) !CollisionResponseStats {
     prepareFrameForRun(fixture, mode);
-    return try system.update(&fixture.data, &fixture.frame);
+    return try system.updateSerial(&fixture.data, &fixture.frame, EntityId.invalid);
 }
 
 fn prepareFrameForRun(fixture: *Fixture, mode: FixtureMode) void {
@@ -194,4 +198,311 @@ fn addEntity(data: *DataSystem, position_x: f32, position_y: f32, velocity_x: f3
     });
     try data.setCollisionResponse(entity, response);
     return entity;
+}
+
+// `collision-response-stage`: one response step over a contact stream where every body
+// sits in several contacts as `a` and as `b`, written once in a scattered order. Timed:
+// one `update`; the movement columns are restored untimed before each run so every run
+// takes the same branch mix. `--details` reports intents, triggers, the gather and
+// apply shapes, and the time and share on main outside the stage batches.
+pub const stage_group = suite.BenchmarkGroup{
+    .name = "collision-response-stage",
+    .item_label = "contacts",
+    .defaultItemCounts = stageItemCounts,
+    .runCase = runStageCase,
+    .write_workload = writeResponseStageWorkload,
+};
+
+const stage_item_counts = [_]usize{ 1_024, 4_096, 16_384 };
+// First stride tried for the scattered contact order; stepped by 2 until coprime with
+// the contact count so the order visits every contact once.
+const stage_scatter_stride_seed: usize = 7_919;
+const stage_bounce_restitution: f32 = 0.5;
+
+fn stageItemCounts(_: suite.Profile) []const usize {
+    return &stage_item_counts;
+}
+
+const StageFixture = struct {
+    data: DataSystem,
+    frame: SimulationFrame,
+    observer: EntityId,
+    expected_intents: usize,
+    expected_triggers: usize,
+    expected_observer_contacts: usize,
+    // Movement columns as built, restored before each run.
+    position_x: []f32,
+    position_y: []f32,
+    velocity_x: []f32,
+    velocity_y: []f32,
+
+    fn deinit(self: *StageFixture, allocator: std.mem.Allocator) void {
+        allocator.free(self.velocity_y);
+        allocator.free(self.velocity_x);
+        allocator.free(self.position_y);
+        allocator.free(self.position_x);
+        self.frame.deinit();
+        self.data.deinit();
+        self.* = undefined;
+    }
+
+    fn restoreMovement(self: *StageFixture) void {
+        const movement = self.data.movementBodySlice();
+        @memcpy(movement.position_x, self.position_x);
+        @memcpy(movement.position_y, self.position_y);
+        @memcpy(movement.velocity_x, self.velocity_x);
+        @memcpy(movement.velocity_y, self.velocity_y);
+    }
+};
+
+fn stageBodyResponse(body: usize) CollisionResponse {
+    if (body % 16 == 3) return .{ .mode = .trigger, .mobility = .static, .restitution = 0 };
+    if (body % 8 == 7) return .{ .mode = .solid, .mobility = .static, .restitution = 0 };
+    if (body % 4 == 1) return .{ .mode = .bounce, .mobility = .dynamic, .restitution = stage_bounce_restitution };
+    return .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 };
+}
+
+// Contact `index` pairs body `index / 2` with the body one or two rows after it.
+fn stageContactBodies(index: usize) [2]usize {
+    const a = index / 2;
+    return .{ a, a + 1 + index % 2 };
+}
+
+// Axis normals cycling through all four directions by contact index.
+fn stageContactNormal(index: usize) [2]f32 {
+    return switch (index % 4) {
+        0 => .{ 1, 0 },
+        1 => .{ -1, 0 },
+        2 => .{ 0, 1 },
+        else => .{ 0, -1 },
+    };
+}
+
+// Intents the response emits for a non-trigger contact between these two bodies.
+fn stageExpectedIntents(a: CollisionResponse, b: CollisionResponse) usize {
+    const a_dynamic = a.mobility == .dynamic;
+    const b_dynamic = b.mobility == .dynamic;
+    if (!a_dynamic and !b_dynamic) return 0;
+    if (a_dynamic != b_dynamic) return 1;
+    if ((a.mode == .bounce) != (b.mode == .bounce)) return 1;
+    return 2;
+}
+
+fn stageScatterStride(count: usize) usize {
+    if (count <= 1) return 1;
+    var stride = stage_scatter_stride_seed;
+    while (std.math.gcd(stride, count) != 1) stride += 2;
+    return stride;
+}
+
+// `contact_count / 2 + 2` bodies, body `j` on movement row `j`, with nonzero velocities of
+// mixed sign; the contacts carry correct movement hints and are written in
+// `order * stride mod contact_count` order. The observer is body 0.
+fn buildStageFixture(allocator: std.mem.Allocator, contact_count: usize) !StageFixture {
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const body_count = contact_count / 2 + 2;
+    for (0..body_count) |body| {
+        const x: f32 = @floatFromInt((body % 256) * 4);
+        const y: f32 = @floatFromInt((body / 256) * 4);
+        const speed_x: f32 = 10.0 + @as(f32, @floatFromInt(body % 7));
+        const speed_y: f32 = 8.0 + @as(f32, @floatFromInt(body % 5));
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{
+            .position = .{ .x = x, .y = y },
+            .previous_position = .{ .x = x, .y = y },
+            .velocity = .{
+                .x = if (body % 2 == 0) speed_x else -speed_x,
+                .y = if (body % 3 == 0) -speed_y else speed_y,
+            },
+            .speed = 0,
+        });
+        try data.setCollisionResponse(entity, stageBodyResponse(body));
+    }
+    const entities = data.movementBodySliceConst().entities;
+    std.debug.assert(entities.len == body_count);
+    for (entities, 0..) |entity, row| {
+        std.debug.assert(data.movementBodyDenseIndex(entity).? == row);
+    }
+
+    var frame = SimulationFrame.init(allocator);
+    errdefer frame.deinit();
+    try frame.reserveStreams(1, 0, 0, contact_count, contact_count, 0);
+    try frame.contacts.prepareRangeCounts(1);
+    frame.contacts.addCount(0, contact_count);
+    try frame.contacts.prefix();
+    var writer = frame.contacts.rangeWriter(0);
+    const stride = stageScatterStride(contact_count);
+    var expected_intents: usize = 0;
+    var expected_triggers: usize = 0;
+    var expected_observer_contacts: usize = 0;
+    for (0..contact_count) |order| {
+        const index = order * stride % contact_count;
+        const bodies = stageContactBodies(index);
+        const normal = stageContactNormal(index);
+        writer.write(.{
+            .a = entities[bodies[0]],
+            .b = entities[bodies[1]],
+            .a_movement_index = bodies[0],
+            .b_movement_index = bodies[1],
+            .normal_x = normal[0],
+            .normal_y = normal[1],
+            .penetration = @as(f32, @floatFromInt(index % 5 + 1)) * 0.25,
+        });
+        if (bodies[0] == 0) expected_observer_contacts += 1;
+        const a_response = stageBodyResponse(bodies[0]);
+        const b_response = stageBodyResponse(bodies[1]);
+        if (a_response.mode == .trigger or b_response.mode == .trigger) {
+            expected_triggers += 1;
+        } else {
+            expected_intents += stageExpectedIntents(a_response, b_response);
+        }
+    }
+    writer.finish();
+    frame.contacts.finishWrite();
+    std.debug.assert(frame.contacts.mergedItems().len == contact_count);
+
+    const movement = data.movementBodySliceConst();
+    const position_x = try allocator.dupe(f32, movement.position_x);
+    errdefer allocator.free(position_x);
+    const position_y = try allocator.dupe(f32, movement.position_y);
+    errdefer allocator.free(position_y);
+    const velocity_x = try allocator.dupe(f32, movement.velocity_x);
+    errdefer allocator.free(velocity_x);
+    const velocity_y = try allocator.dupe(f32, movement.velocity_y);
+
+    return .{
+        .data = data,
+        .frame = frame,
+        .observer = entities[0],
+        .expected_intents = expected_intents,
+        .expected_triggers = expected_triggers,
+        .expected_observer_contacts = expected_observer_contacts,
+        .position_x = position_x,
+        .position_y = position_y,
+        .velocity_x = velocity_x,
+        .velocity_y = velocity_y,
+    };
+}
+
+fn stageRunOnce(
+    system: *CollisionResponseSystem,
+    fixture: *StageFixture,
+    thread_system: ?*ThreadSystem,
+    case: suite.BenchmarkCase,
+) !CollisionResponseStats {
+    const stats = if (thread_system) |threads|
+        try system.update(&fixture.data, &fixture.frame, fixture.observer, threads, .{
+            .items_per_range = stageItemsPerRange(case),
+            .max_worker_threads = case.maxWorkerThreads(),
+            .adaptive = case.adaptive,
+        })
+    else
+        try system.updateSerial(&fixture.data, &fixture.frame, fixture.observer);
+    std.debug.assert(stats.contact_count == fixture.frame.contacts.mergedItems().len);
+    std.debug.assert(stats.intent_count == fixture.expected_intents);
+    std.debug.assert(stats.trigger_count == fixture.expected_triggers);
+    std.debug.assert(fixture.frame.collision_triggers.mergedItems().len == fixture.expected_triggers);
+    std.debug.assert(stats.observer_contact_count == fixture.expected_observer_contacts);
+    std.debug.assert(system.observerContacts(&fixture.frame, fixture.observer).len == fixture.expected_observer_contacts);
+    return stats;
+}
+
+fn stageItemsPerRange(case: suite.BenchmarkCase) ?usize {
+    if (case.adaptive) return null;
+    return case.itemsPerRange(movement_range_alignment_items) orelse
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, movement_range_alignment_items);
+}
+
+// The fixed-range adaptive case's apply tuner: one band per range, so the fixed control
+// dispatches the bands rather than keeping them in one inline range.
+fn stageBandTunerForCase(case: suite.BenchmarkCase) ?AdaptiveWorkTuner {
+    if (!case.adaptive or case.adaptive_range_mode != .fixed) return null;
+    return AdaptiveWorkTuner.init(.{ .initial_range_items = 1, .smallest_range_items = 1, .largest_range_items = 1 });
+}
+
+// An inline-settled gather never dispatches the apply, so its tuner settles alone.
+fn stageTunersSettled(system: *const CollisionResponseSystem) bool {
+    const gather = &system.gather_tuner;
+    return gather.isSettled() and (!gather.report().has_threaded_profile or system.apply_tuner.isSettled());
+}
+
+fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+
+    var fixture = try buildStageFixture(allocator, item_count);
+    defer fixture.deinit(allocator);
+    var system = CollisionResponseSystem.init(allocator);
+    defer system.deinit();
+    try system.reserveForContacts(item_count);
+    if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
+        system.gather_tuner = tuner;
+        system.apply_tuner = stageBandTunerForCase(case).?;
+    }
+
+    // A fixed threaded case with more than one range of contacts dispatches the gather.
+    const expect_dispatch = if (thread_ptr) |thread_system|
+        !case.adaptive and thread_system.workerThreadCount() > 0 and item_count > stageItemsPerRange(case).?
+    else
+        false;
+
+    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+        fixture.restoreMovement();
+        _ = try stageRunOnce(&system, &fixture, thread_ptr, case);
+    }
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while (!stageTunersSettled(&system) and settle_guard < settle_limit) : (settle_guard += 1) {
+            fixture.restoreMovement();
+            _ = try stageRunOnce(&system, &fixture, thread_ptr, case);
+        }
+    }
+    const settled_before_measurement = if (case.adaptive) stageTunersSettled(&system) else false;
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var main_total: u128 = 0;
+    var last_stats = CollisionResponseStats{};
+    for (0..options.iterations) |_| {
+        fixture.restoreMovement();
+        const start_ns = suite.nowNs(io);
+        last_stats = try stageRunOnce(&system, &fixture, thread_ptr, case);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        std.debug.assert(!expect_dispatch or (last_stats.gather_batch.range_count > 1 and !last_stats.gather_batch.ran_inline));
+        accumulator.record(elapsed_ns, last_stats.gather_batch);
+        // Main outside the stage batches: the main thread's own ranges inside a
+        // dispatched batch are not counted (see the batch's `main_ranges`).
+        main_total += elapsed_ns -| offMainNs(last_stats.gather_batch) -| offMainNs(last_stats.apply_batch);
+    }
+
+    var stats = accumulator.finish();
+    stats.candidate_pairs = last_stats.trigger_count;
+    stats.output_count = last_stats.intent_count;
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.apply_batch);
+    if (stats.iterations > 0) {
+        stats.terrain_edit_phases = .{ .main_ns = @intCast(main_total / stats.iterations) };
+    }
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(system.gather_tuner.report(), settled_before_measurement);
+        stats.secondary_work_tuning = suite.workTuningSummary(system.apply_tuner.report(), settled_before_measurement);
+    }
+    return stats;
+}
+
+fn writeResponseWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("triggers={} intents={}", .{ stats.candidate_pairs, stats.output_count });
+}
+
+fn writeResponseStageWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("intents={} triggers={}", .{ stats.output_count, stats.candidate_pairs });
+    if (view == .summary) return;
+    try writer.writeAll(" gather=");
+    try suite.writeStageShape(writer, stats.batch);
+    try writer.writeAll(" apply=");
+    try suite.writeStageShape(writer, stats.secondary_batch orelse .{});
+    try suite.writeShare(writer, "main_outside_stage_batches", (stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{}).main_ns, stats.mean_ns);
 }

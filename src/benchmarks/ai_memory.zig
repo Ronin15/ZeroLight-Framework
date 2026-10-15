@@ -20,12 +20,15 @@ const AiMemoryStats = @import("../game/systems/ai_memory.zig").AiMemoryStats;
 const AiMemorySystem = @import("../game/systems/ai_memory.zig").AiMemorySystem;
 const ai_memory_range_alignment_items = @import("../game/systems/ai_memory.zig").ai_memory_range_alignment_items;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 pub const group = suite.BenchmarkGroup{
     .name = "ai-memory",
+    .item_label = "AI agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeMemoryWorkload,
 };
 
 // Every Nth agent (creation order) gets a synthetic `entity_perceived` event
@@ -90,13 +93,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         system.decay_tuner = tuner;
     }
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     for (0..options.warmup_iterations) |_| {
@@ -175,5 +172,9 @@ fn injectPerceivedEvents(frame: *SimulationFrame, ai_slice: ConstAiAgentSlice, t
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(ai_memory_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, ai_memory_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, ai_memory_range_alignment_items);
+}
+
+fn writeMemoryWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("processed={} refreshed={}", .{ stats.candidate_pairs, stats.output_count });
 }

@@ -3,9 +3,9 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Pure, zero-allocation, zero-vtable utility-arbitration + sticky-selection +
-//! goal-resolution contract for Slice 32. Deliberately decoupled from
+//! goal-resolution contract. Deliberately decoupled from
 //! `AiPerception`/`AiMemory`/`AiAffect` row types: `Signals` is flat data any
-//! future producer (world markers, Slice 41) can populate without depending
+//! future producer (e.g. world markers) can populate without depending
 //! on today's component layout. `ai.zig` is the only current caller: it
 //! gathers `Signals` per row, then chains `scoreBehaviors` -> `selectSticky`
 //! -> `resolveGoal`. This module has no dependency on `ai.zig`, the
@@ -24,7 +24,7 @@ const PathRequestKind = @import("../simulation.zig").PathRequestKind;
 pub const behavior_count: usize = 5;
 pub const Scores = [behavior_count]f32;
 
-const drive_count: usize = @typeInfo(AiAffectDrive).@"enum".fields.len;
+const drive_count: usize = @typeInfo(AiAffectDrive).@"enum".field_names.len;
 
 /// Flat per-agent signal snapshot: drive values, perception, memory, a
 /// caller-gathered cohere neighbor mean, and an explicit opt-in fallback
@@ -50,7 +50,7 @@ pub const Signals = struct {
     heard_stimulus_x: f32 = 0,
     heard_stimulus_y: f32 = 0,
 
-    // World interest marker (Slice 41), gathered read-only from `WorldSystem`.
+    // World interest marker, gathered read-only from `WorldSystem`.
     interest_present: bool = false,
     interest_x: f32 = 0,
     interest_y: f32 = 0,
@@ -63,10 +63,10 @@ pub const Signals = struct {
     memory_last_known_y: f32 = 0,
     memory_staleness: f32 = 0,
     memory_max_staleness: f32 = 0,
-    memory_ring_entity: [ai_memory_ring_capacity]EntityId = [_]EntityId{EntityId.invalid} ** ai_memory_ring_capacity,
-    memory_ring_x: [ai_memory_ring_capacity]f32 = [_]f32{0} ** ai_memory_ring_capacity,
-    memory_ring_y: [ai_memory_ring_capacity]f32 = [_]f32{0} ** ai_memory_ring_capacity,
-    memory_ring_age: [ai_memory_ring_capacity]f32 = [_]f32{0} ** ai_memory_ring_capacity,
+    memory_ring_entity: [ai_memory_ring_capacity]EntityId = @splat(EntityId.invalid),
+    memory_ring_x: [ai_memory_ring_capacity]f32 = @splat(0),
+    memory_ring_y: [ai_memory_ring_capacity]f32 = @splat(0),
+    memory_ring_age: [ai_memory_ring_capacity]f32 = @splat(0),
 
     // Cohere neighbor mean, gathered by the caller via the shared spatial
     // index (see ai.zig's separationNeighborVisit-style visitor) — this
@@ -209,7 +209,7 @@ fn memoryTerm(behavior: AiBehavior, signals: Signals) f32 {
 /// Table-driven utility score per behavior:
 /// `score[b] = gain[b] * sum_d(drive[d] * weight[d][b]) + perceptionTerm(b) + memoryTerm(b)`.
 /// The drive loop (`for (0..drive_count)`) is the extensibility contract for
-/// a future fifth drive (Slice 42): appending a drive means a new enum tag
+/// a future fifth drive: appending a drive means a new enum tag
 /// and a new table row, never a change to this control flow.
 pub fn scoreBehaviors(signals: Signals, gains: PersonalityGains) Scores {
     const drive_values = [drive_count]f32{ signals.fear, signals.curiosity, signals.aggression, signals.fatigue };
@@ -229,7 +229,7 @@ pub fn scoreBehaviors(signals: Signals, gains: PersonalityGains) Scores {
     // this behavior at all," which the bonus terms don't get to bypass.
     var scores: Scores = undefined;
     for (0..behavior_count) |b| {
-        const behavior: AiBehavior = @enumFromInt(b);
+        const behavior: AiBehavior = @fromBackingInt(@intCast(b));
         scores[b] = gainFor(behavior, gains) * (weighted[b] + perceptionTerm(behavior, signals) + memoryTerm(behavior, signals));
     }
     return scores;
@@ -265,7 +265,7 @@ pub fn selectSticky(
     sticky_bonus: f32,
     min_delta: f32,
 ) StickySelection {
-    const previous_index = @intFromEnum(previous);
+    const previous_index = @backingInt(previous);
     if (commitment_remaining > 0) {
         const hold_threshold = scores[previous_index] + sticky_bonus + min_delta;
         var challenged = false;
@@ -434,8 +434,8 @@ test "scoreBehaviors is a pure zero-allocation function (provable by signature a
     // No allocator parameter exists on this function at all -- the type of
     // scoreBehaviors itself is the proof, not a FailingAllocator run.
     const info = @typeInfo(@TypeOf(scoreBehaviors)).@"fn";
-    inline for (info.params) |param| {
-        try testing.expect(param.type != std.mem.Allocator);
+    inline for (info.param_types) |param_type| {
+        try testing.expect(param_type != std.mem.Allocator);
     }
 }
 
@@ -453,8 +453,8 @@ test "scoreBehaviors is table-driven: identical perception/memory with only driv
     aggressive.aggression = 1.0;
     const aggression_scores = scoreBehaviors(aggressive, unitGains());
 
-    const fear_winner: AiBehavior = @enumFromInt(argmax(fear_scores));
-    const aggression_winner: AiBehavior = @enumFromInt(argmax(aggression_scores));
+    const fear_winner: AiBehavior = @fromBackingInt(@intCast(argmax(fear_scores)));
+    const aggression_winner: AiBehavior = @fromBackingInt(@intCast(argmax(aggression_scores)));
 
     try testing.expectEqual(AiBehavior.flee, fear_winner);
     try testing.expectEqual(AiBehavior.pursue, aggression_winner);
@@ -546,8 +546,7 @@ test "resolveGoal pursue prefers a visible threat over stale memory over focus_t
 test "resolveGoal pursue rejects fresh memory of a different entity than focus_target" {
     // Memory is fresh and valid but belongs to a different entity than the
     // configured focus_target fallback -- it must not be trusted as a
-    // substitute for the live focus goal (mirrors the pre-Slice-32 seek_entity
-    // identity check).
+    // substitute for the live focus goal.
     const signals = Signals{
         .memory_last_known_target = EntityId{ .index = 9, .generation = 1 },
         .memory_last_known_x = 30,
@@ -605,7 +604,7 @@ test "scoreBehaviors investigate interest marker bonus is 0.35 with unit gains" 
         .interest_y = 0,
     };
     const scores = scoreBehaviors(signals, unitGains());
-    const investigate_idx = @intFromEnum(AiBehavior.investigate);
+    const investigate_idx = @backingInt(AiBehavior.investigate);
     try testing.expectApproxEqAbs(investigate_interest_marker_bonus, scores[investigate_idx], 0.001);
 }
 
@@ -708,6 +707,6 @@ test "scoreBehaviors gives a pursue-gained agent with only an opt-in focus_targe
     };
     const gains = PersonalityGains{ .wander = 1.0, .pursue = 1.0, .flee = 0, .investigate = 0, .cohere = 0 };
     const scores = scoreBehaviors(signals, gains);
-    try testing.expectEqual(AiBehavior.pursue, @as(AiBehavior, @enumFromInt(argmax(scores))));
-    try testing.expect(scores[@intFromEnum(AiBehavior.pursue)] > scores[@intFromEnum(AiBehavior.wander)]);
+    try testing.expectEqual(AiBehavior.pursue, @as(AiBehavior, @fromBackingInt(@intCast(argmax(scores)))));
+    try testing.expect(scores[@backingInt(AiBehavior.pursue)] > scores[@backingInt(AiBehavior.wander)]);
 }

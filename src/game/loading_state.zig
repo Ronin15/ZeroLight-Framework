@@ -11,7 +11,7 @@ const WorldBuildConfig = @import("world_system.zig").WorldBuildConfig;
 const RuntimeAudioSettings = @import("settings_menu_state.zig").RuntimeAudioSettings;
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;
-const inputFile = @import("../app/input.zig");
+const input_file = @import("../app/input.zig");
 const RenderContext = @import("../app/state.zig").RenderContext;
 const State = @import("../app/state.zig").State;
 const StateStack = @import("../app/state.zig").StateStack;
@@ -91,7 +91,7 @@ pub const LoadingState = struct {
         // (confirm) replace back to the main menu with preserved audio settings.
         // Pending stays non-consuming so FrameCommands can still observe process quit.
         if (self.phase != .failed) return false;
-        const action = inputFile.actionForPressEvent(event) orelse return false;
+        const action = input_file.actionForPressEvent(event) orelse return false;
         switch (action) {
             .quit, .resume_game => {
                 try self.returnToMainMenu(transitions);
@@ -155,6 +155,10 @@ pub const LoadingState = struct {
     }
 
     pub fn onPause(self: *LoadingState) void {
+        _ = self;
+    }
+
+    pub fn onResume(self: *LoadingState) void {
         _ = self;
     }
 
@@ -549,16 +553,22 @@ test "loading state render failure leaves rendered_once false" {
 
     var renderer = try headlessRendererForTest(std.testing.allocator);
     defer deinitHeadlessRenderer(&renderer, std.testing.allocator);
-    // Frame-reserved with zero capacity: the first sprite submit overflows and
-    // aborts before the latch, proving a partial draw cannot unlock world build.
-    renderer.batch.frame_reserved = true;
+    // Frame-reserved with zero capacity: the first sprite submit must grow, and the
+    // failing allocator makes that growth fail, aborting before the latch. Proves a
+    // partial draw cannot unlock world build.
+    renderer.batch.markFrameReserved(0);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const real_batch_allocator = renderer.batch.allocator;
+    renderer.batch.allocator = failing.allocator();
+    // Declared after the renderer deinit defer, so the real allocator is restored first.
+    defer renderer.batch.allocator = real_batch_allocator;
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var dummy_text: TextService = undefined;
 
-    try std.testing.expectError(error.SpriteCommandOverflow, loading.render(.{
+    try std.testing.expectError(error.OutOfMemory, loading.render(.{
         .renderer = &renderer,
         .runtime_assets = &runtime_assets,
         .text_service = &dummy_text,
@@ -603,8 +613,8 @@ fn deinitRuntimeAssetMetadataForTest(runtime_assets: *RuntimeAssets) void {
     }
 }
 
-fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
-    for (inputFile.default_key_bindings) |binding| {
+fn keyEventForAction(action: input_file.Action) c.SDL_Event {
+    for (input_file.default_key_bindings) |binding| {
         if (binding.action == action) {
             return c.SDL_Event{ .key = .{
                 .type = c.SDL_EVENT_KEY_DOWN,
@@ -624,8 +634,8 @@ fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
     unreachable;
 }
 
-fn gamepadButtonEventForAction(action: inputFile.Action) c.SDL_Event {
-    for (inputFile.default_gamepad_bindings) |binding| {
+fn gamepadButtonEventForAction(action: input_file.Action) c.SDL_Event {
+    for (input_file.default_gamepad_bindings) |binding| {
         if (binding.action == action) {
             return c.SDL_Event{ .gbutton = .{
                 .type = c.SDL_EVENT_GAMEPAD_BUTTON_DOWN,

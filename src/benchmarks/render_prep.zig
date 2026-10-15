@@ -9,6 +9,7 @@ const config = @import("../config.zig");
 const math = @import("../core/math.zig");
 const resources = @import("../render/resources.zig");
 const sprite_batch = @import("../render/sprite_batch.zig");
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const sprite_prep_range_alignment_items: usize = 1;
@@ -20,8 +21,11 @@ const ordered_ui_depths = [_]sprite_batch.UiDepth{ .background, .panel, .highlig
 
 pub const group = suite.BenchmarkGroup{
     .name = "render-prep",
+    .item_label = "draw commands",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeRenderPrepWorkload,
+    .summary_focus = .production_adaptive,
 };
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
@@ -70,13 +74,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer batch.deinit();
     try batch.reserveStorage(item_count, item_count * 6, item_count);
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     if (suite.adaptiveTunerForCase(case, sprite_prep_range_alignment_items)) |tuner| {
@@ -124,7 +122,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(sprite_prep_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, sprite_prep_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, sprite_prep_range_alignment_items);
 }
 
 const MeasuredPrep = struct {
@@ -277,4 +275,10 @@ fn tintFor(index: usize) config.Color {
 
 fn textureId(index: u32, generation: u32) sprite_batch.TextureId {
     return sprite_batch.TextureId.init(index, generation) catch unreachable;
+}
+
+fn writeRenderPrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("vertices={} sprites={} skipped={} groups={}", .{ stats.candidate_pairs, stats.output_count, stats.deferred_count, stats.sample_count });
+    const phases = stats.render_prep_phases orelse return;
+    try writer.print(" phases ordered_submit={f} snapshot={f} vertex_emit={f} draw_groups={f}", .{ suite.formatDuration(phases.ordered_submit_ns), suite.formatDuration(phases.snapshot_ns), suite.formatDuration(phases.vertex_emit_ns), suite.formatDuration(phases.draw_group_ns) });
 }

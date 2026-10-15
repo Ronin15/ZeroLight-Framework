@@ -13,7 +13,16 @@ const AdaptiveWorkReport = @import("../app/thread_system.zig").AdaptiveWorkRepor
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
+const DiagnosticCount = @import("../app/thread_system.zig").DiagnosticCount;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
+const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
+const NavMainPhases = @import("../game/systems/pathfinding/types.zig").NavMainPhases;
+const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
+const PathfindingCapacity = @import("../game/systems/pathfinding/types.zig").PathfindingCapacity;
+const NavGraph = @import("../game/systems/pathfinding/nav_graph.zig").NavGraph;
+const GroupField = @import("../game/systems/pathfinding/group_field.zig").GroupField;
+const PathfindingSystem = @import("../game/systems/pathfinding/system.zig").PathfindingSystem;
+const default_chunk_size_tiles = @import("../game/world_system.zig").default_chunk_size_tiles;
 
 pub const default_items_per_range = (ThreadSystemConfig{}).items_per_range;
 
@@ -41,6 +50,8 @@ pub const Options = struct {
     iterations: usize = 30,
     case_filter: ?[]const u8 = null,
     group_filter: ?[]const u8 = null,
+    /// Runs every group whose name starts with this prefix (a family such as `chunk-scale-`).
+    group_prefix: ?[]const u8 = null,
     item_count_filter: ?usize = null,
     fallback_budget: ?usize = null,
     details: bool = false,
@@ -48,9 +59,32 @@ pub const Options = struct {
 
 pub const BenchmarkGroup = struct {
     name: []const u8,
+    /// What one item count names: the unit counted, or an item code's layout
+    /// (`ItemCode(...).label`).
+    item_label: []const u8,
     defaultItemCounts: *const fn (Profile) []const usize,
     runCase: *const fn (std.mem.Allocator, std.Io, Options, BenchmarkCase, usize) anyerror!RunStats,
+    /// Writes a case's workload: its counters in the group's own terms, and under
+    /// `--details` its stage shapes too. Writing nothing prints no workload.
+    write_workload: WorkloadWriter,
+    /// The case the summary leads with.
+    summary_focus: SummaryFocus = .fastest,
 };
+
+/// Where a workload is printed: the one-line summary or the `--details` table.
+pub const WorkloadView = enum { summary, details };
+
+pub const WorkloadWriter = *const fn (*std.Io.Writer, RunStats, WorkloadView) std.Io.Writer.Error!void;
+
+pub const SummaryFocus = enum {
+    // The fastest measured case.
+    fastest,
+    // The production tuner's case, beside the fastest control.
+    production_adaptive,
+};
+
+/// A group with no workload counters.
+pub fn writeNoWorkload(_: *std.Io.Writer, _: RunStats, _: WorkloadView) std.Io.Writer.Error!void {}
 
 pub const BenchmarkCase = struct {
     // Cases are registered by subsystem modules. The suite owns selection,
@@ -79,17 +113,8 @@ pub const BenchmarkCase = struct {
         const base = default_items_per_range;
         return switch (self.range_mode) {
             .default => null,
-            .small => alignItemCount(@max(base / 2, @as(usize, 1)), range_alignment_items),
-            .large => alignItemCount(base * 4, range_alignment_items),
-        };
-    }
-
-    pub fn workerModeLabel(self: BenchmarkCase) []const u8 {
-        return switch (self.worker_mode) {
-            .serial_direct => "serial",
-            .fixed_1 => "fixed-1",
-            .fixed_2 => "fixed-2",
-            .fixed_auto => "fixed-auto",
+            .small => std.mem.alignForwardAnyAlign(usize, @max(base / 2, @as(usize, 1)), range_alignment_items),
+            .large => std.mem.alignForwardAnyAlign(usize, base * 4, range_alignment_items),
         };
     }
 };
@@ -167,8 +192,8 @@ pub const RunStatus = enum {
 };
 
 pub const RunStats = struct {
-    // Plain scalar result surface shared by every benchmark group. Subsystem
-    // counters are optional so the report formatter stays generic.
+    // Plain scalar result surface shared by every benchmark group; each group's
+    // `write_workload` names what its counters hold.
     status: RunStatus = .measured,
     skip_reason: []const u8 = "",
     item_count: usize = 0,
@@ -185,10 +210,23 @@ pub const RunStats = struct {
     items_per_second: u64 = 0,
     batch: BatchSummary = .{},
     secondary_batch: ?BatchSummary = null,
+    // Nav groups: the mark stage (null when the workload marks no events) and the key plan.
+    nav_mark_batch: ?BatchSummary = null,
+    nav_plan_batch: ?BatchSummary = null,
+    // Static-collider groups: the chunk lists' and the query lists' splice stages.
+    splice_batch: ?BatchSummary = null,
+    query_splice_batch: ?BatchSummary = null,
+    // Steering groups: the prepare stages ahead of the avoidance pass (`batch`).
+    steering_stages: ?SteeringStageSummary = null,
     work_tuning: ?WorkTuningSummary = null,
     secondary_work_tuning: ?WorkTuningSummary = null,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
     render_game_prep_phases: ?RenderGamePrepPhaseSummary = null,
+    terrain_edit_phases: ?TerrainEditPhaseSummary = null,
+    // Nav groups: the reaction's connectivity stages and flood (the removal reaction).
+    nav_conn: ?NavConnSummary = null,
+    // Nav groups: the reaction's main-thread time split by section.
+    nav_main: ?NavMainSummary = null,
     render_game_prep_sparse_submitted: usize = 0,
     render_game_prep_dynamic_records: usize = 0,
     render_game_prep_static_groups: usize = 0,
@@ -200,6 +238,98 @@ pub const RunStats = struct {
             .status = .skipped,
             .skip_reason = reason,
         };
+    }
+};
+
+/// One nav reaction's connectivity: the seed, gather, and flood stage shapes (the flood's
+/// rounds folded into one), its families, rounds, the fewest and most searches a round
+/// dispatched, the active sets the round builds walked on the main thread, nodes expanded,
+/// root-groups, components split off, and roots merged, the flood's summed dispatch time and
+/// its share on workers, the flood tuner's policy after the case (null when the case runs no
+/// adaptive tuner; zero workers is inline), the chunks and records patched, and a toggle's
+/// reopen flood nodes (null without a reopen). Then the one-way
+/// closure's stage shapes (candidates, resolve, mask, plan, rows with round 0 and its rounds
+/// folded, landing) and counters: components touched, links resolved, terminals new and left,
+/// rows recomputed, rounds, words written, blocks narrowed, blocks allocated and freed, words
+/// landed, landings deferred, the live block words, the batch tail's capacity, and the rows
+/// stage's time on workers; and the
+/// reserve of its busiest batch: the tail words its bound reserved and its blocks took, its
+/// candidates' block words, and the terminals it could number.
+pub const NavConnSummary = struct {
+    seed: BatchSummary = .{},
+    gather: BatchSummary = .{},
+    flood: BatchSummary = .{},
+    families: usize = 0,
+    rounds: usize = 0,
+    round_items_min: usize = 0,
+    round_items_max: usize = 0,
+    build_visits: usize = 0,
+    flood_nodes: usize = 0,
+    groups: usize = 0,
+    splits: usize = 0,
+    merges: usize = 0,
+    flood_off_main_ns: u64 = 0,
+    flood_tuner_workers: ?usize = null,
+    chunks_patched: usize = 0,
+    records_patched: usize = 0,
+    reopen_flood_nodes: ?usize = null,
+    candidates: BatchSummary = .{},
+    closure_resolve: BatchSummary = .{},
+    closure_mask: BatchSummary = .{},
+    closure_plan: BatchSummary = .{},
+    closure_rows: BatchSummary = .{},
+    closure_land: BatchSummary = .{},
+    closure_touched: usize = 0,
+    closure_links: usize = 0,
+    closure_terms_new: usize = 0,
+    closure_terms_left: usize = 0,
+    closure_a_rows: usize = 0,
+    closure_rounds: usize = 0,
+    closure_words_written: usize = 0,
+    closure_shrinks: usize = 0,
+    closure_block_allocs: usize = 0,
+    closure_block_frees: usize = 0,
+    closure_landed_words: usize = 0,
+    closure_land_deferrals: usize = 0,
+    closure_live_words: usize = 0,
+    closure_tail_capacity: usize = 0,
+    closure_rows_off_main_ns: u64 = 0,
+    closure_tail_bound: usize = 0,
+    closure_tail_used: usize = 0,
+    closure_candidate_words: usize = 0,
+    closure_kb: usize = 0,
+};
+
+/// Nav reaction main-thread time (wall time outside every worker dispatch), its stage time run
+/// inline, and its ordered sections, summed over the reactions added and divided by `samples`
+/// when printed. `rest` is the main time neither holds: untimed glue.
+pub const NavMainSummary = struct {
+    samples: u64 = 0,
+    main_ns: u64 = 0,
+    inline_ns: u64 = 0,
+    sections: NavMainPhases = .{},
+
+    /// Adds one reaction: its main time and its stats' inline stage time and sections.
+    pub fn add(self: *NavMainSummary, main_ns: u64, stats: NavUpdateStats) void {
+        self.main_ns += main_ns;
+        self.inline_ns += stats.inline_stage_ns;
+        addSections(&self.sections, stats.main);
+    }
+
+    /// Adds `other`'s reactions, its samples not counted.
+    pub fn merge(self: *NavMainSummary, other: NavMainSummary) void {
+        self.main_ns += other.main_ns;
+        self.inline_ns += other.inline_ns;
+        addSections(&self.sections, other.sections);
+    }
+
+    /// Counts one sample: a reaction, or an iteration whose reactions were added.
+    pub fn endSample(self: *NavMainSummary) void {
+        self.samples += 1;
+    }
+
+    fn addSections(total: *NavMainPhases, phases: NavMainPhases) void {
+        inline for (@typeInfo(NavMainPhases).@"struct".field_names) |name| @field(total, name) += @field(phases, name);
     }
 };
 
@@ -249,6 +379,28 @@ pub const RenderPrepPhaseSummary = struct {
     draw_group_ns: u64 = 0,
 };
 
+/// Steering's prepare stage batches, in stage order.
+pub const SteeringStageSummary = struct {
+    agents: BatchSummary = .{},
+    select_resolve: BatchSummary = .{},
+    select_claim: BatchSummary = .{},
+    directions: BatchSummary = .{},
+    grid_bucket: BatchSummary = .{},
+    grid_sort: BatchSummary = .{},
+    // Entries in the agent grid's largest band after the last step.
+    band_max: usize = 0,
+};
+
+/// Mean per-iteration time of a batched terrain edit's plan and write stages, its nav
+/// reaction (the nav groups only), and the rest of the iteration (the main thread's
+/// serial share).
+pub const TerrainEditPhaseSummary = struct {
+    plan_ns: u64 = 0,
+    write_ns: u64 = 0,
+    nav_ns: u64 = 0,
+    main_ns: u64 = 0,
+};
+
 pub const RenderGamePrepPhaseSummary = struct {
     entity_collect_ns: u64 = 0,
     merge_ns: u64 = 0,
@@ -257,7 +409,7 @@ pub const RenderGamePrepPhaseSummary = struct {
 };
 
 /// Per-behavior selection counts after one measured `ai` run, read from
-/// `AiAgentStore`'s hot `active_behavior` column post-update (Slice 32
+/// `AiAgentStore`'s hot `active_behavior` column post-update (the
 /// arbitration output) -- proves the utility scorer actually spreads
 /// selections across all five `AiBehavior` buckets at the measured fixture,
 /// not just wander/pursue.
@@ -291,6 +443,8 @@ pub const WorkTuningSummary = struct {
     baseline_mean_batch_duration_ns: u64 = 0,
     has_threaded_profile: bool = false,
     probing: bool = false,
+    probe_window_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
+    demotion_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
 };
 
 pub const StatsAccumulator = struct {
@@ -333,12 +487,12 @@ pub const StatsAccumulator = struct {
         const items_per_second = if (self.total_ns == 0)
             @as(u64, 0)
         else
-            u128ToU64Saturated((total_items * std.time.ns_per_s) / self.total_ns);
+            std.math.lossyCast(u64, (total_items * std.time.ns_per_s) / self.total_ns);
 
         return .{
             .item_count = self.item_count,
             .iterations = self.iterations,
-            .mean_ns = u128ToU64Saturated(self.total_ns / iteration_count),
+            .mean_ns = std.math.lossyCast(u64, self.total_ns / iteration_count),
             .min_ns = self.min_ns,
             .max_ns = self.max_ns,
             .items_per_second = items_per_second,
@@ -349,11 +503,11 @@ pub const StatsAccumulator = struct {
                 .range_alignment_items = self.last_batch.range_alignment_items,
                 .available_worker_threads = self.last_batch.available_worker_threads,
                 .active_worker_threads = self.last_batch.active_worker_threads,
-                .main_thread_ranges = u128ToUsizeSaturated(self.total_main_thread_ranges / iteration_count),
-                .worker_thread_ranges = u128ToUsizeSaturated(self.total_worker_thread_ranges / iteration_count),
+                .main_thread_ranges = std.math.lossyCast(usize, self.total_main_thread_ranges / iteration_count),
+                .worker_thread_ranges = std.math.lossyCast(usize, self.total_worker_thread_ranges / iteration_count),
                 .worker_utilization_percent = @intFromFloat((self.total_worker_utilization / @as(f64, @floatFromInt(self.iterations))) * 100.0),
-                .batch_duration_ns = u128ToU64Saturated(self.total_batch_duration_ns / iteration_count),
-                .main_thread_wait_ns = u128ToU64Saturated(self.total_main_thread_wait_ns / iteration_count),
+                .batch_duration_ns = std.math.lossyCast(u64, self.total_batch_duration_ns / iteration_count),
+                .main_thread_wait_ns = std.math.lossyCast(u64, self.total_main_thread_wait_ns / iteration_count),
                 .ran_inline = self.last_batch.ran_inline,
             },
         };
@@ -381,6 +535,8 @@ pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement:
         .baseline_mean_batch_duration_ns = report.baseline_mean_batch_duration_ns,
         .has_threaded_profile = report.has_threaded_profile,
         .probing = report.probing,
+        .probe_window_count = report.probe_window_count,
+        .demotion_count = report.demotion_count,
     };
 }
 
@@ -391,7 +547,7 @@ pub fn adaptiveTunerForCase(case: BenchmarkCase, range_alignment_items: usize) ?
     return switch (case.adaptive_range_mode) {
         .none, .tuned => null,
         .fixed => fixed: {
-            const fixed_range = alignItemCount(default_items_per_range, range_alignment_items);
+            const fixed_range = std.mem.alignForwardAnyAlign(usize, default_items_per_range, range_alignment_items);
             break :fixed AdaptiveWorkTuner.init(.{
                 .initial_range_items = fixed_range,
                 .smallest_range_items = fixed_range,
@@ -443,6 +599,12 @@ pub fn parseOptions(args: []const []const u8) !Options {
             options.group_filter = args[index];
         } else if (stripPrefix(arg, "--group=")) |value| {
             options.group_filter = value;
+        } else if (std.mem.eql(u8, arg, "--group-prefix")) {
+            index += 1;
+            if (index >= args.len) return error.MissingArgument;
+            options.group_prefix = args[index];
+        } else if (stripPrefix(arg, "--group-prefix=")) |value| {
+            options.group_prefix = value;
         } else if (std.mem.eql(u8, arg, "--items")) {
             index += 1;
             if (index >= args.len) return error.MissingArgument;
@@ -473,12 +635,11 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
     // Run order is deterministic and stdout-first. The benchmark is a regression
     // detector, so reporting favors comparable tables over machine-specific tuning.
     printHeader(options);
-    var matched_group = options.group_filter == null;
+    const filtered = options.group_filter != null or options.group_prefix != null;
+    var matched_group = !filtered;
     for (groups) |group| {
-        if (options.group_filter) |filter| {
-            if (!std.mem.eql(u8, filter, group.name)) continue;
-            matched_group = true;
-        }
+        if (!groupSelected(options, group.name)) continue;
+        matched_group = true;
         var explicit_item_count: [1]usize = undefined;
         const item_counts = itemCountsForOptions(group, options, &explicit_item_count);
         for (item_counts) |item_count| {
@@ -498,9 +659,20 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
         }
     }
     if (!matched_group) {
-        std.debug.print("unknown benchmark group: {s}\n", .{options.group_filter.?});
+        std.debug.print("unknown benchmark group: {s}\n", .{options.group_filter orelse options.group_prefix.?});
         return error.InvalidArgument;
     }
+}
+
+/// A group runs when it equals `--group` (if given) and starts with `--group-prefix` (if given).
+pub fn groupSelected(options: Options, group_name: []const u8) bool {
+    if (options.group_filter) |filter| {
+        if (!std.mem.eql(u8, filter, group_name)) return false;
+    }
+    if (options.group_prefix) |prefix| {
+        if (!std.mem.startsWith(u8, group_name, prefix)) return false;
+    }
+    return true;
 }
 
 fn itemCountsForOptions(group: BenchmarkGroup, options: Options, explicit_item_count: *[1]usize) []const usize {
@@ -516,11 +688,12 @@ pub fn printUsage() void {
         \\Usage: zig build bench -- [options]
         \\
         \\Options:
-        \\  --profile quick|standard|stress
+        \\  --profile quick|standard|stress   (count groups; item-code groups run fixed configs)
         \\  --warmup N
         \\  --iterations N
         \\  --case name
         \\  --group name
+        \\  --group-prefix prefix
         \\  --items N
         \\  --fallback-budget N
         \\  --details
@@ -541,31 +714,12 @@ pub fn skipIfWorkersUnavailable(case: BenchmarkCase) ?RunStats {
     return RunStats.skipped("not enough worker threads available");
 }
 
-pub fn serialBatch(item_count: usize, range_alignment_items: usize) BatchStats {
-    return .{
-        .item_count = item_count,
-        .range_count = if (item_count > 0) 1 else 0,
-        .items_per_range = item_count,
-        .range_alignment_items = range_alignment_items,
-        .main_thread_ranges = if (item_count > 0) 1 else 0,
-        .ran_inline = true,
-    };
-}
-
 pub fn nowNs(io: std.Io) i96 {
     return std.Io.Timestamp.now(io, .awake).toNanoseconds();
 }
 
 pub fn elapsedNs(start_ns: i96, end_ns: i96) u64 {
     return if (end_ns > start_ns) @intCast(end_ns - start_ns) else 0;
-}
-
-pub fn alignItemCount(item_count: usize, alignment: usize) usize {
-    std.debug.assert(alignment > 0);
-    if (alignment == 1) return item_count;
-    const remainder = item_count % alignment;
-    if (remainder == 0) return item_count;
-    return item_count + (alignment - remainder);
 }
 
 /// Ceiling division of `item_count` into ranges of `items_per_range`, shared by
@@ -621,18 +775,17 @@ fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options:
     const baseline = findResult(results, "serial-direct") orelse {
         std.debug.print("\n{s}\n", .{group.name});
         std.debug.print("  no serial baseline was run\n", .{});
-        if (options.details) printDetailTable(group.name, results, null);
+        if (options.details) printDetailTable(group, results);
         return;
     };
     if (baseline.stats.status == .skipped) {
         std.debug.print("\n{s}\n", .{group.name});
         std.debug.print("  serial baseline skipped: {s}\n", .{baseline.stats.skip_reason});
-        if (options.details) printDetailTable(group.name, results, null);
+        if (options.details) printDetailTable(group, results);
         return;
     }
 
-    const item_count = baseline.stats.item_count;
-    std.debug.print("\n{s}  {} {s}\n\n", .{ group.name, item_count, itemLabel(group.name) });
+    std.debug.print("\n{s}  {} {s}\n\n", .{ group.name, baseline.stats.item_count, group.item_label });
     const best = bestMeasured(results) orelse baseline;
     const fixed_auto = measured(findResult(results, "thread-fixed-auto"));
     const adaptive = measured(findResult(results, "thread-adaptive-tuned-range")) orelse measured(findResult(results, "thread-adaptive-fixed-range"));
@@ -640,37 +793,11 @@ fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options:
     printCompactTable(results, baseline);
     if (options.details) {
         std.debug.print("\n", .{});
-        printDetailTable(group.name, results, baseline);
+        printDetailTable(group, results);
     } else {
         std.debug.print("\ndetails: pass --details for scheduler, range, and workload columns\n", .{});
     }
-    printValidationSummary(group.name, baseline, best, fixed_auto, adaptive, results);
-}
-
-fn isRenderGamePrepGroup(group_name: []const u8) bool {
-    return std.mem.eql(u8, group_name, "render-game-prep") or
-        std.mem.startsWith(u8, group_name, "render-game-prep-");
-}
-
-fn itemLabel(group_name: []const u8) []const u8 {
-    if (std.mem.eql(u8, group_name, "movement")) return "movement bodies";
-    if (std.mem.eql(u8, group_name, "particles")) return "particle rows";
-    if (std.mem.eql(u8, group_name, "ai")) return "AI agents";
-    if (std.mem.eql(u8, group_name, "ai-memory")) return "AI agents";
-    if (std.mem.eql(u8, group_name, "ai-affect")) return "AI agents";
-    if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) return "perception agents";
-    if (std.mem.eql(u8, group_name, "pathfinding")) return "path requests";
-    if (std.mem.eql(u8, group_name, "pathfinding-cache-open")) return "cached open path requests";
-    if (std.mem.eql(u8, group_name, "pathfinding-cache-detour")) return "cached detour path requests";
-    if (std.mem.eql(u8, group_name, "pathfinding-cache-unreachable")) return "cached unreachable path requests";
-    if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
-    if (std.mem.eql(u8, group_name, "steering")) return "steering agents";
-    if (std.mem.eql(u8, group_name, "render-prep")) return "draw commands";
-    if (isRenderGamePrepGroup(group_name)) return "render entities";
-    if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
-    if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
-    if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
-    return "items";
+    printValidationSummary(group, baseline, best, fixed_auto, adaptive, results);
 }
 
 fn printCompactTable(results: []const CaseResult, baseline: CaseResult) void {
@@ -701,8 +828,7 @@ fn printCompactTable(results: []const CaseResult, baseline: CaseResult) void {
     }
 }
 
-fn printDetailTable(group_name: []const u8, results: []const CaseResult, baseline: ?CaseResult) void {
-    _ = baseline;
+fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
     printCell("case", 30);
     printCell("min", 11);
     printCell("max", 11);
@@ -710,7 +836,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
     printCell("worker_ranges", 14);
     printCell("wait", 11);
     printCell("items_per_range", 16);
-    printCell("work_tuning", 56);
+    printCell("work_tuning", 72);
     std.debug.print("workload\n", .{});
 
     for (results) |result| {
@@ -722,7 +848,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
             printCell("-", 14);
             printCell("-", 11);
             printCell("-", 16);
-            printCell("-", 56);
+            printCell("-", 72);
             std.debug.print("{s}\n", .{result.stats.skip_reason});
             continue;
         }
@@ -734,53 +860,55 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
         var worker_ranges_buffer: [24]u8 = undefined;
         var items_per_range_buffer: [24]u8 = undefined;
         var tuning_buffer: [96]u8 = undefined;
-        var workload_buffer: [256]u8 = undefined;
+        var workload_buffer: [4096]u8 = undefined;
 
+        const batch = result.stats.batch;
         printCell(result.case.name, 30);
         printCell(formatDurationInto(&min_buffer, result.stats.min_ns), 11);
         printCell(formatDurationInto(&max_buffer, result.stats.max_ns), 11);
-        printCell(formatUsizeInto(&main_ranges_buffer, result.stats.batch.main_thread_ranges), 12);
-        printCell(formatUsizeInto(&worker_ranges_buffer, result.stats.batch.worker_thread_ranges), 14);
-        printCell(formatDurationInto(&wait_buffer, result.stats.batch.main_thread_wait_ns), 11);
-        printCell(formatUsizeInto(&items_per_range_buffer, result.stats.batch.items_per_range), 16);
-        printCell(formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning), 56);
-        std.debug.print("{s}\n", .{formatWorkloadInto(&workload_buffer, group_name, result.stats)});
+        printCell(formatRangeCellInto(&main_ranges_buffer, batch, batch.main_thread_ranges), 12);
+        printCell(formatRangeCellInto(&worker_ranges_buffer, batch, batch.worker_thread_ranges), 14);
+        printCell(formatDurationInto(&wait_buffer, batch.main_thread_wait_ns), 11);
+        printCell(formatRangeCellInto(&items_per_range_buffer, batch, batch.items_per_range), 16);
+        printCell(formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning), 72);
+        const workload = formatWorkloadInto(&workload_buffer, group, result.stats, .details);
+        std.debug.print("{s}\n", .{if (workload.len == 0) "-" else workload});
     }
 }
 
+// `group`'s workload text for `stats`; empty when it writes none.
+fn formatWorkloadInto(buffer: []u8, group: BenchmarkGroup, stats: RunStats, view: WorkloadView) []const u8 {
+    var writer: std.Io.Writer = .fixed(buffer);
+    group.write_workload(&writer, stats, view) catch return "workload";
+    return writer.buffered();
+}
+
 fn printValidationSummary(
-    group_name: []const u8,
+    group: BenchmarkGroup,
     baseline: CaseResult,
     best: CaseResult,
     fixed_auto: ?CaseResult,
     adaptive: ?CaseResult,
     results: []const CaseResult,
 ) void {
-    const is_render_prep = std.mem.eql(u8, group_name, "render-prep");
-    const is_render_game_prep = isRenderGamePrepGroup(group_name);
     // Keep the summary terse and action-oriented: it should call out unusual
     // scheduler behavior or workload counters without pretending to choose
     // runtime tuning policy from one benchmark run.
-    if (is_render_prep or is_render_game_prep) {
-        const focus = adaptive orelse best;
-        const focus_label = if (adaptive != null) "production_adaptive" else if (is_render_game_prep) "render_game_prep_focus" else "render_prep_focus";
-        const focus_speedup = speedupBasisPoints(baseline.stats, focus.stats);
+    const focus = switch (group.summary_focus) {
+        .fastest => best,
+        .production_adaptive => adaptive orelse best,
+    };
+    const focus_label = if (group.summary_focus == .production_adaptive and adaptive != null) "production_adaptive" else "best";
+    const focus_speedup = speedupBasisPoints(baseline.stats, focus.stats);
+    std.debug.print(
+        "summary: {s} {s} at {f} ({d}.{d:0>2}x serial). ",
+        .{ focus_label, focus.case.name, formatDuration(focus.stats.mean_ns), focus_speedup / 100, focus_speedup % 100 },
+    );
+    if (!std.mem.eql(u8, focus.case.name, best.case.name)) {
+        const best_speedup = speedupBasisPoints(baseline.stats, best.stats);
         std.debug.print(
-            "summary: {s} {s} at {f} ({d}.{d:0>2}x serial). ",
-            .{ focus_label, focus.case.name, formatDuration(focus.stats.mean_ns), focus_speedup / 100, focus_speedup % 100 },
-        );
-        if (!std.mem.eql(u8, focus.case.name, best.case.name)) {
-            const best_speedup = speedupBasisPoints(baseline.stats, best.stats);
-            std.debug.print(
-                "best_control {s} at {f} ({d}.{d:0>2}x serial). ",
-                .{ best.case.name, formatDuration(best.stats.mean_ns), best_speedup / 100, best_speedup % 100 },
-            );
-        }
-    } else {
-        const speedup = speedupBasisPoints(baseline.stats, best.stats);
-        std.debug.print(
-            "summary: best {s} at {f} ({d}.{d:0>2}x serial). ",
-            .{ best.case.name, formatDuration(best.stats.mean_ns), speedup / 100, speedup % 100 },
+            "best_control {s} at {f} ({d}.{d:0>2}x serial). ",
+            .{ best.case.name, formatDuration(best.stats.mean_ns), best_speedup / 100, best_speedup % 100 },
         );
     }
 
@@ -810,94 +938,9 @@ fn printValidationSummary(
         std.debug.print("adaptive flow not selected in this run. ", .{});
     }
 
-    if (best.stats.candidate_pairs != 0 or
-        best.stats.output_count != 0 or
-        best.stats.deferred_count != 0 or
-        best.stats.fallback_deferred_count != 0 or
-        best.stats.cache_evictions != 0)
-    {
-        if (std.mem.eql(u8, group_name, "ai")) {
-            std.debug.print(
-                "workload separation_checks={} intents={} agents={}. ",
-                .{ best.stats.candidate_pairs, best.stats.output_count, best.stats.item_count },
-            );
-            if (best.stats.ai_behavior_histogram) |histogram| {
-                std.debug.print(
-                    "behaviors wander={} pursue={} flee={} investigate={} cohere={}. ",
-                    .{ histogram.wander, histogram.pursue, histogram.flee, histogram.investigate, histogram.cohere },
-                );
-            }
-        } else if (std.mem.eql(u8, group_name, "pathfinding")) {
-            std.debug.print(
-                "workload field_requests={} results={}. ",
-                .{ best.stats.candidate_pairs, best.stats.output_count },
-            );
-        } else if (std.mem.startsWith(u8, group_name, "pathfinding-cache")) {
-            std.debug.print(
-                "workload cache_hits={} results={}. ",
-                .{ best.stats.candidate_pairs, best.stats.output_count },
-            );
-        } else if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) {
-            std.debug.print(
-                "workload fallback_requests={} fallback_deferred={} deferred={} results={} evictions={}. ",
-                .{ best.stats.candidate_pairs, best.stats.fallback_deferred_count, best.stats.deferred_count, best.stats.output_count, best.stats.cache_evictions },
-            );
-        } else if (std.mem.startsWith(u8, group_name, "collision-response")) {
-            std.debug.print(
-                "workload triggers={} intents={}. ",
-                .{ best.stats.candidate_pairs, best.stats.output_count },
-            );
-        } else if (std.mem.eql(u8, group_name, "render-prep")) {
-            const render_prep_focus = adaptive orelse best;
-            const focus_label = if (adaptive != null) "production_adaptive" else "render_prep_focus";
-            std.debug.print(
-                "{s}={s} workload vertices={} sprites={} skipped={} groups={}. ",
-                .{
-                    focus_label,
-                    render_prep_focus.case.name,
-                    render_prep_focus.stats.candidate_pairs,
-                    render_prep_focus.stats.output_count,
-                    render_prep_focus.stats.deferred_count,
-                    render_prep_focus.stats.sample_count,
-                },
-            );
-            if (render_prep_focus.stats.render_prep_phases) |phases| {
-                std.debug.print(
-                    "phases ordered_submit={f} snapshot={f} vertex_emit={f} draw_groups={f}. ",
-                    .{ formatDuration(phases.ordered_submit_ns), formatDuration(phases.snapshot_ns), formatDuration(phases.vertex_emit_ns), formatDuration(phases.draw_group_ns) },
-                );
-            }
-        } else if (isRenderGamePrepGroup(group_name)) {
-            const render_game_prep_focus = adaptive orelse best;
-            const focus_label = if (adaptive != null) "production_adaptive" else "render_game_prep_focus";
-            std.debug.print(
-                "{s}={s} workload vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={}. ",
-                .{
-                    focus_label,
-                    render_game_prep_focus.case.name,
-                    render_game_prep_focus.stats.candidate_pairs,
-                    render_game_prep_focus.stats.output_count,
-                    render_game_prep_focus.stats.deferred_count,
-                    render_game_prep_focus.stats.sample_count,
-                    render_game_prep_focus.stats.render_game_prep_sparse_submitted,
-                    render_game_prep_focus.stats.render_game_prep_dynamic_records,
-                    render_game_prep_focus.stats.render_game_prep_static_groups,
-                    render_game_prep_focus.stats.render_game_prep_merged_tilemap_groups,
-                },
-            );
-            if (render_game_prep_focus.stats.render_game_prep_phases) |phases| {
-                std.debug.print(
-                    "phases entity_collect={f} merge={f} snapshot={f} vertex_emit={f}. ",
-                    .{ formatDuration(phases.entity_collect_ns), formatDuration(phases.merge_ns), formatDuration(phases.snapshot_ns), formatDuration(phases.vertex_emit_ns) },
-                );
-            }
-        } else {
-            std.debug.print(
-                "workload candidates={} outputs={}. ",
-                .{ best.stats.candidate_pairs, best.stats.output_count },
-            );
-        }
-    }
+    var workload_buffer: [1024]u8 = undefined;
+    const workload = formatWorkloadInto(&workload_buffer, group, focus.stats, .summary);
+    if (workload.len != 0) std.debug.print("workload {s}. ", .{workload});
 
     printFlowCoverage(results);
 
@@ -1006,6 +1049,12 @@ fn formatWorkerThreadsInto(buffer: []u8, stats: RunStats) []const u8 {
     return std.fmt.bufPrint(buffer, "{}/{}", .{ stats.batch.active_worker_threads, stats.batch.available_worker_threads }) catch "workers";
 }
 
+// A range column of `batch`: `inline` when it ran inline (no range split), else `value`.
+fn formatRangeCellInto(buffer: []u8, batch: BatchSummary, value: usize) []const u8 {
+    if (batch.ran_inline or batch.active_worker_threads == 0) return "inline";
+    return formatUsizeInto(buffer, value);
+}
+
 fn formatUsizeInto(buffer: []u8, value: usize) []const u8 {
     return std.fmt.bufPrint(buffer, "{}", .{value}) catch "value";
 }
@@ -1014,173 +1063,221 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
     // Keep tuner state compact enough for aligned tables; detailed conclusions
     // belong in validation text, not in every cell.
     const summary = maybe_summary orelse return "-";
-    if (!summary.has_threaded_profile) {
-        if (summary.candidate_items_per_range) |candidate| {
-            const candidate_workers = summary.candidate_worker_threads orelse 0;
-            return std.fmt.bufPrint(
-                buffer,
-                "{s} settled={s} threaded=none cand={}/{}",
-                .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), candidate_workers, candidate },
-            ) catch "work";
-        }
-        return std.fmt.bufPrint(
-            buffer,
-            "{s} settled={s} threaded=none",
-            .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement) },
-        ) catch "work";
-    }
-    if (summary.candidate_items_per_range) |candidate| {
-        const candidate_workers = summary.candidate_worker_threads orelse 0;
-        return std.fmt.bufPrint(
-            buffer,
-            "{s} settled={s} best={}/{} final={}/{} cand={}/{}",
-            .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range, candidate_workers, candidate },
-        ) catch "work";
-    }
-    return std.fmt.bufPrint(
-        buffer,
-        "{s} settled={s} best={}/{} final={}/{}",
-        .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
-    ) catch "work";
+    var writer: std.Io.Writer = .fixed(buffer);
+    writeWorkTuning(&writer, summary) catch return "work";
+    return writer.buffered();
 }
 
-fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []const u8 {
-    // Workload labels translate shared counters into subsystem language so the
-    // report remains compact without hiding what was measured.
-    if (stats.candidate_pairs == 0 and stats.output_count == 0 and stats.deferred_count == 0 and stats.fallback_deferred_count == 0 and stats.cache_evictions == 0) return "-";
-    if (std.mem.eql(u8, group_name, "ai")) {
-        if (stats.secondary_batch) |intent| {
-            const tuning = stats.secondary_work_tuning;
-            if (intent.active_worker_threads == 0 or intent.ran_inline) {
-                if (tuning) |summary| {
-                    const tuned = if (summary.has_threaded_profile) "threaded" else "none";
-                    return std.fmt.bufPrint(
-                        buffer,
-                        "separation_checks={} intents={} intent=inline tuned={s}",
-                        .{ stats.candidate_pairs, stats.output_count, tuned },
-                    ) catch "workload";
-                }
-                return std.fmt.bufPrint(
-                    buffer,
-                    "separation_checks={} intents={} intent=inline",
-                    .{ stats.candidate_pairs, stats.output_count },
-                ) catch "workload";
-            }
-            return std.fmt.bufPrint(
-                buffer,
-                "separation_checks={} intents={} intent={}/{}",
-                .{ stats.candidate_pairs, stats.output_count, intent.active_worker_threads, intent.items_per_range },
-            ) catch "workload";
-        }
-        return std.fmt.bufPrint(buffer, "separation_checks={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+fn writeWorkTuning(writer: *std.Io.Writer, summary: WorkTuningSummary) std.Io.Writer.Error!void {
+    try writer.print("{s} settled={s}", .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement) });
+    if (summary.has_threaded_profile) {
+        try writer.print(
+            " best={}/{} final={}/{}",
+            .{ summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
+        );
+    } else {
+        try writer.writeAll(" threaded=none");
     }
-    if (std.mem.eql(u8, group_name, "pathfinding")) {
-        return std.fmt.bufPrint(buffer, "field_requests={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    if (summary.candidate_items_per_range) |candidate| {
+        try writer.print(" cand={}/{}", .{ summary.candidate_worker_threads orelse 0, candidate });
     }
-    if (std.mem.startsWith(u8, group_name, "pathfinding-cache")) {
-        return std.fmt.bufPrint(buffer, "cache_hits={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    if (comptime diagnostics_enabled) {
+        try writer.print(" probes={} demotes={}", .{ summary.probe_window_count, summary.demotion_count });
     }
-    if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) {
-        return std.fmt.bufPrint(
-            buffer,
-            "fallback_requests={} fallback_deferred={} deferred={} results={} evictions={}",
-            .{ stats.candidate_pairs, stats.fallback_deferred_count, stats.deferred_count, stats.output_count, stats.cache_evictions },
-        ) catch "workload";
+}
+
+/// ` <label>=<time> (<percent>%)`: `part_ns` beside its share of `mean_ns`.
+pub fn writeShare(writer: *std.Io.Writer, label: []const u8, part_ns: u64, mean_ns: u64) std.Io.Writer.Error!void {
+    const percent = if (mean_ns == 0) 0 else part_ns * 100 / mean_ns;
+    try writer.print(" {s}={f} ({}%)", .{ label, formatDuration(part_ns), percent });
+}
+
+/// A stage's batch shape: `inline`, or active workers and ranges.
+pub fn writeStageShape(writer: *std.Io.Writer, batch: BatchSummary) std.Io.Writer.Error!void {
+    if (batch.ran_inline or batch.active_worker_threads == 0) return writer.writeAll("inline");
+    try writer.print("{}w/{}r", .{ batch.active_worker_threads, batch.range_count });
+}
+
+// `writeStageShape`, or `-` for a stage that covered no items.
+fn writeRunStageShape(writer: *std.Io.Writer, batch: BatchSummary) std.Io.Writer.Error!void {
+    if (batch.item_count == 0) return writer.writeByte('-');
+    try writeStageShape(writer, batch);
+}
+
+/// A nav reaction's stage shapes: `mark=` (when the workload marks events), `plan=`, then
+/// `remask=` (the primary batch) and `patch=` (the secondary batch), then the connectivity
+/// block and main-thread split when the group reports them.
+pub fn writeNavStages(writer: *std.Io.Writer, stats: RunStats) std.Io.Writer.Error!void {
+    if (stats.nav_mark_batch) |mark| {
+        try writer.writeAll("mark=");
+        try writeStageShape(writer, mark);
+        try writer.writeByte(' ');
     }
-    if (std.mem.eql(u8, group_name, "steering")) {
-        return std.fmt.bufPrint(buffer, "avoidance_checks={} samples={} intents={}", .{ stats.candidate_pairs, stats.sample_count, stats.output_count }) catch "workload";
+    try writer.writeAll("plan=");
+    try writeStageShape(writer, stats.nav_plan_batch orelse .{});
+    try writer.writeAll(" remask=");
+    try writeStageShape(writer, stats.batch);
+    try writer.writeAll(" patch=");
+    try writeStageShape(writer, stats.secondary_batch orelse .{});
+    try writeNavConn(writer, stats.nav_conn);
+    try writeNavMain(writer, stats.nav_main);
+}
+
+/// The ` main_split=` block of a nav reaction's main-thread sections, inline stage time, and
+/// rest, per sample, or nothing.
+pub fn writeNavMain(writer: *std.Io.Writer, summary: ?NavMainSummary) std.Io.Writer.Error!void {
+    const main = summary orelse return;
+    if (main.samples == 0) return;
+    const samples = main.samples;
+    var held = main.inline_ns;
+    try writer.writeAll(" main_split=");
+    inline for (@typeInfo(NavMainPhases).@"struct".field_names, 0..) |name, index| {
+        comptime std.debug.assert(std.mem.endsWith(u8, name, "_ns"));
+        const section_ns = @field(main.sections, name);
+        held += section_ns;
+        if (index != 0) try writer.writeByte(' ');
+        try writer.print("{s}:{f}", .{ name[0 .. name.len - "_ns".len], formatDuration(section_ns / samples) });
     }
-    if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) {
-        return std.fmt.bufPrint(
-            buffer,
-            "sensed={} los_checks={} los_blocked={} found={} events={} dropped_events={}",
-            .{ stats.sample_count, stats.candidate_pairs, stats.deferred_count, stats.output_count, stats.fallback_deferred_count, stats.cache_evictions },
-        ) catch "workload";
+    try writer.print(" inline:{f} rest:{f}", .{ formatDuration(main.inline_ns / samples), formatDuration((main.main_ns -| held) / samples) });
+}
+
+/// `writeNavMain` into `buffer`, for a report line.
+pub fn formatNavMainInto(buffer: []u8, summary: ?NavMainSummary) []const u8 {
+    var writer: std.Io.Writer = .fixed(buffer);
+    writeNavMain(&writer, summary) catch return " main_split";
+    return writer.buffered();
+}
+
+// The connectivity block of a nav reaction, its one-way closure block when the reaction ran
+// a closure stage, or nothing.
+fn writeNavConn(writer: *std.Io.Writer, summary: ?NavConnSummary) std.Io.Writer.Error!void {
+    const conn = summary orelse return;
+    try writer.writeAll(" conn_seed=");
+    try writeRunStageShape(writer, conn.seed);
+    try writer.writeAll(" conn_gather=");
+    try writeRunStageShape(writer, conn.gather);
+    try writer.writeAll(" conn_flood=");
+    try writeRunStageShape(writer, conn.flood);
+    try writer.print(" families={} rounds={} round_items={}-{} build_visits={} flood_nodes={} groups={} splits={} merges={} flood_dispatch={f} flood_off_main={f} flood_tuner=", .{
+        conn.families,
+        conn.rounds,
+        conn.round_items_min,
+        conn.round_items_max,
+        conn.build_visits,
+        conn.flood_nodes,
+        conn.groups,
+        conn.splits,
+        conn.merges,
+        formatDuration(conn.flood.batch_duration_ns),
+        formatDuration(conn.flood_off_main_ns),
+    });
+    if (conn.flood_tuner_workers) |workers| {
+        if (workers == 0) try writer.writeAll("inline") else try writer.print("{}w", .{workers});
+    } else try writer.writeByte('-');
+    try writer.print(" chunks_patched={} records_patched={}", .{ conn.chunks_patched, conn.records_patched });
+    if (conn.reopen_flood_nodes) |nodes| try writer.print(" reopen_flood_nodes={}", .{nodes});
+    if (conn.candidates.item_count == 0 and conn.closure_links == 0 and conn.closure_land.item_count == 0) return;
+    const stages = [_]struct { []const u8, BatchSummary }{
+        .{ " conn_candidates=", conn.candidates },
+        .{ " closure_resolve=", conn.closure_resolve },
+        .{ " closure_mask=", conn.closure_mask },
+        .{ " closure_plan=", conn.closure_plan },
+        .{ " closure_rows=", conn.closure_rows },
+        .{ " closure_land=", conn.closure_land },
+    };
+    for (stages) |stage| {
+        try writer.writeAll(stage[0]);
+        try writeRunStageShape(writer, stage[1]);
     }
-    if (std.mem.eql(u8, group_name, "render-prep")) {
-        if (stats.render_prep_phases) |phases| {
-            return std.fmt.bufPrint(
-                buffer,
-                "vertices={} sprites={} skipped={} groups={} phases ordered_submit={f} snapshot={f} vertex={f} groups={f}",
-                .{
-                    stats.candidate_pairs,
-                    stats.output_count,
-                    stats.deferred_count,
-                    stats.sample_count,
-                    formatDuration(phases.ordered_submit_ns),
-                    formatDuration(phases.snapshot_ns),
-                    formatDuration(phases.vertex_emit_ns),
-                    formatDuration(phases.draw_group_ns),
-                },
-            ) catch "workload";
-        }
-        return std.fmt.bufPrint(buffer, "vertices={} sprites={} skipped={} groups={}", .{ stats.candidate_pairs, stats.output_count, stats.deferred_count, stats.sample_count }) catch "workload";
+    try writer.print(" touched={} links={} terms_new={} terms_left={} a_rows={} closure_rounds={} words_written={} shrinks={} block_allocs={} block_frees={} landed_words={} land_deferrals={} live_words={} tail_capacity={} closure_rows_off_main={f} tail_bound={} tail_used={} cand_words={} kb={} reserve_ratio={d:.2}", .{
+        conn.closure_touched,
+        conn.closure_links,
+        conn.closure_terms_new,
+        conn.closure_terms_left,
+        conn.closure_a_rows,
+        conn.closure_rounds,
+        conn.closure_words_written,
+        conn.closure_shrinks,
+        conn.closure_block_allocs,
+        conn.closure_block_frees,
+        conn.closure_landed_words,
+        conn.closure_land_deferrals,
+        conn.closure_live_words,
+        conn.closure_tail_capacity,
+        formatDuration(conn.closure_rows_off_main_ns),
+        conn.closure_tail_bound,
+        conn.closure_tail_used,
+        conn.closure_candidate_words,
+        conn.closure_kb,
+        // The tail bound over the candidates' block words.
+        if (conn.closure_candidate_words == 0) 0.0 else @as(f64, @floatFromInt(conn.closure_tail_bound)) / @as(f64, @floatFromInt(conn.closure_candidate_words)),
+    });
+}
+
+/// One nav reaction's connectivity and closure summary from its stats, with the flood
+/// tuner's workers when the case runs it adaptive (null otherwise; zero is inline).
+pub fn navConnSummary(stats: NavUpdateStats, flood_tuner_workers: ?usize) NavConnSummary {
+    return .{
+        .seed = batchSummaryFromBatch(stats.conn_seed_batch),
+        .gather = batchSummaryFromBatch(stats.conn_gather_batch),
+        .flood = batchSummaryFromBatch(stats.conn_flood_batch),
+        .families = stats.conn_families,
+        .rounds = stats.conn_rounds,
+        .round_items_min = stats.conn_round_items_min,
+        .round_items_max = stats.conn_round_items_max,
+        .build_visits = stats.conn_build_visits,
+        .flood_nodes = stats.conn_flood_nodes,
+        .groups = stats.conn_groups,
+        .splits = stats.conn_splits,
+        .merges = stats.conn_merges,
+        .flood_off_main_ns = stats.conn_flood_off_main_ns,
+        .flood_tuner_workers = flood_tuner_workers,
+        .chunks_patched = stats.chunks_patched,
+        .records_patched = stats.records_patched,
+        .candidates = batchSummaryFromBatch(stats.conn_closure_candidates_batch),
+        .closure_resolve = batchSummaryFromBatch(stats.conn_closure_resolve_batch),
+        .closure_mask = batchSummaryFromBatch(stats.conn_closure_mask_batch),
+        .closure_plan = batchSummaryFromBatch(stats.conn_closure_plan_batch),
+        .closure_rows = batchSummaryFromBatch(stats.conn_closure_rows_batch),
+        .closure_land = batchSummaryFromBatch(stats.conn_closure_land_batch),
+        .closure_touched = stats.closure_touched,
+        .closure_links = stats.closure_links,
+        .closure_terms_new = stats.closure_terms_new,
+        .closure_terms_left = stats.closure_terms_left,
+        .closure_a_rows = stats.closure_a_rows,
+        .closure_rounds = stats.closure_rounds,
+        .closure_words_written = stats.closure_words_written,
+        .closure_shrinks = stats.closure_shrinks,
+        .closure_block_allocs = stats.closure_block_allocs,
+        .closure_block_frees = stats.closure_block_frees,
+        .closure_landed_words = stats.closure_landed_words,
+        .closure_land_deferrals = stats.closure_land_deferrals,
+        .closure_live_words = stats.closure_live_words,
+        .closure_tail_capacity = stats.closure_tail_capacity,
+        .closure_rows_off_main_ns = if (stats.conn_closure_rows_batch.ran_inline) 0 else stats.conn_closure_rows_batch.batch_duration_ns,
+        .closure_tail_bound = stats.closure_tail_bound,
+        .closure_tail_used = stats.closure_tail_used,
+        .closure_candidate_words = stats.closure_candidate_words,
+        .closure_kb = stats.closure_kb,
+    };
+}
+
+/// Steering's prepare stage shapes, in stage order; `-` for a stage that did not run (the
+/// claim and the grid sort on the serial path).
+pub fn writeSteeringStages(writer: *std.Io.Writer, stats: RunStats) std.Io.Writer.Error!void {
+    const stages = stats.steering_stages orelse SteeringStageSummary{};
+    const shapes = [_]struct { []const u8, BatchSummary }{
+        .{ "agents=", stages.agents },
+        .{ " resolve=", stages.select_resolve },
+        .{ " claim=", stages.select_claim },
+        .{ " dir=", stages.directions },
+        .{ " bucket=", stages.grid_bucket },
+        .{ " sort=", stages.grid_sort },
+    };
+    for (shapes) |shape| {
+        try writer.writeAll(shape[0]);
+        try writeRunStageShape(writer, shape[1]);
     }
-    if (isRenderGamePrepGroup(group_name)) {
-        if (stats.render_game_prep_phases) |phases| {
-            return std.fmt.bufPrint(
-                buffer,
-                "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={} phases entity_collect={f} merge={f} snapshot={f} vertex={f}",
-                .{
-                    stats.candidate_pairs,
-                    stats.output_count,
-                    stats.deferred_count,
-                    stats.sample_count,
-                    stats.render_game_prep_sparse_submitted,
-                    stats.render_game_prep_dynamic_records,
-                    stats.render_game_prep_static_groups,
-                    stats.render_game_prep_merged_tilemap_groups,
-                    formatDuration(phases.entity_collect_ns),
-                    formatDuration(phases.merge_ns),
-                    formatDuration(phases.snapshot_ns),
-                    formatDuration(phases.vertex_emit_ns),
-                },
-            ) catch "workload";
-        }
-        return std.fmt.bufPrint(
-            buffer,
-            "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={}",
-            .{
-                stats.candidate_pairs,
-                stats.output_count,
-                stats.deferred_count,
-                stats.sample_count,
-                stats.render_game_prep_sparse_submitted,
-                stats.render_game_prep_dynamic_records,
-                stats.render_game_prep_static_groups,
-                stats.render_game_prep_merged_tilemap_groups,
-            },
-        ) catch "workload";
-    }
-    if (std.mem.startsWith(u8, group_name, "collision-response")) {
-        return std.fmt.bufPrint(buffer, "triggers={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
-    }
-    if (std.mem.startsWith(u8, group_name, "collision")) {
-        if (stats.secondary_batch) |narrow| {
-            const tuning = stats.secondary_work_tuning;
-            if (narrow.active_worker_threads == 0 or narrow.ran_inline) {
-                if (tuning) |summary| {
-                    const tuned = if (summary.has_threaded_profile) "threaded" else "none";
-                    return std.fmt.bufPrint(
-                        buffer,
-                        "candidates={} outputs={} narrow=inline tuned={s}",
-                        .{ stats.candidate_pairs, stats.output_count, tuned },
-                    ) catch "workload";
-                }
-                return std.fmt.bufPrint(
-                    buffer,
-                    "candidates={} outputs={} narrow=inline",
-                    .{ stats.candidate_pairs, stats.output_count },
-                ) catch "workload";
-            }
-            return std.fmt.bufPrint(
-                buffer,
-                "candidates={} outputs={} narrow={}/{}",
-                .{ stats.candidate_pairs, stats.output_count, narrow.active_worker_threads, narrow.items_per_range },
-            ) catch "workload";
-        }
-    }
-    return std.fmt.bufPrint(buffer, "candidates={} outputs={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
 }
 
 fn yesNo(value: bool) []const u8 {
@@ -1224,12 +1321,7 @@ fn measured(result: ?CaseResult) ?CaseResult {
 
 fn speedupBasisPoints(baseline: RunStats, candidate: RunStats) u64 {
     if (candidate.mean_ns == 0) return 0;
-    return @intCast((@as(u128, baseline.mean_ns) * 100) / candidate.mean_ns);
-}
-
-fn outputsPerItemBasisPoints(stats: RunStats) u64 {
-    if (stats.item_count == 0) return 0;
-    return @intCast((@as(u128, stats.output_count) * 100) / stats.item_count);
+    return std.math.lossyCast(u64, (@as(u128, baseline.mean_ns) * 100) / candidate.mean_ns);
 }
 
 fn percentDelta(candidate_ns: u64, baseline_ns: u64) i64 {
@@ -1239,11 +1331,12 @@ fn percentDelta(candidate_ns: u64, baseline_ns: u64) i64 {
     return @intCast(@divTrunc((candidate - baseline_value) * 100, baseline_value));
 }
 
-fn formatDuration(ns: u64) Duration {
+/// `ns` printed with `{f}` as ns, us, or ms.
+pub fn formatDuration(ns: u64) Duration {
     return .{ .ns = ns };
 }
 
-const Duration = struct {
+pub const Duration = struct {
     ns: u64,
 
     pub fn format(self: Duration, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -1261,19 +1354,301 @@ const Duration = struct {
     }
 };
 
-fn u128ToU64Saturated(value: u128) u64 {
-    return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
+const mib: usize = 1024 * 1024;
+
+// The nav scaling groups' size limit: a listed config whose `navStorageBytes` exceeds it
+// fails, so a storage change that outgrows it is a failure, never a dropped size point.
+const nav_size_limit_bytes: usize = 512 * mib;
+
+/// What sizes the nav a nav scaling config builds: a square world of `side` cells per
+/// level in default chunks, its level links, the nav's threaded participants, and its
+/// path-request capacity (agent budget and group fields; library defaults elsewhere).
+pub const NavSizeConfig = struct {
+    side: usize,
+    levels: usize,
+    links: usize = 0,
+    participant_count: usize,
+    agent_budget: usize,
+    group_fields: usize,
+    /// Cached results whose path can outgrow the inline stripe, each holding one long
+    /// block; the default charges every cached result. A fixture whose paths all fit inline
+    /// passes 0 and checks that no long block was taken.
+    long_results: usize = std.math.maxInt(usize),
+    /// The most registry runs (chunk-local stretches) one cached path holds; null charges
+    /// one per stored cell, the most any path holds. A fixture whose paths are shorter passes
+    /// its bound; `checkNavBytes` tests it after the run.
+    runs_per_result: ?usize = null,
+    /// One-way links among `links`, clamped to it: the one-way closure is charged for these
+    /// only, since a bidirectional link joins its endpoints both ways and holds no closure
+    /// row; every link keeps its one-way registry entry. The default charges every link as
+    /// one-way.
+    oneway_links: usize = std.math.maxInt(usize),
+    /// The most terminals one one-way system holds. The default charges one system holding
+    /// every terminal.
+    oneway_system_terminals: usize = std.math.maxInt(usize),
+    /// The largest marks batch the workload runs; the default charges the worst.
+    batch: NavBatch = .{},
+    /// The escalated search's abstract node cap (`PathfindingCapacity.max_abstract_nodes`),
+    /// which sizes each tier-1 corridor scratch; the library default unless a probe raises it.
+    tier1_abstract_nodes: usize = (PathfindingCapacity{}).max_abstract_nodes,
+    /// The built world's chunk forms and link endpoints (`NavGraph.storageContentOf`), plus
+    /// what the workload adds; null charges every chunk mixed.
+    content: ?NavGraph.StorageContent = null,
+
+    fn levelChunks(self: NavSizeConfig) usize {
+        const per_side = std.math.divCeil(usize, self.side, default_chunk_size_tiles) catch unreachable; // lint:allow catch-unreachable: the chunk edge is a nonzero constant
+        return per_side * per_side;
+    }
+};
+
+/// The largest marks batch of a nav scaling workload: the chunks its marks span (each mark
+/// counted, at most one per changed cell or obstacle rect), its new links, and its distinct
+/// chunk keys (its changed chunks with their four neighbours and both endpoint chunks of
+/// each new link, over every level it touches). A batch reserves the graph's and
+/// connectivity's staging per key, and the staging keeps the largest batch's size. The
+/// defaults charge a mark per cell, every link, and every chunk.
+pub const NavBatch = struct {
+    mark_chunks: usize = std.math.maxInt(usize),
+    links: usize = std.math.maxInt(usize),
+    keys: usize = std.math.maxInt(usize),
+
+    /// A nav that runs no marks batch after its build.
+    pub const none: NavBatch = .{ .mark_chunks = 0, .links = 0, .keys = 0 };
+};
+
+/// The chunk keys a marks batch changing an `edge` x `edge` chunk square patches: the square
+/// and the ring of neighbours around it (`NavBatch.keys`).
+pub fn squareBatchKeys(edge: usize) usize {
+    return edge * edge + 4 * edge;
 }
 
-// Items-per-second from a single mean duration. Lets a group override the throughput
-// numerator (e.g. items actually serviced vs requested) without re-deriving total_ns.
+/// The capacity a nav scaling config's nav reserves; library defaults elsewhere.
+/// `navStorageBytes` charges what it sizes.
+pub fn navSizeCapacity(config: NavSizeConfig) PathfindingCapacity {
+    return .{
+        .worker_participant_count = config.participant_count,
+        .max_agent_budget = config.agent_budget,
+        .max_group_fields = config.group_fields,
+        .max_abstract_nodes = config.tier1_abstract_nodes,
+    };
+}
+
+// `navStorageBytes` by what reports it at run time: the graph (`NavGraph.residentBytes`),
+// the group fields (`GroupField.residentBytes`), and the request side's parts
+// (`PathfindingSystem.requestResidentBytes`).
+const NavStorageParts = struct {
+    graph: usize,
+    group_fields: usize,
+    request: PathfindingSystem.RequestStorage,
+
+    fn total(self: NavStorageParts) usize {
+        var bytes = self.graph +| self.group_fields;
+        inline for (@typeInfo(PathfindingSystem.RequestStorage).@"struct".field_names) |name| bytes +|= @field(self.request, name);
+        return bytes;
+    }
+};
+
+// An over-estimate of the bytes the per-chunk nav takes for `config` at its agent-budget
+// ceiling, from the production bounds: the graph (`NavGraph.storageBytesBound`), group
+// fields (`GroupField.storageBytesBound`), and the request side
+// (`PathfindingSystem.requestStorageBytesBound`). Search scratch and group fields are sized
+// by their node and cell budgets, never by level cells.
+fn navStorageBytes(config: NavSizeConfig) usize {
+    return navStorageParts(config).total();
+}
+
+// `navStorageBytes` split by what reports it at run time.
+fn navStorageParts(config: NavSizeConfig) NavStorageParts {
+    const capacity = navSizeCapacity(config);
+    const chunks = config.levelChunks();
+    const levels: usize = @max(1, config.levels);
+    const graph = NavGraph.storageBytesBound(.{
+        .chunks = chunks,
+        .levels = levels,
+        .links = config.links,
+        .oneway_links = config.oneway_links,
+        .oneway_system_terminals = config.oneway_system_terminals,
+        .participants = @max(1, config.participant_count),
+        .batch_mark_chunks = config.batch.mark_chunks,
+        .batch_links = config.batch.links,
+        .batch_keys = config.batch.keys,
+        .content = config.content,
+    });
+    return .{
+        .graph = graph,
+        .group_fields = config.group_fields *| GroupField.storageBytesBound(capacity.group_field_max_cells, chunks),
+        .request = PathfindingSystem.requestStorageBytesBound(capacity, .{
+            .long_results = config.long_results,
+            .runs_per_result = config.runs_per_result,
+            .chunks = chunks *| levels,
+            // A marks batch holds at most a mark per cell and a key per chunk.
+            .marks = @min(config.batch.mark_chunks, chunks *| levels *| default_chunk_size_tiles *| default_chunk_size_tiles),
+            .batch_keys = @min(config.batch.keys, chunks *| levels),
+        }),
+    };
+}
+
+/// Fails when a built nav holds more bytes in any part than `navStorageParts(config)`
+/// charges it, printing that part's figures.
+pub fn checkNavBytes(group_name: []const u8, item_count: usize, config: NavSizeConfig, system: *const PathfindingSystem) !void {
+    const parts = navStorageParts(config);
+    var field_bytes: usize = 0;
+    for (system.group_fields.items) |*field| field_bytes += field.residentBytes();
+    const resident = system.requestResidentBytes();
+    var past = false;
+    past = reportPart(group_name, item_count, "graph", system.graph.residentBytes(), parts.graph) or past;
+    past = reportPart(group_name, item_count, "group fields", field_bytes, parts.group_fields) or past;
+    inline for (@typeInfo(PathfindingSystem.RequestStorage).@"struct".field_names) |name| {
+        past = reportPart(group_name, item_count, name, @field(resident, name), @field(parts.request, name)) or past;
+    }
+    if (past) return error.NavBytesPastEstimate;
+}
+
+// Prints a part holding more than charged; returns whether it does.
+fn reportPart(group_name: []const u8, item_count: usize, part: []const u8, resident: usize, charged: usize) bool {
+    if (resident <= charged) return false;
+    std.debug.print("  {s} {}: nav {s} holds {} B against {} B charged\n", .{ group_name, item_count, part, resident, charged });
+    return true;
+}
+
+/// Fails for a config whose `navStorageBytes` exceeds the bench nav-size limit, printing
+/// its figure: the lists hold only configs that fit.
+pub fn checkNavSize(group_name: []const u8, item_count: usize, case: BenchmarkCase, config: NavSizeConfig) !void {
+    const bytes = navStorageBytes(config);
+    if (bytes <= nav_size_limit_bytes) return;
+    std.debug.print("  {s} {} {s}: nav needs {} MiB against the {} MiB bench nav-size limit\n", .{
+        group_name,
+        item_count,
+        case.name,
+        std.math.divCeil(usize, bytes, mib) catch unreachable, // lint:allow catch-unreachable: mib is a nonzero constant
+        nav_size_limit_bytes / mib,
+    });
+    return error.NavPastSizeLimit;
+}
+
+/// Items per second over one mean duration, for a group whose throughput numerator is not
+/// its item count (items serviced, cells written, an item code).
 pub fn itemsPerSecond(items: usize, mean_ns: u64) u64 {
     if (mean_ns == 0) return 0;
-    return u128ToU64Saturated((@as(u128, items) * std.time.ns_per_s) / mean_ns);
+    return std.math.lossyCast(u64, (@as(u128, items) * std.time.ns_per_s) / mean_ns);
 }
 
-fn u128ToUsizeSaturated(value: u128) usize {
-    return if (value > std.math.maxInt(usize)) std.math.maxInt(usize) else @intCast(value);
+/// Per stage of `n`, the busiest batch over the samples added (most items; on a tie, one
+/// that ran on workers), and how many non-empty batches ran on workers.
+pub fn StageShapes(comptime n: usize) type {
+    return struct {
+        const Self = @This();
+
+        busiest: [n]BatchStats = @splat(.{}),
+        threaded: [n]usize = @splat(0),
+        dispatched: [n]usize = @splat(0),
+
+        pub fn add(self: *Self, batches: [n]BatchStats) void {
+            for (batches, &self.busiest, &self.threaded, &self.dispatched) |batch, *busiest, *threaded, *dispatched| {
+                if (batch.item_count == 0) continue;
+                dispatched.* += 1;
+                const on_workers = !batch.ran_inline and batch.active_worker_threads != 0;
+                if (on_workers) threaded.* += 1;
+                const busiest_on_workers = !busiest.ran_inline and busiest.active_worker_threads != 0;
+                if (batch.item_count > busiest.item_count or (batch.item_count == busiest.item_count and on_workers and !busiest_on_workers)) busiest.* = batch;
+            }
+        }
+
+        /// Stage `index`'s shape: `inline(items)` or `Ww/Rr(items)`, then threaded/non-empty
+        /// batches.
+        pub fn label(self: *const Self, index: usize, buffer: []u8) []const u8 {
+            const batch = self.busiest[index];
+            if (batch.ran_inline or batch.active_worker_threads == 0) {
+                return std.fmt.bufPrint(buffer, "inline({})[{}/{}]", .{ batch.item_count, self.threaded[index], self.dispatched[index] }) catch "inline";
+            }
+            return std.fmt.bufPrint(buffer, "{}w/{}r({})[{}/{}]", .{ batch.active_worker_threads, batch.range_count, batch.item_count, self.threaded[index], self.dispatched[index] }) catch "stage";
+        }
+    };
+}
+
+/// One field of an `ItemCode`: unsigned ints, bools, and enums with an int backing.
+fn itemFieldValue(value: anytype) usize {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .bool => @intFromBool(value),
+        .@"enum" => @backingInt(value),
+        else => value,
+    };
+}
+
+fn itemFieldFrom(comptime T: type, raw: usize) ?T {
+    return switch (@typeInfo(T)) {
+        .bool => if (raw > 1) null else raw == 1,
+        .@"enum" => std.enums.fromInt(T, raw),
+        else => std.math.cast(T, raw),
+    };
+}
+
+fn powerOfTen(comptime exponent: usize) usize {
+    return comptime std.math.powi(usize, 10, exponent) catch @compileError("item code wider than a usize");
+}
+
+/// A bench item code: the fields of `Fields` packed in decimal, most significant first, each
+/// field after the first `digits[i - 1]` digits wide (the first takes the rest), so every
+/// config of a group has one code. `label` names the layout for the report header.
+pub fn ItemCode(comptime Fields: type, comptime digits: []const usize) type {
+    const names = @typeInfo(Fields).@"struct".field_names;
+    const field_types = @typeInfo(Fields).@"struct".field_types;
+    comptime std.debug.assert(digits.len + 1 == names.len);
+    return struct {
+        pub const label: []const u8 = blk: {
+            @setEvalBranchQuota(10_000);
+            var text: []const u8 = "(";
+            for (names, 0..) |name, index| {
+                var exponent: usize = 0;
+                for (digits[index..]) |width| exponent += width;
+                var words: [name.len]u8 = name[0..name.len].*;
+                std.mem.replaceScalar(u8, &words, '_', ' ');
+                const scale: []const u8 = switch (exponent) {
+                    0 => "",
+                    1, 2, 3 => std.fmt.comptimePrint(" * {}", .{powerOfTen(exponent)}),
+                    else => std.fmt.comptimePrint(" * 10^{}", .{exponent}),
+                };
+                text = text ++ (if (index == 0) "" else " + ") ++ words ++ scale;
+            }
+            break :blk text ++ ")";
+        };
+
+        /// Fails when a field after the first is past its digits.
+        pub fn encode(fields: Fields) error{ItemCodeFieldTooWide}!usize {
+            var code: usize = 0;
+            inline for (names, 0..) |name, index| {
+                const raw = itemFieldValue(@field(fields, name));
+                if (index == 0) {
+                    code = raw;
+                } else {
+                    const scale = comptime powerOfTen(digits[index - 1]);
+                    if (raw >= scale) return error.ItemCodeFieldTooWide;
+                    code = code * scale + raw;
+                }
+            }
+            return code;
+        }
+
+        /// `encode` at comptime, for a group's config list.
+        pub fn of(comptime fields: Fields) usize {
+            @setEvalBranchQuota(100_000);
+            return comptime encode(fields) catch @compileError("item code field past its digits");
+        }
+
+        /// Fails when a field does not fit its type (or names no tag of its enum).
+        pub fn decode(code: usize) error{ItemCodeFieldOutOfRange}!Fields {
+            var fields: Fields = undefined;
+            var rest = code;
+            comptime var index = names.len;
+            inline while (index > 0) {
+                index -= 1;
+                const raw = if (index == 0) rest else rest % comptime powerOfTen(digits[index - 1]);
+                if (index != 0) rest /= comptime powerOfTen(digits[index - 1]);
+                @field(fields, names[index]) = itemFieldFrom(field_types[index], raw) orelse return error.ItemCodeFieldOutOfRange;
+            }
+            return fields;
+        }
+    };
 }
 
 test "default benchmark cases cover required thread modes" {
@@ -1314,6 +1689,22 @@ test "benchmark options parse scaling and filtering arguments" {
     try std.testing.expect(options.details);
 }
 
+test "benchmark group prefix selects a family and combines with an exact group" {
+    const prefix_args = [_][]const u8{ "--group-prefix", "chunk-scale-" };
+    const prefix = try parseOptions(&prefix_args);
+    try std.testing.expectEqualStrings("chunk-scale-", prefix.group_prefix.?);
+    try std.testing.expect(groupSelected(prefix, "chunk-scale-dig"));
+    try std.testing.expect(groupSelected(prefix, "chunk-scale-cave-in"));
+    try std.testing.expect(!groupSelected(prefix, "nav-update"));
+
+    const both_args = [_][]const u8{ "--group-prefix=chunk-scale-", "--group=chunk-scale-dig" };
+    const both = try parseOptions(&both_args);
+    try std.testing.expect(groupSelected(both, "chunk-scale-dig"));
+    try std.testing.expect(!groupSelected(both, "chunk-scale-cave-in"));
+    try std.testing.expect(groupSelected(.{}, "movement"));
+    try std.testing.expectError(error.MissingArgument, parseOptions(&[_][]const u8{"--group-prefix"}));
+}
+
 test "benchmark options reject zero iterations" {
     const args = [_][]const u8{ "--iterations", "0" };
     try std.testing.expectError(error.InvalidArgument, parseOptions(&args));
@@ -1341,12 +1732,24 @@ test "work tuning summary preserves settled phase" {
         .settled_window_count = 4,
         .retune_after_settled_windows = 10_000,
         .best_mean_batch_duration_ns = 42,
+        .has_threaded_profile = true,
+        .probe_window_count = if (diagnostics_enabled) 7 else {},
+        .demotion_count = if (diagnostics_enabled) 2 else {},
     }, true);
 
     try std.testing.expectEqual(AdaptiveWorkPhase.settled, summary.phase);
     try std.testing.expect(summary.settled_before_measurement);
     try std.testing.expectEqual(@as(usize, 4), summary.best_worker_threads);
     try std.testing.expectEqual(@as(usize, 256), summary.best_items_per_range);
+    if (comptime diagnostics_enabled) {
+        try std.testing.expectEqual(@as(u64, 7), summary.probe_window_count);
+        try std.testing.expectEqual(@as(u64, 2), summary.demotion_count);
+        var tuning_buffer: [96]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            "settled settled=yes best=4/256 final=4/256 probes=7 demotes=2",
+            formatWorkTuningInto(&tuning_buffer, summary),
+        );
+    }
 }
 
 test "fixed adaptive benchmark case disables range probing" {
@@ -1379,11 +1782,18 @@ fn testRunCase(_: std.mem.Allocator, _: std.Io, _: Options, _: BenchmarkCase, _:
     return .{};
 }
 
+fn writeTestWorkload(writer: *std.Io.Writer, stats: RunStats, view: WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("hits={}", .{stats.output_count});
+    if (view == .details) try writeShare(writer, "main", 250, 1000);
+}
+
 test "benchmark items option overrides registered counts" {
     const group = BenchmarkGroup{
         .name = "test",
+        .item_label = "test items",
         .defaultItemCounts = testItemCounts,
         .runCase = testRunCase,
+        .write_workload = writeNoWorkload,
     };
     var explicit_item_count: [1]usize = undefined;
 
@@ -1413,8 +1823,9 @@ test "benchmark table formatters keep compact text" {
             .available_worker_threads = 10,
         },
     }));
+    const counters_text = if (diagnostics_enabled) " probes=0 demotes=0" else "";
     try std.testing.expectEqualStrings(
-        "settled settled=yes best=4/256 final=4/256",
+        "settled settled=yes best=4/256 final=4/256" ++ counters_text,
         formatWorkTuningInto(&range_buffer, .{
             .phase = .settled,
             .best_worker_threads = 4,
@@ -1425,16 +1836,130 @@ test "benchmark table formatters keep compact text" {
             .has_threaded_profile = true,
         }),
     );
+    const group = BenchmarkGroup{
+        .name = "test",
+        .item_label = "test items",
+        .defaultItemCounts = testItemCounts,
+        .runCase = testRunCase,
+        .write_workload = writeTestWorkload,
+    };
+    var workload_buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("hits=4", formatWorkloadInto(&workload_buffer, group, .{ .output_count = 4 }, .summary));
+    try std.testing.expectEqualStrings("hits=4 main=250 ns (25%)", formatWorkloadInto(&workload_buffer, group, .{ .output_count = 4 }, .details));
+    const silent = BenchmarkGroup{ .name = "silent", .item_label = "items", .defaultItemCounts = testItemCounts, .runCase = testRunCase, .write_workload = writeNoWorkload };
+    try std.testing.expectEqualStrings("", formatWorkloadInto(&workload_buffer, silent, .{ .output_count = 4 }, .details));
+}
+
+test "the details table's range columns read inline for an inline batch, never a range size" {
+    var buffer: [24]u8 = undefined;
+    const inline_batch = BatchSummary{ .item_count = 64, .range_count = 1, .items_per_range = 64, .main_thread_ranges = 1, .ran_inline = true };
+    try std.testing.expectEqualStrings("inline", formatRangeCellInto(&buffer, inline_batch, inline_batch.items_per_range));
+    try std.testing.expectEqualStrings("inline", formatRangeCellInto(&buffer, inline_batch, inline_batch.main_thread_ranges));
+    // A dispatched batch that kept no worker active ran inline too.
+    const idle = BatchSummary{ .item_count = 64, .range_count = 2, .items_per_range = 32, .ran_inline = false };
+    try std.testing.expectEqualStrings("inline", formatRangeCellInto(&buffer, idle, idle.items_per_range));
+    const threaded = BatchSummary{ .item_count = 64, .range_count = 4, .items_per_range = 16, .active_worker_threads = 3, .worker_thread_ranges = 3, .ran_inline = false };
+    try std.testing.expectEqualStrings("16", formatRangeCellInto(&buffer, threaded, threaded.items_per_range));
+    try std.testing.expectEqualStrings("3", formatRangeCellInto(&buffer, threaded, threaded.worker_thread_ranges));
+}
+
+test "nav main split prints each section, the inline stage time, and the rest per sample" {
+    var buffer: [320]u8 = undefined;
+    try std.testing.expectEqualStrings("", formatNavMainInto(&buffer, null));
+    try std.testing.expectEqualStrings("", formatNavMainInto(&buffer, NavMainSummary{}));
+    const stats = NavUpdateStats{
+        .inline_stage_ns = 20_000,
+        .main = .{
+            .mark_ns = 1_000,
+            .plan_ns = 2_000,
+            .reserve_ns = 3_000,
+            .commit_ns = 4_000,
+            .conn_merge_ns = 5_000,
+            .conn_layout_ns = 6_000,
+            .flood_ns = 7_000,
+            .closure_ns = 8_000,
+            .evict_ns = 9_000,
+        },
+    };
+    // Two samples: one reaction, then an iteration of a reaction merged from another summary.
+    var summary = NavMainSummary{};
+    summary.add(70_000, stats);
+    summary.endSample();
+    var other = NavMainSummary{};
+    other.add(70_000, stats);
+    summary.merge(other);
+    summary.endSample();
     try std.testing.expectEqualStrings(
-        "fallback_requests=4 fallback_deferred=2 deferred=2 results=4 evictions=1",
-        formatWorkloadInto(&range_buffer, "pathfinding-hard-fallback-budget", .{
-            .candidate_pairs = 4,
-            .fallback_deferred_count = 2,
-            .deferred_count = 2,
-            .output_count = 4,
-            .cache_evictions = 1,
-        }),
+        " main_split=mark:1.00 us plan:2.00 us reserve:3.00 us commit:4.00 us conn_merge:5.00 us conn_layout:6.00 us flood:7.00 us closure:8.00 us evict:9.00 us inline:20.00 us rest:5.00 us",
+        formatNavMainInto(&buffer, summary),
     );
+}
+
+const TestVariant = enum(u8) { plain, packed_pads };
+const TestCode = ItemCode(struct { variant: TestVariant, edge_chunks: u16, level_side: u16, levels: u16 }, &.{ 3, 4, 3 });
+
+test "an item code packs its fields in decimal, round-trips them, and names its layout" {
+    try std.testing.expectEqualStrings("(variant * 10^10 + edge chunks * 10^7 + level side * 1000 + levels)", TestCode.label);
+    const code = TestCode.of(.{ .variant = .packed_pads, .edge_chunks = 8, .level_side = 1024, .levels = 1 });
+    try std.testing.expectEqual(@as(usize, 10_081_024_001), code);
+    const fields = try TestCode.decode(code);
+    try std.testing.expectEqual(TestVariant.packed_pads, fields.variant);
+    try std.testing.expectEqual(@as(u16, 8), fields.edge_chunks);
+    try std.testing.expectEqual(@as(u16, 1024), fields.level_side);
+    try std.testing.expectEqual(@as(u16, 1), fields.levels);
+    // A plain count is its own code under a one-field layout's lowest digits.
+    const Plain = ItemCode(struct { level_side: u16, levels: u16 }, &.{3});
+    try std.testing.expectEqualStrings("(level side * 1000 + levels)", Plain.label);
+    try std.testing.expectEqual(@as(usize, 256_008), Plain.of(.{ .level_side = 256, .levels = 8 }));
+}
+
+test "an item code rejects a field past its digits, its type, or its enum's tags" {
+    try std.testing.expectError(error.ItemCodeFieldTooWide, TestCode.encode(.{ .variant = .plain, .edge_chunks = 1000, .level_side = 256, .levels = 1 }));
+    // Variant 2 names no tag.
+    try std.testing.expectError(error.ItemCodeFieldOutOfRange, TestCode.decode(20_081_024_001));
+    // A level side of 70,000 passes u16.
+    const Wide = ItemCode(struct { level_side: u16, requests: u16 }, &.{3});
+    try std.testing.expectError(error.ItemCodeFieldOutOfRange, Wide.decode(70_000_064));
+}
+
+test "the stage-shape accumulator keeps each stage's busiest batch, preferring one on workers at a tie" {
+    var shapes = StageShapes(2){};
+    shapes.add(.{ .{ .item_count = 8, .range_count = 1, .ran_inline = true }, .{} });
+    shapes.add(.{ .{ .item_count = 8, .range_count = 4, .active_worker_threads = 3, .ran_inline = false }, .{ .item_count = 2, .range_count = 1, .ran_inline = true } });
+    shapes.add(.{ .{ .item_count = 4, .range_count = 1, .ran_inline = true }, .{} });
+    var buffer: [48]u8 = undefined;
+    try std.testing.expectEqualStrings("3w/4r(8)[1/3]", shapes.label(0, &buffer));
+    try std.testing.expectEqualStrings("inline(2)[0/1]", shapes.label(1, &buffer));
+}
+
+fn formatSteeringStagesInto(buffer: []u8, stats: RunStats) []const u8 {
+    var writer: std.Io.Writer = .fixed(buffer);
+    writeSteeringStages(&writer, stats) catch return "stages";
+    return writer.buffered();
+}
+
+test "steering stage label tells a stage that did not run from an inline one" {
+    var buffer: [160]u8 = undefined;
+    // The serial path: the claim and the grid sort never ran.
+    try std.testing.expectEqualStrings("agents=inline resolve=inline claim=- dir=inline bucket=inline sort=-", formatSteeringStagesInto(&buffer, .{
+        .steering_stages = .{
+            .agents = .{ .item_count = 64, .range_count = 1, .ran_inline = true },
+            .select_resolve = .{ .item_count = 48, .range_count = 1, .ran_inline = true },
+            .directions = .{ .item_count = 48, .range_count = 1, .ran_inline = true },
+            .grid_bucket = .{ .item_count = 64, .range_count = 1, .ran_inline = true },
+        },
+    }));
+    // Threaded: the claim inline by its tuner, the grid sort on workers.
+    try std.testing.expectEqualStrings("agents=2w/4r resolve=inline claim=inline dir=2w/3r bucket=2w/4r sort=3w/64r", formatSteeringStagesInto(&buffer, .{
+        .steering_stages = .{
+            .agents = .{ .item_count = 64, .range_count = 4, .active_worker_threads = 2, .ran_inline = false },
+            .select_resolve = .{ .item_count = 48, .range_count = 1, .ran_inline = true },
+            .select_claim = .{ .item_count = 4, .range_count = 1, .ran_inline = true },
+            .directions = .{ .item_count = 48, .range_count = 3, .active_worker_threads = 2, .ran_inline = false },
+            .grid_bucket = .{ .item_count = 64, .range_count = 4, .active_worker_threads = 2, .ran_inline = false },
+            .grid_sort = .{ .item_count = 64, .range_count = 64, .active_worker_threads = 3, .ran_inline = false },
+        },
+    }));
 }
 
 test "benchmark skipped status keeps skip reason visible" {
@@ -1478,4 +2003,80 @@ test "batch modes align to cache-line item boundaries" {
     const large = default_cases[5].itemsPerRange(16).?;
     try std.testing.expectEqual(@as(usize, 32), small);
     try std.testing.expectEqual(@as(usize, 256), large);
+}
+
+test "nav storage charges the one-way closure for one-way links only, every link by default" {
+    const base = NavSizeConfig{ .side = 256, .levels = 2, .links = 4096, .participant_count = 1, .agent_budget = 8, .group_fields = 1, .batch = .{ .mark_chunks = 1, .links = 0, .keys = 5 } };
+    var two_way = base;
+    two_way.oneway_links = 0;
+    var all_oneway = base;
+    all_oneway.oneway_links = base.links;
+    var past_all = base;
+    past_all.oneway_links = 2 * base.links;
+    try std.testing.expectEqual(navStorageBytes(base), navStorageBytes(all_oneway));
+    try std.testing.expectEqual(navStorageBytes(base), navStorageBytes(past_all));
+    try std.testing.expect(navStorageBytes(two_way) < navStorageBytes(base));
+    // Systems of a few terminals each hold narrower blocks than one holding every terminal.
+    var small_systems = base;
+    small_systems.oneway_system_terminals = 8;
+    try std.testing.expect(navStorageBytes(small_systems) < navStorageBytes(base));
+    try std.testing.expect(navStorageBytes(two_way) < navStorageBytes(small_systems));
+}
+
+test "nav storage parts pass the config's shape to the graph and field bounds, and a batch moves only the graph and the change scratch" {
+    const base = NavSizeConfig{ .side = 256, .levels = 2, .links = 64, .oneway_links = 0, .participant_count = 3, .agent_budget = 8, .group_fields = 2, .batch = NavBatch.none };
+    var batch = base;
+    batch.batch = .{ .mark_chunks = 300, .links = 10, .keys = 400 };
+    for ([_]NavSizeConfig{ base, batch }) |config| {
+        try std.testing.expectEqual(NavGraph.storageBytesBound(.{
+            .chunks = 256,
+            .levels = 2,
+            .links = 64,
+            .oneway_links = 0,
+            .participants = 3,
+            .batch_mark_chunks = config.batch.mark_chunks,
+            .batch_links = config.batch.links,
+            .batch_keys = config.batch.keys,
+        }), navStorageParts(config).graph);
+        try std.testing.expectEqual(2 * GroupField.storageBytesBound((PathfindingCapacity{}).group_field_max_cells, 256), navStorageParts(config).group_fields);
+    }
+    const base_parts = navStorageParts(base);
+    const batch_parts = navStorageParts(batch);
+    try std.testing.expect(batch_parts.graph > base_parts.graph);
+    try std.testing.expect(batch_parts.request.change_scratch > base_parts.request.change_scratch);
+    var unmoved = batch_parts.request;
+    unmoved.change_scratch = base_parts.request.change_scratch;
+    try std.testing.expectEqual(base_parts.request, unmoved);
+    try std.testing.expectEqual(
+        navStorageBytes(batch) - navStorageBytes(base),
+        (batch_parts.graph - base_parts.graph) + (batch_parts.request.change_scratch - base_parts.request.change_scratch),
+    );
+}
+
+test "nav storage charges the request side's production bound at the config's shape, long blocks for its long results only" {
+    const base = NavSizeConfig{ .side = 256, .levels = 1, .participant_count = 1, .agent_budget = 100, .group_fields = 1 };
+    var inline_only = base;
+    inline_only.long_results = 0;
+    var one_long = base;
+    one_long.long_results = 1;
+    var past_all = base;
+    past_all.long_results = 1000;
+    for ([_]NavSizeConfig{ base, inline_only, one_long, past_all }) |config| {
+        const expected = PathfindingSystem.requestStorageBytesBound(navSizeCapacity(config), .{
+            .long_results = config.long_results,
+            .runs_per_result = config.runs_per_result,
+            .chunks = 256,
+            .marks = 256 * @as(usize, default_chunk_size_tiles) * default_chunk_size_tiles,
+            .batch_keys = 256,
+        });
+        try std.testing.expectEqual(expected, navStorageParts(config).request);
+    }
+    // Long blocks are charged for the long results alone, at most one per cached result.
+    try std.testing.expect(navStorageBytes(inline_only) < navStorageBytes(one_long));
+    try std.testing.expect(navStorageBytes(one_long) < navStorageBytes(base));
+    try std.testing.expectEqual(navStorageBytes(base), navStorageBytes(past_all));
+    // Short routes charge fewer registry runs than one per stored cell.
+    var short_routes = base;
+    short_routes.runs_per_result = 3;
+    try std.testing.expect(navStorageParts(short_routes).request.registry < navStorageParts(base).request.registry);
 }

@@ -3,8 +3,6 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
-const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
-const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const math = @import("../core/math.zig");
 const AiBehavior = @import("../game/data_system.zig").AiBehavior;
@@ -16,6 +14,8 @@ const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alig
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const InterestMarkerStore = @import("../game/world_interest.zig").InterestMarkerStore;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
@@ -33,8 +33,10 @@ const behavior_archetype_cycle_len: usize = 5;
 
 pub const group = suite.BenchmarkGroup{
     .name = "ai",
+    .item_label = "AI agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeAiWorkload,
 };
 
 const Fixture = struct {
@@ -45,8 +47,10 @@ const Fixture = struct {
     // config with only `.focus_target` set and no `.focus_entity` never
     // resolves the fallback tier at all.
     focus_entity: EntityId,
+    markers: InterestMarkerStore,
 
     fn deinit(self: *Fixture) void {
+        self.markers.deinit(self.frame.allocator);
         self.frame.deinit();
         self.data.deinit();
         self.* = undefined;
@@ -115,9 +119,16 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
             },
             else => try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = wander_amplitude, .gain_cohere = 1.5 }),
         }
+        try data.setAiMemory(entity, .{ .staleness = @floatFromInt(index % 5), .familiarity = 0.25 });
+        try data.setAiAffect(entity, .{ .fear = 0.2, .curiosity = 0.15, .aggression = 0.1 });
     }
 
-    return .{ .data = data, .frame = frame, .focus_entity = focus_entity };
+    var markers = InterestMarkerStore.init(allocator);
+    errdefer markers.deinit(allocator);
+    _ = try markers.addMarker(.{ .kind = .investigate, .level = 0, .x = 64, .y = 64, .radius = 16 });
+    _ = try markers.addMarker(.{ .kind = .investigate, .level = 0, .x = 400, .y = 200, .radius = 16 });
+
+    return .{ .data = data, .frame = frame, .focus_entity = focus_entity, .markers = markers };
 }
 
 fn behaviorHistogram(behaviors: []const AiBehavior) suite.AiBehaviorHistogramSummary {
@@ -146,13 +157,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         system.intent_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
     }
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     // This bench never runs movement, so the fixture's positions never change
@@ -212,6 +217,9 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView,
             .focus_target = benchmarkSeekTarget(),
             .focus_entity = fixture.focus_entity,
             .perception_slice = fixture.data.aiPerceptionSliceConst(),
+            .memory_slice = fixture.data.aiMemorySliceConst(),
+            .affect_slice = fixture.data.aiAffectSliceConst(),
+            .interest_markers = &fixture.markers,
         });
     }
 
@@ -223,15 +231,34 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView,
         .focus_target = benchmarkSeekTarget(),
         .focus_entity = fixture.focus_entity,
         .perception_slice = fixture.data.aiPerceptionSliceConst(),
+        .memory_slice = fixture.data.aiMemorySliceConst(),
+        .affect_slice = fixture.data.aiAffectSliceConst(),
+        .interest_markers = &fixture.markers,
     });
 }
 
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(ai_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, ai_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, ai_range_alignment_items);
 }
 
 fn benchmarkSeekTarget() math.Vec2 {
     return .{ .x = 480, .y = 270 };
+}
+
+fn writeAiWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("separation_checks={} intents={}", .{ stats.candidate_pairs, stats.output_count });
+    if (view == .summary) {
+        if (stats.ai_behavior_histogram) |histogram| {
+            try writer.print(" behaviors wander={} pursue={} flee={} investigate={} cohere={}", .{ histogram.wander, histogram.pursue, histogram.flee, histogram.investigate, histogram.cohere });
+        }
+        return;
+    }
+    const intent = stats.secondary_batch orelse return;
+    try writer.writeAll(" intent=");
+    try suite.writeStageShape(writer, intent);
+    if (intent.ran_inline or intent.active_worker_threads == 0) {
+        if (stats.secondary_work_tuning) |summary| try writer.print(" tuned={s}", .{if (summary.has_threaded_profile) "threaded" else "none"});
+    }
 }

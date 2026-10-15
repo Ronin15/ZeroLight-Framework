@@ -5,7 +5,7 @@
 //! Allocation-free input routing for gameplay, UI, app command, and debug contexts.
 
 const std = @import("std");
-const inputFile = @import("input.zig");
+const input_file = @import("input.zig");
 const Action = @import("input.zig").Action;
 const FrameCommands = @import("input.zig").FrameCommands;
 const InputState = @import("input.zig").InputState;
@@ -18,7 +18,7 @@ pub const InputContext = enum(usize) {
     debug,
 };
 
-const context_count = @typeInfo(InputContext).@"enum".fields.len;
+const context_count = @typeInfo(InputContext).@"enum".field_names.len;
 
 pub const InputRoutingPolicy = struct {
     contexts: ContextFlags = ContextFlags.defaultGameplay(),
@@ -87,12 +87,12 @@ pub fn routeEventWithGamepad(
 ) void {
     switch (event.type) {
         c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_KEY_UP => {
-            const action = inputFile.actionForKey(event.key.key) orelse return;
+            const action = input_file.actionForKey(event.key.key) orelse return;
             routeAction(policy, action, event.type == c.SDL_EVENT_KEY_DOWN, event.key.repeat, input, commands);
         },
         c.SDL_EVENT_GAMEPAD_BUTTON_DOWN, c.SDL_EVENT_GAMEPAD_BUTTON_UP => {
             if (!isActiveGamepadEvent(active_gamepad_id, event.gbutton.which)) return;
-            const action = inputFile.actionForGamepadButton(@intCast(event.gbutton.button)) orelse return;
+            const action = input_file.actionForGamepadButton(@intCast(event.gbutton.button)) orelse return;
             // Gamepad buttons never repeat: SDL does not synthesize repeat
             // events for held gamepad buttons the way it does for keys.
             routeAction(policy, action, event.type == c.SDL_EVENT_GAMEPAD_BUTTON_DOWN, false, input, commands);
@@ -170,7 +170,7 @@ pub fn contextForAction(action: Action) InputContext {
 }
 
 pub const ContextFlags = struct {
-    values: [context_count]bool = [_]bool{false} ** context_count,
+    values: [context_count]bool = @splat(false),
 
     pub fn defaultGameplay() ContextFlags {
         var flags = ContextFlags{};
@@ -181,11 +181,11 @@ pub const ContextFlags = struct {
     }
 
     pub fn get(self: *const ContextFlags, context: InputContext) bool {
-        return self.values[@intFromEnum(context)];
+        return self.values[@backingInt(context)];
     }
 
     pub fn set(self: *ContextFlags, context: InputContext, value: bool) void {
-        self.values[@intFromEnum(context)] = value;
+        self.values[@backingInt(context)] = value;
     }
 };
 

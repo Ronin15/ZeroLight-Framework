@@ -20,12 +20,15 @@ const sprite_prep_adaptive_tuner_config = AdaptiveWorkTunerConfig{
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const Camera2D = @import("camera.zig").Camera2D;
 const config = @import("../config.zig");
+const logging = @import("../core/logging.zig");
 const math = @import("../core/math.zig");
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const resources = @import("resources.zig");
+const perf_diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const simd = @import("../core/simd.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
+const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 
 pub const TextureId = resources.TextureId;
 
@@ -55,7 +58,7 @@ pub const UiDepth = enum(i32) {
     text,
 };
 
-const ui_depth_stride: i32 = @intCast(std.meta.fields(UiDepth).len);
+const ui_depth_stride: i32 = @intCast(@typeInfo(UiDepth).@"enum".field_names.len);
 
 pub const UiStackOrder = struct {
     index: u16 = 0,
@@ -88,16 +91,16 @@ pub const RenderOrder = struct {
     }
 
     pub fn uiInStack(stack_order: UiStackOrder, depth: UiDepth) RenderOrder {
-        return .{ .domain = .ui, .depth = stack_order.depthOffset() + @intFromEnum(depth) };
+        return .{ .domain = .ui, .depth = stack_order.depthOffset() + @backingInt(depth) };
     }
 
     pub fn debug(depth: DebugDepth) RenderOrder {
-        return .{ .domain = .debug, .depth = @intFromEnum(depth) };
+        return .{ .domain = .debug, .depth = @backingInt(depth) };
     }
 
     pub fn lessOrEqual(lhs: RenderOrder, rhs: RenderOrder) bool {
-        const lhs_domain = @intFromEnum(lhs.domain);
-        const rhs_domain = @intFromEnum(rhs.domain);
+        const lhs_domain = @backingInt(lhs.domain);
+        const rhs_domain = @backingInt(rhs.domain);
         if (lhs_domain != rhs_domain) return lhs_domain < rhs_domain;
         return lhs.depth <= rhs.depth;
     }
@@ -163,43 +166,39 @@ pub const Material = enum {
     tilemap,
 };
 
-/// Fragment uniform (set 3) for a tilemap draw — world-constant grid + atlas
-/// geometry plus this draw's composited layer window. extern for a stable GPU
-/// layout matching `tilemap.frag.glsl`. Kept off `DrawGroup` (looked up in the
-/// renderer by `tile_data`) so the per-frame draw-group sort/coalesce/merge does
-/// not drag this payload through every sprite group.
+/// Fragment uniform (set 3) for a tilemap draw: world-constant grid and atlas
+/// geometry, the store's chunk geometry and resident window, and this draw's layer
+/// chain. extern, in `tilemap.frag.glsl`'s `TilemapUniform` field order and std140
+/// layout. Kept off `DrawGroup` (looked up in the renderer by `tile_data`) so the
+/// per-frame draw-group sort/coalesce/merge does not drag this payload through every
+/// sprite group.
 pub const TilemapParams = extern struct {
     // x=tile_size, y=grid_width, z=grid_height, w=invalid_tile_id
     grid: [4]f32,
     // x=atlas_columns, y=atlas_width_px, z=atlas_height_px, w=atlas_tile_px
     atlas: [4]f32,
-    // x=this draw's composited layer count (topmost-first), y/z/w unused. Filled
-    // per draw group at push time (Renderer.applyWindowLayers), not stored in
-    // createTileDataBuffer's per-buffer params, since several draws can
-    // composite different layer subsets from one combined buffer.
+    // x=this draw's chained layer count, y=shallowest-bucket flag (both per draw,
+    // `Renderer.applyWindowLayers`); z=chunk shift (log2 of the chunk edge),
+    // w=directory side in chunks (a power of two), both per store.
     layer_meta: [4]i32 = .{ 0, 0, 0, 0 },
-    // Topmost-first element offsets into the tile-data buffer named by
-    // DrawGroup.tile_data, one per composited layer (layer_meta[0] of them
-    // valid; the rest are stale). Packed as a flat [32]u32 to byte-match a GLSL
-    // uvec4[8] array under std140 (uvec4 array elements have no interior
-    // padding, so this is contiguous with no guessed compiler padding).
-    layer_offsets: [32]u32 = @splat(0),
+    // The resident chunk window the draw reads: min chunk x, min chunk y,
+    // max-exclusive chunk x, max-exclusive chunk y. Chunks outside it draw nothing.
+    window: [4]u32 = .{ 0, 0, 0, 0 },
+    // x=this draw's topmost directory start (absolute element offset); deeper
+    // layers follow each directory's link word. y/z/w unused.
+    chain: [4]u32 = .{ 0, 0, 0, 0 },
 };
 
-// std140 (the default GLSL uniform-block layout, and what `tilemap.frag.glsl`'s
-// `TilemapUniform` uses since it names neither std140 nor std430) requires every
-// `vec4`/`ivec4`/`uvec4` field, and every element of an array of them, to sit at
-// a 16-byte-aligned offset with no interior padding — exactly this struct's
-// four 16-byte fields back to back. Confirmed (not just asserted) against the
-// SPIRV-Cross-generated MSL for this shader: `struct TilemapUniform { float4
-// grid; float4 atlas; int4 layer_meta; uint4 layer_offsets[8]; };`, byte-for-byte
-// matching this extern struct with zero padding either side.
+// std140 places every vec4/ivec4/uvec4 member at a 16-byte-aligned offset with no
+// padding between them, which is exactly this struct's five 16-byte fields back to
+// back.
 comptime {
-    std.debug.assert(@sizeOf(TilemapParams) == 4 * 4 + 4 * 4 + 4 * 4 + 32 * 4);
+    std.debug.assert(@sizeOf(TilemapParams) == 80);
     std.debug.assert(@offsetOf(TilemapParams, "grid") == 0);
     std.debug.assert(@offsetOf(TilemapParams, "atlas") == 16);
     std.debug.assert(@offsetOf(TilemapParams, "layer_meta") == 32);
-    std.debug.assert(@offsetOf(TilemapParams, "layer_offsets") == 48);
+    std.debug.assert(@offsetOf(TilemapParams, "window") == 48);
+    std.debug.assert(@offsetOf(TilemapParams, "chain") == 64);
 }
 
 pub const DrawGroup = struct {
@@ -210,14 +209,15 @@ pub const DrawGroup = struct {
     order: RenderOrder = .{},
     first_vertex: u32,
     vertex_count: u32,
-    // Tilemap-material groups only: the buffer's storage-buffer handle. The grid/atlas
-    // uniform lives in the renderer keyed by this id.
+    // Tilemap-material groups only: the world's non-owning tile store id. The
+    // grid/atlas uniform lives in the renderer keyed by this id; a stale id (store
+    // retired) skips the draw.
     tile_data: resources.TileDataId = .invalid,
     // Tilemap-material groups only: indexes the renderer's per-frame
     // TilemapWindowLayers side table (populated by appendStaticTilemapSpan),
-    // giving this draw's topmost-first composited layer offsets. Zero (and
+    // giving this draw's topmost directory and chained layer count. Zero (and
     // unused) for non-tilemap groups.
-    window_slot: u8 = 0,
+    window_slot: u32 = 0,
 };
 
 pub const TextureResolver = struct {
@@ -242,7 +242,78 @@ pub const SpritePrepStats = struct {
     skipped_invalid_count: usize = 0,
     vertex_count: usize = 0,
     draw_group_count: usize = 0,
+    /// 1 when this reserved frame's submits exceeded its command reservation
+    /// (reservation drift), else 0. Always 0 in shipping builds (`ReservationDrift`).
+    command_overflow_grows: usize = 0,
     batch: BatchStats = .{},
+};
+
+/// Sprite-command reservation drift: a reserved frame whose submits exceed its command
+/// reservation (`Renderer.command_high_water`; not the list's physical capacity, which
+/// `ensureTotalCapacity` rounds past it). Drift makes `Renderer.ensureFrameBatchCapacity`
+/// grow prepared/vertex/group storage (and possibly the GPU streams, a GPU-idle stall)
+/// even when the command list itself had slack. Diagnostics only: capacity growth never
+/// reads it. Like the runtime perf log, it exists only where `runtime_perf_log.enabled`
+/// (Debug/ReleaseSafe); in ReleaseFast/ReleaseSmall it is zero-sized and every call is an
+/// empty inline no-op, so no draw-path compare, counter, or warn ships.
+const ReservationDrift = if (perf_diagnostics_enabled) struct {
+    /// This frame's command reservation, set by `markReserved` and cleared by
+    /// `beginFrame`; null in an unreserved frame.
+    frame_reservation: ?usize = null,
+    /// Lifetime count of drifting reserved frames; zero under a correct reservation.
+    lifetime_grows: u64 = 0,
+    /// This frame's share of `lifetime_grows` (0 or 1), reported by `finishPrepStats`.
+    frame_grows: usize = 0,
+
+    inline fn beginFrame(self: *@This()) void {
+        self.frame_reservation = null;
+        self.frame_grows = 0;
+    }
+
+    /// `len_before` is the command count before the submit that just succeeded; counts
+    /// at the one submit that crosses the reservation.
+    inline fn noteSubmit(self: *@This(), len_before: usize) void {
+        if (self.frame_reservation) |reservation| {
+            if (len_before == reservation) self.exceeded(len_before + 1, reservation);
+        }
+    }
+
+    inline fn markReserved(self: *@This(), reservation: usize, len: usize) void {
+        self.frame_reservation = reservation;
+        if (len > reservation) self.exceeded(len, reservation);
+    }
+
+    inline fn lifetimeGrows(self: *const @This()) u64 {
+        return self.lifetime_grows;
+    }
+
+    inline fn frameGrows(self: *const @This()) usize {
+        return self.frame_grows;
+    }
+
+    /// Counts one drifting reserved frame (at most once per frame). Warns on the 1st,
+    /// 2nd, 4th, 8th, ... drifting frame so a chronically short reservation stays visible
+    /// without logging every frame.
+    fn exceeded(self: *@This(), count: usize, reservation: usize) void {
+        @branchHint(.cold);
+        if (self.frame_grows != 0) return;
+        self.frame_grows = 1;
+        self.lifetime_grows += 1;
+        if (comptime logging.enabled(.warn) and !builtin.is_test) {
+            if (std.math.isPowerOfTwo(self.lifetime_grows))
+                logging.render.warn("sprite commands exceeded the frame reservation ({d} > {d}; {d} frames so far); reserveSpriteCommands bound is short", .{ count, reservation, self.lifetime_grows });
+        }
+    }
+} else struct {
+    inline fn beginFrame(_: *@This()) void {}
+    inline fn noteSubmit(_: *@This(), _: usize) void {}
+    inline fn markReserved(_: *@This(), _: usize, _: usize) void {}
+    inline fn lifetimeGrows(_: *const @This()) u64 {
+        return 0;
+    }
+    inline fn frameGrows(_: *const @This()) usize {
+        return 0;
+    }
 };
 
 pub const SpriteBatch = struct {
@@ -255,7 +326,9 @@ pub const SpriteBatch = struct {
     uvs: std.ArrayList(Uv) = .empty,
     colors: std.ArrayList(VertexColor) = .empty,
     draw_groups: std.ArrayList(DrawGroup) = .empty,
-    frame_reserved: bool = false,
+    /// Reservation-drift diagnostics (see `ReservationDrift`); zero-sized in shipping
+    /// builds.
+    reservation_drift: ReservationDrift = .{},
     camera: Camera2D = .{},
     last_order: ?RenderOrder = null,
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(sprite_prep_adaptive_tuner_config),
@@ -285,7 +358,7 @@ pub const SpriteBatch = struct {
         self.colors.clearRetainingCapacity();
         self.draw_groups.clearRetainingCapacity();
         self.prepared_commands.clearRetainingCapacity();
-        self.frame_reserved = false;
+        self.reservation_drift.beginFrame();
         self.last_order = null;
         self.last_prep_stats = .{};
     }
@@ -296,13 +369,39 @@ pub const SpriteBatch = struct {
         }
         // Ordered submission keeps the renderer cheap: grouping can preserve
         // stream order instead of sorting every frame.
-        if (self.frame_reserved) {
-            if (self.commands.items.len >= self.commands.capacity) return error.SpriteCommandOverflow;
-            self.commands.appendAssumeCapacity(.{ .sprite = sprite });
-        } else {
-            try self.commands.append(self.allocator, .{ .sprite = sprite });
-        }
+        const len = self.commands.items.len;
+        if (len == self.commands.capacity) try self.growCommands();
+        self.commands.appendAssumeCapacity(.{ .sprite = sprite });
         self.last_order = sprite.order;
+        // Counted only after the append succeeded (an OOM leaves the stream and the
+        // counters unchanged). Compiles out in shipping builds.
+        self.reservation_drift.noteSubmit(len);
+    }
+
+    /// Marks this frame reserved for `command_reservation` commands. Called by
+    /// `Renderer.reserveSpriteCommands` with its grow-only high water, possibly more than
+    /// once per frame (the engine's overlay top-up); a frame already past the new
+    /// reservation counts as drift now. Diagnostics only (a no-op in shipping builds):
+    /// capacity growth never depends on it.
+    pub fn markFrameReserved(self: *SpriteBatch, command_reservation: usize) void {
+        self.reservation_drift.markReserved(command_reservation, self.commands.items.len);
+    }
+
+    /// Lifetime diagnostic count of reserved frames whose submits exceeded the frame's
+    /// command reservation (`ReservationDrift`). Tracked only in Debug/ReleaseSafe
+    /// (`runtime_perf_log.enabled`); always 0 in ReleaseFast/ReleaseSmall. Not the perf
+    /// metric: `sprite_command_overflow_grows` records the per-frame
+    /// `SpritePrepStats.command_overflow_grows` (0 or 1) from `finishPrepStats`.
+    pub fn commandOverflowGrows(self: *const SpriteBatch) u64 {
+        return self.reservation_drift.lifetimeGrows();
+    }
+
+    /// Cold geometric growth of the command list for one more submit (the same policy
+    /// as a growing `append`), so the outcome never depends on growth history. Whether
+    /// the growth is drift is decided against the reservation in `drawSprite`.
+    fn growCommands(self: *SpriteBatch) !void {
+        @branchHint(.cold);
+        try self.commands.ensureTotalCapacity(self.allocator, self.commands.items.len + 1);
     }
 
     pub fn setCamera(self: *SpriteBatch, camera: Camera2D) void {
@@ -455,13 +554,7 @@ pub const SpriteBatch = struct {
                     .start = 0,
                     .end = valid_count,
                 });
-                batch = .{
-                    .item_count = valid_count,
-                    .range_count = 1,
-                    .items_per_range = valid_count,
-                    .main_thread_ranges = 1,
-                    .ran_inline = true,
-                };
+                batch = inlineBatch(valid_count, 1);
             }
         }
         return batch;
@@ -478,6 +571,7 @@ pub const SpriteBatch = struct {
             .skipped_invalid_count = self.commands.items.len - self.prepared_commands.items.len,
             .vertex_count = self.positions.items.len,
             .draw_group_count = self.draw_groups.items.len,
+            .command_overflow_grows = self.reservation_drift.frameGrows(),
             .batch = batch,
         };
         return self.last_prep_stats;
@@ -895,17 +989,17 @@ test "batch builder preserves ordered submission stream" {
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 10, .y = 0, .w = 1, .h = 1 },
-        .order = RenderOrder.world(@intFromEnum(OrderedStreamDepth.near)),
+        .order = RenderOrder.world(@backingInt(OrderedStreamDepth.near)),
     });
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 20, .y = 0, .w = 1, .h = 1 },
-        .order = RenderOrder.world(@intFromEnum(OrderedStreamDepth.far)),
+        .order = RenderOrder.world(@backingInt(OrderedStreamDepth.far)),
     });
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 30, .y = 0, .w = 1, .h = 1 },
-        .order = RenderOrder.world(@intFromEnum(OrderedStreamDepth.far)),
+        .order = RenderOrder.world(@backingInt(OrderedStreamDepth.far)),
     });
 
     try batch.buildSerial(table.resolver());
@@ -1104,7 +1198,7 @@ test "reserveStorage grow failure preserves prior capacity" {
     try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
 
     // Prior reserved capacity is still usable for submit + prep.
-    batch.frame_reserved = true;
+    batch.markFrameReserved(commands_capacity);
     try batch.drawSprite(.{
         .texture = texture,
         .dest = .{ .x = 1, .y = 0, .w = 1, .h = 1 },
@@ -1152,7 +1246,7 @@ test "reserveStorage mid-list grow failure preserves prior data and capacity" {
     try std.testing.expectEqual(draw_groups_capacity, batch.draw_groups.capacity);
     try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
 
-    batch.frame_reserved = true;
+    batch.markFrameReserved(commands_capacity);
     try batch.drawSprite(.{
         .texture = texture,
         .dest = .{ .x = 1, .y = 0, .w = 1, .h = 1 },
@@ -1166,12 +1260,12 @@ test "render order compares domain before depth" {
         ground = 0,
         above_ground = 1,
     };
-    const high_world = RenderOrder.world(@intFromEnum(ComparisonDepth.above_ground));
+    const high_world = RenderOrder.world(@backingInt(ComparisonDepth.above_ground));
     const ui_background = RenderOrder.ui(.background);
     const ui_text = RenderOrder.ui(.text);
     const debug_overlay = RenderOrder.debug(.overlay);
-    const below_ground = RenderOrder.world(@intFromEnum(ComparisonDepth.below_ground));
-    const ground = RenderOrder.world(@intFromEnum(ComparisonDepth.ground));
+    const below_ground = RenderOrder.world(@backingInt(ComparisonDepth.below_ground));
+    const ground = RenderOrder.world(@backingInt(ComparisonDepth.ground));
 
     try std.testing.expect(high_world.lessOrEqual(ui_background));
     try std.testing.expect(ui_text.lessOrEqual(debug_overlay));
@@ -1370,7 +1464,7 @@ fn addParallelParityCommands(batch: *SpriteBatch) !void {
     try batch.drawSprite(.{
         .texture = testTextureId(2, 1),
         .dest = .{ .x = -10, .y = 0, .w = 12, .h = 12 },
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.invalid_background)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.invalid_background)),
     });
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
@@ -1379,32 +1473,32 @@ fn addParallelParityCommands(batch: *SpriteBatch) !void {
         .origin = .{ .x = 8, .y = 9 },
         .rotation = 0.25,
         .tint = .{ .r = 0.2, .g = 0.5, .b = 0.8, .a = 0.9 },
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.world_sprite)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.world_sprite)),
         .coordinate_space = .world,
     });
     try batch.drawSprite(.{
         .texture = testTextureId(1, 1),
         .dest = .{ .x = 12, .y = 14, .w = 8, .h = 8 },
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.logical_sprite)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.logical_sprite)),
         .coordinate_space = .logical,
     });
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 60, .y = 12, .w = 10, .h = 10 },
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.logical_sprite)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.logical_sprite)),
         .coordinate_space = .drawable,
     });
     try batch.drawSprite(.{
         .texture = testTextureId(99, 1),
         .dest = .{ .x = 0, .y = 0, .w = 4, .h = 4 },
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.foreground)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.foreground)),
     });
     try batch.drawSprite(.{
         .texture = testTextureId(1, 1),
         .dest = .{ .x = 2, .y = 6, .w = 7, .h = 9 },
         .origin = .{ .x = 3, .y = 4 },
         .rotation = -0.5,
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.foreground)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.foreground)),
         .coordinate_space = .world,
     });
     // Extra valid sprites so the 4-command range alignment yields more than one
@@ -1422,7 +1516,7 @@ fn addParallelParityCommands(batch: *SpriteBatch) !void {
             .origin = .{ .x = 1, .y = 2 },
             .rotation = @as(f32, @floatFromInt(index)) * 0.1,
             .tint = .{ .r = 0.3, .g = 0.4, .b = 0.5, .a = 1 },
-            .order = RenderOrder.world(@intFromEnum(ParityDepth.foreground)),
+            .order = RenderOrder.world(@backingInt(ParityDepth.foreground)),
             .coordinate_space = .world,
         });
     }
@@ -1585,7 +1679,7 @@ test "draw sprite stays allocation-free after reserve" {
 
     const command_capacity: usize = 8;
     try batch.reserveStorage(command_capacity, command_capacity * 6, command_capacity);
-    batch.frame_reserved = true;
+    batch.markFrameReserved(command_capacity);
     const capacity_before = batch.commands.capacity;
 
     const texture = TextureId.init(0, 1) catch unreachable;
@@ -1601,32 +1695,115 @@ test "draw sprite stays allocation-free after reserve" {
     try std.testing.expectEqual(command_capacity, batch.commands.items.len);
 }
 
-test "draw sprite returns overflow error once reserved capacity is exhausted" {
-    const allocator = std.testing.allocator;
-    var batch = SpriteBatch.init(allocator);
-    defer batch.deinit();
-
+/// Reserves 8 commands, marks the frame reserved at the list's physical capacity (which
+/// `ensureTotalCapacity` may round past 8), and fills it to that capacity. Returns it.
+fn fillReservedCommandsToCapacity(batch: *SpriteBatch) !usize {
     const command_capacity: usize = 8;
     try batch.reserveStorage(command_capacity, command_capacity * 6, command_capacity);
-    batch.frame_reserved = true;
-    // ensureTotalCapacity may round up past the requested count, so fill to
-    // the real capacity rather than assuming it equals command_capacity.
-    const capacity_before = batch.commands.capacity;
+    batch.markFrameReserved(batch.commands.capacity);
+    const capacity = batch.commands.capacity;
+    for (0..capacity) |i| try batch.drawSprite(try testOrderedSprite(i));
+    try std.testing.expectEqual(capacity, batch.commands.items.len);
+    try std.testing.expectEqual(capacity, batch.commands.capacity);
+    return capacity;
+}
 
-    const texture = TextureId.init(0, 1) catch unreachable;
-    for (0..capacity_before) |i| {
-        try batch.drawSprite(.{
-            .texture = texture,
-            .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
-            .order = RenderOrder.world(@intCast(i)),
-        });
-    }
-    try std.testing.expectEqual(capacity_before, batch.commands.items.len);
-
-    const result = batch.drawSprite(.{
+fn testOrderedSprite(i: usize) !Sprite {
+    const texture = try TextureId.init(0, 1);
+    return .{
         .texture = texture,
-        .dest = .{ .x = @floatFromInt(capacity_before), .y = 0, .w = 1, .h = 1 },
-        .order = RenderOrder.world(@intCast(capacity_before)),
-    });
-    try std.testing.expectError(error.SpriteCommandOverflow, result);
+        .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
+        .order = RenderOrder.world(@intCast(i)),
+    };
+}
+
+test "draw sprite past a reserved frame's capacity grows in order and counts the overflow" {
+    var batch = SpriteBatch.init(std.testing.allocator);
+    defer batch.deinit();
+    const capacity = try fillReservedCommandsToCapacity(&batch);
+
+    try batch.drawSprite(try testOrderedSprite(capacity));
+
+    try std.testing.expectEqual(capacity + 1, batch.commands.items.len);
+    try std.testing.expect(batch.commands.capacity > capacity);
+    for (batch.commands.items, 0..) |command, i| {
+        try std.testing.expectEqual(@as(f32, @floatFromInt(i)), command.sprite.dest.x);
+    }
+    // Drift is counted only where perf diagnostics compile in (never in shipping builds).
+    const drift: u64 = @intFromBool(perf_diagnostics_enabled);
+    try std.testing.expectEqual(drift, batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(usize, @intCast(drift)), batch.finishPrepStats(.{}).command_overflow_grows);
+
+    // The per-frame share resets; the lifetime count stays.
+    batch.beginFrame();
+    try std.testing.expectEqual(@as(usize, 0), batch.finishPrepStats(.{}).command_overflow_grows);
+    try std.testing.expectEqual(drift, batch.commandOverflowGrows());
+}
+
+test "submits past the reservation are drift even inside the physical slack" {
+    if (!perf_diagnostics_enabled) return error.SkipZigTest;
+    var batch = SpriteBatch.init(std.testing.allocator);
+    defer batch.deinit();
+    try batch.reserveStorage(16, 16 * 6, 16);
+    const capacity = batch.commands.capacity;
+    const reservation: usize = 4;
+
+    batch.markFrameReserved(reservation);
+    for (0..reservation) |i| try batch.drawSprite(try testOrderedSprite(i));
+    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
+
+    // Past the reservation, well inside the physical capacity: no growth, still drift.
+    // Counted once for the frame however far it overshoots, and re-marking the frame at
+    // the same reservation (the engine's top-up) does not count it again.
+    for (reservation..reservation + 3) |i| try batch.drawSprite(try testOrderedSprite(i));
+    batch.markFrameReserved(reservation);
+    try std.testing.expectEqual(capacity, batch.commands.capacity);
+    try std.testing.expectEqual(@as(u64, 1), batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(usize, 1), batch.finishPrepStats(.{}).command_overflow_grows);
+
+    // Every drifting frame counts.
+    batch.beginFrame();
+    batch.markFrameReserved(reservation);
+    for (0..reservation + 1) |i| try batch.drawSprite(try testOrderedSprite(i));
+    try std.testing.expectEqual(@as(u64, 2), batch.commandOverflowGrows());
+}
+
+test "marking a frame reserved below its submitted count counts the drift" {
+    if (!perf_diagnostics_enabled) return error.SkipZigTest;
+    var batch = SpriteBatch.init(std.testing.allocator);
+    defer batch.deinit();
+    try batch.reserveStorage(16, 16 * 6, 16);
+    for (0..5) |i| try batch.drawSprite(try testOrderedSprite(i));
+    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
+
+    batch.markFrameReserved(4);
+    try std.testing.expectEqual(@as(u64, 1), batch.commandOverflowGrows());
+    try batch.drawSprite(try testOrderedSprite(5));
+    try std.testing.expectEqual(@as(u64, 1), batch.commandOverflowGrows());
+}
+
+test "draw sprite growth OOM leaves the reserved stream unchanged" {
+    var batch = SpriteBatch.init(std.testing.allocator);
+    defer batch.deinit();
+    const capacity = try fillReservedCommandsToCapacity(&batch);
+
+    const original = batch.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    batch.allocator = failing.allocator();
+    defer batch.allocator = original;
+
+    try std.testing.expectError(error.OutOfMemory, batch.drawSprite(try testOrderedSprite(capacity)));
+    try std.testing.expectEqual(capacity, batch.commands.items.len);
+    try std.testing.expectEqual(capacity, batch.commands.capacity);
+    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
+}
+
+test "draw sprite growth outside a reserved frame is not counted" {
+    var batch = SpriteBatch.init(std.testing.allocator);
+    defer batch.deinit();
+
+    try batch.drawSprite(try testOrderedSprite(0));
+
+    try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
+    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
 }

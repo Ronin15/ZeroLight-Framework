@@ -93,7 +93,7 @@ test "uniformF32 stays in [0, 1) across a wide sample sweep" {
 }
 
 test "uniformF32 is roughly uniformly distributed" {
-    var buckets = [_]u32{0} ** 10;
+    var buckets: [10]u32 = @splat(0);
     var total: u32 = 0;
     var entity_index: u32 = 0;
     while (entity_index < 100) : (entity_index += 1) {

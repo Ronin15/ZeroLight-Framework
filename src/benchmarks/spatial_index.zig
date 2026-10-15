@@ -2,27 +2,28 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Shared spatial index (Slice 28) build throughput: times only
+//! Shared spatial index build throughput: times only
 //! `SpatialIndexSystem.build`/`buildSerial` in isolation, answering "index
 //! build allocation-free, no regression" separately from the `ai` group (which
 //! now excludes the build from its own timed window — see
 //! `src/benchmarks/ai.zig`).
 
 const std = @import("std");
-const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
-const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const SpatialIndexStats = @import("../game/systems/spatial_index.zig").SpatialIndexStats;
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const spatial_index_range_alignment_items = @import("../game/systems/spatial_index.zig").spatial_index_range_alignment_items;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 pub const group = suite.BenchmarkGroup{
     .name = "spatial_index",
+    .item_label = "indexed entities",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeIndexWorkload,
 };
 
 const Fixture = struct {
@@ -75,13 +76,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         system.build_tuner = tuner;
     }
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     for (0..options.warmup_iterations) |_| {
@@ -130,5 +125,9 @@ fn runOnce(system: *SpatialIndexSystem, fixture: *Fixture, thread_system: ?*Thre
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(spatial_index_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, spatial_index_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, spatial_index_range_alignment_items);
+}
+
+fn writeIndexWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("entities={}", .{stats.output_count});
 }

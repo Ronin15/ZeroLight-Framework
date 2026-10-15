@@ -25,7 +25,7 @@ pub const Action = enum(usize) {
     interact,
 };
 
-const action_count = @typeInfo(Action).@"enum".fields.len;
+const action_count = @typeInfo(Action).@"enum".field_names.len;
 
 pub const KeyBinding = struct {
     key: c.SDL_Keycode,
@@ -242,18 +242,18 @@ fn deadzonedStick(raw_x: i16, raw_y: i16) math.Vec2 {
 }
 
 const ActionFlags = struct {
-    values: [action_count]bool = [_]bool{false} ** action_count,
+    values: [action_count]bool = @splat(false),
 
     fn clear(self: *ActionFlags) void {
-        self.values = [_]bool{false} ** action_count;
+        self.values = @splat(false);
     }
 
     fn get(self: *const ActionFlags, action: Action) bool {
-        return self.values[@intFromEnum(action)];
+        return self.values[@backingInt(action)];
     }
 
     fn set(self: *ActionFlags, action: Action, value: bool) void {
-        self.values[@intFromEnum(action)] = value;
+        self.values[@backingInt(action)] = value;
     }
 };
 

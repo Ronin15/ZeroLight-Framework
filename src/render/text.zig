@@ -135,14 +135,6 @@ pub const TextRequest = struct {
         };
     }
 
-    pub fn withLayout(self: TextRequest, layout: TextLayoutOptions) TextRequest {
-        return .{
-            .text = self.text,
-            .style = self.style,
-            .layout = layout,
-        };
-    }
-
     pub fn validate(self: TextRequest) !void {
         if (self.text.len == 0) return error.InvalidText;
         try self.style.validate();
@@ -231,7 +223,7 @@ pub const TextService = struct {
         };
         defer self.allocator.free(path);
 
-        const path_z = try self.allocator.dupeZ(u8, path);
+        const path_z = try self.allocator.dupeSentinel(u8, path, 0);
         defer self.allocator.free(path_z);
 
         const font = c.TTF_OpenFont(path_z.ptr, desc.point_size) orelse {

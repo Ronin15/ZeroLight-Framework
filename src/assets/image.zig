@@ -32,7 +32,7 @@ pub fn loadPng(assets: AssetStore, relative_path: []const u8) !LoadedImage {
     const path = try assets.resolveReadablePath(relative_path);
     defer assets.allocator.free(path);
 
-    const path_z = try assets.allocator.dupeZ(u8, path);
+    const path_z = try assets.allocator.dupeSentinel(u8, path, 0);
     defer assets.allocator.free(path_z);
 
     const loaded = c.SDL_LoadPNG(path_z.ptr) orelse {

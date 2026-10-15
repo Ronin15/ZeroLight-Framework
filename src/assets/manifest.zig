@@ -134,15 +134,15 @@ pub const audio_assets = [_]AudioAssetSpec{
     },
 };
 
-pub const sprite_asset_count = std.meta.fields(SpriteAssetId).len;
-pub const audio_asset_count = std.meta.fields(AudioAssetId).len;
+pub const sprite_asset_count = @typeInfo(SpriteAssetId).@"enum".field_names.len;
+pub const audio_asset_count = @typeInfo(AudioAssetId).@"enum".field_names.len;
 
 pub fn spriteIndex(id: SpriteAssetId) usize {
-    return @intFromEnum(id);
+    return @backingInt(id);
 }
 
 pub fn audioIndex(id: AudioAssetId) usize {
-    return @intFromEnum(id);
+    return @backingInt(id);
 }
 
 test "metadata manifest entries declare loader kind and sidecar together" {
@@ -189,7 +189,7 @@ test "atlas metadata paths link to registered sprite assets" {
 }
 
 test "startup asset manifest covers every stable id once" {
-    var sprite_seen = [_]bool{false} ** sprite_asset_count;
+    var sprite_seen: [sprite_asset_count]bool = @splat(false);
     for (sprite_assets) |spec| {
         const index = spriteIndex(spec.id);
         try std.testing.expect(!sprite_seen[index]);
@@ -197,7 +197,7 @@ test "startup asset manifest covers every stable id once" {
     }
     for (sprite_seen) |seen| try std.testing.expect(seen);
 
-    var audio_seen = [_]bool{false} ** audio_asset_count;
+    var audio_seen: [audio_asset_count]bool = @splat(false);
     for (audio_assets) |spec| {
         const index = audioIndex(spec.id);
         try std.testing.expect(!audio_seen[index]);

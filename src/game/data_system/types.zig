@@ -30,6 +30,25 @@ pub fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, movement_range_alignment_items);
 }
 
+/// Committed row counts of the component stores whose pipeline scratch, event
+/// shares, and pathfinding pools are population-sized. Read by the pipeline's
+/// population growth seam (`SimulationPipeline.syncPopulationCapacity`).
+pub const PopulationRowCounts = struct {
+    movement_bodies: usize,
+    steering_agents: usize,
+    ai_agents: usize,
+    collision_bounds: usize,
+    ai_perceptions: usize,
+    ai_affects: usize,
+
+    /// Rows of every store whose pipeline scratch is sized by `movement_body_capacity`.
+    /// DataSystem enforces no component dependency (`setSteeringAgent`/`setAiAgent`/
+    /// `setCollisionBounds` attach independently), so this is the max, not one store.
+    pub fn population(self: PopulationRowCounts) usize {
+        return @max(@max(self.movement_bodies, self.steering_agents), @max(self.ai_agents, self.collision_bounds));
+    }
+};
+
 /// Stable entity handle. The index points at an entity slot and the generation
 /// changes whenever that slot is retired, so stale IDs cannot resolve after
 /// free-list reuse.
@@ -96,7 +115,7 @@ pub const component_masks = struct {
 };
 
 pub fn componentMask(component: Component) ComponentMask {
-    return @as(ComponentMask, 1) << @intFromEnum(component);
+    return @as(ComponentMask, 1) << @backingInt(component);
 }
 
 pub const Facing = enum {
@@ -193,11 +212,6 @@ pub const ConstScopeColumnsSlice = struct {
 
 pub const FacingData = struct {
     direction: Facing = .down,
-};
-
-pub const FacingSlice = struct {
-    entities: []const EntityId,
-    directions: []Facing,
 };
 
 pub const ConstFacingSlice = struct {
@@ -433,8 +447,6 @@ pub const ConstSteeringAgentSlice = struct {
 // Default half-angle is 60 degrees (120 degree full cone). Capped in
 // validateAiPerception at pi/2 (90 degrees) so cos_half_fov never goes
 // negative — the FOV test in PerceptionSystem relies on cos_half_fov >= 0.
-// Widening past 90 degrees is deferred to a future slice if a wider cone is
-// ever needed.
 const default_ai_perception_fov_half_angle_radians: f32 = std.math.pi / 3.0;
 // cos(pi/3) == 0.5 exactly; kept as a literal comptime constant (not a
 // math.sinCos call) so the struct-field default stays trivially comptime-known.
@@ -555,7 +567,7 @@ pub const AiMemory = struct {
     last_known_y: f32 = 0,
     staleness: f32 = max_ai_memory_staleness,
     familiarity: f32 = 0,
-    ring: [ai_memory_ring_capacity]AiMemoryContact = [_]AiMemoryContact{.{}} ** ai_memory_ring_capacity,
+    ring: [ai_memory_ring_capacity]AiMemoryContact = @splat(.{}),
     ring_next_slot: u8 = 0,
 };
 
@@ -595,9 +607,8 @@ pub const AiMemorySlice = struct {
     ring_next_slot: []u8,
 };
 
-/// One appraisal drive an `AiAffect` row tracks. A future arbitration slice
-/// switches behavior selection on this; this slice only appraises and
-/// decays the four drives.
+/// One appraisal drive an `AiAffect` row tracks. `AffectSystem` appraises and
+/// decays the four drives; arbitration reads them.
 pub const AiAffectDrive = enum { fear, curiosity, aggression, fatigue };
 
 /// Rising/falling-edge threshold-crossing band: a drive must fall below
@@ -623,7 +634,7 @@ pub const ai_affect_threshold_hysteresis: f32 = 0.05;
 /// `AffectSystem`'s live per-step appraisal output: the four drive values are
 /// each clamped to `[0, 1]`; `above_threshold_mask` is the persisted Schmitt-
 /// trigger state that makes threshold-crossing detection stateful across
-/// steps (see `ai_affect_threshold_hysteresis`) — bit `@intFromEnum(drive)`
+/// steps (see `ai_affect_threshold_hysteresis`) — bit `@backingInt(drive)`
 /// is set while that drive is above its rising threshold. Not user-facing
 /// validated: any combination of the low 4 bits is valid internal state, and
 /// the upper 4 bits are unused.
@@ -659,7 +670,7 @@ pub const AiAffectCommand = struct {
     affect: AiAffect,
 };
 
-/// Compact destructible fact for action-intent consumers (Slice 45). Demo crates
+/// Compact destructible fact for action-intent consumers. Demo crates
 /// use `hit_points = 1` (one interact/attack destroys). Multi-hit entities keep
 /// remaining HP via deferred `set_destructible` until zero → `destroy_entity`.
 pub const Destructible = struct {
@@ -826,19 +837,14 @@ fn metric(value: usize) u64 {
 }
 
 /// World-space AABB of a static navigation obstacle's collision body, resolved from its
-/// movement body position plus collision bounds offset/size. Lets nav invalidation localize
-/// to the covered nav cells instead of re-deriving the whole level. Same shape pathfinding's
-/// nav_grid.zig StaticBodyRect aliases: both derive from math.aabbFromOffsetSize so the two
-/// can never drift apart.
+/// movement body position plus collision bounds offset/size (`math.aabbFromOffsetSize`).
 pub const ObstacleWorldRect = math.Aabb;
 
 pub const StructuralEntityDestroyedChange = struct {
     entity: EntityId,
     component_mask: ComponentMask,
     was_static_navigation_obstacle: bool,
-    obstacle_world_rect: ?ObstacleWorldRect = null,
     /// World/level plane at destroy time (`world_level` component, else 0).
-    /// Lets post-commit nav invalidation mark the correct multi-level grid.
     level: u16 = 0,
 };
 
@@ -847,10 +853,7 @@ pub const StructuralComponentChangedChange = struct {
     component: Component,
     was_static_navigation_obstacle: bool,
     is_static_navigation_obstacle: bool,
-    old_obstacle_world_rect: ?ObstacleWorldRect = null,
-    new_obstacle_world_rect: ?ObstacleWorldRect = null,
     /// World/level plane at change time (`world_level` component, else 0).
-    /// Lets post-commit nav invalidation mark the correct multi-level grid.
     level: u16 = 0,
 };
 

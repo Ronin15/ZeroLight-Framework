@@ -14,6 +14,8 @@
 pub const Faction = @import("data_system/types.zig").Faction;
 pub const hot_soa_column_alignment = @import("data_system/types.zig").hot_soa_column_alignment;
 pub const movement_range_alignment_items = @import("data_system/types.zig").movement_range_alignment_items;
+pub const hotStoreCapacity = @import("data_system/types.zig").hotStoreCapacity;
+pub const PopulationRowCounts = @import("data_system/types.zig").PopulationRowCounts;
 pub const HotF32Slice = @import("data_system/types.zig").HotF32Slice;
 pub const ConstHotF32Slice = @import("data_system/types.zig").ConstHotF32Slice;
 pub const HotI32Slice = @import("data_system/types.zig").HotI32Slice;
@@ -31,7 +33,6 @@ pub const ConstMovementBodySlice = @import("data_system/types.zig").ConstMovemen
 pub const ScopeColumnsSlice = @import("data_system/types.zig").ScopeColumnsSlice;
 pub const ConstScopeColumnsSlice = @import("data_system/types.zig").ConstScopeColumnsSlice;
 pub const FacingData = @import("data_system/types.zig").FacingData;
-pub const FacingSlice = @import("data_system/types.zig").FacingSlice;
 pub const ConstFacingSlice = @import("data_system/types.zig").ConstFacingSlice;
 pub const ConstFactionSlice = @import("data_system/types.zig").ConstFactionSlice;
 pub const PrimitiveVisual = @import("data_system/types.zig").PrimitiveVisual;
@@ -100,11 +101,11 @@ pub const DestructibleCommand = @import("data_system/types.zig").DestructibleCom
 pub const ConstDestructibleSlice = @import("data_system/types.zig").ConstDestructibleSlice;
 pub const StructuralCommand = @import("data_system/types.zig").StructuralCommand;
 pub const StructuralCommitStats = @import("data_system/types.zig").StructuralCommitStats;
-pub const ObstacleWorldRect = @import("data_system/types.zig").ObstacleWorldRect;
 pub const StructuralEntityDestroyedChange = @import("data_system/types.zig").StructuralEntityDestroyedChange;
 pub const StructuralComponentChangedChange = @import("data_system/types.zig").StructuralComponentChangedChange;
 pub const StructuralChange = @import("data_system/types.zig").StructuralChange;
 pub const StructuralPlanScratch = @import("data_system/structural.zig").StructuralPlanScratch;
+pub const max_structural_events_per_create = @import("data_system/structural.zig").max_structural_events_per_create;
 pub const DataSystem = @import("data_system/system.zig").DataSystem;
 
 test {

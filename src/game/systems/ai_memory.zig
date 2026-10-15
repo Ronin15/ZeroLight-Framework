@@ -50,6 +50,7 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstPerceptionSlice = @import("../data_system.zig").ConstPerceptionSlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
@@ -73,8 +74,8 @@ fn hotStoreCapacity(min_len: usize) usize {
 
 pub const AiMemoryConfig = struct {
     /// When non-null, only these dense ai-store indices participate this step
-    /// (the scope system's cognition halo + stagger selection). Null = all
-    /// agents. Mirrors `AiConfig.scope_dense_indices`/
+    /// (the scope system's think set: halo ∩ stagger). Null = all agents.
+    /// Mirrors `AiConfig.scope_dense_indices` /
     /// `PerceptionConfig.scope_dense_indices` exactly.
     scope_dense_indices: ?[]const u32 = null,
     items_per_range: ?usize = null,
@@ -97,6 +98,11 @@ pub const AiMemorySystem = struct {
     // store's own row order, consumed via indexed SIMD gather/scatter.
     memory_dense_indices: std.ArrayList(u32) = .empty,
     decay_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+
+    pub fn reserve(self: *AiMemorySystem, pop: usize) !void {
+        if (pop == 0) return;
+        try self.memory_dense_indices.ensureTotalCapacity(self.allocator, hotStoreCapacity(pop));
+    }
 
     pub fn init(allocator: std.mem.Allocator) AiMemorySystem {
         return .{
@@ -180,7 +186,7 @@ pub const AiMemorySystem = struct {
         return .{
             .processed_count = count,
             .refreshed_count = finishMemoryRefresh(data, frame, self.memory_dense_indices.items),
-            .batch = serialBatch(count),
+            .batch = inlineBatch(count, ai_memory_range_alignment_items),
         };
     }
 
@@ -446,10 +452,6 @@ fn upsertRingContact(memory_slice: *AiMemorySlice, index: usize, target: EntityI
     ring_y[cursor] = y;
     ring_age[cursor] = 0;
     memory_slice.ring_next_slot[index] = @intCast((cursor + 1) % ai_memory_ring_capacity);
-}
-
-fn serialBatch(count: usize) BatchStats {
-    return .{ .ran_inline = true, .item_count = count, .range_count = if (count > 0) 1 else 0, .items_per_range = count };
 }
 
 const testing = std.testing;
@@ -823,9 +825,7 @@ test "AiMemorySystem serial has no steady-state allocation after warmup (Failing
     defer frame.deinit();
     try frame.reserveStreams(1, 4, 0, 0, 0, 0);
 
-    // Warm-up run sizes memory_dense_indices to steady state.
-    frame.beginStep();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    try sys.reserve(1);
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const original_allocator = sys.allocator;
@@ -864,11 +864,7 @@ test "AiMemorySystem threaded update has no steady-state allocation after warmup
         .adaptive = false,
     };
 
-    // Warm-up: sizes memory_dense_indices to steady state.
-    frame.beginStep();
-    const warmup_stats = try sys.update(data.aiAgentSliceConst(), &data, &frame, &threads, config);
-    try testing.expect(!warmup_stats.batch.ran_inline);
-    try testing.expect(warmup_stats.batch.active_worker_threads > 0);
+    try sys.reserve(64);
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const original_allocator = sys.allocator;

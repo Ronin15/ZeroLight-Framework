@@ -28,12 +28,19 @@ pub const TextureId = struct {
     }
 };
 
-/// Opaque handle to a renderer-owned tilemap tile-data storage buffer. World and
-/// game code hold these per dense layer; the renderer owns the GPU resource. The
-/// enum's value is the buffer's index in the renderer registry.
-pub const TileDataId = enum(u32) {
-    invalid = std.math.maxInt(u32),
-    _,
+/// Non-owning, generational handle to a renderer-owned GPU tile store: a slot
+/// index plus the slot generation it was issued under. The renderer owns the
+/// buffer and retires it; a stale id (retired slot, or slot reused under a newer
+/// generation) resolves to nothing.
+pub const TileDataId = struct {
+    index: u32,
+    generation: u32,
+
+    pub const invalid = TileDataId{ .index = std.math.maxInt(u32), .generation = 0 };
+
+    pub fn isValid(self: TileDataId) bool {
+        return self.generation != 0 and self.index != std.math.maxInt(u32);
+    }
 };
 
 pub const TextureFormat = enum {
@@ -50,23 +57,6 @@ pub const TextureDesc = struct {
     }
 };
 
-pub const FilterMode = enum {
-    nearest,
-    linear,
-};
-
-pub const AddressMode = enum {
-    clamp_to_edge,
-    repeat,
-};
-
-pub const SamplerDesc = struct {
-    min_filter: FilterMode = .nearest,
-    mag_filter: FilterMode = .nearest,
-    address_u: AddressMode = .clamp_to_edge,
-    address_v: AddressMode = .clamp_to_edge,
-};
-
 pub fn nextGeneration(generation: u32) u32 {
     const next = generation +% 1;
     return if (next == 0) 1 else next;
@@ -81,6 +71,14 @@ test "texture ids reject generation zero and match slots exactly" {
     try std.testing.expect(id.matches(3, 7));
     try std.testing.expect(!id.matches(3, 8));
     try std.testing.expect(!TextureId.invalid.isValid());
+}
+
+test "tile data ids are valid only with a nonzero generation and a real slot index" {
+    try std.testing.expect(!TileDataId.invalid.isValid());
+    try std.testing.expect(!(TileDataId{ .index = 3, .generation = 0 }).isValid());
+    try std.testing.expect(!(TileDataId{ .index = std.math.maxInt(u32), .generation = 1 }).isValid());
+    try std.testing.expect((TileDataId{ .index = 3, .generation = 7 }).isValid());
+    try std.testing.expect((TileDataId{ .index = 0, .generation = 1 }).isValid());
 }
 
 test "texture descriptors require non-zero dimensions" {

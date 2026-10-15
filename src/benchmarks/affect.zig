@@ -13,19 +13,20 @@
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const ConstAiAgentSlice = @import("../game/data_system.zig").ConstAiAgentSlice;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
-const EntityId = @import("../game/data_system.zig").EntityId;
 const AffectStats = @import("../game/systems/affect.zig").AffectStats;
 const AffectSystem = @import("../game/systems/affect.zig").AffectSystem;
 const affect_range_alignment_items = @import("../game/systems/affect.zig").affect_range_alignment_items;
 const SimulationEvents = @import("../game/simulation.zig").SimulationEvents;
+const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 pub const group = suite.BenchmarkGroup{
     .name = "ai-affect",
+    .item_label = "AI agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeAffectWorkload,
 };
 
 // Every Nth agent (creation order) also carries AiPerception/AiMemory with a
@@ -80,13 +81,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         system.compute_tuner = tuner;
     }
 
-    var threads: ?ThreadSystem = null;
-    if (case.usesThreadSystem()) {
-        threads = try ThreadSystem.init(allocator, io, .{
-            .max_worker_threads = case.maxWorkerThreads(),
-            .items_per_range = suite.default_items_per_range,
-        });
-    }
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     for (0..options.warmup_iterations) |_| {
@@ -137,5 +132,9 @@ fn runOnce(system: *AffectSystem, fixture: *Fixture, thread_system: ?*ThreadSyst
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(affect_range_alignment_items) orelse
-        suite.alignItemCount(suite.default_items_per_range, affect_range_alignment_items);
+        std.mem.alignForwardAnyAlign(usize, suite.default_items_per_range, affect_range_alignment_items);
+}
+
+fn writeAffectWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("processed={} threshold_crossings={}", .{ stats.candidate_pairs, stats.output_count });
 }

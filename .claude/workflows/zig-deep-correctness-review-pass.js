@@ -1,7 +1,7 @@
 export const meta = {
   name: 'zig-deep-correctness-review-pass',
-  description: 'Pass 3: deep behavioral correctness review — concurrency, algorithms, SIMD parity, pipeline/determinism contracts, resource lifetime, outliers, and test-coverage gaps',
-  whenToUse: 'Third pass going beyond idiom/surface (covered by passes 1-2) into cross-cutting correctness themes and untested invariants',
+  description: 'Deep behavioral correctness review — concurrency, algorithms, SIMD parity, pipeline/determinism contracts, resource lifetime, outliers, and test-coverage gaps',
+  whenToUse: 'Theme-based correctness pass beyond idiom/surface issues (those belong to /zig-best-practices-review): cross-cutting correctness themes and untested invariants',
   phases: [
     { title: 'Review', detail: 'one deep-review specialist per correctness theme' },
     { title: 'Verify', detail: 'adversarial verification per finding' },
@@ -9,9 +9,9 @@ export const meta = {
   ],
 }
 
-// Passes 1-2 already covered idioms/naming/stdlib-currency/ReleaseFast-surface
-// across every src file. This pass is theme-based DEEP correctness: each unit
-// spans multiple files and reasons about behavior, not per-file style.
+// Theme-based DEEP correctness: each unit spans multiple files and reasons
+// about behavior, not per-file style (idiom and surface issues belong to
+// /zig-best-practices-review).
 const REVIEW_UNITS = [
   {
     unit: 'thread-pool-core',
@@ -35,7 +35,7 @@ const REVIEW_UNITS = [
   },
   {
     unit: 'nav-graph-invalidation',
-    files: ['src/game/systems/pathfinding/nav_graph.zig', 'src/game/systems/pathfinding/nav_memory.zig'],
+    files: ['src/game/systems/pathfinding/nav_graph.zig', 'src/game/systems/pathfinding/connectivity.zig'],
     focus: 'Nav-graph structural correctness: incremental-dig chunk-patch correctness vs a full rebuild (does the patched graph equal a from-scratch rebuild?), nav-invalidation classification correctness (are all affected portals/edges recomputed, none missed or double-counted?), the threaded chunk-patch race, and portal/edge consistency across chunk borders. This is the highest-risk correctness area.',
   },
   {
@@ -79,15 +79,16 @@ const FINDINGS_SCHEMA = {
           file: { type: 'string' },
           line: { type: 'integer' },
           severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+          tag: { type: 'string', enum: ['structural', 'local'] },
           kind: { type: 'string', enum: ['bug', 'race', 'determinism', 'numerical', 'leak', 'test-gap', 'anomaly', 'contract'] },
           title: { type: 'string' },
           detail: { type: 'string', description: 'the concrete failure: inputs/state → wrong behavior, or the exact untested invariant and its blast radius' },
           fix_direction: { type: 'string' },
-          durable: { type: 'boolean', description: 'true if a lint rule or durable agent-guidance line could prevent this class recurring' },
-          durable_mechanism: { type: 'string', enum: ['lint-rule', 'agent-guidance', 'doc', 'none'] },
+          durable: { type: 'boolean', description: 'true if a lint rule or a new .claude/rules/ line could prevent this class recurring' },
+          durable_mechanism: { type: 'string', enum: ['lint-rule', 'rule-edit', 'none'] },
           durable_rationale: { type: 'string' },
         },
-        required: ['file', 'line', 'severity', 'kind', 'title', 'detail', 'fix_direction', 'durable', 'durable_mechanism', 'durable_rationale'],
+        required: ['file', 'line', 'severity', 'tag', 'kind', 'title', 'detail', 'fix_direction', 'durable', 'durable_mechanism', 'durable_rationale'],
       },
     },
   },
@@ -122,10 +123,11 @@ const SYNTHESIS_SCHEMA = {
           line: { type: 'integer' },
           title: { type: 'string' },
           severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+          tag: { type: 'string', enum: ['structural', 'local'] },
           kind: { type: 'string' },
           fix_direction: { type: 'string' },
         },
-        required: ['file', 'line', 'title', 'severity', 'kind', 'fix_direction'],
+        required: ['file', 'line', 'title', 'severity', 'tag', 'kind', 'fix_direction'],
       },
     },
     test_gaps: {
@@ -149,8 +151,8 @@ const SYNTHESIS_SCHEMA = {
         type: 'object',
         additionalProperties: false,
         properties: {
-          mechanism: { type: 'string', enum: ['lint-rule', 'agent-guidance', 'doc'] },
-          target: { type: 'string' },
+          mechanism: { type: 'string', enum: ['lint-rule', 'rule-edit'] },
+          target: { type: 'string', description: 'tools/lint_idioms.py, or the .claude/rules/<file>.md that owns the topic' },
           guidance: { type: 'string' },
           rationale: { type: 'string' },
         },
@@ -164,7 +166,7 @@ const SYNTHESIS_SCHEMA = {
 
 function reviewPrompt(u) {
   return [
-    `DEEP CORRECTNESS review (pass 3). Passes 1-2 already covered idioms, naming, stdlib currency, and the ReleaseFast unreachable/cast/allocator SURFACE across every file — do NOT re-report those classes. Go deeper.`,
+    `DEEP CORRECTNESS review. Idioms, naming, stdlib currency, and surface-level ReleaseFast/allocator issues are out of scope for this pass (they belong to /zig-best-practices-review); report behavioral defects.`,
     ``,
     `Files in scope:`,
     (Array.isArray(u.files) ? u.files : [u.files]).map((f) => `  - ${f}`).join('\n'),
@@ -172,7 +174,7 @@ function reviewPrompt(u) {
     `Your focus for this unit:`,
     u.focus,
     ``,
-    `Read the files (and any adjacent test/helper they depend on) and REASON about behavior, not style. For each finding give the concrete failure: the inputs/state that trigger it and the wrong output/crash/leak/nondeterminism that results — a vague "could be risky" is not a finding. Cite real file:line. Prefer a few high-confidence, well-argued findings over a long speculative list. If, after genuinely digging, the unit is correct, say so and return few or no findings (that is a valid, valuable result — do not manufacture findings). For test-gap findings, name the exact untested invariant and the narrow scenario that would expose a regression, and rank by blast radius.`,
+    `Read the files (and any adjacent test/helper they depend on) and REASON about behavior, not style. Run your Scale Pass first. For each finding give the concrete failure: the inputs/state that trigger it and the wrong output/crash/leak/nondeterminism that results — a vague "could be risky" is not a finding. Cite real file:line. Prefer a few high-confidence, well-argued findings over a long speculative list. If, after genuinely digging, the unit is correct, say so and return few or no findings (that is a valid, valuable result — do not manufacture findings). For test-gap findings, name the exact untested invariant and the narrow scenario that would expose a regression, and rank by blast radius.`,
     ``,
     `Return the structured object: {unit: "${u.unit}", findings: [...]}.`,
   ].join('\n')
@@ -198,48 +200,54 @@ phase('Review')
 
 const perUnit = await pipeline(
   REVIEW_UNITS,
-  (u) => agent(reviewPrompt(u), { label: `review:${u.unit}`, phase: 'Review', schema: FINDINGS_SCHEMA, agentType: 'zig-review-specialist', effort: 'high' }),
+  (u) => agent(reviewPrompt(u), { label: `review:${u.unit}`, phase: 'Review', schema: FINDINGS_SCHEMA, agentType: 'zig-review-specialist' }),
   (review, u) => {
     if (!review || !review.findings || review.findings.length === 0) return { unit: u.unit, verified: [] }
+    // Adversarially verify only high findings; others pass through unverified.
+    const unverified = review.findings.filter((f) => f.severity !== 'high').map((f) => ({ ...f, unit: u.unit, verdict: { verdict: 'UNVERIFIED', is_real: true, reasoning: 'not verified (below high)', corrected_severity: f.severity, durable_confirmed: f.durable } }))
     return parallel(
-      review.findings.map((f) => () =>
-        agent(verifyPrompt(f), { label: `verify:${u.unit}:${f.kind}`, phase: 'Verify', schema: VERDICT_SCHEMA, effort: 'high' })
+      review.findings.filter((f) => f.severity === 'high').map((f) => () =>
+        agent(verifyPrompt(f), { label: `verify:${u.unit}:${f.kind}`, phase: 'Verify', schema: VERDICT_SCHEMA, agentType: 'zig-review-specialist' })
           .then((v) => (v ? { ...f, unit: u.unit, verdict: v } : null))
       )
-    ).then((rows) => ({ unit: u.unit, verified: rows.filter(Boolean) }))
+    ).then((rows) => ({ unit: u.unit, verified: [...rows.filter(Boolean), ...unverified] }))
   }
 )
 
 const allVerified = perUnit.filter(Boolean).flatMap((r) => r.verified)
 const confirmed = allVerified.filter((f) => f.verdict && (f.verdict.verdict === 'CONFIRMED' || f.verdict.verdict === 'PLAUSIBLE') && f.verdict.is_real)
+const unverified = allVerified.filter((f) => f.verdict && f.verdict.verdict === 'UNVERIFIED')
 
-log(`Pass 3: reviewed ${REVIEW_UNITS.length} themes; ${allVerified.length} raw findings, ${confirmed.length} confirmed/plausible.`)
+log(`Deep correctness: reviewed ${REVIEW_UNITS.length} themes; ${allVerified.length} raw findings, ${confirmed.length} confirmed/plausible.`)
 
 if (confirmed.length === 0) {
-  return { counts: { units: REVIEW_UNITS.length, raw: allVerified.length, confirmed: 0 }, confirmed: [], synthesis: null, note: 'No findings survived verification — the deep-correctness surface reviewed is clean.' }
+  return { counts: { units: REVIEW_UNITS.length, raw: allVerified.length, confirmed: 0 }, confirmed: [], unverified, synthesis: null, note: 'No findings survived verification — the deep-correctness surface reviewed is clean.' }
 }
 
 phase('Synthesize')
 
 const digest = confirmed.map((f) =>
-  `[${f.verdict.verdict}/${f.verdict.corrected_severity}] ${f.kind} ${f.file}:${f.line} — ${f.title}` +
+  `[${f.verdict.verdict}/${f.verdict.corrected_severity}/${f.tag}] ${f.kind} ${f.file}:${f.line} — ${f.title}` +
   `\n    ${f.detail}\n    fix: ${f.fix_direction}`
 ).join('\n\n')
 
 const synthesis = await agent(
   [
-    `Consolidate verified DEEP-correctness findings (PASS 3) for ZeroLight-Framework. Passes 1-2 handled idiom/surface; this pass is behavioral correctness, concurrency, numerics, determinism, resource lifetime, and test gaps.`,
+    `Consolidate verified DEEP-correctness findings for ZeroLight-Framework: behavioral correctness, concurrency, numerics, determinism, resource lifetime, and test gaps.`,
     ``,
-    `Split the output cleanly: top_bugs (confirmed real defects ranked by severity, each with a concrete fix direction), test_gaps (highest-value untested load-bearing invariants ranked by blast radius, each with the narrow scenario to add), and durable_items (only genuinely net-new lint/agent-guidance/doc items — the linter already has 7 rules and both agents carry extensive allocator/threading/ReleaseFast/SIMD/errdefer/validation guidance, so do not duplicate). Be precise and non-duplicative; a clean result with few items is fine.`,
+    `Split the output cleanly: top_bugs (confirmed real defects ranked by severity, each with a concrete fix direction), test_gaps (highest-value untested load-bearing invariants ranked by blast radius, each with the narrow scenario to add), and durable_items (only genuinely net-new lint rules or rule-file lines — read tools/lint_idioms.py and every .claude/rules/ file first and do not duplicate; a new technical rule targets the rule file that owns its topic and is consistent with every existing rule). Be precise and non-duplicative; a clean result with few items is fine.`,
+    ``,
+    `Each top_bugs fix_direction and test_gaps scenario names its owning slice id (docs/roadmap/slices/slice-<id>.md) or 'new slice needed: <title>' stated as intent and constraints, never a design; never a Scaling Gaps/backlog line. Only verified findings appear below; unverified (below high) findings are returned separately as leads for the main session to check against live code.`,
     ``,
     `Verified findings:`,
     digest,
   ].join('\n'),
-  { label: 'synthesize', phase: 'Synthesize', schema: SYNTHESIS_SCHEMA, effort: 'high' }
+  { label: 'synthesize', phase: 'Synthesize', schema: SYNTHESIS_SCHEMA, agentType: 'zig-review-specialist' }
 )
 
 return {
   counts: { units: REVIEW_UNITS.length, raw: allVerified.length, confirmed: confirmed.length },
   confirmed,
+  unverified,
   synthesis,
 }

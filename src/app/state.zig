@@ -14,7 +14,7 @@ const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const runtime_perf_log = @import("runtime_perf_log.zig");
 const log = @import("../core/logging.zig").app;
-const inputRouter = @import("input_router.zig");
+const input_router = @import("input_router.zig");
 const InputRoutingPolicy = @import("input_router.zig").InputRoutingPolicy;
 const renderer_file = @import("../render/renderer.zig");
 const Renderer = renderer_file.Renderer;
@@ -130,9 +130,7 @@ pub const State = struct {
 
             fn adapterOnResume(state_ptr: *anyopaque) void {
                 const self: *T = @ptrCast(@alignCast(state_ptr));
-                if (@hasDecl(T, "onResume")) {
-                    self.onResume();
-                }
+                self.onResume();
             }
 
             fn adapterDestroy(state_ptr: *anyopaque, allocator: std.mem.Allocator) void {
@@ -733,6 +731,10 @@ test "state stack owns pushed states and destroys removed states" {
             _ = self;
         }
 
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         fn deinit(self: *@This()) void {
             self.deinit_count.* += 1;
         }
@@ -785,6 +787,10 @@ test "state stack deinit destroys remaining states from top to bottom" {
             _ = self;
         }
 
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         fn deinit(self: *@This()) void {
             self.deinit_order.append(std.testing.allocator, self.id) catch unreachable;
         }
@@ -826,6 +832,10 @@ test "state stack replace destroys existing states from top to bottom" {
         }
 
         fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn onResume(self: *@This()) void {
             _ = self;
         }
 
@@ -872,6 +882,10 @@ test "state stack removeIfPresent clears live handles and leaves stale handles a
             _ = self;
         }
 
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         fn deinit(self: *@This()) void {
             _ = self;
         }
@@ -912,6 +926,10 @@ test "modal state blocks updates below and pass-through state allows them" {
         }
 
         fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn onResume(self: *@This()) void {
             _ = self;
         }
 
@@ -971,6 +989,10 @@ test "state event handling stops at consumed state" {
             _ = self;
         }
 
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         fn deinit(self: *@This()) void {
             _ = self;
         }
@@ -1022,6 +1044,10 @@ test "modal state blocks event handling below it" {
             _ = self;
         }
 
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         fn deinit(self: *@This()) void {
             _ = self;
         }
@@ -1068,6 +1094,10 @@ test "consumed modal event suppresses routed frame command" {
             _ = self;
         }
 
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         fn deinit(self: *@This()) void {
             _ = self;
         }
@@ -1084,7 +1114,7 @@ test "consumed modal event suppresses routed frame command" {
     var event = testKeyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_ESCAPE, false);
     const routing_policy = stack.inputRoutingPolicy();
     const consumed = try stack.handleEvent(&event, &transitions);
-    if (!consumed) inputRouter.routeEvent(routing_policy, &event, &input, &commands);
+    if (!consumed) input_router.routeEvent(routing_policy, &event, &input, &commands);
 
     try std.testing.expect(consumed);
     try std.testing.expect(!commands.wasPressed(.quit));
@@ -1110,6 +1140,10 @@ test "state stack input routing follows active state policy" {
         }
 
         fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn onResume(self: *@This()) void {
             _ = self;
         }
 
@@ -1153,13 +1187,13 @@ test "state stack input routing follows active state policy" {
     var input = InputState{};
     var commands = FrameCommands{};
     var move_down = testKeyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_A, false);
-    inputRouter.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
+    input_router.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
     try std.testing.expect(!input.isHeld(.move_left));
 
     try std.testing.expect(stack.remove(modal_handle));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
-    inputRouter.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
+    input_router.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
     try std.testing.expect(input.isHeld(.move_left));
 
     _ = try stack.pushOpaque(TestingState, .{});
@@ -1190,6 +1224,10 @@ test "opaque state render policy hides states below it" {
         }
 
         fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn onResume(self: *@This()) void {
             _ = self;
         }
 
@@ -1249,6 +1287,10 @@ test "transition requests apply after dispatch and preserve FIFO order" {
             _ = self;
         }
 
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         fn deinit(self: *@This()) void {
             _ = self;
         }
@@ -1302,6 +1344,10 @@ test "queued transition from update waits until applyTransitions" {
             _ = self;
         }
 
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         fn deinit(self: *@This()) void {
             _ = self;
         }
@@ -1349,6 +1395,10 @@ test "queued transition from handleEvent waits until applyTransitions" {
         }
 
         fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn onResume(self: *@This()) void {
             _ = self;
         }
 
@@ -1408,6 +1458,10 @@ test "event dispatch batch keeps stack stable until applyTransitions" {
             _ = self;
         }
 
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         fn deinit(self: *@This()) void {
             _ = self;
         }
@@ -1463,6 +1517,10 @@ test "stale duplicate and remove after replace transitions are no-ops" {
             _ = self;
         }
 
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         fn deinit(self: *@This()) void {
             _ = self;
         }
@@ -1512,6 +1570,10 @@ test "transition queue destroys unapplied owned states" {
             _ = self;
         }
 
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         fn deinit(self: *@This()) void {
             self.deinit_count.* += 1;
         }
@@ -1550,6 +1612,10 @@ test "owned gameplay transition destroys state when enqueue fails" {
         }
 
         fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn onResume(self: *@This()) void {
             _ = self;
         }
 
@@ -1608,6 +1674,10 @@ test "reserved modal push consumes only reserved capacity and allocates zero (Fa
         }
 
         fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn onResume(self: *@This()) void {
             _ = self;
         }
 
@@ -1674,6 +1744,10 @@ test "pop transition removes and destroys the current top state" {
         }
 
         fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn onResume(self: *@This()) void {
             _ = self;
         }
 

@@ -4,7 +4,7 @@
 
 //! AI decision processor: gathers per-row perception/memory/affect/personality
 //! signals, runs `arbitration.zig`'s utility scoring + sticky selection +
-//! goal resolution (Slice 32) to pick one of 5 behaviors and a concrete goal,
+//! goal resolution to pick one of 5 behaviors and a concrete goal,
 //! then blends that goal with wander noise and local separation into a
 //! `NavigationIntent`. Arbitration output is per-agent: perception's
 //! `nearest_threat` is already faction-generic (any hostile can become a
@@ -14,14 +14,18 @@
 //! Stateless (except work memory + per-system tuner); reads typed const slices for ai + movement prior positions,
 //! pre-sizes NavigationIntent output ranges and uses staged parallelForWithOptions work.
 //! Deterministic via explicit seed in config. Gather uses DataSystem dense-index lookup, so cost is bounded by live AI rows.
-//! Separation queries the pipeline-owned `SpatialIndexSystem` (Slice 28) — the caller
-//! builds it once per step from the same scoped population and passes a read-only
-//! `SpatialIndexView` in; this module no longer owns a private grid. See
-//! `spatial_index.zig`'s module doc for the population-domain-equivalence contract
-//! this depends on and the determinism-critical cell-scan traversal order. The same
-//! shared index also backs arbitration's cohere neighbor-mean gather (a second
-//! `queryNeighbors` call in the same separation-stage job, filtered to friendly
-//! stance) — no second grid.
+//! Separation queries the pipeline-owned `SpatialIndexSystem` — the caller
+//! builds it once per step from the unstaggered cognition halo and passes a
+//! read-only `SpatialIndexView` in; this module no longer owns a private grid.
+//! Think-set rows are a subset of that halo, so gather records `spatial_self_index`
+//! (the thinker's row in the halo walk) and a `candidates` side table aligned 1:1
+//! with spatial rows — the same mapping `perception.zig` uses, a deliberate
+//! duplicate gather rather than a shared table. Single-list callers (null
+//! `spatial_population_indices`) keep the equal-length path. See
+//! `spatial_index.zig`'s module doc for the determinism-critical cell-scan
+//! traversal order. The same shared index also backs arbitration's cohere
+//! neighbor-mean gather (a second `queryNeighbors` call in the same
+//! separation-stage job, filtered to friendly stance) — no second grid.
 //! decideDir pure base; applySeparationAndNormalize shared (no logic dup). Serial fallback + threaded identical.
 //! Arbitration itself (scoreBehaviors -> selectSticky -> resolveGoal per row) runs
 //! inside the already-threaded `writeAiIntentsJob`/`writeAiSeparationJob` range jobs —
@@ -37,13 +41,12 @@ const math = @import("../../core/math.zig");
 const rng = @import("../../core/rng.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
-const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
-const rangeCount = @import("../../app/thread_system.zig").rangeCount;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const AiAgentSlice = @import("../data_system.zig").AiAgentSlice;
 const ConstAiMemorySlice = @import("../data_system.zig").ConstAiMemorySlice;
@@ -54,7 +57,6 @@ const DataSystem = @import("../data_system.zig").DataSystem;
 const max_ai_memory_staleness = @import("../data_system.zig").max_ai_memory_staleness;
 const ai_memory_ring_capacity = @import("../data_system.zig").ai_memory_ring_capacity;
 const EntityId = @import("../data_system.zig").EntityId;
-const AiAgent = @import("../data_system.zig").AiAgent;
 const AiBehavior = @import("../data_system.zig").AiBehavior;
 const Faction = @import("../data_system.zig").Faction;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
@@ -82,8 +84,6 @@ const ai_adaptive_tuner_config = AdaptiveWorkTunerConfig{
 /// == 32.0), not derived from world/map size. See
 /// `AiConfig.goal_requantization_hysteresis_distance`.
 pub const default_goal_requantization_hysteresis_distance: f32 = 56.0;
-
-pub const HotF32Slice = []f32;
 
 fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, ai_range_alignment_items);
@@ -150,11 +150,19 @@ const RowDrives = struct {
     fatigue: f32,
 };
 
-/// World interest marker signal (Slice 41), gathered from `WorldSystem`.
+/// World interest marker signal, gathered from `WorldSystem`.
 const RowInterest = struct {
     present: bool = false,
     x: f32 = 0,
     y: f32 = 0,
+    /// World level sampled at gather. The separation job reads it when it scans markers.
+    level: u16 = 0,
+    /// Whether the agent carries a real faction component. The gathered
+    /// `faction` column falls back to `.neutral` for stance math, but the
+    /// marker scan must pass `null` for a factionless agent so a
+    /// faction-restricted marker never accepts it (`factionAccepts`). Packs
+    /// into this struct's existing padding, so the job layout does not grow.
+    has_faction: bool = false,
 };
 
 /// Explicit opt-in fallback target (see `AiConfig.focus_target`'s doc
@@ -200,11 +208,29 @@ const RowResolved = struct {
 /// comptime field-layout sort exceeds Zig's default eval-branch quota well
 /// before that many fields (verified empirically), and grouping keeps each
 /// signal domain readable as a unit besides.
+const AiCandidateRow = struct {
+    entity: EntityId,
+    faction: Faction,
+};
+
+fn appendAiCandidateRow(
+    rows: *std.MultiArrayList(AiCandidateRow),
+    row_slice: *std.MultiArrayList(AiCandidateRow).Slice,
+    row: AiCandidateRow,
+) void {
+    _ = rows.addOneAssumeCapacity();
+    row_slice.len = rows.len;
+    row_slice.set(rows.len - 1, row);
+}
+
 const AiGatherRow = struct {
     entity: EntityId,
     pos_x: f32,
     pos_y: f32,
     faction: Faction,
+    /// Row index in the spatial/halo candidate walk, passed to `queryNeighbors`
+    /// as self-exclusion. Equals the gather-row index only on the single-list path.
+    spatial_self_index: usize,
     wander_amplitude: f32,
     gains: RowGains,
     sticky: RowSticky,
@@ -332,7 +358,7 @@ pub const AiConfig = struct {
     /// drive scores as 0 (pure personality-gain + perception/memory scoring).
     affect_slice: ?ConstAiAffectSlice = null,
     /// Solver-mode ceiling honored only when a row's `kind_hint` is not
-    /// `.individual`. Per Slice 32's `arbitration.resolveGoal`, every
+    /// `.individual`. Per `arbitration.resolveGoal`, every
     /// behavior (including the `focus_target` pursue fallback) currently
     /// resolves `kind_hint = .individual` — goals are agent-specific by
     /// construction now, not a single broadcast target — so this field has
@@ -343,8 +369,14 @@ pub const AiConfig = struct {
     nav_request_kind: PathRequestKind = .individual,
     navigation_intents: ?*RangeOutputStream(NavigationIntent) = null,
     /// When non-null, only these dense ai-store indices participate this step
-    /// (the scope system's cognition halo + stagger selection). Null = all agents.
+    /// (the scope system's stagger-filtered think set). Null = all agents on
+    /// the single-list path, or all halo rows when `spatial_population_indices`
+    /// is set.
     scope_dense_indices: ?[]const u32 = null,
+    /// Halo/spatial-population indices (unstaggered cognition halo). Null =
+    /// walk `scope_dense_indices` for both candidates and think rows (equal-
+    /// length tests / benches). Pipeline always passes `ai_halo_indices`.
+    spatial_population_indices: ?[]const u32 = null,
     /// Read-only world interest markers for investigate goal gathering. Null =
     /// no marker contribution (prior behavior unchanged).
     interest_markers: ?*const InterestMarkerStore = null,
@@ -365,12 +397,22 @@ pub const AiSystem = struct {
     allocator: std.mem.Allocator,
     // Gathered work memory (main-thread only; workers read only copies in ctx). Sized to ai ents.
     rows: std.MultiArrayList(AiGatherRow) = .{},
+    /// Halo-aligned candidate side table (faction + entity), 1:1 with spatial rows.
+    /// Think rows index it via `spatial_self_index`; not shared with PerceptionSystem.
+    candidates: std.MultiArrayList(AiCandidateRow) = .{},
     separation_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
     intent_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
     // Broadcast goal-requantization state (see `requantizeGoal`); one scalar
     // pair since every default-target row shares this same broadcast value.
     snapped_goal: AiDir = .{ .x = 0, .y = 0 },
     snapped_goal_initialized: bool = false,
+
+    pub fn reserve(self: *AiSystem, pop: usize) !void {
+        if (pop == 0) return;
+        const cap = hotStoreCapacity(pop);
+        try self.candidates.ensureTotalCapacity(self.allocator, cap);
+        try self.rows.ensureTotalCapacity(self.allocator, cap);
+    }
 
     pub fn init(allocator: std.mem.Allocator) AiSystem {
         return .{
@@ -381,6 +423,7 @@ pub const AiSystem = struct {
     }
 
     pub fn deinit(self: *AiSystem) void {
+        self.candidates.deinit(self.allocator);
         self.rows.deinit(self.allocator);
         self.* = undefined;
     }
@@ -398,36 +441,33 @@ pub const AiSystem = struct {
     ) !AiStats {
         _ = delta_seconds; // decisions are instantaneous; integration in movement
         const held_focus_target = self.resolveFocusTarget(config);
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, held_focus_target, config.focus_entity, config.perception_slice, config.memory_slice, config.affect_slice, config.interest_markers);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, config.spatial_population_indices, held_focus_target, config.focus_entity, config.perception_slice, config.memory_slice, config.affect_slice, config.interest_markers);
         const entity_count = self.rows.len;
         if (entity_count == 0) {
             // No ai this step; do not touch caller's stream (other emitters may use intents).
             return .{};
         }
 
-        // Population-domain contract with spatial_index.zig (see the module doc
-        // and `computeAiSeparationsSerial`): the shared index built for this step
-        // must have gathered the identical row count, since `computeBoundedSeparation`
-        // passes a gather row index into `queryNeighbors` as a self-index used only
-        // for self-exclusion (an equality compare against spatial's own row indices,
-        // which are always bounds-safe within spatial's own arrays) — a divergence
-        // here corrupts self-exclusion/separation-force correctness, not memory
-        // safety. Debug/ReleaseSafe-only guard (compiles out in ReleaseFast, like
-        // every std.debug.assert); O(1) count compare, not a per-row cost.
-        std.debug.assert(entity_count == spatial.pos_x.len);
+        // Population-domain contract with spatial_index.zig (see the module doc):
+        // the shared index built for this step must match the candidate walk.
+        // Single-list callers also keep think-row == spatial-row; dual-list
+        // (non-null `spatial_population_indices`) uses `spatial_self_index`.
+        if (config.spatial_population_indices == null) {
+            std.debug.assert(entity_count == spatial.pos_x.len);
+        }
+        std.debug.assert(self.candidates.len == spatial.pos_x.len);
 
         const system_config = normalizedConfig(config, self);
         self.resetSeparationScratch();
         const gathered = self.rows.slice();
-        const separation_selection = selectStageWork(
-            thread_system,
-            entity_count,
-            system_config.separation_items_per_range orelse system_config.items_per_range,
-            system_config.max_worker_threads,
-            system_config.adaptive,
-            system_config.separation_adaptive_tuner,
-        );
-        var separation_context = buildAiSeparationContext(gathered, spatial, separation_selection.range_count);
+        const separation_selection = thread_system.selectBatchProfile(system_config.separation_adaptive_tuner, .{
+            .item_count = entity_count,
+            .items_per_range = system_config.separation_items_per_range orelse system_config.items_per_range,
+            .max_worker_threads = system_config.max_worker_threads,
+            .range_alignment_items = ai_range_alignment_items,
+            .adaptive = system_config.adaptive,
+        });
+        var separation_context = buildAiSeparationContext(self, gathered, spatial, separation_selection.range_count, config.interest_markers);
         const separation_batch = thread_system.parallelForWithOptions(entity_count, &separation_context, writeAiSeparationJob, .{
             .max_worker_threads = separation_selection.worker_threads,
             .range_alignment_items = ai_range_alignment_items,
@@ -435,14 +475,13 @@ pub const AiSystem = struct {
             .selected_profile = separation_selection.profile,
         });
 
-        const intent_selection = selectStageWork(
-            thread_system,
-            entity_count,
-            system_config.intent_items_per_range orelse system_config.items_per_range,
-            system_config.max_worker_threads,
-            system_config.adaptive,
-            system_config.intent_adaptive_tuner,
-        );
+        const intent_selection = thread_system.selectBatchProfile(system_config.intent_adaptive_tuner, .{
+            .item_count = entity_count,
+            .items_per_range = system_config.intent_items_per_range orelse system_config.items_per_range,
+            .max_worker_threads = system_config.max_worker_threads,
+            .range_alignment_items = ai_range_alignment_items,
+            .adaptive = system_config.adaptive,
+        });
         const rcount = intent_selection.range_count;
 
         const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
@@ -497,11 +536,15 @@ pub const AiSystem = struct {
     ) !AiStats {
         _ = delta_seconds;
         const held_focus_target = self.resolveFocusTarget(config);
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, held_focus_target, config.focus_entity, config.perception_slice, config.memory_slice, config.affect_slice, config.interest_markers);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, config.spatial_population_indices, held_focus_target, config.focus_entity, config.perception_slice, config.memory_slice, config.affect_slice, config.interest_markers);
         const entity_count = self.rows.len;
         if (entity_count == 0) return .{};
+        if (config.spatial_population_indices == null) {
+            std.debug.assert(entity_count == spatial.pos_x.len);
+        }
+        std.debug.assert(self.candidates.len == spatial.pos_x.len);
         self.resetSeparationScratch();
-        self.computeAiSeparationsSerial(spatial);
+        self.computeAiSeparationsSerial(spatial, config.interest_markers);
         const gathered = self.rows.slice();
         const rcount: usize = 1;
         const system_config = normalizedConfig(config, self);
@@ -514,8 +557,8 @@ pub const AiSystem = struct {
         writeAiIntentsJob(&context, .{ .index = 0, .start = 0, .end = entity_count }, WorkerId.main);
 
         navigation_stream.finishWrite();
-        const separation_batch = serialBatch(entity_count);
-        const intent_batch = serialBatch(entity_count);
+        const separation_batch = inlineBatch(entity_count, ai_range_alignment_items);
+        const intent_batch = inlineBatch(entity_count, ai_range_alignment_items);
         return .{
             .entity_count = entity_count,
             .intent_count = entity_count,
@@ -528,14 +571,14 @@ pub const AiSystem = struct {
         };
     }
 
-    // Population-domain contract with `spatial_index.zig` (Slice 28): the shared
+    // Population-domain contract with `spatial_index.zig`: the shared
     // `SpatialIndexSystem` the caller builds for this step walks the identical
-    // `scope_dense_indices` selection with the identical
+    // halo/`scope_dense_indices` selection with the identical
     // `movementBodyDenseIndex(entity) orelse continue` skip, in the same order —
-    // a deliberate duplicate gather, not shared code. That equivalence is what
-    // lets `computeBoundedSeparation` below use a spatial-index row index
-    // directly as this system's own row index with zero translation (see
-    // `spatial_index.zig`'s module doc and the cross-system contract test).
+    // a deliberate duplicate gather, not shared code. Dual-list (non-null
+    // `spatial_population_indices`) records each think row's place in that walk
+    // as `spatial_self_index` and fills a halo-aligned `candidates` table;
+    // single-list keeps think-row == spatial-row.
     //
     // Populates every INPUT column arbitration needs (personality gains, hot
     // commitment state, perception/memory/affect signals, the gated
@@ -550,30 +593,62 @@ pub const AiSystem = struct {
         movement: ConstMovementBodySlice,
         data: *const DataSystem,
         scope_dense_indices: ?[]const u32,
+        spatial_population_indices: ?[]const u32,
         focus_target: ?AiDir,
         focus_entity: ?EntityId,
         perception_slice: ?ConstPerceptionSlice,
         memory_slice: ?ConstAiMemorySlice,
         affect_slice: ?ConstAiAffectSlice,
-        interest_markers: ?*const InterestMarkerStore,
+        _: ?*const InterestMarkerStore,
     ) !void {
         self.clearWork();
-        // n is the candidate count: the scoped subset when the scope system has
-        // selected ai rows for this step, otherwise every ai agent.
-        const n = if (scope_dense_indices) |idx| idx.len else ai_slice.entities.len;
+        const spatial_indices = spatial_population_indices orelse scope_dense_indices;
+        const think_indices: ?[]const u32 = if (spatial_population_indices) |halo|
+            (scope_dense_indices orelse halo)
+        else
+            spatial_indices;
+        const n = if (spatial_indices) |idx| idx.len else ai_slice.entities.len;
         if (n == 0) return;
-        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
+        const think_n = if (think_indices) |idx| idx.len else n;
+        try self.candidates.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
+        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(think_n));
 
         // Preserve ai order for deterministic output. DataSystem rejects stale generations
         // and returns direct dense movement rows without transient high-water index tables.
         // The scoped path walks only the selected ai indices; both paths gather the
         // same per-row columns, so all downstream stages operate on the gathered set.
+        var candidate_slice = self.candidates.slice();
         var row_slice = self.rows.slice();
         var k: usize = 0;
+        var think_k: usize = 0;
+        var spatial_row_index: usize = 0;
         while (k < n) : (k += 1) {
-            const i: usize = if (scope_dense_indices) |idx| idx[k] else k;
+            const i: usize = if (spatial_indices) |idx| idx[k] else k;
+            const ai_index: u32 = @intCast(i);
             const ent = ai_slice.entities[i];
-            const mi = data.movementBodyDenseIndex(ent) orelse continue;
+            const mi = data.movementBodyDenseIndex(ent) orelse {
+                if (think_indices) |think| {
+                    if (think_k < think.len and think[think_k] == ai_index) think_k += 1;
+                }
+                continue;
+            };
+
+            const maybe_faction = data.factionConst(ent);
+            const ent_faction = maybe_faction orelse .neutral;
+            appendAiCandidateRow(&self.candidates, &candidate_slice, .{
+                .entity = ent,
+                .faction = ent_faction,
+            });
+
+            const in_think_set = if (think_indices) |think|
+                think_k < think.len and think[think_k] == ai_index
+            else
+                true;
+            if (!in_think_set) {
+                spatial_row_index += 1;
+                continue;
+            }
+            if (think_indices != null) think_k += 1;
 
             // See AiConfig.focus_target's doc comment: only an explicit opt-in,
             // never populated for a row with no pursue gain at all.
@@ -584,7 +659,8 @@ pub const AiSystem = struct {
                 .entity = ent,
                 .pos_x = movement.previous_x[mi],
                 .pos_y = movement.previous_y[mi],
-                .faction = data.factionConst(ent) orelse .neutral,
+                .faction = ent_faction,
+                .spatial_self_index = spatial_row_index,
                 .wander_amplitude = ai_slice.wander_amplitudes[i],
                 .gains = .{
                     .wander = ai_slice.gain_wanders[i],
@@ -614,7 +690,7 @@ pub const AiSystem = struct {
                     .staleness = 0,
                     .max_staleness = 0,
                 },
-                .memory_ring = [_]RowMemoryRingSlot{.{}} ** ai_memory_ring_capacity,
+                .memory_ring = @splat(.{}),
                 .drives = .{ .fear = 0, .curiosity = 0, .aggression = 0, .fatigue = 0 },
                 .focus = .{
                     .entity = if (has_focus) focus_entity else null,
@@ -681,23 +757,19 @@ pub const AiSystem = struct {
                 }
             }
 
-            // Mirror focus gating: investigate score is multiplied by gain, so a
-            // zero-gain row can never win investigate — skip the marker scan.
-            if (interest_markers) |markers| {
-                if (row.gains.investigate > 0) {
-                    const level = data.worldLevelConst(ent) orelse 0;
-                    const agent_faction = data.factionConst(ent);
-                    if (markers.findBestInvestigateMarker(level, row.pos_x, row.pos_y, interest_marker_query_radius, agent_faction)) |hit| {
-                        row.interest = .{ .present = true, .x = hit.x, .y = hit.y };
-                    }
-                }
-            }
+            row.interest = .{
+                .level = data.worldLevelConst(ent) orelse 0,
+                .has_faction = maybe_faction != null,
+            };
 
             appendAiGatherRow(&self.rows, &row_slice, row);
+            spatial_row_index += 1;
         }
+        if (think_indices) |think| std.debug.assert(think_k == think.len);
     }
 
     fn clearWork(self: *AiSystem) void {
+        self.candidates.clearRetainingCapacity();
         self.rows.clearRetainingCapacity();
     }
 
@@ -728,20 +800,12 @@ pub const AiSystem = struct {
         @memset(gathered.items(.cohere), RowCohere{});
     }
 
-    fn computeAiSeparationsSerial(self: *AiSystem, spatial: SpatialIndexView) void {
-        // Population-domain contract with spatial_index.zig: the shared index
-        // built for this step must have gathered the identical row count, since
-        // `computeBoundedSeparation` passes a gather row index into `queryNeighbors`
-        // as a self-index used only for self-exclusion (an equality compare against
-        // spatial's own row indices, which are always bounds-safe within spatial's
-        // own arrays) — a divergence here corrupts self-exclusion/separation-force
-        // correctness, not memory safety. Debug/ReleaseSafe-only guard (compiles out
-        // in ReleaseFast, like every std.debug.assert); O(1) count compare (not
-        // per-row), guarding against a future silent divergence between the two
-        // independent gathers.
-        std.debug.assert(self.rows.len == spatial.pos_x.len);
+    fn computeAiSeparationsSerial(self: *AiSystem, spatial: SpatialIndexView, markers: ?*const InterestMarkerStore) void {
+        // Population-domain contract with spatial_index.zig: candidates (halo walk)
+        // must match the shared index row count. Think rows may be a subset.
+        std.debug.assert(self.candidates.len == spatial.pos_x.len);
         const gathered = self.rows.slice();
-        var context = buildAiSeparationContext(gathered, spatial, 1);
+        var context = buildAiSeparationContext(self, gathered, spatial, 1, markers);
         writeAiSeparationJob(&context, .{ .index = 0, .start = 0, .end = self.rows.len }, WorkerId.main);
     }
 };
@@ -784,17 +848,28 @@ fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
     };
 }
 
-fn buildAiSeparationContext(gathered: std.MultiArrayList(AiGatherRow).Slice, spatial: SpatialIndexView, range_count: usize) AiSeparationContext {
+fn buildAiSeparationContext(
+    system: *const AiSystem,
+    gathered: std.MultiArrayList(AiGatherRow).Slice,
+    spatial: SpatialIndexView,
+    range_count: usize,
+    markers: ?*const InterestMarkerStore,
+) AiSeparationContext {
+    const candidate_slice = system.candidates.slice();
     return .{
         .pos_x = gathered.items(.pos_x),
         .pos_y = gathered.items(.pos_y),
         .faction = gathered.items(.faction),
+        .spatial_self_index = gathered.items(.spatial_self_index),
+        .candidate_faction = candidate_slice.items(.faction),
         .gains = gathered.items(.gains),
         .sep_x = gathered.items(.sep_x),
         .sep_y = gathered.items(.sep_y),
         .neighbor_counts = gathered.items(.separation_neighbor_count),
         .candidate_counts = gathered.items(.separation_candidate_count),
         .cohere = gathered.items(.cohere),
+        .interest = gathered.items(.interest),
+        .markers = markers,
         .spatial_index = spatial,
         .range_count = range_count,
     };
@@ -840,27 +915,6 @@ fn buildAiJobContext(
         .range_base = range_base,
         .range_count = range_count,
     };
-}
-
-const StageWorkSelection = BatchSelection;
-
-fn selectStageWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    items_per_range_override: ?usize,
-    max_worker_threads_override: ?usize,
-    adaptive: bool,
-    adaptive_tuner: ?*AdaptiveWorkTuner,
-) StageWorkSelection {
-    // Shapes work through the single tuner-owned entry point so pre-sizing and
-    // dispatch (parallelForWithOptions) resolve an identical batch shape.
-    return thread_system.selectBatchProfile(adaptive_tuner, .{
-        .item_count = item_count,
-        .items_per_range = items_per_range_override,
-        .max_worker_threads = max_worker_threads_override,
-        .range_alignment_items = ai_range_alignment_items,
-        .adaptive = adaptive,
-    });
 }
 
 fn sumU8(values: []const u8) usize {
@@ -965,6 +1019,8 @@ const AiSeparationContext = struct {
     pos_x: []const f32,
     pos_y: []const f32,
     faction: []const Faction,
+    spatial_self_index: []const usize,
+    candidate_faction: []const Faction,
     /// Only `.cohere` is read here (gates the neighbor query below) — kept as
     /// the full row rather than a single `[]const f32` column so this struct
     /// doesn't grow a second near-duplicate gains slice alongside
@@ -978,6 +1034,8 @@ const AiSeparationContext = struct {
     /// by the same job, same shared spatial index, as local separation. Not
     /// a second grid.
     cohere: []RowCohere,
+    interest: []RowInterest,
+    markers: ?*const InterestMarkerStore,
     spatial_index: SpatialIndexView,
     /// Dispatched range count; dual-asserted against `range.index` at job entry.
     range_count: usize,
@@ -1006,6 +1064,18 @@ fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
             computeCohereNeighbors(job, index)
         else
             .{};
+
+        if (job.markers) |markers| {
+            if (job.gains[index].investigate > 0) {
+                const interest = &job.interest[index];
+                const agent_faction: ?Faction = if (interest.has_faction) job.faction[index] else null;
+                if (markers.findBestInvestigateMarker(interest.level, job.pos_x[index], job.pos_y[index], interest_marker_query_radius, agent_faction)) |hit| {
+                    interest.present = true;
+                    interest.x = hit.x;
+                    interest.y = hit.y;
+                }
+            }
+        }
     }
 }
 
@@ -1045,7 +1115,7 @@ fn computeBoundedSeparation(job: *const AiSeparationContext, index: usize) Separ
     const stats = job.spatial_index.queryNeighbors(
         job.pos_x[index],
         job.pos_y[index],
-        index,
+        job.spatial_self_index[index],
         separation_cell_scan_radius,
         .{ .radius = separation_radius, .max_candidate_checks = max_separation_candidate_checks },
         &acc,
@@ -1094,15 +1164,15 @@ fn computeCohereNeighbors(job: *const AiSeparationContext, index: usize) RowCohe
     var acc = CohereAccumulator{};
     var visit_ctx = CohereVisitContext{
         .self_faction = job.faction[index],
-        .candidate_faction = job.faction,
-        .candidate_pos_x = job.pos_x,
-        .candidate_pos_y = job.pos_y,
+        .candidate_faction = job.candidate_faction,
+        .candidate_pos_x = job.spatial_index.pos_x,
+        .candidate_pos_y = job.spatial_index.pos_y,
         .acc = &acc,
     };
     _ = job.spatial_index.queryNeighbors(
         job.pos_x[index],
         job.pos_y[index],
-        index,
+        job.spatial_self_index[index],
         cohere_cell_scan_radius,
         .{ .radius = cohere_radius, .max_candidate_checks = max_cohere_candidate_checks },
         &visit_ctx,
@@ -1236,7 +1306,7 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
         sticky.sticky_bonus,
         arbitration_sticky_min_delta,
     );
-    const selected_behavior: AiBehavior = @enumFromInt(selection.index);
+    const selected_behavior: AiBehavior = @fromBackingInt(@intCast(selection.index));
     const goal = arbitration.resolveGoal(selected_behavior, signals);
 
     const agent_index = sticky.agent_dense_index;
@@ -1266,7 +1336,7 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
         // not held as the active exertion mode.
         job.ai_agent_hot.active_behavior[agent_index] = .wander;
         job.ai_agent_hot.commitment_remaining[agent_index] = 0;
-        job.ai_agent_hot.last_score[agent_index] = scores[@intFromEnum(AiBehavior.wander)];
+        job.ai_agent_hot.last_score[agent_index] = scores[@backingInt(AiBehavior.wander)];
         job.resolved[i] = .{
             .behavior = .wander,
             .gain = 0,
@@ -1317,10 +1387,6 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
     writer.finish();
 }
 
-fn serialBatch(count: usize) BatchStats {
-    return .{ .ran_inline = true, .item_count = count, .range_count = 1, .items_per_range = count };
-}
-
 const SpatialIndexSystem = spatial_index.SpatialIndexSystem;
 
 /// Test-only helper: builds a `SpatialIndexSystem` from the same fixture an
@@ -1347,6 +1413,7 @@ fn expectAiGatherColumnsAligned(rows: *const std.MultiArrayList(AiGatherRow)) !v
     try std.testing.expectEqual(count, s.items(.pos_x).len);
     try std.testing.expectEqual(count, s.items(.pos_y).len);
     try std.testing.expectEqual(count, s.items(.faction).len);
+    try std.testing.expectEqual(count, s.items(.spatial_self_index).len);
     try std.testing.expectEqual(count, s.items(.wander_amplitude).len);
     try std.testing.expectEqual(count, s.items(.gains).len);
     try std.testing.expectEqual(count, s.items(.sticky).len);
@@ -1356,6 +1423,7 @@ fn expectAiGatherColumnsAligned(rows: *const std.MultiArrayList(AiGatherRow)) !v
     try std.testing.expectEqual(count, s.items(.memory_ring).len);
     try std.testing.expectEqual(count, s.items(.drives).len);
     try std.testing.expectEqual(count, s.items(.focus).len);
+    try std.testing.expectEqual(count, s.items(.interest).len);
     try std.testing.expectEqual(count, s.items(.sep_x).len);
     try std.testing.expectEqual(count, s.items(.sep_y).len);
     try std.testing.expectEqual(count, s.items(.separation_neighbor_count).len);
@@ -1552,12 +1620,11 @@ test "ai goal requantization: nonzero hysteresis holds the goal until displaceme
 }
 
 test "ai goal requantization: decideDir's steering target is the same held goal as the NavigationIntent, not a separate live target" {
-    // Slice 32 simplification: unlike the pre-arbitration broadcast design,
-    // there is no longer a separate raw/live vs hysteresis-held pair for a
-    // resolved goal -- resolveGoal's output feeds both the NavigationIntent's
+    // There is no separate raw/live vs hysteresis-held pair for a
+    // resolved goal: resolveGoal's output feeds both the NavigationIntent's
     // `.goal` and decideDir's steering target uniformly, for every tier
     // (perception/memory goals are already fresh every step; only the
-    // focus_target fallback has a hysteresis concept at all, and it now
+    // focus_target fallback has a hysteresis concept at all, and it
     // applies identically to both consumers).
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1969,12 +2036,7 @@ test "ai threaded multi-worker update has no steady-state allocation after warmu
         .focus_target = .{ .x = 100, .y = 100 },
     };
 
-    // Warm multi-worker path (must not be the inline fallback).
-    frame.beginStep();
-    const warmup = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, cfg);
-    try std.testing.expect(!warmup.intent_batch.ran_inline);
-    try std.testing.expect(warmup.intent_batch.active_worker_threads > 0);
-    frame.phase = .finished;
+    try ai_sys.reserve(64);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     const original_ai = ai_sys.allocator;
@@ -1993,6 +2055,61 @@ test "ai threaded multi-worker update has no steady-state allocation after warmu
     const stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, cfg);
     try std.testing.expect(!stats.intent_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 64), frame.navigation_intents.mergedItems().len);
+    frame.phase = .finished;
+}
+
+test "ai dual-list gather has no steady-state allocation after warmup (FailingAllocator)" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..4) |i| {
+        const entity = try data.createEntity();
+        const x: f32 = @floatFromInt(i * 20);
+        try data.setMovementBody(entity, .{
+            .position = .{ .x = x, .y = 0 },
+            .previous_position = .{ .x = x, .y = 0 },
+            .velocity = .{},
+            .speed = 20,
+        });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    }
+
+    const halo = [_]u32{ 0, 1, 2, 3 };
+    const think = [_]u32{ 0, 2 };
+    var spatial_sys = SpatialIndexSystem.init(std.testing.allocator);
+    defer spatial_sys.deinit();
+    try spatial_sys.reserve(4, .{});
+    _ = try spatial_sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{ .scope_dense_indices = &halo });
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    const cfg: AiConfig = .{
+        .scope_dense_indices = &think,
+        .spatial_population_indices = &halo,
+        .intent_seed = 1,
+    };
+
+    try ai_sys.reserve(4);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_ai = ai_sys.allocator;
+    const original_frame = frame.allocator;
+    const original_nav = frame.navigation_intents.allocator;
+    ai_sys.allocator = failing.allocator();
+    frame.allocator = failing.allocator();
+    frame.navigation_intents.allocator = failing.allocator();
+    defer {
+        ai_sys.allocator = original_ai;
+        frame.allocator = original_frame;
+        frame.navigation_intents.allocator = original_nav;
+    }
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, cfg);
+    try std.testing.expectEqual(@as(usize, 2), ai_sys.rows.len);
+    try std.testing.expectEqual(@as(usize, 4), ai_sys.candidates.len);
     frame.phase = .finished;
 }
 
@@ -2084,11 +2201,7 @@ test "ai memory-retargeted seek has no steady-state allocation after warmup (Fai
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
 
-    // Warm-up run sizes rows/navigation_intents to steady state and exercises
-    // arbitration's populated (perception + fresh memory) pursue branch.
-    frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
-    frame.phase = .finished;
+    try ai_sys.reserve(ai_slice.entities.len);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     const original_ai_allocator = ai_sys.allocator;
@@ -2201,9 +2314,12 @@ test "ai interest gate skips the marker scan for a zero-investigate-gain row" {
     const ai_slice = data.aiAgentSliceConst();
     const move_slice = data.movementBodySliceConst();
 
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, move_slice, &data, null, null, null, null, null, null, &markers);
+    try ai_sys.gatherAiData(ai_slice, move_slice, &data, null, null, null, null, null, null, null, &markers);
+    ai_sys.computeAiSeparationsSerial(spatial_sys.view(), &markers);
 
     const rows = ai_sys.rows.slice();
     const entities = rows.items(.entity);
@@ -2215,6 +2331,53 @@ test "ai interest gate skips the marker scan for a zero-investigate-gain row" {
         } else {
             try std.testing.expect(marker.present);
             try std.testing.expectApproxEqAbs(@as(f32, 200), marker.x, 1e-3);
+        }
+    }
+}
+
+test "ai factionless agent never discovers a faction-restricted marker" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    var markers = InterestMarkerStore.init(std.testing.allocator);
+    defer markers.deinit(std.testing.allocator);
+    // In range, but restricted to `.neutral`: the gathered stance column's
+    // `.neutral` fallback must not masquerade as a real neutral faction.
+    _ = try markers.addMarker(.{ .kind = .investigate, .level = 0, .x = 200, .y = 50, .radius = 256, .faction_filter = .neutral });
+
+    const factionless = try data.createEntity();
+    try data.setMovementBody(factionless, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setWorldLevel(factionless, 0);
+    try data.setAiAgent(factionless, .{ .active_behavior = .investigate, .gain_investigate = 2.0, .gain_wander = 0 });
+
+    // Control: a real `.neutral` agent at the same spot does pass the filter.
+    const neutral = try data.createEntity();
+    try data.setMovementBody(neutral, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setWorldLevel(neutral, 0);
+    try data.setFaction(neutral, .neutral);
+    try data.setAiAgent(neutral, .{ .active_behavior = .investigate, .gain_investigate = 2.0, .gain_wander = 0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    try ai_sys.gatherAiData(ai_slice, move_slice, &data, null, null, null, null, null, null, null, &markers);
+    ai_sys.computeAiSeparationsSerial(spatial_sys.view(), &markers);
+
+    const rows = ai_sys.rows.slice();
+    const entities = rows.items(.entity);
+    const interest = rows.items(.interest);
+    try std.testing.expectEqual(@as(usize, 2), entities.len);
+    for (entities, interest) |ent, marker| {
+        if (ent.index == factionless.index) {
+            try std.testing.expect(!marker.has_faction);
+            try std.testing.expect(!marker.present);
+        } else {
+            try std.testing.expect(marker.has_faction);
+            try std.testing.expect(marker.present);
         }
     }
 }
@@ -2397,7 +2560,7 @@ test "ai gather direct table and separation blend produce correct order + dirs (
 test "ai serial and threaded (0 workers) produce identical intents with separation + seek_target" {
     if (builtin.single_threaded) return error.SkipZigTest;
     // Two DataSystems: arbitration write-back mutates sticky columns, so serial
-    // and threaded must start from identical unmutated state (L2).
+    // and threaded must start from identical unmutated state.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -2450,7 +2613,7 @@ test "ai serial and real threaded workers produce identical navigation intents" 
     if (builtin.single_threaded) return error.SkipZigTest;
 
     // Two DataSystems: arbitration write-back mutates sticky columns, so serial
-    // and threaded must start from identical unmutated state (L2).
+    // and threaded must start from identical unmutated state.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -2647,7 +2810,7 @@ test "spatial index and AiSystem gather agree on row-index population order even
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null, null, null);
     try std.testing.expectEqual(@as(usize, 4), ai_sys.rows.len);
 
     const ai_entities = ai_sys.rows.slice().items(.entity);
@@ -2658,6 +2821,105 @@ test "spatial index and AiSystem gather agree on row-index population order even
         try std.testing.expectEqual(ai_entities[i].index, spatial_entities[i].index);
         try std.testing.expectEqual(ai_entities[i].generation, spatial_entities[i].generation);
     }
+}
+
+test "dual-list AI self-exclusion uses spatial row index, not think-row index" {
+    // Halo is [A, B]; only B thinks. B is spatial-row 1 / think-row 0. If
+    // queryNeighbors received think-row 0 as self-index it would exclude A
+    // instead of B, so separation/cohere would miss the only neighbor.
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const a = try data.createEntity();
+    try data.setMovementBody(a, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(a, .{ .active_behavior = .wander, .gain_cohere = 1.0 });
+    try data.setFaction(a, .hostile);
+
+    const b = try data.createEntity();
+    try data.setMovementBody(b, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(b, .{ .active_behavior = .wander, .gain_cohere = 1.0 });
+    try data.setFaction(b, .hostile);
+
+    const halo = [_]u32{ 0, 1 };
+    const think = [_]u32{1};
+
+    var spatial_sys = SpatialIndexSystem.init(std.testing.allocator);
+    defer spatial_sys.deinit();
+    try spatial_sys.reserve(2, .{});
+    _ = try spatial_sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{ .scope_dense_indices = &halo });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+    frame.beginStep();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
+        .scope_dense_indices = &think,
+        .spatial_population_indices = &halo,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), ai_sys.rows.len);
+    try std.testing.expectEqual(@as(usize, 2), ai_sys.candidates.len);
+    try std.testing.expectEqual(@as(usize, 1), ai_sys.rows.slice().items(.spatial_self_index)[0]);
+    try std.testing.expectEqual(b.index, ai_sys.rows.slice().items(.entity)[0].index);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.separation_neighbor_samples);
+    try std.testing.expect(stats.separation_candidate_checks >= 1);
+
+    const cohere = ai_sys.rows.slice().items(.cohere)[0];
+    try std.testing.expectEqual(@as(u32, 1), cohere.count);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), cohere.mean_x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), cohere.mean_y, 1e-4);
+}
+
+test "gapped think set two-pointer records spatial_self_index for both thinkers" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const a = try data.createEntity();
+    try data.setMovementBody(a, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(a, .{ .active_behavior = .wander, .gain_cohere = 1.0 });
+    try data.setFaction(a, .hostile);
+
+    const b = try data.createEntity();
+    try data.setMovementBody(b, .{ .position = .{ .x = 40, .y = 0 }, .previous_position = .{ .x = 40, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(b, .{ .active_behavior = .wander, .gain_cohere = 1.0 });
+    try data.setFaction(b, .hostile);
+
+    const c = try data.createEntity();
+    try data.setMovementBody(c, .{ .position = .{ .x = 80, .y = 0 }, .previous_position = .{ .x = 80, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(c, .{ .active_behavior = .wander, .gain_cohere = 1.0 });
+    try data.setFaction(c, .hostile);
+
+    const halo = [_]u32{ 0, 1, 2 };
+    const think = [_]u32{ 0, 2 };
+
+    var spatial_sys = SpatialIndexSystem.init(std.testing.allocator);
+    defer spatial_sys.deinit();
+    try spatial_sys.reserve(3, .{});
+    _ = try spatial_sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{ .scope_dense_indices = &halo });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    frame.beginStep();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
+        .scope_dense_indices = &think,
+        .spatial_population_indices = &halo,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), ai_sys.rows.len);
+    try std.testing.expectEqual(@as(usize, 3), ai_sys.candidates.len);
+    const gathered = ai_sys.rows.slice();
+    try std.testing.expectEqual(a.index, gathered.items(.entity)[0].index);
+    try std.testing.expectEqual(c.index, gathered.items(.entity)[1].index);
+    try std.testing.expectEqual(@as(usize, 0), gathered.items(.spatial_self_index)[0]);
+    try std.testing.expectEqual(@as(usize, 2), gathered.items(.spatial_self_index)[1]);
 }
 
 /// O(n^2) reference reproducing `computeBoundedSeparation`'s documented
@@ -2720,14 +2982,14 @@ test "ai computeBoundedSeparation matches an O(n^2) brute-force reference bit-fo
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null, null, null);
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
     const pos_x = gathered.items(.pos_x);
     const pos_y = gathered.items(.pos_y);
 
-    const context = buildAiSeparationContext(gathered, spatial_sys.view(), 1);
+    const context = buildAiSeparationContext(&ai_sys, gathered, spatial_sys.view(), 1, null);
 
     for (0..count) |i| {
         const ported = computeBoundedSeparation(&context, i);
@@ -2813,7 +3075,7 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across mult
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null, null, null);
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
@@ -2837,7 +3099,7 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across mult
     try std.testing.expect(max_cell_x - min_cell_x >= 3);
     try std.testing.expect(max_cell_y - min_cell_y >= 3);
 
-    const context = buildAiSeparationContext(gathered, spatial_sys.view(), 1);
+    const context = buildAiSeparationContext(&ai_sys, gathered, spatial_sys.view(), 1, null);
 
     // Fail loud if no agent ever accumulates >= 2 neighbors: with fewer than
     // two summed `dir` terms, float-summation order can't actually differ,
@@ -2969,7 +3231,7 @@ test "ai seek keeps the default seek target when memory can't override it" {
     const remembered_target = try data.createEntity();
 
     // No memory / no perception at all: default behavior is unaffected by
-    // config fields defaulting to null (mirrors pre-Slice-30 seek).
+    // config fields defaulting to null.
     const no_memory = try data.createEntity();
     try data.setMovementBody(no_memory, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
     try data.setAiAgent(no_memory, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 });
@@ -3084,7 +3346,7 @@ test "ai memory override does not apply while perception still reports the targe
 
 test "ai serial and threaded (0 workers) agree on a memory-overridden seek target" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    // Two DataSystems: arbitration write-back mutates sticky columns (L2).
+    // Two DataSystems: arbitration write-back mutates sticky columns.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -3150,7 +3412,7 @@ test "ai serial and threaded (0 workers) agree on a memory-overridden seek targe
     try std.testing.expectEqual(@as(f32, 100), serial[0].goal.y);
 }
 
-// ---- Slice 32 arbitration integration tests -----------------------------------
+// ---- Arbitration integration tests ---------------------------------------------
 
 test "arbitration pursue resolves from a non-player hostile entity, not context.player" {
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -3212,7 +3474,7 @@ test "arbitration graceful degrade to wander when perception/memory/affect are a
     // A nonzero pursue gain but no perception/memory/affect component and no
     // configured focus_target: no signal anywhere ties pursue's score above
     // wander's, so wander wins the lowest-index tie-break -- an ordinary
-    // wander-only agent behaves identically to before this slice.
+    // wander-only agent keeps wandering.
     try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = 30, .gain_pursue = 1.0 });
 
     const ai_slice = data.aiAgentSliceConst();
@@ -3283,7 +3545,7 @@ test "invalid pursue goal writes wander active_behavior so fatigue does not trea
 
 test "arbitration serial and threaded (0 workers) parity across perception + memory + affect signals" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    // Two DataSystems: arbitration write-back mutates sticky columns (L2).
+    // Two DataSystems: arbitration write-back mutates sticky columns.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -3298,10 +3560,11 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
             try data.setAiAgent(entity, .{
                 .active_behavior = .wander,
                 .wander_amplitude = @floatFromInt(i % 5),
-                .gain_wander = 1.0,
-                .gain_pursue = if (i % 3 == 0) 1.0 else 0,
-                .gain_flee = if (i % 3 == 1) 1.0 else 0,
-                .gain_cohere = if (i % 3 == 2) 1.0 else 0,
+                .gain_wander = if (i == 0) 0 else 1.0,
+                .gain_pursue = if (i == 0) 0 else if (i % 3 == 0) 1.0 else 0,
+                .gain_flee = if (i == 0) 0 else if (i % 3 == 1) 1.0 else 0,
+                .gain_cohere = if (i == 0) 0 else if (i % 3 == 2) 1.0 else 0,
+                .gain_investigate = if (i == 0) 1.0 else 0,
             });
             try data.setAiPerception(entity, .{
                 .target_visible = i % 4 == 0,
@@ -3321,6 +3584,16 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
     var threaded_spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
     defer threaded_spatial.deinit();
 
+    var markers = InterestMarkerStore.init(std.testing.allocator);
+    defer markers.deinit(std.testing.allocator);
+    _ = try markers.addMarker(.{
+        .kind = .investigate,
+        .level = 0,
+        .x = 100,
+        .y = 0,
+        .radius = 8,
+    });
+
     var serial_ai = AiSystem.init(std.testing.allocator);
     defer serial_ai.deinit();
     var serial_frame = SimulationFrame.init(std.testing.allocator);
@@ -3333,6 +3606,7 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
         .perception_slice = serial_data.aiPerceptionSliceConst(),
         .memory_slice = serial_data.aiMemorySliceConst(),
         .affect_slice = serial_data.aiAffectSliceConst(),
+        .interest_markers = &markers,
     });
     const serial = serial_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 12), serial.len);
@@ -3351,6 +3625,7 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
         .perception_slice = threaded_data.aiPerceptionSliceConst(),
         .memory_slice = threaded_data.aiMemorySliceConst(),
         .affect_slice = threaded_data.aiAffectSliceConst(),
+        .interest_markers = &markers,
     });
     const threaded = threaded_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(serial.len, threaded.len);
@@ -3364,6 +3639,11 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
         try std.testing.expectEqual(a.direct_direction_y, b.direct_direction_y);
         try std.testing.expectEqual(a.priority, b.priority);
     }
+    var saw_marker = false;
+    for (serial) |intent| {
+        if (intent.goal.x == 100 and intent.goal.y == 0) saw_marker = true;
+    }
+    try std.testing.expect(saw_marker);
 }
 
 test "arbitration cohere goal is the mean of friendly spatial neighbors" {
@@ -3458,12 +3738,7 @@ test "arbitration call path has no steady-state allocation after warmup (Failing
         .affect_slice = data.aiAffectSliceConst(),
     };
 
-    // Warm-up run sizes rows/navigation_intents to steady state and exercises
-    // every arbitration input branch (perception, memory, affect, cohere
-    // neighbor query, focus_target fallback).
-    frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
-    frame.phase = .finished;
+    try ai_sys.reserve(ai_slice.entities.len);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     const original_ai_allocator = ai_sys.allocator;

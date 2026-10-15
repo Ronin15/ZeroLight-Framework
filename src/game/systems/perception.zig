@@ -2,16 +2,16 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! AI perception substrate (Slice 29): gathers the cognition-scoped subset of
+//! AI perception substrate: gathers the cognition-scoped subset of
 //! AI agents that also carry an `AiPerception` component, queries the shared
-//! `SpatialIndexSystem` (Slice 28) for nearby hostile candidates, applies a
+//! `SpatialIndexSystem` for nearby hostile candidates, applies a
 //! squared-form field-of-view test and a bounded line-of-sight raycast, and
 //! writes the winning `nearest_threat`/`target_visible`/`last_seen_x/y`/
 //! `facing_x/y` hot columns back onto `DataSystem`'s `PerceptionStore`.
 //! Emits `entity_perceived`/`entity_lost` `SimulationEvent`s on transitions,
-//! range-owned during the parallel compute pass and merged deterministically
-//! afterward — same gather -> parallel compute -> per-range emit -> merge
-//! shape as `ai.zig`/`collision.zig`.
+//! derived on the main thread after the parallel compute pass from the
+//! per-row `prev_*`/`final_nearest_threat_*` columns the workers already
+//! write (`emitTransitionEvents`) — no per-range event scratch.
 //!
 //! Two-index-space contract (population-domain equivalence with
 //! `spatial_index.zig`, mirrors `ai.zig`'s cross-file contract): this
@@ -19,11 +19,14 @@
 //! entities that also carry `AiPerception`), so it cannot reuse its own row
 //! index as `SpatialIndexView.queryNeighbors`'s self-exclusion index. Instead
 //! it duplicates the same scoped walk `SpatialIndexSystem`/`AiSystem` use
-//! (`scope_dense_indices` + `movementBodyDenseIndex(entity) orelse continue`,
-//! identical skip, identical order) to build a `candidates` side table
-//! (entity/faction/level) aligned 1:1 with `spatial`'s own row order, and
-//! records each observer row's position in *that* full-population walk as
-//! `spatial_self_index` — the value actually passed to `queryNeighbors`.
+//! (`candidate_dense_indices`/`scope_dense_indices` +
+//! `movementBodyDenseIndex(entity) orelse continue`, identical skip, identical
+//! order) to build a `candidates` side table (entity/faction/level) aligned 1:1
+//! with `spatial`'s own row order, and records each observer row's position in
+//! *that* full-population walk as `spatial_self_index` — the value actually
+//! passed to `queryNeighbors`. Pipeline passes the unstaggered halo as
+//! `candidate_dense_indices` and the think set as `scope_dense_indices`; a null
+//! candidate list walks `scope_dense_indices` for both (tests / benches).
 //! `perception_dense_index` is the unrelated, separate index: the entity's
 //! own row in `PerceptionStore`, used only to write results back.
 //! `std.debug.assert(self.candidates.len == spatial.pos_x.len)` is the
@@ -44,50 +47,51 @@
 //! dist_squared` is equivalent to a true angle compare given `cos_half_fov >=
 //! 0`, which `AiPerception`'s `fov_half_angle_radians <= pi/2` cap guarantees
 //! (see `data_system/perception.zig`). A wider-than-90-degree cone (needing a
-//! sign-split) is explicitly out of scope for this slice.
+//! sign-split) is not supported.
 //!
 //! Scalar exceptions (each documented again at its call site): the spatial
-//! cell-scan traversal and stance lookup (Slice 28 shared infra; branchy and a
+//! cell-scan traversal and stance lookup (shared spatial-index infra; branchy and a
 //! 4-value enum table index, not float math), the small (<= 17) per-agent
 //! nearest-candidate sort (irreducibly small/branchy, does not scale with
 //! population), and the bounded LOS raycast (early-exit grid/DDA walk, one
-//! scattered cell lookup per visited cell). The per-cell blocked test itself
-//! is an O(1) read into `LevelBlockedSlot`'s per-level bitmap cache
-//! (`level_blocked`, brought current for a distinct observer level at most
-//! once per step by
-//! `ensureLevelBlockedCachesForObservers`/`ensureLevelBlockedCache` — a skip,
-//! a scoped patch, or a full rebuild, whichever `reactToPostCommitPerceptionEvents`'s
-//! dirty tracking says is cheapest, see `LevelBlockedSlot`'s doc comment), not
-//! `WorldSystem.levelBlocksMovement`'s own per-call linear scan over the
-//! world's sparse tiles — see `LevelBlockedSlot`'s doc comment for why this is
-//! a bespoke cache rather than a reuse of `pathfinding/nav_grid.zig`'s
-//! `NavGrid`, and `src/benchmarks/perception.zig`'s `perception`/
-//! `perception-los-dense` groups for the before/after cost proof.
+//! scattered cell lookup per visited cell). The per-cell blocked test reads
+//! the world's chunk terrain directly (`WorldSystem.levelBlocksMovement`,
+//! O(1): the chunk's composed-bits entry plus one bit), so perception keeps
+//! no LOS state and a same-step terrain edit occludes with no reaction.
 //!
 //! Threaded writes: each worker range writes only its own gather rows' hot
-//! columns in `PerceptionStore` (disjoint per entity, since gather rows are
-//! 1:1 with entities and ranges partition row indices) and appends events
-//! only into its own reserved, exactly-sized event scratch buffer
-//! (`range_len * 2` — an identity-swap transition emits at most two events per
-//! row, so this can never overflow, unlike collision's broadphase estimate).
+//! columns in `PerceptionStore` and its rows' `final_nearest_threat_*`
+//! columns (disjoint per entity, since gather rows are 1:1 with entities and
+//! ranges partition row indices), plus its own padded `range_stats` slot,
+//! which also tallies the range's transition-event count. Nothing appendable
+//! is shared, so nothing partition-sized needs reserving. After the join the
+//! main thread derives the events from the now-immutable `prev_*`/`final_*`
+//! columns in row order and appends them as one range
+//! (`emitTransitionEvents`); concatenating ranges in ascending order already
+//! equals row order, so this is byte-identical to the former per-range merge.
 //! Serial and threaded paths share every vectorized helper
 //! (`computeFacingDense`, `filterFovSurvivors`, the transition `equalInt4`
 //! pass) and the same per-range compute function
 //! (`computePerceptionRange`) — see the serial/threaded parity test.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
+const logging = @import("../../core/logging.zig");
 const simd = @import("../../core/simd.zig");
 const stance = @import("../faction.zig").stance;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
-const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
+const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
@@ -98,7 +102,6 @@ const movement_range_alignment_items = @import("../data_system.zig").movement_ra
 const WorldSystem = @import("../world_system.zig").WorldSystem;
 const SimulationEvent = @import("../simulation.zig").SimulationEvent;
 const SimulationEvents = @import("../simulation.zig").SimulationEvents;
-const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const WorldStimulus = @import("../simulation.zig").WorldStimulus;
 const stimulusHearingScore = @import("../simulation.zig").stimulusHearingScore;
 const spatial_index_mod = @import("spatial_index.zig");
@@ -137,18 +140,6 @@ const max_perception_scratch: usize = max_perception_candidates + 1; // + player
 const facing_speed_squared_threshold: f32 = 1.0;
 const facing_normalize_epsilon: f32 = 1.0e-6;
 
-// Defensive ceiling on LOS raycast visited-cell count (the DDA grid walk in
-// `hasLineOfSight` visits one cell per loop iteration, not one interpolated
-// sample). AiPerception.vision_range is itself capped
-// (max_ai_perception_vision_range) which already keeps the worst-case
-// Manhattan cell count small (at most ~26 cells for a maximally diagonal
-// 512-unit ray over 32-unit tiles); this is a second, independent bound with
-// headroom above that. Reaching this cap mid-traversal fails closed (treats
-// the rest of the ray as blocked) the same way an out-of-bounds cell does —
-// unreachable under any valid `AiPerception` config, only a fallback for a
-// pathological one.
-const los_max_cells: u32 = 64;
-
 const player_candidate_sentinel: usize = std.math.maxInt(usize);
 
 const default_max_events_per_step: usize = 512;
@@ -165,12 +156,16 @@ pub const PlayerPerceptionCandidate = struct {
 };
 
 pub const PerceptionConfig = struct {
-    /// When non-null, only these dense ai-store indices participate this step
-    /// (the scope system's cognition halo + stagger selection). Null = all
-    /// agents. Mirrors `AiConfig.scope_dense_indices`/
-    /// `SpatialIndexConfig.scope_dense_indices` exactly (population-domain
-    /// contract — see the module doc).
+    /// Think/observer set: dense ai-store indices that may write `PerceptionStore`
+    /// this step (stagger-filtered cognition). Null = all agents on the single-list
+    /// path, or all halo rows when `candidate_dense_indices` is set. Pipeline
+    /// passes `ai_cognition_indices`.
     scope_dense_indices: ?[]const u32 = null,
+    /// Halo/candidate set: unstaggered cognition-halo indices walked into
+    /// `candidates` (1:1 with spatial rows). Null = walk `scope_dense_indices`
+    /// for both candidates and observers (single-list tests / benches). Pipeline
+    /// always passes `ai_halo_indices`.
+    candidate_dense_indices: ?[]const u32 = null,
     /// Optional player entity, resolved by the caller once per step (null if
     /// no player entity exists yet).
     player_candidate: ?PlayerPerceptionCandidate = null,
@@ -178,9 +173,9 @@ pub const PerceptionConfig = struct {
     /// by the hearing pass folded into `computeOneAgent`.
     stimuli: []const WorldStimulus = &.{},
     /// Deterministic per-step cap on emitted perception events, enforced by
-    /// this system itself (see the module doc's threaded-writes note and
-    /// `mergePerceptionEvents`) rather than letting `SimulationEvents`'s own
-    /// capacity check throw.
+    /// this system itself in row order (see the module doc's threaded-writes
+    /// note and `emitTransitionEvents`) rather than letting
+    /// `SimulationEvents`'s own capacity check throw.
     max_events_per_step: usize = default_max_events_per_step,
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
@@ -201,11 +196,8 @@ pub const PerceptionStats = struct {
     nearest_threat_found_count: usize = 0,
     // `hasLineOfSight` call count and how many of those returned blocked,
     // summed across every range — see the per-range accumulation note on
-    // `PerceptionRangeStats`. `hasLineOfSight` visits are O(1) lookups into
-    // `PerceptionSystem.level_blocked`'s per-level bitmap cache (see that
-    // struct's doc comment), not raw `WorldSystem.levelBlocksMovement` calls,
-    // so these counters exist to make the LOS visited-cell volume visible to
-    // `src/benchmarks/perception.zig` rather than let it hide inside aggregate
+    // `PerceptionRangeStats`. These make the LOS volume visible to
+    // `src/benchmarks/perception.zig` rather than hide it inside aggregate
     // step timing.
     los_checks: usize = 0,
     los_blocked: usize = 0,
@@ -222,17 +214,15 @@ pub const PerceptionStats = struct {
     batch: BatchStats = .{},
 };
 
-// Per-range accumulator for the LOS/sensed/found counters above. Each range
-// job owns one slot (indexed by `range.index`, mirrors `event_ranges`), writes
-// to a local `PerceptionRangeStats` value throughout its own
-// `computeOneAgent` calls, and stores it once at the end of
+// Per-range accumulator for the LOS/sensed/found counters above and the
+// range's transition-event count. Each range job owns one slot (indexed by
+// `range.index`), writes to a local `PerceptionRangeStats` value throughout
+// its own `computeOneAgent` calls, and stores it once at the end of
 // `computePerceptionRange` — a single write per range, so no atomics are
-// needed (unlike the event scratch buffers, nothing appends concurrently
-// into a range's slot). It is 32 bytes (4 `usize` fields), so two adjacent
-// slots would otherwise share one 64-byte cache line; concurrently running
-// worker ranges writing their final stats into adjacent slots would then
-// false-share that line, so `PerceptionRangeStatsSlot` pads it the same way
-// `PerceptionEventRangeSlot` pads `PerceptionEventRangeBuffer` below.
+// needed. It is 48 bytes (6 `usize` fields), so two adjacent slots would
+// otherwise share a 64-byte cache line; concurrently running worker ranges
+// writing their final stats into adjacent slots would then false-share that
+// line, so `PerceptionRangeStatsSlot` pads each slot to a full line.
 const PerceptionRangeStats = struct {
     sensed_count: usize = 0,
     nearest_threat_found: usize = 0,
@@ -246,6 +236,11 @@ const PerceptionRangeStats = struct {
     // visited-then-rejected shows up here even though it never reaches
     // `sensed_count`.
     candidate_checks: usize = 0,
+    // Uncapped `entity_lost` + `entity_perceived` events this range's rows
+    // will produce (`transitionEventCount`), counted by the worker on the row
+    // it just wrote so the main-thread emit (`emitTransitionEvents`) knows the
+    // step total, and so the cap, before it walks the columns.
+    transition_events: usize = 0,
 };
 
 const CandidateRow = struct {
@@ -307,209 +302,29 @@ const ConstCandidateSlice = struct {
     level: []const u16,
 };
 
-const thread_shared_record_alignment: usize = 64;
-
-const PerceptionEventRangeBuffer = struct {
-    events: std.ArrayList(SimulationEvent) = .empty,
-
-    fn clearRetainingCapacity(self: *PerceptionEventRangeBuffer) void {
-        self.events.clearRetainingCapacity();
-    }
-
-    fn appendAssumeCapacity(self: *PerceptionEventRangeBuffer, event: SimulationEvent) void {
-        self.events.appendAssumeCapacity(event);
-    }
-
-    fn deinit(self: *PerceptionEventRangeBuffer, allocator: std.mem.Allocator) void {
-        self.events.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-const PerceptionEventRangeSlot = struct {
-    // Each worker writes only its assigned slot. Padding keeps hot append
-    // state off shared cache lines across concurrently written range records.
-    buffer: PerceptionEventRangeBuffer = .{},
-    padding: [paddingForCacheLine(PerceptionEventRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(PerceptionEventRangeBuffer),
-};
-
-const PerceptionEventRangeSlotList = std.ArrayListAligned(PerceptionEventRangeSlot, .fromByteUnits(thread_shared_record_alignment));
-
 const PerceptionRangeStatsSlot = struct {
     // Each worker writes only its assigned slot, once, at the end of its
     // range (see `PerceptionRangeStats`'s doc comment). Padding keeps that
     // write off shared cache lines across concurrently running ranges.
     stats: PerceptionRangeStats = .{},
-    padding: [paddingForCacheLine(PerceptionRangeStats)]u8 = [_]u8{0} ** paddingForCacheLine(PerceptionRangeStats),
+    padding: [paddingForCacheLine(PerceptionRangeStats)]u8 = @splat(0),
 };
 
-const PerceptionRangeStatsSlotList = std.ArrayListAligned(PerceptionRangeStatsSlot, .fromByteUnits(thread_shared_record_alignment));
-
-fn paddingForCacheLine(comptime T: type) usize {
-    const rem = @sizeOf(T) % thread_shared_record_alignment;
-    return if (rem == 0) 0 else thread_shared_record_alignment - rem;
-}
-
-fn rangeLenForIndex(item_count: usize, items_per_range: usize, range_index: usize) usize {
-    const start = range_index * items_per_range;
-    if (start >= item_count) return 0;
-    return @min(start + items_per_range, item_count) - start;
-}
-
-fn serialBatch(count: usize) BatchStats {
-    return .{ .ran_inline = true, .item_count = count, .range_count = if (count > 0) 1 else 0, .items_per_range = count };
-}
-
-// Sentinel meaning "never built" so a fresh slot (default-initialized, step 0
-// never having run yet) always misses the `built_step == step_counter` check
-// below and gets populated the first time its level is touched.
-const invalid_build_step: u64 = std.math.maxInt(u64);
-
-// A pending edit to one level's blocked bitmap, awaiting the next
-// `ensureLevelBlockedCache` call that actually touches that level (see
-// `LevelBlockedSlot.pending_dirty`). Cell-rect shape mirrors
-// `WorldObstacleChangedEvent` (min inclusive, max exclusive) rather than
-// `pathfinding/nav_grid.zig`'s `NavCellEdit`/chunk-grid dirty model — this
-// cache works in raw world tiles, not nav cells/chunks, and reusing that
-// type would couple this file to nav's chunk-grid shape for no benefit (the
-// chunk grid is only consulted transiently, at patch time, to scope the
-// sparse-tile rescan — see `PerceptionSystem.patchLevelBlockedCache`).
-const DirtyRect = struct {
-    min_x: u16,
-    min_y: u16,
-    max_x_exclusive: u16,
-    max_y_exclusive: u16,
-};
-
-// Above this fraction of a level's total cell count, accumulated dirty area
-// makes the scoped patch path (a memset + rescan per pending rect, plus a
-// chunk-scoped sparse walk per rect) costlier than one dense full pass over
-// the whole level, so `ensureLevelBlockedCache` falls back to a full rebuild
-// instead — same spirit as `pathfinding/nav_graph.zig`'s
-// `full_relabel_level_threshold` (there: a count of affected *levels*; here:
-// a fraction of one level's *cells*, the finer unit this cache works in).
-// `pending_dirty`'s rects are summed without deduplicating overlap, so this
-// is a conservative (over-)estimate of actual dirty coverage — cheap to
-// compute and safe to fall back early on.
-const full_rebuild_dirty_area_numerator: u64 = 1;
-const full_rebuild_dirty_area_denominator: u64 = 4; // 25%
-
-fn dirtyAreaExceedsFullRebuildThreshold(pending_dirty: []const DirtyRect, cell_count: usize) bool {
-    var area: u64 = 0;
-    for (pending_dirty) |rect| {
-        const width = if (rect.max_x_exclusive > rect.min_x) rect.max_x_exclusive - rect.min_x else 0;
-        const height = if (rect.max_y_exclusive > rect.min_y) rect.max_y_exclusive - rect.min_y else 0;
-        area += @as(u64, width) * @as(u64, height);
-    }
-    return area * full_rebuild_dirty_area_denominator > @as(u64, cell_count) * full_rebuild_dirty_area_numerator;
-}
-
-// One level's O(1) LOS-blocked lookup cache: a raw world-tile-granularity
-// bitmap (`blocked[y * width + x]`), kept current for a distinct level at
-// most once per step (see `PerceptionSystem.ensureLevelBlockedCache`) via a
-// skip (nothing changed), a scoped patch (a bounded set of edits since the
-// last build), or a full rebuild (first build, or an invalid/never-built
-// level, or accumulated dirty area over `full_rebuild_dirty_area_numerator`/
-// `_denominator`). This exists solely to answer `hasLineOfSight`'s per-sample
-// question in O(1) instead of `WorldSystem.levelBlocksMovement`'s per-call
-// linear scan over every sparse tile in the world (see the module doc's
-// LOS-cost note and `src/benchmarks/perception.zig`'s `perception`/
-// `perception-los-dense` split that proved the cost). Deliberately NOT a
-// reuse of `pathfinding/nav_grid.zig`'s `NavGrid`: that grid's blocked mask is
-// world obstacles OR (level 0 only) DataSystem static collision bodies — a
-// different, broader set than `levelBlocksMovement`'s world-tiles-only
-// contract — and its `cell_size` is only incidentally equal to
-// `WorldSystem.tile_size` (two independently-set literals, not an enforced
-// invariant), so reusing it would risk both a silent LOS-granularity change
-// and a silent LOS-occlusion behavior change. This cache instead mirrors
-// `NavGrid.markWorldObstacles`'s shape (dense-band scan + sparse-filtered-to-
-// level pass) but stays at raw world-tile granularity with no rect
-// rasterization, so it is a direct, provable stand-in for
-// `levelBlocksMovement` — see the parity test.
-const LevelBlockedSlot = struct {
-    // `invalid_build_step` until the first build that finds `valid == true`;
-    // thereafter the `PerceptionSystem.step_counter` value as of the last
-    // build/patch. A rebuild attempt that finds the level still out of range
-    // leaves this at `invalid_build_step` (see `ensureLevelBlockedCache`'s
-    // self-healing note), so a level queried before it exists retries a full
-    // rebuild every time it is touched until the level is actually added,
-    // instead of staying stuck fail-closed forever. A step-counter mismatch
-    // (a new step ran since) revisits the slot the next time its level is
-    // touched — see `pending_dirty` for what that revisit actually does
-    // (skip/patch/rebuild), which is no longer "always rebuild" the way a
-    // bare step-counter mismatch alone would imply.
-    built_step: u64 = invalid_build_step,
-    // False for a level index that did not exist in `WorldSystem` at build
-    // time (`level_index >= world.levelCount()`), matching
-    // `levelBlocksMovement`'s fail-closed contract for an invalid level:
-    // `lookupLevelBlocked` returns blocked immediately without ever reading
-    // `blocked`.
-    valid: bool = false,
-    width: u16 = 0,
-    height: u16 = 0,
-    blocked: std.ArrayList(bool) = .empty,
-    // Edits recorded by `PerceptionSystem.reactToPostCommitPerceptionEvents`
-    // since this slot was last built/patched, awaiting the next
-    // `ensureLevelBlockedCache` call that actually touches this level. Unlike
-    // `PathfindingSystem.nav_dirty_edits` (drained once per step regardless of
-    // whether nav ran that step), this can persist across MULTIPLE untouched
-    // steps: a level with no observer this step is never asked to rebuild, so
-    // edits on it simply accumulate until an observer next looks at it. Grows
-    // rather than drops on append (same must-not-silently-lose-an-edit
-    // contract as `nav_dirty_edits`) so a burst of edits between two observer
-    // visits is never forgotten; cleared only after a build/patch actually
-    // consumes it.
-    pending_dirty: std.ArrayList(DirtyRect) = .empty,
-
-    fn deinit(self: *LevelBlockedSlot, allocator: std.mem.Allocator) void {
-        self.pending_dirty.deinit(allocator);
-        self.blocked.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-// O(1) lookup mirroring `WorldSystem.levelBlocksMovement`'s exact external
-// contract: an out-of-range level index or out-of-bounds x/y is fail-closed
-// (blocked); everything else is the cached bit. `level_blocked` is a
-// `PerceptionSystem.level_blocked` snapshot (main-thread-built, worker-read
-// only) indexed directly by level.
-fn lookupLevelBlocked(level_blocked: []const LevelBlockedSlot, level: u16, x: u16, y: u16) bool {
-    if (@as(usize, level) >= level_blocked.len) return true;
-    const slot = &level_blocked[level];
-    if (!slot.valid) return true;
-    if (x >= slot.width or y >= slot.height) return true;
-    return slot.blocked.items[@as(usize, y) * @as(usize, slot.width) + @as(usize, x)];
-}
+const PerceptionRangeStatsSlotList = std.array_list.Aligned(PerceptionRangeStatsSlot, .fromByteUnits(thread_shared_record_alignment));
 
 pub const PerceptionSystem = struct {
     allocator: std.mem.Allocator,
     // Gathered work memory (main-thread only; workers read only copies in
-    // job context, except their own reserved event scratch range).
+    // job context, except their own rows' `final_nearest_threat_*` columns
+    // and their own padded `range_stats` slot).
     candidates: std.MultiArrayList(CandidateRow) = .{},
     rows: std.MultiArrayList(PerceptionGatherRow) = .{},
-    event_ranges: PerceptionEventRangeSlotList = .empty,
     range_stats: PerceptionRangeStatsSlotList = .empty,
-    range_take_counts: std.ArrayList(usize) = .empty,
+    /// Once-only flag for the emit-cap drop warn. The pipeline's derived share makes a
+    /// drop impossible by construction; the cap and `dropped_events` stay as the
+    /// shared-frame safety net.
+    dropped_events_warned: bool = false,
     compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
-    // Per-level LOS-blocked bitmap cache, indexed directly by level (see
-    // `LevelBlockedSlot`). Sized/reused across steps (never deinit between
-    // steps) — only the per-level `blocked` bitmap contents are refreshed,
-    // at most once per distinct level actually touched by an observer this
-    // step, via `ensureLevelBlockedCache`.
-    level_blocked: std.ArrayList(LevelBlockedSlot) = .empty,
-    // Monotonic step marker: incremented once per `update`/`updateSerial`
-    // call that has at least one observer (a zero-observer step returns
-    // early and does not increment it). A level's cached bitmap is reused
-    // for every LOS sample within the same step; the first time a level is
-    // touched in a LATER step, `ensureLevelBlockedCache` sees the step-counter
-    // mismatch and decides what to do with the slot's `pending_dirty` list —
-    // skip (empty: nothing changed since the last build/patch), a scoped
-    // patch (a bounded set of edits), or a full rebuild (first build, or
-    // dirty area over the full-rebuild threshold). A step-counter mismatch by
-    // itself no longer implies "stale, must fully rescan" — only
-    // `pending_dirty` being non-empty does.
-    step_counter: u64 = 0,
-
     pub fn init(allocator: std.mem.Allocator) PerceptionSystem {
         return .{
             .allocator = allocator,
@@ -518,33 +333,23 @@ pub const PerceptionSystem = struct {
     }
 
     pub fn deinit(self: *PerceptionSystem) void {
-        for (self.level_blocked.items) |*slot| slot.deinit(self.allocator);
-        self.level_blocked.deinit(self.allocator);
-        self.range_take_counts.deinit(self.allocator);
         self.range_stats.deinit(self.allocator);
-        for (self.event_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
-        self.event_ranges.deinit(self.allocator);
         self.rows.deinit(self.allocator);
         self.candidates.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Eagerly builds every existing level's `level_blocked` cache once, at
-    /// world/state load time (mirrors `PathfindingSystem`'s one-time static
-    /// nav-grid build — same "pay it once at an accepted init cost" shape,
-    /// called from the same `SimulationPipeline.init` call site). Without
-    /// this, each level's first-ever full rebuild happens lazily, triggered
-    /// by whichever fixed step first has an observer on that level —
-    /// scattered across the live session instead of paid once up front, and
-    /// with no bound on how many distinct never-touched levels an unlucky
-    /// step's observer set could span at once. Safe to call with zero
-    /// levels (no-op) or to call again later (subsequent per-level calls are
-    /// the normal cheap "nothing changed" reuse path, not a second rebuild).
-    pub fn prebuildLevelCaches(self: *PerceptionSystem, world: *const WorldSystem) !void {
-        var level: usize = 0;
-        while (level < world.levelCount()) : (level += 1) {
-            try self.ensureLevelBlockedCache(world, @intCast(level));
-        }
+    /// Sizes candidate/observer rows and the per-range stats tallies
+    /// (`maxRangeCount`, every partition the tuner can pick) for `pop` agents;
+    /// nothing partition-sized remains, so `update`/`updateSerial` allocate
+    /// nothing after this under any `items_per_range`. Grow-only; re-run by
+    /// the pipeline's population seam.
+    pub fn reserve(self: *PerceptionSystem, pop: usize) !void {
+        if (pop == 0) return;
+        const cap = hotStoreCapacity(pop);
+        try self.candidates.ensureTotalCapacity(self.allocator, cap);
+        try self.rows.ensureTotalCapacity(self.allocator, cap);
+        try self.prepareRangeStats(maxRangeCount(cap, perception_range_alignment_items));
     }
 
     pub fn update(
@@ -559,7 +364,7 @@ pub const PerceptionSystem = struct {
         config: PerceptionConfig,
     ) !PerceptionStats {
         const perception_slice = data.perceptionSlice();
-        try self.gatherPerceptionData(ai_agents, movement, data, perception_slice, config.scope_dense_indices);
+        try self.gatherPerceptionData(ai_agents, movement, data, perception_slice, config.scope_dense_indices, config.candidate_dense_indices);
         const observer_count = self.rows.len;
         if (observer_count == 0) return .{ .candidate_population_count = self.candidates.len };
 
@@ -570,19 +375,18 @@ pub const PerceptionSystem = struct {
         std.debug.assert(self.candidates.len == spatial.pos_x.len);
 
         self.computeFacingDense(perception_slice);
-        try self.ensureLevelBlockedCachesForObservers(world);
 
         const active_tuner: ?*AdaptiveWorkTuner = config.adaptive_tuner orelse
             if (config.adaptive and config.items_per_range == null) &self.compute_tuner else null;
-        const selection = selectStageWork(
-            thread_system,
-            observer_count,
-            config.items_per_range,
-            config.max_worker_threads,
-            config.adaptive,
-            active_tuner,
-        );
-        try self.prepareEventRangeBuffers(selection.range_count, selection.items_per_range, observer_count);
+        const selection = thread_system.selectBatchProfile(active_tuner, .{
+            .item_count = observer_count,
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .range_alignment_items = perception_range_alignment_items,
+            .adaptive = config.adaptive,
+        });
+        // Grow-only safety net for unreserved standalone use; after `reserve`
+        // it never allocates (`selection.range_count <= maxRangeCount(cap, 16)`).
         try self.prepareRangeStats(selection.range_count);
 
         var job = self.buildJobContext(perception_slice, spatial, world, config.player_candidate, config.stimuli, selection.range_count);
@@ -593,8 +397,8 @@ pub const PerceptionSystem = struct {
             .selected_profile = selection.profile,
         });
 
-        const merge = try self.mergePerceptionEvents(events, selection.range_count, config.max_events_per_step);
         const totals = self.sumRangeStats(selection.range_count);
+        const merge = try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
         return .{
             .observer_count = observer_count,
             .candidate_population_count = self.candidates.len,
@@ -621,24 +425,22 @@ pub const PerceptionSystem = struct {
         config: PerceptionConfig,
     ) !PerceptionStats {
         const perception_slice = data.perceptionSlice();
-        try self.gatherPerceptionData(ai_agents, movement, data, perception_slice, config.scope_dense_indices);
+        try self.gatherPerceptionData(ai_agents, movement, data, perception_slice, config.scope_dense_indices, config.candidate_dense_indices);
         const observer_count = self.rows.len;
         if (observer_count == 0) return .{ .candidate_population_count = self.candidates.len };
 
         std.debug.assert(self.candidates.len == spatial.pos_x.len);
 
         self.computeFacingDense(perception_slice);
-        try self.ensureLevelBlockedCachesForObservers(world);
 
         const range_count: usize = 1;
-        try self.prepareEventRangeBuffers(range_count, observer_count, observer_count);
         try self.prepareRangeStats(range_count);
 
         var job = self.buildJobContext(perception_slice, spatial, world, config.player_candidate, config.stimuli, range_count);
         computePerceptionRange(&job, .{ .index = 0, .start = 0, .end = observer_count });
 
-        const merge = try self.mergePerceptionEvents(events, range_count, config.max_events_per_step);
         const totals = self.sumRangeStats(range_count);
+        const merge = try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
         return .{
             .observer_count = observer_count,
             .candidate_population_count = self.candidates.len,
@@ -650,7 +452,7 @@ pub const PerceptionSystem = struct {
             .perceived_events = merge.perceived,
             .lost_events = merge.lost,
             .dropped_events = merge.dropped,
-            .batch = serialBatch(observer_count),
+            .batch = inlineBatch(observer_count, perception_range_alignment_items),
         };
     }
 
@@ -691,191 +493,19 @@ pub const PerceptionSystem = struct {
             .perception_slice = perception_slice,
             .spatial = spatial,
             .world = world,
-            .level_blocked = self.level_blocked.items,
             .player_candidate = player_candidate,
-            .event_ranges = self.event_ranges.items[0..range_count],
             .range_stats = self.range_stats.items[0..range_count],
         };
     }
 
-    // Builds (or, if already current for this step, reuses) every distinct
-    // observer level's `LevelBlockedSlot` bitmap, once, on the main thread,
-    // before any range job is dispatched — workers only ever read the
-    // completed `level_blocked` snapshot handed to them via
-    // `PerceptionJobContext`. Walking every gathered row's level (rather than
-    // building a separate deduped level list) needs no extra allocation:
-    // `ensureLevelBlockedCache` itself is an O(1) no-op for a level already
-    // current this step, so revisiting the same level across many rows costs
-    // nothing beyond the index read.
-    fn ensureLevelBlockedCachesForObservers(self: *PerceptionSystem, world: *const WorldSystem) !void {
-        self.step_counter +%= 1;
-        const levels = self.rows.items(.level);
-        for (levels) |level| try self.ensureLevelBlockedCache(world, level);
-    }
-
-    // Grows `level_blocked` on demand up to `level + 1` slots (never shrinks,
-    // never drops an already-built slot), returning the slot for `level`.
-    // Shared by `ensureLevelBlockedCache` (which then reads/writes the slot's
-    // bitmap) and `reactToPostCommitPerceptionEvents` (which only ever
-    // appends to `pending_dirty`) so a level touched only by a dirty-marking
-    // event before its first observer visit still gets a slot to record
-    // against.
-    fn levelBlockedSlot(self: *PerceptionSystem, level: u16) !*LevelBlockedSlot {
-        if (@as(usize, level) >= self.level_blocked.items.len) {
-            const new_len = @as(usize, level) + 1;
-            try self.level_blocked.ensureTotalCapacity(self.allocator, new_len);
-            while (self.level_blocked.items.len < new_len) self.level_blocked.appendAssumeCapacity(.{});
-        }
-        return &self.level_blocked.items[level];
-    }
-
-    // Brings one level's LOS-blocked bitmap current for this step: a no-op
-    // when the slot is already built for the current `step_counter`;
-    // otherwise a skip (nothing changed since the last build/patch — the
-    // headline case this incremental design exists for, see the module doc),
-    // a scoped patch (`patchLevelBlockedCache`), or a full rebuild
-    // (`rebuildLevelBlockedCache`) — first build, or accumulated dirty area
-    // over the full-rebuild threshold. Any stale `pending_dirty` recorded
-    // before a level's first-ever build is discarded rather than patched
-    // against: the full rebuild below already reflects the current world
-    // state directly, so replaying pre-first-build edits on top would be
-    // redundant at best.
-    //
-    // Self-healing for a level queried before `WorldSystem.addLevel` created
-    // it: a rebuild that finds the level still out of range leaves
-    // `slot.valid == false` AND leaves `built_step` unstamped (still
-    // `invalid_build_step`), so the next call for this level still sees
-    // `first_build == true` and retries a full rebuild rather than being
-    // stuck fail-closed forever once the level actually exists.
-    fn ensureLevelBlockedCache(self: *PerceptionSystem, world: *const WorldSystem, level: u16) !void {
-        const slot = try self.levelBlockedSlot(level);
-        if (slot.built_step == self.step_counter) return;
-
-        const first_build = slot.built_step == invalid_build_step;
-        const cell_count = @as(usize, world.width) * @as(usize, world.height);
-        if (first_build) {
-            try self.rebuildLevelBlockedCache(world, level, slot, cell_count);
-        } else if (slot.pending_dirty.items.len == 0) {
-            // Nothing changed since the last build/patch: reuse it as-is.
-        } else if (dirtyAreaExceedsFullRebuildThreshold(slot.pending_dirty.items, cell_count)) {
-            try self.rebuildLevelBlockedCache(world, level, slot, cell_count);
-        } else {
-            patchLevelBlockedCache(world, level, slot);
-        }
-
-        slot.pending_dirty.clearRetainingCapacity();
-        if (!slot.valid) return;
-        slot.built_step = self.step_counter;
-    }
-
-    // Rebuilds one level's LOS-blocked bitmap from `world`'s dense bands and
-    // sparse obstacles, mirroring `nav_grid.zig`'s `markWorldObstacles` shape
-    // (uniform-fill fast path, then a per-dense-layer cell scan, then a
-    // sparse-tile pass scoped to this level via `sparseTileIndicesForLevel` —
-    // O(sparse tiles on this level), not O(sparse tiles in the whole world))
-    // but at raw world-tile granularity — no nav-cell rect rasterization — so
-    // the result is a direct, provable stand-in for
-    // `WorldSystem.levelBlocksMovement` (see `LevelBlockedSlot`'s doc comment
-    // and the parity test). `blocked`'s backing storage is grown once and
-    // reused across steps (never deinit/re-init between steps); only its
-    // contents are refreshed. Caller (`ensureLevelBlockedCache`) clears
-    // `pending_dirty` afterward and stamps `built_step` only if the level
-    // turned out valid (see that function's self-healing note).
-    fn rebuildLevelBlockedCache(self: *PerceptionSystem, world: *const WorldSystem, level: u16, slot: *LevelBlockedSlot, cell_count: usize) !void {
-        try slot.blocked.ensureTotalCapacity(self.allocator, cell_count);
-        slot.blocked.items.len = cell_count;
-        slot.width = world.width;
-        slot.height = world.height;
-        @memset(slot.blocked.items, false);
-
-        // Fail-closed contract for an invalid level index (mirrors
-        // levelBlocksMovement's own first check): leave the bitmap all-false
-        // but mark the slot invalid, so `lookupLevelBlocked` returns blocked
-        // without ever reading `blocked`'s (unpopulated) contents.
-        slot.valid = @as(usize, level) < world.levelCount();
-        if (!slot.valid) return;
-
-        for (0..world.denseLayerCount()) |layer_index| {
-            if (world.denseLayerLevel(layer_index) != level) continue;
-            if (world.denseLayerUniformFillTile(layer_index) != null) {
-                if (world.denseTileBlocksMovement(layer_index, 0, 0)) @memset(slot.blocked.items, true);
-                continue;
-            }
-            for (0..world.height) |y_usize| {
-                const y: u16 = @intCast(y_usize);
-                for (0..world.width) |x_usize| {
-                    const x: u16 = @intCast(x_usize);
-                    if (!world.denseTileBlocksMovement(layer_index, x, y)) continue;
-                    slot.blocked.items[y_usize * world.width + x_usize] = true;
-                }
-            }
-        }
-        for (world.sparseTileIndicesForLevel(level)) |sparse_index| {
-            if (!world.sparseTileBlocksMovement(sparse_index)) continue;
-            const cell = world.sparseTileCellCoord(sparse_index);
-            slot.blocked.items[@as(usize, cell.y) * @as(usize, world.width) + @as(usize, cell.x)] = true;
-        }
-    }
-
-    // Records one committed structural event's blocked-cache impact for the
-    // next `ensureLevelBlockedCache` call on its level: this system's own
-    // narrower sibling of `PathfindingSystem.reactToPostCommitNavEvents`.
-    // Only `.world_tile_changed` (a single-cell rect, and only when the
-    // movement-blocking flag actually flipped) and `.world_obstacle_changed`
-    // (the event's own already-multi-cell rect) are localizable to this
-    // cache's world-tiles-only contract (see the module doc); every other
-    // structural event (entity/component changes, which this cache never
-    // reads) is irrelevant and ignored. Unlike nav's `eventInvalidatesNavigation`,
-    // there is no non-localizable whole-level fallback case here. Purely
-    // internal bookkeeping: nothing currently reacts to "perception's cache
-    // changed," so this emits no event of its own — simpler than nav's
-    // reaction, which does emit `nav_region_invalidated`.
-    pub fn reactToPostCommitPerceptionEvents(self: *PerceptionSystem, frame: *SimulationFrame, world: *const WorldSystem) !void {
-        for (frame.events.mergedItems()) |event| {
-            if (event.stage != .structural_commit) continue;
-            switch (event.payload) {
-                .world_tile_changed => |changed| {
-                    if (changed.old_blocks_movement == changed.new_blocks_movement) continue;
-                    if (changed.level >= world.levelCount()) continue;
-                    try self.markLevelDirty(changed.level, .{
-                        .min_x = changed.x,
-                        .min_y = changed.y,
-                        .max_x_exclusive = changed.x +| 1,
-                        .max_y_exclusive = changed.y +| 1,
-                    });
-                },
-                .world_obstacle_changed => |changed| {
-                    if (changed.level >= world.levelCount()) continue;
-                    try self.markLevelDirty(changed.level, .{
-                        .min_x = changed.min_x,
-                        .min_y = changed.min_y,
-                        .max_x_exclusive = changed.max_x_exclusive,
-                        .max_y_exclusive = changed.max_y_exclusive,
-                    });
-                },
-                else => {},
-            }
-        }
-    }
-
-    fn markLevelDirty(self: *PerceptionSystem, level: u16, rect: DirtyRect) !void {
-        const slot = try self.levelBlockedSlot(level);
-        try slot.pending_dirty.ensureTotalCapacity(self.allocator, slot.pending_dirty.items.len + 1);
-        slot.pending_dirty.appendAssumeCapacity(rect);
-    }
-
     // Population-domain contract with spatial_index.zig/ai.zig (see module
-    // doc): walks `scope_dense_indices` (or all ai agents) resolving
-    // `data.movementBodyDenseIndex(entity) orelse continue`, in the exact
-    // same order SpatialIndexSystem/AiSystem's own gathers do — a deliberate
-    // duplicate gather, not shared code, so `candidates` row `i` and
-    // `spatial`'s row `i` refer to the same agent. This walk does double
-    // duty: every surviving entity (regardless of AiPerception) becomes a
-    // `candidates` row (so the neighbor-visit callback can resolve
-    // faction/level/entity from a spatial row index); entities that also
-    // carry `AiPerception` additionally become an observer `rows` entry,
-    // capturing `spatial_self_index` (this walk's row count so far) and
-    // `perception_dense_index` (the unrelated `PerceptionStore` row).
+    // doc): walks `candidate_dense_indices` (halo) or `scope_dense_indices`
+    // (single-list / all agents) resolving `data.movementBodyDenseIndex(entity)
+    // orelse continue`, in the exact same order SpatialIndexSystem's own gather
+    // does — a deliberate duplicate gather, not shared code, so `candidates`
+    // row `i` and `spatial`'s row `i` refer to the same agent. Observer rows
+    // are the subset that carry `AiPerception` and, on the dual-list path,
+    // also appear in the think set (`scope_dense_indices`, two-pointer).
     fn gatherPerceptionData(
         self: *PerceptionSystem,
         ai_agents: ConstAiAgentSlice,
@@ -883,21 +513,35 @@ pub const PerceptionSystem = struct {
         data: *const DataSystem,
         perception_slice: PerceptionSlice,
         scope_dense_indices: ?[]const u32,
+        candidate_dense_indices: ?[]const u32,
     ) !void {
         self.clearWork();
-        const n = if (scope_dense_indices) |idx| idx.len else ai_agents.entities.len;
+        const spatial_indices = candidate_dense_indices orelse scope_dense_indices;
+        const think_indices: ?[]const u32 = if (candidate_dense_indices) |halo|
+            (scope_dense_indices orelse halo)
+        else
+            spatial_indices;
+        const n = if (spatial_indices) |idx| idx.len else ai_agents.entities.len;
         if (n == 0) return;
+        const observer_cap = if (think_indices) |idx| idx.len else n;
         try self.candidates.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
-        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
+        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(observer_cap));
 
         var candidate_slice = self.candidates.slice();
         var row_slice = self.rows.slice();
         var k: usize = 0;
+        var think_k: usize = 0;
         var spatial_row_index: usize = 0;
         while (k < n) : (k += 1) {
-            const i: usize = if (scope_dense_indices) |idx| idx[k] else k;
+            const i: usize = if (spatial_indices) |idx| idx[k] else k;
+            const ai_index: u32 = @intCast(i);
             const ent = ai_agents.entities[i];
-            const mi = data.movementBodyDenseIndex(ent) orelse continue;
+            const mi = data.movementBodyDenseIndex(ent) orelse {
+                if (think_indices) |think| {
+                    if (think_k < think.len and think[think_k] == ai_index) think_k += 1;
+                }
+                continue;
+            };
 
             const ent_faction = data.factionConst(ent) orelse .neutral;
             const ent_level = data.worldLevelConst(ent) orelse 0;
@@ -907,32 +551,40 @@ pub const PerceptionSystem = struct {
                 .level = ent_level,
             });
 
-            if (data.aiPerceptionDenseIndex(ent)) |perception_index| {
-                const prev_nearest = perception_slice.nearest_threat[perception_index];
-                appendPerceptionGatherRow(&self.rows, &row_slice, .{
-                    .entity = ent,
-                    .pos_x = movement.previous_x[mi],
-                    .pos_y = movement.previous_y[mi],
-                    .velocity_x = movement.velocity_x[mi],
-                    .velocity_y = movement.velocity_y[mi],
-                    .vision_range = perception_slice.vision_range[perception_index],
-                    .cos_half_fov = perception_slice.cos_half_fov[perception_index],
-                    .hearing_range = perception_slice.hearing_range[perception_index],
-                    .faction = ent_faction,
-                    .level = ent_level,
-                    .spatial_self_index = spatial_row_index,
-                    .perception_dense_index = perception_index,
-                    .facing_x = perception_slice.facing_x[perception_index],
-                    .facing_y = perception_slice.facing_y[perception_index],
-                    .prev_nearest_threat_index = @bitCast(prev_nearest.index),
-                    .prev_nearest_threat_generation = @bitCast(prev_nearest.generation),
-                    .final_nearest_threat_index = invalid_index_bits,
-                    .final_nearest_threat_generation = invalid_generation_bits,
-                });
+            const in_think_set = if (think_indices) |think|
+                think_k < think.len and think[think_k] == ai_index
+            else
+                true;
+            if (in_think_set) {
+                if (think_indices != null) think_k += 1;
+                if (data.aiPerceptionDenseIndex(ent)) |perception_index| {
+                    const prev_nearest = perception_slice.nearest_threat[perception_index];
+                    appendPerceptionGatherRow(&self.rows, &row_slice, .{
+                        .entity = ent,
+                        .pos_x = movement.previous_x[mi],
+                        .pos_y = movement.previous_y[mi],
+                        .velocity_x = movement.velocity_x[mi],
+                        .velocity_y = movement.velocity_y[mi],
+                        .vision_range = perception_slice.vision_range[perception_index],
+                        .cos_half_fov = perception_slice.cos_half_fov[perception_index],
+                        .hearing_range = perception_slice.hearing_range[perception_index],
+                        .faction = ent_faction,
+                        .level = ent_level,
+                        .spatial_self_index = spatial_row_index,
+                        .perception_dense_index = perception_index,
+                        .facing_x = perception_slice.facing_x[perception_index],
+                        .facing_y = perception_slice.facing_y[perception_index],
+                        .prev_nearest_threat_index = @bitCast(prev_nearest.index),
+                        .prev_nearest_threat_generation = @bitCast(prev_nearest.generation),
+                        .final_nearest_threat_index = invalid_index_bits,
+                        .final_nearest_threat_generation = invalid_generation_bits,
+                    });
+                }
             }
 
             spatial_row_index += 1;
         }
+        if (think_indices) |think| std.debug.assert(think_k == think.len);
     }
 
     fn clearWork(self: *PerceptionSystem) void {
@@ -989,23 +641,9 @@ pub const PerceptionSystem = struct {
         }
     }
 
-    fn prepareEventRangeBuffers(self: *PerceptionSystem, range_count: usize, items_per_range: usize, item_count: usize) !void {
-        try self.event_ranges.ensureTotalCapacity(self.allocator, range_count);
-        while (self.event_ranges.items.len < range_count) self.event_ranges.appendAssumeCapacity(.{});
-        for (self.event_ranges.items[0..range_count], 0..) |*slot, range_index| {
-            slot.buffer.clearRetainingCapacity();
-            const range_len = rangeLenForIndex(item_count, items_per_range, range_index);
-            // Worst case: an identity swap emits two events for one row, so
-            // this exact reserve can never overflow (unlike collision's
-            // broadphase pair estimate) — no grow-and-replay dance needed.
-            try slot.buffer.events.ensureTotalCapacity(self.allocator, range_len * 2);
-        }
-    }
-
-    // Sizes/resets `range_stats` to `range_count` slots before dispatch (same
-    // reserve-before-dispatch shape as `prepareEventRangeBuffers`), so every
-    // range job has a pre-existing slot to write its single accumulated
-    // `PerceptionRangeStats` value into.
+    // Sizes/resets `range_stats` to `range_count` slots before dispatch
+    // (reserve-before-dispatch), so every range job has a pre-existing slot to
+    // write its single accumulated `PerceptionRangeStats` value into.
     fn prepareRangeStats(self: *PerceptionSystem, range_count: usize) !void {
         try self.range_stats.ensureTotalCapacity(self.allocator, range_count);
         while (self.range_stats.items.len < range_count) self.range_stats.appendAssumeCapacity(.{});
@@ -1020,61 +658,84 @@ pub const PerceptionSystem = struct {
             totals.los_checks += slot.stats.los_checks;
             totals.los_blocked += slot.stats.los_blocked;
             totals.candidate_checks += slot.stats.candidate_checks;
+            totals.transition_events += slot.stats.transition_events;
         }
         return totals;
     }
 
-    /// Serial merge after the parallel/serial compute pass: sums each range's
-    /// real (not worst-case) event count, applies this system's own
-    /// deterministic per-step cap in range-ascending, within-range-write-order
-    /// (truncating the tail rather than letting `SimulationEvents`'s own
-    /// capacity check throw — see the module doc), then re-walks each range's
-    /// scratch into `events`'s shared range-output stream.
-    fn mergePerceptionEvents(
+    /// Main-thread transition emit after the parallel/serial compute pass.
+    /// `total` is the workers' uncapped event count
+    /// (`PerceptionRangeStats.transition_events`); this system's own
+    /// deterministic per-step cap keeps the first `max_events_per_step` in
+    /// row order (`entity_lost` before `entity_perceived` within a row),
+    /// truncating the tail rather than letting `SimulationEvents`'s own
+    /// capacity check throw. One pass over the immutable `prev_*`/`final_*`
+    /// columns (`simd.equalInt4`, scalar tail) writes them as one range; the
+    /// pass is skipped outright when nothing is emitted. Row order equals the
+    /// former range-ascending concatenation, so the output is byte-identical
+    /// under every partition.
+    fn emitTransitionEvents(
         self: *PerceptionSystem,
+        job: *const PerceptionJobContext,
         events: *SimulationEvents,
-        range_count: usize,
+        total: usize,
         max_events_per_step: usize,
     ) !PerceptionEventMergeResult {
-        try self.range_take_counts.ensureTotalCapacity(self.allocator, range_count);
-        self.range_take_counts.clearRetainingCapacity();
-
-        var total: usize = 0;
-        for (self.event_ranges.items[0..range_count]) |*slot| total += slot.buffer.events.items.len;
         const capped_total = @min(total, max_events_per_step);
         const dropped = total - capped_total;
 
-        var remaining = capped_total;
-        for (self.event_ranges.items[0..range_count]) |*slot| {
-            const take = @min(slot.buffer.events.items.len, remaining);
-            self.range_take_counts.appendAssumeCapacity(take);
-            remaining -= take;
-        }
-
-        const first_range = try events.appendRangeCounts(range_count);
-        for (self.range_take_counts.items, 0..) |take, range_index| {
-            events.addCount(first_range + range_index, take);
-        }
+        const first_range = try events.appendRangeCounts(1);
+        events.addCount(first_range, capped_total);
         try events.prefixAppendedRanges(first_range);
 
-        var perceived: usize = 0;
-        var lost: usize = 0;
-        for (self.event_ranges.items[0..range_count], self.range_take_counts.items, 0..) |*slot, take, range_index| {
-            var writer = events.rangeWriter(first_range + range_index);
-            for (slot.buffer.events.items[0..take]) |event| {
-                writer.write(event);
-                switch (event.payload) {
-                    .entity_perceived => perceived += 1,
-                    .entity_lost => lost += 1,
-                    else => {},
+        var sink = TransitionSink{ .writer = events.rangeWriter(first_range), .remaining = capped_total };
+        if (capped_total > 0) {
+            const n = job.entities.len;
+            const prev_index = job.prev_nearest_threat_index;
+            const prev_generation = job.prev_nearest_threat_generation;
+            const final_index = job.final_nearest_threat_index;
+            const final_generation = job.final_nearest_threat_generation;
+            var i: usize = 0;
+            const vend = simd.vectorizedEnd(n);
+            while (i < vend and sink.remaining > 0) : (i += simd.lane_count) {
+                const idx_equal = simd.equalInt4(simd.loadInt4(prev_index[i..]), simd.loadInt4(final_index[i..]));
+                const gen_equal = simd.equalInt4(simd.loadInt4(prev_generation[i..]), simd.loadInt4(final_generation[i..]));
+                const unchanged = idx_equal & gen_equal;
+                inline for (0..simd.lane_count) |lane| {
+                    if (!unchanged[lane]) {
+                        sink.write(
+                            job.entities[i + lane],
+                            reconstructEntityId(prev_index[i + lane], prev_generation[i + lane]),
+                            reconstructEntityId(final_index[i + lane], final_generation[i + lane]),
+                        );
+                    }
                 }
             }
-            writer.finish();
+            while (i < n and sink.remaining > 0) : (i += 1) {
+                if (prev_index[i] != final_index[i] or prev_generation[i] != final_generation[i]) {
+                    sink.write(
+                        job.entities[i],
+                        reconstructEntityId(prev_index[i], prev_generation[i]),
+                        reconstructEntityId(final_index[i], final_generation[i]),
+                    );
+                }
+            }
         }
+        // Declared count == written count: `sink` stops at exactly
+        // `capped_total` because the workers' tally and this pass read the
+        // same immutable columns (`RangeWriter.finish` asserts it).
+        sink.writer.finish();
         events.finishWrite();
         events.stats.dropped += dropped;
+        if (dropped > 0 and !self.dropped_events_warned) {
+            self.dropped_events_warned = true;
+            if (comptime logging.enabled(.warn) and !builtin.is_test) logging.game.warn(
+                "perception: {d} events dropped past the per-step share of {d}",
+                .{ dropped, max_events_per_step },
+            );
+        }
 
-        return .{ .perceived = perceived, .lost = lost, .dropped = dropped };
+        return .{ .perceived = sink.perceived, .lost = sink.lost, .dropped = dropped };
     }
 };
 
@@ -1083,107 +744,6 @@ const PerceptionEventMergeResult = struct {
     lost: usize,
     dropped: usize,
 };
-
-fn clampRectToLevel(rect: DirtyRect, width: u16, height: u16) DirtyRect {
-    return .{
-        .min_x = @min(rect.min_x, width),
-        .min_y = @min(rect.min_y, height),
-        .max_x_exclusive = @min(rect.max_x_exclusive, width),
-        .max_y_exclusive = @min(rect.max_y_exclusive, height),
-    };
-}
-
-const ChunkRange = struct { min_x: u16, min_y: u16, max_x: u16, max_y: u16 };
-
-// The level-local chunk range a (clamped) rect overlaps, clamped to
-// `[0, chunks_x - 1] x [0, chunks_y - 1]` — mirrors
-// `WorldSystem.localChunkIndexForCell`'s per-cell chunk math, computed once
-// for the whole rect instead of per cell. Callers combine `min_y..max_y` and
-// `min_x..max_x` with `chunks_x` the same way `localChunkIndexForCell` does
-// (`chunk_y * chunks_x + chunk_x`) to reach `sparseTileIndicesForChunk`.
-fn chunkRangeForRect(rect: DirtyRect, chunk_size_tiles: u16, chunks_x: u16, chunks_y: u16) ChunkRange {
-    const chunk_size = @max(chunk_size_tiles, 1);
-    const max_chunk_x = if (chunks_x == 0) 0 else chunks_x - 1;
-    const max_chunk_y = if (chunks_y == 0) 0 else chunks_y - 1;
-    const max_x_inclusive_cell: u16 = if (rect.max_x_exclusive == 0) 0 else rect.max_x_exclusive - 1;
-    const max_y_inclusive_cell: u16 = if (rect.max_y_exclusive == 0) 0 else rect.max_y_exclusive - 1;
-    return .{
-        .min_x = @min(rect.min_x / chunk_size, max_chunk_x),
-        .min_y = @min(rect.min_y / chunk_size, max_chunk_y),
-        .max_x = @min(max_x_inclusive_cell / chunk_size, max_chunk_x),
-        .max_y = @min(max_y_inclusive_cell / chunk_size, max_chunk_y),
-    };
-}
-
-// Patches only the cells covered by `slot.pending_dirty`, in place, instead of
-// rescanning the whole level (see `LevelBlockedSlot`'s doc comment and
-// `ensureLevelBlockedCache`'s decision tree). A bit can flip either direction
-// (a dig can unblock a cell, not just block one), so each rect's cell range is
-// `@memset` false first, then rescanned: per relevant dense layer, bounded to
-// the rect instead of the whole level; and per sparse tile, but only within
-// the rect's overlapping level-local chunks (`WorldSystem.sparseTileIndicesForChunk`
-// via `chunkRangeForRect`) rather than every sparse tile on the level — the
-// candidate set is bounded by chunk population, not level population, which
-// is the real complexity-class win on the sparse side. Takes no allocator and
-// grows nothing: `slot.blocked`'s backing storage is already sized to
-// `slot.width * slot.height` by an earlier full build (a slot only reaches
-// this function post-first-build — see `ensureLevelBlockedCache`), and
-// `slot.width`/`height` cannot have changed since (levels never resize after
-// creation). An invalid slot (fail-closed, `blocked` never populated) has
-// nothing to patch and is left as-is.
-fn patchLevelBlockedCache(world: *const WorldSystem, level: u16, slot: *LevelBlockedSlot) void {
-    if (!slot.valid) return;
-    const chunks_x = world.chunksX();
-    const chunks_y = world.chunksY();
-
-    for (slot.pending_dirty.items) |raw_rect| {
-        const rect = clampRectToLevel(raw_rect, slot.width, slot.height);
-        if (rect.min_x >= rect.max_x_exclusive or rect.min_y >= rect.max_y_exclusive) continue;
-
-        var y = rect.min_y;
-        while (y < rect.max_y_exclusive) : (y += 1) {
-            const row_offset = @as(usize, y) * @as(usize, slot.width);
-            @memset(slot.blocked.items[row_offset + rect.min_x .. row_offset + rect.max_x_exclusive], false);
-        }
-
-        for (0..world.denseLayerCount()) |layer_index| {
-            if (world.denseLayerLevel(layer_index) != level) continue;
-            if (world.denseLayerUniformFillTile(layer_index) != null) {
-                if (!world.denseTileBlocksMovement(layer_index, 0, 0)) continue;
-                var yy = rect.min_y;
-                while (yy < rect.max_y_exclusive) : (yy += 1) {
-                    const row_offset = @as(usize, yy) * @as(usize, slot.width);
-                    @memset(slot.blocked.items[row_offset + rect.min_x .. row_offset + rect.max_x_exclusive], true);
-                }
-                continue;
-            }
-            var yy = rect.min_y;
-            while (yy < rect.max_y_exclusive) : (yy += 1) {
-                var xx = rect.min_x;
-                while (xx < rect.max_x_exclusive) : (xx += 1) {
-                    if (!world.denseTileBlocksMovement(layer_index, xx, yy)) continue;
-                    slot.blocked.items[@as(usize, yy) * @as(usize, slot.width) + @as(usize, xx)] = true;
-                }
-            }
-        }
-
-        const chunk_range = chunkRangeForRect(rect, world.chunk_size_tiles, chunks_x, chunks_y);
-        var cy = chunk_range.min_y;
-        while (cy <= chunk_range.max_y) : (cy += 1) {
-            var cx = chunk_range.min_x;
-            while (cx <= chunk_range.max_x) : (cx += 1) {
-                const local_chunk_index: u32 = @as(u32, cy) * @as(u32, chunks_x) + @as(u32, cx);
-                for (world.sparseTileIndicesForChunk(level, local_chunk_index)) |sparse_index| {
-                    if (!world.sparseTileBlocksMovement(sparse_index)) continue;
-                    const cell = world.sparseTileCellCoord(sparse_index);
-                    if (cell.x < rect.min_x or cell.x >= rect.max_x_exclusive) continue;
-                    if (cell.y < rect.min_y or cell.y >= rect.max_y_exclusive) continue;
-                    slot.blocked.items[@as(usize, cell.y) * @as(usize, slot.width) + @as(usize, cell.x)] = true;
-                }
-            }
-        }
-    }
-}
 
 fn computeFacingScalar(vx: f32, vy: f32, prev_facing: math.Vec2) math.Vec2 {
     const speed2 = vx * vx + vy * vy;
@@ -1215,12 +775,7 @@ const PerceptionJobContext = struct {
     perception_slice: PerceptionSlice,
     spatial: SpatialIndexView,
     world: *const WorldSystem,
-    // O(1) LOS-blocked lookup cache, main-thread-built before dispatch (see
-    // `PerceptionSystem.ensureLevelBlockedCachesForObservers`), read-only for
-    // every worker range.
-    level_blocked: []const LevelBlockedSlot,
     player_candidate: ?PlayerPerceptionCandidate,
-    event_ranges: []PerceptionEventRangeSlot,
     range_stats: []PerceptionRangeStatsSlot,
 };
 
@@ -1228,26 +783,32 @@ fn writePerceptionRangeJob(context: *anyopaque, range: ParallelRange, _: WorkerI
     const job: *PerceptionJobContext = @ptrCast(@alignCast(context));
     // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs
     // dispatched range count AND range.end vs the observer buffer this job walks.
-    // Guards the reserve-before-dispatch invariant: prepareEventRangeBuffers
-    // must have sized event_ranges to at least this dispatch's range count.
-    std.debug.assert(range.index < job.event_ranges.len);
+    // Guards the reserve-before-dispatch invariant: prepareRangeStats must
+    // have sized range_stats to at least this dispatch's range count.
+    std.debug.assert(range.index < job.range_stats.len);
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.entities.len);
     computePerceptionRange(job, range);
 }
 
 /// Shared per-range compute: scalar per-agent neighbor query/FOV/LOS/writeback
-/// (`computeOneAgent`), then the dense transition-detection + scalar emit
-/// pass (`emitTransitionsForRange`). Called identically by the threaded
-/// dispatch and the serial single-range path — see the module doc's
-/// serial/threaded parity note.
+/// (`computeOneAgent`), then a tally of the transition events the row just
+/// written will produce (`transitionEventCount`); the events themselves are
+/// emitted after the join by `PerceptionSystem.emitTransitionEvents`. Called
+/// identically by the threaded dispatch and the serial single-range path —
+/// see the module doc's serial/threaded parity note.
 fn computePerceptionRange(job: *PerceptionJobContext, range: ParallelRange) void {
     // Local accumulator, not a pointer into job.range_stats: only one write
     // (below) ever lands per range, so concurrently running ranges never
     // touch each other's slot mid-accumulation.
     var range_stats = PerceptionRangeStats{};
-    for (range.start..range.end) |i| computeOneAgent(job, i, &range_stats);
-    emitTransitionsForRange(job, range);
+    for (range.start..range.end) |i| {
+        computeOneAgent(job, i, &range_stats);
+        range_stats.transition_events += transitionEventCount(
+            reconstructEntityId(job.prev_nearest_threat_index[i], job.prev_nearest_threat_generation[i]),
+            reconstructEntityId(job.final_nearest_threat_index[i], job.final_nearest_threat_generation[i]),
+        );
+    }
     job.range_stats[range.index].stats = range_stats;
 }
 
@@ -1273,7 +834,7 @@ const NeighborVisitContext = struct {
     scratch: *CandidateScratch,
 };
 
-/// Scalar: the spatial cell-scan traversal itself (Slice 28 shared infra) and
+/// Scalar: the spatial cell-scan traversal itself (shared spatial-index infra) and
 /// the stance lookup (a 4-value enum table index, not float math) are both
 /// branchy/sparse, not dense uniform work, so this callback stays scalar —
 /// same shape as ai.zig's `separationNeighborVisit`. Negates
@@ -1360,10 +921,9 @@ fn resolveCandidate(ctx: SurvivorSortContext, slot: usize) ResolvedCandidate {
     return .{ .entity = ctx.candidates.entities[candidate_index], .level = ctx.candidates.level[candidate_index] };
 }
 
-// Small (<= max_perception_scratch), branchy comparator resolving an entity
-// per compare: irreducibly small and does not scale with population, so this
-// sort stays scalar (per-agent candidate counts are bounded by
-// max_perception_candidates regardless of world size).
+// Branchy comparator resolving an entity per compare. Scalar: each observer
+// sorts at most max_perception_scratch survivors, a tiny batch; total work
+// grows with observers, which the threaded perception ranges spread.
 fn survivorLessThan(ctx: SurvivorSortContext, lhs: usize, rhs: usize) bool {
     const lhs_dist2 = ctx.scratch.dist2[lhs];
     const rhs_dist2 = ctx.scratch.dist2[rhs];
@@ -1371,79 +931,120 @@ fn survivorLessThan(ctx: SurvivorSortContext, lhs: usize, rhs: usize) bool {
     return resolveCandidate(ctx, lhs).entity.index < resolveCandidate(ctx, rhs).entity.index;
 }
 
-/// Bounded LOS raycast: an Amanatides-Woo grid/DDA walk from the observer's
-/// cell to the target's cell, with an early exit on the first blocked cell
-/// visited. Unlike fixed-step linear-interpolation sampling, this visits
-/// every grid cell the segment's interior actually crosses — a diagonal ray
-/// can no longer straddle a blocking cell's interior between two samples
-/// without either one landing inside it (see the module doc's LOS test for
-/// the reproduction this replaces). Each visited cell is a branchy, scattered
-/// lookup (not dense/uniform), so the walk itself stays scalar; the per-cell
-/// blocked test is still `lookupLevelBlocked`'s O(1) bitmap read (see
-/// `LevelBlockedSlot`), not a `WorldSystem.levelBlocksMovement` call.
-fn hasLineOfSight(world: *const WorldSystem, level_blocked: []const LevelBlockedSlot, level: u16, ox: f32, oy: f32, tx: f32, ty: f32) bool {
-    const dx = tx - ox;
-    const dy = ty - oy;
-    if (dx == 0 and dy == 0) return true;
+// One ray's cell reads on one level, resolved once per ray. Out-of-world cells
+// block (fail closed). `across_*` offsets to the cell across the grid line a ray
+// runs exactly along (0, 0 when it runs along none).
+const RayCells = struct {
+    terrain: WorldSystem.LevelBlockedView,
+    width: i32,
+    height: i32,
+    across_x: i32,
+    across_y: i32,
 
-    const tile_size = world.tile_size;
+    fn blocked(self: RayCells, x: i32, y: i32) bool {
+        if (x < 0 or y < 0 or x >= self.width or y >= self.height) return true;
+        // In [0, width) x [0, height) per the check above, so both fit u16.
+        const cell_x: u16 = @intCast(x);
+        const cell_y: u16 = @intCast(y);
+        return self.terrain.blocked.get(self.terrain.geom.chunkOf(cell_x, cell_y), self.terrain.geom.localOf(cell_x, cell_y));
+    }
+
+    // The cell across the ray's grid line; a line on the world edge has none.
+    fn acrossBlocked(self: RayCells, x: i32, y: i32) bool {
+        if (self.across_x == 0 and self.across_y == 0) return false;
+        const across_x = x + self.across_x;
+        const across_y = y + self.across_y;
+        if (across_x < 0 or across_y < 0) return false;
+        return self.blocked(across_x, across_y);
+    }
+};
+
+/// LOS raycast: a grid walk from the observer's cell to the target's cell that
+/// checks every cell the segment touches after leaving the observer, exiting on
+/// the first blocked one. The observer's own cell is never checked; the
+/// target's is.
+/// - Through an exact grid corner, both side cells are checked before the
+///   diagonal step, so a ray never slips between two blocked cells that meet at
+///   a corner (pathfinding's no-corner-cutting rule).
+/// - A ray running exactly along a grid line also checks the in-world cells
+///   across the line.
+/// With both endpoint cells open (and endpoints off grid corners), A to B
+/// equals B to A. Crossing order compares f64 products of boundary distances,
+/// exact for cell-aligned endpoints, so corner ties are found exactly and
+/// nothing accumulates along the ray. An axis step visits one cell and a corner
+/// step two, so an arriving walk takes exactly |dcx| + |dcy| visits; one that
+/// has not arrived by then fails closed. The level's blocked bits are resolved
+/// once per ray; an invalid level or a point off the world is blocked. Scalar:
+/// one branchy, scattered lookup per cell.
+fn hasLineOfSight(world: *const WorldSystem, level: u16, ox: f32, oy: f32, tx: f32, ty: f32) bool {
+    if (ox == tx and oy == ty) return true;
+
+    const terrain = world.levelBlockedView(level) orelse return false;
     const start_cell = world.cellContaining(ox, oy) orelse return false;
     const end_cell = world.cellContaining(tx, ty) orelse return false;
 
-    // The observer's own starting cell is never checked (mirrors the old
-    // sampler, which never evaluated t == 0): a straight segment that starts
-    // and ends in the same cell never leaves it, so only the shared cell
-    // itself needs a blocked check.
-    if (start_cell.x == end_cell.x and start_cell.y == end_cell.y) {
-        return !lookupLevelBlocked(level_blocked, level, end_cell.x, end_cell.y);
-    }
+    const tile_size = world.tile_size;
+    // A ray on a vertical (horizontal) grid line touches the column (row) across
+    // it; `cellContaining` puts the ray's own cells right of (below) the line.
+    const cells = RayCells{
+        .terrain = terrain,
+        .width = world.width,
+        .height = world.height,
+        .across_x = if (ox == tx and @mod(ox, tile_size) == 0) -1 else 0,
+        .across_y = if (oy == ty and @mod(oy, tile_size) == 0) -1 else 0,
+    };
 
     var cell_x: i32 = start_cell.x;
     var cell_y: i32 = start_cell.y;
     const end_x: i32 = end_cell.x;
     const end_y: i32 = end_cell.y;
-    const world_width: i32 = world.width;
-    const world_height: i32 = world.height;
+    if (cells.acrossBlocked(cell_x, cell_y)) return false;
+    if (cell_x == end_x and cell_y == end_y) return !cells.blocked(end_x, end_y);
 
-    const step_x: i32 = if (dx > 0) 1 else if (dx < 0) -1 else 0;
-    const step_y: i32 = if (dy > 0) 1 else if (dy < 0) -1 else 0;
-
-    // t_max_* is the distance (in the segment's own [0,1] parameterization)
-    // to the next vertical/horizontal grid line; t_delta_* is that same unit
-    // distance between consecutive grid lines on that axis. An axis the
-    // segment never crosses (step == 0) is pinned at +inf so the `<`
-    // comparison below always advances the other axis.
-    var t_max_x = std.math.inf(f32);
-    var t_delta_x = std.math.inf(f32);
-    if (step_x != 0) {
-        const next_cell_x = if (step_x > 0) cell_x + 1 else cell_x;
-        const boundary_x = @as(f32, @floatFromInt(next_cell_x)) * tile_size;
-        t_max_x = (boundary_x - ox) / dx;
-        t_delta_x = tile_size / @abs(dx);
-    }
-
-    var t_max_y = std.math.inf(f32);
-    var t_delta_y = std.math.inf(f32);
-    if (step_y != 0) {
-        const next_cell_y = if (step_y > 0) cell_y + 1 else cell_y;
-        const boundary_y = @as(f32, @floatFromInt(next_cell_y)) * tile_size;
-        t_max_y = (boundary_y - oy) / dy;
-        t_delta_y = tile_size / @abs(dy);
-    }
+    const step_x: i32 = if (tx > ox) 1 else if (tx < ox) -1 else 0;
+    const step_y: i32 = if (ty > oy) 1 else if (ty < oy) -1 else 0;
+    const origin_x: f64 = ox;
+    const origin_y: f64 = oy;
+    const extent_x: f64 = @abs(@as(f64, tx) - origin_x);
+    const extent_y: f64 = @abs(@as(f64, ty) - origin_y);
+    const tile: f64 = tile_size;
+    const ray_cell_count: u32 = @abs(end_x - cell_x) + @abs(end_y - cell_y);
 
     var visited: u32 = 0;
-    while (visited < los_max_cells) : (visited += 1) {
-        if (t_max_x < t_max_y) {
+    while (visited < ray_cell_count) {
+        // Distance to the next grid line on each axis; the ray crosses x first
+        // when to_x / extent_x < to_y / extent_y, compared without dividing. An
+        // axis the ray never crosses is infinitely far (its extent is 0, so the
+        // other product is 0).
+        const to_x: f64 = if (step_x > 0)
+            @as(f64, @floatFromInt(cell_x + 1)) * tile - origin_x
+        else if (step_x < 0)
+            origin_x - @as(f64, @floatFromInt(cell_x)) * tile
+        else
+            std.math.inf(f64);
+        const to_y: f64 = if (step_y > 0)
+            @as(f64, @floatFromInt(cell_y + 1)) * tile - origin_y
+        else if (step_y < 0)
+            origin_y - @as(f64, @floatFromInt(cell_y)) * tile
+        else
+            std.math.inf(f64);
+        const cross_x = to_x * extent_y;
+        const cross_y = to_y * extent_x;
+        if (cross_x < cross_y) {
             cell_x += step_x;
-            t_max_x += t_delta_x;
-        } else {
+            visited += 1;
+        } else if (cross_y < cross_x) {
             cell_y += step_y;
-            t_max_y += t_delta_y;
+            visited += 1;
+        } else {
+            // Exact corner. Its side cells touch the ray unless the corner is the
+            // observer's own point.
+            if (to_x > 0 and (cells.blocked(cell_x + step_x, cell_y) or cells.blocked(cell_x, cell_y + step_y))) return false;
+            cell_x += step_x;
+            cell_y += step_y;
+            visited += 2;
         }
-        if (cell_x < 0 or cell_y < 0 or cell_x >= world_width or cell_y >= world_height) return false;
-        const cx: u16 = @intCast(cell_x);
-        const cy: u16 = @intCast(cell_y);
-        if (lookupLevelBlocked(level_blocked, level, cx, cy)) return false;
+        if (cells.blocked(cell_x, cell_y) or cells.acrossBlocked(cell_x, cell_y)) return false;
         if (cell_x == end_x and cell_y == end_y) return true;
     }
     return false;
@@ -1506,16 +1107,16 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
     var last_seen_x: f32 = 0;
     var last_seen_y: f32 = 0;
 
-    // Small (<= max_perception_scratch), branchy walk with a per-candidate
-    // bounded LOS raycast: irreducible, does not scale with population, so
-    // this stays scalar.
+    // Scalar: a branchy walk with a data-dependent LOS raycast per candidate,
+    // over at most max_perception_scratch survivors per observer; total work
+    // grows with observers, which the threaded perception ranges spread.
     for (survivors[0..survivor_count]) |slot| {
         const resolved = resolveCandidate(sort_ctx, slot);
         if (resolved.level != observer_level) continue;
         const tx = ox + scratch.to_x[slot];
         const ty = oy + scratch.to_y[slot];
         range_stats.los_checks += 1;
-        if (hasLineOfSight(job.world, job.level_blocked, observer_level, ox, oy, tx, ty)) {
+        if (hasLineOfSight(job.world, observer_level, ox, oy, tx, ty)) {
             target_visible = true;
             nearest_threat = resolved.entity;
             nearest_threat_dist = math.length(.{ .x = scratch.to_x[slot], .y = scratch.to_y[slot] });
@@ -1546,7 +1147,7 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
     var heard_stimulus = false;
     var heard_x: f32 = 0;
     var heard_y: f32 = 0;
-    // Soft ranking (Slice 39): max intensity / (1 + dist2 * k) among same-level
+    // Soft ranking: max intensity / (1 + dist2 * k) among same-level
     // stimuli inside the hard hearing range. Equal intensities reduce to nearest.
     // Kind is not stored on perception columns — bus-only metadata.
     var best_score = -std.math.inf(f32);
@@ -1577,85 +1178,41 @@ fn reconstructEntityId(index_bits: i32, generation_bits: i32) EntityId {
     return .{ .index = @bitCast(index_bits), .generation = @bitCast(generation_bits) };
 }
 
-/// Batches the prev-vs-final `EntityId` compare 4 rows at a time via
-/// `simd.equalInt4` over the row's contiguous bitcast index/generation
-/// columns, feeding a scalar per-row emit — same shape as collision.zig's
-/// SIMD Y-overlap filter feeding scalar contact emission. Scalar tail for the
-/// `< lane_count` remainder.
-fn emitTransitionsForRange(job: *PerceptionJobContext, range: ParallelRange) void {
-    const buffer = &job.event_ranges[range.index].buffer;
-    var i = range.start;
-    while (i + simd.lane_count <= range.end) : (i += simd.lane_count) {
-        const prev_idx = simd.loadInt4(job.prev_nearest_threat_index[i..]);
-        const prev_gen = simd.loadInt4(job.prev_nearest_threat_generation[i..]);
-        const final_idx = simd.loadInt4(job.final_nearest_threat_index[i..]);
-        const final_gen = simd.loadInt4(job.final_nearest_threat_generation[i..]);
-        const idx_equal = simd.equalInt4(prev_idx, final_idx);
-        const gen_equal = simd.equalInt4(prev_gen, final_gen);
-        const unchanged = idx_equal & gen_equal;
-        inline for (0..simd.lane_count) |lane| {
-            if (!unchanged[lane]) {
-                emitTransition(
-                    buffer,
-                    job.entities[i + lane],
-                    reconstructEntityId(job.prev_nearest_threat_index[i + lane], job.prev_nearest_threat_generation[i + lane]),
-                    reconstructEntityId(job.final_nearest_threat_index[i + lane], job.final_nearest_threat_generation[i + lane]),
-                );
-            }
-        }
-    }
-    while (i < range.end) : (i += 1) {
-        if (job.prev_nearest_threat_index[i] != job.final_nearest_threat_index[i] or
-            job.prev_nearest_threat_generation[i] != job.final_nearest_threat_generation[i])
-        {
-            emitTransition(
-                buffer,
-                job.entities[i],
-                reconstructEntityId(job.prev_nearest_threat_index[i], job.prev_nearest_threat_generation[i]),
-                reconstructEntityId(job.final_nearest_threat_index[i], job.final_nearest_threat_generation[i]),
-            );
-        }
-    }
-}
-
 /// Transition rules (see module doc): invalid->valid emits only
 /// `entity_perceived`; valid->invalid emits only `entity_lost`; a
 /// valid->different-valid identity swap emits both, `entity_lost` (the
 /// previous target) before `entity_perceived` (the new one), in that order.
-/// `prev`/`final` equal (including both invalid) never reaches here — the
-/// caller's `unchanged` check already filtered that out.
-fn emitTransition(buffer: *PerceptionEventRangeBuffer, observer: EntityId, prev: EntityId, final: EntityId) void {
-    if (prev.isValid()) {
-        buffer.appendAssumeCapacity(.{ .stage = .domain_reaction, .payload = .{ .entity_lost = .{ .observer = observer, .target = prev } } });
-    }
-    if (final.isValid()) {
-        buffer.appendAssumeCapacity(.{ .stage = .domain_reaction, .payload = .{ .entity_perceived = .{ .observer = observer, .target = final } } });
-    }
+/// `prev`/`final` bit-identical (including both invalid) emits nothing. This
+/// count and `TransitionSink.write` encode the same rules, so the worker
+/// tally and the main-thread emit agree exactly.
+fn transitionEventCount(prev: EntityId, final: EntityId) usize {
+    if (prev.index == final.index and prev.generation == final.generation) return 0;
+    return @as(usize, @intFromBool(prev.isValid())) + @intFromBool(final.isValid());
 }
 
-const StageWorkSelection = BatchSelection;
+/// Main-thread row-order writer for `emitTransitionEvents`: writes at most
+/// `remaining` more events, so a swap truncated with one slot left keeps only
+/// its `entity_lost` (the same within-row write-order truncation the former
+/// per-range merge applied).
+const TransitionSink = struct {
+    writer: SimulationEvents.RangeWriter,
+    remaining: usize,
+    perceived: usize = 0,
+    lost: usize = 0,
 
-// Mirrors ai.zig/spatial_index.zig/collision.zig's selectStageWork verbatim
-// (module-local adaptive-profile resolution), keyed by
-// perception_range_alignment_items.
-fn selectStageWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    items_per_range_override: ?usize,
-    max_worker_threads_override: ?usize,
-    adaptive: bool,
-    adaptive_tuner: ?*AdaptiveWorkTuner,
-) StageWorkSelection {
-    // Shapes work through the single tuner-owned entry point so pre-sizing and
-    // dispatch (parallelForWithOptions) resolve an identical batch shape.
-    return thread_system.selectBatchProfile(adaptive_tuner, .{
-        .item_count = item_count,
-        .items_per_range = items_per_range_override,
-        .max_worker_threads = max_worker_threads_override,
-        .range_alignment_items = perception_range_alignment_items,
-        .adaptive = adaptive,
-    });
-}
+    fn write(self: *TransitionSink, observer: EntityId, prev: EntityId, final: EntityId) void {
+        if (prev.isValid() and self.remaining > 0) {
+            self.writer.write(.{ .stage = .domain_reaction, .payload = .{ .entity_lost = .{ .observer = observer, .target = prev } } });
+            self.remaining -= 1;
+            self.lost += 1;
+        }
+        if (final.isValid() and self.remaining > 0) {
+            self.writer.write(.{ .stage = .domain_reaction, .payload = .{ .entity_perceived = .{ .observer = observer, .target = final } } });
+            self.remaining -= 1;
+            self.perceived += 1;
+        }
+    }
+};
 
 // ---- Tests --------------------------------------------------------------------
 
@@ -1715,7 +1272,7 @@ fn minimalWorld(allocator: std.mem.Allocator, width: u16, height: u16, tile_size
         .width = width,
         .height = height,
         .tile_size = tile_size,
-        .chunk_size_tiles = width,
+        .chunk_size_tiles = @import("../world_system.zig").max_chunk_size_tiles,
     };
     _ = try world.addLevel(0);
     return world;
@@ -1856,6 +1413,123 @@ test "gather uses the full-population spatial row index for self-exclusion, not 
     // X is far from everyone (out of default vision_range) and unaffected.
     const x_perception = data.aiPerceptionConst(x).?;
     try testing.expect(!x_perception.target_visible);
+}
+
+test "think observer acquires an off-phase hostile from the halo candidate set" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+
+    // Ally at the origin faces +x; hostile 40 units ahead. Halo is both rows;
+    // only the ally thinks this step, so the hostile store must stay untouched.
+    const ally = try addObserver(&data, 0, 0, 100, 0, .ally, .{});
+    const hostile = try addObserver(&data, 40, 0, -100, 0, .hostile, .{});
+
+    const halo = [_]u32{ 0, 1 };
+    const think = [_]u32{0};
+    var spatial_sys = SpatialIndexSystem.init(testing.allocator);
+    defer spatial_sys.deinit();
+    try spatial_sys.reserve(data.aiAgentSliceConst().entities.len, .{});
+    _ = try spatial_sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{ .scope_dense_indices = &halo });
+
+    var world = try minimalWorld(testing.allocator, 8, 8, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+        .scope_dense_indices = &think,
+        .candidate_dense_indices = &halo,
+    });
+
+    try testing.expectEqual(@as(usize, 1), stats.observer_count);
+    try testing.expectEqual(@as(usize, 2), stats.candidate_population_count);
+
+    const ally_perception = data.aiPerceptionConst(ally).?;
+    try testing.expect(ally_perception.target_visible);
+    try testing.expectEqual(hostile.index, ally_perception.nearest_threat.index);
+
+    const hostile_perception = data.aiPerceptionConst(hostile).?;
+    try testing.expect(!hostile_perception.target_visible);
+    try testing.expectEqual(EntityId.invalid, hostile_perception.nearest_threat);
+}
+
+test "off-phase observer acquires the on-phase ally on the reverse think step" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+
+    const ally = try addObserver(&data, 0, 0, 100, 0, .ally, .{});
+    const hostile = try addObserver(&data, 40, 0, -100, 0, .hostile, .{});
+
+    const halo = [_]u32{ 0, 1 };
+    const think = [_]u32{1};
+    var spatial_sys = SpatialIndexSystem.init(testing.allocator);
+    defer spatial_sys.deinit();
+    try spatial_sys.reserve(data.aiAgentSliceConst().entities.len, .{});
+    _ = try spatial_sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{ .scope_dense_indices = &halo });
+
+    var world = try minimalWorld(testing.allocator, 8, 8, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+        .scope_dense_indices = &think,
+        .candidate_dense_indices = &halo,
+    });
+
+    const hostile_perception = data.aiPerceptionConst(hostile).?;
+    try testing.expect(hostile_perception.target_visible);
+    try testing.expectEqual(ally.index, hostile_perception.nearest_threat.index);
+
+    const ally_perception = data.aiPerceptionConst(ally).?;
+    try testing.expect(!ally_perception.target_visible);
+    try testing.expectEqual(EntityId.invalid, ally_perception.nearest_threat);
+}
+
+test "gapped think set two-pointer assigns spatial_self_index for both observers" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+
+    // Halo [A, B, C]; think [A, C] with off-phase B between them. Both on-phase
+    // allies face the middle hostile.
+    const a = try addObserver(&data, 0, 0, 100, 0, .ally, .{});
+    const b = try addObserver(&data, 40, 0, 0, 0, .hostile, .{});
+    const c = try addObserver(&data, 80, 0, -100, 0, .ally, .{});
+
+    const halo = [_]u32{ 0, 1, 2 };
+    const think = [_]u32{ 0, 2 };
+    var spatial_sys = SpatialIndexSystem.init(testing.allocator);
+    defer spatial_sys.deinit();
+    try spatial_sys.reserve(data.aiAgentSliceConst().entities.len, .{});
+    _ = try spatial_sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{ .scope_dense_indices = &halo });
+
+    var world = try minimalWorld(testing.allocator, 8, 8, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+        .scope_dense_indices = &think,
+        .candidate_dense_indices = &halo,
+    });
+
+    try testing.expectEqual(@as(usize, 2), stats.observer_count);
+    try testing.expectEqual(@as(usize, 3), stats.candidate_population_count);
+    const self_index = sys.rows.slice().items(.spatial_self_index);
+    try testing.expectEqual(@as(usize, 0), self_index[0]);
+    try testing.expectEqual(@as(usize, 2), self_index[1]);
+
+    try testing.expect(data.aiPerceptionConst(a).?.target_visible);
+    try testing.expectEqual(b.index, data.aiPerceptionConst(a).?.nearest_threat.index);
+    try testing.expect(data.aiPerceptionConst(c).?.target_visible);
+    try testing.expectEqual(b.index, data.aiPerceptionConst(c).?.nearest_threat.index);
+    try testing.expect(!data.aiPerceptionConst(b).?.target_visible);
 }
 
 test "candidate outside vision_range is never selected" {
@@ -2185,13 +1859,13 @@ test "LOS gating skips a blocked nearer candidate in favor of a farther clear on
     const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
     const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
     // Wall at cell (1, 0): blocks the straight path from the observer to the
-    // nearer candidate but not the diagonal path to the farther one (the
-    // diagonal ray drops into row 1 before it reaches column 1).
+    // nearer candidate but not the straight path down column 0 to the farther
+    // one. (A diagonal to (2, 2) would graze the wall's corner and be blocked.)
     _ = try world.setDenseTile(layer, 1, 0, tree);
 
     const tile_size = world.tile_size;
     const nearer_blocked = try addAgent(&data, tile_size * 2.5, tile_size * 0.5, 0, 0, .hostile);
-    const farther_clear = try addAgent(&data, tile_size * 2.5, tile_size * 2.5, 0, 0, .hostile);
+    const farther_clear = try addAgent(&data, tile_size * 0.5, tile_size * 3.5, 0, 0, .hostile);
     const observer = try addObserver(&data, tile_size * 0.5, tile_size * 0.5, 1, 1, .player, .{
         .fov_half_angle_radians = std.math.pi / 2.0,
         .vision_range = tile_size * 10,
@@ -2268,463 +1942,321 @@ test "LOS blocks a diagonal ray through a mid-segment occluder's interior, not j
     try testing.expectEqual(EntityId.invalid.index, perception.nearest_threat.index);
 }
 
-test "LevelBlockedSlot cache lookup matches WorldSystem.levelBlocksMovement exactly: dense-blocked, sparse-blocked, open, out-of-range level, out-of-range cell" {
-    // Real asset-backed tileset (same pattern as the LOS gating test above):
-    // a synthetic tile id has no catalog entry, so a real "blocks movement"
-    // tile needs the real tileset metadata rather than a hand-poked
-    // WorldSystem.
+const WorldTilesetMeta = @import("../../assets/world_tileset_meta.zig").WorldTilesetMeta;
+const ChunkForm = @import("../world_terrain.zig").ChunkForm;
+
+fn loadTestTilesetMeta() !WorldTilesetMeta {
     const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
-    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+    return @import("../../assets/world_tileset_meta.zig").load(
         testing.allocator,
         asset_store,
         @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
     );
-    defer meta.deinit();
-
-    // A large bounds keeps this test's small (cells 0..4) coordinate area
-    // away from `initDemoFromMeta`'s own fixed demo obstacles (see the LOS
-    // gating test's comment), and its mid-cross dense path pattern (which
-    // only touches the exact middle row/column), so the only blocking cells
-    // in play are the two this test adds below.
-    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
-    defer world.deinit();
-    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
-    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
-    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
-    _ = try world.setDenseTile(layer, 1, 1, tree); // dense-blocked cell
-    _ = try world.addSparseTile(0, 3, 3, tree, 0, .obstacle); // sparse-blocked cell
-
-    var sys = PerceptionSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.ensureLevelBlockedCache(&world, 0);
-    // Also build a slot for a level that does not exist in `world` (only
-    // level 0 was added), so the fail-closed check below exercises
-    // `LevelBlockedSlot.valid == false` directly, not just the cheaper
-    // `level >= level_blocked.len` early-out (both must fail-closed).
-    try sys.ensureLevelBlockedCache(&world, 1);
-
-    const Case = struct { level: u16, x: u16, y: u16 };
-    const cases = [_]Case{
-        .{ .level = 0, .x = 1, .y = 1 }, // dense-blocked
-        .{ .level = 0, .x = 3, .y = 3 }, // sparse-blocked
-        .{ .level = 0, .x = 4, .y = 4 }, // open
-        .{ .level = 1, .x = 0, .y = 0 }, // built but invalid (world has only level 0)
-        .{ .level = 2, .x = 0, .y = 0 }, // never built: out-of-range level_blocked index
-        .{ .level = 0, .x = world.width, .y = 0 }, // out-of-range x
-        .{ .level = 0, .x = 0, .y = world.height }, // out-of-range y
-    };
-    for (cases) |c| {
-        const expected = world.levelBlocksMovement(c.level, c.x, c.y);
-        const actual = lookupLevelBlocked(sys.level_blocked.items, c.level, c.x, c.y);
-        try testing.expectEqual(expected, actual);
-    }
 }
 
-test "ensureLevelBlockedCache self-heals once a level queried before it existed is actually added" {
-    // No addLevel call yet: levelCount() == 0, so level 0 is out of range at
-    // the moment of this first touch.
+const ChunkedObstacleWorld = struct { world: WorldSystem, layer: usize };
+
+// One level in `chunk_size_tiles` chunks with an all-open obstacle layer, so
+// multi-chunk LOS tests shrink the chunk rather than grow the world.
+fn chunkedObstacleWorld(meta: *const WorldTilesetMeta, width: u16, height: u16, chunk_size_tiles: u16) !ChunkedObstacleWorld {
     var world = WorldSystem{
         .allocator = testing.allocator,
-        .width = 4,
-        .height = 4,
-        .tile_size = 32,
-        .chunk_size_tiles = 4,
+        .width = width,
+        .height = height,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = chunk_size_tiles,
     };
-    defer world.deinit();
-
-    var sys = PerceptionSystem.init(testing.allocator);
-    defer sys.deinit();
-
-    try sys.ensureLevelBlockedCache(&world, 0);
-    try testing.expect(!sys.level_blocked.items[0].valid);
-    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 0, 0)); // fail-closed
-
-    // Level added post-init (a future caller calling WorldSystem.addLevel
-    // after startup).
-    _ = try world.addLevel(0);
-
-    // A later step's touch must retry a full rebuild and recover, not stay
-    // permanently fail-closed.
-    sys.step_counter += 1;
-    try sys.ensureLevelBlockedCache(&world, 0);
-    try testing.expect(sys.level_blocked.items[0].valid);
-    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 0, 0, 0)); // real, open tile data
+    errdefer world.deinit();
+    try world.buildCatalog(meta);
+    const level = try world.addLevel(0);
+    const layer = try world.addDenseLayer(level, 0, .obstacle, try world.requireTileByName(meta, "grass"));
+    return .{ .world = world, .layer = layer };
 }
 
-test "prebuildLevelCaches builds every existing level once, so a later per-step touch reuses rather than rebuilding" {
-    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
-    var meta = try @import("../../assets/world_tileset_meta.zig").load(
-        testing.allocator,
-        asset_store,
-        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
-    );
+// Reference LOS: blocked when a cell that touches the closed segment at some
+// t in (0, 1] blocks movement on `level`, skipping the observer's own cell
+// unless the target shares it. That is the supercover past the observer:
+// corner side cells and the cells across a grid line the ray runs along count.
+fn bruteForceLineOfSight(world: *const WorldSystem, level: u16, ox: f32, oy: f32, tx: f32, ty: f32) bool {
+    if (ox == tx and oy == ty) return true;
+    const start = world.cellContaining(ox, oy).?;
+    const end = world.cellContaining(tx, ty).?;
+    const same_cell = start.x == end.x and start.y == end.y;
+    const tile: f64 = world.tile_size;
+    const origin = [2]f64{ ox, oy };
+    const delta = [2]f64{ @as(f64, tx) - ox, @as(f64, ty) - oy };
+    // One cell of margin covers the cells across a grid line.
+    const min_x = @as(usize, @min(start.x, end.x)) -| 1;
+    const min_y = @as(usize, @min(start.y, end.y)) -| 1;
+    const max_x = @min(@as(usize, @max(start.x, end.x)) + 1, @as(usize, world.width) - 1);
+    const max_y = @min(@as(usize, @max(start.y, end.y)) + 1, @as(usize, world.height) - 1);
+    for (min_y..max_y + 1) |y| {
+        for (min_x..max_x + 1) |x| {
+            if (!same_cell and x == start.x and y == start.y) continue;
+            const cell_min = [2]f64{ @as(f64, @floatFromInt(x)) * tile, @as(f64, @floatFromInt(y)) * tile };
+            if (!segmentTouchesCell(origin, delta, cell_min, tile)) continue;
+            if (world.levelBlocksMovement(level, @intCast(x), @intCast(y))) return false;
+        }
+    }
+    return true;
+}
+
+// Whether `origin + t * delta` touches the closed cell box at some t in (0, 1].
+// The entry and exit bounds are fractions (distance / |delta|) compared by
+// cross-multiplication, exact for cell-aligned endpoints.
+fn segmentTouchesCell(origin: [2]f64, delta: [2]f64, cell_min: [2]f64, tile: f64) bool {
+    var enter_distance: f64 = 0;
+    var enter_extent: f64 = 1;
+    var exit_distance: f64 = 1;
+    var exit_extent: f64 = 1;
+    for (0..2) |axis| {
+        const low = cell_min[axis] - origin[axis];
+        const high = low + tile;
+        const d = delta[axis];
+        if (d == 0) {
+            if (low > 0 or high < 0) return false;
+            continue;
+        }
+        const entry = if (d > 0) low else -high;
+        const exit = if (d > 0) high else -low;
+        const extent = @abs(d);
+        if (entry * enter_extent > enter_distance * extent) {
+            enter_distance = entry;
+            enter_extent = extent;
+        }
+        if (exit * exit_extent < exit_distance * extent) {
+            exit_distance = exit;
+            exit_extent = extent;
+        }
+    }
+    return exit_distance > 0 and enter_distance * exit_extent <= exit_distance * enter_extent;
+}
+
+// Whether the segment's line passes within `epsilon` pixels of a grid corner in
+// its cell bounding box: for random (not cell-aligned) endpoints the walk and the
+// reference may round a near-graze differently, so the parity test skips the ray.
+fn rayGrazesGridCorner(world: *const WorldSystem, ox: f32, oy: f32, tx: f32, ty: f32, epsilon: f64) bool {
+    const start = world.cellContaining(ox, oy).?;
+    const end = world.cellContaining(tx, ty).?;
+    const tile: f64 = world.tile_size;
+    const dx = @as(f64, tx) - ox;
+    const dy = @as(f64, ty) - oy;
+    const length = @sqrt(dx * dx + dy * dy);
+    if (length == 0) return false;
+    for (@min(start.y, end.y)..@as(usize, @max(start.y, end.y)) + 2) |gy| {
+        for (@min(start.x, end.x)..@as(usize, @max(start.x, end.x)) + 2) |gx| {
+            const px = @as(f64, @floatFromInt(gx)) * tile - ox;
+            const py = @as(f64, @floatFromInt(gy)) * tile - oy;
+            if (@abs(dx * py - dy * px) / length < epsilon) return true;
+        }
+    }
+    return false;
+}
+
+test "a same-step blocking edit between observer and target occludes LOS with no reaction; clearing it restores LOS" {
+    var meta = try loadTestTilesetMeta();
     defer meta.deinit();
+    var fixture = try chunkedObstacleWorld(&meta, 16, 16, 4);
+    defer fixture.world.deinit();
+    const world = &fixture.world;
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    const grass = try world.requireTileByName(&meta, "grass");
 
-    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
-    defer world.deinit();
-    _ = try world.addLevel(1);
-    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
-    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
-    const layer0 = try world.addDenseLayer(0, 0, .obstacle, grass);
-    const layer1 = try world.addDenseLayer(1, 0, .obstacle, grass);
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const tile_size = world.tile_size;
+    // Observer in cell (1, 1), target in cell (6, 1): the ray crosses the chunk
+    // border at x = 4, where the edit lands.
+    _ = try addAgent(&data, tile_size * 6.5, tile_size * 1.5, 0, 0, .hostile);
+    const observer = try addObserver(&data, tile_size * 1.5, tile_size * 1.5, 10, 0, .player, .{
+        .fov_half_angle_radians = std.math.pi / 2.0,
+        .vision_range = tile_size * 10,
+    });
 
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
     var sys = PerceptionSystem.init(testing.allocator);
     defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
 
-    try sys.prebuildLevelCaches(&world);
-    try testing.expect(sys.level_blocked.items[0].valid);
-    try testing.expect(sys.level_blocked.items[1].valid);
-    try testing.expect(sys.level_blocked.items[0].built_step != invalid_build_step);
-    try testing.expect(sys.level_blocked.items[1].built_step != invalid_build_step);
-    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 0, 2, 2));
-    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 1, 2, 2));
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
+    try testing.expect(data.aiPerceptionConst(observer).?.target_visible);
 
-    // Mutate both levels' worlds directly, never reporting either edit as
-    // dirty (mirrors the "never reported as dirty" trick the full-rebuild
-    // fallback test above uses): if the next per-step touch silently redid a
-    // full rebuild instead of reusing the prebuilt cache, it would pick this
-    // up; if it correctly takes the cheap "nothing changed" path, it won't.
-    _ = try world.setDenseTile(layer0, 2, 2, tree);
-    _ = try world.setDenseTile(layer1, 2, 2, tree);
+    // The edit is the only thing between the two updates: no event, no reaction.
+    _ = (try world.setDenseTile(fixture.layer, 4, 1, tree)) orelse return error.TestExpectedEqual;
+    events.clearRetainingCapacity();
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
+    try testing.expect(!data.aiPerceptionConst(observer).?.target_visible);
 
-    sys.step_counter += 1;
-    try sys.ensureLevelBlockedCache(&world, 0);
-    try sys.ensureLevelBlockedCache(&world, 1);
-    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 0, 2, 2));
-    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 1, 2, 2));
+    _ = (try world.setDenseTile(fixture.layer, 4, 1, grass)) orelse return error.TestExpectedEqual;
+    events.clearRetainingCapacity();
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
+    try testing.expect(data.aiPerceptionConst(observer).?.target_visible);
 }
 
-// Shared parity check for the dirty-tracked patch/skip/fallback tests below:
-// a fresh `PerceptionSystem`'s first (always full-rebuild) build against the
-// same `world`/`level` state is the ground truth every patched result must
-// match bit-for-bit.
-fn expectLevelBlockedMatchesFreshRebuild(sys: *PerceptionSystem, world: *const WorldSystem, level: u16) !void {
-    var fresh = PerceptionSystem.init(testing.allocator);
-    defer fresh.deinit();
-    try fresh.ensureLevelBlockedCache(world, level);
+// A point at the center of cell (x, y) in tile units, or on its top (left) grid
+// line when `on_line` is .y (.x).
+fn cellAlignedPoint(tile: f32, x: u16, y: u16, on_line: enum { none, x, y }) [2]f32 {
+    const fx: f32 = @floatFromInt(x);
+    const fy: f32 = @floatFromInt(y);
+    return .{
+        (if (on_line == .x) fx else fx + 0.5) * tile,
+        (if (on_line == .y) fy else fy + 0.5) * tile,
+    };
+}
 
-    var y: u16 = 0;
-    while (y < world.height) : (y += 1) {
-        var x: u16 = 0;
-        while (x < world.width) : (x += 1) {
-            const expected = lookupLevelBlocked(fresh.level_blocked.items, level, x, y);
-            const actual = lookupLevelBlocked(sys.level_blocked.items, level, x, y);
-            try testing.expectEqual(expected, actual);
+test "the LOS walk equals a brute-force supercover over levelBlocksMovement on random and cell-aligned rays across chunk borders" {
+    var meta = try loadTestTilesetMeta();
+    defer meta.deinit();
+    // 42 is not a multiple of the chunk edge: the right and bottom border chunks
+    // are partial.
+    const side: u16 = 42;
+    const chunk_size_tiles: u16 = 4;
+    var fixture = try chunkedObstacleWorld(&meta, side, side, chunk_size_tiles);
+    defer fixture.world.deinit();
+    const world = &fixture.world;
+    const tree = try world.requireTileByName(&meta, "tree_0");
+
+    var prng = std.Random.DefaultPrng.init(0x64_6e_31);
+    const random = prng.random();
+    // Mixed chunks: scattered dense blockers plus sparse blockers.
+    for (0..side) |y| {
+        for (0..side) |x| {
+            if (random.float(f32) < 0.12) _ = try world.setDenseTile(fixture.layer, @intCast(x), @intCast(y), tree);
+        }
+    }
+    for (0..30) |_| {
+        _ = try world.addSparseTile(0, random.uintLessThan(u16, side), random.uintLessThan(u16, side), tree, 0, .obstacle);
+    }
+    // Fully blocked chunks next to open ones, so rays cross every chunk form.
+    for ([_][2]u16{ .{ 2, 2 }, .{ 7, 5 }, .{ 3, 8 } }) |chunk| {
+        for (0..chunk_size_tiles) |dy| {
+            for (0..chunk_size_tiles) |dx| {
+                const x: u16 = chunk[0] * chunk_size_tiles + @as(u16, @intCast(dx));
+                const y: u16 = chunk[1] * chunk_size_tiles + @as(u16, @intCast(dy));
+                _ = try world.setDenseTile(fixture.layer, x, y, tree);
+            }
+        }
+    }
+    var form_counts = std.EnumArray(ChunkForm, usize).initFill(0);
+    for (0..world.chunkCountPerLevel()) |chunk| form_counts.getPtr(world.levelChunkBlockedForm(0, @intCast(chunk))).* += 1;
+    for (form_counts.values) |count| try testing.expect(count > 0);
+
+    const extent = @as(f32, @floatFromInt(side)) * world.tile_size;
+    var checked: usize = 0;
+    var visible: usize = 0;
+    const ray_count: usize = 1000;
+    for (0..ray_count) |_| {
+        const ox = random.float(f32) * extent;
+        const oy = random.float(f32) * extent;
+        const tx = random.float(f32) * extent;
+        const ty = random.float(f32) * extent;
+        if (rayGrazesGridCorner(world, ox, oy, tx, ty, 0.01)) continue;
+        const expected = bruteForceLineOfSight(world, 0, ox, oy, tx, ty);
+        try testing.expectEqual(expected, hasLineOfSight(world, 0, ox, oy, tx, ty));
+        checked += 1;
+        visible += @intFromBool(expected);
+    }
+    try testing.expect(checked > ray_count * 9 / 10);
+    try testing.expect(visible > 0 and visible < checked);
+
+    // Cell-aligned rays hit exact ties: centers with odd x and y cell deltas
+    // cross a grid corner, and rays along a grid line touch the cells across it.
+    // Each runs both ways; with both endpoint cells open the result is symmetric.
+    var corner_rays: usize = 0;
+    var aligned_visible: usize = 0;
+    var aligned_blocked: usize = 0;
+    for (0..600) |ray_index| {
+        const kind = ray_index % 3;
+        const ax = random.uintLessThan(u16, side);
+        const ay = random.uintLessThan(u16, side);
+        var bx = random.uintLessThan(u16, side);
+        var by = random.uintLessThan(u16, side);
+        if (kind == 1) by = ay;
+        if (kind == 2) bx = ax;
+        const a = switch (kind) {
+            0 => cellAlignedPoint(world.tile_size, ax, ay, .none),
+            1 => cellAlignedPoint(world.tile_size, ax, ay, .y),
+            else => cellAlignedPoint(world.tile_size, ax, ay, .x),
+        };
+        const b = switch (kind) {
+            0 => cellAlignedPoint(world.tile_size, bx, by, .none),
+            1 => cellAlignedPoint(world.tile_size, bx, by, .y),
+            else => cellAlignedPoint(world.tile_size, bx, by, .x),
+        };
+        if (kind == 0 and (bx -% ax) % 2 == 1 and (by -% ay) % 2 == 1) corner_rays += 1;
+        const forward = hasLineOfSight(world, 0, a[0], a[1], b[0], b[1]);
+        const backward = hasLineOfSight(world, 0, b[0], b[1], a[0], a[1]);
+        try testing.expectEqual(bruteForceLineOfSight(world, 0, a[0], a[1], b[0], b[1]), forward);
+        try testing.expectEqual(bruteForceLineOfSight(world, 0, b[0], b[1], a[0], a[1]), backward);
+        const a_cell = world.cellContaining(a[0], a[1]).?;
+        const b_cell = world.cellContaining(b[0], b[1]).?;
+        if (!world.levelBlocksMovement(0, a_cell.x, a_cell.y) and !world.levelBlocksMovement(0, b_cell.x, b_cell.y)) {
+            try testing.expectEqual(forward, backward);
+        }
+        if (forward) aligned_visible += 1 else aligned_blocked += 1;
+    }
+    try testing.expect(corner_rays > 0);
+    try testing.expect(aligned_visible > 0 and aligned_blocked > 0);
+}
+
+test "LOS through an exact grid corner or along a grid line is blocked by either side cell, in both directions" {
+    var meta = try loadTestTilesetMeta();
+    defer meta.deinit();
+    var fixture = try chunkedObstacleWorld(&meta, 8, 8, 4);
+    defer fixture.world.deinit();
+    const world = &fixture.world;
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    const grass = try world.requireTileByName(&meta, "grass");
+    const tile = world.tile_size;
+
+    const Case = struct { a: [2]f32, b: [2]f32, side_cells: []const [2]u16 };
+    const cases = [_]Case{
+        // 45 degrees, cell centers (1, 1) -> (3, 3): corners (2, 2) and (3, 3).
+        .{ .a = .{ 1.5, 1.5 }, .b = .{ 3.5, 3.5 }, .side_cells = &.{ .{ 1, 2 }, .{ 2, 1 }, .{ 2, 3 }, .{ 3, 2 } } },
+        // Slope 1/2 through the corner (2, 2).
+        .{ .a = .{ 0.5, 1.25 }, .b = .{ 4.5, 3.25 }, .side_cells = &.{ .{ 2, 1 }, .{ 1, 2 } } },
+        // Along the horizontal grid line y = 2: rows 2 and 1 both touch it.
+        .{ .a = .{ 1.5, 2 }, .b = .{ 5.5, 2 }, .side_cells = &.{ .{ 3, 1 }, .{ 3, 2 }, .{ 1, 1 }, .{ 5, 1 } } },
+        // Along the vertical grid line x = 2: columns 2 and 1 both touch it.
+        .{ .a = .{ 2, 1.5 }, .b = .{ 2, 5.5 }, .side_cells = &.{ .{ 1, 3 }, .{ 2, 3 }, .{ 1, 1 }, .{ 1, 5 } } },
+    };
+    for (cases) |case| {
+        const ax = case.a[0] * tile;
+        const ay = case.a[1] * tile;
+        const bx = case.b[0] * tile;
+        const by = case.b[1] * tile;
+        try testing.expect(hasLineOfSight(world, 0, ax, ay, bx, by));
+        try testing.expect(hasLineOfSight(world, 0, bx, by, ax, ay));
+        for (case.side_cells) |cell| {
+            _ = (try world.setDenseTile(fixture.layer, cell[0], cell[1], tree)) orelse return error.TestExpectedEqual;
+            try testing.expect(!hasLineOfSight(world, 0, ax, ay, bx, by));
+            try testing.expect(!hasLineOfSight(world, 0, bx, by, ax, ay));
+            try testing.expect(!bruteForceLineOfSight(world, 0, ax, ay, bx, by));
+            _ = (try world.setDenseTile(fixture.layer, cell[0], cell[1], grass)) orelse return error.TestExpectedEqual;
         }
     }
 }
 
-test "patch: single dense-tile flip (open->blocked and blocked->open) matches a fresh full rebuild" {
-    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
-    var meta = try @import("../../assets/world_tileset_meta.zig").load(
-        testing.allocator,
-        asset_store,
-        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
-    );
-    defer meta.deinit();
-
-    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+test "LOS sees a target farther than 64 cells on open terrain" {
+    var world = try minimalWorld(testing.allocator, 160, 1, 32);
     defer world.deinit();
-    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
-    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
-    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
-
-    var sys = PerceptionSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.ensureLevelBlockedCache(&world, 0); // first build: obstacle layer all-open
-
-    var frame = SimulationFrame.init(testing.allocator);
-    defer frame.deinit();
-
-    // Open -> blocked.
-    const changed = (try world.setDenseTile(layer, 2, 2, tree)) orelse return error.TestExpectedEqual;
-    try testing.expect(changed.old_blocks_movement != changed.new_blocks_movement);
-    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
-    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
-    sys.step_counter += 1;
-    try sys.ensureLevelBlockedCache(&world, 0); // patch
-    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 2, 2));
-    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
-
-    // Blocked -> open: proves the patch memsets false first rather than only
-    // ever setting bits true.
-    frame.events.clearRetainingCapacity();
-    const changed_back = (try world.setDenseTile(layer, 2, 2, grass)) orelse return error.TestExpectedEqual;
-    try testing.expect(changed_back.old_blocks_movement != changed_back.new_blocks_movement);
-    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed_back } });
-    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
-    sys.step_counter += 1;
-    try sys.ensureLevelBlockedCache(&world, 0); // patch
-    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 0, 2, 2));
-    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
+    // 150 cells along one row, across ten chunks, in both directions.
+    try testing.expect(hasLineOfSight(&world, 0, 16, 16, 150.5 * 32, 16));
+    try testing.expect(hasLineOfSight(&world, 0, 150.5 * 32, 16, 16, 16));
 }
 
-test "patch: single sparse-tile add matches a fresh full rebuild" {
-    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
-    var meta = try @import("../../assets/world_tileset_meta.zig").load(
-        testing.allocator,
-        asset_store,
-        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
-    );
-    defer meta.deinit();
-
-    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+test "LOS fails closed on an out-of-range level" {
+    var world = try minimalWorld(testing.allocator, 32, 32, 32);
     defer world.deinit();
-    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
-
-    var sys = PerceptionSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.ensureLevelBlockedCache(&world, 0); // first build
-
-    const changed = (try world.addSparseTile(0, 5, 5, tree, 0, .obstacle)) orelse return error.TestExpectedEqual;
-    var frame = SimulationFrame.init(testing.allocator);
-    defer frame.deinit();
-    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = changed } });
-    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
-    sys.step_counter += 1;
-    try sys.ensureLevelBlockedCache(&world, 0); // patch
-
-    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 5, 5));
-    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
-}
-
-test "patch: a sparse tile's blocking removal (simulated -- WorldSystem has no removal API) matches a fresh full rebuild of the post-removal world" {
-    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
-    var meta = try @import("../../assets/world_tileset_meta.zig").load(
-        testing.allocator,
-        asset_store,
-        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
-    );
-    defer meta.deinit();
-    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
-
-    // "Before": a real sparse blocking tile at (6, 6).
-    var world_before = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
-    defer world_before.deinit();
-    _ = try world_before.addSparseTile(0, 6, 6, tree, 0, .obstacle);
-
-    var sys = PerceptionSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.ensureLevelBlockedCache(&world_before, 0); // first build: (6,6) blocked
-    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 6, 6));
-
-    // "After": sparse tiles are append-only (`addSparseTile`'s doc comment on
-    // `sparse_level_tiles` -- never removed, never reassigned), so there is no
-    // API call that un-blocks (6,6) on `world_before`. This builds the
-    // post-removal world state directly instead, and marks the cell dirty
-    // against it -- proving the patch path correctly clears a bit (not just
-    // sets one) when the causing world state genuinely no longer blocks.
-    var world_after = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
-    defer world_after.deinit();
-
-    var frame = SimulationFrame.init(testing.allocator);
-    defer frame.deinit();
-    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{
-        .level = 0,
-        .min_x = 6,
-        .min_y = 6,
-        .max_x_exclusive = 7,
-        .max_y_exclusive = 7,
-    } } });
-    try sys.reactToPostCommitPerceptionEvents(&frame, &world_after);
-    sys.step_counter += 1;
-    try sys.ensureLevelBlockedCache(&world_after, 0); // patch against the post-removal world
-
-    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 0, 6, 6));
-    try expectLevelBlockedMatchesFreshRebuild(&sys, &world_after, 0);
-}
-
-test "patch: a multi-cell world_obstacle_changed rect matches a fresh full rebuild" {
-    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
-    var meta = try @import("../../assets/world_tileset_meta.zig").load(
-        testing.allocator,
-        asset_store,
-        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
-    );
-    defer meta.deinit();
-
-    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
-    defer world.deinit();
-    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
-    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
-    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
-
-    var sys = PerceptionSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.ensureLevelBlockedCache(&world, 0); // first build: obstacle layer all-open
-
-    const min_x: u16 = 2;
-    const min_y: u16 = 2;
-    const max_x_exclusive: u16 = 6;
-    const max_y_exclusive: u16 = 6;
-    var yy: u16 = min_y;
-    while (yy < max_y_exclusive) : (yy += 1) {
-        var xx: u16 = min_x;
-        while (xx < max_x_exclusive) : (xx += 1) {
-            _ = try world.setDenseTile(layer, xx, yy, tree);
-        }
+    // Level 0 is open: a multi-cell and a same-cell ray both see.
+    try testing.expect(hasLineOfSight(&world, 0, 16, 16, 20.5 * 32, 7.5 * 32));
+    try testing.expect(hasLineOfSight(&world, 0, 16, 16, 20, 20));
+    for ([_]u16{ 1, std.math.maxInt(u16) }) |level| {
+        try testing.expect(!hasLineOfSight(&world, level, 16, 16, 20.5 * 32, 7.5 * 32));
+        try testing.expect(!hasLineOfSight(&world, level, 16, 16, 20, 20));
     }
-    var frame = SimulationFrame.init(testing.allocator);
-    defer frame.deinit();
-    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{
-        .level = 0,
-        .min_x = min_x,
-        .min_y = min_y,
-        .max_x_exclusive = max_x_exclusive,
-        .max_y_exclusive = max_y_exclusive,
-    } } });
-    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
-    sys.step_counter += 1;
-    try sys.ensureLevelBlockedCache(&world, 0); // patch
-
-    yy = min_y;
-    while (yy < max_y_exclusive) : (yy += 1) {
-        var xx: u16 = min_x;
-        while (xx < max_x_exclusive) : (xx += 1) {
-            try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, xx, yy));
-        }
-    }
-    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
-}
-
-test "patch: dirty rects accumulated across several untouched steps still patch correctly once the level is finally touched" {
-    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
-    var meta = try @import("../../assets/world_tileset_meta.zig").load(
-        testing.allocator,
-        asset_store,
-        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
-    );
-    defer meta.deinit();
-
-    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
-    defer world.deinit();
-    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
-    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
-    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
-
-    var sys = PerceptionSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.ensureLevelBlockedCache(&world, 0); // first build
-
-    var frame = SimulationFrame.init(testing.allocator);
-    defer frame.deinit();
-
-    // Three edits, each its own reactToPostCommitPerceptionEvents call with no
-    // intervening ensureLevelBlockedCache -- simulates three simulation steps
-    // where no observer looked at this level in between, so pending_dirty
-    // accumulates across all three rather than being drained per step (the
-    // key behavioral difference from `PathfindingSystem.nav_dirty_edits`).
-    const cells = [_][2]u16{ .{ 1, 1 }, .{ 2, 2 }, .{ 3, 3 } };
-    for (cells) |c| {
-        frame.events.clearRetainingCapacity();
-        const changed = (try world.setDenseTile(layer, c[0], c[1], tree)) orelse return error.TestExpectedEqual;
-        try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
-        try sys.reactToPostCommitPerceptionEvents(&frame, &world);
-    }
-    try testing.expectEqual(@as(usize, 3), sys.level_blocked.items[0].pending_dirty.items.len);
-
-    sys.step_counter += 1;
-    try sys.ensureLevelBlockedCache(&world, 0); // one patch call applies all 3 accumulated rects
-
-    for (cells) |c| try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, c[0], c[1]));
-    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
-    try testing.expectEqual(@as(usize, 0), sys.level_blocked.items[0].pending_dirty.items.len);
-}
-
-test "patch: dirty rects recorded before a level's first build are discarded, not replayed as a patch" {
-    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
-    var meta = try @import("../../assets/world_tileset_meta.zig").load(
-        testing.allocator,
-        asset_store,
-        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
-    );
-    defer meta.deinit();
-
-    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
-    defer world.deinit();
-    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
-    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
-    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
-    // A second blocking cell OUTSIDE the dirty rect below, already part of the
-    // world before this level's first build ever runs: only a real full scan
-    // (not a naive "patch just the dirty rect on first build" shortcut) would
-    // pick this up.
-    _ = try world.setDenseTile(layer, 9, 9, tree) orelse return error.TestExpectedEqual;
-
-    var sys = PerceptionSystem.init(testing.allocator);
-    defer sys.deinit();
-
-    // Mark a cell dirty BEFORE this level has ever been built -- no observer
-    // has looked at level 0 yet, so `level_blocked` has no slot for it at all
-    // (`markLevelDirty`/`levelBlockedSlot` grow one on demand).
-    const changed = (try world.setDenseTile(layer, 4, 4, tree)) orelse return error.TestExpectedEqual;
-    var frame = SimulationFrame.init(testing.allocator);
-    defer frame.deinit();
-    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
-    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
-    try testing.expectEqual(@as(usize, 1), sys.level_blocked.items[0].pending_dirty.items.len);
-
-    try sys.ensureLevelBlockedCache(&world, 0); // first-ever build: must reflect the whole world directly
-
-    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 4, 4));
-    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 9, 9));
-    try testing.expectEqual(@as(usize, 0), sys.level_blocked.items[0].pending_dirty.items.len);
-    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
-}
-
-test "patch: accumulated dirty area over the full-rebuild threshold falls back to a full rebuild" {
-    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
-    var meta = try @import("../../assets/world_tileset_meta.zig").load(
-        testing.allocator,
-        asset_store,
-        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
-    );
-    defer meta.deinit();
-
-    const tile_size = meta.tileSize();
-    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, tile_size * 16, tile_size * 16);
-    defer world.deinit();
-    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
-    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
-    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
-
-    var sys = PerceptionSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.ensureLevelBlockedCache(&world, 0); // first build: obstacle layer all-open
-
-    // A 9x9 rect (81 of 256 cells, ~31.6%) is over the 25% threshold, so the
-    // next ensureLevelBlockedCache call must fall back to a full rebuild
-    // rather than patch just this rect.
-    var yy: u16 = 0;
-    while (yy < 9) : (yy += 1) {
-        var xx: u16 = 0;
-        while (xx < 9) : (xx += 1) {
-            _ = try world.setDenseTile(layer, xx, yy, tree);
-        }
-    }
-    var frame = SimulationFrame.init(testing.allocator);
-    defer frame.deinit();
-    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{
-        .level = 0,
-        .min_x = 0,
-        .min_y = 0,
-        .max_x_exclusive = 9,
-        .max_y_exclusive = 9,
-    } } });
-    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
-
-    // An edit NEVER reported as dirty, far outside the reported rect: only a
-    // genuine full rebuild (not a per-rect patch, which would never look at
-    // this cell) picks this up too.
-    _ = try world.setDenseTile(layer, 15, 0, tree) orelse return error.TestExpectedEqual;
-
-    sys.step_counter += 1;
-    try sys.ensureLevelBlockedCache(&world, 0);
-
-    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 4, 4));
-    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 15, 0));
-    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
-    try testing.expectEqual(@as(usize, 0), sys.level_blocked.items[0].pending_dirty.items.len);
 }
 
 test "player-candidate detection: hostile player within vision/FOV becomes nearest_threat" {
@@ -2893,13 +2425,22 @@ test "PerceptionSystem enforces its own per-step event cap and records the drop 
     try testing.expectEqual(@as(usize, 1), stats.dropped_events);
     try testing.expectEqual(@as(usize, 1), events.mergedItems().len);
     try testing.expectEqual(@as(usize, 1), events.stats.dropped);
+    try testing.expect(sys.dropped_events_warned);
+
+    // The flag is once-only: a later capped step never clears it.
+    events.clearRetainingCapacity();
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+        .max_events_per_step = 1,
+    });
+    try testing.expect(sys.dropped_events_warned);
 }
 
 test "multi-range serial/threaded cap=1 keeps the same survivor under identity-swap + acquire" {
-    // M14: observer A identity-swaps (lost then perceived), observer B acquires.
+    // Observer A identity-swaps (lost then perceived), observer B acquires.
     // With multi-range dispatch and max_events_per_step=1, both serial and real
     // multi-worker threaded paths must keep the same single survivor event
-    // (range-ascending, within-range write order — the first of A's lost).
+    // (row order, `entity_lost` before `entity_perceived` within a row — A's
+    // lost, row 0's first write).
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // items_per_range is aligned up to perception_range_alignment_items (16), so
@@ -2978,8 +2519,8 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         ids.b_threat = try addAgent(data, 210, 0, 0, 0, .hostile);
     }
 
-    // Aligned range size with A..fillers in range 0 and B in range 1 so the cap
-    // merge walks ranges in order rather than a single serial buffer.
+    // Aligned range size with A..fillers in range 0 and B in range 1: the cap
+    // applies in row order after the join, regardless of the partition.
     const multi_range_cfg = PerceptionConfig{
         .items_per_range = range_items,
         .max_worker_threads = 2,
@@ -2994,7 +2535,8 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
     var serial_events = SimulationEvents.init(testing.allocator);
     defer serial_events.deinit();
     // updateSerial always uses range_count=1; drive serial through update with
-    // max_worker_threads=0 so the same multi-range merge path is exercised on both sides.
+    // max_worker_threads=0 so the same multi-range compute + row-order emit is
+    // exercised on both sides.
     var serial_threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0, .items_per_range = range_items });
     defer serial_threads.deinit();
     const serial_stats = try serial_sys.update(
@@ -3028,7 +2570,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         multi_range_cfg,
     );
 
-    // Both paths: multi-range, cap=1 survivor is A's entity_lost (first write in range 0).
+    // Both paths: multi-range, cap=1 survivor is A's entity_lost (row 0's first write).
     try testing.expect(serial_stats.batch.range_count > 1);
     try testing.expect(threaded_stats.batch.range_count > 1);
     try testing.expect(!threaded_stats.batch.ran_inline);
@@ -3140,12 +2682,8 @@ test "PerceptionSystem has no steady-state allocation after warmup (FailingAlloc
 
     const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 20, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 }};
 
-    // Warm up: one full serial run sizes every scratch buffer (candidates,
-    // rows, event range scratch, range_take_counts, and the per-level
-    // LOS-blocked bitmap cache) to steady state.
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
-    try testing.expect(sys.level_blocked.items.len > 0);
-    try testing.expect(sys.level_blocked.items[0].valid);
+    try sys.reserve(2);
+    try events.reserve(8, 8);
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const original_system_allocator = sys.allocator;
@@ -3157,35 +2695,79 @@ test "PerceptionSystem has no steady-state allocation after warmup (FailingAlloc
         events.stream.allocator = original_events_allocator;
     }
 
-    // The second run's ensureLevelBlockedCache call sees a step_counter
-    // mismatch (a new step ran) but no pending dirty rects (nothing called
-    // reactToPostCommitPerceptionEvents between the two runs), so it takes
-    // the skip branch rather than rebuilding — proving that path allocates
-    // nothing either. The dedicated patch-path FailingAllocator test below
-    // covers the case where a dirty rect actually is pending. `job.stimuli` is
-    // a borrowed slice, never copied, so passing it here adds no allocation.
+    // `job.stimuli` is a borrowed slice, never copied, so passing it here
+    // adds no allocation.
     const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
     try testing.expectEqual(@as(usize, 1), stats.observer_count);
     try testing.expect(data.aiPerceptionConst(data.aiAgentSliceConst().entities[0]).?.heard_stimulus);
 }
 
-test "PerceptionSystem threaded update has no steady-state allocation after warmup, multi-range (FailingAllocator)" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
-    // Enough observers to force multiple ranges under items_per_range ==
-    // perception_range_alignment_items, exercising prepareEventRangeBuffers's
-    // and prepareRangeStats's multi-slot growth loops (only reachable when
-    // range_count > 1), which the serial-only proof above never touches.
+test "PerceptionSystem dual-list gather has no steady-state allocation after warmup (FailingAllocator)" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
-    for (0..40) |i| {
-        const fi: f32 = @floatFromInt(i);
-        const faction: Faction = if (i % 3 == 0) .hostile else .player;
-        _ = try addAgent(&data, fi * 6, 0, 0, 0, faction);
+    _ = try addObserver(&data, 0, 0, 100, 0, .ally, .{});
+    _ = try addObserver(&data, 40, 0, 0, 0, .hostile, .{});
+    _ = try addObserver(&data, 80, 0, -100, 0, .ally, .{});
+    _ = try addObserver(&data, 120, 0, 0, 0, .hostile, .{});
+
+    const halo = [_]u32{ 0, 1, 2, 3 };
+    const think = [_]u32{ 0, 2 };
+    var spatial_sys = SpatialIndexSystem.init(testing.allocator);
+    defer spatial_sys.deinit();
+    try spatial_sys.reserve(4, .{});
+    _ = try spatial_sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{ .scope_dense_indices = &halo });
+    var world = try minimalWorld(testing.allocator, 8, 8, 32);
+    defer world.deinit();
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+    const cfg: PerceptionConfig = .{
+        .scope_dense_indices = &think,
+        .candidate_dense_indices = &halo,
+    };
+
+    try sys.reserve(4);
+    try events.reserve(8, 8);
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const original_system_allocator = sys.allocator;
+    const original_events_allocator = events.stream.allocator;
+    sys.allocator = failing.allocator();
+    events.stream.allocator = failing.allocator();
+    defer {
+        sys.allocator = original_system_allocator;
+        events.stream.allocator = original_events_allocator;
     }
-    for (0..40) |i| {
-        const fi: f32 = @floatFromInt(i);
-        _ = try addObserver(&data, fi * 6 + 3, 4, 1, 1, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100, .hearing_range = 5 });
+
+    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, cfg);
+    try testing.expectEqual(@as(usize, 2), stats.observer_count);
+    try testing.expectEqual(@as(usize, 4), stats.candidate_population_count);
+    try testing.expectEqual(@as(usize, 4), sys.candidates.len);
+    try testing.expectEqual(@as(usize, 2), sys.rows.len);
+}
+
+test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // Nothing partition-sized is left to reserve, so `reserve`
+    // alone (no warm step) covers the tuner's 64-item initial profile and the
+    // 16-item alignment floor on the real multi-worker path. 16 hostile
+    // non-observers on y = 0 and 96 `.player` observers on y = 10 facing -y:
+    // every observer acquires a hostile within 41 units on step 1. 96 rows
+    // put 32 in the 64-item partition's second range, which the old per-range
+    // event slots (reserved for 16 rows past slot 0) grew in-stage.
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    for (0..16) |h| {
+        const fh: f32 = @floatFromInt(h);
+        _ = try addAgent(&data, fh * 80, 0, 0, 0, .hostile);
+    }
+    const observer_total: usize = 96;
+    for (0..observer_total) |j| {
+        const fj: f32 = @floatFromInt(j);
+        _ = try addObserver(&data, fj * 12.5, 10, 0, -10, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100, .hearing_range = 5 });
     }
 
     var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
@@ -3202,33 +2784,12 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 63, .y = 4 }, .intensity = 1, .kind = .dig, .level = 0 }};
-    const config = PerceptionConfig{
-        .items_per_range = perception_range_alignment_items,
-        .max_worker_threads = 2,
-        .adaptive = false,
-        .stimuli = &stimuli,
-    };
+    try sys.reserve(data.aiAgentSliceConst().entities.len);
+    try events.reserve(1, 256);
 
-    // Warm up: one full threaded run sizes every scratch buffer (candidates,
-    // rows, per-range event buffers, per-range stats, range_take_counts, and
-    // the per-level LOS-blocked bitmap cache) to steady state at range_count
-    // > 1.
-    const warmup_stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, config);
-    try testing.expect(warmup_stats.batch.range_count > 1);
-    try testing.expect(!warmup_stats.batch.ran_inline);
-    try testing.expect(warmup_stats.batch.active_worker_threads > 0);
-    try testing.expect(sys.level_blocked.items.len > 0);
-    try testing.expect(sys.level_blocked.items[0].valid);
-
-    // Mirror the real per-frame lifecycle (SimulationFrame.beginStep) that
-    // resets `events` to steady-state-retained-capacity before every step;
-    // without this, `events.range_stats`'s own first_range bookkeeping would
-    // keep growing across steps regardless of this system's allocation
-    // behavior, which is not what this proof is about.
-    events.clearRetainingCapacity();
-
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    // resize_fail_index = 0 also catches in-place growth (a resize/remap that
+    // would not count as an allocation).
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const original_system_allocator = sys.allocator;
     const original_events_allocator = events.stream.allocator;
     sys.allocator = failing.allocator();
@@ -3238,79 +2799,20 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
         events.stream.allocator = original_events_allocator;
     }
 
-    const stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, config);
-    try testing.expectEqual(@as(usize, 40), stats.observer_count);
-    try testing.expect(stats.batch.range_count > 1);
-    try testing.expect(!stats.batch.ran_inline);
-    try testing.expect(stats.batch.active_worker_threads > 0);
-}
-
-test "PerceptionSystem's dirty-tracked patch path has no steady-state allocation after warmup (FailingAllocator)" {
-    var data = DataSystem.init(testing.allocator);
-    defer data.deinit();
-    _ = try addObserver(&data, 0, 0, 10, 0, .player, .{});
-    _ = try addAgent(&data, 10, 0, 0, 0, .hostile);
-
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
-    defer spatial_sys.deinit();
-
-    // A real asset-backed tileset (same pattern as the LOS/parity tests
-    // above): the patch path's dense-layer rescan needs a real "blocks
-    // movement" tile, not a hand-poked `minimalWorld`.
-    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
-    var meta = try @import("../../assets/world_tileset_meta.zig").load(
-        testing.allocator,
-        asset_store,
-        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
-    );
-    defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
-    defer world.deinit();
-    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
-    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
-    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
-
-    var sys = PerceptionSystem.init(testing.allocator);
-    defer sys.deinit();
-    var events = SimulationEvents.init(testing.allocator);
-    defer events.deinit();
-    var frame = SimulationFrame.init(testing.allocator);
-    defer frame.deinit();
-
-    // Warm up: a full serial run sizes every scratch buffer (including
-    // `level_blocked`'s bitmap) to steady state, then several one-cell-edit
-    // patch cycles plateau `pending_dirty`'s capacity for level 0.
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
-    var cell_x: u16 = 20;
-    for (0..3) |_| {
-        frame.events.clearRetainingCapacity();
-        const changed = (try world.setDenseTile(layer, cell_x, 20, tree)) orelse return error.TestExpectedEqual;
-        try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
-        try sys.reactToPostCommitPerceptionEvents(&frame, &world);
-        _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
-        cell_x += 1;
+    const partitions = [_]usize{ perception_adaptive_tuner_config.initial_range_items, perception_range_alignment_items };
+    for (partitions, 0..) |items, step| {
+        // Mirrors `SimulationFrame.beginStep`'s per-step reset of `events`.
+        events.clearRetainingCapacity();
+        const stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, .{
+            .items_per_range = items,
+            .max_worker_threads = 2,
+            .adaptive = false,
+        });
+        try testing.expectEqual(observer_total, stats.observer_count);
+        try testing.expectEqual(rangeCount(observer_total, items), stats.batch.range_count);
+        try testing.expect(!stats.batch.ran_inline);
+        try testing.expect(stats.batch.active_worker_threads > 0);
+        if (step == 0) try testing.expectEqual(observer_total, stats.perceived_events);
     }
-    try testing.expect(sys.level_blocked.items[0].valid);
-
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    const original_system_allocator = sys.allocator;
-    const original_events_allocator = events.stream.allocator;
-    sys.allocator = failing.allocator();
-    events.stream.allocator = failing.allocator();
-    defer {
-        sys.allocator = original_system_allocator;
-        events.stream.allocator = original_events_allocator;
-    }
-
-    // One more same-shape edit (`pending_dirty`'s capacity already plateaued
-    // above, and `frame.events` keeps its own real allocator, since only
-    // `sys`'s dirty-tracking/cache allocations are under test here), then the
-    // update whose `ensureLevelBlockedCache` call must patch (not skip, not
-    // rebuild) without allocating.
-    frame.events.clearRetainingCapacity();
-    const changed = (try world.setDenseTile(layer, cell_x, 20, tree)) orelse return error.TestExpectedEqual;
-    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
-    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
-    try testing.expectEqual(@as(usize, 1), stats.observer_count);
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
 }

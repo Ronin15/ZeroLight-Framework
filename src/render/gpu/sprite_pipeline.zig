@@ -5,7 +5,6 @@
 const std = @import("std");
 const AssetStore = @import("../../assets/assets.zig").AssetStore;
 const log = @import("../../core/logging.zig").render;
-const sprite_batch = @import("../sprite_batch.zig");
 const sdl = @import("../../platform/sdl.zig");
 const c = sdl.c;
 const shader_paths = @import("shader_paths.zig");

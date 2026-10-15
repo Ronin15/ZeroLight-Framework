@@ -21,6 +21,7 @@ const EntityId = @import("data_system.zig").EntityId;
 const Player = @import("player.zig").Player;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const CollisionContact = @import("simulation.zig").CollisionContact;
+const contact_query = @import("contact_query.zig");
 
 const cooldown_capacity = 32;
 const cooldown_seconds: f32 = 0.14;
@@ -92,14 +93,16 @@ pub const AudioController = struct {
     /// spam the mixer. Contacts between two non-player entities never play a
     /// sound: at high population counts, NPC-vs-NPC contacts dominate mass
     /// pileups and would otherwise overload the mixer with simultaneous
-    /// collision triggers every step.
-    pub fn queueCollision(self: *AudioController, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, player_entity: EntityId, delta_seconds: f32) void {
+    /// collision triggers every step. `player_contacts` indexes `frame.contacts`: the contacts naming the player, in
+    /// contact order.
+    pub fn queueCollision(self: *AudioController, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, player_contacts: []const u32, delta_seconds: f32) void {
         self.tickCooldowns(delta_seconds);
-        for (frame.contacts.mergedItems()) |contact| {
-            if (!involvesEntity(contact, player_entity)) continue;
+        const contacts = frame.contacts.mergedItems();
+        for (player_contacts) |contact_index| {
+            const contact = contacts[contact_index];
             if (self.pairOnCooldown(contact.a, contact.b)) continue;
-            const position = contactAudioPosition(data, contact) orelse continue;
-            const gain = std.math.clamp(contact.penetration / 18.0, 0.25, 1.0);
+            const position = contact_query.midpoint(data, contact) orelse continue;
+            const gain = contact_query.penetrationScale(contact.penetration);
             const frequency_ratio = collisionSfxFrequencyRatio(contact);
             audio.playSfx(.{
                 .asset = collision_sfx,
@@ -171,20 +174,9 @@ pub const AudioController = struct {
     }
 };
 
-/// Whether `entity` is either side of `contact`.
-fn involvesEntity(contact: CollisionContact, entity: EntityId) bool {
-    return contact.a.eql(entity) or contact.b.eql(entity);
-}
-
-fn contactAudioPosition(data: *const DataSystem, contact: CollisionContact) ?math.Vec2 {
-    const a = data.movementBodyConst(contact.a) orelse return null;
-    const b = data.movementBodyConst(contact.b) orelse return null;
-    return .{
-        .x = (a.position.x + b.position.x) * 0.5,
-        .y = (a.position.y + b.position.y) * 0.5,
-    };
-}
-
+/// Deterministic per-contact pitch ratio for a collision SFX: hashes the contact's
+/// pair key, normal, and clamped penetration into one of nine buckets in
+/// [0.92, 1.08], so repeated hits vary in pitch without a random source.
 fn collisionSfxFrequencyRatio(contact: CollisionContact) f32 {
     var hash = CollisionSfxCooldown.keyFor(contact.a, contact.b);
     hash ^= hashBitsFromFloat(@abs(contact.normal_x) * 31.0);
@@ -297,6 +289,8 @@ fn contactFixture(a: EntityId, b: EntityId, penetration: f32) CollisionContact {
         .penetration = penetration,
     };
 }
+
+const contactsNaming = @import("systems/collision_response_test_support.zig").contactsNaming;
 
 fn countKind(commands: *const AudioCommandBuffer, comptime tag: std.meta.Tag(AudioCommand)) usize {
     var n: usize = 0;
@@ -455,7 +449,8 @@ test "queueCollision plays a sound for a contact involving the player" {
     var commands = AudioCommandBuffer.init(allocator, 8);
     defer commands.deinit();
     var controller = AudioController.init();
-    controller.queueCollision(&commands, &frame, &data, player_entity, 1.0 / 60.0);
+    var player_contacts: [4]u32 = undefined;
+    controller.queueCollision(&commands, &frame, &data, contactsNaming(&frame, player_entity, &player_contacts), 1.0 / 60.0);
 
     try std.testing.expectEqual(@as(usize, 1), commands.len());
     try std.testing.expectEqual(AudioAssetId.collision_sfx, commands.items()[0].play_sfx.asset);
@@ -480,7 +475,8 @@ test "queueCollision plays no sound for a contact between two non-player entitie
     var commands = AudioCommandBuffer.init(allocator, 8);
     defer commands.deinit();
     var controller = AudioController.init();
-    controller.queueCollision(&commands, &frame, &data, player_entity, 1.0 / 60.0);
+    var player_contacts: [4]u32 = undefined;
+    controller.queueCollision(&commands, &frame, &data, contactsNaming(&frame, player_entity, &player_contacts), 1.0 / 60.0);
 
     try std.testing.expectEqual(@as(usize, 0), commands.len());
     try std.testing.expectEqual(@as(usize, 0), controller.cooldown_count);
@@ -509,7 +505,8 @@ test "queueCollision skips non-player contacts and still plays player contacts i
     var commands = AudioCommandBuffer.init(allocator, 8);
     defer commands.deinit();
     var controller = AudioController.init();
-    controller.queueCollision(&commands, &frame, &data, player_entity, 1.0 / 60.0);
+    var player_contacts: [4]u32 = undefined;
+    controller.queueCollision(&commands, &frame, &data, contactsNaming(&frame, player_entity, &player_contacts), 1.0 / 60.0);
 
     try std.testing.expectEqual(@as(usize, 1), commands.len());
     try std.testing.expect(!controller.pairOnCooldown(npc_a, npc_b));

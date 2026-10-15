@@ -8,6 +8,7 @@
 //! TextureId values are generational handles backed by renderer-owned slots.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const LoadedImage = @import("../assets/image.zig").LoadedImage;
 const build_options = @import("build_options");
@@ -49,7 +50,7 @@ pub const VertexColumns = sprite_batch.VertexColumns;
 pub const VertexColumnsConst = sprite_batch.VertexColumnsConst;
 pub const writeWorldSpriteQuad = sprite_batch.writeWorldSpriteQuad;
 // Re-exported so game/test code can name draw-list types without importing
-// sprite_batch.zig outside the render facade (L6).
+// sprite_batch.zig outside the render facade.
 pub const DrawGroup = sprite_batch.DrawGroup;
 const DrawSource = sprite_batch.DrawSource;
 pub const Material = sprite_batch.Material;
@@ -62,14 +63,259 @@ pub const FrameResult = enum {
 };
 
 pub const TileDataId = resources.TileDataId;
+// The render facade's span type: game code never imports `render/gpu/*`.
+pub const TileStoreSpan = gpu_buffer.StorageSpan;
 
-/// One queued tile-data cell edit: write `value` at `element_index` of the layer
-/// buffer `buffer`. Game code accumulates these on tile changes and flushes them
-/// to the GPU once per frame at the render boundary.
-pub const TileDataEdit = struct {
-    buffer: TileDataId,
-    element_index: usize,
-    value: u32,
+// Tile blocks pack two 16-bit tile ids per `u32` element: local cell `i` lives in
+// element `i >> 1`, in the low half when `i` is even. `u32` elements avoid a 16-bit
+// storage extension; `tilemap.frag.glsl`'s `tileAt` is the matching unpack.
+const tile_data_cells_per_element: usize = 2;
+/// Fills the unread high half of a trailing element when the cell count is odd.
+pub const tile_data_pad_cell: u16 = std.math.maxInt(u16);
+
+fn tileDataElementCount(cell_count: usize) usize {
+    return (cell_count + tile_data_cells_per_element - 1) / tile_data_cells_per_element;
+}
+
+fn packTileDataElement(low_cell: u16, high_cell: u16) u32 {
+    return @as(u32, low_cell) | (@as(u32, high_cell) << 16);
+}
+
+/// Packs `cells` into `out` (`tileDataElementCount(cells.len)` elements).
+pub fn packTileData(cells: []const u16, out: []u32) void {
+    std.debug.assert(out.len == tileDataElementCount(cells.len));
+    const pair_count = cells.len / tile_data_cells_per_element;
+    if (comptime builtin.cpu.arch.endian() == .little) {
+        // Low cell first in each u32 is the cells' own byte image on little-endian.
+        @memcpy(std.mem.sliceAsBytes(out[0..pair_count]), std.mem.sliceAsBytes(cells[0 .. pair_count * tile_data_cells_per_element]));
+    } else {
+        for (out[0..pair_count], 0..) |*element, pair| {
+            element.* = packTileDataElement(cells[pair * 2], cells[pair * 2 + 1]);
+        }
+    }
+    if (pair_count < out.len) {
+        out[pair_count] = packTileDataElement(cells[cells.len - 1], tile_data_pad_cell);
+    }
+}
+
+/// Tile store layout, shared with `tilemap.frag.glsl`. One `u32` buffer holds two
+/// allocation classes at absolute element offsets:
+/// - a directory per resident layer: `side * side` toroidal words, chunk (cx, cy) at
+///   `(cy & (side - 1)) * side + (cx & (side - 1))`, then one link word holding the
+///   next deeper resident layer's directory start, or `tile_store_no_link`. A word
+///   with `tile_store_uniform_bit` set is a uniform chunk whose tile is the low 16
+///   bits; any other word is the absolute element offset of the chunk's block.
+/// - a block per resident mixed chunk-layer: `tileStoreBlockElements(chunk_edge)`
+///   elements holding the chunk's tiles in local row-major order
+///   (`(y % edge) * edge + x % edge`), packed by `packTileData`.
+/// A draw reads only chunks inside the window its uniform names; words of chunks
+/// outside it are never read.
+pub const tile_store_uniform_bit: u32 = 1 << 31;
+pub const tile_store_no_link: u32 = std.math.maxInt(u32);
+/// Largest element count whose byte size fits SDL's `u32` buffer size and offsets.
+/// Below `tile_store_uniform_bit`, so a block offset never reads as uniform.
+pub const tile_store_max_elements: u32 = std.math.maxInt(u32) / @sizeOf(gpu_buffer.StorageElement);
+/// Largest directory side: the largest power of two whose one directory
+/// (`side * side + 1` words) fits `tile_store_max_elements`, so every directory
+/// index and the shader's `side * side` fit `u32`.
+pub const tile_store_max_side: u32 = 1 << 14;
+
+comptime {
+    std.debug.assert(tile_store_max_elements < tile_store_uniform_bit);
+    std.debug.assert(@as(u64, tile_store_max_side) * tile_store_max_side + 1 <= tile_store_max_elements);
+    std.debug.assert(@as(u64, tile_store_max_side) * 2 * tile_store_max_side * 2 + 1 > tile_store_max_elements);
+}
+
+pub fn tileStoreUniformWord(tile: u16) u32 {
+    return tile_store_uniform_bit | tile;
+}
+
+pub fn tileStoreBlockElements(chunk_edge: u16) u32 {
+    return @intCast(tileDataElementCount(@as(usize, chunk_edge) * chunk_edge));
+}
+
+// `TilemapParams.layer_meta` slots: per draw, the chained layer count and the
+// shallowest-bucket flag (`applyWindowLayers`); per store, the chunk shift and the
+// directory side (`createTileStore`).
+const layer_meta_chain_count = 0;
+const layer_meta_shallowest_bucket = 1;
+const layer_meta_chunk_shift = 2;
+const layer_meta_directory_side = 3;
+// Largest chunk shift a store lays out: a 16-cell chunk edge.
+const tile_store_max_chunk_shift: u4 = 4;
+
+/// One world's tile store: `params` carries the grid, atlas, and resident chunk window
+/// (`setTileStoreWindow` moves it); the store records `chunk_shift` (`log2` of the
+/// chunk edge) and the directory `side` in it.
+pub const TileStoreDesc = struct {
+    element_capacity: u32,
+    params: TilemapParams,
+    chunk_shift: u4,
+    side: u32,
+};
+
+/// What creating a tile store or reserving its uploads can fail with; each leaves the
+/// store (and every other store) as it was.
+pub const TileStoreError = error{
+    InvalidTileStoreLayout,
+    InvalidTileStore,
+    TooManyTileStores,
+    EmptyStorageBuffer,
+    GpuBufferTooLarge,
+    SdlError,
+    OutOfMemory,
+};
+
+fn validateTileStoreDesc(desc: TileStoreDesc) error{InvalidTileStoreLayout}!void {
+    if (desc.chunk_shift > tile_store_max_chunk_shift) return error.InvalidTileStoreLayout;
+    if (desc.side < 1 or desc.side > tile_store_max_side or !std.math.isPowerOfTwo(desc.side)) {
+        return error.InvalidTileStoreLayout;
+    }
+    const grid_w = desc.params.grid[1];
+    const grid_h = desc.params.grid[2];
+    if (!(grid_w >= 1 and grid_w <= std.math.maxInt(u16) and grid_h >= 1 and grid_h <= std.math.maxInt(u16))) {
+        return error.InvalidTileStoreLayout;
+    }
+    if (desc.element_capacity < 1 or desc.element_capacity > tile_store_max_elements) {
+        return error.InvalidTileStoreLayout;
+    }
+}
+
+/// Element capacity after growing a store to hold `required` elements: at least
+/// double the current capacity, clamped to `tile_store_max_elements`.
+fn tileStoreGrownCapacity(current: u32, required: u32) error{GpuBufferTooLarge}!u32 {
+    if (required <= current) return current;
+    if (required > tile_store_max_elements) return error.GpuBufferTooLarge;
+    const doubled = @as(u64, current) * 2;
+    return @intCast(@min(@max(@as(u64, required), doubled), tile_store_max_elements));
+}
+
+// Byte size of a replacement tile-upload transfer: at least double the current one
+// so rising uploads create O(log peak) transfers, clamped to SDL's `u32` size.
+fn grownTransferBytes(current: u32, required: u32) u32 {
+    const doubled = @as(u64, current) * 2;
+    return @intCast(@min(@max(@as(u64, required), doubled), std.math.maxInt(u32)));
+}
+
+/// The ranges of a grown store's previous contents to copy forward: elements
+/// `[0, source_elements)` less the pending spans (sorted), which overwrite theirs in
+/// the same copy pass, so no element is written twice.
+const GrowthCopySegments = struct {
+    spans: []const TileStoreSpan,
+    source_elements: u32,
+    cursor: u32 = 0,
+    span_index: usize = 0,
+
+    fn next(self: *GrowthCopySegments) ?TileStoreSpan {
+        while (self.cursor < self.source_elements) {
+            if (self.span_index == self.spans.len) {
+                const tail = TileStoreSpan{ .dst_element = self.cursor, .count = self.source_elements - self.cursor };
+                self.cursor = self.source_elements;
+                return tail;
+            }
+            const span = self.spans[self.span_index];
+            if (span.dst_element <= self.cursor) {
+                self.cursor = @max(self.cursor, @as(u32, @intCast(@min(span.end(), self.source_elements))));
+                self.span_index += 1;
+                continue;
+            }
+            const segment_end = @min(span.dst_element, self.source_elements);
+            const segment = TileStoreSpan{ .dst_element = self.cursor, .count = segment_end - self.cursor };
+            self.cursor = segment_end;
+            return segment;
+        }
+        return null;
+    }
+};
+
+/// Folds a new batch into a store's batch still pending from a skipped frame. Both
+/// are sorted and disjoint, and any old and new span are disjoint or nested: a new
+/// span covering an old one replaces it, and a new span inside an old one patches
+/// the old span's values in place. `out_*` must hold both batches.
+fn mergeTileStoreSpans(
+    old_spans: []const TileStoreSpan,
+    old_values: []u32,
+    new_spans: []const TileStoreSpan,
+    new_values: []const u32,
+    out_spans: *std.ArrayList(TileStoreSpan),
+    out_values: *std.ArrayList(u32),
+) void {
+    std.debug.assert(out_spans.capacity - out_spans.items.len >= old_spans.len + new_spans.len);
+    std.debug.assert(out_values.capacity - out_values.items.len >= old_values.len + new_values.len);
+    var old_index: usize = 0;
+    var old_value: usize = 0;
+    var new_index: usize = 0;
+    var new_value: usize = 0;
+    while (old_index < old_spans.len or new_index < new_spans.len) {
+        const take_old = if (new_index == new_spans.len)
+            true
+        else if (old_index == old_spans.len)
+            false
+        else blk: {
+            const old = old_spans[old_index];
+            const new = new_spans[new_index];
+            if (old.end() <= new.dst_element) break :blk true;
+            if (new.end() <= old.dst_element) break :blk false;
+            if (new.dst_element <= old.dst_element and old.end() <= new.end()) {
+                old_value += old.count;
+                old_index += 1;
+                continue;
+            }
+            std.debug.assert(old.dst_element <= new.dst_element and new.end() <= old.end());
+            const patch_start = old_value + (new.dst_element - old.dst_element);
+            @memcpy(old_values[patch_start..][0..new.count], new_values[new_value..][0..new.count]);
+            new_value += new.count;
+            new_index += 1;
+            continue;
+        };
+        if (take_old) {
+            const old = old_spans[old_index];
+            out_spans.appendAssumeCapacity(old);
+            out_values.appendSliceAssumeCapacity(old_values[old_value..][0..old.count]);
+            old_value += old.count;
+            old_index += 1;
+        } else {
+            const new = new_spans[new_index];
+            out_spans.appendAssumeCapacity(new);
+            out_values.appendSliceAssumeCapacity(new_values[new_value..][0..new.count]);
+            new_value += new.count;
+            new_index += 1;
+        }
+    }
+}
+
+// One world's GPU tile store. A retired slot has a null buffer and a generation
+// already advanced past every id issued for it.
+const TileStore = struct {
+    buffer: ?*c.SDL_GPUBuffer,
+    // Generation the slot's current (or next) store is issued under.
+    generation: u32 = 1,
+    // Set by `createTileStore` and `claimTileStore`; cleared by the `endFrame`
+    // sweep, which retires a live store still unclaimed.
+    claimed: bool = false,
+    element_capacity: u32,
+    // Grid, atlas, chunk geometry, and resident window; each draw adds its chain.
+    params: TilemapParams,
+    // Uploads not yet recorded, sorted and disjoint; values concatenated in span order.
+    pending_spans: std.ArrayList(TileStoreSpan) = .empty,
+    pending_values: std.ArrayList(u32) = .empty,
+    // After a growth not yet recorded: the buffer holding the last recorded contents.
+    growth_source: ?*c.SDL_GPUBuffer = null,
+    growth_source_elements: u32 = 0,
+    // First transfer element of this store's values staged this frame.
+    staged_first_element: u32 = 0,
+
+    const released = TileStore{
+        .buffer = null,
+        .element_capacity = 0,
+        .params = std.mem.zeroes(TilemapParams),
+    };
+};
+
+// GPU buffers a retired tile store held, for the caller to release.
+const RetiredTileStore = struct {
+    buffer: *c.SDL_GPUBuffer,
+    growth_source: ?*c.SDL_GPUBuffer,
 };
 
 // One GPU vertex buffer + its upload transfer buffer per SoA column. The three
@@ -153,50 +399,27 @@ pub const Renderer = struct {
         std.debug.assert(k_stacked_state_ui_headroom >= 2 * k_overlay_command_headroom);
     }
 
-    /// Upper bound on composited layers in one tilemap draw's window. Tied to
-    /// `world_system.zig`'s `k_max_dense_submit_stack_cap` by a comptime assert in
-    /// that file (which already imports this module, so the assert lives there
-    /// to avoid an import cycle).
-    pub const k_max_tilemap_window_layers: usize = 32;
-
-    /// Cap on separate tilemap composite draw calls in one frame. In the
-    /// shipped default config this always resolves to 1 (only the active
-    /// level's own actor depth is ever an interleave point); more buckets only
-    /// appear when something (a sparse tile, a dynamic depth) needs to render
-    /// sandwiched between two dense layers this frame. Sized to the
-    /// mathematically-proven worst case rather than a defensive guess:
-    /// `partitionDenseCompositeBuckets` can never produce more buckets than
-    /// submitted dense layers, which `world_system.zig` already hard-caps at
-    /// `k_max_dense_submit_stack_cap` — tied to that constant by a comptime
-    /// assert in that file (which already imports this module, avoiding an
-    /// import cycle).
-    pub const k_max_dense_composite_draws: usize = 32;
-
-    /// One tilemap draw's composited layer window: up to
-    /// `k_max_tilemap_window_layers` element offsets into a combined tile-data
-    /// buffer, topmost layer first. The fragment shader walks these in order and
-    /// stops at the first opaque cell. `is_shallowest_bucket` is true only for
-    /// the composite draw holding the frame's overall shallowest submitted dense
-    /// layer (`world_system.zig`'s `submitStaticDenseGeometry`) — the fragment
-    /// shader's rim-shadow effect must gate on this rather than its own
-    /// draw-local resolved depth, since bucket splitting for an unrelated
-    /// interleave point can otherwise put a merely hole-revealed tile at
-    /// resolved depth 0 within a non-shallowest draw.
+    /// One tilemap draw's layers: the directory start of its topmost layer in the
+    /// world's tile store and how many layers its chain walks (each directory's link
+    /// word names the next deeper one). The fragment shader stops at the first
+    /// opaque cell. `is_shallowest_bucket` is true only for the composite draw
+    /// holding the frame's overall shallowest submitted dense layer
+    /// (`world_system.zig`'s `submitStaticDenseGeometry`): the shader's rim shadow
+    /// gates on it rather than on its own draw-local resolved depth, since bucket
+    /// splitting for an unrelated interleave point can put a hole-revealed tile at
+    /// resolved depth 0 within a deeper draw.
     pub const TilemapWindowLayers = struct {
-        count: u8 = 0,
+        first_directory: u32 = 0,
+        count: u32 = 0,
         is_shallowest_bucket: bool = false,
-        offsets: [k_max_tilemap_window_layers]u32 = @splat(0),
     };
 
-    /// Fills `params.layer_meta`/`layer_offsets` from `window` right before the
-    /// fragment uniform push. Pure and GPU-free so it is unit-testable headlessly.
+    /// Fills the per-draw fields of `params` (`layer_meta[0..2]`, `chain[0]`) from
+    /// `window` right before the fragment uniform push. Pure and GPU-free.
     pub fn applyWindowLayers(params: *TilemapParams, window: TilemapWindowLayers) void {
-        std.debug.assert(window.count <= k_max_tilemap_window_layers);
-        params.layer_meta[0] = @intCast(window.count);
-        params.layer_meta[1] = @intFromBool(window.is_shallowest_bucket);
-        for (0..window.count) |i| {
-            params.layer_offsets[i] = window.offsets[i];
-        }
+        params.layer_meta[layer_meta_chain_count] = @intCast(window.count);
+        params.layer_meta[layer_meta_shallowest_bucket] = @intFromBool(window.is_shallowest_bucket);
+        params.chain[0] = window.first_directory;
     }
 
     allocator: std.mem.Allocator,
@@ -208,24 +431,29 @@ pub const Renderer = struct {
     vertex_streams: VertexStreams,
     batch_capacity_vertices: usize,
     texture_slots: std.ArrayList(TextureSlot) = .empty,
-    // GPU-driven tilemap tile-data: one graphics-storage-read buffer per dense
-    // layer (a row-major copy of the world's dense_tile_ids). Renderer-owned so
-    // world keeps only opaque handles and never crosses the render/gpu boundary.
-    tile_data_buffers: std.ArrayList(*c.SDL_GPUBuffer) = .empty,
-    // World-constant grid/atlas uniform per tile-data buffer (parallel to
-    // tile_data_buffers). Kept here rather than on each DrawGroup so the per-frame
-    // draw-group sort/coalesce/merge stays small.
-    tile_data_params: std.ArrayList(TilemapParams) = .empty,
-    // Cell count per tile-data buffer (parallel to tile_data_buffers) so the
-    // dig-edit upload boundary can reject an out-of-range element_index before it
-    // becomes an out-of-bounds GPU buffer write.
-    tile_data_counts: std.ArrayList(u32) = .empty,
-    // Grow-only scratch resolving queued tile-data edits (handles) to GPU buffers
-    // for one batched dig upload per frame.
-    tile_edit_scratch: std.ArrayList(gpu_buffer.StorageRegion) = .empty,
-    tile_edit_transfer: ?*c.SDL_GPUTransferBuffer = null,
-    tile_edit_transfer_byte_size: u32 = 0,
-    tile_edits_pending: bool = false,
+    // Per-world GPU tile stores (`createTileStore`), indexed by `TileDataId.index`.
+    // Renderer-owned so a world keeps only its non-owning handle. Retired slots are
+    // reused from `tile_store_free`, whose capacity always covers every slot.
+    tile_stores: std.ArrayList(TileStore) = .empty,
+    tile_store_free: std.ArrayList(u32) = .empty,
+    // Grow-only scratch for folding a new batch into one carried from a skipped frame.
+    tile_merge_spans: std.ArrayList(TileStoreSpan) = .empty,
+    tile_merge_values: std.ArrayList(u32) = .empty,
+    // Pooled transfer buffer holding every store's pending values for one copy pass.
+    tile_upload_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    tile_upload_transfer_byte_size: u32 = 0,
+    // Times a larger transfer replaced the pooled one; the first replacement logs once.
+    tile_upload_transfer_grows: u64 = 0,
+    tile_upload_transfer_growth_logged: bool = false,
+    // Times a tile store grew into a larger buffer; the first growth logs once.
+    tile_store_grows: u64 = 0,
+    tile_store_growth_logged: bool = false,
+    // Times the retained static streams grew; the first growth logs once.
+    static_stream_grows: u64 = 0,
+    static_stream_growth_logged: bool = false,
+    // Times the dynamic batch streams grew past their reservation; the first warns once.
+    batch_stream_grows: u64 = 0,
+    batch_stream_growth_logged: bool = false,
     batch: sprite_batch.SpriteBatch,
     white_texture: TextureId = TextureId.invalid,
     first_free_texture_slot: ?u32 = null,
@@ -237,8 +465,8 @@ pub const Renderer = struct {
     viewport_height: u32 = 0,
     window_claimed: bool = true,
     // Retained static world geometry: world-space vertices uploaded once and
-    // re-uploaded only when `static_dirty` (visible set change, dig/build). The
-    // GPU buffer persists across frames; the per-frame draw list interleaves
+    // re-uploaded only when `static_dirty` (the world re-submitted its static draws).
+    // The GPU buffer persists across frames; the per-frame draw list interleaves
     // these spans with the dynamic batch by render order.
     static_streams: ?VertexStreams = null,
     static_capacity_vertices: usize = 0,
@@ -247,11 +475,10 @@ pub const Renderer = struct {
     static_colors: std.ArrayList(VertexColor) = .empty,
     static_groups: std.ArrayList(DrawGroup) = .empty,
     static_dirty: bool = false,
-    // Per-frame side table for tilemap DrawGroup.window_slot: which composited
-    // layer offsets each static tilemap span reads this frame. Reset by
-    // beginStaticGeometry; populated by appendStaticTilemapSpan.
-    tilemap_window_layers: [k_max_dense_composite_draws]TilemapWindowLayers = undefined,
-    tilemap_window_layer_count: usize = 0,
+    // Side table for tilemap DrawGroup.window_slot: the layer chain each static
+    // tilemap span reads. Reset by beginStaticGeometry; populated by
+    // appendStaticTilemapSpan; reserved with the static spans.
+    tilemap_window_layers: std.ArrayList(TilemapWindowLayers) = .empty,
     draw_list: std.ArrayList(DrawGroup) = .empty,
     // Reserved upper bounds feeding the merged draw list. `draw_list` is sized to
     // their sum so the per-frame merge stays allocation-free.
@@ -331,22 +558,24 @@ pub const Renderer = struct {
             }
         }
         self.texture_slots.deinit(self.allocator);
-        for (self.tile_data_buffers.items) |buffer| {
-            c.SDL_ReleaseGPUBuffer(self.device, buffer);
+        for (self.tile_stores.items, 0..) |store, index| {
+            // Slot indices fit u32: `reserveTileStoreSlot` refuses past it.
+            if (store.buffer != null) self.releaseTileStoreSlot(@intCast(index));
         }
-        self.tile_data_buffers.deinit(self.allocator);
-        self.tile_data_params.deinit(self.allocator);
-        self.tile_data_counts.deinit(self.allocator);
-        self.tile_edit_scratch.deinit(self.allocator);
-        if (self.tile_edit_transfer) |transfer| {
+        self.tile_stores.deinit(self.allocator);
+        self.tile_store_free.deinit(self.allocator);
+        self.tile_merge_spans.deinit(self.allocator);
+        self.tile_merge_values.deinit(self.allocator);
+        if (self.tile_upload_transfer) |transfer| {
             c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
-            self.tile_edit_transfer = null;
+            self.tile_upload_transfer = null;
         }
         self.deinitBatchStorage();
         self.static_positions.deinit(self.allocator);
         self.static_uvs.deinit(self.allocator);
         self.static_colors.deinit(self.allocator);
         self.static_groups.deinit(self.allocator);
+        self.tilemap_window_layers.deinit(self.allocator);
         self.draw_list.deinit(self.allocator);
         if (self.static_streams) |streams| releaseVertexStreams(self.device, streams);
 
@@ -376,7 +605,11 @@ pub const Renderer = struct {
 
     /// Grows batch storage to hold `command_capacity` ordered sprite commands.
     /// Setup-time and grow-only (never shrinks); call before relying on
-    /// allocation-free render frames.
+    /// allocation-free render frames. Marks the frame reserved at `command_high_water`,
+    /// the same bound `ensureFrameBatchCapacity` grows past, so in perf-diagnostic builds a
+    /// frame whose submits exceed it is counted as reservation drift
+    /// (`SpriteBatch.commandOverflowGrows`) even when the command list's rounded-up
+    /// capacity absorbed them; it still grows in every build.
     pub fn reserveSpriteCommands(self: *Renderer, command_capacity: usize) !void {
         if (command_capacity > self.command_high_water) {
             const vertex_capacity = try std.math.mul(usize, command_capacity, 6);
@@ -390,7 +623,7 @@ pub const Renderer = struct {
             self.reserved_dynamic_groups = command_capacity;
             try self.ensureDrawListReservation();
         }
-        self.batch.frame_reserved = true;
+        self.batch.markFrameReserved(self.command_high_water);
     }
 
     pub fn spriteCommandCount(self: *const Renderer) usize {
@@ -427,7 +660,7 @@ pub const Renderer = struct {
         self.static_uvs.clearRetainingCapacity();
         self.static_colors.clearRetainingCapacity();
         self.static_groups.clearRetainingCapacity();
-        self.tilemap_window_layer_count = 0;
+        self.tilemap_window_layers.clearRetainingCapacity();
         self.static_dirty = true;
     }
 
@@ -438,6 +671,7 @@ pub const Renderer = struct {
         try self.static_uvs.ensureTotalCapacity(self.allocator, vertex_capacity);
         try self.static_colors.ensureTotalCapacity(self.allocator, vertex_capacity);
         try self.static_groups.ensureTotalCapacity(self.allocator, span_capacity);
+        try self.tilemap_window_layers.ensureTotalCapacity(self.allocator, span_capacity);
         self.reserved_static_spans = span_capacity;
         try self.ensureDrawListReservation();
     }
@@ -451,13 +685,12 @@ pub const Renderer = struct {
         self.draw_list_high_water = total;
     }
 
-    /// Appends one retained world-space quad that composites `window_layers`
-    /// (topmost-first offsets into a combined tile-data buffer) via the tilemap
-    /// pipeline: the fragment shader walks them per pixel, stopping at the first
-    /// opaque cell, and samples `atlas_texture`. `vertices` are the quad's
+    /// Appends one retained world-space quad that composites `window_layers` (a
+    /// chain of directories in the `tile_data` store, topmost first) via the
+    /// tilemap pipeline: the fragment shader walks it per pixel, stopping at the
+    /// first opaque cell, and samples `atlas_texture`. `vertices` are the quad's
     /// world-space corners (6). Must be called between `beginStaticGeometry` and
-    /// the next `endFrame`. At most `k_max_dense_composite_draws` calls are
-    /// allowed between two `beginStaticGeometry` calls.
+    /// the next `endFrame`. Allocation-free within `reserveStaticGeometry`.
     pub fn appendStaticTilemapSpan(
         self: *Renderer,
         atlas_texture: TextureId,
@@ -465,11 +698,10 @@ pub const Renderer = struct {
         vertices: VertexColumnsConst,
         tile_data: TileDataId,
         window_layers: TilemapWindowLayers,
-    ) !void {
+    ) error{ Overflow, StaticGeometryTooLarge, OutOfMemory }!void {
         const vertex_count = vertices.positions.len;
         std.debug.assert(vertices.uvs.len == vertex_count and vertices.colors.len == vertex_count);
         if (vertex_count == 0) return;
-        if (self.tilemap_window_layer_count >= k_max_dense_composite_draws) return error.TooManyTilemapWindowDraws;
         const end = try std.math.add(usize, self.static_positions.items.len, vertex_count);
         const first_vertex = std.math.cast(u32, self.static_positions.items.len) orelse return error.StaticGeometryTooLarge;
         _ = std.math.cast(u32, end) orelse return error.StaticGeometryTooLarge;
@@ -480,12 +712,12 @@ pub const Renderer = struct {
         try self.static_uvs.ensureTotalCapacity(self.allocator, end);
         try self.static_colors.ensureTotalCapacity(self.allocator, end);
         try self.static_groups.ensureTotalCapacity(self.allocator, self.static_groups.items.len + 1);
+        try self.tilemap_window_layers.ensureTotalCapacity(self.allocator, self.tilemap_window_layers.items.len + 1);
+        const window_slot = std.math.cast(u32, self.tilemap_window_layers.items.len) orelse return error.StaticGeometryTooLarge;
         self.static_positions.appendSliceAssumeCapacity(vertices.positions);
         self.static_uvs.appendSliceAssumeCapacity(vertices.uvs);
         self.static_colors.appendSliceAssumeCapacity(vertices.colors);
-        const window_slot: u8 = @intCast(self.tilemap_window_layer_count);
-        self.tilemap_window_layers[window_slot] = window_layers;
-        self.tilemap_window_layer_count += 1;
+        self.tilemap_window_layers.appendAssumeCapacity(window_layers);
         self.static_groups.appendAssumeCapacity(.{
             .source = .static,
             .material = .tilemap,
@@ -607,7 +839,10 @@ pub const Renderer = struct {
         };
     }
 
+    /// Retires every tile store no owner claimed since the previous `endFrame`
+    /// (`claimTileStore`), then prepares, uploads, and draws the frame.
     pub fn endFrame(self: *Renderer, thread_system: ?*ThreadSystem) !FrameResult {
+        self.sweepUnclaimedTileStores();
         try self.ensureFrameBatchCapacity();
         const window_size = try self.currentWindowSize();
         // Cheap pre-acquire probe: a zero/invalid drawable means there is no
@@ -631,18 +866,18 @@ pub const Renderer = struct {
         // gpu/buffer.zig): the map rotates to fresh backing storage rather than
         // overwriting bytes a prior frame's copy pass may still reference. The
         // static buffer uses the same cycle=true upload, only when dirty.
-        // Tile-edit transfer grow (create → WaitForGPUIdle → release-old) and
-        // staging also live here so a capacity stall never holds an acquired
-        // swapchain and post-acquire work is record-only (matches dynamic verts).
+        // Tile-store transfer growth (create new, release old; SDL frees the old
+        // one after in-flight copies, so no drain) and staging also live here so
+        // post-acquire work is record-only (matches dynamic verts).
         if (self.batch.positions.items.len > 0) {
             try self.stageVertices();
         }
         if (upload_static) {
             try self.stageStaticVertices();
         }
-        const upload_tile_edits = self.tile_edits_pending and self.tile_edit_scratch.items.len > 0;
-        if (upload_tile_edits) {
-            try self.stageTileEdits();
+        const upload_tile_stores = self.tileStoreUploadsPending();
+        if (upload_tile_stores) {
+            try self.stageTileStoreUploads();
         }
 
         const frame = try self.acquireSwapchainFrame(false) orelse return .skipped_no_swapchain;
@@ -654,11 +889,11 @@ pub const Renderer = struct {
         });
 
         const upload_dynamic = self.batch.positions.items.len > 0;
-        if (upload_dynamic or upload_static or upload_tile_edits) {
+        if (upload_dynamic or upload_static or upload_tile_stores) {
             self.recordFrameCopyPass(command_buffer, .{
                 .dynamic = upload_dynamic,
                 .static_vertices = upload_static,
-                .tile_edits = upload_tile_edits,
+                .tile_stores = upload_tile_stores,
             }) catch |err| {
                 log.err("recording frame copy pass failed: {s}", .{@errorName(err)});
                 return finishAcquiredCommandBufferAfterError(command_buffer, "copy pass");
@@ -702,7 +937,7 @@ pub const Renderer = struct {
                 };
                 const tile_buffer: ?*c.SDL_GPUBuffer = switch (group.material) {
                     .sprite => null,
-                    .tilemap => self.tileDataBuffer(group.tile_data) orelse continue,
+                    .tilemap => (self.tileStore(group.tile_data) orelse continue).buffer.?,
                 };
 
                 if (active_material == null or active_material.? != group.material) {
@@ -752,11 +987,10 @@ pub const Renderer = struct {
                     // differs, and an unconditional rebind is correct on every backend.
                     var storage = tile_buffer.?;
                     c.SDL_BindGPUFragmentStorageBuffers(render_pass, 0, &storage, 1);
-                    var params = self.tileDataParams(group.tile_data);
-                    // The per-buffer params carry only the world-constant grid/atlas
-                    // geometry; the per-draw composited layer window (which offsets
-                    // into a possibly-shared buffer this group reads) is set here.
-                    applyWindowLayers(&params, self.tilemap_window_layers[group.window_slot]);
+                    var params = self.tileStore(group.tile_data).?.params;
+                    // The per-store params carry the grid, atlas, chunk geometry, and
+                    // resident window; the per-draw layer chain is set here.
+                    applyWindowLayers(&params, self.tilemap_window_layers.items[group.window_slot]);
                     c.SDL_PushGPUFragmentUniformData(command_buffer, 0, &params, @sizeOf(TilemapParams));
                 }
 
@@ -930,121 +1164,275 @@ pub const Renderer = struct {
         return ids;
     }
 
-    /// Creates a renderer-owned tile-data storage buffer from a row-major tile
-    /// array (one `u32` per cell) and returns its handle. `params` is the
-    /// world-constant grid/atlas uniform, stored alongside so draw groups carry only
-    /// the handle. A generic multi-buffer registry: `WorldSystem` registers one
-    /// entry holding every dense layer's cells concatenated, built once at world
-    /// load; draw groups distinguish layers via a per-draw cell offset instead of
-    /// a distinct buffer per layer.
-    pub fn createTileDataBuffer(self: *Renderer, tiles: []const u32, params: TilemapParams) !TileDataId {
-        const cell_count = std.math.cast(u32, tiles.len) orelse return error.TileDataBufferTooLarge;
-        const buffer = try gpu_buffer.uploadStorageData(self.device, tiles);
-        errdefer c.SDL_ReleaseGPUBuffer(self.device, buffer);
-        const index = std.math.cast(u32, self.tile_data_buffers.items.len) orelse return error.TooManyTileDataBuffers;
-        if (index == @intFromEnum(TileDataId.invalid)) return error.TooManyTileDataBuffers;
-        try self.tile_data_buffers.append(self.allocator, buffer);
-        errdefer _ = self.tile_data_buffers.pop();
-        try self.tile_data_params.append(self.allocator, params);
-        errdefer _ = self.tile_data_params.pop();
-        try self.tile_data_counts.append(self.allocator, cell_count);
-        log.debug("created tilemap tile-data buffer {d}: {d} cells", .{ index, tiles.len });
-        return @enumFromInt(index);
+    /// Creates a world's GPU tile store (layout documented at `tile_store_uniform_bit`) with
+    /// `desc.element_capacity` elements and returns its non-owning id, claimed for
+    /// the current frame. Contents are undefined until uploads are queued; draws
+    /// must read only directories and blocks the owner has written. The owner
+    /// claims it every frame it renders (`claimTileStore`); `endFrame` retires it
+    /// the first frame nobody does, and its id goes stale.
+    pub fn createTileStore(self: *Renderer, desc: TileStoreDesc) TileStoreError!TileDataId {
+        try validateTileStoreDesc(desc);
+        try self.reserveTileStoreSlot();
+        const buffer = try gpu_buffer.createStorageBuffer(self.device, desc.element_capacity);
+        var params = desc.params;
+        params.layer_meta[layer_meta_chunk_shift] = desc.chunk_shift;
+        // At most `tile_store_max_side` (validated), which fits i32.
+        params.layer_meta[layer_meta_directory_side] = @intCast(desc.side);
+        const id = self.installTileStore(.{
+            .buffer = buffer,
+            .element_capacity = desc.element_capacity,
+            .params = params,
+        });
+        log.debug("created tile store {d}: {d} elements", .{ id.index, desc.element_capacity });
+        return id;
     }
 
-    /// Queues a batch of single-cell tile edits (the dig path) for upload during
-    /// the next `endFrame` copy pass. Edits whose handle no longer resolves are
-    /// skipped. The scratch list resolves handles to buffers and is grow-only.
-    pub fn uploadTileDataEdits(self: *Renderer, edits: []const TileDataEdit) !void {
-        if (edits.len == 0) return;
-        // Grow-only append: pending edits are held until the post-acquire copy pass
-        // runs so a skipped swapchain frame does not drop dig updates.
-        try self.tile_edit_scratch.ensureTotalCapacity(self.allocator, self.tile_edit_scratch.items.len + edits.len);
-        for (edits) |edit| {
-            const buffer = self.tileDataBuffer(edit.buffer) orelse continue;
-            const element_count = self.tileDataCount(edit.buffer);
-            if (edit.element_index >= element_count) {
-                log.warn("dropped tile-data edit: cell {d} out of range for buffer {d}", .{
-                    edit.element_index,
-                    @intFromEnum(edit.buffer),
-                });
-                continue;
-            }
-            self.tile_edit_scratch.appendAssumeCapacity(.{
-                .buffer = buffer,
-                .element_index = edit.element_index,
-                .element_count = element_count,
-                .value = edit.value,
-            });
-        }
-        self.tile_edits_pending = self.tile_edit_scratch.items.len > 0;
+    /// Keeps the store alive through the next `endFrame`; returns false when `id`
+    /// is stale (its store was retired), in which case the owner's GPU contents are
+    /// gone and it must create a new store. O(1).
+    pub fn claimTileStore(self: *Renderer, id: TileDataId) bool {
+        const store = self.tileStore(id) orelse return false;
+        store.claimed = true;
+        return true;
     }
 
-    /// Releases every renderer-owned tile-data storage buffer and resets the
-    /// parallel handle/params/count lists. Required before rebuilding the dense
-    /// tilemap when the renderer outlives the world that created the buffers; app
-    /// shutdown goes through `deinit`, which performs the same release. Waits for
-    /// GPU idle first so in-flight frames (up to `frames_in_flight`) finish
-    /// sampling the buffers/transfer before they are freed.
-    pub fn releaseTileDataBuffers(self: *Renderer) void {
-        const has_buffers = self.tile_data_buffers.items.len > 0 or self.tile_edit_transfer != null;
-        if (has_buffers) self.waitForIdle();
-
-        for (self.tile_data_buffers.items) |buffer| {
-            c.SDL_ReleaseGPUBuffer(self.device, buffer);
-        }
-        self.tile_data_buffers.clearRetainingCapacity();
-        self.tile_data_params.clearRetainingCapacity();
-        self.tile_data_counts.clearRetainingCapacity();
-        self.tile_edit_scratch.clearRetainingCapacity();
-        self.tile_edits_pending = false;
-        if (self.tile_edit_transfer) |transfer| {
-            c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
-            self.tile_edit_transfer = null;
-            self.tile_edit_transfer_byte_size = 0;
-        }
+    /// Moves the store's resident chunk window (min x, min y, max-exclusive x,
+    /// max-exclusive y), read by every later draw of the store. No-op when `id` is
+    /// stale. O(1).
+    pub fn setTileStoreWindow(self: *Renderer, id: TileDataId, window: [4]u32) void {
+        const store = self.tileStore(id) orelse return;
+        store.params.window = window;
     }
 
-    /// Ensures the reusable tile-edit transfer buffer is large enough. Mirrors
-    /// `ensureBatchCapacity`: create the new transfer first, idle the GPU, then
-    /// release the old one so a creation failure leaves the live transfer
-    /// untouched and no in-flight copy still reads a freed buffer.
-    fn ensureTileEditTransfer(self: *Renderer, required_bytes: u32) !void {
-        if (self.tile_edit_transfer) |existing| {
-            if (self.tile_edit_transfer_byte_size >= required_bytes) return;
+    /// Grows the store to `required_elements` when it is smaller (a new buffer; the
+    /// previous contents copy forward in the next frame copy pass, then the old
+    /// buffer is released) and reserves room for `span_count` spans of
+    /// `value_count` values, so the matching `queueTileStoreUploads` allocates nothing
+    /// and cannot fail. Call before swapchain acquisition.
+    pub fn reserveTileStoreUploads(self: *Renderer, id: TileDataId, required_elements: u32, span_count: usize, value_count: usize) TileStoreError!void {
+        const store = self.tileStore(id) orelse return error.InvalidTileStore;
+        // CPU lists first, GPU growth last: an OOM leaves the store's capacity,
+        // growth source, and pending batch as they were.
+        try store.pending_spans.ensureUnusedCapacity(self.allocator, span_count);
+        try store.pending_values.ensureUnusedCapacity(self.allocator, value_count);
+        if (store.pending_spans.items.len > 0) {
+            try self.tile_merge_spans.ensureTotalCapacity(self.allocator, store.pending_spans.items.len + span_count);
+            try self.tile_merge_values.ensureTotalCapacity(self.allocator, store.pending_values.items.len + value_count);
+        }
+        if (required_elements > store.element_capacity) try self.growTileStore(store, required_elements);
+    }
 
-            const new_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, required_bytes);
-            errdefer c.SDL_ReleaseGPUTransferBuffer(self.device, new_transfer);
-
-            _ = c.SDL_WaitForGPUIdle(self.device);
-            c.SDL_ReleaseGPUTransferBuffer(self.device, existing);
-            self.tile_edit_transfer = new_transfer;
-            self.tile_edit_transfer_byte_size = required_bytes;
+    /// Queues one upload batch for the store, flushed in the next frame copy pass
+    /// and carried across skipped frames. Requires `reserveTileStoreUploads` for
+    /// `id` with at least these counts and the store's final size, with no queue for
+    /// it in between: then it allocates nothing and cannot fail, so an owner can
+    /// commit its side before queueing. `spans` must be sorted, disjoint, and inside
+    /// the store, with `values` holding their elements in span order; every span of a
+    /// carried batch must be disjoint from or nested with every new span, and the
+    /// newer values win. This is the batch's one bounds validation (asserted).
+    pub fn queueTileStoreUploads(self: *Renderer, id: TileDataId, spans: []const TileStoreSpan, values: []const u32) void {
+        // The reserve resolved `id` this frame, and only `endFrame` retires a store.
+        const store = self.tileStore(id).?;
+        std.debug.assert(gpu_buffer.storageSpansValid(spans, values.len, store.element_capacity));
+        if (spans.len == 0) return;
+        std.debug.assert(store.pending_spans.unusedCapacitySlice().len >= spans.len);
+        std.debug.assert(store.pending_values.unusedCapacitySlice().len >= values.len);
+        if (store.pending_spans.items.len == 0) {
+            store.pending_spans.appendSliceAssumeCapacity(spans);
+            store.pending_values.appendSliceAssumeCapacity(values);
             return;
         }
-
-        self.tile_edit_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, required_bytes);
-        self.tile_edit_transfer_byte_size = required_bytes;
+        self.tile_merge_spans.clearRetainingCapacity();
+        self.tile_merge_values.clearRetainingCapacity();
+        mergeTileStoreSpans(
+            store.pending_spans.items,
+            store.pending_values.items,
+            spans,
+            values,
+            &self.tile_merge_spans,
+            &self.tile_merge_values,
+        );
+        std.mem.swap(std.ArrayList(TileStoreSpan), &store.pending_spans, &self.tile_merge_spans);
+        std.mem.swap(std.ArrayList(u32), &store.pending_values, &self.tile_merge_values);
     }
 
-    fn tileDataBuffer(self: *const Renderer, id: TileDataId) ?*c.SDL_GPUBuffer {
-        if (id == .invalid) return null;
-        const index = @intFromEnum(id);
-        if (index >= self.tile_data_buffers.items.len) return null;
-        return self.tile_data_buffers.items[index];
+    // Makes the next `installTileStore` infallible: a retired slot, or room for a
+    // new one in both the store list and the free list (which retire pushes to).
+    fn reserveTileStoreSlot(self: *Renderer) error{ OutOfMemory, TooManyTileStores }!void {
+        if (self.tile_store_free.items.len > 0) return;
+        const appended = std.math.cast(u32, self.tile_stores.items.len) orelse return error.TooManyTileStores;
+        if (appended == TileDataId.invalid.index) return error.TooManyTileStores;
+        try self.tile_stores.ensureUnusedCapacity(self.allocator, 1);
+        try self.tile_store_free.ensureTotalCapacity(self.allocator, self.tile_stores.items.len + 1);
     }
 
-    fn tileDataCount(self: *const Renderer, id: TileDataId) u32 {
-        if (id == .invalid) return 0;
-        const index = @intFromEnum(id);
-        if (index >= self.tile_data_counts.items.len) return 0;
-        return self.tile_data_counts.items[index];
+    // Places `store` in a retired slot under that slot's generation, or appends it
+    // at generation 1, claimed. Requires `reserveTileStoreSlot`.
+    fn installTileStore(self: *Renderer, store: TileStore) TileDataId {
+        std.debug.assert(store.buffer != null);
+        if (self.tile_store_free.pop()) |index| {
+            const slot = &self.tile_stores.items[index];
+            std.debug.assert(slot.buffer == null);
+            const generation = slot.generation;
+            slot.* = store;
+            slot.generation = generation;
+            slot.claimed = true;
+            return .{ .index = index, .generation = generation };
+        }
+        // `reserveTileStoreSlot` bounded the length below `TileDataId.invalid.index`.
+        const index: u32 = @intCast(self.tile_stores.items.len);
+        std.debug.assert(self.tile_store_free.capacity >= self.tile_stores.items.len + 1);
+        self.tile_stores.appendAssumeCapacity(store);
+        const slot = &self.tile_stores.items[index];
+        slot.generation = 1;
+        slot.claimed = true;
+        return .{ .index = index, .generation = 1 };
     }
 
-    // Direct load: only called for a tilemap group whose `tile_data` already
-    // resolved to a buffer this frame, so the parallel params entry is present.
-    fn tileDataParams(self: *const Renderer, id: TileDataId) TilemapParams {
-        return self.tile_data_params.items[@intFromEnum(id)];
+    // Returns the first live store at or after `cursor` that nobody claimed since
+    // the last sweep, clearing the claim of every claimed store it passes. Touches
+    // no SDL state.
+    fn nextUnclaimedTileStore(self: *Renderer, cursor: u32) ?u32 {
+        var index: usize = cursor;
+        while (index < self.tile_stores.items.len) : (index += 1) {
+            const store = &self.tile_stores.items[index];
+            if (store.buffer == null) continue;
+            if (store.claimed) {
+                store.claimed = false;
+                continue;
+            }
+            // Below the slot count, which fits u32 (`reserveTileStoreSlot`).
+            return @intCast(index);
+        }
+        return null;
+    }
+
+    // Retires every store unclaimed since the last sweep, so a destroyed or
+    // replaced world's store goes at the first frame it does not render. O(live
+    // stores); SDL frees the buffers once in-flight frames finish, so no drain.
+    fn sweepUnclaimedTileStores(self: *Renderer) void {
+        var cursor: u32 = 0;
+        while (self.nextUnclaimedTileStore(cursor)) |index| {
+            self.releaseTileStoreSlot(index);
+            cursor = index + 1;
+        }
+    }
+
+    // Retires a live slot without touching SDL: frees its pending upload lists,
+    // advances its generation so every issued id goes stale (the
+    // `retireTextureSlotForReuse` pattern), and returns it to the free list.
+    // Retained draws naming it are skipped from the sweeping `endFrame`'s draw
+    // loop onward.
+    fn retireTileStoreSlot(self: *Renderer, index: u32) RetiredTileStore {
+        const store = &self.tile_stores.items[index];
+        const retired = RetiredTileStore{ .buffer = store.buffer.?, .growth_source = store.growth_source };
+        store.pending_spans.deinit(self.allocator);
+        store.pending_values.deinit(self.allocator);
+        const generation = resources.nextGeneration(store.generation);
+        store.* = TileStore.released;
+        store.generation = generation;
+        std.debug.assert(self.tile_store_free.items.len < self.tile_store_free.capacity);
+        self.tile_store_free.appendAssumeCapacity(index);
+        return retired;
+    }
+
+    // Retires a live slot and releases its GPU buffers; SDL defers the free past
+    // in-flight frames.
+    fn releaseTileStoreSlot(self: *Renderer, index: u32) void {
+        const retired = self.retireTileStoreSlot(index);
+        c.SDL_ReleaseGPUBuffer(self.device, retired.buffer);
+        if (retired.growth_source) |source| c.SDL_ReleaseGPUBuffer(self.device, source);
+    }
+
+    fn growTileStore(self: *Renderer, store: *TileStore, required_elements: u32) error{ GpuBufferTooLarge, EmptyStorageBuffer, SdlError }!void {
+        const capacity = try tileStoreGrownCapacity(store.element_capacity, required_elements);
+        const grown = try gpu_buffer.createStorageBuffer(self.device, capacity);
+        if (store.growth_source == null) {
+            store.growth_source = store.buffer;
+            store.growth_source_elements = store.element_capacity;
+        } else {
+            // No frame recorded the replaced buffer; `growth_source` still holds the contents.
+            c.SDL_ReleaseGPUBuffer(self.device, store.buffer.?);
+        }
+        store.buffer = grown;
+        store.element_capacity = capacity;
+        self.countTileStoreGrowth(capacity);
+    }
+
+    fn countTileStoreGrowth(self: *Renderer, capacity: u32) void {
+        @branchHint(.cold);
+        self.tile_store_grows += 1;
+        if (self.tile_store_growth_logged) return;
+        self.tile_store_growth_logged = true;
+        if (comptime logging.enabled(.info)) log.info("tile store grew to {d} elements", .{capacity});
+    }
+
+    fn tileStoreUploadsPending(self: *const Renderer) bool {
+        for (self.tile_stores.items) |store| {
+            if (store.buffer == null) continue;
+            if (store.pending_spans.items.len > 0 or store.growth_source != null) return true;
+        }
+        return false;
+    }
+
+    // Stages every store's pending values into the pooled transfer buffer
+    // (cycle=true, so a reused transfer never overwrites an in-flight copy) and
+    // records where each store's values start. Pre-acquire; the copy pass only records.
+    fn stageTileStoreUploads(self: *Renderer) !void {
+        var total: usize = 0;
+        for (self.tile_stores.items) |*store| {
+            if (store.buffer == null) continue;
+            store.staged_first_element = std.math.cast(u32, total) orelse return error.GpuBufferTooLarge;
+            total += store.pending_values.items.len;
+        }
+        if (total == 0) return;
+        try self.ensureTileUploadTransfer(try gpu_buffer.storageByteSize(total));
+        const transfer = self.tile_upload_transfer.?;
+        const mapped = c.SDL_MapGPUTransferBuffer(self.device, transfer, true) orelse {
+            return sdlError("SDL_MapGPUTransferBuffer");
+        };
+        const staged = @as([*]u32, @ptrCast(@alignCast(mapped)))[0..total];
+        for (self.tile_stores.items) |store| {
+            if (store.buffer == null) continue;
+            @memcpy(staged[store.staged_first_element..][0..store.pending_values.items.len], store.pending_values.items);
+        }
+        c.SDL_UnmapGPUTransferBuffer(self.device, transfer);
+    }
+
+    // Grows geometrically (`grownTransferBytes`). The new transfer is created before
+    // the old one is released, so a creation failure leaves the live transfer
+    // untouched; SDL frees the old one once in-flight copies finish, so no drain.
+    // A failed grown create retries once at exactly `required_bytes`.
+    fn ensureTileUploadTransfer(self: *Renderer, required_bytes: u32) !void {
+        if (self.tile_upload_transfer != null and self.tile_upload_transfer_byte_size >= required_bytes) return;
+        var byte_size = grownTransferBytes(self.tile_upload_transfer_byte_size, required_bytes);
+        const transfer = gpu_buffer.createVertexTransferBuffer(self.device, byte_size) catch |err| exact: {
+            if (byte_size == required_bytes) return err;
+            byte_size = required_bytes;
+            break :exact try gpu_buffer.createVertexTransferBuffer(self.device, byte_size);
+        };
+        if (self.tile_upload_transfer) |existing| {
+            c.SDL_ReleaseGPUTransferBuffer(self.device, existing);
+            self.countTileUploadTransferGrowth(byte_size);
+        }
+        self.tile_upload_transfer = transfer;
+        self.tile_upload_transfer_byte_size = byte_size;
+    }
+
+    fn countTileUploadTransferGrowth(self: *Renderer, byte_size: u32) void {
+        @branchHint(.cold);
+        self.tile_upload_transfer_grows += 1;
+        if (self.tile_upload_transfer_growth_logged) return;
+        self.tile_upload_transfer_growth_logged = true;
+        if (comptime logging.enabled(.info)) log.info("tile upload transfer grew to {d} bytes", .{byte_size});
+    }
+
+    fn tileStore(self: *const Renderer, id: TileDataId) ?*TileStore {
+        if (!id.isValid()) return null;
+        if (id.index >= self.tile_stores.items.len) return null;
+        const store = &self.tile_stores.items[id.index];
+        if (store.buffer == null or store.generation != id.generation) return null;
+        return store;
     }
 
     fn createInternalTextureFromPixels(
@@ -1169,12 +1557,13 @@ pub const Renderer = struct {
     fn ensureFrameBatchCapacity(self: *Renderer) !void {
         const command_count = self.batch.commands.items.len;
         if (command_count == 0) return;
-        // Over-submission beyond the reserved `command_high_water` is owned by the
-        // grow fallback below, identically in Debug and ReleaseFast. `drawSprite`'s
-        // `SpriteCommandOverflow` guard (against the ArrayList's physical capacity)
-        // is the only hard bound; a Debug-only assert against `command_high_water`
-        // would panic on over-reservations that the frame path otherwise regrows,
-        // making the two modes disagree and leaving this fallback dead in Debug.
+        // Over-submission beyond the reserved `command_high_water` is handled the same
+        // way in Debug and ReleaseFast. `drawSprite` already grew the command list if
+        // needed and, in a reserved frame of a perf-diagnostic build, counted crossing this
+        // same bound as drift (`SpriteBatch.commandOverflowGrows`); this fallback grows prepared/vertex/group
+        // storage and the GPU streams before the threaded emit. There is no hard submit
+        // bound. A Debug-only assert against `command_high_water` would panic where
+        // ReleaseFast regrows.
         if (command_count <= self.command_high_water) return;
 
         const needed_vertices = try std.math.mul(usize, command_count, 6);
@@ -1190,18 +1579,12 @@ pub const Renderer = struct {
             new_capacity *= 2;
         }
 
-        // Growth requires a full GPU idle below, stalling the pipeline. Large
-        // scenes should reserve vertex capacity up front; warn so an unreserved
-        // runtime grow-and-stall is visible rather than silent.
-        log.warn("growing vertex batch capacity {} -> {} vertices (GPU stall); reserve capacity to avoid this", .{ self.batch_capacity_vertices, new_capacity });
-
-        // Build the full new three-buffer set before idling and releasing the old,
-        // so a creation failure leaves the live streams untouched.
+        // Build the full new three-buffer set before releasing the old, so a creation
+        // failure leaves the live streams untouched; SDL frees the old set once
+        // in-flight frames finish, so no drain.
         const new_streams = try createVertexStreams(self.device, new_capacity);
-        errdefer releaseVertexStreams(self.device, new_streams);
-
-        _ = c.SDL_WaitForGPUIdle(self.device);
         releaseVertexStreams(self.device, self.vertex_streams);
+        self.countBatchStreamGrowth(new_capacity);
 
         self.vertex_streams = new_streams;
         self.batch_capacity_vertices = new_capacity;
@@ -1217,7 +1600,7 @@ pub const Renderer = struct {
     const FrameCopyPassWork = struct {
         dynamic: bool = false,
         static_vertices: bool = false,
-        tile_edits: bool = false,
+        tile_stores: bool = false,
     };
 
     fn recordFrameCopyPass(
@@ -1230,8 +1613,7 @@ pub const Renderer = struct {
 
         // Every vertex-stream upload below is a full-buffer rewrite, so each
         // passes `cycle=true` independently of what else shares this pass.
-        // Tile-data storage edits are excluded — they target retained
-        // per-layer buffers with partial writes.
+        // Tile-store uploads are excluded: they write retained stores in part.
         if (work.dynamic) {
             const streams = self.vertex_streams;
             try gpu_buffer.recordVertexUploadInPass(
@@ -1294,45 +1676,47 @@ pub const Renderer = struct {
             );
         }
 
-        if (work.tile_edits) {
-            // Staging (map + write values) already happened pre-acquire; only
-            // record the storage-region uploads into the open copy pass here.
-            const transfer = self.tile_edit_transfer.?;
-            const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
-            std.debug.assert(self.tile_edit_transfer_byte_size >= required_bytes);
-            try gpu_buffer.recordStorageRegionsInPass(
-                copy_pass_scope.pass,
-                transfer,
-                self.tile_edit_transfer_byte_size,
-                self.tile_edit_scratch.items,
-            );
-            self.tile_edits_pending = false;
-            self.tile_edit_scratch.clearRetainingCapacity();
+        if (work.tile_stores) {
+            // Values were staged pre-acquire; this only records. A grown store first
+            // copies its previous contents forward, skipping the elements its
+            // pending spans overwrite, so no element is written twice in the pass.
+            for (self.tile_stores.items) |*store| {
+                const buffer = store.buffer orelse continue;
+                if (store.growth_source) |source| {
+                    var segments = GrowthCopySegments{
+                        .spans = store.pending_spans.items,
+                        .source_elements = store.growth_source_elements,
+                    };
+                    while (segments.next()) |segment| {
+                        try gpu_buffer.recordStorageCopyInPass(copy_pass_scope.pass, source, buffer, segment.dst_element, segment.count);
+                    }
+                }
+                if (store.pending_spans.items.len > 0) {
+                    try gpu_buffer.recordStorageSpansInPass(
+                        copy_pass_scope.pass,
+                        self.tile_upload_transfer.?,
+                        self.tile_upload_transfer_byte_size,
+                        store.staged_first_element,
+                        buffer,
+                        store.element_capacity,
+                        store.pending_spans.items,
+                    );
+                }
+                if (store.growth_source) |source| {
+                    c.SDL_ReleaseGPUBuffer(self.device, source);
+                    store.growth_source = null;
+                }
+                store.pending_spans.clearRetainingCapacity();
+                store.pending_values.clearRetainingCapacity();
+            }
         }
     }
 
-    /// Ensures tile-edit transfer capacity and stages edit values into the
-    /// pooled transfer buffer (cycle=true). Call pre-acquire so the post-acquire
-    /// copy pass only records `recordStorageRegionsInPass`.
-    fn stageTileEdits(self: *Renderer) !void {
-        const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
-        try self.ensureTileEditTransfer(required_bytes);
-        const transfer = self.tile_edit_transfer.?;
-        // cycle=true: transfer is renderer-owned and reused across frames, so
-        // map must rotate to fresh backing rather than overwrite in-flight data.
-        try gpu_buffer.stageStorageRegions(
-            self.device,
-            transfer,
-            self.tile_edit_transfer_byte_size,
-            self.tile_edit_scratch.items,
-            true,
-        );
-    }
-
-    // Grows the retained static buffer to hold `needed_vertices` (the dense-layer
-    // tilemap quads, 6 per layer). Grow-only and created lazily on first upload; it
-    // grows only when a dense layer is added, so the GPU-idle stall below is a rare,
-    // few-vertex structural event rather than a per-frame cost.
+    // Grows the retained static buffer to hold `needed_vertices` (6 per composite
+    // tilemap draw, which follow the world's resident layers). Grow-only, geometric,
+    // and created lazily on first upload. The new streams are created before the old
+    // ones are released, so a creation failure leaves the live streams untouched; SDL
+    // frees the old ones once in-flight frames finish, so no drain.
     fn ensureStaticCapacity(self: *Renderer, needed_vertices: usize) !void {
         if (self.static_streams != null and needed_vertices <= self.static_capacity_vertices) return;
 
@@ -1342,15 +1726,30 @@ pub const Renderer = struct {
         }
 
         const new_streams = try createVertexStreams(self.device, new_capacity);
-        errdefer releaseVertexStreams(self.device, new_streams);
-
         if (self.static_streams) |streams| {
-            _ = c.SDL_WaitForGPUIdle(self.device);
             releaseVertexStreams(self.device, streams);
+            self.countStaticStreamGrowth(new_capacity);
         }
-
         self.static_streams = new_streams;
         self.static_capacity_vertices = new_capacity;
+    }
+
+    // An unreserved runtime growth: large scenes should reserve vertex capacity up front,
+    // so the first warns.
+    fn countBatchStreamGrowth(self: *Renderer, capacity: usize) void {
+        @branchHint(.cold);
+        self.batch_stream_grows += 1;
+        if (self.batch_stream_growth_logged) return;
+        self.batch_stream_growth_logged = true;
+        if (comptime logging.enabled(.warn)) log.warn("vertex batch streams grew to {d} vertices; reserve capacity to avoid this", .{capacity});
+    }
+
+    fn countStaticStreamGrowth(self: *Renderer, capacity: usize) void {
+        @branchHint(.cold);
+        self.static_stream_grows += 1;
+        if (self.static_stream_growth_logged) return;
+        self.static_stream_growth_logged = true;
+        if (comptime logging.enabled(.info)) log.info("static vertex streams grew to {d} vertices", .{capacity});
     }
 
     fn stageStaticVertices(self: *Renderer) !void {
@@ -1374,8 +1773,8 @@ pub const Renderer = struct {
 // orders keep append order (static spans are appended before dynamic groups,
 // preserving the prior world-before-dynamic tie-break at the same depth).
 fn drawGroupOrderLessThan(_: void, a: DrawGroup, b: DrawGroup) bool {
-    const a_domain = @intFromEnum(a.order.domain);
-    const b_domain = @intFromEnum(b.order.domain);
+    const a_domain = @backingInt(a.order.domain);
+    const b_domain = @backingInt(b.order.domain);
     if (a_domain != b_domain) return a_domain < b_domain;
     return a.order.depth < b.order.depth;
 }
@@ -1607,16 +2006,6 @@ fn sdlError(comptime operation: []const u8) error{SdlError} {
 
 fn testTextureId(index: u32, generation: u32) TextureId {
     return TextureId.init(index, generation) catch unreachable;
-}
-
-fn testTextureSlot(texture: *c.SDL_GPUTexture, width: u32, height: u32, generation: u32, internal: bool) TextureSlot {
-    return .{
-        .texture = texture,
-        .desc = .{ .width = width, .height = height },
-        .generation = generation,
-        .alive = true,
-        .internal = internal,
-    };
 }
 
 test "texture slots reuse retired slots with fresh generations" {
@@ -1963,29 +2352,358 @@ test "contiguous tilemap groups never coalesce" {
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
 }
 
-test "applyWindowLayers fills layer count and topmost-first offsets" {
+test "packTileData packs two cells per element low half first and pads an odd tail" {
+    const cells = [_]u16{ 0x0001, 0x0002, 0xABCD, 0xFFFF, 0x0007 };
+    var elements: [tileDataElementCount(cells.len)]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), elements.len);
+    packTileData(&cells, &elements);
+
+    try std.testing.expectEqual(@as(u32, 0x0002_0001), elements[0]);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_ABCD), elements[1]);
+    try std.testing.expectEqual(@as(u32, 0x0007) | (@as(u32, tile_data_pad_cell) << 16), elements[2]);
+
+    // Every cell unpacks from its element exactly as tilemap.frag.glsl's tileAt does.
+    for (cells, 0..) |cell, flat| {
+        const element = elements[flat / tile_data_cells_per_element];
+        const shift: u5 = @intCast((flat & 1) * 16);
+        try std.testing.expectEqual(cell, @as(u16, @truncate(element >> shift)));
+    }
+}
+
+test "packTileData matches per-element packing at every length up to 33, odd tails padded" {
+    var prng = std.Random.DefaultPrng.init(0x7a1e_da7a);
+    const random = prng.random();
+    var cells: [33]u16 = undefined;
+    for (&cells) |*cell| cell.* = random.int(u16);
+    var packed_elements: [tileDataElementCount(cells.len)]u32 = undefined;
+    for (0..cells.len + 1) |len| {
+        const element_count = tileDataElementCount(len);
+        packTileData(cells[0..len], packed_elements[0..element_count]);
+        for (packed_elements[0..element_count], 0..) |element, index| {
+            const low = cells[index * 2];
+            const high = if (index * 2 + 1 < len) cells[index * 2 + 1] else tile_data_pad_cell;
+            try std.testing.expectEqual(packTileDataElement(low, high), element);
+        }
+    }
+}
+
+test "mergeTileStoreSpans replaces covered carried spans and patches nested ones" {
+    const allocator = std.testing.allocator;
+    // Carried: a directory word (0), a block (8..12), a single element (20).
+    const old_spans = [_]TileStoreSpan{
+        .{ .dst_element = 0, .count = 1 },
+        .{ .dst_element = 8, .count = 4 },
+        .{ .dst_element = 20, .count = 1 },
+    };
+    var old_values = [_]u32{ 1, 10, 11, 12, 13, 2 };
+    // New: a whole directory covering element 0, an element inside the carried block,
+    // the same single element again, and a disjoint element.
+    const new_spans = [_]TileStoreSpan{
+        .{ .dst_element = 0, .count = 4 },
+        .{ .dst_element = 10, .count = 1 },
+        .{ .dst_element = 16, .count = 1 },
+        .{ .dst_element = 20, .count = 1 },
+    };
+    const new_values = [_]u32{ 100, 101, 102, 103, 99, 50, 3 };
+    var out_spans: std.ArrayList(TileStoreSpan) = .empty;
+    defer out_spans.deinit(allocator);
+    var out_values: std.ArrayList(u32) = .empty;
+    defer out_values.deinit(allocator);
+    try out_spans.ensureTotalCapacity(allocator, old_spans.len + new_spans.len);
+    try out_values.ensureTotalCapacity(allocator, old_values.len + new_values.len);
+
+    mergeTileStoreSpans(&old_spans, &old_values, &new_spans, &new_values, &out_spans, &out_values);
+
+    try std.testing.expectEqualSlices(TileStoreSpan, &.{
+        .{ .dst_element = 0, .count = 4 },
+        .{ .dst_element = 8, .count = 4 },
+        .{ .dst_element = 16, .count = 1 },
+        .{ .dst_element = 20, .count = 1 },
+    }, out_spans.items);
+    try std.testing.expectEqualSlices(u32, &.{ 100, 101, 102, 103, 10, 11, 99, 13, 50, 3 }, out_values.items);
+    try std.testing.expect(gpu_buffer.storageSpansValid(out_spans.items, out_values.items.len, 24));
+}
+
+test "growth copy segments skip the elements pending spans overwrite" {
+    const spans = [_]TileStoreSpan{
+        .{ .dst_element = 0, .count = 2 },
+        .{ .dst_element = 5, .count = 1 },
+        .{ .dst_element = 9, .count = 4 },
+        .{ .dst_element = 20, .count = 1 },
+    };
+    var segments = GrowthCopySegments{ .spans = &spans, .source_elements = 12 };
+    var copied: [3]TileStoreSpan = undefined;
+    var count: usize = 0;
+    while (segments.next()) |segment| {
+        copied[count] = segment;
+        count += 1;
+    }
+    try std.testing.expectEqualSlices(TileStoreSpan, &.{
+        .{ .dst_element = 2, .count = 3 },
+        .{ .dst_element = 6, .count = 3 },
+    }, copied[0..count]);
+
+    var whole = GrowthCopySegments{ .spans = &.{}, .source_elements = 7 };
+    try std.testing.expectEqual(TileStoreSpan{ .dst_element = 0, .count = 7 }, whole.next().?);
+    try std.testing.expectEqual(@as(?TileStoreSpan, null), whole.next());
+}
+
+test "tile store growth at least doubles, covers the request, and clamps to the SDL width" {
+    try std.testing.expectEqual(@as(u32, 80), try tileStoreGrownCapacity(80, 80));
+    try std.testing.expectEqual(@as(u32, 160), try tileStoreGrownCapacity(80, 81));
+    try std.testing.expectEqual(@as(u32, 500), try tileStoreGrownCapacity(80, 500));
+    try std.testing.expectEqual(@as(u32, 2), try tileStoreGrownCapacity(1, 2));
+    const near_max = tile_store_max_elements - 8;
+    try std.testing.expectEqual(tile_store_max_elements, try tileStoreGrownCapacity(near_max - 1000, near_max));
+    try std.testing.expectError(error.GpuBufferTooLarge, tileStoreGrownCapacity(80, tile_store_max_elements + 1));
+}
+
+test "tile upload transfer grows geometrically and clamps to the u32 byte width" {
+    try std.testing.expectEqual(@as(u32, 48), grownTransferBytes(0, 48));
+    try std.testing.expectEqual(@as(u32, 96), grownTransferBytes(48, 52));
+    try std.testing.expectEqual(@as(u32, 400), grownTransferBytes(48, 400));
+    const max_bytes = std.math.maxInt(u32);
+    try std.testing.expectEqual(max_bytes, grownTransferBytes(max_bytes / 2 + 1, max_bytes / 2 + 2));
+    try std.testing.expectEqual(max_bytes, grownTransferBytes(max_bytes - 4, max_bytes));
+}
+
+test "tile store layout bounds the chunk shift, directory side, grid, and capacity" {
+    const params = TilemapParams{ .grid = .{ 16, 10, 6, 65535 }, .atlas = .{ 1, 1, 1, 16 } };
+    const desc = TileStoreDesc{ .element_capacity = 17, .params = params, .chunk_shift = 2, .side = 4 };
+    try validateTileStoreDesc(desc);
+    var edge = desc;
+    edge.side = tile_store_max_side;
+    edge.chunk_shift = tile_store_max_chunk_shift;
+    edge.element_capacity = tile_store_max_elements;
+    try validateTileStoreDesc(edge);
+    edge.side = 1;
+    edge.element_capacity = 1;
+    try validateTileStoreDesc(edge);
+
+    var wrong = desc;
+    wrong.side = 3;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong.side = 0;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong.side = tile_store_max_side * 2;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong = desc;
+    wrong.chunk_shift = tile_store_max_chunk_shift + 1;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong = desc;
+    wrong.params.grid[1] = 0;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong = desc;
+    wrong.element_capacity = 0;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    wrong.element_capacity = tile_store_max_elements + 1;
+    try std.testing.expectError(error.InvalidTileStoreLayout, validateTileStoreDesc(wrong));
+    try std.testing.expectEqual(@as(u32, 1), tileStoreBlockElements(1));
+    try std.testing.expectEqual(@as(u32, 128), tileStoreBlockElements(16));
+}
+
+test "setTileStoreWindow moves a live store's window and ignores a stale id" {
+    var renderer = testRenderer(std.testing.allocator);
+    defer deinitTileStoreTestRenderer(&renderer);
+    const id = try testInstallTileStore(&renderer, 0x1000);
+    renderer.setTileStoreWindow(id, .{ 3, 4, 7, 8 });
+    try std.testing.expectEqual([4]u32{ 3, 4, 7, 8 }, renderer.tileStore(id).?.params.window);
+    renderer.setTileStoreWindow(.{ .index = id.index, .generation = id.generation + 1 }, .{ 0, 0, 1, 1 });
+    try std.testing.expectEqual([4]u32{ 3, 4, 7, 8 }, renderer.tileStore(id).?.params.window);
+}
+
+test "queueTileStoreUploads folds a carried batch allocation-free after reserve" {
+    const allocator = std.testing.allocator;
+    var renderer = testRenderer(allocator);
+    defer renderer.batch.deinit();
+    defer renderer.tile_stores.deinit(allocator);
+    defer renderer.tile_merge_spans.deinit(allocator);
+    defer renderer.tile_merge_values.deinit(allocator);
+    // Fake GPU handle: queueing only validates and records, never touches SDL.
+    try renderer.tile_stores.append(allocator, .{
+        .buffer = @ptrFromInt(0x1000),
+        .element_capacity = 64,
+        .params = std.mem.zeroes(TilemapParams),
+    });
+    const store = &renderer.tile_stores.items[0];
+    defer store.pending_spans.deinit(allocator);
+    defer store.pending_values.deinit(allocator);
+    const id = TileDataId{ .index = 0, .generation = 1 };
+
+    const first_spans = [_]TileStoreSpan{ .{ .dst_element = 3, .count = 1 }, .{ .dst_element = 32, .count = 8 } };
+    const first_values = [_]u32{ 7, 0, 1, 2, 3, 4, 5, 6, 7 };
+    try renderer.reserveTileStoreUploads(id, 40, first_spans.len, first_values.len);
+    // A batch no frame recorded stays pending and the next one folds into it.
+    const second_spans = [_]TileStoreSpan{ .{ .dst_element = 3, .count = 1 }, .{ .dst_element = 34, .count = 1 }, .{ .dst_element = 40, .count = 8 } };
+    const second_values = [_]u32{ 8, 22, 9, 9, 9, 9, 9, 9, 9, 9 };
+    {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        renderer.allocator = failing.allocator();
+        defer renderer.allocator = allocator;
+        renderer.queueTileStoreUploads(id, &first_spans, &first_values);
+        try std.testing.expectError(error.OutOfMemory, renderer.reserveTileStoreUploads(id, 48, second_spans.len, second_values.len));
+    }
+    try renderer.reserveTileStoreUploads(id, 48, second_spans.len, second_values.len);
+    {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        renderer.allocator = failing.allocator();
+        defer renderer.allocator = allocator;
+        renderer.queueTileStoreUploads(id, &second_spans, &second_values);
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    }
+    try std.testing.expectEqualSlices(TileStoreSpan, &.{
+        .{ .dst_element = 3, .count = 1 },
+        .{ .dst_element = 32, .count = 8 },
+        .{ .dst_element = 40, .count = 8 },
+    }, store.pending_spans.items);
+    try std.testing.expectEqualSlices(u32, &.{ 8, 0, 1, 22, 3, 4, 5, 6, 7, 9, 9, 9, 9, 9, 9, 9, 9 }, store.pending_values.items);
+    // A stale handle never reaches the queue: its reserve refuses it first.
+    try std.testing.expectError(error.InvalidTileStore, renderer.reserveTileStoreUploads(.{ .index = 1, .generation = 1 }, 1, 0, 0));
+    try std.testing.expectError(error.InvalidTileStore, renderer.reserveTileStoreUploads(.{ .index = 0, .generation = 2 }, 1, 0, 0));
+}
+
+// Installs a store with a fake GPU handle; the sweep and retire tests only
+// record and compare it, never pass it to SDL.
+fn testInstallTileStore(renderer: *Renderer, buffer_address: usize) !TileDataId {
+    try renderer.reserveTileStoreSlot();
+    return renderer.installTileStore(.{
+        .buffer = @ptrFromInt(buffer_address),
+        .element_capacity = 64,
+        .params = std.mem.zeroes(TilemapParams),
+    });
+}
+
+fn deinitTileStoreTestRenderer(renderer: *Renderer) void {
+    for (renderer.tile_stores.items) |*store| {
+        store.pending_spans.deinit(renderer.allocator);
+        store.pending_values.deinit(renderer.allocator);
+    }
+    renderer.tile_stores.deinit(renderer.allocator);
+    renderer.tile_store_free.deinit(renderer.allocator);
+    renderer.tile_merge_spans.deinit(renderer.allocator);
+    renderer.tile_merge_values.deinit(renderer.allocator);
+    renderer.batch.deinit();
+}
+
+test "an unclaimed tile store is retired by the sweep and its id goes stale; a claimed store survives with its claim cleared" {
+    var renderer = testRenderer(std.testing.allocator);
+    defer deinitTileStoreTestRenderer(&renderer);
+    const kept = try testInstallTileStore(&renderer, 0x1000);
+    const dropped = try testInstallTileStore(&renderer, 0x2000);
+    // Uploads still pending on a retired store are freed with it.
+    try renderer.reserveTileStoreUploads(dropped, 8, 1, 2);
+    renderer.queueTileStoreUploads(dropped, &.{.{ .dst_element = 0, .count = 2 }}, &.{ 1, 2 });
+
+    // First sweep: creation claimed both for their first frame.
+    try std.testing.expectEqual(@as(?u32, null), renderer.nextUnclaimedTileStore(0));
+    // Second sweep: only `kept` was claimed again.
+    try std.testing.expect(renderer.claimTileStore(kept));
+    try std.testing.expectEqual(@as(?u32, dropped.index), renderer.nextUnclaimedTileStore(0));
+    const retired = renderer.retireTileStoreSlot(dropped.index);
+    try std.testing.expectEqual(@as(usize, 0x2000), @intFromPtr(retired.buffer));
+    try std.testing.expectEqual(@as(?*c.SDL_GPUBuffer, null), retired.growth_source);
+    try std.testing.expectEqual(@as(?u32, null), renderer.nextUnclaimedTileStore(dropped.index + 1));
+
+    try std.testing.expect(renderer.tileStore(dropped) == null);
+    try std.testing.expect(!renderer.claimTileStore(dropped));
+    try std.testing.expectError(error.InvalidTileStore, renderer.reserveTileStoreUploads(dropped, 1, 0, 0));
+    const survivor = renderer.tileStore(kept).?;
+    try std.testing.expect(!survivor.claimed);
+    // Third sweep: `kept` was not claimed this time.
+    try std.testing.expectEqual(@as(?u32, kept.index), renderer.nextUnclaimedTileStore(0));
+}
+
+test "a tile store retired mid-growth hands back both buffers and leaves a clean slot" {
+    var renderer = testRenderer(std.testing.allocator);
+    defer deinitTileStoreTestRenderer(&renderer);
+    const id = try testInstallTileStore(&renderer, 0x1000);
+    // A growth no frame recorded yet: the replaced buffer still holds the contents.
+    renderer.tileStore(id).?.growth_source = @ptrFromInt(0x2000);
+    renderer.tileStore(id).?.growth_source_elements = 32;
+
+    const retired = renderer.retireTileStoreSlot(id.index);
+    try std.testing.expectEqual(@as(usize, 0x1000), @intFromPtr(retired.buffer));
+    try std.testing.expectEqual(@as(usize, 0x2000), @intFromPtr(retired.growth_source.?));
+    const slot = renderer.tile_stores.items[id.index];
+    try std.testing.expectEqual(@as(?*c.SDL_GPUBuffer, null), slot.buffer);
+    try std.testing.expectEqual(@as(?*c.SDL_GPUBuffer, null), slot.growth_source);
+    try std.testing.expectEqual(@as(u32, 0), slot.growth_source_elements);
+    // Nothing is left for the frame copy pass to stage or record.
+    try std.testing.expect(!renderer.tileStoreUploadsPending());
+    try std.testing.expectEqual(@as(?u32, null), renderer.nextUnclaimedTileStore(0));
+}
+
+test "a retired tile store slot is reused under a new generation and the old id stays stale" {
+    const allocator = std.testing.allocator;
+    var renderer = testRenderer(allocator);
+    defer deinitTileStoreTestRenderer(&renderer);
+    const first = try testInstallTileStore(&renderer, 0x1000);
+    _ = renderer.retireTileStoreSlot(first.index);
+
+    // Reuse, retire, and reuse again allocate nothing once a slot is reserved.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    renderer.allocator = failing.allocator();
+    const second = try testInstallTileStore(&renderer, 0x2000);
+    _ = renderer.retireTileStoreSlot(second.index);
+    const third = try testInstallTileStore(&renderer, 0x3000);
+    renderer.allocator = allocator;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    try std.testing.expectEqual(first.index, second.index);
+    try std.testing.expectEqual(first.index, third.index);
+    try std.testing.expectEqual(resources.nextGeneration(first.generation), second.generation);
+    try std.testing.expectEqual(resources.nextGeneration(second.generation), third.generation);
+    try std.testing.expectEqual(@as(usize, 1), renderer.tile_stores.items.len);
+    try std.testing.expect(renderer.tileStore(first) == null);
+    try std.testing.expect(renderer.tileStore(second) == null);
+    try std.testing.expect(!renderer.claimTileStore(first));
+    try std.testing.expectEqual(@as(usize, 0x3000), @intFromPtr(renderer.tileStore(third).?.buffer.?));
+    try std.testing.expect(renderer.claimTileStore(third));
+
+    // A fresh slot is reserved up front, so installing it and retiring it later
+    // allocate nothing.
+    try renderer.reserveTileStoreSlot();
+    failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    renderer.allocator = failing.allocator();
+    const fresh = renderer.installTileStore(.{
+        .buffer = @ptrFromInt(0x4000),
+        .element_capacity = 64,
+        .params = std.mem.zeroes(TilemapParams),
+    });
+    _ = renderer.retireTileStoreSlot(fresh.index);
+    _ = renderer.retireTileStoreSlot(third.index);
+    renderer.allocator = allocator;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(u32, 1), fresh.index);
+    try std.testing.expectEqual(@as(u32, 1), fresh.generation);
+}
+
+test "tileDataElementCount halves cell counts rounding up" {
+    try std.testing.expectEqual(@as(usize, 0), tileDataElementCount(0));
+    try std.testing.expectEqual(@as(usize, 1), tileDataElementCount(1));
+    try std.testing.expectEqual(@as(usize, 1), tileDataElementCount(2));
+    try std.testing.expectEqual(@as(usize, 2), tileDataElementCount(3));
+}
+
+test "applyWindowLayers fills the draw's layer count, shallowest flag, and topmost directory" {
     var params = TilemapParams{
         .grid = .{ 1, 1, 1, 1 },
         .atlas = .{ 1, 1, 1, 1 },
+        .layer_meta = .{ 0, 0, 2, 8 },
+        .window = .{ 1, 2, 3, 4 },
     };
-    var window = Renderer.TilemapWindowLayers{};
-    window.count = 3;
-    window.offsets[0] = 100;
-    window.offsets[1] = 200;
-    window.offsets[2] = 300;
+    Renderer.applyWindowLayers(&params, .{ .first_directory = 130, .count = 80, .is_shallowest_bucket = true });
 
-    Renderer.applyWindowLayers(&params, window);
-
-    try std.testing.expectEqual(@as(i32, 3), params.layer_meta[0]);
-    try std.testing.expectEqual(@as(u32, 100), params.layer_offsets[0]);
-    try std.testing.expectEqual(@as(u32, 200), params.layer_offsets[1]);
-    try std.testing.expectEqual(@as(u32, 300), params.layer_offsets[2]);
+    try std.testing.expectEqual([4]i32{ 80, 1, 2, 8 }, params.layer_meta);
+    try std.testing.expectEqual(@as(u32, 130), params.chain[0]);
+    // The store's window is untouched.
+    try std.testing.expectEqual([4]u32{ 1, 2, 3, 4 }, params.window);
 }
 
 // A minimal 6-vertex quad; `appendStaticTilemapSpan` only counts and stores
 // vertices, so their contents do not matter for these tests.
 fn testStaticQuad() [6]Position {
-    return [_]Position{.{ 0, 0 }} ** 6;
+    return @splat(.{ 0, 0 });
 }
 
 fn testRenderer(allocator: std.mem.Allocator) Renderer {
@@ -2007,6 +2725,7 @@ fn deinitStaticGeometryTestRenderer(renderer: *Renderer, allocator: std.mem.Allo
     renderer.static_uvs.deinit(allocator);
     renderer.static_colors.deinit(allocator);
     renderer.static_groups.deinit(allocator);
+    renderer.tilemap_window_layers.deinit(allocator);
     renderer.batch.deinit();
 }
 
@@ -2016,63 +2735,54 @@ test "appendStaticTilemapSpan assigns sequential window slots per static-geometr
     defer deinitStaticGeometryTestRenderer(&renderer, allocator);
 
     const positions = testStaticQuad();
-    const uvs = [_]Uv{.{ 0, 0 }} ** 6;
-    const colors = [_]VertexColor{.{ 1, 1, 1, 1 }} ** 6;
+    const uvs: [6]Uv = @splat(.{ 0, 0 });
+    const colors: [6]VertexColor = @splat(.{ 1, 1, 1, 1 });
     const vertices = VertexColumnsConst{ .positions = &positions, .uvs = &uvs, .colors = &colors };
     const texture = testTextureId(0, 1);
 
     renderer.beginStaticGeometry();
     for (0..3) |i| {
-        var window = Renderer.TilemapWindowLayers{};
-        window.count = 1;
-        window.offsets[0] = @intCast(i);
-        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @enumFromInt(0), window);
+        const window = Renderer.TilemapWindowLayers{ .first_directory = @intCast(i), .count = 1 };
+        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, TileDataId{ .index = 0, .generation = 1 }, window);
     }
 
-    try std.testing.expectEqual(@as(usize, 3), renderer.tilemap_window_layer_count);
+    try std.testing.expectEqual(@as(usize, 3), renderer.tilemap_window_layers.items.len);
     for (0..3) |i| {
-        try std.testing.expectEqual(@as(u8, @intCast(i)), renderer.static_groups.items[i].window_slot);
-        try std.testing.expectEqual(@as(u32, @intCast(i)), renderer.tilemap_window_layers[i].offsets[0]);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), renderer.static_groups.items[i].window_slot);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), renderer.tilemap_window_layers.items[i].first_directory);
     }
 
-    // A rebuild's beginStaticGeometry resets the slot count -- no leaked slots
+    // A rebuild's beginStaticGeometry resets the side table -- no leaked slots
     // carry over from the prior cycle.
     renderer.beginStaticGeometry();
-    try std.testing.expectEqual(@as(usize, 0), renderer.tilemap_window_layer_count);
-
-    var window = Renderer.TilemapWindowLayers{};
-    window.count = 1;
-    window.offsets[0] = 99;
-    try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(0), vertices, @enumFromInt(0), window);
-    try std.testing.expectEqual(@as(usize, 1), renderer.tilemap_window_layer_count);
-    try std.testing.expectEqual(@as(u8, 0), renderer.static_groups.items[0].window_slot);
+    try std.testing.expectEqual(@as(usize, 0), renderer.tilemap_window_layers.items.len);
+    try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(0), vertices, TileDataId{ .index = 0, .generation = 1 }, .{ .first_directory = 99, .count = 1 });
+    try std.testing.expectEqual(@as(usize, 1), renderer.tilemap_window_layers.items.len);
+    try std.testing.expectEqual(@as(u32, 0), renderer.static_groups.items[0].window_slot);
 }
 
-test "appendStaticTilemapSpan returns TooManyTilemapWindowDraws past the composite-draw cap" {
+test "appendStaticTilemapSpan assigns window slots past 255" {
     const allocator = std.testing.allocator;
     var renderer = testRenderer(allocator);
     defer deinitStaticGeometryTestRenderer(&renderer, allocator);
 
     const positions = testStaticQuad();
-    const uvs = [_]Uv{.{ 0, 0 }} ** 6;
-    const colors = [_]VertexColor{.{ 1, 1, 1, 1 }} ** 6;
+    const uvs: [6]Uv = @splat(.{ 0, 0 });
+    const colors: [6]VertexColor = @splat(.{ 1, 1, 1, 1 });
     const vertices = VertexColumnsConst{ .positions = &positions, .uvs = &uvs, .colors = &colors };
     const texture = testTextureId(0, 1);
-    const window = Renderer.TilemapWindowLayers{ .count = 1 };
+    const span_count: usize = 300;
 
     renderer.beginStaticGeometry();
-    for (0..Renderer.k_max_dense_composite_draws) |i| {
-        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @enumFromInt(0), window);
+    for (0..span_count) |i| {
+        const window = Renderer.TilemapWindowLayers{ .first_directory = @intCast(i * 3), .count = 1 };
+        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, TileDataId{ .index = 0, .generation = 1 }, window);
     }
-    try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, renderer.tilemap_window_layer_count);
-
-    try std.testing.expectError(
-        error.TooManyTilemapWindowDraws,
-        renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(Renderer.k_max_dense_composite_draws)), vertices, @enumFromInt(0), window),
-    );
-    // The fixed-size table stayed exactly at the cap; the failed call past it
-    // neither corrupted it nor grew past bounds.
-    try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, renderer.tilemap_window_layer_count);
+    try std.testing.expectEqual(span_count, renderer.tilemap_window_layers.items.len);
+    for (renderer.static_groups.items, 0..) |group, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(i)), group.window_slot);
+        try std.testing.expectEqual(@as(u32, @intCast(i * 3)), renderer.tilemap_window_layers.items[group.window_slot].first_directory);
+    }
 }
 
 test "reserved static geometry append and mergeDrawList stay allocation-free" {
@@ -2086,13 +2796,14 @@ test "reserved static geometry append and mergeDrawList stay allocation-free" {
     try renderer.reserveStaticGeometry(vertex_capacity, span_count);
 
     const positions = testStaticQuad();
-    const uvs = [_]Uv{.{ 0, 0 }} ** 6;
-    const colors = [_]VertexColor{.{ 1, 1, 1, 1 }} ** 6;
+    const uvs: [6]Uv = @splat(.{ 0, 0 });
+    const colors: [6]VertexColor = @splat(.{ 1, 1, 1, 1 });
     const vertices = VertexColumnsConst{ .positions = &positions, .uvs = &uvs, .colors = &colors };
     const texture = testTextureId(0, 1);
     const window = Renderer.TilemapWindowLayers{ .count = 1 };
 
-    // Reserved-then-append/merge SUCCESS branch under a hard-failing allocator.
+    // Reserved-then-append/merge SUCCESS branch under a hard-failing allocator,
+    // the window side table included.
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const real_allocator = renderer.allocator;
     renderer.allocator = failing.allocator();
@@ -2104,7 +2815,7 @@ test "reserved static geometry append and mergeDrawList stay allocation-free" {
             texture,
             RenderOrder.world(@intCast(i)),
             vertices,
-            @enumFromInt(0),
+            TileDataId{ .index = 0, .generation = 1 },
             window,
         );
     }
@@ -2113,6 +2824,7 @@ test "reserved static geometry append and mergeDrawList stay allocation-free" {
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(span_count, renderer.static_groups.items.len);
+    try std.testing.expectEqual(span_count, renderer.tilemap_window_layers.items.len);
     try std.testing.expectEqual(vertex_capacity, renderer.static_positions.items.len);
     try std.testing.expectEqual(span_count, renderer.draw_list.items.len);
 }
@@ -2224,7 +2936,7 @@ test "reserve sprite commands is grow-only and enables allocation-free enqueue" 
     try renderer.reserveSpriteCommands(8);
     const capacity_before = renderer.batch.commands.capacity;
     try renderer.reserveSpriteCommands(4);
-    try std.testing.expect(renderer.batch.frame_reserved);
+    try std.testing.expectEqual(@as(usize, 8), renderer.command_high_water);
     try std.testing.expectEqual(capacity_before, renderer.batch.commands.capacity);
 
     const white = TextureId.init(0, 1) catch unreachable;
@@ -2331,6 +3043,91 @@ test "engine overlay top-up after stacked UI fully consumes its headroom stays a
         order += 1;
     }
     try std.testing.expectEqual(commands_capacity_after_state_reserve, renderer.batch.commands.capacity);
+}
+
+test "reserved sprite frame submits allocation-free with no overflow growth (FailingAllocator)" {
+    const allocator = std.testing.allocator;
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer renderer.batch.deinit();
+    defer renderer.draw_list.deinit(allocator);
+
+    const reserved: usize = 8;
+    try renderer.reserveSpriteCommands(reserved);
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const real_renderer_allocator = renderer.allocator;
+    const real_batch_allocator = renderer.batch.allocator;
+    renderer.allocator = failing.allocator();
+    renderer.batch.allocator = failing.allocator();
+    defer {
+        renderer.allocator = real_renderer_allocator;
+        renderer.batch.allocator = real_batch_allocator;
+    }
+
+    // Exactly the declared reservation, not the list's (possibly rounded-up) physical capacity.
+    const white = try TextureId.init(0, 1);
+    for (0..reserved) |i| {
+        try renderer.submitOrderedSprite(.{
+            .texture = white,
+            .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(@intCast(i)),
+        });
+    }
+    try std.testing.expectEqual(reserved, renderer.spriteCommandCount());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(u64, 0), renderer.batch.commandOverflowGrows());
+}
+
+test "submits past the reservation inside the command list's slack count as drift" {
+    // Drift diagnostics compile out of shipping builds (`SpriteBatch.ReservationDrift`).
+    if (!@import("../app/runtime_perf_log.zig").enabled) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer renderer.batch.deinit();
+    defer renderer.draw_list.deinit(allocator);
+
+    // Physical command capacity well past the declared reservation, as std's rounding or
+    // an earlier larger batch reserve leaves it.
+    try renderer.batch.reserveStorage(32, 32 * 6, 32);
+    const reserved: usize = 8;
+    try renderer.reserveSpriteCommands(reserved);
+    const capacity_before = renderer.batch.commands.capacity;
+
+    const white = try TextureId.init(0, 1);
+    for (0..reserved + 2) |i| {
+        try renderer.submitOrderedSprite(.{
+            .texture = white,
+            .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(@intCast(i)),
+        });
+    }
+    // The command list never grew, but the frame is past `command_high_water`, which is
+    // what makes `ensureFrameBatchCapacity` grow (and can GPU-idle stall): drift, counted
+    // once for the frame.
+    try std.testing.expectEqual(capacity_before, renderer.batch.commands.capacity);
+    try std.testing.expect(renderer.spriteCommandCount() > renderer.command_high_water);
+    try std.testing.expectEqual(@as(u64, 1), renderer.batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(usize, 1), renderer.batch.finishPrepStats(.{}).command_overflow_grows);
 }
 
 test "linear merge matches stable sort for pre-sorted static and dynamic groups" {

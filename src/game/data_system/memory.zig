@@ -234,15 +234,15 @@ test "validateAiMemory accepts defaults and rejects out-of-range or non-finite f
 
     try std.testing.expectError(error.InvalidAiMemory, validateAiMemory(.{ .ring_next_slot = ai_memory_ring_capacity }));
 
-    var bad_age_ring: [ai_memory_ring_capacity]AiMemoryContact = [_]AiMemoryContact{.{}} ** ai_memory_ring_capacity;
+    var bad_age_ring: [ai_memory_ring_capacity]AiMemoryContact = @splat(.{});
     bad_age_ring[0].age = -1;
     try std.testing.expectError(error.InvalidAiMemory, validateAiMemory(.{ .ring = bad_age_ring }));
 
-    var stale_ring: [ai_memory_ring_capacity]AiMemoryContact = [_]AiMemoryContact{.{}} ** ai_memory_ring_capacity;
+    var stale_ring: [ai_memory_ring_capacity]AiMemoryContact = @splat(.{});
     stale_ring[1].age = max_ai_memory_staleness + 1;
     try std.testing.expectError(error.InvalidAiMemory, validateAiMemory(.{ .ring = stale_ring }));
 
-    var nan_ring: [ai_memory_ring_capacity]AiMemoryContact = [_]AiMemoryContact{.{}} ** ai_memory_ring_capacity;
+    var nan_ring: [ai_memory_ring_capacity]AiMemoryContact = @splat(.{});
     nan_ring[2].x = std.math.nan(f32);
     try std.testing.expectError(error.InvalidAiMemory, validateAiMemory(.{ .ring = nan_ring }));
 }
@@ -262,7 +262,7 @@ test "AiMemoryStore append/set/get/removeAt round-trip" {
     try std.testing.expectEqual(@as(usize, 3), store.len());
     try std.testing.expectEqual(@as(f32, 20), store.get(1).staleness);
 
-    var ring: [ai_memory_ring_capacity]AiMemoryContact = [_]AiMemoryContact{.{}} ** ai_memory_ring_capacity;
+    var ring: [ai_memory_ring_capacity]AiMemoryContact = @splat(.{});
     ring[0] = .{ .entity = contact_entity, .x = 5, .y = 6, .age = 1.5 };
     store.set(0, .{
         .last_known_target = contact_entity,
