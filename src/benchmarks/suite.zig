@@ -20,6 +20,8 @@ const NavMainPhases = @import("../game/systems/pathfinding/types.zig").NavMainPh
 const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
 
 pub const default_items_per_range = (ThreadSystemConfig{}).items_per_range;
+/// The fixed partition of a chunk-partitioned stage: one chunk per range.
+pub const chunk_partition_items: usize = 1;
 
 pub const Profile = enum {
     quick,
@@ -64,6 +66,17 @@ pub const BenchmarkGroup = struct {
     write_workload: WorkloadWriter,
     /// The case the summary leads with.
     summary_focus: SummaryFocus = .fastest,
+    /// Set only when every fixed-control stage of the group resolves its range from this
+    /// one shape. A fixed case that resolves to an earlier case's configuration is then
+    /// reported as that case's duplicate and not timed again; null keeps every case timed.
+    fixed_range_shape: ?FixedRangeShape = null,
+};
+
+/// The partition a group's fixed stages scale their range modes from, and the alignment
+/// they share.
+pub const FixedRangeShape = struct {
+    partition_items: usize,
+    range_alignment_items: usize,
 };
 
 /// Where a workload is printed: the one-line summary or the `--details` table.
@@ -104,26 +117,38 @@ pub const BenchmarkCase = struct {
         return self.worker_mode != .serial_direct;
     }
 
-    pub fn itemsPerRange(self: BenchmarkCase, range_alignment_items: usize) ?usize {
-        const base = default_items_per_range;
-        return switch (self.range_mode) {
-            .default => null,
-            .small => std.mem.alignForwardAnyAlign(usize, @max(base / 2, @as(usize, 1)), range_alignment_items),
-            .large => std.mem.alignForwardAnyAlign(usize, base * 4, range_alignment_items),
-        };
-    }
-
     /// The range size a fixed control runs: this case's range mode, or the default size
     /// aligned to the stage's range alignment.
     pub fn fixedItemsPerRange(self: BenchmarkCase, range_alignment_items: usize) usize {
-        return self.itemsPerRange(range_alignment_items) orelse alignedDefaultItemsPerRange(range_alignment_items);
+        return self.fixedItemsPerRangeForPartition(default_items_per_range, range_alignment_items);
     }
 
     /// A stage's `items_per_range` control: null for adaptive cases so the stage's tuner
     /// picks the range, otherwise `fixedItemsPerRange`.
     pub fn stageItemsPerRange(self: BenchmarkCase, range_alignment_items: usize) ?usize {
+        return self.stageItemsPerRangeForPartition(default_items_per_range, range_alignment_items);
+    }
+
+    /// `stageItemsPerRange` for a group whose fixed partition is `partition_items` (one
+    /// chunk for chunk-partitioned stages) instead of the element default: the range modes
+    /// scale from that partition.
+    pub fn stageItemsPerRangeForPartition(self: BenchmarkCase, partition_items: usize, range_alignment_items: usize) ?usize {
         if (self.adaptive) return null;
-        return self.fixedItemsPerRange(range_alignment_items);
+        return self.fixedItemsPerRangeForPartition(partition_items, range_alignment_items);
+    }
+
+    fn fixedItemsPerRangeForPartition(self: BenchmarkCase, partition_items: usize, range_alignment_items: usize) usize {
+        return self.itemsPerRangeForPartition(partition_items, range_alignment_items) orelse
+            std.mem.alignForwardAnyAlign(usize, partition_items, range_alignment_items);
+    }
+
+    // Null in the default range mode; small halves the partition and large quadruples it.
+    fn itemsPerRangeForPartition(self: BenchmarkCase, partition_items: usize, range_alignment_items: usize) ?usize {
+        return switch (self.range_mode) {
+            .default => null,
+            .small => std.mem.alignForwardAnyAlign(usize, @max(partition_items / 2, @as(usize, 1)), range_alignment_items),
+            .large => std.mem.alignForwardAnyAlign(usize, partition_items * 4, range_alignment_items),
+        };
     }
 };
 
@@ -139,10 +164,6 @@ pub const RangeMode = enum {
     small,
     large,
 };
-
-fn alignedDefaultItemsPerRange(range_alignment_items: usize) usize {
-    return std.mem.alignForwardAnyAlign(usize, default_items_per_range, range_alignment_items);
-}
 
 pub const AdaptiveRangeMode = enum {
     none,
@@ -201,6 +222,16 @@ pub const default_cases = [_]BenchmarkCase{
 pub const RunStatus = enum {
     measured,
     skipped,
+    // Resolves to an earlier case's configuration under the group's `fixed_range_shape`;
+    // not timed.
+    duplicate,
+};
+
+// Per default case, the status text of a later case that duplicates it.
+const same_shape_notes = blk: {
+    var notes: [default_cases.len][]const u8 = undefined;
+    for (default_cases, &notes) |case, *note| note.* = "same shape as " ++ case.name;
+    break :blk notes;
 };
 
 pub const RunStats = struct {
@@ -208,6 +239,7 @@ pub const RunStats = struct {
     // `write_workload` names what its counters hold.
     status: RunStatus = .measured,
     skip_reason: []const u8 = "",
+    duplicate_note: []const u8 = "",
     item_count: usize = 0,
     candidate_pairs: usize = 0,
     sample_count: usize = 0,
@@ -553,13 +585,19 @@ pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement:
 }
 
 pub fn adaptiveTunerForCase(case: BenchmarkCase, range_alignment_items: usize) ?AdaptiveWorkTuner {
+    return adaptiveTunerForPartition(case, default_items_per_range, range_alignment_items);
+}
+
+/// `adaptiveTunerForCase` for a group whose fixed partition is `partition_items`: the
+/// fixed-adaptive case clamps its range to that partition, aligned.
+pub fn adaptiveTunerForPartition(case: BenchmarkCase, partition_items: usize, range_alignment_items: usize) ?AdaptiveWorkTuner {
     // Fixed-adaptive cases reuse tuner reporting but clamp range probing so they
     // can act as a stable control against fully adaptive policy.
     if (!case.adaptive) return null;
     return switch (case.adaptive_range_mode) {
         .none, .tuned => null,
         .fixed => fixed: {
-            const fixed_range = alignedDefaultItemsPerRange(range_alignment_items);
+            const fixed_range = std.mem.alignForwardAnyAlign(usize, partition_items, range_alignment_items);
             break :fixed AdaptiveWorkTuner.init(.{
                 .initial_range_items = fixed_range,
                 .smallest_range_items = fixed_range,
@@ -658,11 +696,15 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
             var results: [default_cases.len]CaseResult = undefined;
             var result_count: usize = 0;
 
-            for (default_cases) |case| {
+            for (default_cases, 0..) |case, case_index| {
                 if (options.case_filter) |filter| {
                     if (!std.mem.eql(u8, filter, case.name) and !shouldIncludeBaselineForFilter(filter, case)) continue;
                 }
-                const stats = try group.runCase(allocator, io, options, case, item_count);
+                const duplicate_of = if (group.fixed_range_shape) |shape| sameShapeCaseIndex(shape, case_index) else null;
+                const stats: RunStats = if (duplicate_of) |earlier|
+                    .{ .status = .duplicate, .duplicate_note = same_shape_notes[earlier] }
+                else
+                    try group.runCase(allocator, io, options, case, item_count);
                 results[result_count] = .{ .case = case, .stats = stats };
                 result_count += 1;
             }
@@ -674,6 +716,19 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
         std.debug.print("unknown benchmark group: {s}\n", .{options.group_filter orelse options.group_prefix.?});
         return error.InvalidArgument;
     }
+}
+
+// The earliest default case that `default_cases[case_index]` runs the same configuration as
+// under `shape`: the same fixed (non-adaptive) threaded worker mode and the same resolved range.
+fn sameShapeCaseIndex(shape: FixedRangeShape, case_index: usize) ?usize {
+    const case = default_cases[case_index];
+    if (case.adaptive or !case.usesThreadSystem()) return null;
+    const range = case.fixedItemsPerRangeForPartition(shape.partition_items, shape.range_alignment_items);
+    for (default_cases[0..case_index], 0..) |earlier, earlier_index| {
+        if (earlier.adaptive or earlier.worker_mode != case.worker_mode) continue;
+        if (earlier.fixedItemsPerRangeForPartition(shape.partition_items, shape.range_alignment_items) == range) return earlier_index;
+    }
+    return null;
 }
 
 /// A group runs when it equals `--group` (if given) and starts with `--group-prefix` (if given).
@@ -826,9 +881,10 @@ fn printCompactTable(results: []const CaseResult, baseline: CaseResult) void {
         var throughput_buffer: [32]u8 = undefined;
         var worker_buffer: [24]u8 = undefined;
 
-        const mean = if (result.stats.status == .measured) formatDurationInto(&mean_buffer, result.stats.mean_ns) else "skipped";
-        const speedup = if (result.stats.status == .measured) formatSpeedupInto(&speedup_buffer, speedupBasisPoints(baseline.stats, result.stats)) else "skipped";
-        const throughput = if (result.stats.status == .measured) formatThroughputInto(&throughput_buffer, result.stats.items_per_second) else "skipped";
+        const unmeasured = @tagName(result.stats.status);
+        const mean = if (result.stats.status == .measured) formatDurationInto(&mean_buffer, result.stats.mean_ns) else unmeasured;
+        const speedup = if (result.stats.status == .measured) formatSpeedupInto(&speedup_buffer, speedupBasisPoints(baseline.stats, result.stats)) else unmeasured;
+        const throughput = if (result.stats.status == .measured) formatThroughputInto(&throughput_buffer, result.stats.items_per_second) else unmeasured;
         const workers = if (result.stats.status == .measured) formatWorkerThreadsInto(&worker_buffer, result.stats) else "-";
 
         printCell(result.case.name, 30);
@@ -852,16 +908,16 @@ fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
     std.debug.print("workload\n", .{});
 
     for (results) |result| {
-        if (result.stats.status == .skipped) {
+        if (result.stats.status != .measured) {
             printCell(result.case.name, 30);
-            printCell("skipped", 11);
-            printCell("skipped", 11);
+            printCell(@tagName(result.stats.status), 11);
+            printCell(@tagName(result.stats.status), 11);
             printCell("-", 12);
             printCell("-", 14);
             printCell("-", 11);
             printCell("-", 16);
             printCell("-", 72);
-            std.debug.print("{s}\n", .{result.stats.skip_reason});
+            std.debug.print("{s}\n", .{statusText(result.stats)});
             continue;
         }
 
@@ -975,15 +1031,20 @@ fn bestFixedThreadedResult(results: []const CaseResult) ?CaseResult {
 fn printFlowCoverage(results: []const CaseResult) void {
     var measured_count: usize = 0;
     var skipped_count: usize = 0;
+    var duplicate_count: usize = 0;
     for (results) |result| {
         switch (result.stats.status) {
             .measured => measured_count += 1,
             .skipped => skipped_count += 1,
+            .duplicate => duplicate_count += 1,
         }
     }
     std.debug.print("flow coverage {}/{} measured", .{ measured_count, results.len });
     if (skipped_count != 0) {
         std.debug.print(", {} skipped", .{skipped_count});
+    }
+    if (duplicate_count != 0) {
+        std.debug.print(", {} duplicate", .{duplicate_count});
     }
     std.debug.print(".", .{});
 }
@@ -1023,6 +1084,7 @@ fn statusText(stats: RunStats) []const u8 {
     return switch (stats.status) {
         .measured => "measured",
         .skipped => stats.skip_reason,
+        .duplicate => stats.duplicate_note,
     };
 }
 
@@ -1618,8 +1680,7 @@ test "benchmark fixed and stage range sizes align the range and null out adaptiv
     try std.testing.expectEqual(@as(?usize, wide_alignment), fixed_auto.stageItemsPerRange(wide_alignment));
 
     const small = cases.named("thread-small-range");
-    try std.testing.expectEqual(small.itemsPerRange(16).?, small.fixedItemsPerRange(16));
-    try std.testing.expectEqual(small.itemsPerRange(16), small.stageItemsPerRange(16));
+    try std.testing.expectEqual(@as(?usize, small.fixedItemsPerRange(16)), small.stageItemsPerRange(16));
 
     for ([_][]const u8{ "thread-adaptive-fixed-range", "thread-adaptive-tuned-range" }) |name| {
         const adaptive = cases.named(name);
@@ -1627,6 +1688,91 @@ test "benchmark fixed and stage range sizes align the range and null out adaptiv
         try std.testing.expectEqual(@as(?usize, null), adaptive.stageItemsPerRange(16));
         try std.testing.expectEqual(wide_alignment, adaptive.fixedItemsPerRange(wide_alignment));
     }
+}
+
+test "benchmark range modes and the fixed-adaptive range scale from the group's partition" {
+    const RangeCase = struct { name: []const u8, element: ?usize, chunk: ?usize, chunk_aligned: ?usize };
+    // Element partition (the default) at alignment 16; one-chunk partition at alignment 1
+    // and at an alignment above the partition.
+    const expected = [_]RangeCase{
+        .{ .name = "thread-fixed-auto", .element = 64, .chunk = 1, .chunk_aligned = 16 },
+        .{ .name = "thread-small-range", .element = 32, .chunk = 1, .chunk_aligned = 16 },
+        .{ .name = "thread-large-range", .element = 256, .chunk = 4, .chunk_aligned = 16 },
+        .{ .name = "thread-adaptive-fixed-range", .element = null, .chunk = null, .chunk_aligned = null },
+        .{ .name = "thread-adaptive-tuned-range", .element = null, .chunk = null, .chunk_aligned = null },
+    };
+    for (expected) |row| {
+        const case = findBenchmarkCase(row.name).?;
+        try std.testing.expectEqual(row.element, case.stageItemsPerRange(16));
+        try std.testing.expectEqual(row.element, case.stageItemsPerRangeForPartition(default_items_per_range, 16));
+        try std.testing.expectEqual(row.chunk, case.stageItemsPerRangeForPartition(1, 1));
+        try std.testing.expectEqual(row.chunk_aligned, case.stageItemsPerRangeForPartition(1, 16));
+    }
+
+    const fixed_adaptive = findBenchmarkCase("thread-adaptive-fixed-range").?;
+    try std.testing.expectEqual(AdaptiveRangeMode.fixed, fixed_adaptive.adaptive_range_mode);
+    const ClampCase = struct { partition: usize, alignment: usize, range: usize };
+    const clamps = [_]ClampCase{
+        .{ .partition = default_items_per_range, .alignment = 16, .range = 64 },
+        .{ .partition = 1, .alignment = 1, .range = 1 },
+        .{ .partition = 1, .alignment = 16, .range = 16 },
+    };
+    for (clamps) |clamp| {
+        const config = adaptiveTunerForPartition(fixed_adaptive, clamp.partition, clamp.alignment).?.config;
+        try std.testing.expectEqual(clamp.range, config.initial_range_items);
+        try std.testing.expectEqual(clamp.range, config.smallest_range_items);
+        try std.testing.expectEqual(clamp.range, config.largest_range_items);
+    }
+    const tuned = findBenchmarkCase("thread-adaptive-tuned-range").?;
+    try std.testing.expectEqual(AdaptiveRangeMode.tuned, tuned.adaptive_range_mode);
+    try std.testing.expect(adaptiveTunerForPartition(tuned, 1, 1) == null);
+    const fixed_auto = findBenchmarkCase("thread-fixed-auto").?;
+    try std.testing.expect(!fixed_auto.adaptive);
+    try std.testing.expect(adaptiveTunerForPartition(fixed_auto, 1, 1) == null);
+}
+
+test "benchmark fixed case resolving to an earlier case's configuration is reported as its duplicate" {
+    const lookup = struct {
+        fn index(name: []const u8) usize {
+            for (default_cases, 0..) |case, case_index| {
+                if (std.mem.eql(u8, case.name, name)) return case_index;
+            }
+            std.debug.panic("no default benchmark case named {s}", .{name});
+        }
+    };
+    const DuplicateCase = struct { name: []const u8, chunk: ?[]const u8, chunk_aligned: ?[]const u8 };
+    // One-chunk partition at alignment 1 (small collapses onto the default) and at an
+    // alignment above the partition (large collapses too).
+    const expected = [_]DuplicateCase{
+        .{ .name = "serial-direct", .chunk = null, .chunk_aligned = null },
+        .{ .name = "thread-fixed-1", .chunk = null, .chunk_aligned = null },
+        .{ .name = "thread-fixed-2", .chunk = null, .chunk_aligned = null },
+        .{ .name = "thread-fixed-auto", .chunk = null, .chunk_aligned = null },
+        .{ .name = "thread-small-range", .chunk = "thread-fixed-auto", .chunk_aligned = "thread-fixed-auto" },
+        .{ .name = "thread-large-range", .chunk = null, .chunk_aligned = "thread-fixed-auto" },
+        .{ .name = "thread-adaptive-fixed-range", .chunk = null, .chunk_aligned = null },
+        .{ .name = "thread-adaptive-tuned-range", .chunk = null, .chunk_aligned = null },
+    };
+    try std.testing.expectEqual(default_cases.len, expected.len);
+    const element: FixedRangeShape = .{ .partition_items = default_items_per_range, .range_alignment_items = 16 };
+    const chunk: FixedRangeShape = .{ .partition_items = chunk_partition_items, .range_alignment_items = 1 };
+    const chunk_aligned: FixedRangeShape = .{ .partition_items = chunk_partition_items, .range_alignment_items = 16 };
+    for (expected) |row| {
+        const case_index = lookup.index(row.name);
+        try std.testing.expectEqual(@as(?usize, null), sameShapeCaseIndex(element, case_index));
+        try std.testing.expectEqual(if (row.chunk) |name| lookup.index(name) else null, sameShapeCaseIndex(chunk, case_index));
+        try std.testing.expectEqual(if (row.chunk_aligned) |name| lookup.index(name) else null, sameShapeCaseIndex(chunk_aligned, case_index));
+    }
+
+    const duplicate: RunStats = .{ .status = .duplicate, .duplicate_note = same_shape_notes[lookup.index("thread-fixed-auto")] };
+    try std.testing.expectEqualStrings("same shape as thread-fixed-auto", statusText(duplicate));
+    // An untimed duplicate (mean 0) never wins the best-control pick.
+    const results = [_]CaseResult{
+        .{ .case = findBenchmarkCase("thread-fixed-auto").?, .stats = .{ .mean_ns = 100 } },
+        .{ .case = findBenchmarkCase("thread-small-range").?, .stats = duplicate },
+    };
+    try std.testing.expectEqualStrings("thread-fixed-auto", bestFixedThreadedResult(&results).?.case.name);
+    try std.testing.expectEqualStrings("thread-fixed-auto", bestMeasured(&results).?.case.name);
 }
 
 test "adaptive settle budget covers multiple tuner windows" {
@@ -1864,11 +2010,4 @@ test "benchmark validation attention flags adaptive regressions against controls
         .case = default_cases[6],
         .stats = .{ .mean_ns = 110 },
     }, threaded_control) == null);
-}
-
-test "batch modes align to cache-line item boundaries" {
-    const small = default_cases[4].itemsPerRange(16).?;
-    const large = default_cases[5].itemsPerRange(16).?;
-    try std.testing.expectEqual(@as(usize, 32), small);
-    try std.testing.expectEqual(@as(usize, 256), large);
 }

@@ -23,6 +23,7 @@ const level_z_step = @import("../game/world/system.zig").level_z_step;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const evict_range_alignment_items = @import("../game/systems/pathfinding/types.zig").evict_range_alignment_items;
+const nav_mark_range_alignment_items = @import("../game/systems/pathfinding/nav_reaction.zig").nav_mark_range_alignment_items;
 const suite = @import("suite.zig");
 
 /// The case's thread system, or null for the serial case.
@@ -136,19 +137,23 @@ pub fn flood4(allocator: std.mem.Allocator, width: u32, height: u32, seed: [2]u3
 }
 
 /// Gives every nav reaction stage (the batch stages, connectivity and closure included, the
-/// mark stage, and the eviction stages) a fresh tuner for `case` and its control config: a
-/// fixed control runs one chunk per range. Call after the nav build, which resets tuners.
+/// mark stage, and the eviction stages) a fresh tuner for `case` and its control config. The
+/// stages share one control, so every stage's fixed range modes and fixed-adaptive range
+/// scale from one item per range, aligned per stage: a chunk for the chunk stages, an event
+/// for the mark stage, a registry entry or pair for the eviction stages. Call after the nav
+/// build, which resets tuners.
 pub fn setNavTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
+    const partition_items = suite.chunk_partition_items;
     const fresh = AdaptiveWorkTuner.init(.{});
-    system.tuners.nav = .initFill(suite.adaptiveTunerForCase(case, 1) orelse fresh);
-    system.tuners.nav_mark = suite.adaptiveTunerForCase(case, 1) orelse fresh;
-    system.tuners.nav_evict_count = suite.adaptiveTunerForCase(case, evict_range_alignment_items) orelse fresh;
-    system.tuners.nav_evict = suite.adaptiveTunerForCase(case, evict_range_alignment_items) orelse fresh;
-    system.tuners.evict_flush = suite.adaptiveTunerForCase(case, 1) orelse fresh;
+    system.tuners.nav = .initFill(suite.adaptiveTunerForPartition(case, partition_items, 1) orelse fresh);
+    system.tuners.nav_mark = suite.adaptiveTunerForPartition(case, partition_items, nav_mark_range_alignment_items) orelse fresh;
+    system.tuners.nav_evict_count = suite.adaptiveTunerForPartition(case, partition_items, evict_range_alignment_items) orelse fresh;
+    system.tuners.nav_evict = suite.adaptiveTunerForPartition(case, partition_items, evict_range_alignment_items) orelse fresh;
+    system.tuners.evict_flush = suite.adaptiveTunerForPartition(case, partition_items, 1) orelse fresh;
     system.nav_controls = .{
         .adaptive = case.adaptive,
         .max_worker_threads = case.maxWorkerThreads(),
-        .items_per_range = if (case.adaptive) null else case.itemsPerRange(1) orelse 1,
+        .items_per_range = case.stageItemsPerRangeForPartition(partition_items, 1),
     };
 }
 

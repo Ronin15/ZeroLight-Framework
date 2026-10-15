@@ -14,7 +14,6 @@
 //! thread's share: the iteration minus its off-main stage time.
 
 const std = @import("std");
-const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
@@ -279,8 +278,10 @@ fn measureCase(
         system.select_resolve_tuner = tuner;
         system.directions_tuner = tuner;
         system.grid_bucket_tuner = tuner;
-        system.select_claim_tuner = bandTunerForCase(case).?;
-        system.grid_sort_tuner = bandTunerForCase(case).?;
+        // Band stages: one band per range, so the fixed control dispatches the bands
+        // rather than keeping them in one inline range.
+        system.select_claim_tuner = suite.adaptiveTunerForPartition(case, 1, 1).?;
+        system.grid_sort_tuner = suite.adaptiveTunerForPartition(case, 1, 1).?;
     }
 
     var threads = try fixtures.initCaseThreads(allocator, io, case);
@@ -332,13 +333,6 @@ fn measureCase(
         stats.work_tuning = suite.workTuningSummary(system.adaptive_tuner.report(), settled_before_measurement);
     }
     return .{ .stats = stats, .last = last_stats };
-}
-
-// The fixed-range cases' tuner for a stage dispatched over band items: one band per range,
-// so the fixed control dispatches the bands rather than keeping them in one inline range.
-fn bandTunerForCase(case: suite.BenchmarkCase) ?AdaptiveWorkTuner {
-    if (!case.adaptive or case.adaptive_range_mode != .fixed) return null;
-    return AdaptiveWorkTuner.init(.{ .initial_range_items = 1, .smallest_range_items = 1, .largest_range_items = 1 });
 }
 
 // A new step with a navigation intent for every agent.

@@ -242,9 +242,14 @@ fn expectedPanUploads(window_edge: u16, resident_layers: u16) usize {
 
 const dig_cell_count: u16 = 64;
 const cave_in_levels: u16 = 4;
-// Batched edits are independent chunks; one chunk per range is the fixed controls'
-// partition.
+// Batched edits are independent chunks: ranges need no alignment, and the fixed
+// controls' range modes scale from one chunk per range.
 const edit_range_alignment_items: usize = 1;
+// The edit-only batched groups' one fixed-control shape: the plan and write stages.
+const edit_fixed_range_shape: suite.FixedRangeShape = .{
+    .partition_items = suite.chunk_partition_items,
+    .range_alignment_items = edit_range_alignment_items,
+};
 // The fixed render window of the dig, level-enter, and batched groups, in chunks: the
 // dig workload's 8x8 chunk square at the level center.
 const dig_window_chunks: u16 = 8;
@@ -271,6 +276,7 @@ pub const cave_in_group = suite.BenchmarkGroup{
     .defaultItemCounts = regionItemCounts,
     .runCase = runCaveInCase,
     .write_workload = writeBatchWorkload,
+    .fixed_range_shape = edit_fixed_range_shape,
 };
 
 pub const explosion_fill_group = suite.BenchmarkGroup{
@@ -279,6 +285,7 @@ pub const explosion_fill_group = suite.BenchmarkGroup{
     .defaultItemCounts = explosionItemCounts,
     .runCase = runExplosionFillCase,
     .write_workload = writeBatchWorkload,
+    .fixed_range_shape = edit_fixed_range_shape,
 };
 
 pub const gpu_sync_dig_group = suite.BenchmarkGroup{
@@ -1183,13 +1190,13 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     }
 
     const world = &fixture.world;
-    world.terrain_edit_plan_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-    world.terrain_edit_write_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    world.terrain_edit_plan_tuner = suite.adaptiveTunerForPartition(case, suite.chunk_partition_items, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    world.terrain_edit_write_tuner = suite.adaptiveTunerForPartition(case, suite.chunk_partition_items, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     const edit_threads: ?TerrainEditThreads = if (threads) |*thread_system| .{
         .thread_system = thread_system,
         .plan_tuner = &world.terrain_edit_plan_tuner,
         .write_tuner = &world.terrain_edit_write_tuner,
-        .controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1 },
+        .controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, edit_range_alignment_items) },
     } else null;
 
     var unused_timing: BatchTiming = .{};
@@ -1778,14 +1785,14 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     const world = &nav.base.world;
     const system = &nav.system;
-    world.terrain_edit_plan_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-    world.terrain_edit_write_tuner = suite.adaptiveTunerForCase(case, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    world.terrain_edit_plan_tuner = suite.adaptiveTunerForPartition(case, suite.chunk_partition_items, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    world.terrain_edit_write_tuner = suite.adaptiveTunerForPartition(case, suite.chunk_partition_items, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     fixtures.setNavTuners(system, case);
     const edit_threads: ?TerrainEditThreads = if (threads) |*thread_system| .{
         .thread_system = thread_system,
         .plan_tuner = &world.terrain_edit_plan_tuner,
         .write_tuner = &world.terrain_edit_write_tuner,
-        .controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = if (case.adaptive) null else case.itemsPerRange(edit_range_alignment_items) orelse 1 },
+        .controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, edit_range_alignment_items) },
     } else null;
 
     var unused_timing: NavBatchTiming = .{};

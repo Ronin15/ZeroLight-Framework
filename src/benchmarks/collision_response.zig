@@ -3,7 +3,6 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
-const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
@@ -407,13 +406,6 @@ fn stageRunOnce(
     return stats;
 }
 
-// The fixed-range adaptive case's apply tuner: one band per range, so the fixed control
-// dispatches the bands rather than keeping them in one inline range.
-fn stageBandTunerForCase(case: suite.BenchmarkCase) ?AdaptiveWorkTuner {
-    if (!case.adaptive or case.adaptive_range_mode != .fixed) return null;
-    return AdaptiveWorkTuner.init(.{ .initial_range_items = 1, .smallest_range_items = 1, .largest_range_items = 1 });
-}
-
 // An inline-settled gather never dispatches the apply, so its tuner settles alone.
 fn stageTunersSettled(system: *const CollisionResponseSystem) bool {
     const gather = &system.gather_tuner;
@@ -434,7 +426,9 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     try system.reserveForContacts(item_count);
     if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
         system.gather_tuner = tuner;
-        system.apply_tuner = stageBandTunerForCase(case).?;
+        // Apply: one band per range, so the fixed control dispatches the bands rather than
+        // keeping them in one inline range.
+        system.apply_tuner = suite.adaptiveTunerForPartition(case, 1, 1).?;
     }
 
     // A fixed threaded case with more than one range of contacts dispatches the gather.
