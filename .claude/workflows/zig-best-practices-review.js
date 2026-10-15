@@ -23,7 +23,7 @@ const REVIEW_UNITS = [
   { unit: 'collision', files: ['src/game/systems/collision.zig', 'src/game/systems/collision_response.zig', 'src/game/systems/spatial_index.zig'] },
   { unit: 'movement-particle-affect', files: ['src/game/systems/movement.zig', 'src/game/systems/particle.zig', 'src/game/systems/affect.zig'] },
   { unit: 'data-system-core', files: ['src/game/data_system/system.zig', 'src/game/data_system/types.zig', 'src/game/data_system/structural.zig'] },
-  { unit: 'world-system', files: ['src/game/world/system.zig'] },
+  { unit: 'world-system', files: ['src/game/world/system.zig', 'src/game/world/render.zig'] },
   { unit: 'simulation-pipeline', files: ['src/game/simulation_pipeline.zig', 'src/game/simulation.zig', 'src/game/simulation_scope.zig', 'src/game/systems/simulation_scope.zig'] },
   { unit: 'thread-system', files: ['src/app/thread_system.zig'] },
   { unit: 'renderer-batch', files: ['src/render/renderer.zig', 'src/render/sprite_batch.zig'] },

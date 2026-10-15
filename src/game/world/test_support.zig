@@ -9,12 +9,18 @@ const std = @import("std");
 const AssetStore = @import("../../assets/assets.zig").AssetStore;
 const manifest = @import("../../assets/manifest.zig");
 const world_tileset_meta = @import("../../assets/world_tileset_meta.zig");
+const WorldTilesetMeta = @import("../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const WorldSystem = @import("system.zig").WorldSystem;
 const TileId = @import("system.zig").TileId;
 const DenseCellWrite = @import("system.zig").DenseCellWrite;
 const DenseChunkWrites = @import("system.zig").DenseChunkWrites;
 const WorldTileChangedEvent = @import("../simulation.zig").WorldTileChangedEvent;
 const default_chunk_size_tiles = @import("system.zig").default_chunk_size_tiles;
+const invalid_tile_id = @import("system.zig").invalid_tile_id;
+const max_chunk_size_tiles = @import("system.zig").max_chunk_size_tiles;
+const world_render = @import("render.zig");
+const world_gpu_tiles = @import("gpu_tiles.zig");
+const no_sparse_tile = @import("terrain.zig").no_sparse_tile;
 const ChunkGeometry = @import("terrain.zig").ChunkGeometry;
 const ChunkWindow = @import("gpu_tiles.zig").ChunkWindow;
 const TileStoreSpan = @import("../../render/renderer.zig").TileStoreSpan;
@@ -101,6 +107,117 @@ pub fn warmLandingTerrain(world: *WorldSystem, tunnel_tile: TileId, level: u16, 
         }};
         try world.applyDenseCellWrites(&chunks, null, &events);
     }
+}
+
+pub fn testWorldMeta() !WorldTilesetMeta {
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    return try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+}
+
+/// Minimal grass-filled surface world (one dense floor layer, one chunk when
+/// `max(width,height) <= max_chunk_size_tiles`). Prefer this over `initDemoFromMeta`
+/// in unit tests that only need levels/dense layers, not demo terrain paint.
+pub fn testMinimalSurfaceWorld(meta: *const WorldTilesetMeta, width: u16, height: u16) !WorldSystem {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = width,
+        .height = height,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = max_chunk_size_tiles,
+    };
+    errdefer world.deinit();
+    try world.buildCatalog(meta);
+    const level = try world.addLevel(0);
+    const grass = try world.requireTileByName(meta, "grass");
+    _ = try world.addDenseLayer(level, 0, .floor, grass);
+    return world;
+}
+
+/// Runs one GPU tile sync without a renderer; the upload batch stays in
+/// `world.gpu_tiles.spans`/`values`. A world with no render window set renders its
+/// whole extent.
+pub fn testSyncGpuTiles(world: *WorldSystem, active_level: u16) !world_gpu_tiles.SyncPlan {
+    if (world.visible == null) try testShowWholeWorld(world, active_level);
+    const sync_plan = try world_render.planDenseGpuSync(world, active_level);
+    world_render.commitDenseGpuSync(world, &sync_plan, active_level);
+    return sync_plan;
+}
+
+pub fn testShowWholeWorld(world: *WorldSystem, active_level: u16) !void {
+    try world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = world.worldWidthPixels(), .h = world.worldHeightPixels() }, 0, active_level);
+}
+
+/// Applies the last sync's upload batch to `gpu`.
+pub fn testApplySync(world: *const WorldSystem, gpu: *TestGpuStore) !void {
+    try gpu.apply(world.gpu_tiles.spans.items, world.gpu_tiles.values.items);
+}
+
+/// The tile `gpu` shows for resident `layer` at (x, y), or null outside the window.
+pub fn testGpuTile(world: *const WorldSystem, gpu: *const TestGpuStore, layer: usize, x: u16, y: u16) ?TileId {
+    const mirror = &world.gpu_tiles;
+    const slot = world.dense_layers.items(.gpu_slot)[layer];
+    std.debug.assert(slot != world_gpu_tiles.no_slot);
+    return gpu.tileAt(world.chunkGeometry(), mirror.side, mirror.window, mirror.slotDirectory(slot), x, y);
+}
+
+/// Every resident layer reads back its CPU tiles over the window and nothing
+/// outside it, and the chain from the topmost resident layer composites them in
+/// depth order.
+pub fn expectGpuStoreMatches(world: *const WorldSystem, gpu: *const TestGpuStore) !void {
+    const mirror = &world.gpu_tiles;
+    const layers = world.dense_render.layers.items;
+    try std.testing.expectEqual(mirror.residentLayerCount(), layers.len);
+    for (world.dense_layers.items(.gpu_slot), 0..) |slot, layer| {
+        if (slot == world_gpu_tiles.no_slot) continue;
+        for (0..world.height) |y| for (0..world.width) |x| {
+            const gpu_tile = testGpuTile(world, gpu, layer, @intCast(x), @intCast(y));
+            const chunk_x = @as(u32, @intCast(x)) >> world.chunkGeometry().shift;
+            const chunk_y = @as(u32, @intCast(y)) >> world.chunkGeometry().shift;
+            if (mirror.window.contains(chunk_x, chunk_y)) {
+                try std.testing.expectEqual(@as(?TileId, world.denseTile(layer, @intCast(x), @intCast(y))), gpu_tile);
+            } else {
+                try std.testing.expectEqual(@as(?TileId, null), gpu_tile);
+            }
+        };
+    }
+    if (layers.len == 0) return;
+    const top_slot = world.dense_layers.items(.gpu_slot)[layers[layers.len - 1]];
+    for (0..world.height) |y| for (0..world.width) |x| {
+        const shown = gpu.composite(world.chunkGeometry(), mirror.side, mirror.window, mirror.slotDirectory(top_slot), layers.len, invalid_tile_id, @intCast(x), @intCast(y)) orelse continue;
+        var expected: TileId = invalid_tile_id;
+        var index = layers.len;
+        while (index > 0) {
+            index -= 1;
+            expected = world.denseTile(layers[index], @intCast(x), @intCast(y));
+            if (expected != invalid_tile_id) break;
+        }
+        try std.testing.expectEqual(expected, shown);
+    };
+}
+
+/// Every sparse row is listed exactly once, in its own (level, chunk) list, linked both
+/// ways, and the lists list nothing else.
+pub fn expectSparseIndexConsistent(world: *const WorldSystem) !void {
+    const rows = world.sparse_tiles.slice();
+    const geom = world.chunkGeometry();
+    var listed: usize = 0;
+    for (world.level_terrain.items, 0..) |terrain, level| {
+        for (terrain.sparse_heads, 0..) |head, chunk| {
+            var previous: u32 = no_sparse_tile;
+            var row = head;
+            while (row != no_sparse_tile) : (row = rows.items(.chunk_next)[row]) {
+                try std.testing.expect(row < rows.len);
+                try std.testing.expectEqual(level, rows.items(.level_index)[row]);
+                const coord = world.sparseTileCellCoord(row);
+                try std.testing.expectEqual(chunk, geom.chunkOf(coord.x, coord.y));
+                try std.testing.expectEqual(previous, rows.items(.chunk_prev)[row]);
+                previous = row;
+                listed += 1;
+                try std.testing.expect(listed <= rows.len);
+            }
+        }
+    }
+    try std.testing.expectEqual(rows.len, listed);
 }
 
 test "the demo world paints the same tiles at every chunk edge" {

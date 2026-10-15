@@ -55,7 +55,7 @@ const REVIEW_UNITS = [
   },
   {
     unit: 'data-lifetime-and-handles',
-    files: ['src/game/data_system/system.zig', 'src/game/data_system/structural.zig', 'src/game/data_system/agents.zig', 'src/game/world/system.zig'],
+    files: ['src/game/data_system/system.zig', 'src/game/data_system/structural.zig', 'src/game/data_system/agents.zig', 'src/game/world/system.zig', 'src/game/world/render.zig'],
     focus: 'Entity/data correctness: generational-handle reuse safety (can a stale handle ever alias a recycled slot?), structural add/remove (swap-remove index fixups, mask consistency across parallel SoA columns), dense/sparse world-tile index consistency, and whether any store column can desync from another after spawn/destroy. Flag determinism hazards in entity iteration order.',
   },
   {

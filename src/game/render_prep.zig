@@ -401,7 +401,7 @@ pub fn collectDynamicRecords(
             // Window membership (not exact equality) so an entity that fell to a
             // deeper in-window level (e.g. through a dug hole) still renders, at
             // its own real depth — matches the dense-layer window this frame
-            // already composites via WorldSystem.collectDenseSubmitLayers.
+            // already composites via world/render.zig collectDenseSubmitLayers.
             if (!scene.world.render_window.levelInWindow(scene.player_level, entity_level, max_world_level)) continue;
         }
         if (!entityVisibleForRenderCollect(movement_index, scope, visible_chunks)) continue;
