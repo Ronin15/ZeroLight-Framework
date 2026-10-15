@@ -47,10 +47,13 @@ paths:
   ranges plus a capped case.
 - Hot loops iterate dense SoA columns; component masks are membership only,
   never dynamic joins.
-- Worker ranges never share writable cache lines; pad to 64 bytes only shared
-  records with real false-sharing risk. Ranges writing rows that are disjoint
-  by contract but scattered across a column are allowed when a scattered-order
-  bench is within spread of the same stream in row order.
+- Worker ranges never share writable cache lines; pad only shared records with
+  real false-sharing risk. Per-range and per-row slots use the 64-byte
+  quantum, because slot arrays multiply; a contended singleton shared record (a
+  hot atomic every participant touches) aligns to `std.atomic.cache_line`. Ranges
+  writing rows that are disjoint by contract but scattered across a column are
+  allowed when a scattered-order bench is within spread of the same stream in
+  row order.
 - Keep state transitions, structural changes, SDL/GPU/audio, asset and save
   I/O, and resource ownership off workers unless a deferred boundary is
   designed. Workers never mutate `DataSystem` structurally; structural commits
