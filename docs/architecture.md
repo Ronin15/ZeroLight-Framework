@@ -70,11 +70,13 @@ Designs start here, then read the live structure below (rules:
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
 - `src/game/game_demo_state.zig`, `src/game/loading_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state; gameplay is launched from it via a runtime-asset-backed loading transition.
 - **Split-file types.** A type too large for one file keeps its definition,
-  fields, and remaining methods in its package's `system.zig`; each public
-  method defined in a sibling file is a declaration alias on the type
-  (`pub const setDenseTile = world_edit.setDenseTile;`) with its `///` doc on the
-  definition, so method syntax resolves straight to it with no forwarder frame
-  in any mode (`.claude/rules/zig-style.md`). `world/` and `data_system/` use it.
+  fields, and remaining methods in its home file (a package's `system.zig`);
+  each public method defined in a sibling file is a declaration alias on the
+  type (`pub const setDenseTile = world_edit.setDenseTile;`) with its `///` doc
+  on the definition, so method syntax resolves straight to it with no forwarder
+  frame in any mode (`.claude/rules/zig-style.md`). `world/`, `data_system/`,
+  and `pathfinding/` use it; in `pathfinding/`, `Connectivity`'s home file is
+  `connectivity.zig`.
 - `src/game/world/` holds `WorldSystem`'s state-local world/tile data, with no
   facade: importers name the file they use. Public methods in `render.zig`,
   `edit.zig`, and `worldgen.zig` are aliases on the type (split-file types,
@@ -183,10 +185,36 @@ Designs start here, then read the live structure below (rules:
   fixtures shared across modules.
 - `src/game/systems/particle.zig` owns state-local transient particle effects
   in a fixed-capacity SoA pool with serial or threaded SIMD-aware updates.
-- `src/game/systems/pathfinding.zig` fronts the `pathfinding/` subpackage
-  (types, nav_grid, nav_graph, connectivity, caches, goal_table, group_field,
-  scratch, solve, system, test_support) for frame-delayed multi-level grid
-  navigation.
+- `src/game/systems/pathfinding.zig` fronts the `pathfinding/` subpackage for
+  frame-delayed multi-level grid navigation: it re-exports the public surface,
+  and its `test` block reaches every package file. `types`, `nav_grid`,
+  `nav_graph`, `caches`, `goal_table`, `group_field`, `scratch`, `solve`, and
+  `test_support` each hold one type or job. `PathfindingSystem` and
+  `Connectivity` are split-file types (above); the package files call each
+  other's free functions directly.
+  - `system.zig`: `PathfindingSystem`: the type, its lifecycle and elastic
+    capacity, status, reach and goals, the update orchestration, the solve
+    phase, and the pending ring. `navDispatch`, the nav stages' dispatch, is a
+    file-level function the package files share.
+  - `publish.zig`: the publish and path registry (reserve, claim, the
+    `publish_copy` and `registry_flush` stages).
+  - `group_service.zig`: the group-field service (claim, rekey, build, the
+    threaded `group_field_expand` rounds, retire).
+  - `intake.zig`: request intake (`path_intake`'s classify and the main
+    merge).
+  - `eviction.zig`: scoped eviction of the cached results and group fields a
+    nav change touches (`evictLevel`, the `nav_evict_count`, `nav_evict`, and
+    `evict_flush` stages).
+  - `nav_reaction.zig`: the nav builds, nav-mark recording (`nav_mark`), and
+    the post-commit reaction; its public functions are aliases on
+    `PathfindingSystem`.
+  - `connectivity.zig`: `Connectivity`: connectivity ids over the nav graph,
+    the seed and gather stages, the merge, and the flood.
+  - `connectivity_closure.zig`: the one-way reach closure over the
+    connectivity roots (H-components and their reachability blocks), its
+    registry, prepare and commit, and its stages.
+  - `link_bounds.zig`: the link cost bounds the abstract heuristic reads
+    (`LinkBounds`, `LevelCrossings`), held and folded by `NavGraph`.
 - `src/game/dig_controller.zig` is the pipeline-owned controller for player
   digging, authoring world-tile edits and navigation-invalidation signals.
 - `src/game/destructible_controller.zig` is the pipeline-owned controller that
@@ -212,11 +240,14 @@ Designs start here, then read the live structure below (rules:
 - `src/root.zig` stays minimal for math aliases and compile coverage; feature
   modules live in their matching `src/` area and import each other directly.
 - `src/tests.zig` imports reusable modules so `zig build test` covers their tests and compile-time contracts.
-- `src/benchmarks/` holds the `zig build bench` groups, one file per area:
-  `suite.zig` is the shared harness (options, cases, item codes, stage shapes,
-  reporting, the nav memory estimate) and `fixtures.zig` the shared fixtures
-  (thread systems, bodies, request streams, tilesets, banded worlds, nav tuner
-  setup).
+- `src/benchmarks/` holds the `zig build bench` groups, one file per area, or
+  a folder where an area has several: in `pathfinding/`, `nav_fixtures.zig`
+  holds what two or more group files share, and `requests`, `routes`, `cache`,
+  `negative`, and `connectivity` hold the groups. `suite.zig` is the shared
+  harness (options, cases, item codes, stage shapes, reporting), `fixtures.zig`
+  the shared fixtures (thread systems, bodies, request streams, tilesets,
+  banded worlds, nav tuner setup), and `nav_size.zig` the nav memory estimate
+  the pathfinding and chunk-scale groups check.
 
 ## Frame Flow
 
@@ -1073,9 +1104,10 @@ nav graph (§ Nav Graph And Reaction).
 
 ### Nav Graph And Reaction
 
-The nav graph (`nav_graph.zig`, `nav_grid.zig`, `connectivity.zig`) is stored per
-chunk (`.claude/rules/budgets-capacities.md`). With a world, a nav cell is a tile
-and a nav chunk the world's chunk (`NavExtent.world`, one `ChunkGeometry`);
+The nav graph (`nav_graph.zig`, `nav_grid.zig`, `connectivity.zig`, the one-way
+closure in `connectivity_closure.zig`) is stored per chunk
+(`.claude/rules/budgets-capacities.md`). With a world, a nav cell is a tile and
+a nav chunk the world's chunk (`NavExtent.world`, one `ChunkGeometry`);
 bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
 
 - **Cells.** Per level, `NavGrid` holds a chunk directory whose entry is OPEN,
@@ -1107,12 +1139,13 @@ bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
   own footprint chunks, never the static count.
 
 `PathfindingSystem` owns the post-commit nav reaction end to end
-(`.claude/rules/pathfinding.md`). Writers record what changed, never the reaction:
-a terrain writer (the dig stage, plane traversal's carve batch) reserves its record
-before its world write (`reserveTerrainNavRecord`) and records its appended events
-right after it, even when it failed after writing (`recordTerrainNavEvents`, the
-`nav_mark` stage interpreting events into per-range windows that merge tile boxes
-of one chunk); the collider sync records each change's old and new cell spans
+(`.claude/rules/pathfinding.md`; `nav_reaction.zig`, eviction in `eviction.zig`).
+Writers record what changed, never the reaction: a terrain writer (the dig
+stage, plane traversal's carve batch) reserves its record before its world write
+(`reserveTerrainNavRecord`) and records its appended events right after it, even
+when it failed after writing (`recordTerrainNavEvents`, the `nav_mark` stage
+interpreting events into per-range windows that merge tile boxes of one chunk);
+the collider sync records each change's old and new cell spans
 (`recordStaticColliderChanges`, room reserved before the commit by
 `reserveStaticColliderMarks`). At the seam `reactToPostCommitNavEvents` runs
 `applyBufferedNavUpdates`, each step its own transaction:

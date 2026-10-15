@@ -553,7 +553,7 @@ are flush work units, not the 16 shards) and the main time per phase; a configur
 range size (the fixed controls, `PathfindingConfig.items_per_range`) counts flush
 units too. `candidates` on route groups includes the tier-1 pool.
 
-The nav memory estimate (`suite.navStorageParts`) only sums production byte bounds:
+The nav memory estimate (`nav_size.navStorageParts`) only sums production byte bounds:
 each nav structure and the request side (`requestStorageBytesBound`) owns an
 `@sizeOf`-based worst-case bound beside it, fed by the built world's content
 (`NavGraph.storageContentOf`), with `runs_per_result` defaulting to one run per

@@ -206,7 +206,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
-| [**81**](roadmap/slices/slice-81.md) | Not started | Split The Pathfinding Module — after 64G, 82 |
+| [**81**](roadmap/slices/slice-81.md) | Complete | Split The Pathfinding Module — after 64G, 82 |
 | [**82**](roadmap/slices/slice-82.md) | Complete | Split The World Module — after 64G |
 
 **Recently settled (archive only):** 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).

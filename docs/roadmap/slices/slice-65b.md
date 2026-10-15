@@ -17,7 +17,7 @@ apply produces for the same batch.
 Nav is chunk-owned (64G).
 
 - `PathfindingSystem.reactToPostCommitNavEvents`
-  (`src/game/systems/pathfinding/system.zig`) applies the marks terrain
+  (`src/game/systems/pathfinding/nav_reaction.zig`) applies the marks terrain
   writers and the collider sync recorded (grow-only) synchronously
   (`applyBufferedNavUpdates`) as one prepare/commit transaction over dirty
   chunks, threaded per stage, and emits at most one `nav_region_invalidated`.
