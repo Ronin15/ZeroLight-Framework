@@ -1373,3 +1373,56 @@ pub fn stallingFieldCapacity(participant_count: usize) PathfindingCapacity {
 
 /// Four far-apart goals on the stalling-field world, one per field slot.
 pub const stalling_field_goals = [_]math.Vec2{ cellWorld(5, 58), cellWorld(58, 58), cellWorld(58, 5), cellWorld(30, 30) };
+
+/// A dense multi-chunk edit's terrain events: runs of tile flips that straddle range
+/// boundaries, obstacle rects, and terrain events nav ignores (tile changes that keep their
+/// blocking, and a non-commit-stage rect).
+pub fn navMarkTestEvents(allocator: std.mem.Allocator, world: *const WorldSystem) !std.ArrayList(SimulationEvent) {
+    var events: std.ArrayList(SimulationEvent) = .empty;
+    errdefer events.deinit(allocator);
+    for (0..world.height) |y| for (0..world.width) |x| {
+        if ((x + y) % 3 == 0) continue;
+        try events.append(allocator, .{ .stage = .structural_commit, .payload = .{ .world_tile_changed = .{
+            .level = @intCast((x / 6) % 2),
+            .x = @intCast(x),
+            .y = @intCast(y),
+            .old_tile_id = 0,
+            .new_tile_id = 1,
+            .old_blocks_movement = false,
+            .new_blocks_movement = (x + y) % 5 != 0,
+        } } });
+        if (x == 5 and y % 4 == 0) {
+            try events.append(allocator, .{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{ .level = 0, .min_x = 1, .min_y = @intCast(y), .max_x_exclusive = 9, .max_y_exclusive = @intCast(y + 2) } } });
+            try events.append(allocator, .{ .stage = .domain_reaction, .payload = .{ .world_obstacle_changed = .{ .level = 1, .min_x = 0, .min_y = 0, .max_x_exclusive = 12, .max_y_exclusive = 12 } } });
+        }
+    };
+    return events;
+}
+
+/// Side, in tiles, of the pocket test world.
+pub const pocket_world_side: u16 = 32;
+/// Side, in tiles, of the pocket sealed at its origin.
+pub const pocket_cells: u16 = 10;
+
+/// A registry world `side` tiles a side with a `pocket`-tile pocket at the origin, closed by
+/// a wall column x = `pocket` (rows 0 to `pocket`) and a wall row y = `pocket`.
+pub fn pocketWorld(meta: *const WorldTilesetMeta, side: u16, pocket: u16) !RegistryWorld {
+    var fixture = try registryWorld(meta, side);
+    errdefer fixture.world.deinit();
+    for (0..pocket + 1) |y| _ = try fixture.world.setDenseTile(fixture.obstacle, pocket, @intCast(y), fixture.tree);
+    for (0..pocket) |x| _ = try fixture.world.setDenseTile(fixture.obstacle, @intCast(x), pocket, fixture.tree);
+    return fixture;
+}
+
+/// Cell `index` of the pocket, row by row, as a world position.
+pub fn pocketGoal(index: usize) math.Vec2 {
+    return tileCenter(@intCast(index % pocket_cells), @intCast(index / pocket_cells));
+}
+
+/// One serial update requesting a path from `start` to `goal`.
+pub fn solveFrom(system: *PathfindingSystem, requester: EntityId, start: math.Vec2, goal: math.Vec2, config: PathfindingConfig) !PathfindingStats {
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
+    return system.updateSerial(&stream, 16, config);
+}
