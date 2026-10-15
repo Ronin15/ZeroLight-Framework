@@ -13,7 +13,7 @@ export const meta = {
 // reading the actual files. Grouped so related files review together but no
 // single agent is overloaded.
 const REVIEW_UNITS = [
-  { unit: 'pathfinding-system', files: ['src/game/systems/pathfinding/system.zig'] },
+  { unit: 'pathfinding-system', files: ['src/game/systems/pathfinding/system.zig', 'src/game/systems/pathfinding/publish.zig'] },
   { unit: 'pathfinding-navgraph', files: ['src/game/systems/pathfinding/nav_graph.zig', 'src/game/systems/pathfinding/link_bounds.zig', 'src/game/systems/pathfinding/nav_grid.zig'] },
   { unit: 'pathfinding-connectivity', files: ['src/game/systems/pathfinding/connectivity.zig', 'src/game/systems/pathfinding/connectivity_closure.zig'] },
   { unit: 'pathfinding-support', files: ['src/game/systems/pathfinding/caches.zig', 'src/game/systems/pathfinding/solve.zig', 'src/game/systems/pathfinding/group_field.zig', 'src/game/systems/pathfinding/scratch.zig', 'src/game/systems/pathfinding/goal_table.zig', 'src/game/systems/pathfinding/types.zig'] },

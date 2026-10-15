@@ -5,7 +5,8 @@
 //! PathfindingSystem orchestrator: owns the transient request queues, goal-keyed
 //! caches, per-level nav graph, group flow fields, per-worker scratch, and the
 //! elastic capacity policy. Drives the fixed-step accept -> group-service -> solve ->
-//! publish pipeline (serial and threaded), delegating solves to solve.zig.
+//! publish pipeline (serial and threaded), delegating solves to solve.zig and the publish
+//! and path registry to publish.zig.
 
 const std = @import("std");
 const stamped_table = @import("../../stamped_table.zig");
@@ -69,6 +70,12 @@ const GroupKeyMap = @import("caches.zig").GroupKeyMap;
 const waypointFromPath = @import("caches.zig").waypointFromPath;
 const waypointFromStitched = @import("caches.zig").waypointFromStitched;
 const solve = @import("solve.zig");
+const publish = @import("publish.zig");
+const RegRecordList = @import("publish.zig").RegRecordList;
+const PublishBandList = @import("publish.zig").PublishBandList;
+const PublishBand = @import("publish.zig").PublishBand;
+const FlushTally = @import("publish.zig").FlushTally;
+const flush_pair_count = @import("publish.zig").flush_pair_count;
 const solveOne = @import("solve.zig").solveOne;
 const solveJob = @import("solve.zig").solveJob;
 const SolveJobContext = @import("solve.zig").SolveJobContext;
@@ -102,7 +109,6 @@ const PathSolveResult = @import("types.zig").PathSolveResult;
 const GroupRequestTally = @import("types.zig").GroupRequestTally;
 const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
 const emptyKey = @import("types.zig").emptyKey;
-const OwnerOp = @import("types.zig").OwnerOp;
 const no_owner = @import("types.zig").no_owner;
 const RegRecord = @import("types.zig").RegRecord;
 const EvictItem = @import("types.zig").EvictItem;
@@ -137,24 +143,8 @@ const GroupKeyCountList = std.array_list.Aligned(GroupKeyCount, .fromByteUnits(t
 const IntakeTallyList = std.array_list.Aligned(IntakeTally, .fromByteUnits(thread_shared_record_alignment));
 const NavMarkList = std.array_list.Aligned(NavMark, .fromByteUnits(thread_shared_record_alignment));
 const NavMarkTallyList = std.array_list.Aligned(NavMarkTally, .fromByteUnits(thread_shared_record_alignment));
-const RegRecordList = std.array_list.Aligned(RegRecord, .fromByteUnits(thread_shared_record_alignment));
-const PublishBandList = std.array_list.Aligned(PublishBand, .fromByteUnits(thread_shared_record_alignment));
 const EvictItemList = std.array_list.Aligned(EvictItem, .fromByteUnits(thread_shared_record_alignment));
 const HitList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
-
-// `registry_flush` work pairs: one per path registry shard.
-const flush_pair_count = registry_shard_count;
-
-// One `publish_copy` range's registrations per flush pair, padded to its own cache line.
-const PublishBand = struct {
-    counts: [flush_pair_count]u32 align(thread_shared_record_alignment) = @splat(0),
-};
-
-// One `registry_flush` pair's entries removed and added, padded to its own cache line.
-const FlushTally = struct {
-    removed: usize align(thread_shared_record_alignment) = 0,
-    added: usize = 0,
-};
 
 // One `nav_mark` range's mark count, padded to its own cache line.
 const NavMarkTally = struct {
@@ -168,10 +158,6 @@ const nav_mark_range_alignment_items: usize = 4 * simd.lane_count;
 comptime {
     std.debug.assert((nav_mark_range_alignment_items * @sizeOf(NavMark)) % thread_shared_record_alignment == 0);
     std.debug.assert(@sizeOf(NavMarkTally) % thread_shared_record_alignment == 0);
-    std.debug.assert(@sizeOf(PublishBand) % thread_shared_record_alignment == 0);
-    std.debug.assert(@sizeOf(FlushTally) % thread_shared_record_alignment == 0);
-    // A publish band counts each flush pair's registrations.
-    std.debug.assert(@typeInfo(@FieldType(PublishBand, "counts")).array.len == flush_pair_count);
 }
 
 pub const PathfindingSystem = struct {
@@ -359,8 +345,8 @@ pub const PathfindingSystem = struct {
         count: u64 = 0,
         logged: bool = false,
 
-        // Adds `amount` and logs the first record at `level` through the game logger.
-        fn record(self: *GrowthCounter, amount: u64, comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
+        /// Adds `amount` and logs the first record at `level` through the game logger.
+        pub fn record(self: *GrowthCounter, amount: u64, comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
             self.count += amount;
             if (self.logged) return;
             self.logged = true;
@@ -469,7 +455,7 @@ pub const PathfindingSystem = struct {
         if (types.resultBlockWords(capacity.max_explored_nodes, capacity.max_stitched_path_cells) > types.max_result_block_words) return error.PathfindingBudgetTooWide;
         self.group_field_threshold_ceiling = @max(min_capacity_floor, capacity.max_agent_budget);
         // A shrink of live entries logs owner ops: flushed here, so no reader sees them.
-        defer _ = self.flushRegistry(null, null);
+        defer _ = publish.flushRegistry(self, null, null);
         if (self.effective_agent_capacity != 0) return self.resizePreservingLiveState(capacity, @max(min_capacity_floor, self.effective_agent_capacity), null);
         // Never reserved: nothing was admitted, so the queue, the tallies, and their key
         // tables hold nothing to keep.
@@ -547,12 +533,12 @@ pub const PathfindingSystem = struct {
         // Logical capacity only: every ProbeTable/ResultCache reserve internally doubles
         // physical slots for probe headroom, so callers pass the true entry-count ceiling,
         // never a caller-side multiplier (one load-factor policy, not two stacked).
-        try self.reserveRegistryOwners(limits.cached_results);
+        try publish.reserveRegistryOwners(self, limits.cached_results);
         const path_shrinking = limits.cached_results < self.completed.logicalCapacity();
         if (path_shrinking) try prepareTruncate(&self.path_index, limits.cached_results);
         errdefer if (path_shrinking and !self.registry_truncate_pending) abortTruncate(&self.path_index);
         const outcome = try self.completed.reserve(self.allocator, limits.cached_results, capacity.max_stored_path_cells, stripe_words, self.step_counter);
-        if (outcome == .rebuilt) self.clearRegistry();
+        if (outcome == .rebuilt) publish.clearRegistry(self);
         self.last_resize_copy_batch = self.runResizeCopy(if (threads) |stage| stage.stage(&self.tuners.resize_copy) else null);
         if (path_shrinking) self.registry_truncate_pending = true;
         try self.pending_keys.reserve(self.allocator, limits.pending_requests);
@@ -1210,7 +1196,7 @@ pub const PathfindingSystem = struct {
             // A flush with no publish weighs each pair at its ops plus one.
             if (stage.adaptive and stage.items_per_range == null) stage.items_per_range = self.completed.core.ownerLog().len + 1;
         }
-        return self.flushRegistry(dispatch, null);
+        return publish.flushRegistry(self, dispatch, null);
     }
 
     // Eviction before the batch commit, one item per changed key (a chunk with a changed
@@ -1309,7 +1295,7 @@ pub const PathfindingSystem = struct {
         }
         const flush_dispatch = self.navDispatch(thread_system, &self.tuners.evict_flush);
         const flush_timer = StageTimer.begin();
-        stats.evict_flush_batch = self.flushRegistry(flush_dispatch, null);
+        stats.evict_flush_batch = publish.flushRegistry(self, flush_dispatch, null);
         // The flush's code outside its dispatch, inline or not.
         stats.main.evict_ns += flush_timer.lap() -| stats.evict_flush_batch.batch_duration_ns;
         stats.addStageTime(stats.evict_count_batch);
@@ -1436,7 +1422,7 @@ pub const PathfindingSystem = struct {
         self.solved_paths.clearRetainingCapacity();
         self.group_requests.clearRetainingCapacity();
         self.group_key_map.clear();
-        self.clearCompleted();
+        publish.clearCompleted(self);
         for (self.group_fields.items) |*field| field.state = .empty;
         self.group_field_keys.clear();
     }
@@ -1673,9 +1659,9 @@ pub const PathfindingSystem = struct {
     // caller's flush still applies the ops logged so far.
     fn finishUpdate(self: *PathfindingSystem, solve_count: usize, threads: ?StageThreads, stats: *PathfindingStats) !void {
         var publish_timer = StageTimer.begin();
-        try self.reservePublish();
-        self.claimPublish(stats);
-        stats.publish_copy_batch = self.publishCopy(if (threads) |stage| stage.stage(&self.tuners.publish_copy) else null);
+        try publish.reservePublish(self);
+        publish.claimPublish(self, stats);
+        stats.publish_copy_batch = publish.publishCopy(self, if (threads) |stage| stage.stage(&self.tuners.publish_copy) else null);
         self.compactPendingAfterSolve(solve_count, stats);
         stats.publish_ns = publish_timer.lap();
         stats.pending_requests = self.pending.len;
@@ -1701,9 +1687,9 @@ pub const PathfindingSystem = struct {
         const threads = StageThreads{ .thread_system = thread_system, .config = config };
         const flush = threads.stage(&self.tuners.registry_flush);
         var stats = PathfindingStats{};
-        errdefer _ = self.flushRegistry(flush, null);
+        errdefer _ = publish.flushRegistry(self, flush, null);
         try self.updateThreaded(requests, agent_count, threads, &stats);
-        stats.registry_flush_batch = self.flushRegistry(flush, &stats);
+        stats.registry_flush_batch = publish.flushRegistry(self, flush, &stats);
         return stats;
     }
 
@@ -1743,9 +1729,9 @@ pub const PathfindingSystem = struct {
     /// Returns with the path registry flushed, on success and on error.
     pub fn updateSerial(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig) error{OutOfMemory}!PathfindingStats {
         var stats = PathfindingStats{};
-        errdefer _ = self.flushRegistry(null, null);
+        errdefer _ = publish.flushRegistry(self, null, null);
         try self.updateInline(requests, agent_count, config, &stats);
-        stats.registry_flush_batch = self.flushRegistry(null, &stats);
+        stats.registry_flush_batch = publish.flushRegistry(self, null, &stats);
         return stats;
     }
 
@@ -2373,215 +2359,6 @@ pub const PathfindingSystem = struct {
         }
     }
 
-    // The publish reserve, before any claim: long-block pages for the step's results past
-    // an inline stripe, each registry shard's room for this step's path runs in it, and the
-    // registration windows. O(solves * shards) on the main thread; on error nothing is
-    // claimed.
-    fn reservePublish(self: *PathfindingSystem) error{OutOfMemory}!void {
-        var long_results: usize = 0;
-        var registrations: usize = 0;
-        var shard_registrations: [registry_shard_count]usize = @splat(0);
-        for (self.solve_results.items, 0..) |result, ordinal| {
-            switch (result) {
-                .available, .partial => {},
-                else => continue,
-            }
-            const solved = self.solved_paths.items[ordinal];
-            if (types.storedPathWords(solved.len, solved.stitched_len) > self.completed.inline_words) long_results += 1;
-            registrations += solved.run_count;
-            for (&shard_registrations, solved.shard_counts) |*total, shard_count| total.* += shard_count;
-        }
-        const grows_before = self.registryGrowths();
-        for (&self.path_index, shard_registrations) |*shard, count| try shard.reserve(count, count, self.completed.logicalCapacity());
-        var grows = self.registryGrowths() - grows_before;
-        // Each range window starts on a cache line.
-        const padding = (reg_window_alignment_items - 1) * maxRangeCount(self.solve_results.items.len, 1);
-        if (registrations + padding > self.reg_buckets.capacity) {
-            try self.reg_buckets.ensureTotalCapacity(self.allocator, registrations + padding);
-            grows += 1;
-        }
-        if (grows != 0) self.countRegistryGrowth(grows);
-        const pages = try self.completed.reserveLongBlocks(self.allocator, long_results);
-        if (pages != 0) self.long_block_growth.record(pages, .info, "path cache long-block pool grew to {d} blocks", .{self.completed.long_block_count});
-    }
-
-    // Growths of every registry shard's table, entry pool, and owner heads so far.
-    fn registryGrowths(self: *const PathfindingSystem) u64 {
-        var grows: u64 = 0;
-        for (&self.path_index) |*shard| grows += shard.grows;
-        return grows;
-    }
-
-    fn countRegistryGrowth(self: *PathfindingSystem, grows: u64) void {
-        self.registry_growth.record(grows, .info, "path registry storage grew ({d} growths so far)", .{self.registry_growth.count + grows});
-    }
-
-    // Every registry shard holds an owner head per cache owner id below `capacity`.
-    fn reserveRegistryOwners(self: *PathfindingSystem, capacity: usize) !void {
-        const grows_before = self.registryGrowths();
-        for (&self.path_index) |*shard| try shard.reserve(0, 0, capacity);
-        const grows = self.registryGrowths() - grows_before;
-        if (grows != 0) self.countRegistryGrowth(grows);
-    }
-
-    // Drops every path registration, as when the result cache dropped every entry.
-    fn clearRegistry(self: *PathfindingSystem) void {
-        for (&self.path_index) |*shard| shard.clear();
-        self.publish_ranges = 0;
-    }
-
-    // Empties the result cache, its owner log, and the registry.
-    fn clearCompleted(self: *PathfindingSystem) void {
-        self.completed.clear();
-        self.clearRegistry();
-    }
-
-    // Claims every result of the step in solve-ordinal order, which is pending order
-    // (ordinals increase with the pending index): its cache entry and, past the inline
-    // stripe, a long block, logging the retire of a re-put or a victim. O(1) per result
-    // on the main thread; the paths are copied by `publish_copy`. Allocates nothing after
-    // `reservePublish`.
-    fn claimPublish(self: *PathfindingSystem, stats: *PathfindingStats) void {
-        std.debug.assert(self.publish_records.capacity >= self.solve_results.items.len);
-        self.publish_records.items.len = self.solve_results.items.len;
-        self.completed.core.beginPublish();
-        for (self.solve_results.items, self.publish_records.items, 0..) |result, *record, ordinal| {
-            record.* = null;
-            switch (result) {
-                .available, .partial => |key| {
-                    const solved = self.solved_paths.items[ordinal];
-                    if (self.completed.canStore()) {
-                        record.* = self.completed.claim(key, solved.len, solved.stitched_len, solved.path_level, solved.end, solved.goal_cell, self.step_counter, stats);
-                    }
-                    stats.solved_requests += 1;
-                    if (result == .partial) stats.partial_results += 1 else stats.available_results += 1;
-                    if (solved.via_abstract) stats.abstract_solves += 1;
-                    if (solved.cross_level) stats.cross_level_solves += 1;
-                },
-                // Answered without a search and never cached: dropped in
-                // compactPendingAfterSolve.
-                .unavailable => stats.unavailable_results += 1,
-                .budget_exhausted => {
-                    stats.budget_exhausted += 1;
-                },
-                // Start-side failure: dropped in compactPendingAfterSolve, never cached; the
-                // next status query falls through to `.missing`.
-                .start_invalid => {
-                    stats.start_invalid_dropped += 1;
-                },
-                .deferred => continue,
-            }
-        }
-        stats.solve_admissions = self.solve_indices.items.len;
-    }
-
-    // `publish_copy`: each range copies its claimed results' paths into their stripes or
-    // blocks and buckets their path runs' registrations by flush pair into its window,
-    // recording each pair's count in its band. The main thread sizes the windows from the
-    // selected shape, O(1) per result; inline it is one range. Returns the stage's batch.
-    fn publishCopy(self: *PathfindingSystem, dispatch: ?Dispatch) BatchStats {
-        const item_count = self.solve_results.items.len;
-        self.publish_ranges = 0;
-        if (item_count == 0) return .{};
-        const shape = stageShape(dispatch, item_count, 1);
-        std.debug.assert(self.publish_range_bases.capacity >= shape.range_count);
-        std.debug.assert(self.publish_bands.capacity >= shape.range_count);
-        self.publish_range_bases.items.len = shape.range_count;
-        self.publish_bands.items.len = shape.range_count;
-        var total: usize = 0;
-        for (self.publish_range_bases.items, 0..) |*base, range_index| {
-            total = std.mem.alignForward(usize, total, reg_window_alignment_items);
-            base.* = total;
-            const first = range_index * shape.items_per_range;
-            for (first..@min(first + shape.items_per_range, item_count)) |ordinal| {
-                if (self.publish_records.items[ordinal] != null) total += self.solved_paths.items[ordinal].run_count;
-            }
-        }
-        std.debug.assert(total <= self.reg_buckets.capacity);
-        self.reg_buckets.items.len = total;
-        var job = PublishCopyJob{
-            .system = self,
-            .geometry = self.graph.chunkGeometry(),
-            .stripe_words = self.stripe_words,
-            .items_per_range = shape.items_per_range,
-            .range_count = shape.range_count,
-            .buckets = self.reg_buckets.items,
-            .bands = self.publish_bands.items,
-        };
-        const batch = runShaped(dispatch, shape, item_count, 1, &job, publishCopyJob);
-        self.publish_ranges = shape.range_count;
-        return batch;
-    }
-
-    // `registry_flush`: shard by shard, removes and renames the owners of the result
-    // cache's owner log in log order, then adds the last publish copy's registrations of the
-    // shard in range order, so every list holds its adds in (op, ordinal, run) order for any
-    // partition, and installs a shrink's prepared owner heads. Each pair (shard) writes only
-    // its shard and its tally. Then the log is emptied, the replaced owner heads are freed,
-    // and `stats` (when given) takes the counts. Allocates nothing; every add was reserved
-    // by the publish.
-    // Items are work units: pair p weighs the log's ops + its adds + 1, and a range runs
-    // the pairs whose first unit lies in it, so each pair runs in exactly one range. The
-    // main thread sums the weights, O(publish ranges * pairs). A shrink's flush carries ops
-    // for most cache entries, a one-off the stage's tuner has no threaded profile for, so
-    // with a tuned dispatch it runs at a fixed shape of about one pair per range, outside
-    // the tuner. A dispatch wakes at most one worker fewer than the pair count. Returns the
-    // stage's batch.
-    fn flushRegistry(self: *PathfindingSystem, dispatch: ?Dispatch, stats: ?*PathfindingStats) BatchStats {
-        var batch = BatchStats{};
-        const truncate = self.registry_truncate_pending;
-        const ops = self.completed.core.ownerLog();
-        if (ops.len != 0 or self.publish_ranges != 0 or truncate) {
-            var pair_adds: [flush_pair_count]usize = @splat(0);
-            for (self.publish_bands.items[0..self.publish_ranges]) |band| {
-                for (&pair_adds, band.counts) |*adds, count| adds.* += count;
-            }
-            var unit_starts: [flush_pair_count + 1]usize = undefined;
-            var units: usize = 0;
-            for (unit_starts[0..flush_pair_count], pair_adds) |*start, adds| {
-                start.* = units;
-                units += ops.len + adds + 1;
-            }
-            unit_starts[flush_pair_count] = units;
-            const flush_dispatch: ?Dispatch = if (dispatch) |stage| pairs: {
-                var flush_stage = stage;
-                // At most one participant per pair: a worker past that takes only ranges
-                // where no pair starts.
-                flush_stage.max_worker_threads = @min(stage.max_worker_threads orelse flush_pair_count - 1, flush_pair_count - 1);
-                // Only a tuned dispatch's shrink shape is replaced; a configured range size
-                // keeps its shape. The explicit range size opts the batch out of the tuner:
-                // nothing is recorded.
-                if (truncate and stage.adaptive and stage.items_per_range == null) {
-                    flush_stage.items_per_range = (units + flush_pair_count - 1) / flush_pair_count;
-                }
-                break :pairs flush_stage;
-            } else null;
-            const shape = stageShape(flush_dispatch, units, 1);
-            var job = RegistryFlushJob{
-                .system = self,
-                .ops = ops,
-                .publish_ranges = self.publish_ranges,
-                .truncate = truncate,
-                .range_count = shape.range_count,
-                .unit_starts = unit_starts,
-            };
-            batch = runShaped(flush_dispatch, shape, units, 1, &job, registryFlushJob);
-            if (stats) |step| {
-                for (self.flush_tallies) |tally| {
-                    step.registrations_removed += tally.removed;
-                    step.registrations_added += tally.added;
-                }
-            }
-        }
-        self.publish_ranges = 0;
-        self.completed.core.finishOwnerLog(self.allocator);
-        if (truncate) {
-            for (&self.path_index) |*shard| shard.releaseTruncated();
-            self.registry_truncate_pending = false;
-        }
-        return batch;
-    }
-
     // `resize_copy`: copies a shrink's pending path moves, threaded over moves, then frees
     // the pages the shrink left behind. Moves have distinct sources and destinations.
     fn runResizeCopy(self: *PathfindingSystem, dispatch: ?Dispatch) BatchStats {
@@ -2844,110 +2621,6 @@ fn abortTruncate(shards: *[registry_shard_count]ChunkListMap) void {
     for (shards) |*shard| shard.abortTruncate();
 }
 
-// One range of `publish_copy`: its ordinals' paths into their claimed stripes or blocks,
-// and their registrations, shard by shard in (ordinal, run) order, into its window.
-const PublishCopyJob = struct {
-    system: *const PathfindingSystem,
-    geometry: ChunkGeometry,
-    stripe_words: usize,
-    items_per_range: usize,
-    range_count: usize,
-    buckets: []RegRecord,
-    bands: []PublishBand,
-};
-
-// SIMD verdict: the path copy is `@memcpy`; bucketing is a scalar counting-sort scatter
-// with one division per run start.
-fn publishCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *PublishCopyJob = @ptrCast(@alignCast(context));
-    const system = job.system;
-    std.debug.assert(range.index < job.range_count and range.index < job.bands.len);
-    std.debug.assert(range.start == range.index * job.items_per_range);
-    std.debug.assert(range.start <= range.end and range.end <= system.publish_records.items.len and range.end <= system.solve_results.items.len);
-    var counts: [flush_pair_count]u32 = @splat(0);
-    for (range.start..range.end) |ordinal| {
-        // Only available and partial results claim an entry.
-        const claimed = system.publish_records.items[ordinal] orelse continue;
-        const solved = system.solved_paths.items[ordinal];
-        const words = types.storedPathWords(solved.len, solved.stitched_len);
-        // Claims of one publish never share a stripe or a block.
-        @memcpy(system.completed.destination(claimed)[0..words], system.worker_path_pool.items[solved.offset..][0..words]);
-        for (&counts, solved.shard_counts) |*total, shard_count| total.* += shard_count;
-    }
-    var cursors: [flush_pair_count]usize = undefined;
-    var next = system.publish_range_bases.items[range.index];
-    for (&cursors, counts) |*cursor, pair_count| {
-        cursor.* = next;
-        next += pair_count;
-    }
-    std.debug.assert(next <= job.buckets.len);
-    for (range.start..range.end) |ordinal| {
-        const claimed = system.publish_records.items[ordinal] orelse continue;
-        const solved = system.solved_paths.items[ordinal];
-        const stripe = system.worker_path_pool.items[solved.offset..][0..job.stripe_words];
-        const view = types.stitchedView(stripe, solved.stitched_len);
-        for (system.worker_run_starts.items[solved.offset..][0..solved.run_count]) |start| {
-            const key = if (solved.stitched_len != 0)
-                chunkKey(view.levels[start], job.geometry.chunkOfCell(view.cells[start]))
-            else
-                chunkKey(solved.path_level, job.geometry.chunkOfCell(stripe[start]));
-            const shard = registryShard(key);
-            job.buckets[cursors[shard]] = .{ .key = key, .owner = claimed.owner, .order = start };
-            cursors[shard] += 1;
-        }
-    }
-    job.bands[range.index] = .{ .counts = counts };
-}
-
-// One range of `registry_flush`: the pairs (shards) whose first work unit lies in the
-// range, each applying the owner log in order and then its segment of every publish range
-// in range order.
-const RegistryFlushJob = struct {
-    system: *PathfindingSystem,
-    // The result cache's owner log.
-    ops: []const OwnerOp,
-    publish_ranges: usize,
-    // Install each pair's prepared owner heads after its ops and adds.
-    truncate: bool,
-    range_count: usize,
-    // Per pair, its first work unit, increasing; the last entry is the unit total.
-    unit_starts: [flush_pair_count + 1]usize,
-};
-
-fn orderUnit(unit: usize, start: usize) std.math.Order {
-    return std.math.order(unit, start);
-}
-
-// SIMD verdict: scalar. Hash probes and list links per op and add; one binary search over
-// the pair starts per range.
-fn registryFlushJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *RegistryFlushJob = @ptrCast(@alignCast(context));
-    const system = job.system;
-    const starts = job.unit_starts[0..flush_pair_count];
-    std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.start <= range.end and range.end <= job.unit_starts[flush_pair_count]);
-    var pair = std.sort.lowerBound(usize, starts, range.start, orderUnit);
-    while (pair < flush_pair_count and starts[pair] < range.end) : (pair += 1) {
-        std.debug.assert(pair < system.flush_tallies.len);
-        const map = &system.path_index[pair];
-        var removed: usize = 0;
-        for (job.ops) |op| {
-            // Most owners hold runs in few shards.
-            if (!map.holdsOwner(op.old)) continue;
-            if (op.new == no_owner) removed += map.removeOwner(op.old) else map.renameOwner(op.old, op.new);
-        }
-        var added: usize = 0;
-        for (system.publish_bands.items[0..job.publish_ranges], system.publish_range_bases.items[0..job.publish_ranges]) |band, base| {
-            var start = base;
-            for (band.counts[0..pair]) |pair_count| start += pair_count;
-            map.addAll(system.reg_buckets.items[start..][0..band.counts[pair]]);
-            added += band.counts[pair];
-        }
-        if (job.truncate) map.installTruncate();
-        system.flush_tallies[pair] = .{ .removed = removed, .added = added };
-    }
-}
-
 // One range of `resize_copy`: its moves' stored paths.
 const ResizeCopyJob = struct {
     cache: *const ResultCache,
@@ -3185,6 +2858,28 @@ const baselineCapacity = @import("test_support.zig").baselineCapacity;
 const abstractCapacity = @import("test_support.zig").abstractCapacity;
 const loadTestWorldMeta = @import("test_support.zig").loadTestWorldMeta;
 const requireTestTile = @import("test_support.zig").requireTestTile;
+const tileCenter = @import("test_support.zig").tileCenter;
+const cellWorld = @import("test_support.zig").cellWorld;
+const appendIndividual = @import("test_support.zig").appendIndividual;
+const publishTestPath = @import("test_support.zig").publishTestPath;
+const solveIndividualGoals = @import("test_support.zig").solveIndividualGoals;
+const cachedPathCells = @import("test_support.zig").cachedPathCells;
+const RegistryWorld = @import("test_support.zig").RegistryWorld;
+const registryWorld = @import("test_support.zig").registryWorld;
+const registrySystem = @import("test_support.zig").registrySystem;
+const registrySystemWith = @import("test_support.zig").registrySystemWith;
+const registryRoute = @import("test_support.zig").registryRoute;
+const registryRouteKey = @import("test_support.zig").registryRouteKey;
+const solveRegistryRoutes = @import("test_support.zig").solveRegistryRoutes;
+const storedPath = @import("test_support.zig").storedPath;
+const expectRegistryMatchesCache = @import("test_support.zig").expectRegistryMatchesCache;
+const expectSameRegistry = @import("test_support.zig").expectSameRegistry;
+const expectSameCache = @import("test_support.zig").expectSameCache;
+const setRegistryCells = @import("test_support.zig").setRegistryCells;
+const setSystemAllocators = @import("test_support.zig").setSystemAllocators;
+const fixed_threads_config = @import("test_support.zig").fixed_threads_config;
+const flushUnits = @import("test_support.zig").flushUnits;
+const shrinkFixture = @import("test_support.zig").shrinkFixture;
 const no_colliders = &test_support.no_colliders;
 
 test "pathfinding individual solve produces deterministic available path and waypoint" {
@@ -3548,7 +3243,7 @@ test "pathfinding same-level group agent falls through on a field-sample miss in
     // Clear the goal-keyed cache the first step's individual solve populated, and
     // simulate an in-flight solve for it, so the only remaining fallthrough signal is
     // pending_keys — isolating the field-sample-miss branch from the unrelated cache hit.
-    system.clearCompleted();
+    publish.clearCompleted(&system);
     const key = system.graph.keyForWorld(0, goal, .default).?;
     _ = system.pending_keys.insert(key);
 
@@ -5100,12 +4795,6 @@ test "pathfinding warmed cross-level abstract solve does not allocate" {
 // Incremental nav update tests
 // ----------------------------------------------------------------------------
 
-// World center (px) of tile cell (cx, cy) at the demo 32px tile size, used to seed
-// requests/queries at a known nav cell.
-fn tileCenter(cx: u16, cy: u16) math.Vec2 {
-    return .{ .x = @as(f32, @floatFromInt(cx)) * 32 + 16, .y = @as(f32, @floatFromInt(cy)) * 32 + 16 };
-}
-
 // Builds a 12x12-tile single-level world with a vertical tree wall at column 5 that
 // leaves open gaps at the given rows. The base floor is open grass, so the only way
 // across the wall is through a gap. Returns the world plus the obstacle layer index
@@ -6510,7 +6199,7 @@ fn clearRequestsKeepingFields(system: *PathfindingSystem) void {
     system.pending_keys.clear();
     system.group_requests.clearRetainingCapacity();
     system.group_key_map.clear();
-    system.clearCompleted();
+    publish.clearCompleted(system);
 }
 
 /// Every pool the intake/solve/publish paths `appendAssumeCapacity` into fits the
@@ -7438,8 +7127,8 @@ test "a capped stitch toward the least-estimate node is cut to its last cell bel
     // From (31, 56), against the wall, every cell of the capped prefix past the start lies at or
     // above the start's estimate, though the whole stitch ends below it.
     // Dropped caches: a cached partial would serve this start.
-    reference.clearCompleted();
-    system.clearCompleted();
+    publish.clearCompleted(&reference);
+    publish.clearCompleted(&system);
     const climbing = tileCenter(31, 56);
     const climbing_h = northGapEstimate(stripCellOf(&system, climbing));
     try std.testing.expectEqual(@as(usize, 1), (try solveHop(&reference, requester, climbing, goal)).partial_results);
@@ -7512,14 +7201,6 @@ test "threaded least-estimate partials equal serial for any range size and worke
 // ---- Request-side stages (path_intake, group_field_expand, pending ring) ----------
 
 const intake_test_agents: usize = 40;
-
-fn cellWorld(x: i32, y: i32) math.Vec2 {
-    return .{ .x = @as(f32, @floatFromInt(x)) * 32.0 + 16.0, .y = @as(f32, @floatFromInt(y)) * 32.0 + 16.0 };
-}
-
-fn appendIndividual(stream: *RangeOutputStream(PathRequest), entity: EntityId, goal: math.Vec2) !void {
-    try appendPathRequest(stream, .{ .entity = entity, .start = cellWorld(1, 2), .goal = goal });
-}
 
 const IntakeGoals = struct {
     const hit = cellWorld(1, 1);
@@ -7595,26 +7276,6 @@ fn intakeScenarioSystem(data: *const DataSystem, requester: EntityId, participan
     try publishTestPath(&system, key(&system, IntakeGoals.prefilled(0)), &path, step -% 400, &put_stats);
     try publishTestPath(&system, key(&system, IntakeGoals.blocked), &path, step, &put_stats);
     return system;
-}
-
-// Stores the level-0 plain `path` for `key` at `step` as one publish would, its registry
-// runs included, and flushes the registry.
-fn publishTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []const u32, step: u32, stats: *PathfindingStats) !void {
-    system.completed.core.beginPublish();
-    const claimed = system.completed.claim(key, path.len, 0, 0, .{ .level = 0, .cell = path[path.len - 1] }, path[path.len - 1], step, stats);
-    @memcpy(system.completed.destination(claimed)[0..path.len], path);
-    _ = system.flushRegistry(null, null);
-    const starts = try std.testing.allocator.alloc(u16, path.len);
-    defer std.testing.allocator.free(starts);
-    var counts: [registry_shard_count]u32 = @splat(0);
-    const geometry = system.graph.chunkGeometry();
-    const run_count = solve.splitRuns(geometry, path, null, 0, starts, &counts);
-    for (starts[0..run_count]) |start| {
-        const run_key = chunkKey(0, geometry.chunkOfCell(path[start]));
-        const shard = &system.path_index[registryShard(run_key)];
-        try shard.reserve(1, 1, system.completed.logicalCapacity());
-        shard.add(claimed.owner, run_key, start);
-    }
 }
 
 // Forty requests crossing every intake class, with repeats in different ranges.
@@ -8280,50 +7941,6 @@ test "a first group-field build that cannot allocate builds nothing and retries"
     for (0..grid.cellCount()) |cell| try std.testing.expectEqualDeep(expected.lookup(grid, cell), field.lookup(grid, cell));
 }
 
-test "solve results land at their solve ordinal and publish in pending order" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    const requester = try data.createEntity();
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(baselineCapacity());
-    try system.rebuildStaticNavGrid(&data, 256, 256, 32);
-    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer stream.deinit();
-    const goals = [_]math.Vec2{ cellWorld(6, 1), cellWorld(6, 3), cellWorld(6, 5), cellWorld(6, 7) };
-    for (goals) |goal| try appendIndividual(&stream, requester, goal);
-    _ = try system.updateSerial(&stream, 8, .{ .max_solve_admissions_per_step = 0 });
-    try std.testing.expectEqual(goals.len, system.pending.len);
-    // Pending 0 and 1 are escalated: the one-per-step tier-1 cap admits 0 and defers 1,
-    // so ordinals 0, 1, 2 hold pending 0, 2, 3.
-    system.pending.atPtr(0).tier = 1;
-    system.pending.atPtr(1).tier = 1;
-    var keys: [goals.len]PathQueryKey = undefined;
-    for (&keys, 0..) |*key, index| key.* = system.pending.at(index).key;
-
-    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer empty.deinit();
-    const stats = try system.updateSerial(&empty, 8, .{});
-    try std.testing.expectEqual(@as(usize, 1), stats.escalated_deferred);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 3 }, system.solve_indices.items);
-    try std.testing.expectEqual(@as(usize, 3), system.solve_results.items.len);
-    const stride = system.stripe_words;
-    for (system.solve_results.items, system.solved_paths.items, 0..) |result, solved, ordinal| {
-        const key = keys[system.solve_indices.items[ordinal]];
-        try std.testing.expectEqualDeep(key, result.available);
-        try std.testing.expectEqual(ordinal * stride, solved.offset);
-    }
-    // Published results serve their own goals; the deferred one stays pending first.
-    for ([_]usize{ 0, 2, 3 }) |index| {
-        const view = system.statusForWorld(0, cellWorld(1, 2), 0, goals[index], .default, null);
-        try std.testing.expectEqual(PathStatus.available, view.status);
-        const path = system.completed.pathSlice(system.completed.slotIndex(keys[index]).?, system.completed.resultAt(system.completed.slotIndex(keys[index]).?).path_len);
-        try std.testing.expectEqual(@as(u32, @intCast(system.graph.grid(0).?.indexForCell(keys[index].goal).?)), path[path.len - 1]);
-    }
-    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
-    try std.testing.expectEqualDeep(keys[1], system.pending.at(0).key);
-}
-
 test "pending reserve keeps its slots down to half, reallocates below it, and an out-of-memory shrink keeps slots and entries (FailingAllocator)" {
     var pending: std.Deque(PendingRequest) = .empty;
     defer pending.deinit(std.testing.allocator);
@@ -8398,24 +8015,6 @@ test "pending compaction keeps deferred, tail, and rotated order across a ring w
     try std.testing.expectEqual(@as(usize, 1), stats.escalated_dropped);
 }
 
-// Solves `goals` from cellWorld(1, 2) in one serial step with the default budgets.
-fn solveIndividualGoals(system: *PathfindingSystem, requester: EntityId, goals: []const math.Vec2, agent_count: usize) !PathfindingStats {
-    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer stream.deinit();
-    for (goals) |goal| try appendIndividual(&stream, requester, goal);
-    return system.updateSerial(&stream, agent_count, .{});
-}
-
-// The stored cells of `goal`'s cached plain path, copied out.
-fn cachedPathCells(system: *const PathfindingSystem, goal: math.Vec2) !std.ArrayList(u32) {
-    const key = system.graph.keyForWorld(0, goal, .default).?;
-    const slot = system.completed.slotIndex(key) orelse return error.TestExpectedCachedPath;
-    var cells: std.ArrayList(u32) = .empty;
-    errdefer cells.deinit(std.testing.allocator);
-    try cells.appendSlice(std.testing.allocator, system.completed.pathSlice(slot, system.completed.resultAt(slot).path_len));
-    return cells;
-}
-
 test "pathfinding an elastic grow and shrink keep cached paths and pending" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -8480,108 +8079,6 @@ test "pathfinding an elastic grow and shrink keep cached paths and pending" {
     const again_stats = try system.updateSerial(&again, 8, no_admission);
     try std.testing.expectEqual(cached_goals.len, again_stats.cache_hits);
     try std.testing.expectEqual(@as(usize, 0), again_stats.solved_requests);
-}
-
-test "pathfinding result publish after its reserve allocates nothing (FailingAllocator)" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    const requester = try data.createEntity();
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    // Two-word inline stripes: every multi-cell path is a long result.
-    var capacity = baselineCapacity();
-    capacity.max_stored_path_cells = 2;
-    try system.reserve(capacity);
-    try system.rebuildStaticNavGrid(&data, 512, 512, 32);
-    const goals = [_]math.Vec2{ cellWorld(6, 1), cellWorld(6, 9), cellWorld(12, 4), cellWorld(3, 13) };
-
-    // Warm: the first publish grows the long pool at its reserve.
-    try std.testing.expectEqual(goals.len, (try solveIndividualGoals(&system, requester, &goals, 8)).available_results);
-    try std.testing.expect(system.completed.long_block_count >= goals.len);
-    const grows = system.long_block_growth.count;
-    try std.testing.expect(grows >= 1);
-
-    // Cleared (every block free again), the same results publish on a failing allocator.
-    system.clearCompleted();
-    const original = system.allocator;
-    system.allocator = std.testing.failing_allocator;
-    system.graph.allocator = std.testing.failing_allocator;
-    defer {
-        system.allocator = original;
-        system.graph.allocator = original;
-    }
-    const stats = try solveIndividualGoals(&system, requester, &goals, 8);
-    try std.testing.expectEqual(goals.len, stats.available_results);
-    try std.testing.expectEqual(grows, system.long_block_growth.count);
-    for (goals) |goal| {
-        var cells = try cachedPathCells(&system, goal);
-        defer cells.deinit(std.testing.allocator);
-        // Stored whole: the path runs from the start cell to the goal cell, past the stripe.
-        const grid = system.graph.grid(0).?;
-        try std.testing.expect(cells.items.len > capacity.max_stored_path_cells);
-        try std.testing.expectEqual(@as(u32, @intCast(grid.indexForCell(grid.worldToCellClamped(cellWorld(1, 2))).?)), cells.items[0]);
-        try std.testing.expectEqual(@as(u32, @intCast(grid.indexForCell(grid.worldToCellClamped(goal)).?)), cells.items[cells.items.len - 1]);
-    }
-}
-
-test "pathfinding a publish reserve out of memory claims nothing, leaves pending for retry, and still flushes logged ops (FailingAllocator)" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    const requester = try data.createEntity();
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    // Two-word inline stripes: every multi-cell path is a long result.
-    var capacity = baselineCapacity();
-    capacity.max_stored_path_cells = 2;
-    try system.reserve(capacity);
-    try system.rebuildStaticNavGrid(&data, 512, 512, 32);
-
-    // Warm the step on a one-cell (inline) result, then clear: the long pool stays empty.
-    // The result is published again and aged past the TTL, so the failing step's intake
-    // removes it and logs its retire.
-    const aged_goal = cellWorld(1, 2);
-    try std.testing.expectEqual(@as(usize, 1), (try solveIndividualGoals(&system, requester, &.{aged_goal}, 8)).available_results);
-    system.clearCompleted();
-    try std.testing.expectEqual(@as(usize, 0), system.completed.long_block_count);
-    try std.testing.expectEqual(@as(usize, 1), (try solveIndividualGoals(&system, requester, &.{aged_goal}, 8)).available_results);
-    const aged_owner = system.completed.core.ownerOf(system.graph.keyForWorld(0, aged_goal, .default).?).?;
-    system.completed.core.records.items[aged_owner].stamp -%= types.default_cache_ttl_steps + 1;
-    var aged_registrations: usize = 0;
-    for (&system.path_index) |*shard| aged_registrations += shard.entries.len - shard.entry_free.items.len;
-    try std.testing.expect(aged_registrations != 0);
-
-    const goals = [_]math.Vec2{ cellWorld(6, 1), cellWorld(6, 9), cellWorld(12, 4) };
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    const original = system.allocator;
-    system.allocator = failing.allocator();
-    system.graph.allocator = failing.allocator();
-    const failed = solveIndividualGoals(&system, requester, &(goals ++ [_]math.Vec2{aged_goal}), 8);
-    system.allocator = original;
-    system.graph.allocator = original;
-    try std.testing.expectError(error.OutOfMemory, failed);
-
-    try std.testing.expectEqual(@as(usize, 0), system.completed.count());
-    try std.testing.expectEqual(@as(usize, 0), system.completed.long_block_count);
-    // The expired result's retire was flushed: no owner op waits and no registration remains.
-    try std.testing.expectEqual(@as(usize, 0), system.completed.core.ownerLog().len);
-    for (&system.path_index) |*shard| try std.testing.expectEqual(shard.entries.len, shard.entry_free.items.len);
-    try std.testing.expectEqual(goals.len + 1, system.pending.len);
-    for (goals) |goal| {
-        try std.testing.expect(system.pending_keys.contains(system.graph.keyForWorld(0, goal, .default).?));
-        try std.testing.expectEqual(PathStatus.pending, system.statusForWorld(0, cellWorld(1, 2), 0, goal, .default, null).status);
-    }
-
-    // With memory back, the next step publishes the same requests without new intake.
-    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer empty.deinit();
-    const retry = try system.updateSerial(&empty, 8, .{});
-    try std.testing.expectEqual(@as(usize, 0), retry.accepted_requests);
-    try std.testing.expectEqual(goals.len + 1, retry.available_results);
-    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
-    try std.testing.expect(system.long_block_growth.count >= 1);
-    for (goals) |goal| {
-        try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, cellWorld(1, 2), 0, goal, .default, null).status);
-    }
 }
 
 test "a static mark record after its reserve allocates nothing (FailingAllocator)" {
@@ -9257,212 +8754,7 @@ test "an elastic resize keeps a building group field building" {
 
 // ---- Path registry, publish split, and scoped eviction ---------------------------
 
-const TileId = @import("../../world/system.zig").TileId;
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
-
-// A world `side` tiles a side in 4-tile chunks, open grass, with an obstacle layer to flip.
-const RegistryWorld = struct {
-    world: WorldSystem,
-    obstacle: usize,
-    grass: TileId,
-    tree: TileId,
-};
-
-fn registryWorld(meta: *const WorldTilesetMeta, side: u16) !RegistryWorld {
-    const grass = try requireTestTile(meta, "grass");
-    const tree = try requireTestTile(meta, "tree_0");
-    var world = try test_support.abstractTestWorld(meta, @as(f32, @floatFromInt(side)) * 32, @as(f32, @floatFromInt(side)) * 32);
-    errdefer world.deinit();
-    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
-    return .{ .world = world, .obstacle = obstacle, .grass = grass, .tree = tree };
-}
-
-// A system over `world` at the abstract capacity (4-tile chunks, a two-step shrink
-// window), grown to `agent_count` agents.
-fn registrySystem(data: *const DataSystem, world: *const WorldSystem, agent_count: usize) !PathfindingSystem {
-    return registrySystemWith(data, world, agent_count, .{});
-}
-
-const RegistrySystemOptions = struct {
-    // Inline stripe cells; a path past it is stored in a long block.
-    stored_path_cells: ?usize = null,
-    participants: usize = 1,
-};
-
-fn registrySystemWith(data: *const DataSystem, world: *const WorldSystem, agent_count: usize, options: RegistrySystemOptions) !PathfindingSystem {
-    var system = PathfindingSystem.init(std.testing.allocator);
-    errdefer system.deinit();
-    var capacity = abstractCapacity();
-    capacity.capacity_shrink_window = 2;
-    capacity.worker_participant_count = options.participants;
-    if (options.stored_path_cells) |cells| capacity.max_stored_path_cells = cells;
-    try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(data, world, null);
-    try system.growForAgentCount(agent_count);
-    return system;
-}
-
-// Route `index` across a registry world `side` tiles a side: distinct goals, each start
-// mirrored through the center, so routes cross many chunks.
-fn registryRoute(index: usize, side: u16) [2]math.Vec2 {
-    const span: usize = side - 4;
-    const goal_x: u16 = @intCast(2 + index % span);
-    const goal_y: u16 = @intCast(2 + (index / span * 3 + index % 3) % span);
-    var start_x = side - 1 - goal_x;
-    const start_y = side - 1 - goal_y;
-    // The test world's two blocking decorations are no start.
-    if ((start_x == side / 4 and start_y == side / 3) or (start_x == side * 3 / 4 and start_y == side * 2 / 3)) start_x += 1;
-    return .{ tileCenter(start_x, start_y), tileCenter(goal_x, goal_y) };
-}
-
-fn registryRouteKey(system: *const PathfindingSystem, index: usize, side: u16) PathQueryKey {
-    return system.graph.keyForWorld(0, registryRoute(index, side)[1], .default).?;
-}
-
-// Requests routes [first, first + count) and updates (on `threads` when given) until
-// nothing is pending.
-fn solveRegistryRoutes(system: *PathfindingSystem, requester: EntityId, side: u16, first: usize, count: usize, agent_count: usize, threads: ?*ThreadSystem, config: PathfindingConfig) !void {
-    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer stream.deinit();
-    for (first..first + count) |index| {
-        const route = registryRoute(index, side);
-        try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
-    }
-    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer empty.deinit();
-    var requests = &stream;
-    for (0..16) |_| {
-        if (threads) |thread_system| {
-            _ = try system.update(requests, agent_count, thread_system, config);
-        } else {
-            _ = try system.updateSerial(requests, agent_count, config);
-        }
-        requests = &empty;
-        if (system.pending.len == 0) return;
-    }
-    return error.TestRoutesStalled;
-}
-
-// A cached path's stored cells: its cells, and its levels (null: all on `level`).
-const StoredPath = struct {
-    cells: []const u32,
-    levels: ?[]const u16,
-    level: u16,
-
-    fn levelAt(self: StoredPath, index: usize) u16 {
-        return if (self.levels) |column| column[index] else self.level;
-    }
-};
-
-fn storedPath(system: *const PathfindingSystem, owner: u32) StoredPath {
-    const payload = system.completed.core.records.items[owner].extra;
-    const words = system.completed.storedWords(owner);
-    if (payload.stitched_len != 0) {
-        const view = types.stitchedView(words, payload.stitched_len);
-        return .{ .cells = view.cells, .levels = view.levels, .level = 0 };
-    }
-    return .{ .cells = words[0..payload.path_len], .levels = null, .level = payload.path_level };
-}
-
-const Registration = struct {
-    key: u64,
-    owner: u32,
-    start: u32,
-
-    fn lessThan(_: void, a: Registration, b: Registration) bool {
-        if (a.key != b.key) return a.key < b.key;
-        if (a.owner != b.owner) return a.owner < b.owner;
-        return a.start < b.start;
-    }
-};
-
-// The registry holds exactly the runs of every live cached path, each in its key's shard,
-// with every key's count its list's length and every owner chain naming its own live
-// owner; the owner log is empty.
-fn expectRegistryMatchesCache(system: *const PathfindingSystem) !void {
-    try std.testing.expectEqual(@as(usize, 0), system.completed.core.ownerLog().len);
-    const allocator = std.testing.allocator;
-    var expected: std.ArrayList(Registration) = .empty;
-    defer expected.deinit(allocator);
-    var actual: std.ArrayList(Registration) = .empty;
-    defer actual.deinit(allocator);
-    const geometry = system.graph.chunkGeometry();
-    for (system.completed.core.records.items, 0..) |record, owner_index| {
-        if (!record.live) continue;
-        const owner: u32 = @intCast(owner_index);
-        const path = storedPath(system, owner);
-        const starts = try allocator.alloc(u16, @max(path.cells.len, 1));
-        defer allocator.free(starts);
-        var counts: [registry_shard_count]u32 = @splat(0);
-        const run_count = solve.splitRuns(geometry, path.cells, path.levels, path.level, starts, &counts);
-        for (starts[0..run_count]) |start| try expected.append(allocator, .{ .key = chunkKey(path.levelAt(start), geometry.chunkOfCell(path.cells[start])), .owner = owner, .start = start });
-    }
-    for (&system.path_index, 0..) |*shard, shard_index| {
-        for (shard.slot_keys, 0..) |key, slot| {
-            if (key == std.math.maxInt(u64)) continue;
-            try std.testing.expectEqual(shard_index, registryShard(key));
-            var length: u32 = 0;
-            var entry = shard.slot_heads[slot];
-            while (entry != no_entry) : (entry = shard.entry_next[entry]) {
-                length += 1;
-                try actual.append(allocator, .{ .key = key, .owner = shard.entry_owner[entry], .start = shard.entry_order[entry] });
-            }
-            try std.testing.expect(length != 0);
-            try std.testing.expectEqual(length, shard.slot_counts[slot]);
-        }
-        try std.testing.expect(shard.owner_heads.items.len >= system.completed.logicalCapacity());
-        for (shard.owner_heads.items, 0..) |owner_head, owner| {
-            var entry = owner_head;
-            while (entry != no_entry) : (entry = shard.entry_owner_next[entry]) {
-                try std.testing.expectEqual(@as(u32, @intCast(owner)), shard.entry_owner[entry]);
-                try std.testing.expect(system.completed.core.records.items[owner].live);
-            }
-        }
-    }
-    std.mem.sort(Registration, expected.items, {}, Registration.lessThan);
-    std.mem.sort(Registration, actual.items, {}, Registration.lessThan);
-    try std.testing.expectEqualSlices(Registration, expected.items, actual.items);
-}
-
-// Two systems' registries hold the same keys in the same slots and the same lists in the
-// same order.
-fn expectSameRegistry(a: *const PathfindingSystem, b: *const PathfindingSystem) !void {
-    for (&a.path_index, &b.path_index) |*shard_a, *shard_b| {
-        try std.testing.expectEqualSlices(u64, shard_a.slot_keys, shard_b.slot_keys);
-        for (shard_a.slot_keys, 0..) |key, slot| {
-            if (key == std.math.maxInt(u64)) continue;
-            var entry_a = shard_a.slot_heads[slot];
-            var entry_b = shard_b.slot_heads[slot];
-            while (entry_a != no_entry or entry_b != no_entry) {
-                try std.testing.expect(entry_a != no_entry and entry_b != no_entry);
-                try std.testing.expectEqual(shard_a.entry_owner[entry_a], shard_b.entry_owner[entry_b]);
-                try std.testing.expectEqual(shard_a.entry_order[entry_a], shard_b.entry_order[entry_b]);
-                entry_a = shard_a.entry_next[entry_a];
-                entry_b = shard_b.entry_next[entry_b];
-            }
-        }
-    }
-}
-
-// Two systems' caches hold the same entries under the same owner ids and probe slots,
-// with the same stored cells.
-fn expectSameCache(a: *const PathfindingSystem, b: *const PathfindingSystem) !void {
-    try std.testing.expectEqual(a.completed.count(), b.completed.count());
-    try std.testing.expectEqual(a.completed.logicalCapacity(), b.completed.logicalCapacity());
-    for (a.completed.core.slots.items, b.completed.core.slots.items) |slot_a, slot_b| {
-        try std.testing.expectEqual(slot_a.occupied, slot_b.occupied);
-        if (slot_a.occupied) try std.testing.expectEqual(slot_a.payload_index, slot_b.payload_index);
-    }
-    for (a.completed.core.records.items, b.completed.core.records.items, 0..) |record_a, record_b, owner| {
-        try std.testing.expectEqual(record_a.live, record_b.live);
-        if (!record_a.live) continue;
-        try std.testing.expect(std.meta.eql(a.completed.core.keyOf(@intCast(owner)), b.completed.core.keyOf(@intCast(owner))));
-        try std.testing.expectEqual(record_a.stamp, record_b.stamp);
-        try std.testing.expectEqualDeep(record_a.extra, record_b.extra);
-        const words = types.storedPathWords(record_a.extra.path_len, record_a.extra.stitched_len);
-        try std.testing.expectEqualSlices(u32, a.completed.storedWords(owner)[0..words], b.completed.storedWords(owner)[0..words]);
-    }
-}
 
 // Whether a stored cell of `owner`'s path lies within one cell (8-neighbour) of one of
 // `changed` ((level, x, y) cells).
@@ -9478,85 +8770,6 @@ fn pathNearCells(system: *const PathfindingSystem, owner: u32, changed: []const 
         }
     }
     return false;
-}
-
-// Sets each (x, y) of `cells` on the obstacle layer to `tile` and records it for nav.
-fn setRegistryCells(system: *PathfindingSystem, fixture: *RegistryWorld, cells: []const [2]u16, tile: TileId) !void {
-    for (cells) |cell| {
-        const changed = (try fixture.world.setDenseTile(fixture.obstacle, cell[0], cell[1], tile)) orelse continue;
-        try test_support.recordTileChange(system, &fixture.world, changed);
-    }
-}
-
-test "the path registry holds every run of every published path, and the incremental registry equals one rebuilt from the live cache after victims, TTL expiry, evictions, re-puts, and a shrink with renames" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try registryWorld(&meta, 24);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var system = try registrySystem(&data, &fixture.world, 16);
-    defer system.deinit();
-    try std.testing.expectEqual(@as(usize, 64), system.completed.logicalCapacity());
-
-    // Published paths, then victims: more routes than the 64 entries hold.
-    try solveRegistryRoutes(&system, requester, 24, 0, 16, 16, null, .{});
-    try expectRegistryMatchesCache(&system);
-    for (1..6) |batch| try solveRegistryRoutes(&system, requester, 24, batch * 16, 16, 16, null, .{});
-    try std.testing.expect(system.completed.count() == 64);
-    try expectRegistryMatchesCache(&system);
-
-    // TTL expiry: an aged entry removed at intake.
-    const aged = system.completed.core.ownerOf(registryRouteKey(&system, 90, 24)).?;
-    system.completed.core.records.items[aged].stamp -%= types.default_cache_ttl_steps + 1;
-    try solveRegistryRoutes(&system, requester, 24, 90, 1, 16, null, .{});
-    try expectRegistryMatchesCache(&system);
-
-    // Evictions: a dig across the middle of the map.
-    try setRegistryCells(&system, &fixture, &.{ .{ 11, 11 }, .{ 12, 11 }, .{ 12, 12 } }, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expect(reaction.evicted_results != 0);
-    try expectRegistryMatchesCache(&system);
-
-    // A re-put: the same key published with a different path.
-    var put_stats = PathfindingStats{};
-    var reput_key = emptyKey(system.graph.version);
-    for (system.completed.core.records.items, 0..) |record, owner| {
-        if (record.live) reput_key = system.completed.core.keyOf(@intCast(owner));
-    }
-    try publishTestPath(&system, reput_key, &.{ 30, 31, 55, 79 }, system.step_counter, &put_stats);
-    try expectRegistryMatchesCache(&system);
-
-    // A shrink with renames: sustained low load drops the capacity to the floor's 32.
-    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer empty.deinit();
-    for (0..system.capacity.capacity_shrink_window) |_| _ = try system.updateSerial(&empty, 1, .{});
-    try std.testing.expectEqual(@as(usize, 32), system.completed.logicalCapacity());
-    try expectRegistryMatchesCache(&system);
-}
-
-test "re-putting a key replaces its registrations" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try registryWorld(&meta, 24);
-    defer fixture.world.deinit();
-    var system = try registrySystem(&data, &fixture.world, 8);
-    defer system.deinit();
-    var stats = PathfindingStats{};
-    var key = emptyKey(system.graph.version);
-    key.goal = .{ .x = 20, .y = 20 };
-    // Row 1 across three chunks, then column 22 across two others.
-    try publishTestPath(&system, key, &.{ 25, 26, 27, 28, 29, 30, 31, 32, 33 }, 1, &stats);
-    try expectRegistryMatchesCache(&system);
-    try publishTestPath(&system, key, &.{ 22 + 24 * 10, 22 + 24 * 11, 22 + 24 * 12 }, 2, &stats);
-    try expectRegistryMatchesCache(&system);
-    // Only the second path's two runs remain.
-    var registrations: usize = 0;
-    for (&system.path_index) |*shard| registrations += shard.entries.len - shard.entry_free.items.len;
-    try std.testing.expectEqual(@as(usize, 2), registrations);
 }
 
 test "eviction equals a brute-force reference: exactly the cached paths with a cell within one cell of a changed cell" {
@@ -9770,7 +8983,7 @@ fn publishTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: 
     system.completed.core.beginPublish();
     const claimed = system.completed.claim(key, 0, corridor.len, corridor[0].level, corridor[corridor.len - 1], corridor[corridor.len - 1].cell, step, stats);
     types.writeStitched(system.completed.destination(claimed), corridor);
-    _ = system.flushRegistry(null, null);
+    _ = publish.flushRegistry(system, null, null);
     const view = types.stitchedView(system.completed.destination(claimed), corridor.len);
     var starts: [64]u16 = undefined;
     var counts: [registry_shard_count]u32 = @splat(0);
@@ -9782,69 +8995,6 @@ fn publishTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: 
         try shard.reserve(1, 1, system.completed.logicalCapacity());
         shard.add(claimed.owner, run_key, start);
     }
-}
-
-// Points every allocator `system` uses (its own, its graph's, and each registry shard's) at
-// `allocator`.
-fn setSystemAllocators(system: *PathfindingSystem, allocator: std.mem.Allocator) void {
-    system.allocator = allocator;
-    system.graph.allocator = allocator;
-    for (&system.path_index) |*shard| shard.allocator = allocator;
-}
-
-// A fixed-range threaded control: one item per range, so every stage with two or more items
-// runs on workers.
-const fixed_threads_config = PathfindingConfig{ .adaptive = false, .items_per_range = 1 };
-
-test "threaded publish equals serial across range sizes and worker counts (cache bytes, per-shard lists, stats), and publish_copy and registry_flush run on workers" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try registryWorld(&meta, 24);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    // Eight-cell stripes: most routes are long results.
-    var serial = try registrySystemWith(&data, &fixture.world, 64, .{ .stored_path_cells = 8 });
-    defer serial.deinit();
-    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer stream.deinit();
-    for (0..48) |index| {
-        const route = registryRoute(index, 24);
-        try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
-    }
-    const serial_stats = try serial.updateSerial(&stream, 64, .{});
-    try std.testing.expectEqual(@as(usize, 48), serial_stats.available_results);
-    try std.testing.expect(serial_stats.registrations_added > 48);
-    try std.testing.expect(serial.completed.long_block_count != 0);
-    try expectRegistryMatchesCache(&serial);
-    for ([_]usize{ 1, 3 }) |workers| {
-        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
-        defer threads.deinit();
-        if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-        for ([_]usize{ 1, 3, 8 }) |items_per_range| {
-            var threaded = try registrySystemWith(&data, &fixture.world, 64, .{ .stored_path_cells = 8, .participants = threads.participantSlotCount() });
-            defer threaded.deinit();
-            const stats = try threaded.update(&stream, 64, &threads, .{ .adaptive = false, .items_per_range = items_per_range });
-            try expectSameCache(&serial, &threaded);
-            try expectSameRegistry(&serial, &threaded);
-            try std.testing.expectEqual(serial_stats.available_results, stats.available_results);
-            try std.testing.expectEqual(serial_stats.registrations_added, stats.registrations_added);
-            try std.testing.expectEqual(serial_stats.registrations_removed, stats.registrations_removed);
-            try std.testing.expectEqual(serial_stats.cache_evictions, stats.cache_evictions);
-            if (items_per_range == 1) {
-                try std.testing.expect(!stats.publish_copy_batch.ran_inline and stats.publish_copy_batch.range_count > 1);
-                try std.testing.expect(!stats.registry_flush_batch.ran_inline and stats.registry_flush_batch.range_count > 1);
-            }
-        }
-    }
-}
-
-// Work units of a registry flush over `ops` logged ops and `adds` pending registrations:
-// every pair weighs the whole log, its adds, and one.
-fn flushUnits(ops: usize, adds: usize) usize {
-    return registry_shard_count * (ops + 1) + adds;
 }
 
 // Fills `system`'s 64-entry cache with routes [0, 64), then publishes routes [64, 80) into
@@ -9916,11 +9066,11 @@ test "threaded registry flush equals serial with victims, re-puts, and renames i
     // One unit per range: a range per unit, most with no pair starting in it.
     const units = flushUnits(ops.len, 0);
     var serial_stats = PathfindingStats{};
-    const serial_batch = systems[0].flushRegistry(null, &serial_stats);
+    const serial_batch = publish.flushRegistry(&systems[0], null, &serial_stats);
     try std.testing.expectEqual(units, serial_batch.item_count);
     var threaded_stats = PathfindingStats{};
     const stage = (StageThreads{ .thread_system = &threads, .config = fixed_threads_config }).stage(&systems[1].tuners.registry_flush);
-    const batch = systems[1].flushRegistry(stage, &threaded_stats);
+    const batch = publish.flushRegistry(&systems[1], stage, &threaded_stats);
     try std.testing.expect(!batch.ran_inline);
     try std.testing.expectEqual(units, batch.item_count);
     try std.testing.expectEqual(units, batch.range_count);
@@ -9944,7 +9094,7 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
     try prepareMixedFlush(&serial, requester);
     const ops = serial.completed.core.ownerLog().len;
     var serial_stats = PathfindingStats{};
-    const serial_batch = serial.flushRegistry(null, &serial_stats);
+    const serial_batch = publish.flushRegistry(&serial, null, &serial_stats);
     try std.testing.expect(serial_stats.registrations_removed != 0 and serial_stats.registrations_added != 0);
     const units = flushUnits(ops, serial_stats.registrations_added);
     try std.testing.expectEqual(units, serial_batch.item_count);
@@ -9964,7 +9114,7 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
             var stats = PathfindingStats{};
             const config = PathfindingConfig{ .adaptive = false, .items_per_range = items_per_range };
             const stage = (StageThreads{ .thread_system = &threads, .config = config }).stage(&threaded.tuners.registry_flush);
-            const batch = threaded.flushRegistry(stage, &stats);
+            const batch = publish.flushRegistry(&threaded, stage, &stats);
             try std.testing.expect(!batch.ran_inline and batch.active_worker_threads != 0);
             try std.testing.expect(batch.active_worker_threads <= flush_pair_count - 1);
             worker_ranges += batch.worker_thread_ranges;
@@ -9978,44 +9128,6 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
         }
         try std.testing.expect(worker_ranges != 0);
     }
-}
-
-test "publish after its reserve allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try registryWorld(&meta, 24);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
-    defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-    var system = try registrySystemWith(&data, &fixture.world, 64, .{ .stored_path_cells = 8, .participants = threads.participantSlotCount() });
-    defer system.deinit();
-    // One publish of the routes reserves the registry, its windows, and long pages; cleared,
-    // the same publish fits them.
-    try solveRegistryRoutes(&system, requester, 24, 0, 48, 64, &threads, fixed_threads_config);
-    system.clearRuntimeState();
-    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer stream.deinit();
-    for (0..48) |index| {
-        const route = registryRoute(index, 24);
-        try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
-    }
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    setSystemAllocators(&system, failing.allocator());
-    const stats = system.update(&stream, 64, &threads, fixed_threads_config);
-    setSystemAllocators(&system, std.testing.allocator);
-    const published = try stats;
-    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(usize, 48), published.available_results);
-    try std.testing.expect(!published.publish_copy_batch.ran_inline and !published.registry_flush_batch.ran_inline);
-    const units = flushUnits(0, published.registrations_added);
-    try std.testing.expectEqual(units, published.registry_flush_batch.item_count);
-    try std.testing.expectEqual(units, published.registry_flush_batch.range_count);
-    try expectRegistryMatchesCache(&system);
 }
 
 // Flips one cell in each of 20 chunks (a 5 x 4 chunk block) of a 24-tile registry world.
@@ -10222,16 +9334,6 @@ test "an elastic grow and shrink keep cached paths and registrations, and a rena
     try expectRegistryMatchesCache(&system);
 }
 
-// Two registry systems filled alike with long and inline results, for a shrink to the
-// floor's 32 entries.
-fn shrinkFixture(data: *const DataSystem, fixture: *const RegistryWorld, requester: EntityId, participants: usize) !PathfindingSystem {
-    var system = try registrySystemWith(data, &fixture.world, 16, .{ .stored_path_cells = 8, .participants = participants });
-    errdefer system.deinit();
-    for (0..4) |batch| try solveRegistryRoutes(&system, requester, 24, batch * 16, 16, 16, null, .{});
-    try std.testing.expectEqual(@as(usize, 64), system.completed.count());
-    return system;
-}
-
 test "threaded resize copy equals serial for inline and long moves, and runs on workers" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
@@ -10262,8 +9364,8 @@ test "threaded resize copy equals serial for inline and long moves, and runs on 
     try std.testing.expect(serial.last_resize_copy_batch.ran_inline);
     try std.testing.expect(!threaded.last_resize_copy_batch.ran_inline and threaded.last_resize_copy_batch.range_count > 1);
     try std.testing.expectEqual(serial.last_resize_copy_batch.item_count, threaded.last_resize_copy_batch.item_count);
-    _ = serial.flushRegistry(null, null);
-    _ = threaded.flushRegistry(null, null);
+    _ = publish.flushRegistry(&serial, null, null);
+    _ = publish.flushRegistry(&threaded, null, null);
     try expectSameCache(&serial, &threaded);
     try expectSameRegistry(&serial, &threaded);
     try expectRegistryMatchesCache(&threaded);
@@ -10298,7 +9400,7 @@ test "a shrink's resize copy allocates nothing after its prepare on a multi-work
     setSystemAllocators(&system, failing.allocator());
     const stage = (StageThreads{ .thread_system = &threads, .config = fixed_threads_config });
     const batch = system.runResizeCopy(stage.stage(&system.tuners.resize_copy));
-    const flush = system.flushRegistry(stage.stage(&system.tuners.registry_flush), null);
+    const flush = publish.flushRegistry(&system, stage.stage(&system.tuners.registry_flush), null);
     setSystemAllocators(&system, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
@@ -10310,96 +9412,6 @@ test "a shrink's resize copy allocates nothing after its prepare on a multi-work
     try std.testing.expectEqual(@as(usize, 0), system.completed.pendingMoves().len);
     for (&system.path_index) |*shard| try std.testing.expectEqual(@as(usize, 32), shard.owner_heads.items.len);
     try expectRegistryMatchesCache(&system);
-}
-
-const ShrinkFlushes = struct {
-    serial: BatchStats = .{},
-    threaded: BatchStats = .{},
-};
-
-// Two registry systems over one world, filled alike, then shrunk by sustained low load:
-// one serial, one on `threads` under `config`. Returns each shrink step's flush batch.
-fn shrinkThroughUpdates(serial: *PathfindingSystem, threaded: *PathfindingSystem, threads: *ThreadSystem, config: PathfindingConfig) !ShrinkFlushes {
-    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
-    defer empty.deinit();
-    var flushes = ShrinkFlushes{};
-    for (0..serial.capacity.capacity_shrink_window) |_| {
-        const serial_capacity = serial.completed.logicalCapacity();
-        const serial_stats = try serial.updateSerial(&empty, 1, .{});
-        if (serial.completed.logicalCapacity() < serial_capacity) flushes.serial = serial_stats.registry_flush_batch;
-        const capacity = threaded.completed.logicalCapacity();
-        const stats = try threaded.update(&empty, 1, threads, config);
-        if (threaded.completed.logicalCapacity() < capacity) flushes.threaded = stats.registry_flush_batch;
-    }
-    return flushes;
-}
-
-test "a shrink's registry flush runs on workers at about one pair per range under the adaptive control, renames included, and equals the serial flush" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try registryWorld(&meta, 24);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
-    defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-    var serial = try shrinkFixture(&data, &fixture, requester, 1);
-    defer serial.deinit();
-    var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
-    defer threaded.deinit();
-    // The shrink's fixed-shape flush leaves the flush tuner untouched.
-    const tuner_before = threaded.tuners.registry_flush.report();
-    const flushes = try shrinkThroughUpdates(&serial, &threaded, &threads, .{});
-    const flush = flushes.threaded;
-    const tuner_after = threaded.tuners.registry_flush.report();
-    try std.testing.expectEqual(tuner_before.sample_count, tuner_after.sample_count);
-    try std.testing.expectEqual(tuner_before.phase, tuner_after.phase);
-    try std.testing.expectEqual(tuner_before.current_profile, tuner_after.current_profile);
-    try std.testing.expectEqual(@as(usize, 32), threaded.completed.logicalCapacity());
-    try std.testing.expect(!flush.ran_inline and flush.active_worker_threads != 0 and flush.worker_thread_ranges != 0);
-    // The fixed shape is ceil(units / pairs) units per range; at a pair count's square of
-    // units or more that is exactly one range per pair.
-    try std.testing.expectEqual(flushes.serial.item_count, flush.item_count);
-    try std.testing.expect(flush.item_count >= flush_pair_count * flush_pair_count);
-    try std.testing.expectEqual((flush.item_count + flush_pair_count - 1) / flush_pair_count, flush.items_per_range);
-    try std.testing.expectEqual(flush_pair_count, flush.range_count);
-    try expectSameCache(&serial, &threaded);
-    try expectSameRegistry(&serial, &threaded);
-    try expectRegistryMatchesCache(&threaded);
-    for (&threaded.path_index) |*shard| try std.testing.expectEqual(@as(usize, 32), shard.owner_heads.items.len);
-}
-
-test "a shrink's registry flush keeps a configured range size and equals the serial flush" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try registryWorld(&meta, 24);
-    defer fixture.world.deinit();
-    const requester = try data.createEntity();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
-    defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-    var serial = try shrinkFixture(&data, &fixture, requester, 1);
-    defer serial.deinit();
-    var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
-    defer threaded.deinit();
-    const units_per_range = 4;
-    const flushes = try shrinkThroughUpdates(&serial, &threaded, &threads, .{ .items_per_range = units_per_range });
-    const flush = flushes.threaded;
-    try std.testing.expectEqual(@as(usize, 32), threaded.completed.logicalCapacity());
-    try std.testing.expect(!flush.ran_inline);
-    try std.testing.expectEqual(flushes.serial.item_count, flush.item_count);
-    try std.testing.expect(flush.item_count > flush_pair_count * units_per_range);
-    try std.testing.expectEqual(units_per_range, flush.items_per_range);
-    try std.testing.expectEqual((flush.item_count + units_per_range - 1) / units_per_range, flush.range_count);
-    try expectSameCache(&serial, &threaded);
-    try expectSameRegistry(&serial, &threaded);
-    try expectRegistryMatchesCache(&threaded);
 }
 
 test "reserve() with live entries returns with an empty owner log and no owner past the new capacity" {
@@ -10435,36 +9447,6 @@ test "a resize at unchanged budgets leaves the solve-output pool unwritten" {
     try std.testing.expectEqual(pool_len, system.worker_path_pool.items.len);
     for (system.worker_path_pool.items) |word| try std.testing.expectEqual(@as(u32, 0xabcd), word);
     for (system.worker_run_starts.items) |start| try std.testing.expectEqual(@as(u16, 0x5a5a), start);
-}
-
-test "keys of one shard spread over its table (bounded probe length for a dense chunk block)" {
-    // A 64 x 64 chunk block of one level: one shard's keys in a registry table.
-    var map = ChunkListMap.init(std.testing.allocator, "test registry");
-    defer map.deinit();
-    const shard = 5;
-    var keys: std.ArrayList(u64) = .empty;
-    defer keys.deinit(std.testing.allocator);
-    for (0..64 * 64) |chunk| {
-        const key = chunkKey(3, @intCast(chunk));
-        if (registryShard(key) == shard) try keys.append(std.testing.allocator, key);
-    }
-    try std.testing.expect(keys.items.len > 128);
-    try map.reserve(keys.items.len, keys.items.len, keys.items.len);
-    for (keys.items, 0..) |key, owner| map.add(@intCast(owner), key, 0);
-    const reader = map.reader();
-    const mask = reader.keys.len - 1;
-    var total: usize = 0;
-    var longest: usize = 0;
-    for (keys.items) |key| {
-        const home = stamped_table.fibonacciSlot(key, reader.shift);
-        var distance: usize = 0;
-        while (reader.keys[(home + distance) & mask] != key) distance += 1;
-        total += distance;
-        longest = @max(longest, distance);
-    }
-    // Linear probing at load <= 1/2 averages under one slot past home.
-    try std.testing.expect(total <= keys.items.len);
-    try std.testing.expect(longest <= 24);
 }
 
 // ---------------------------------------------------------------------------------------

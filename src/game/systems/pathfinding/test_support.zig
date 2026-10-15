@@ -50,6 +50,15 @@ const StagingSizes = @import("connectivity.zig").StagingSizes;
 const MergeMap = @import("connectivity.zig").MergeMap;
 const rowWords = @import("connectivity_closure.zig").rowWords;
 const indexMap = @import("connectivity_closure.zig").indexMap;
+const publish = @import("publish.zig");
+const solve = @import("solve.zig");
+const PathQueryKey = @import("types.zig").PathQueryKey;
+const PathfindingStats = @import("types.zig").PathfindingStats;
+const PathfindingConfig = @import("types.zig").PathfindingConfig;
+const registry_shard_count = @import("types.zig").registry_shard_count;
+const registryShard = @import("types.zig").registryShard;
+const chunkKey = @import("../chunk_list_map.zig").chunkKey;
+const no_entry = @import("../chunk_list_map.zig").no_entry;
 
 pub fn addNavBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, static: bool) !EntityId {
     const entity = try data.createEntity();
@@ -988,3 +997,295 @@ pub fn expectExhaustedPoolBatch(fixture: *TestWorld, system: *PathfindingSystem,
 
 /// A long release window, so a warmed batch's staging stays held.
 pub const exhausted_pool_window: u32 = 1 << 16;
+
+/// World center (px) of tile cell (cx, cy) at the demo 32px tile size, used to seed
+/// requests/queries at a known nav cell.
+pub fn tileCenter(cx: u16, cy: u16) math.Vec2 {
+    return .{ .x = @as(f32, @floatFromInt(cx)) * 32 + 16, .y = @as(f32, @floatFromInt(cy)) * 32 + 16 };
+}
+
+pub fn cellWorld(x: i32, y: i32) math.Vec2 {
+    return .{ .x = @as(f32, @floatFromInt(x)) * 32.0 + 16.0, .y = @as(f32, @floatFromInt(y)) * 32.0 + 16.0 };
+}
+
+pub fn appendIndividual(stream: *RangeOutputStream(PathRequest), entity: EntityId, goal: math.Vec2) !void {
+    try appendPathRequest(stream, .{ .entity = entity, .start = cellWorld(1, 2), .goal = goal });
+}
+
+/// Stores the level-0 plain `path` for `key` at `step` as one publish would, its registry
+/// runs included, and flushes the registry.
+pub fn publishTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []const u32, step: u32, stats: *PathfindingStats) !void {
+    system.completed.core.beginPublish();
+    const claimed = system.completed.claim(key, path.len, 0, 0, .{ .level = 0, .cell = path[path.len - 1] }, path[path.len - 1], step, stats);
+    @memcpy(system.completed.destination(claimed)[0..path.len], path);
+    _ = publish.flushRegistry(system, null, null);
+    const starts = try std.testing.allocator.alloc(u16, path.len);
+    defer std.testing.allocator.free(starts);
+    var counts: [registry_shard_count]u32 = @splat(0);
+    const geometry = system.graph.chunkGeometry();
+    const run_count = solve.splitRuns(geometry, path, null, 0, starts, &counts);
+    for (starts[0..run_count]) |start| {
+        const run_key = chunkKey(0, geometry.chunkOfCell(path[start]));
+        const shard = &system.path_index[registryShard(run_key)];
+        try shard.reserve(1, 1, system.completed.logicalCapacity());
+        shard.add(claimed.owner, run_key, start);
+    }
+}
+
+/// Solves `goals` from cellWorld(1, 2) in one serial step with the default budgets.
+pub fn solveIndividualGoals(system: *PathfindingSystem, requester: EntityId, goals: []const math.Vec2, agent_count: usize) !PathfindingStats {
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    for (goals) |goal| try appendIndividual(&stream, requester, goal);
+    return system.updateSerial(&stream, agent_count, .{});
+}
+
+/// The stored cells of `goal`'s cached plain path, copied out.
+pub fn cachedPathCells(system: *const PathfindingSystem, goal: math.Vec2) !std.ArrayList(u32) {
+    const key = system.graph.keyForWorld(0, goal, .default).?;
+    const slot = system.completed.slotIndex(key) orelse return error.TestExpectedCachedPath;
+    var cells: std.ArrayList(u32) = .empty;
+    errdefer cells.deinit(std.testing.allocator);
+    try cells.appendSlice(std.testing.allocator, system.completed.pathSlice(slot, system.completed.resultAt(slot).path_len));
+    return cells;
+}
+
+/// A world `side` tiles a side in 4-tile chunks, open grass, with an obstacle layer to flip.
+pub const RegistryWorld = struct {
+    world: WorldSystem,
+    obstacle: usize,
+    grass: TileId,
+    tree: TileId,
+};
+
+pub fn registryWorld(meta: *const WorldTilesetMeta, side: u16) !RegistryWorld {
+    const grass = try requireTestTile(meta, "grass");
+    const tree = try requireTestTile(meta, "tree_0");
+    var world = try abstractTestWorld(meta, @as(f32, @floatFromInt(side)) * 32, @as(f32, @floatFromInt(side)) * 32);
+    errdefer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+    return .{ .world = world, .obstacle = obstacle, .grass = grass, .tree = tree };
+}
+
+/// A system over `world` at the abstract capacity (4-tile chunks, a two-step shrink
+/// window), grown to `agent_count` agents.
+pub fn registrySystem(data: *const DataSystem, world: *const WorldSystem, agent_count: usize) !PathfindingSystem {
+    return registrySystemWith(data, world, agent_count, .{});
+}
+
+const RegistrySystemOptions = struct {
+    // Inline stripe cells; a path past it is stored in a long block.
+    stored_path_cells: ?usize = null,
+    participants: usize = 1,
+};
+
+pub fn registrySystemWith(data: *const DataSystem, world: *const WorldSystem, agent_count: usize, options: RegistrySystemOptions) !PathfindingSystem {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    errdefer system.deinit();
+    var capacity = abstractCapacity();
+    capacity.capacity_shrink_window = 2;
+    capacity.worker_participant_count = options.participants;
+    if (options.stored_path_cells) |cells| capacity.max_stored_path_cells = cells;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(data, world, null);
+    try system.growForAgentCount(agent_count);
+    return system;
+}
+
+/// Route `index` across a registry world `side` tiles a side: distinct goals, each start
+/// mirrored through the center, so routes cross many chunks.
+pub fn registryRoute(index: usize, side: u16) [2]math.Vec2 {
+    const span: usize = side - 4;
+    const goal_x: u16 = @intCast(2 + index % span);
+    const goal_y: u16 = @intCast(2 + (index / span * 3 + index % 3) % span);
+    var start_x = side - 1 - goal_x;
+    const start_y = side - 1 - goal_y;
+    // The test world's two blocking decorations are no start.
+    if ((start_x == side / 4 and start_y == side / 3) or (start_x == side * 3 / 4 and start_y == side * 2 / 3)) start_x += 1;
+    return .{ tileCenter(start_x, start_y), tileCenter(goal_x, goal_y) };
+}
+
+pub fn registryRouteKey(system: *const PathfindingSystem, index: usize, side: u16) PathQueryKey {
+    return system.graph.keyForWorld(0, registryRoute(index, side)[1], .default).?;
+}
+
+/// Requests routes [first, first + count) and updates (on `threads` when given) until
+/// nothing is pending.
+pub fn solveRegistryRoutes(system: *PathfindingSystem, requester: EntityId, side: u16, first: usize, count: usize, agent_count: usize, threads: ?*ThreadSystem, config: PathfindingConfig) !void {
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    for (first..first + count) |index| {
+        const route = registryRoute(index, side);
+        try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
+    }
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    var requests = &stream;
+    for (0..16) |_| {
+        if (threads) |thread_system| {
+            _ = try system.update(requests, agent_count, thread_system, config);
+        } else {
+            _ = try system.updateSerial(requests, agent_count, config);
+        }
+        requests = &empty;
+        if (system.pending.len == 0) return;
+    }
+    return error.TestRoutesStalled;
+}
+
+// A cached path's stored cells: its cells, and its levels (null: all on `level`).
+const StoredPath = struct {
+    cells: []const u32,
+    levels: ?[]const u16,
+    level: u16,
+
+    pub fn levelAt(self: StoredPath, index: usize) u16 {
+        return if (self.levels) |column| column[index] else self.level;
+    }
+};
+
+pub fn storedPath(system: *const PathfindingSystem, owner: u32) StoredPath {
+    const payload = system.completed.core.records.items[owner].extra;
+    const words = system.completed.storedWords(owner);
+    if (payload.stitched_len != 0) {
+        const view = types.stitchedView(words, payload.stitched_len);
+        return .{ .cells = view.cells, .levels = view.levels, .level = 0 };
+    }
+    return .{ .cells = words[0..payload.path_len], .levels = null, .level = payload.path_level };
+}
+
+const Registration = struct {
+    key: u64,
+    owner: u32,
+    start: u32,
+
+    fn lessThan(_: void, a: Registration, b: Registration) bool {
+        if (a.key != b.key) return a.key < b.key;
+        if (a.owner != b.owner) return a.owner < b.owner;
+        return a.start < b.start;
+    }
+};
+
+/// The registry holds exactly the runs of every live cached path, each in its key's shard,
+/// with every key's count its list's length and every owner chain naming its own live
+/// owner; the owner log is empty.
+pub fn expectRegistryMatchesCache(system: *const PathfindingSystem) !void {
+    try std.testing.expectEqual(@as(usize, 0), system.completed.core.ownerLog().len);
+    const allocator = std.testing.allocator;
+    var expected: std.ArrayList(Registration) = .empty;
+    defer expected.deinit(allocator);
+    var actual: std.ArrayList(Registration) = .empty;
+    defer actual.deinit(allocator);
+    const geometry = system.graph.chunkGeometry();
+    for (system.completed.core.records.items, 0..) |record, owner_index| {
+        if (!record.live) continue;
+        const owner: u32 = @intCast(owner_index);
+        const path = storedPath(system, owner);
+        const starts = try allocator.alloc(u16, @max(path.cells.len, 1));
+        defer allocator.free(starts);
+        var counts: [registry_shard_count]u32 = @splat(0);
+        const run_count = solve.splitRuns(geometry, path.cells, path.levels, path.level, starts, &counts);
+        for (starts[0..run_count]) |start| try expected.append(allocator, .{ .key = chunkKey(path.levelAt(start), geometry.chunkOfCell(path.cells[start])), .owner = owner, .start = start });
+    }
+    for (&system.path_index, 0..) |*shard, shard_index| {
+        for (shard.slot_keys, 0..) |key, slot| {
+            if (key == std.math.maxInt(u64)) continue;
+            try std.testing.expectEqual(shard_index, registryShard(key));
+            var length: u32 = 0;
+            var entry = shard.slot_heads[slot];
+            while (entry != no_entry) : (entry = shard.entry_next[entry]) {
+                length += 1;
+                try actual.append(allocator, .{ .key = key, .owner = shard.entry_owner[entry], .start = shard.entry_order[entry] });
+            }
+            try std.testing.expect(length != 0);
+            try std.testing.expectEqual(length, shard.slot_counts[slot]);
+        }
+        try std.testing.expect(shard.owner_heads.items.len >= system.completed.logicalCapacity());
+        for (shard.owner_heads.items, 0..) |owner_head, owner| {
+            var entry = owner_head;
+            while (entry != no_entry) : (entry = shard.entry_owner_next[entry]) {
+                try std.testing.expectEqual(@as(u32, @intCast(owner)), shard.entry_owner[entry]);
+                try std.testing.expect(system.completed.core.records.items[owner].live);
+            }
+        }
+    }
+    std.mem.sort(Registration, expected.items, {}, Registration.lessThan);
+    std.mem.sort(Registration, actual.items, {}, Registration.lessThan);
+    try std.testing.expectEqualSlices(Registration, expected.items, actual.items);
+}
+
+/// Two systems' registries hold the same keys in the same slots and the same lists in the
+/// same order.
+pub fn expectSameRegistry(a: *const PathfindingSystem, b: *const PathfindingSystem) !void {
+    for (&a.path_index, &b.path_index) |*shard_a, *shard_b| {
+        try std.testing.expectEqualSlices(u64, shard_a.slot_keys, shard_b.slot_keys);
+        for (shard_a.slot_keys, 0..) |key, slot| {
+            if (key == std.math.maxInt(u64)) continue;
+            var entry_a = shard_a.slot_heads[slot];
+            var entry_b = shard_b.slot_heads[slot];
+            while (entry_a != no_entry or entry_b != no_entry) {
+                try std.testing.expect(entry_a != no_entry and entry_b != no_entry);
+                try std.testing.expectEqual(shard_a.entry_owner[entry_a], shard_b.entry_owner[entry_b]);
+                try std.testing.expectEqual(shard_a.entry_order[entry_a], shard_b.entry_order[entry_b]);
+                entry_a = shard_a.entry_next[entry_a];
+                entry_b = shard_b.entry_next[entry_b];
+            }
+        }
+    }
+}
+
+/// Two systems' caches hold the same entries under the same owner ids and probe slots,
+/// with the same stored cells.
+pub fn expectSameCache(a: *const PathfindingSystem, b: *const PathfindingSystem) !void {
+    try std.testing.expectEqual(a.completed.count(), b.completed.count());
+    try std.testing.expectEqual(a.completed.logicalCapacity(), b.completed.logicalCapacity());
+    for (a.completed.core.slots.items, b.completed.core.slots.items) |slot_a, slot_b| {
+        try std.testing.expectEqual(slot_a.occupied, slot_b.occupied);
+        if (slot_a.occupied) try std.testing.expectEqual(slot_a.payload_index, slot_b.payload_index);
+    }
+    for (a.completed.core.records.items, b.completed.core.records.items, 0..) |record_a, record_b, owner| {
+        try std.testing.expectEqual(record_a.live, record_b.live);
+        if (!record_a.live) continue;
+        try std.testing.expect(std.meta.eql(a.completed.core.keyOf(@intCast(owner)), b.completed.core.keyOf(@intCast(owner))));
+        try std.testing.expectEqual(record_a.stamp, record_b.stamp);
+        try std.testing.expectEqualDeep(record_a.extra, record_b.extra);
+        const words = types.storedPathWords(record_a.extra.path_len, record_a.extra.stitched_len);
+        try std.testing.expectEqualSlices(u32, a.completed.storedWords(owner)[0..words], b.completed.storedWords(owner)[0..words]);
+    }
+}
+
+/// Sets each (x, y) of `cells` on the obstacle layer to `tile` and records it for nav.
+pub fn setRegistryCells(system: *PathfindingSystem, fixture: *RegistryWorld, cells: []const [2]u16, tile: TileId) !void {
+    for (cells) |cell| {
+        const changed = (try fixture.world.setDenseTile(fixture.obstacle, cell[0], cell[1], tile)) orelse continue;
+        try recordTileChange(system, &fixture.world, changed);
+    }
+}
+
+/// Points every allocator `system` uses (its own, its graph's, and each registry shard's) at
+/// `allocator`.
+pub fn setSystemAllocators(system: *PathfindingSystem, allocator: std.mem.Allocator) void {
+    system.allocator = allocator;
+    system.graph.allocator = allocator;
+    for (&system.path_index) |*shard| shard.allocator = allocator;
+}
+
+/// A fixed-range threaded control: one item per range, so every stage with two or more items
+/// runs on workers.
+pub const fixed_threads_config = PathfindingConfig{ .adaptive = false, .items_per_range = 1 };
+
+/// Work units of a registry flush over `ops` logged ops and `adds` pending registrations:
+/// every pair weighs the whole log, its adds, and one.
+pub fn flushUnits(ops: usize, adds: usize) usize {
+    return registry_shard_count * (ops + 1) + adds;
+}
+
+/// Two registry systems filled alike with long and inline results, for a shrink to the
+/// floor's 32 entries.
+pub fn shrinkFixture(data: *const DataSystem, fixture: *const RegistryWorld, requester: EntityId, participants: usize) !PathfindingSystem {
+    var system = try registrySystemWith(data, &fixture.world, 16, .{ .stored_path_cells = 8, .participants = participants });
+    errdefer system.deinit();
+    for (0..4) |batch| try solveRegistryRoutes(&system, requester, 24, batch * 16, 16, 16, null, .{});
+    try std.testing.expectEqual(@as(usize, 64), system.completed.count());
+    return system;
+}

@@ -42,5 +42,6 @@ test {
     _ = @import("pathfinding/goal_table.zig");
     _ = @import("pathfinding/solve.zig");
     _ = @import("pathfinding/system.zig");
+    _ = @import("pathfinding/publish.zig");
     _ = @import("pathfinding/test_support.zig");
 }
