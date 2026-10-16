@@ -59,7 +59,8 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
       local fixes land here, and structural findings become items here.
 - [ ] The whole subsystem checked against the cost model and the rules
       (owner 2026-10-16), not only the items above: `src/game/render_prep.zig`
-      and the GPU tile sync (`src/game/world/gpu_tiles.zig`). Each finding
+      the GPU tile sync (`src/game/world/gpu_tiles.zig`), `world/render.zig`,
+      `render_depth.zig`, and the `data_system/visual.zig` store. Each finding
       becomes an item here.
 - [ ] Tests: collect output matches today's for in-view rows (order
       included); allocation-free warmed collect.

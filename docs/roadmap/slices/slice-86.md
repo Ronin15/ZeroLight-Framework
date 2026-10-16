@@ -108,8 +108,11 @@ order stay deterministic for the order-sensitive consumers.
       unchanged.
 - [ ] A SIMD verdict at `gatherRange` (`collision_response.zig:436`).
 - [ ] The rest of the subsystem checked against the cost model and the rules:
-      narrowphase, response, contact streams, level handling, and scope tiers.
-      Each finding becomes an item here.
+      narrowphase, response, contact streams, level handling, and scope tiers,
+      over every file it owns (`systems/collision.zig`,
+      `collision_response.zig`, `static_colliders.zig`, `contact_query.zig`,
+      `destructible_controller.zig`, `data_system/collision.zig`,
+      `data_system/destructible.zig`). Each finding becomes an item here.
 - [ ] Benches at the worst-case shapes (thin, tall, deep, dense), with the
       shape asserts landing with each fix (`.claude/rules/tests-benchmarks.md`).
 - [ ] Tests: identical contacts and order across worker counts; cross-level,

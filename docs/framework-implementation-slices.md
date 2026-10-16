@@ -211,6 +211,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**85**](roadmap/slices/slice-85.md) | Not started | Steering On The Shared Neighbor Index — after 84, 86 |
 | [**86**](roadmap/slices/slice-86.md) | Not started | Collision Subsystem Pass — after 83, 84 |
 | [**87**](roadmap/slices/slice-87.md) | Not started | Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items |
+| [**88**](roadmap/slices/slice-88.md) | Not started | DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 |
 
 **Recently settled (archive only):** 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
@@ -278,8 +279,9 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    [86](roadmap/slices/slice-86.md) collision →
    [85](roadmap/slices/slice-85.md) steering → tile gate
    ([35](roadmap/slices/slice-35.md)'s `world_gate` items) →
-   [87](roadmap/slices/slice-87.md) render prep → inert rows (86's and 75's
-   items) → [75](roadmap/slices/slice-75.md)'s tier mechanics; 87's render
+   [87](roadmap/slices/slice-87.md) render prep →
+   [88](roadmap/slices/slice-88.md) DataSystem, contracts, pipeline, kernels →
+   inert rows (86's and 75's items) → [75](roadmap/slices/slice-75.md)'s tier mechanics; 87's render
    backend pass closes the branch (owner 2026-10-16). Items the 64G combined
    review routed here (`e2b9b2c`):
    - Tile gate on main (area D H1): 35.
@@ -293,6 +295,27 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    - World creation and worldgen: measured; its findings are in 74.
    - Collision, whole subsystem: 86.
    - Render backend pass: 87, last.
+
+   Coverage (owner 2026-10-16: every system gets a whole-subsystem pass
+   against the cost model and the rules, not only its measured findings):
+   - Core branch:
+     - 84: spatial index;
+     - 86: collision, response, static colliders, destructibles;
+     - 85: steering, movement, particles;
+     - 35: tile gate;
+     - 87: render prep, GPU tile sync, world render, and the render backend;
+     - 88: `DataSystem`, step contracts, pipeline, `src/core` kernels;
+     - 75: simulation scope;
+     - 50 (landed): `ThreadSystem`.
+   - World creation (`world/system.zig`, `worldgen.zig`): 74.
+   - Pathfinding branch (sealed, combined-reviewed): `systems/pathfinding/`,
+     `plane_entry`, `chunk_list_map`, `stamped_table`, `world/edit`,
+     `world/terrain`, `dig_controller`.
+   - AI branch: `ai`, `ai_memory`, `affect`, `perception`, `arbitration`,
+     `sensory_bus`, `ai_archetypes`, `ai_debug_overlay`, `world/interest`, and
+     the AI stores.
+   - Item 4: states and menus, `audio_controller`, `player`, `src/app` apart
+     from `ThreadSystem`, `src/assets`, `src/platform`.
 3. **AI:** cognition, perception, memory, affect, sensory bus and interest
    markers, built on the core branch's final form.
 4. **Remaining layers, when normal roadmap flow resumes after the AI branch:**
@@ -385,6 +408,7 @@ order.
 7. **86** Collision Subsystem Pass — after 83, 84 (core-systems branch).
 8. **85** Steering On The Shared Neighbor Index — after 84, 86 (core-systems branch).
 9. **87** Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items (core-systems branch).
+9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 (core-systems branch).
 10. **76** Cave-Ins — after 64G.
 11. **77** Explosions — after 64G, 76.
 12. **49** Session Seed And Determinism Checksum Harness — after 64G.

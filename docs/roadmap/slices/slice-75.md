@@ -125,6 +125,9 @@ Scope comes from one camera and puts far entities to sleep.
       budget.
 - [ ] New persistent scope state classified for 49/64B; included in 46's
       v1.
+- [ ] The whole of `systems/simulation_scope.zig` and `simulation_scope.zig`
+      checked against the cost model and the rules (owner 2026-10-16), not only
+      the items above. Each finding becomes an item here.
 - [ ] Tests: an agent in every band advances (thinks, moves, paths) at its
       cadence; the far signal is deterministic; results are identical across render cadence and worker
       count; serial equals threaded.

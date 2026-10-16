@@ -134,7 +134,11 @@ One world per gameplay state; nothing models a set of worlds.
 - [ ] The commit-seam order moves out of the demo state into the per-world
       step, so every world (and any second gameplay state) runs the same
       order. Failure scenario (derived): a stepper that reorders the seam's
-      calls desyncs the collider or nav sync.
+      calls desyncs the collider or nav sync. The pipeline test fixture
+      `commitAndSyncLikeDemo` (`pipeline_test_support.zig:535-553`) copies
+      the seam step by step, so a reorder of the demo seam leaves every
+      growth, OOM, and nav-seam pipeline test passing on the old order; the
+      fixture calls the moved seam once it exists.
 - [ ] A world's create-time memory follows its content. Failure scenario:
       every small dungeon pays the nav phase's ~12.4 MB floor (measured
       above; cause not identified, so the first step is finding it). Pass:

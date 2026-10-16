@@ -78,6 +78,9 @@ and the `world-gate` bench that measures it.
       non-movement tiers, x-then-y resolve order, and any elevation (38) or
       knockback (68B) reads present then; `FailingAllocator` proof for serial
       and multi-worker steps.
+- [ ] The whole of `systems/world_gate.zig` checked against the cost model and
+      the rules (owner 2026-10-16), not only the items above. Each finding
+      becomes an item here.
 - [ ] Tests: scalar/SIMD and serial/threaded parity per restructured path; a
       `FailingAllocator` proof over a real multi-worker AI + steering step
       with agents at the full neighbor and candidate caps.

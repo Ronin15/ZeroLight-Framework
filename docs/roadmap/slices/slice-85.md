@@ -62,7 +62,9 @@ keeps the apply local.
 - [ ] The whole subsystem checked against the cost model and the rules
       (owner 2026-10-16), not only the items above: every file in
       `src/game/systems/steering/` (selection, directions, avoidance, the
-      movement-intent write). Each finding becomes an item here.
+      movement-intent write), `systems/movement.zig`, `systems/particle.zig`,
+      and the `data_system/movement.zig` and `data_system/agents.zig` stores.
+      Each finding becomes an item here.
 - [ ] Tests: steering output on today's fixtures unchanged, or changed only by
       a stated order; serial == threaded; allocation-free warmed step.
 - [ ] Docs: `docs/architecture.md` steering;
