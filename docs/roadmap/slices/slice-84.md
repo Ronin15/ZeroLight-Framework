@@ -78,6 +78,11 @@ that does not grow with them.
 - [ ] One index per step: `DenseCellLookup` (`:141`) goes, and 85 retires
       steering's second sort onto this index. Slice 72's dense-window open
       site closes with it (72 cross-edit).
+- [ ] The whole subsystem checked against the cost model and the rules
+      (owner 2026-10-16), not only the items above: `spatial_index.zig`,
+      its build and query paths, and the stage contract and dispatch it
+      touches in `simulation_pipeline.zig` (the first core slice to change
+      the pipeline). Each finding becomes an item here.
 - [ ] Tests: per-level queries at shared xy; ally-crowded and level-stacked
       hostiles found; serial == threaded; allocation-free warmed step.
 - [ ] Docs: `docs/architecture.md` spatial index;

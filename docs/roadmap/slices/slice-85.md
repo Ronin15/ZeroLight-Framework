@@ -59,6 +59,10 @@ keeps the apply local.
       come first, `.claude/rules/build-validation.md`). Pass:
       `movement-apply-intents` within spread of `-sorted`, with the ordering
       cost counted in steering.
+- [ ] The whole subsystem checked against the cost model and the rules
+      (owner 2026-10-16), not only the items above: every file in
+      `src/game/systems/steering/` (selection, directions, avoidance, the
+      movement-intent write). Each finding becomes an item here.
 - [ ] Tests: steering output on today's fixtures unchanged, or changed only by
       a stated order; serial == threaded; allocation-free warmed step.
 - [ ] Docs: `docs/architecture.md` steering;
