@@ -110,3 +110,13 @@ instances, dispatches through this pool, so its safety is engine-wide.
       regression beyond run-to-run spread on adjacent commits in ReleaseFast
       (`.claude/rules/tests-benchmarks.md`).
 - [ ] `zig build verify` passes.
+- [ ] Owner hardware runs of the core low-power wait module, outside this
+      host (x86_64 AMD/MWAITX runs here; the other bodies are cross-compiled
+      and covered by the shared contract tests only):
+      (a) Windows machine: `zig build test` and `zig build bench -- --group
+      thread-dispatch`, recording which wait body the runtime check selected
+      (Intel WAITPKG UMWAIT, or the pause fallback without it);
+      (b) Mac machine: the same on macOS, recording the selected body
+      (aarch64 WFE, or the yield fallback if EL0 WFE is unavailable);
+      (c) on each, no hang, no test failure, and `thread-dispatch` at or
+      below the pure-park numbers the landing commit records.
