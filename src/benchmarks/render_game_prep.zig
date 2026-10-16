@@ -5,6 +5,12 @@
 //! Extended game render-prep benchmark (R29/R32): dynamic record collection,
 //! depth-bucket sparse/dynamic emit, sprite-batch snapshot/vertex prep, and
 //! realistic static+dynamic `mergeDrawList` group counts. CPU-only; no SDL_GPU.
+//!
+//! `render-game-prep-offview` times `collectDynamicRecords` alone under the production
+//! camera window: a fixed set of rows inside it and a growing count of rows outside it on
+//! one fixed level. Pass shape: collect time and the record and command capacities flat
+//! in the off-view count. Asserts check only that the collect returns the in-view rows and
+//! active particles.
 
 const std = @import("std");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
@@ -54,6 +60,16 @@ const FixtureConfig = struct {
 };
 
 const default_fixture_config = FixtureConfig{};
+
+pub const offview_group = suite.BenchmarkGroup{
+    .name = "render-game-prep-offview",
+    .item_label = "off-view render rows",
+    .defaultItemCounts = offviewItemCounts,
+    .runCase = runOffviewCase,
+    .write_workload = writeOffviewWorkload,
+    // Collect runs on the main thread: the serial case is its only path.
+    .cases = &suite.serial_cases,
+};
 
 pub const group = suite.BenchmarkGroup{
     .name = "render-game-prep",
@@ -558,7 +574,7 @@ fn initFixture(
 
     const tile_size_px = fixture.tileset_meta.tileSize();
     const entity_layout = entitySpawnLayout(item_count);
-    const sparse_grid_side = ceilSqrt(sparse_tile_count);
+    const sparse_grid_side = suite.ceilSqrt(sparse_tile_count);
     const sparse_world_tiles = @max(@as(u16, @intCast(sparse_grid_side * 2 + 8)), 64);
     const sparse_world_px = @as(f32, @floatFromInt(sparse_world_tiles)) * tile_size_px;
     const world_width_px = @max(sparse_world_px, entity_layout.width);
@@ -693,12 +709,6 @@ fn particleCapacity(item_count: usize) usize {
     return @max(item_count / 8, 64);
 }
 
-fn ceilSqrt(value: usize) usize {
-    var side: usize = 1;
-    while (side * side < value) side += 1;
-    return side;
-}
-
 const EntitySpawnLayout = struct {
     cols: usize,
     stride: f32,
@@ -801,4 +811,161 @@ fn writeRenderGamePrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _:
     });
     const phases = stats.render_game_prep_phases orelse return;
     try writer.print(" phases entity_collect={f} merge={f} snapshot={f} vertex_emit={f}", .{ suite.formatDuration(phases.entity_collect_ns), suite.formatDuration(phases.merge_ns), suite.formatDuration(phases.snapshot_ns), suite.formatDuration(phases.vertex_emit_ns) });
+}
+
+// The off-view group's fixed level side in tiles, in-view rows (a 32 x 32 grid over the
+// camera rect), and particles inside the camera rect.
+const offview_level_side: u16 = 1024;
+const offview_grid_side: usize = 32;
+const offview_visible_rows: usize = offview_grid_side * offview_grid_side;
+const offview_particles: usize = 64;
+const offview_body_size: f32 = 14;
+
+const offview_item_counts = [_]usize{ 4_096, 32_768, 262_144 };
+
+fn offviewItemCounts(_: suite.Profile) []const usize {
+    return &offview_item_counts;
+}
+
+const OffviewFixture = struct {
+    data: DataSystem,
+    particles: ParticleSystem,
+    world: WorldSystem,
+    scene_prep: render_prep.DynamicScenePrep,
+    runtime_assets: RuntimeAssets,
+    player_entity: EntityId = undefined,
+
+    fn deinit(self: *OffviewFixture) void {
+        self.scene_prep.deinit();
+        self.world.deinit();
+        self.particles.deinit();
+        self.data.deinit();
+        self.* = undefined;
+    }
+
+    fn scene(self: *OffviewFixture) render_prep.GameplayScene {
+        return .{
+            .data = &self.data,
+            .world = &self.world,
+            .player_entity = self.player_entity,
+            .player_level = 0,
+            .particles = &self.particles,
+            .overscan_chunks = world_overscan_chunks,
+        };
+    }
+};
+
+fn addOffviewRow(fixture: *OffviewFixture, position: math.Vec2) !EntityId {
+    const entity = try fixture.data.createEntity();
+    try fixture.data.setMovementBody(entity, .{ .position = position, .previous_position = position });
+    try fixture.data.setPrimitiveVisual(entity, .{
+        .size = .{ .x = offview_body_size, .y = offview_body_size },
+        .color = tintFor(entity.index),
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+    try fixture.data.setSimulationMetadata(entity, .{ .chunk = fixture.world.chunkCoordForWorldPos(position.x, position.y) });
+    return entity;
+}
+
+// The empty fixture: one walkable level of `offview_level_side`, no rows yet.
+fn initOffviewFixture(allocator: std.mem.Allocator, io: std.Io) !OffviewFixture {
+    var particles = try ParticleSystem.init(allocator, .{ .capacity = offview_particles });
+    errdefer particles.deinit();
+    const world = try fixtures.buildBandedWorld(allocator, io, offview_level_side, 1, "grass", "grass");
+    return .{
+        .data = DataSystem.init(allocator),
+        .particles = particles,
+        .world = world,
+        .scene_prep = render_prep.DynamicScenePrep.init(allocator),
+        .runtime_assets = RuntimeAssets.init(allocator),
+    };
+}
+
+// Whether `position` lies in the visible chunk region.
+fn inVisibleChunks(world: *const WorldSystem, position: math.Vec2) bool {
+    const region = world.visibleChunkRegion() orelse return false;
+    return region.containsChunk(world.chunkCoordForWorldPos(position.x, position.y));
+}
+
+fn runOffviewCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    std.debug.assert(!case.usesThreadSystem());
+    var fixture = try initOffviewFixture(allocator, io);
+    defer fixture.deinit();
+
+    const world_px = fixture.world.worldWidthPixels();
+    const camera_rect = cameraWorldRect(world_px, world_px);
+    try fixture.world.setVisibleChunksForWorldRect(camera_rect, world_overscan_chunks, 0);
+    const visible = render_prep.VisibleWorldRect.fromCameraRect(camera_rect, world_overscan_chunks, fixture.world.chunk_size_tiles, fixture.world.tile_size);
+
+    // In view: a grid over the camera rect; the first row is the player.
+    const pitch_x = camera_rect.w / @as(f32, @floatFromInt(offview_grid_side));
+    const pitch_y = camera_rect.h / @as(f32, @floatFromInt(offview_grid_side));
+    for (0..offview_visible_rows) |index| {
+        const entity = try addOffviewRow(&fixture, .{
+            .x = camera_rect.x + @as(f32, @floatFromInt(index % offview_grid_side)) * pitch_x,
+            .y = camera_rect.y + @as(f32, @floatFromInt(index / offview_grid_side)) * pitch_y,
+        });
+        if (index == 0) fixture.player_entity = entity;
+    }
+    // Off view: a uniform grid over the level, cells in the visible chunks left out,
+    // widened until it holds `item_count` rows.
+    var side = suite.ceilSqrt(item_count);
+    const offview_cells = while (true) : (side += 1) {
+        const pitch = world_px / @as(f32, @floatFromInt(side));
+        var outside: usize = 0;
+        for (0..side * side) |cell| {
+            const position = math.Vec2{ .x = (@as(f32, @floatFromInt(cell % side)) + 0.5) * pitch, .y = (@as(f32, @floatFromInt(cell / side)) + 0.5) * pitch };
+            if (!inVisibleChunks(&fixture.world, position)) outside += 1;
+        }
+        if (outside >= item_count) break side;
+    };
+    const offview_pitch = world_px / @as(f32, @floatFromInt(offview_cells));
+    var placed: usize = 0;
+    for (0..offview_cells * offview_cells) |cell| {
+        if (placed == item_count) break;
+        const position = math.Vec2{ .x = (@as(f32, @floatFromInt(cell % offview_cells)) + 0.5) * offview_pitch, .y = (@as(f32, @floatFromInt(cell / offview_cells)) + 0.5) * offview_pitch };
+        if (inVisibleChunks(&fixture.world, position)) continue;
+        _ = try addOffviewRow(&fixture, position);
+        placed += 1;
+    }
+    std.debug.assert(placed == item_count);
+    for (0..offview_particles) |index| {
+        const emitted = fixture.particles.emit(.{
+            .position = .{ .x = camera_rect.x + @as(f32, @floatFromInt(index)) * pitch_x * 0.5, .y = camera_rect.y + camera_rect.h * 0.5 },
+            .start_size = 4,
+            .lifetime = 1_000_000,
+        });
+        std.debug.assert(emitted);
+    }
+    try render_prep.ensureScenePrepCapacity(&fixture.scene_prep, fixture.scene());
+    const expected_records = offview_visible_rows + fixture.particles.activeCount();
+
+    for (0..options.warmup_iterations) |_| try collectOffview(&fixture, visible, expected_records);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    for (0..options.iterations) |_| {
+        const start_ns = suite.nowNs(io);
+        try collectOffview(&fixture, visible, expected_records);
+        const end_ns = suite.nowNs(io);
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), .{});
+    }
+    var stats = accumulator.finish();
+    stats.output_count = fixture.scene_prep.orderedRecords().len;
+    stats.sample_count = offview_visible_rows;
+    stats.render_capacities = .{
+        .record_capacity = render_prep.dynamicRecordCapacity(fixture.scene()),
+        .command_capacity = render_prep.spriteCommandCapacity(fixture.scene()),
+    };
+    return stats;
+}
+
+fn collectOffview(fixture: *OffviewFixture, visible: render_prep.VisibleWorldRect, expected_records: usize) !void {
+    try render_prep.collectDynamicRecords(&fixture.scene_prep, fixture.scene(), visible, &fixture.runtime_assets, 1.0);
+    std.debug.assert(fixture.scene_prep.orderedRecords().len == expected_records);
+}
+
+fn writeOffviewWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("in_view={} collected={}", .{ stats.sample_count, stats.output_count });
+    if (view == .summary) return;
+    const capacities = stats.render_capacities orelse return;
+    try writer.print(" record_capacity={} command_capacity={}", .{ capacities.record_capacity, capacities.command_capacity });
 }

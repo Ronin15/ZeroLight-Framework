@@ -16,6 +16,9 @@ const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const DiagnosticCount = @import("../app/thread_system.zig").DiagnosticCount;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
+const PerfBatchStage = @import("../app/runtime_perf_log.zig").BatchStage;
+const PerfMetric = @import("../app/runtime_perf_log.zig").Metric;
+const PerfTiming = @import("../app/runtime_perf_log.zig").Timing;
 const NavMainPhases = @import("../game/systems/pathfinding/types.zig").NavMainPhases;
 const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
 
@@ -69,7 +72,12 @@ pub const BenchmarkGroup = struct {
     /// Set only when every fixed-control stage of the group resolves its range from this
     /// one shape. A fixed case that resolves to an earlier case's configuration is then
     /// reported as that case's duplicate and not timed again; null keeps every case timed.
+    /// Requires the default case list.
     fixed_range_shape: ?FixedRangeShape = null,
+    /// The cases the group's workload runs (`casesNamed`), in default-case order and
+    /// holding `serial-direct`; a case the workload has no path for is left out, never
+    /// skipped.
+    cases: []const BenchmarkCase = &default_cases,
 };
 
 /// The partition a group's fixed stages scale their range modes from, and the alignment
@@ -219,6 +227,31 @@ pub const default_cases = [_]BenchmarkCase{
     },
 };
 
+/// The default cases named by `names`, in default-case order; a name that is no default
+/// case fails the build.
+pub fn casesNamed(comptime names: []const []const u8) [names.len]BenchmarkCase {
+    return comptime blk: {
+        var cases: [names.len]BenchmarkCase = undefined;
+        var count: usize = 0;
+        for (default_cases) |case| {
+            for (names) |name| {
+                if (std.mem.eql(u8, name, case.name)) {
+                    cases[count] = case;
+                    count += 1;
+                }
+            }
+        }
+        if (count != names.len) @compileError("a case name names no default case, or repeats");
+        break :blk cases;
+    };
+}
+
+/// The serial case alone: a workload with only a main-thread path.
+pub const serial_cases = casesNamed(&.{"serial-direct"});
+/// The serial case and the production tuner's case: a workload whose stages run their own
+/// tuners, with no fixed-control path of its own.
+pub const serial_and_tuned_cases = casesNamed(&.{ "serial-direct", "thread-adaptive-tuned-range" });
+
 pub const RunStatus = enum {
     measured,
     skipped,
@@ -253,6 +286,9 @@ pub const RunStats = struct {
     max_ns: u64 = 0,
     items_per_second: u64 = 0,
     batch: BatchSummary = .{},
+    /// False when a sample spans many stages and `batch` holds none of them: the worker
+    /// and range cells print `-` and the summary names no worker use.
+    batch_carried: bool = true,
     secondary_batch: ?BatchSummary = null,
     // Nav groups: the mark stage (null when the workload marks no events) and the key plan.
     nav_mark_batch: ?BatchSummary = null,
@@ -276,6 +312,13 @@ pub const RunStats = struct {
     render_game_prep_static_groups: usize = 0,
     render_game_prep_merged_tilemap_groups: usize = 0,
     ai_behavior_histogram: ?AiBehaviorHistogramSummary = null,
+    /// Mean main-thread time per iteration: wall time minus the dispatch time of the
+    /// stages that ran on workers.
+    main_ns: ?u64 = null,
+    collision_phases: ?CollisionPhaseSummary = null,
+    render_capacities: ?RenderCapacitySummary = null,
+    production_step: ?ProductionStepSummary = null,
+    world_create: ?WorldCreateSummary = null,
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -463,6 +506,53 @@ pub const AiBehaviorHistogramSummary = struct {
     flee: usize = 0,
     investigate: usize = 0,
     cohere: usize = 0,
+};
+
+/// Mean per-iteration time of collision's main-thread gather and sort, ahead of the
+/// broadphase batch.
+pub const CollisionPhaseSummary = struct {
+    gather_ns: u64 = 0,
+    sort_ns: u64 = 0,
+};
+
+/// Render-prep capacities after a collect: the dynamic record reserve and the sprite
+/// command reserve the scene asks for.
+pub const RenderCapacitySummary = struct {
+    record_capacity: usize = 0,
+    command_capacity: usize = 0,
+};
+
+/// One production fixed step's census, means per measured step. `main_ns` is the step's
+/// wall time minus the off-main time of every perf-log batch stage that ran on workers: an
+/// upper bound, since batches the log does not carry count as main. `untimed_ns` is the
+/// wall time no top-level stage timer holds. Stage wall times are every perf-log timer the
+/// step records, nested ones included; batch off-main time counts a step only when every
+/// call of the stage that step ran on workers. `shared_tuner` is the thread system's
+/// shared tuner after the run.
+pub const ProductionStepSummary = struct {
+    population: usize = 0,
+    measured_steps: usize = 0,
+    main_ns: u64 = 0,
+    untimed_ns: u64 = 0,
+    stage_wall_ns: std.enums.EnumArray(PerfTiming, u64) = .initFill(0),
+    batch_off_main_ns: std.enums.EnumArray(PerfBatchStage, u64) = .initFill(0),
+    batch_threaded_steps: std.enums.EnumArray(PerfBatchStage, usize) = .initFill(0),
+    batch_recorded_steps: std.enums.EnumArray(PerfBatchStage, usize) = .initFill(0),
+    metrics: std.enums.EnumArray(PerfMetric, u64) = .initFill(0),
+    shared_tuner: AdaptiveWorkReport = .{},
+};
+
+/// One world's create and destroy: each phase's mean time, the live bytes after each
+/// create phase, and the live bytes left after destroy (from one counted pass).
+pub const WorldCreateSummary = struct {
+    surface_ns: u64 = 0,
+    stack_ns: u64 = 0,
+    nav_ns: u64 = 0,
+    destroy_ns: u64 = 0,
+    surface_bytes: usize = 0,
+    stack_bytes: usize = 0,
+    nav_bytes: usize = 0,
+    destroyed_bytes: usize = 0,
 };
 
 pub const WorkTuningSummary = struct {
@@ -696,7 +786,8 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
             var results: [default_cases.len]CaseResult = undefined;
             var result_count: usize = 0;
 
-            for (default_cases, 0..) |case, case_index| {
+            std.debug.assert(group.fixed_range_shape == null or group.cases.len == default_cases.len);
+            for (group.cases, 0..) |case, case_index| {
                 if (options.case_filter) |filter| {
                     if (!std.mem.eql(u8, filter, case.name) and !shouldIncludeBaselineForFilter(filter, case)) continue;
                 }
@@ -921,16 +1012,17 @@ fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
         var worker_ranges_buffer: [24]u8 = undefined;
         var items_per_range_buffer: [24]u8 = undefined;
         var tuning_buffer: [96]u8 = undefined;
-        var workload_buffer: [4096]u8 = undefined;
+        var workload_buffer: [8192]u8 = undefined;
 
         const batch = result.stats.batch;
+        const carried = result.stats.batch_carried;
         printCell(result.case.name, 30);
         printCell(formatDurationInto(&min_buffer, result.stats.min_ns), 11);
         printCell(formatDurationInto(&max_buffer, result.stats.max_ns), 11);
-        printCell(formatRangeCellInto(&main_ranges_buffer, batch, batch.main_thread_ranges), 12);
-        printCell(formatRangeCellInto(&worker_ranges_buffer, batch, batch.worker_thread_ranges), 14);
-        printCell(formatDurationInto(&wait_buffer, batch.main_thread_wait_ns), 11);
-        printCell(formatRangeCellInto(&items_per_range_buffer, batch, batch.items_per_range), 16);
+        printCell(if (carried) formatRangeCellInto(&main_ranges_buffer, batch, batch.main_thread_ranges) else "-", 12);
+        printCell(if (carried) formatRangeCellInto(&worker_ranges_buffer, batch, batch.worker_thread_ranges) else "-", 14);
+        printCell(if (carried) formatDurationInto(&wait_buffer, batch.main_thread_wait_ns) else "-", 11);
+        printCell(if (carried) formatRangeCellInto(&items_per_range_buffer, batch, batch.items_per_range) else "-", 16);
         printCell(formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning), 72);
         const workload = formatWorkloadInto(&workload_buffer, group, result.stats, .details);
         std.debug.print("{s}\n", .{if (workload.len == 0) "-" else workload});
@@ -984,16 +1076,14 @@ fn printValidationSummary(
                 std.debug.print("adaptive phase={s} threaded_profile=none. ", .{@tagName(summary.phase)});
             }
         }
-        if (adaptive_result.stats.batch.active_worker_threads == 0) {
-            std.debug.print(
-                "adaptive stayed inline with {}/{} worker_threads. ",
-                .{ adaptive_result.stats.batch.active_worker_threads, adaptive_result.stats.batch.available_worker_threads },
-            );
-        } else {
-            std.debug.print(
-                "adaptive used {}/{} worker_threads. ",
-                .{ adaptive_result.stats.batch.active_worker_threads, adaptive_result.stats.batch.available_worker_threads },
-            );
+        // A sample that carries no batch has no one stage to name worker use from.
+        if (adaptive_result.stats.batch_carried) {
+            const batch = adaptive_result.stats.batch;
+            if (batch.active_worker_threads == 0) {
+                std.debug.print("adaptive stayed inline with {}/{} worker_threads. ", .{ batch.active_worker_threads, batch.available_worker_threads });
+            } else {
+                std.debug.print("adaptive used {}/{} worker_threads. ", .{ batch.active_worker_threads, batch.available_worker_threads });
+            }
         }
     } else {
         std.debug.print("adaptive flow not selected in this run. ", .{});
@@ -1113,6 +1203,7 @@ fn formatThroughputInto(buffer: []u8, items_per_second: u64) []const u8 {
 }
 
 fn formatWorkerThreadsInto(buffer: []u8, stats: RunStats) []const u8 {
+    if (!stats.batch_carried) return "-";
     return std.mem.print(buffer, "{}/{}", .{ stats.batch.active_worker_threads, stats.batch.available_worker_threads }) catch "workers";
 }
 
@@ -1421,6 +1512,12 @@ pub const Duration = struct {
     }
 };
 
+/// The smallest grid side, at least 1, whose square holds `count` cells.
+pub fn ceilSqrt(count: usize) usize {
+    const floor_side: usize = std.math.sqrt(count);
+    return @max(if (floor_side * floor_side < count) floor_side + 1 else floor_side, 1);
+}
+
 /// Items per second over one mean duration, for a group whose throughput numerator is not
 /// its item count (items serviced, cells written, an item code).
 pub fn itemsPerSecond(items: usize, mean_ns: u64) u64 {
@@ -1556,6 +1653,21 @@ test "default benchmark cases cover required thread modes" {
     try std.testing.expectEqualStrings("thread-large-range", default_cases[5].name);
     try std.testing.expectEqualStrings("thread-adaptive-fixed-range", default_cases[6].name);
     try std.testing.expectEqualStrings("thread-adaptive-tuned-range", default_cases[7].name);
+}
+
+test "a group's named cases keep default-case order, and the default list is every case" {
+    const named = casesNamed(&.{ "thread-adaptive-tuned-range", "serial-direct" });
+    try std.testing.expectEqual(@as(usize, 2), named.len);
+    try std.testing.expectEqualStrings("serial-direct", named[0].name);
+    try std.testing.expectEqualStrings("thread-adaptive-tuned-range", named[1].name);
+    try std.testing.expect(named[1].adaptive);
+    const group = BenchmarkGroup{ .name = "test", .item_label = "items", .defaultItemCounts = testItemCounts, .runCase = testRunCase, .write_workload = writeNoWorkload };
+    try std.testing.expectEqual(default_cases.len, group.cases.len);
+}
+
+test "a grid side covers its count with the fewest cells" {
+    const cases = [_][2]usize{ .{ 0, 1 }, .{ 1, 1 }, .{ 2, 2 }, .{ 4, 2 }, .{ 5, 3 }, .{ 16_384, 128 }, .{ 16_385, 129 } };
+    for (cases) |case| try std.testing.expectEqual(case[1], ceilSqrt(case[0]));
 }
 
 test "benchmark options parse scaling and filtering arguments" {
@@ -1824,6 +1936,7 @@ test "benchmark table formatters keep compact text" {
 
     try std.testing.expectEqualStrings("1.23M/s", formatThroughputInto(&throughput_buffer, 1_234_567));
     try std.testing.expectEqualStrings("3.25x", formatSpeedupInto(&speedup_buffer, 325));
+    try std.testing.expectEqualStrings("-", formatWorkerThreadsInto(&worker_buffer, .{ .batch_carried = false }));
     try std.testing.expectEqualStrings("4/10", formatWorkerThreadsInto(&worker_buffer, .{
         .batch = .{
             .active_worker_threads = 4,

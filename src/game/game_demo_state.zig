@@ -339,9 +339,10 @@ pub const GameDemoState = struct {
         return state;
     }
 
-    /// Resolves the dig controller's tile config (the walkable ramp and tunnel
-    /// tiles) from the runtime tileset metadata.
-    fn initWithWorld(
+    /// Builds the state on `world_value`, which it owns from the call on: it is freed on
+    /// failure too, so the caller keeps no cleanup for it. `dig_config` is the dig
+    /// controller's tile config, resolved by the caller; `mover_count` demo movers spawn.
+    pub fn initWithWorld(
         allocator: std.mem.Allocator,
         viewport_width: f32,
         viewport_height: f32,

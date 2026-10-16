@@ -69,7 +69,10 @@ paths:
   (pure `@sizeOf`-based bounds beside each structure); never copy them. A
   memory estimate is checked whole against live bytes.
 - Each group's doc states what it measures and its pass shape, and its
-  asserts check that shape. A config the bench cannot run fails, never skips.
+  asserts check that shape. Exception: a branch's measuring landing states
+  each finding's pass shape in the group doc and asserts only fixture
+  invariants; the shape assert lands with the fix. A config the bench cannot
+  run fails, never skips.
   A variant, column, or assert that measures a removed design goes with it.
 - Shared harness pieces live once (`suite.zig`: item codes, labels, stage
   shapes, reporting; `fixtures.zig`: worlds, bodies, threads, tuners;

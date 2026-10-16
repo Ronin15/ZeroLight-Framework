@@ -168,6 +168,7 @@ pub const long_path_group = suite.BenchmarkGroup{
     .defaultItemCounts = longPathItemCounts,
     .runCase = runLongPathCase,
     .write_workload = writeLongPathWorkload,
+    .cases = &suite.serial_cases,
 };
 
 // A 512² world of 8 walkable levels holding random pads: bidirectional teleports from level 0
@@ -1366,7 +1367,7 @@ fn printLongPathAttempt(label: []const u8, attempt: LongPathAttempt, mean_ns: u6
 }
 
 fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    if (case.usesThreadSystem()) return suite.RunStats.skipped("each step solves one request: a one-item solve batch");
+    std.debug.assert(!case.usesThreadSystem());
     const config = try LongPathConfig.decode(item_count);
     const levels = config.levels();
     const agent_count = config.agents();

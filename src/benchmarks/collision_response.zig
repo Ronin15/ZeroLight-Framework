@@ -22,6 +22,7 @@ pub const solid_group = suite.BenchmarkGroup{
     .defaultItemCounts = defaultItemCounts,
     .runCase = runSolidCase,
     .write_workload = writeResponseWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const bounce_group = suite.BenchmarkGroup{
@@ -30,6 +31,7 @@ pub const bounce_group = suite.BenchmarkGroup{
     .defaultItemCounts = defaultItemCounts,
     .runCase = runBounceCase,
     .write_workload = writeResponseWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const trigger_group = suite.BenchmarkGroup{
@@ -38,6 +40,7 @@ pub const trigger_group = suite.BenchmarkGroup{
     .defaultItemCounts = defaultItemCounts,
     .runCase = runTriggerCase,
     .write_workload = writeResponseWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const mixed_group = suite.BenchmarkGroup{
@@ -46,6 +49,7 @@ pub const mixed_group = suite.BenchmarkGroup{
     .defaultItemCounts = defaultItemCounts,
     .runCase = runMixedCase,
     .write_workload = writeResponseWorkload,
+    .cases = &suite.serial_cases,
 };
 
 const FixtureMode = enum {
@@ -87,7 +91,7 @@ fn runMixedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 }
 
 fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, mode: FixtureMode) !suite.RunStats {
-    if (case.usesThreadSystem()) return suite.RunStats.skipped("threaded response is benched by collision-response-stage");
+    std.debug.assert(!case.usesThreadSystem());
 
     var fixture = try createFixture(allocator, item_count, mode);
     defer fixture.deinit();

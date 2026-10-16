@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const SpatialIndexStats = @import("../game/systems/spatial_index.zig").SpatialIndexStats;
@@ -93,14 +94,18 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = SpatialIndexStats{};
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         last_stats = try runOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.batch);
+        const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
+        accumulator.record(elapsed_ns, last_stats.batch);
+        main_total += elapsed_ns -| offMainNs(last_stats.batch);
     }
 
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.output_count = last_stats.entity_count;
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(system.build_tuner.report(), settled_before_measurement);
@@ -122,6 +127,8 @@ fn runOnce(system: *SpatialIndexSystem, fixture: *Fixture, thread_system: ?*Thre
     });
 }
 
-fn writeIndexWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+fn writeIndexWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("entities={}", .{stats.output_count});
+    if (view == .summary) return;
+    if (stats.main_ns) |main_ns| try suite.writeShare(writer, "main", main_ns, stats.mean_ns);
 }

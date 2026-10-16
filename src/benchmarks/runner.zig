@@ -20,6 +20,7 @@ const pathfinding_requests = @import("pathfinding/requests.zig");
 const pathfinding_routes = @import("pathfinding/routes.zig");
 const perception = @import("perception.zig");
 const plane_traversal = @import("plane_traversal.zig");
+const production_step = @import("production_step.zig");
 const render_prep = @import("render_prep.zig");
 const render_game_prep = @import("render_game_prep.zig");
 const scope = @import("scope.zig");
@@ -28,6 +29,8 @@ const spatial_index = @import("spatial_index.zig");
 const steering = @import("steering.zig");
 const suite = @import("suite.zig");
 const thread_dispatch = @import("thread_dispatch.zig");
+const world_create = @import("world_create.zig");
+const world_gate = @import("world_gate.zig");
 
 pub const std_options = logging.std_options;
 
@@ -41,6 +44,8 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     affect.group,
     collision.group,
     collision.sparse_group,
+    collision.tall_group,
+    collision.stacked_group,
     collision_response.solid_group,
     collision_response.bounce_group,
     collision_response.trigger_group,
@@ -97,6 +102,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     render_game_prep.group,
     render_game_prep.dense_surface_group,
     render_game_prep.dense_deep_group,
+    render_game_prep.offview_group,
     sparse_window.frame_group,
     sparse_window.pan_group,
     sparse_window.add_group,
@@ -109,6 +115,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     perception.group,
     perception.los_dense_group,
     perception.scattered_dense_index_group,
+    perception.crowd_group,
     steering.group,
     steering.shuffled_group,
     steering.corridor_group,
@@ -116,6 +123,9 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     steering.static_change_group,
     steering.static_dense_group,
     thread_dispatch.group,
+    world_gate.group,
+    world_create.group,
+    production_step.group,
 };
 
 pub fn main(init: std.process.Init) !void {

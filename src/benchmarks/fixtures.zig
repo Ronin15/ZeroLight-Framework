@@ -9,6 +9,7 @@
 const std = @import("std");
 const math = @import("../core/math.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
@@ -29,10 +30,15 @@ const suite = @import("suite.zig");
 /// The case's thread system, or null for the serial case.
 pub fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !?ThreadSystem {
     if (!case.usesThreadSystem()) return null;
-    return try ThreadSystem.init(allocator, io, .{
-        .max_worker_threads = case.maxWorkerThreads(),
-        .items_per_range = suite.default_items_per_range,
-    });
+    return try initRequiredCaseThreads(allocator, io, case);
+}
+
+/// The case's thread system for a stage that requires one: the engine's default config at
+/// the case's worker count, with no workers for the serial case.
+pub fn initRequiredCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !ThreadSystem {
+    var config = ThreadSystemConfig{};
+    config.max_worker_threads = case.maxWorkerThreads();
+    return ThreadSystem.init(allocator, io, config);
 }
 
 /// Threaded participant slots of `thread_system` (workers + main), or 1 without one.

@@ -70,6 +70,7 @@ pub const frame_group = suite.BenchmarkGroup{
     .defaultItemCounts = sparseTileCounts,
     .runCase = runFrameCase,
     .write_workload = writeSparseWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const pan_group = suite.BenchmarkGroup{
@@ -78,6 +79,7 @@ pub const pan_group = suite.BenchmarkGroup{
     .defaultItemCounts = sparseTileCounts,
     .runCase = runPanCase,
     .write_workload = writeSparseWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const add_group = suite.BenchmarkGroup{
@@ -86,6 +88,7 @@ pub const add_group = suite.BenchmarkGroup{
     .defaultItemCounts = sparseTileCounts,
     .runCase = runAddCase,
     .write_workload = writeSparseWorkload,
+    .cases = &suite.serial_cases,
 };
 
 fn sparseTileCounts(_: suite.Profile) []const usize {
@@ -233,7 +236,7 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, spar
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload) !suite.RunStats {
-    if (case.usesThreadSystem()) return suite.RunStats.skipped("sparse window prep runs on the main thread");
+    std.debug.assert(!case.usesThreadSystem());
     var fixture: Fixture = undefined;
     try initFixture(&fixture, allocator, io, item_count);
     defer fixture.deinit();

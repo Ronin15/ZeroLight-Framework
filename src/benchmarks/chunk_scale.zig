@@ -260,6 +260,7 @@ pub const dig_group = suite.BenchmarkGroup{
     .defaultItemCounts = scaleItemCounts,
     .runCase = runDigCase,
     .write_workload = writeCellsWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const ramp_group = suite.BenchmarkGroup{
@@ -268,6 +269,7 @@ pub const ramp_group = suite.BenchmarkGroup{
     .defaultItemCounts = scaleItemCounts,
     .runCase = runRampCase,
     .write_workload = writeCellsWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const cave_in_group = suite.BenchmarkGroup{
@@ -294,6 +296,7 @@ pub const gpu_sync_dig_group = suite.BenchmarkGroup{
     .defaultItemCounts = gpuSyncDigItemCounts,
     .runCase = runGpuSyncDigCase,
     .write_workload = writeUploadsWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const gpu_sync_level_enter_group = suite.BenchmarkGroup{
@@ -302,6 +305,7 @@ pub const gpu_sync_level_enter_group = suite.BenchmarkGroup{
     .defaultItemCounts = levelEnterItemCounts,
     .runCase = runGpuSyncLevelEnterCase,
     .write_workload = writeUploadsWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const gpu_sync_pan_group = suite.BenchmarkGroup{
@@ -310,6 +314,7 @@ pub const gpu_sync_pan_group = suite.BenchmarkGroup{
     .defaultItemCounts = panItemCounts,
     .runCase = runGpuSyncPanCase,
     .write_workload = writeUploadsWorkload,
+    .cases = &suite.serial_cases,
 };
 
 pub const nav_dig_group = suite.BenchmarkGroup{
@@ -736,7 +741,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, shape: CaseShape) !suite.RunStats {
-    if (case.usesThreadSystem()) return suite.RunStats.skipped("single-cell digs, ramps, and GPU syncs run on the main thread");
+    std.debug.assert(!case.usesThreadSystem());
     const resident_layers = shape.resident_layers;
     const window_edge = shape.window_edge;
     const side = shape.side;
@@ -1314,7 +1319,7 @@ fn expectedBatchSyncUploads(edit: *const BatchEdit) usize {
 // untimed), each followed by the timed GPU sync. Every resident layer is flagged.
 fn runGpuSyncBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: GpuSyncDigConfig) !suite.RunStats {
     std.debug.assert(config.variant == .batched);
-    if (case.usesThreadSystem()) return suite.RunStats.skipped("single-cell digs, ramps, and GPU syncs run on the main thread");
+    std.debug.assert(!case.usesThreadSystem());
     std.debug.assert(config.resident_layers + 1 <= config.levels);
     var fixture = try buildFixture(allocator, io, config.side, config.levels);
     defer fixture.deinit();

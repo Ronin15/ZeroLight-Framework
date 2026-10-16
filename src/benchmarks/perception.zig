@@ -23,12 +23,21 @@
 //!   (`createDecorrelatedFixture`), so worker ranges write interleaved
 //!   (same-cache-line) `PerceptionStore` slots; `perception` keeps that index
 //!   near-monotonic in row order and would hide any such contention.
+//! - `perception-crowd`: separated clusters of one observer (default
+//!   `AiPerception`) and one hostile on its level ahead of it. Variant `allies`
+//!   puts the hostile at half the vision range and adds allies inside the range;
+//!   variant `levels` stacks one hostile per level below the observer's at half the
+//!   range and puts the same-level hostile farther out, past the stack. Pass shape:
+//!   every observer finds its hostile in both variants, nothing is sensed across
+//!   levels, and candidate checks per observer stay flat in allies and in levels.
+//!   Asserts check only the observer count.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const Faction = @import("../game/data_system.zig").Faction;
+const AiPerception = @import("../game/data_system.zig").AiPerception;
 const SimulationEvents = @import("../game/simulation.zig").SimulationEvents;
 const spatial_index_mod = @import("../game/systems/spatial_index.zig");
 const SpatialIndexSystem = spatial_index_mod.SpatialIndexSystem;
@@ -65,9 +74,44 @@ pub const scattered_dense_index_group = suite.BenchmarkGroup{
     .write_workload = writePerceptionWorkload,
 };
 
+pub const crowd_group = suite.BenchmarkGroup{
+    .name = "perception-crowd",
+    .item_label = CrowdCode.label,
+    .defaultItemCounts = crowdItemCounts,
+    .runCase = runCrowdCase,
+    .write_workload = writeCrowdWorkload,
+};
+
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
     return suite.eventScaleCounts(profile);
 }
+
+const CrowdVariant = enum(u8) { allies, levels };
+// `axis` is the allies per observer (`allies`) or the level count (`levels`).
+const CrowdCode = suite.ItemCode(struct { variant: CrowdVariant, axis: u32 }, &.{6});
+
+const crowd_item_counts = [_]usize{
+    CrowdCode.of(.{ .variant = .allies, .axis = 16 }),
+    CrowdCode.of(.{ .variant = .allies, .axis = 64 }),
+    CrowdCode.of(.{ .variant = .allies, .axis = 256 }),
+    CrowdCode.of(.{ .variant = .levels, .axis = 2 }),
+    CrowdCode.of(.{ .variant = .levels, .axis = 8 }),
+    CrowdCode.of(.{ .variant = .levels, .axis = 32 }),
+};
+
+fn crowdItemCounts(_: suite.Profile) []const usize {
+    return &crowd_item_counts;
+}
+
+// Observers on a square grid of clusters. The pitch keeps every other cluster's members
+// past the observer's vision range, and the grid inside the spatial index's dense window
+// at the world's chunk geometry.
+const crowd_grid_side: usize = 32;
+const crowd_observers: usize = crowd_grid_side * crowd_grid_side;
+const crowd_cluster_pitch: f32 = 384;
+// Allies fill a square of this half-extent around their observer, inside its range.
+const crowd_ally_half_extent: f32 = 84;
+const crowd_observer_velocity_x: f32 = 10;
 
 // Grid spacing for observer/candidate pairs is tile-aligned (see
 // `createFixture`): each pair's candidate lands in its own distinct tile
@@ -408,4 +452,164 @@ fn runOnce(
 
 fn writePerceptionWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("sensed={} los_checks={} los_blocked={} found={} events={} dropped_events={}", .{ stats.sample_count, stats.candidate_pairs, stats.deferred_count, stats.output_count, stats.fallback_deferred_count, stats.cache_evictions });
+}
+
+const CrowdFixture = struct {
+    data: DataSystem,
+    world: WorldSystem,
+
+    fn deinit(self: *CrowdFixture) void {
+        self.world.deinit();
+        self.data.deinit();
+        self.* = undefined;
+    }
+};
+
+fn createCrowdFixture(allocator: std.mem.Allocator, io: std.Io, variant: CrowdVariant, axis: u32) !CrowdFixture {
+    const vision_range = (AiPerception{}).vision_range;
+    const side_px = @as(f32, @floatFromInt(crowd_grid_side)) * crowd_cluster_pitch;
+    // Every member sits inside its observer's range, and every other cluster's past it.
+    const member_reach = @max(crowd_ally_half_extent * std.math.sqrt2, vision_range * 0.5);
+    std.debug.assert(member_reach < vision_range and crowd_cluster_pitch - member_reach > vision_range);
+    const levels: u16 = switch (variant) {
+        .allies => 1,
+        .levels => @intCast(axis),
+    };
+    var meta = try fixtures.loadTilesetMeta(allocator, io);
+    const tile_size = meta.tileSize();
+    meta.deinit();
+    const side_tiles: u16 = @intFromFloat(@ceil(side_px / tile_size));
+    var world = try fixtures.buildBandedWorld(allocator, io, side_tiles, levels, "grass", "grass");
+    errdefer world.deinit();
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+
+    const ally_side = suite.ceilSqrt(axis);
+    const ally_pitch = 2 * crowd_ally_half_extent / @as(f32, @floatFromInt(ally_side));
+    for (0..crowd_observers) |cluster| {
+        const center_x = (@as(f32, @floatFromInt(cluster % crowd_grid_side)) + 0.5) * crowd_cluster_pitch;
+        const center_y = (@as(f32, @floatFromInt(cluster / crowd_grid_side)) + 0.5) * crowd_cluster_pitch;
+        const observer = try addAgent(&data, center_x, center_y, crowd_observer_velocity_x, 0, .player);
+        try data.setAiPerception(observer, .{});
+        const hostile_x = center_x + vision_range * 0.5;
+        // Past the stacked hostiles, still inside the range.
+        const same_level_hostile_x = center_x + vision_range * 0.75;
+        switch (variant) {
+            .allies => {
+                _ = try addAgent(&data, hostile_x, center_y, 0, 0, .hostile);
+                for (0..axis) |ally| {
+                    _ = try addAgent(
+                        &data,
+                        center_x - crowd_ally_half_extent + (@as(f32, @floatFromInt(ally % ally_side)) + 0.5) * ally_pitch,
+                        center_y - crowd_ally_half_extent + (@as(f32, @floatFromInt(ally / ally_side)) + 0.5) * ally_pitch,
+                        0,
+                        0,
+                        .player,
+                    );
+                }
+            },
+            .levels => {
+                for (1..levels) |level| {
+                    const hostile = try addAgent(&data, hostile_x, center_y, 0, 0, .hostile);
+                    try data.setWorldLevel(hostile, @intCast(level));
+                }
+                _ = try addAgent(&data, same_level_hostile_x, center_y, 0, 0, .hostile);
+            },
+        }
+    }
+    std.debug.assert(data.perceptionSlice().entities.len == crowd_observers);
+    return .{ .data = data, .world = world };
+}
+
+fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const fields = try CrowdCode.decode(item_count);
+    var fixture = try createCrowdFixture(allocator, io, fields.variant, fields.axis);
+    defer fixture.deinit();
+
+    var system = PerceptionSystem.init(allocator);
+    defer system.deinit();
+    if (suite.adaptiveTunerForCase(case, perception_range_alignment_items)) |tuner| {
+        system.compute_tuner = tuner;
+    }
+    var events = SimulationEvents.init(allocator);
+    defer events.deinit();
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+
+    // Positions never change, so the shared index is built once, untimed, at the world's
+    // chunk geometry as the pipeline reserves it.
+    var spatial_sys = SpatialIndexSystem.init(allocator);
+    defer spatial_sys.deinit();
+    const ai_slice = fixture.data.aiAgentSliceConst();
+    try spatial_sys.reserve(ai_slice.entities.len, .{ .chunk_size_tiles = fixture.world.chunk_size_tiles, .tile_size = fixture.world.tile_size });
+    _ = try spatial_sys.buildSerial(ai_slice, fixture.data.movementBodySliceConst(), &fixture.data, .{});
+    const spatial_view = spatial_sys.view();
+    const thread_ptr = if (threads) |*thread_system| thread_system else null;
+
+    for (0..options.warmup_iterations) |_| {
+        _ = try runCrowdOnce(&system, &fixture, spatial_view, &events, thread_ptr, case);
+    }
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while (!system.compute_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runCrowdOnce(&system, &fixture, spatial_view, &events, thread_ptr, case);
+        }
+    }
+    const settled_before_measurement = if (case.adaptive) system.compute_tuner.isSettled() else false;
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var last_stats = PerceptionStats{};
+    for (0..options.iterations) |_| {
+        const start_ns = suite.nowNs(io);
+        last_stats = try runCrowdOnce(&system, &fixture, spatial_view, &events, thread_ptr, case);
+        const end_ns = suite.nowNs(io);
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.batch);
+    }
+    std.debug.assert(last_stats.observer_count == crowd_observers);
+
+    var stats = accumulator.finish();
+    stats.items_per_second = suite.itemsPerSecond(last_stats.observer_count, stats.mean_ns);
+    stats.deferred_count = last_stats.observer_count;
+    stats.output_count = last_stats.nearest_threat_found_count;
+    stats.sample_count = last_stats.sensed_count;
+    stats.candidate_pairs = last_stats.candidate_checks;
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(system.compute_tuner.report(), settled_before_measurement);
+    }
+    return stats;
+}
+
+fn runCrowdOnce(
+    system: *PerceptionSystem,
+    fixture: *CrowdFixture,
+    spatial_view: SpatialIndexView,
+    events: *SimulationEvents,
+    thread_system: ?*ThreadSystem,
+    case: suite.BenchmarkCase,
+) !PerceptionStats {
+    events.clearRetainingCapacity();
+    const ai_slice = fixture.data.aiAgentSliceConst();
+    const movement_slice = fixture.data.movementBodySliceConst();
+    if (!case.usesThreadSystem()) {
+        return try system.updateSerial(ai_slice, movement_slice, spatial_view, &fixture.world, &fixture.data, events, .{});
+    }
+    return try system.update(ai_slice, movement_slice, spatial_view, &fixture.world, &fixture.data, events, thread_system.?, .{
+        .items_per_range = case.stageItemsPerRange(perception_range_alignment_items),
+        .max_worker_threads = case.maxWorkerThreads(),
+        .adaptive = case.adaptive,
+    });
+}
+
+// `deferred_count` holds the observers, `output_count` those that found a threat,
+// `sample_count` the sensed candidates, and `candidate_pairs` the index candidate checks.
+fn writeCrowdWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    const observers = @max(stats.deferred_count, 1);
+    try writer.print("threat_found={}/{} sensed={} checks_per_observer={d:.2}", .{
+        stats.output_count,
+        stats.deferred_count,
+        stats.sample_count,
+        @as(f64, @floatFromInt(stats.candidate_pairs)) / @as(f64, @floatFromInt(observers)),
+    });
 }
