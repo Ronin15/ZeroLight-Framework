@@ -69,6 +69,7 @@ const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
@@ -123,7 +124,6 @@ pub const AffectConfig = struct {
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    adaptive_tuner: ?*AdaptiveWorkTuner = null,
 };
 
 pub const AffectStats = struct {
@@ -233,22 +233,14 @@ pub const AffectSystem = struct {
         const count = self.rows.len;
         if (count == 0) return .{};
 
-        const active_tuner: ?*AdaptiveWorkTuner = config.adaptive_tuner orelse
-            if (config.adaptive and config.items_per_range == null) &self.compute_tuner else null;
-        const selection = thread_system.selectBatchProfile(active_tuner, .{
-            .item_count = count,
+        const compute = Dispatch.init(thread_system, &self.compute_tuner, .{
             .items_per_range = config.items_per_range,
             .max_worker_threads = config.max_worker_threads,
-            .range_alignment_items = affect_range_alignment_items,
             .adaptive = config.adaptive,
         });
+        const selection = compute.select(count, affect_range_alignment_items);
         var job = self.buildJobContext(data, selection.range_count);
-        const batch = thread_system.parallelForWithOptions(count, &job, affectRangeJob, .{
-            .max_worker_threads = selection.worker_threads,
-            .range_alignment_items = affect_range_alignment_items,
-            .adaptive_tuner = selection.active_tuner,
-            .selected_profile = selection.profile,
-        });
+        const batch = compute.run(selection, count, affect_range_alignment_items, &job, affectRangeJob);
 
         const merge = try self.emitCrossingEvents(events, config.max_events_per_step);
         return .{
@@ -1290,6 +1282,38 @@ test "after reserve alone, threaded updates at 64- then 16-item ranges allocate 
         if (step == 0) try testing.expectEqual(row_total, stats.threshold_crossed_count);
     }
     try testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "threaded update records one sample into the compute tuner and none into the shared tuner" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    for (0..64) |_| {
+        _ = try addAgentWithPerceptionMemoryAffect(
+            &data,
+            .{ .active_behavior = .wander },
+            .{ .vision_range = 100, .target_visible = true, .nearest_threat_dist = 5 },
+            .{ .familiarity = 0.3 },
+            .{},
+        );
+    }
+
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var sys = AffectSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stats = try sys.update(data.aiAgentSliceConst(), &data, &events, &threads, .{});
+    try testing.expectEqual(@as(usize, 64), stats.processed_count);
+    try testing.expectEqual(@as(usize, 1), sys.compute_tuner.report().sample_count);
+    try testing.expect(sys.compute_tuner.last_request != null);
+    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "crossings are emitted in (gather row, drive declaration) order, not entity-index order" {

@@ -18,6 +18,7 @@ const sprite_prep_adaptive_tuner_config = AdaptiveWorkTunerConfig{
     .smallest_range_items = 16,
 };
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../app/thread_system.zig").Dispatch;
 const Camera2D = @import("camera.zig").Camera2D;
 const config = @import("../config.zig");
 const logging = @import("../core/logging.zig");
@@ -233,7 +234,6 @@ pub const SpritePrepConfig = struct {
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    adaptive_tuner: ?*AdaptiveWorkTuner = null,
 };
 
 pub const SpritePrepStats = struct {
@@ -519,36 +519,23 @@ pub const SpriteBatch = struct {
             // command indices. Draw groups remain serial because they depend on
             // ordered texture/presentation transitions.
             if (thread_system) |threads| {
-                var system_config = prep_config;
-                if (system_config.adaptive and system_config.adaptive_tuner == null and system_config.items_per_range == null) {
-                    system_config.adaptive_tuner = &self.adaptive_tuner;
-                }
-                // Pre-select so the job context can dual-assert range.index against
-                // the dispatched range count (mirror affect.zig / particle.zig).
-                // Mirrors parallelForWithOptions' adaptive_tuner fallback.
-                const selection = threads.selectBatchProfile(system_config.adaptive_tuner orelse &threads.adaptive_tuner, .{
-                    .item_count = valid_count,
-                    .items_per_range = system_config.items_per_range,
-                    .max_worker_threads = system_config.max_worker_threads,
-                    .range_alignment_items = 4,
-                    .adaptive = system_config.adaptive,
+                const prep = Dispatch.init(threads, &self.adaptive_tuner, .{
+                    .items_per_range = prep_config.items_per_range,
+                    .max_worker_threads = prep_config.max_worker_threads,
+                    .adaptive = prep_config.adaptive,
                 });
+                // Align range boundaries to 4 commands (192/192/384 B per column,
+                // all divisible by 64) so no worker range straddles a cache line in
+                // any of the three columns — avoids false sharing on the seams.
+                // Pre-select so the job context can dual-assert range.index against
+                // the dispatched range count.
+                const selection = prep.select(valid_count, 4);
                 var context = SpritePrepJobContext{
                     .commands = self.prepared_commands.items,
                     .columns = columns,
                     .range_count = selection.range_count,
                 };
-                // Align range boundaries to 4 commands (192/192/384 B per column,
-                // all divisible by 64) so no worker range straddles a cache line in
-                // any of the three columns — avoids false sharing on the seams.
-                batch = threads.parallelForWithOptions(valid_count, &context, writePreparedSpritesJob, .{
-                    .items_per_range = system_config.items_per_range,
-                    .max_worker_threads = system_config.max_worker_threads,
-                    .range_alignment_items = 4,
-                    .adaptive = system_config.adaptive,
-                    .adaptive_tuner = selection.active_tuner,
-                    .selected_profile = selection.profile,
-                });
+                batch = prep.run(selection, valid_count, 4, &context, writePreparedSpritesJob);
             } else {
                 fillPreparedRange(self.prepared_commands.items, columns, .{
                     .start = 0,
@@ -1325,7 +1312,7 @@ test "parallel sprite prep matches serial vertices and draw groups" {
     try std.testing.expectEqual(@as(usize, 2), threaded.lastPrepStats().skipped_invalid_count);
 }
 
-test "sprite prep uses batch owned adaptive tuner instead of thread system fallback" {
+test "sprite prep records one sample into its own tuner and none into the shared tuner" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -1353,11 +1340,13 @@ test "sprite prep uses batch owned adaptive tuner instead of thread system fallb
         .items_per_range = 1,
     });
     defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     _ = try batch.build(table.resolver(), &threads, .{});
 
-    try std.testing.expect(batch.adaptive_tuner.report().sample_count > 0);
-    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().baseline_mean_batch_duration_ns);
+    try std.testing.expectEqual(@as(usize, 1), batch.adaptive_tuner.report().sample_count);
+    try std.testing.expect(batch.adaptive_tuner.last_request != null);
     try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "sprite prep adaptive gate keeps cheap batches inline" {

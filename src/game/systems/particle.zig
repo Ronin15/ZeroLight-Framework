@@ -15,6 +15,7 @@ const render_depth = @import("../render_depth.zig");
 const WorldDepth = render_depth.WorldDepth;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
@@ -39,7 +40,6 @@ pub const ParticleUpdateConfig = struct {
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    adaptive_tuner: ?*AdaptiveWorkTuner = null,
 };
 
 pub const ParticleUpdateStats = struct {
@@ -375,33 +375,20 @@ pub const ParticleSystem = struct {
         if (active_before == 0) return .{};
 
         const particles = self.slice();
-        const adaptive_tuner = if (update_config.adaptive and update_config.items_per_range == null)
-            update_config.adaptive_tuner orelse &self.adaptive_tuner
-        else
-            null;
-        // Pre-select so the job context can dual-assert range.index against the
-        // dispatched range count (mirror affect.zig / collision.zig). Mirrors
-        // parallelForWithOptions' `adaptive_tuner orelse &self.adaptive_tuner` fallback.
-        const selection = thread_system.selectBatchProfile(adaptive_tuner orelse &thread_system.adaptive_tuner, .{
-            .item_count = active_before,
+        const dispatch = Dispatch.init(thread_system, &self.adaptive_tuner, .{
             .items_per_range = update_config.items_per_range,
             .max_worker_threads = update_config.max_worker_threads,
-            .range_alignment_items = particle_range_alignment_items,
             .adaptive = update_config.adaptive,
         });
+        // Pre-select so the job context can dual-assert range.index against the
+        // dispatched range count.
+        const selection = dispatch.select(active_before, particle_range_alignment_items);
         var context = ParticleJobContext{
             .particles = particles,
             .delta_seconds = delta_seconds,
             .range_count = selection.range_count,
         };
-        const batch = thread_system.parallelForWithOptions(active_before, &context, particleJob, .{
-            .items_per_range = update_config.items_per_range,
-            .max_worker_threads = update_config.max_worker_threads,
-            .range_alignment_items = particle_range_alignment_items,
-            .adaptive = update_config.adaptive,
-            .adaptive_tuner = selection.active_tuner,
-            .selected_profile = selection.profile,
-        });
+        const batch = dispatch.run(selection, active_before, particle_range_alignment_items, &context, particleJob);
         const removed = self.removeExpiredSwap();
         return .{
             .active_before = active_before,
@@ -824,21 +811,16 @@ test "particle explicit items_per_range bypasses tuner" {
     });
     defer threads.deinit();
 
-    var adaptive_tuner = AdaptiveWorkTuner.init(.{
-        .initial_range_items = particle_range_alignment_items * 2,
-        .smallest_range_items = particle_range_alignment_items,
-        .largest_range_items = particle_range_alignment_items * 4,
-    });
     const stats = particles.update(&threads, 0.25, .{
         .items_per_range = particle_range_alignment_items,
         .max_worker_threads = 2,
-        .adaptive_tuner = &adaptive_tuner,
     });
 
     try std.testing.expectEqual(particle_range_alignment_items, stats.batch.items_per_range);
-    try std.testing.expectEqual(@as(usize, 0), adaptive_tuner.report().sample_count);
-    try std.testing.expectEqual(@as(u64, 0), adaptive_tuner.report().best_mean_batch_duration_ns);
     try std.testing.expectEqual(@as(usize, 0), particles.adaptive_tuner.report().sample_count);
+    try std.testing.expect(particles.adaptive_tuner.last_request == null);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "particle system owns adaptive tuner for default update" {
@@ -853,43 +835,15 @@ test "particle system owns adaptive tuner for default update" {
         .items_per_range = particle_range_alignment_items,
     });
     defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
-    var stats = ParticleUpdateStats{};
-    for (0..particles.adaptive_tuner.report().sample_window) |_| {
-        stats = particles.update(&threads, 0.25, .{
-            .max_worker_threads = 2,
-        });
-    }
+    const stats = particles.update(&threads, 0.25, .{ .max_worker_threads = 2 });
 
     try std.testing.expectEqual(particle_range_alignment_items * 8, stats.active_before);
-    try std.testing.expect(particles.adaptive_tuner.report().baseline_mean_batch_duration_ns > 0);
-    try std.testing.expect(!particles.adaptive_tuner.report().has_threaded_profile);
-    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().best_mean_batch_duration_ns);
-}
-
-test "particle update uses provided adaptive tuner" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
-    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = particle_range_alignment_items * 8 });
-    defer particles.deinit();
-    fillParticles(&particles, particle_range_alignment_items * 8);
-
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
-        .max_worker_threads = 2,
-        .items_per_range = particle_range_alignment_items,
-    });
-    defer threads.deinit();
-
-    var adaptive_tuner = AdaptiveWorkTuner.init(.{ .sample_window = 1 });
-    const stats = particles.update(&threads, 0.25, .{
-        .max_worker_threads = 2,
-        .adaptive_tuner = &adaptive_tuner,
-    });
-
-    try std.testing.expectEqual(particle_range_alignment_items * 8, stats.active_before);
-    try std.testing.expect(adaptive_tuner.report().baseline_mean_batch_duration_ns > 0);
-    try std.testing.expect(!adaptive_tuner.report().has_threaded_profile);
-    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().best_mean_batch_duration_ns);
+    try std.testing.expectEqual(@as(usize, 1), particles.adaptive_tuner.report().sample_count);
+    try std.testing.expect(particles.adaptive_tuner.last_request != null);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "particle range only writes assigned rows" {

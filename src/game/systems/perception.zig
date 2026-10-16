@@ -83,6 +83,7 @@ const stance = @import("../faction.zig").stance;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
@@ -179,7 +180,6 @@ pub const PerceptionConfig = struct {
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    adaptive_tuner: ?*AdaptiveWorkTuner = null,
 };
 
 pub const PerceptionStats = struct {
@@ -375,26 +375,18 @@ pub const PerceptionSystem = struct {
 
         self.computeFacingDense(perception_slice);
 
-        const active_tuner: ?*AdaptiveWorkTuner = config.adaptive_tuner orelse
-            if (config.adaptive and config.items_per_range == null) &self.compute_tuner else null;
-        const selection = thread_system.selectBatchProfile(active_tuner, .{
-            .item_count = observer_count,
+        const compute = Dispatch.init(thread_system, &self.compute_tuner, .{
             .items_per_range = config.items_per_range,
             .max_worker_threads = config.max_worker_threads,
-            .range_alignment_items = perception_range_alignment_items,
             .adaptive = config.adaptive,
         });
+        const selection = compute.select(observer_count, perception_range_alignment_items);
         // Grow-only safety net for unreserved standalone use; after `reserve`
         // it never allocates (`selection.range_count <= maxRangeCount(cap, 16)`).
         try self.prepareRangeStats(selection.range_count);
 
         var job = self.buildJobContext(perception_slice, spatial, world, config.player_candidate, config.stimuli, selection.range_count);
-        const batch = thread_system.parallelForWithOptions(observer_count, &job, writePerceptionRangeJob, .{
-            .max_worker_threads = selection.worker_threads,
-            .range_alignment_items = perception_range_alignment_items,
-            .adaptive_tuner = selection.active_tuner,
-            .selected_profile = selection.profile,
-        });
+        const batch = compute.run(selection, observer_count, perception_range_alignment_items, &job, writePerceptionRangeJob);
 
         const totals = self.sumRangeStats(selection.range_count);
         const merge = try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
@@ -2661,6 +2653,43 @@ test "serial and threaded PerceptionSystem updates route through identical math"
     const serial_merged = serial_events.mergedItems();
     const threaded_merged = threaded_events.mergedItems();
     try testing.expectEqualSlices(SimulationEvent, serial_merged, threaded_merged);
+}
+
+test "threaded PerceptionSystem update records one sample into the compute tuner and none into the shared tuner" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    for (0..8) |h| {
+        const fh: f32 = @floatFromInt(h);
+        _ = try addAgent(&data, fh * 80, 0, 0, 0, .hostile);
+    }
+    const observer_total: usize = 64;
+    for (0..observer_total) |j| {
+        const fj: f32 = @floatFromInt(j);
+        _ = try addObserver(&data, fj * 10, 10, 0, -10, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100 });
+    }
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 512, 64, 32);
+    defer world.deinit();
+
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, .{});
+    try testing.expectEqual(observer_total, stats.observer_count);
+    try testing.expectEqual(@as(usize, 1), sys.compute_tuner.report().sample_count);
+    try testing.expect(sys.compute_tuner.last_request != null);
+    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "PerceptionSystem has no steady-state allocation after warmup (FailingAllocator)" {

@@ -15,6 +15,7 @@ const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkProfile = @import("../app/thread_system.zig").AdaptiveWorkProfile;
+const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const rangeCount = @import("../app/thread_system.zig").rangeCount;
 const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
 const DataSystem = @import("data_system.zig").DataSystem;
@@ -5378,6 +5379,77 @@ test "the AI movement intent apply runs on workers in the pipeline, allocation-f
     const threaded = try runApplyIntentsScenario(2);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_x), std.mem.sliceAsBytes(&threaded.velocity_x));
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_y), std.mem.sliceAsBytes(&threaded.velocity_y));
+}
+
+test "production steps on workers record nothing into the thread system's shared tuner" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    // Alternating factions so observers sense hostiles; 4 px apart under 16 px bounds, so
+    // every body overlaps its nearest neighbours and the narrowphase spans several ranges.
+    const agent_count: usize = 64;
+    for (0..agent_count) |index| {
+        const agent = try addShareTestAgent(&data, 40 + @as(f32, @floatFromInt(index)) * 4, if (index % 2 == 0) .player else .hostile, true);
+        try data.setAiAffect(agent, .{});
+        try data.setSteeringAgent(agent, growthSteeringTemplate(.{ 0, 0 }).create_entity.steering_agent.?);
+        const npc = growthNpcTemplate(.{ 0, 0 }).create_entity;
+        try data.setCollisionBounds(agent, npc.collision_bounds.?);
+        try data.setCollisionResponse(agent, npc.collision_response.?);
+    }
+    try markAllAlwaysActive(&data);
+
+    var world = try shareTestWorld();
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{
+        .contact_capacity = agent_count * 8,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, agent_count, agent_count * 8, 4, 4);
+    try frame.reservePathRequests(1, agent_count);
+    try pipeline.reserve(&frame, agent_count);
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 2048,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    };
+    // One sample window under the default stage tuners, then a step pinned onto workers.
+    for (0..(AdaptiveWorkTunerConfig{}).sample_window) |_| {
+        frame.beginStep();
+        _ = try pipeline.update(context);
+    }
+    pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+    frame.beginStep();
+    const stats = try pipeline.update(context);
+    const stage_batches = [_]BatchStats{
+        stats.perception.batch,
+        stats.ai_memory.batch,
+        stats.affect.batch,
+        stats.ai.separation_batch,
+        stats.ai.intent_batch,
+        stats.steering.agents_batch,
+        stats.apply_intents.batch,
+        stats.movement.batch,
+        stats.chunk_derive,
+        stats.collision.broadphase_batch,
+        stats.collision.narrowphase_batch,
+    };
+    for (stage_batches) |batch| try std.testing.expect(!batch.ran_inline);
+    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "after population growth, ~2 solid contacts per body on the multi-worker path allocate nothing" {

@@ -12,6 +12,7 @@ const builtin = @import("builtin");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
@@ -109,8 +110,6 @@ pub const CollisionConfig = struct {
     narrowphase_items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    broadphase_adaptive_tuner: ?*AdaptiveWorkTuner = null,
-    narrowphase_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     full_sort_disorder_percent: u8 = 12,
     /// When non-null, only these dense collision-bounds indices generate contacts
     /// this step (the scope system excludes dormant/kinematic entities). Null = all.
@@ -335,23 +334,12 @@ pub const CollisionSystem = struct {
         var sort_timer = StageTimer.start();
         const used_full_sort = self.sortWarm(config.full_sort_disorder_percent);
         const sort_ns = sort_timer.lap();
-        var system_config = config;
-        if (system_config.adaptive) {
-            if (system_config.broadphase_adaptive_tuner == null and system_config.broadphase_items_per_range == null and system_config.items_per_range == null) {
-                system_config.broadphase_adaptive_tuner = &self.broadphase_tuner;
-            }
-            if (system_config.narrowphase_adaptive_tuner == null and system_config.narrowphase_items_per_range == null and system_config.items_per_range == null) {
-                system_config.narrowphase_adaptive_tuner = &self.narrowphase_tuner;
-            }
-        }
-
-        const broadphase_selection = thread_system.selectBatchProfile(system_config.broadphase_adaptive_tuner, .{
-            .item_count = body_count,
-            .items_per_range = system_config.broadphase_items_per_range orelse system_config.items_per_range,
-            .max_worker_threads = system_config.max_worker_threads,
-            .range_alignment_items = collision_range_alignment_items,
-            .adaptive = system_config.adaptive,
+        const broadphase_dispatch = Dispatch.init(thread_system, &self.broadphase_tuner, .{
+            .items_per_range = config.broadphase_items_per_range orelse config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .adaptive = config.adaptive,
         });
+        const broadphase_selection = broadphase_dispatch.select(body_count, collision_range_alignment_items);
         const broadphase = try self.buildBroadphaseCandidatesThreaded(
             thread_system,
             broadphase_selection,
@@ -374,13 +362,12 @@ pub const CollisionSystem = struct {
         }
         const pair_bound_exceeded = self.countPairBoundOverflow(candidate_pair_count, broadphase.grew);
 
-        const narrowphase_selection = thread_system.selectBatchProfile(system_config.narrowphase_adaptive_tuner, .{
-            .item_count = candidate_pair_count,
-            .items_per_range = system_config.narrowphase_items_per_range orelse system_config.items_per_range,
-            .max_worker_threads = system_config.max_worker_threads,
-            .range_alignment_items = collision_range_alignment_items,
-            .adaptive = system_config.adaptive,
+        const narrowphase_dispatch = Dispatch.init(thread_system, &self.narrowphase_tuner, .{
+            .items_per_range = config.narrowphase_items_per_range orelse config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .adaptive = config.adaptive,
         });
+        const narrowphase_selection = narrowphase_dispatch.select(candidate_pair_count, collision_range_alignment_items);
 
         try self.prepareNarrowphaseStaging(candidate_pair_count, narrowphase_selection.range_count);
         var context = NarrowphaseJobContext{
@@ -389,12 +376,7 @@ pub const CollisionSystem = struct {
             .candidate_pair_count = candidate_pair_count,
             .items_per_range = narrowphase_selection.items_per_range,
         };
-        const narrowphase_batch = thread_system.parallelForWithOptions(candidate_pair_count, &context, narrowphaseContactsJob, .{
-            .max_worker_threads = narrowphase_selection.worker_threads,
-            .range_alignment_items = collision_range_alignment_items,
-            .adaptive_tuner = narrowphase_selection.active_tuner,
-            .selected_profile = narrowphase_selection.profile,
-        });
+        const narrowphase_batch = narrowphase_dispatch.run(narrowphase_selection, candidate_pair_count, collision_range_alignment_items, &context, narrowphaseContactsJob);
         const contact_count = try self.mergeNarrowphaseContacts(contacts, narrowphase_selection.items_per_range);
 
         return .{
@@ -1251,6 +1233,36 @@ test "threaded collision matches serial contact order" {
         try std.testing.expectEqual(serial.normal_y, threaded.normal_y);
         try std.testing.expectApproxEqAbs(serial.penetration, threaded.penetration, 0.001);
     }
+}
+
+test "threaded collision records one sample into each stage tuner and none into the shared tuner" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..64) |index| {
+        const x: f32 = @floatFromInt((index % 16) * 6);
+        const y: f32 = @floatFromInt((index / 16) * 6);
+        _ = try addBody(&data, x, y, 8);
+    }
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    const stats = try system.update(&data, &contacts, &threads, .{});
+    try std.testing.expectEqual(@as(usize, 64), stats.broadphase_batch.item_count);
+    try std.testing.expect(stats.narrowphase_batch.item_count > 0);
+    for ([_]*const AdaptiveWorkTuner{ &system.broadphase_tuner, &system.narrowphase_tuner }) |tuner| {
+        try std.testing.expectEqual(@as(usize, 1), tuner.report().sample_count);
+        try std.testing.expect(tuner.last_request != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "threaded collision matches serial across multiple range splits and worker counts" {

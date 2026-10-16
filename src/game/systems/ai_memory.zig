@@ -46,6 +46,7 @@ const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
@@ -80,7 +81,6 @@ pub const AiMemoryConfig = struct {
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    adaptive_tuner: ?*AdaptiveWorkTuner = null,
 };
 
 pub const AiMemoryStats = struct {
@@ -129,35 +129,22 @@ pub const AiMemorySystem = struct {
             return .{ .refreshed_count = finishMemoryRefresh(data, frame, &.{}) };
         }
 
-        var system_config = config;
-        if (system_config.adaptive and system_config.adaptive_tuner == null and system_config.items_per_range == null) {
-            system_config.adaptive_tuner = &self.decay_tuner;
-        }
-
-        // Pre-select so the job context can dual-assert range.index against
-        // the dispatched range count (mirror affect.zig / collision.zig). Mirrors
-        // parallelForWithOptions' `adaptive_tuner orelse &self.adaptive_tuner` fallback.
-        const selection = thread_system.selectBatchProfile(system_config.adaptive_tuner orelse &thread_system.adaptive_tuner, .{
-            .item_count = count,
-            .items_per_range = system_config.items_per_range,
-            .max_worker_threads = system_config.max_worker_threads,
-            .adaptive = system_config.adaptive,
+        const decay = Dispatch.init(thread_system, &self.decay_tuner, .{
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .adaptive = config.adaptive,
         });
+        // Pre-select so the job context can dual-assert range.index against
+        // the dispatched range count.
+        const selection = decay.select(count, 1);
         var context = AiMemoryDecayContext{
             .slice = data.aiMemorySlice(),
             .indices = self.memory_dense_indices.items,
             .range_count = selection.range_count,
         };
-        // No range_alignment_items: the indexed gather/scatter path processes
-        // each row independently of any contiguous-range shape, mirroring
-        // movement.zig's own scoped/indexed dispatch.
-        const batch = thread_system.parallelForWithOptions(count, &context, aiMemoryDecayJob, .{
-            .items_per_range = system_config.items_per_range,
-            .max_worker_threads = system_config.max_worker_threads,
-            .adaptive = system_config.adaptive,
-            .adaptive_tuner = selection.active_tuner,
-            .selected_profile = selection.profile,
-        });
+        // Range alignment 1: the indexed gather/scatter path processes each row
+        // independently of any contiguous-range shape.
+        const batch = decay.run(selection, count, 1, &context, aiMemoryDecayJob);
 
         return .{
             .processed_count = count,
@@ -875,4 +862,33 @@ test "AiMemorySystem threaded update has no steady-state allocation after warmup
     try testing.expectEqual(@as(usize, 64), stats.processed_count);
     try testing.expect(!stats.batch.ran_inline);
     try testing.expect(stats.batch.active_worker_threads > 0);
+}
+
+test "AiMemorySystem decay records one sample into its own tuner and none into the shared tuner" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    for (0..64) |i| {
+        const fi: f32 = @floatFromInt(i);
+        _ = try addAgentWithPerceptionAndMemory(&data, fi, 0, .{}, .{ .staleness = 5 });
+    }
+
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var sys = AiMemorySystem.init(testing.allocator);
+    defer sys.deinit();
+    var frame = SimulationFrame.init(testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 4, 0, 0, 0, 0);
+
+    frame.beginStep();
+    const stats = try sys.update(data.aiAgentSliceConst(), &data, &frame, &threads, .{});
+    try testing.expectEqual(@as(usize, 64), stats.processed_count);
+    try testing.expectEqual(@as(usize, 1), sys.decay_tuner.report().sample_count);
+    try testing.expect(sys.decay_tuner.last_request != null);
+    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try testing.expect(threads.adaptive_tuner.last_request == null);
 }

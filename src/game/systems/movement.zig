@@ -8,6 +8,7 @@ const data = @import("../data_system.zig");
 const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
@@ -20,8 +21,9 @@ pub const MovementConfig = struct {
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    adaptive_tuner: ?*AdaptiveWorkTuner = null,
 };
+
+const MovementThreads = @import("../../app/thread_system.zig").StageThreads(MovementConfig);
 
 pub const MovementStats = struct {
     body_count: usize = 0,
@@ -51,11 +53,7 @@ pub const MovementSystem = struct {
         delta_seconds: f32,
         config: MovementConfig,
     ) MovementStats {
-        var system_config = config;
-        if (system_config.adaptive and system_config.adaptive_tuner == null and system_config.items_per_range == null) {
-            system_config.adaptive_tuner = &self.adaptive_tuner;
-        }
-        return updateMovementBodies(slice, thread_system, delta_seconds, system_config);
+        return updateMovementBodies(slice, (MovementThreads{ .thread_system = thread_system, .config = config }).stage(&self.adaptive_tuner), delta_seconds);
     }
 
     pub fn syncPreviousPositions(_: *MovementSystem, slice: *data.MovementBodySlice) void {
@@ -66,9 +64,9 @@ pub const MovementSystem = struct {
     /// merged stream: `direction * speed` at the entity's movement row, speed `40` when
     /// not positive. Entities without both an AI agent and a movement body are skipped.
     /// Ranges write rows in parallel, relying on `frame.intents` carrying at most one
-    /// movement intent per entity. Records timing into a tuner only on adaptive selection
-    /// (`adaptive`, no `items_per_range`, workers available): `config.adaptive_tuner`, or
-    /// `apply_intents_tuner` when none is named. An empty stream records nothing.
+    /// movement intent per entity. Records timing into `apply_intents_tuner` only on adaptive
+    /// selection (`adaptive`, no `items_per_range`, workers available). An empty stream
+    /// records nothing.
     pub fn applyIntents(
         self: *MovementSystem,
         bodies: *data.DataSystem,
@@ -79,27 +77,15 @@ pub const MovementSystem = struct {
         const intents = frame.intents.mergedItems();
         if (intents.len == 0) return .{};
 
-        const selection = thread_system.selectBatchProfile(config.adaptive_tuner orelse &self.apply_intents_tuner, .{
-            .item_count = intents.len,
-            .items_per_range = config.items_per_range,
-            .max_worker_threads = config.max_worker_threads,
-            .range_alignment_items = data.movement_range_alignment_items,
-            .adaptive = config.adaptive,
-        });
+        const apply = (MovementThreads{ .thread_system = thread_system, .config = config }).stage(&self.apply_intents_tuner);
+        const selection = apply.select(intents.len, data.movement_range_alignment_items);
         var context = ApplyIntentsJobContext{
             .bodies = bodies,
             .intents = intents,
             .slice = bodies.movementBodySlice(),
             .range_count = selection.range_count,
         };
-        const batch = thread_system.parallelForWithOptions(intents.len, &context, applyIntentsJob, .{
-            .items_per_range = config.items_per_range,
-            .max_worker_threads = config.max_worker_threads,
-            .range_alignment_items = data.movement_range_alignment_items,
-            .adaptive = config.adaptive,
-            .adaptive_tuner = selection.active_tuner,
-            .selected_profile = selection.profile,
-        });
+        const batch = apply.run(selection, intents.len, data.movement_range_alignment_items, &context, applyIntentsJob);
         return .{
             .intent_count = intents.len,
             .batch = batch,
@@ -221,35 +207,20 @@ fn applyIntentRangeScalar(bodies: *data.DataSystem, frame: *const SimulationFram
 /// writes it — there is no previous-z to maintain, keeping the vectorized loop pure.
 fn updateMovementBodies(
     slice: *data.MovementBodySlice,
-    thread_system: *ThreadSystem,
+    integrate: Dispatch,
     delta_seconds: f32,
-    config: MovementConfig,
 ) MovementStats {
     if (slice.entities.len == 0) return .{};
 
     // Pre-select so the job context can dual-assert range.index against the
-    // dispatched range count (mirror affect.zig / collision.zig). Mirrors
-    // parallelForWithOptions' `adaptive_tuner orelse &self.adaptive_tuner` fallback.
-    const selection = thread_system.selectBatchProfile(config.adaptive_tuner orelse &thread_system.adaptive_tuner, .{
-        .item_count = slice.entities.len,
-        .items_per_range = config.items_per_range,
-        .max_worker_threads = config.max_worker_threads,
-        .range_alignment_items = data.movement_range_alignment_items,
-        .adaptive = config.adaptive,
-    });
+    // dispatched range count.
+    const selection = integrate.select(slice.entities.len, data.movement_range_alignment_items);
     var context = MovementJobContext{
         .slice = slice.*,
         .delta_seconds = delta_seconds,
         .range_count = selection.range_count,
     };
-    const batch = thread_system.parallelForWithOptions(slice.entities.len, &context, movementJob, .{
-        .items_per_range = config.items_per_range,
-        .max_worker_threads = config.max_worker_threads,
-        .range_alignment_items = data.movement_range_alignment_items,
-        .adaptive = config.adaptive,
-        .adaptive_tuner = selection.active_tuner,
-        .selected_profile = selection.profile,
-    });
+    const batch = integrate.run(selection, slice.entities.len, data.movement_range_alignment_items, &context, movementJob);
     return .{
         .body_count = slice.entities.len,
         .batch = batch,
@@ -387,8 +358,9 @@ test "threaded movement matches serial movement" {
     });
     defer threads.deinit();
 
+    var system = MovementSystem.init();
     var threaded_slice = threaded_data.movementBodySlice();
-    const stats = updateMovementBodies(&threaded_slice, &threads, 0.5, .{
+    const stats = system.update(&threaded_slice, &threads, 0.5, .{
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -429,12 +401,13 @@ test "threaded movement matches serial across multiple range splits and worker c
         .{ .items_per_range = data.movement_range_alignment_items, .workers = 4 },
         .{ .items_per_range = data.movement_range_alignment_items * 3, .workers = 3 },
     };
+    var system = MovementSystem.init();
     for (splits) |split| {
         var threaded_data = data.DataSystem.init(std.testing.allocator);
         defer threaded_data.deinit();
         try fillMovementData(&threaded_data, item_count);
         var threaded_slice = threaded_data.movementBodySlice();
-        const stats = updateMovementBodies(&threaded_slice, &threads, 0.5, .{
+        const stats = system.update(&threaded_slice, &threads, 0.5, .{
             .items_per_range = split.items_per_range,
             .max_worker_threads = split.workers,
             .adaptive = false,
@@ -459,21 +432,18 @@ test "movement explicit items_per_range bypasses tuner" {
     });
     defer threads.deinit();
 
-    var adaptive_tuner = AdaptiveWorkTuner.init(.{
-        .initial_range_items = data.movement_range_alignment_items * 2,
-        .smallest_range_items = data.movement_range_alignment_items,
-        .largest_range_items = data.movement_range_alignment_items * 4,
-    });
+    var system = MovementSystem.init();
     var slice = game_data.movementBodySlice();
-    const stats = updateMovementBodies(&slice, &threads, 0.5, .{
+    const stats = system.update(&slice, &threads, 0.5, .{
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
-        .adaptive_tuner = &adaptive_tuner,
     });
 
     try std.testing.expectEqual(data.movement_range_alignment_items, stats.batch.items_per_range);
-    try std.testing.expectEqual(@as(usize, 0), adaptive_tuner.report().sample_count);
-    try std.testing.expectEqual(@as(u64, 0), adaptive_tuner.report().best_mean_batch_duration_ns);
+    try std.testing.expectEqual(@as(usize, 0), system.adaptive_tuner.report().sample_count);
+    try std.testing.expect(system.adaptive_tuner.last_request == null);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "movement system owns adaptive tuner for default update" {
@@ -488,46 +458,19 @@ test "movement system owns adaptive tuner for default update" {
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var system = MovementSystem.init();
-    var stats = MovementStats{};
-    for (0..system.adaptive_tuner.report().sample_window) |_| {
-        var slice = game_data.movementBodySlice();
-        stats = system.update(&slice, &threads, 0.5, .{
-            .max_worker_threads = 2,
-        });
-    }
-
-    try std.testing.expect(system.adaptive_tuner.report().baseline_mean_batch_duration_ns > 0);
-    try std.testing.expect(!system.adaptive_tuner.report().has_threaded_profile);
-    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().best_mean_batch_duration_ns);
-    try std.testing.expectEqual(game_data.movementBodySliceConst().entities.len, stats.body_count);
-}
-
-test "movement update uses provided adaptive tuner" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
-    var game_data = data.DataSystem.init(std.testing.allocator);
-    defer game_data.deinit();
-    try fillMovementData(&game_data, data.movement_range_alignment_items * 8);
-
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
-        .max_worker_threads = 2,
-        .items_per_range = data.movement_range_alignment_items,
-    });
-    defer threads.deinit();
-
-    var adaptive_tuner = AdaptiveWorkTuner.init(.{ .sample_window = 1 });
     var slice = game_data.movementBodySlice();
-    const stats = updateMovementBodies(&slice, &threads, 0.5, .{
-        .max_worker_threads = 2,
-        .adaptive_tuner = &adaptive_tuner,
-    });
+    const stats = system.update(&slice, &threads, 0.5, .{ .max_worker_threads = 2 });
 
     try std.testing.expectEqual(game_data.movementBodySliceConst().entities.len, stats.body_count);
-    try std.testing.expect(adaptive_tuner.report().baseline_mean_batch_duration_ns > 0);
-    try std.testing.expect(!adaptive_tuner.report().has_threaded_profile);
-    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().best_mean_batch_duration_ns);
+    try std.testing.expectEqual(@as(usize, 1), system.adaptive_tuner.report().sample_count);
+    try std.testing.expect(system.adaptive_tuner.last_request != null);
+    try std.testing.expectEqual(@as(usize, 0), system.apply_intents_tuner.report().sample_count);
+    try std.testing.expect(system.apply_intents_tuner.last_request == null);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "movement range only writes assigned items" {
@@ -595,8 +538,9 @@ test "warmed movement update does not allocate" {
         threads.allocator = original_thread_allocator;
     }
 
+    var system = MovementSystem.init();
     var slice = game_data.movementBodySlice();
-    const stats = updateMovementBodies(&slice, &threads, 0.016, .{
+    const stats = system.update(&slice, &threads, 0.016, .{
         .items_per_range = data.movement_range_alignment_items,
     });
     try std.testing.expectEqual(@as(usize, 32), stats.body_count);
@@ -617,8 +561,9 @@ test "threaded multi-worker movement update has no steady-state allocation after
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
+    var system = MovementSystem.init();
     var slice = game_data.movementBodySlice();
-    const warmup = updateMovementBodies(&slice, &threads, 0.016, .{
+    const warmup = system.update(&slice, &threads, 0.016, .{
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -638,7 +583,7 @@ test "threaded multi-worker movement update has no steady-state allocation after
     }
 
     slice = game_data.movementBodySlice();
-    const stats = updateMovementBodies(&slice, &threads, 0.016, .{
+    const stats = system.update(&slice, &threads, 0.016, .{
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -908,13 +853,14 @@ test "intent apply records into its own tuner" {
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var system = MovementSystem.init();
-    for (0..system.apply_intents_tuner.report().sample_window) |_| {
-        _ = system.applyIntents(&fixture.game_data, &fixture.frame, &threads, .{ .max_worker_threads = 2 });
-    }
+    _ = system.applyIntents(&fixture.game_data, &fixture.frame, &threads, .{ .max_worker_threads = 2 });
 
-    try std.testing.expect(system.apply_intents_tuner.report().baseline_mean_batch_duration_ns > 0);
-    try std.testing.expectEqual(@as(u64, 0), system.adaptive_tuner.report().baseline_mean_batch_duration_ns);
-    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().baseline_mean_batch_duration_ns);
+    try std.testing.expectEqual(@as(usize, 1), system.apply_intents_tuner.report().sample_count);
+    try std.testing.expect(system.apply_intents_tuner.last_request != null);
+    try std.testing.expectEqual(@as(usize, 0), system.adaptive_tuner.report().sample_count);
+    try std.testing.expect(system.adaptive_tuner.last_request == null);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "empty intent stream applies nothing and records no batch" {

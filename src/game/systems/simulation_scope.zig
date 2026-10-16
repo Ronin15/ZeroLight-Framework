@@ -42,6 +42,7 @@ const simd = @import("../../core/simd.zig");
 const math = @import("../../core/math.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
@@ -220,17 +221,13 @@ pub const SimulationScopeSystem = struct {
             .chunk_y = scope.chunk_y,
             .grid = grid,
         };
-        const active_tuner = if (config.adaptive and config.items_per_range == null)
-            &self.chunk_derive_tuner
-        else
-            null;
-        return thread_system.parallelForWithOptions(n, &context, deriveChunkJob, .{
+        const derive = Dispatch.init(thread_system, &self.chunk_derive_tuner, .{
             .items_per_range = config.items_per_range,
             .max_worker_threads = config.max_worker_threads,
-            .range_alignment_items = scope_range_alignment_items,
             .adaptive = config.adaptive,
-            .adaptive_tuner = active_tuner,
         });
+        const selection = derive.select(n, scope_range_alignment_items);
+        return derive.run(selection, n, scope_range_alignment_items, &context, deriveChunkJob);
     }
 
     /// Serial chunk derivation: same computation over the full range, no thread
@@ -1198,6 +1195,33 @@ test "threaded deriveChunks matches serial across the range block and tail" {
         try std.testing.expectEqual(ss.chunk_x[i], ts.chunk_x[i]);
         try std.testing.expectEqual(ss.chunk_y[i], ts.chunk_y[i]);
     }
+}
+
+test "threaded deriveChunks records one sample into its own tuner and none into the shared tuner" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const count = scope_range_alignment_items * 8;
+    for (0..count) |i| {
+        const fi: f32 = @floatFromInt(i);
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = fi * 3.5, .y = fi * 1.25 } });
+    }
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    const stats = sys.deriveChunks(&data, &threads, .{ .tile_size = 32, .chunk_size_tiles = 8, .width = 256, .height = 256 }, .{});
+    try std.testing.expectEqual(count, stats.item_count);
+    try std.testing.expectEqual(@as(usize, 1), sys.chunk_derive_tuner.report().sample_count);
+    try std.testing.expect(sys.chunk_derive_tuner.last_request != null);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "scoped collision excludes kinematic and dormant bodies from contacts" {

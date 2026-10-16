@@ -42,6 +42,7 @@ const rng = @import("../../core/rng.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
@@ -307,8 +308,6 @@ pub const AiConfig = struct {
     intent_items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    separation_adaptive_tuner: ?*AdaptiveWorkTuner = null,
-    intent_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     intent_seed: u64 = 0,
     /// Current fixed-step counter (see `SimulationScopeSystem.currentStep()`),
     /// combined with `intent_seed` and each entity's dense index to key
@@ -456,37 +455,29 @@ pub const AiSystem = struct {
         }
         std.debug.assert(self.candidates.len == spatial.pos_x.len);
 
-        const system_config = normalizedConfig(config, self);
         self.resetSeparationScratch();
         const gathered = self.rows.slice();
-        const separation_selection = thread_system.selectBatchProfile(system_config.separation_adaptive_tuner, .{
-            .item_count = entity_count,
-            .items_per_range = system_config.separation_items_per_range orelse system_config.items_per_range,
-            .max_worker_threads = system_config.max_worker_threads,
-            .range_alignment_items = ai_range_alignment_items,
-            .adaptive = system_config.adaptive,
+        const separation = Dispatch.init(thread_system, &self.separation_tuner, .{
+            .items_per_range = config.separation_items_per_range orelse config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .adaptive = config.adaptive,
         });
+        const separation_selection = separation.select(entity_count, ai_range_alignment_items);
         var separation_context = buildAiSeparationContext(self, gathered, spatial, separation_selection.range_count, config.interest_markers);
-        const separation_batch = thread_system.parallelForWithOptions(entity_count, &separation_context, writeAiSeparationJob, .{
-            .max_worker_threads = separation_selection.worker_threads,
-            .range_alignment_items = ai_range_alignment_items,
-            .adaptive_tuner = separation_selection.active_tuner,
-            .selected_profile = separation_selection.profile,
-        });
+        const separation_batch = separation.run(separation_selection, entity_count, ai_range_alignment_items, &separation_context, writeAiSeparationJob);
 
-        const intent_selection = thread_system.selectBatchProfile(system_config.intent_adaptive_tuner, .{
-            .item_count = entity_count,
-            .items_per_range = system_config.intent_items_per_range orelse system_config.items_per_range,
-            .max_worker_threads = system_config.max_worker_threads,
-            .range_alignment_items = ai_range_alignment_items,
-            .adaptive = system_config.adaptive,
+        const intent = Dispatch.init(thread_system, &self.intent_tuner, .{
+            .items_per_range = config.intent_items_per_range orelse config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .adaptive = config.adaptive,
         });
+        const intent_selection = intent.select(entity_count, ai_range_alignment_items);
         const rcount = intent_selection.range_count;
 
-        const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
+        const navigation_stream = config.navigation_intents orelse &frame.navigation_intents;
         const range_base = try navigation_stream.appendRangeCounts(rcount);
 
-        var context = buildAiJobContext(gathered, navigation_stream, data, system_config, range_base, rcount);
+        var context = buildAiJobContext(gathered, navigation_stream, data, config, range_base, rcount);
 
         for (0..rcount) |range_index| {
             const start = range_index * intent_selection.items_per_range;
@@ -496,12 +487,7 @@ pub const AiSystem = struct {
 
         try navigation_stream.prefixAppendedRanges(range_base);
 
-        const intent_batch = thread_system.parallelForWithOptions(entity_count, &context, writeAiIntentsJob, .{
-            .max_worker_threads = intent_selection.worker_threads,
-            .range_alignment_items = ai_range_alignment_items,
-            .adaptive_tuner = intent_selection.active_tuner,
-            .selected_profile = intent_selection.profile,
-        });
+        const intent_batch = intent.run(intent_selection, entity_count, ai_range_alignment_items, &context, writeAiIntentsJob);
 
         navigation_stream.finishWrite();
 
@@ -546,13 +532,12 @@ pub const AiSystem = struct {
         self.computeAiSeparationsSerial(spatial, config.interest_markers);
         const gathered = self.rows.slice();
         const rcount: usize = 1;
-        const system_config = normalizedConfig(config, self);
-        const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
+        const navigation_stream = config.navigation_intents orelse &frame.navigation_intents;
         const range_base = try navigation_stream.appendRangeCounts(rcount);
         navigation_stream.addCount(range_base, entity_count);
         try navigation_stream.prefixAppendedRanges(range_base);
 
-        var context = buildAiJobContext(gathered, navigation_stream, data, system_config, range_base, rcount);
+        var context = buildAiJobContext(gathered, navigation_stream, data, config, range_base, rcount);
         writeAiIntentsJob(&context, .{ .index = 0, .start = 0, .end = entity_count }, WorkerId.main);
 
         navigation_stream.finishWrite();
@@ -809,44 +794,6 @@ pub const AiSystem = struct {
     }
 };
 
-const NormalizedAiConfig = struct {
-    items_per_range: ?usize,
-    separation_items_per_range: ?usize,
-    intent_items_per_range: ?usize,
-    max_worker_threads: ?usize,
-    adaptive: bool,
-    separation_adaptive_tuner: ?*AdaptiveWorkTuner,
-    intent_adaptive_tuner: ?*AdaptiveWorkTuner,
-    intent_seed: u64,
-    step: u32,
-    wander_resample_period_steps: u32,
-    nav_request_kind: PathRequestKind,
-    navigation_intents: ?*RangeOutputStream(NavigationIntent),
-};
-
-fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
-    return .{
-        .items_per_range = config.items_per_range,
-        .separation_items_per_range = config.separation_items_per_range,
-        .intent_items_per_range = config.intent_items_per_range,
-        .max_worker_threads = config.max_worker_threads,
-        .adaptive = config.adaptive,
-        .separation_adaptive_tuner = config.separation_adaptive_tuner orelse if (config.adaptive and config.separation_items_per_range == null and config.items_per_range == null)
-            &system.separation_tuner
-        else
-            null,
-        .intent_adaptive_tuner = config.intent_adaptive_tuner orelse if (config.adaptive and config.intent_items_per_range == null and config.items_per_range == null)
-            &system.intent_tuner
-        else
-            null,
-        .intent_seed = config.intent_seed,
-        .step = config.step,
-        .wander_resample_period_steps = config.wander_resample_period_steps,
-        .nav_request_kind = config.nav_request_kind,
-        .navigation_intents = config.navigation_intents,
-    };
-}
-
 fn buildAiSeparationContext(
     system: *const AiSystem,
     gathered: std.MultiArrayList(AiGatherRow).Slice,
@@ -884,7 +831,7 @@ fn buildAiJobContext(
     gathered: std.MultiArrayList(AiGatherRow).Slice,
     navigation_stream: *RangeOutputStream(NavigationIntent),
     data: *DataSystem,
-    system_config: NormalizedAiConfig,
+    config: AiConfig,
     range_base: usize,
     range_count: usize,
 ) AiJobContext {
@@ -908,9 +855,9 @@ fn buildAiJobContext(
         .resolved = gathered.items(.resolved),
         .navigation_intents = navigation_stream,
         .ai_agent_hot = data.aiAgentSlice(),
-        .seed = system_config.intent_seed,
-        .wander_step = system_config.step / @max(system_config.wander_resample_period_steps, 1),
-        .nav_request_kind = system_config.nav_request_kind,
+        .seed = config.intent_seed,
+        .wander_step = config.step / @max(config.wander_resample_period_steps, 1),
+        .nav_request_kind = config.nav_request_kind,
         .range_base = range_base,
         .range_count = range_count,
     };
@@ -1806,32 +1753,70 @@ test "ai processor uses committed adaptive threaded profiles with default thread
     frame.beginStep();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    var separation_tuner = AdaptiveWorkTuner.init(.{
+    var committed_tuner = AdaptiveWorkTuner.init(.{
         .initial_range_items = ai_range_alignment_items,
         .smallest_range_items = ai_range_alignment_items,
         .largest_range_items = ai_range_alignment_items * 4,
     });
-    separation_tuner.current_profile = .{
+    committed_tuner.current_profile = .{
         .worker_threads = 1,
         .items_per_range = ai_range_alignment_items,
     };
-    separation_tuner.best_profile = separation_tuner.current_profile;
-    separation_tuner.has_threaded_profile = true;
-    separation_tuner.best_mean_batch_duration_ns = 1;
-
-    var intent_tuner = separation_tuner;
+    committed_tuner.best_profile = committed_tuner.current_profile;
+    committed_tuner.has_threaded_profile = true;
+    committed_tuner.best_mean_batch_duration_ns = 1;
+    ai_sys.separation_tuner = committed_tuner;
+    ai_sys.intent_tuner = committed_tuner;
 
     var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
     defer spatial_sys.deinit();
 
     const stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, .{
-        .separation_adaptive_tuner = &separation_tuner,
-        .intent_adaptive_tuner = &intent_tuner,
         .intent_seed = 3,
     });
     try std.testing.expectEqual(@as(usize, 128), stats.intent_count);
     try std.testing.expect(stats.separation_batch.active_worker_threads > 0);
     try std.testing.expect(stats.intent_batch.active_worker_threads > 0);
+}
+
+test "ai update records one sample into each stage tuner and none into the shared tuner" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..128) |i| {
+        const x: f32 = @floatFromInt(i);
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{
+            .position = .{ .x = x, .y = 0 },
+            .previous_position = .{ .x = x, .y = 0 },
+            .velocity = .{},
+            .speed = 20,
+        });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = 30 });
+    }
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 0, 128, 0, 0, 0);
+    frame.beginStep();
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
+    const stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, .{ .intent_seed = 3 });
+    try std.testing.expectEqual(@as(usize, 128), stats.intent_count);
+    for ([_]*const AdaptiveWorkTuner{ &ai_sys.separation_tuner, &ai_sys.intent_tuner }) |tuner| {
+        try std.testing.expectEqual(@as(usize, 1), tuner.report().sample_count);
+        try std.testing.expect(tuner.last_request != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "wander amplitude scales steering perturbation against seek" {
