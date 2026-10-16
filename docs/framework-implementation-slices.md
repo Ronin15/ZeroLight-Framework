@@ -174,6 +174,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**66C**](roadmap/slices/slice-66c.md) | Gated: first public release outside Steam | Signing, Notarization, .dmg, And Linux AppImage — after 66A |
 | [**66D**](roadmap/slices/slice-66d.md) | Gated: a Steamworks app ID | SteamPipe Upload Automation — after 66A |
 | [**66E**](roadmap/slices/slice-66e.md) | Gated: first release-candidate tag | Authoritative Perf Runner — after 52C |
+| [**66F**](roadmap/slices/slice-66f.md) | Gated: a Steamworks app ID | Steamworks Runtime Integration — after 66D and the VoidLight port slices |
 | [**67**](roadmap/slices/slice-67.md) | Not started (umbrella) | UI, Input, And Text Completion — after 53A, 53B, 54, 44, 46, 60 |
 | [**67A**](roadmap/slices/slice-67a.md) | Not started | Pointer Input, Menu Hold-To-Repeat, And Scancode Bindings — after 53B, 54, 44 |
 | [**67B**](roadmap/slices/slice-67b.md) | Not started | Debug Text Migration, Event Log, Text Atlas Telemetry, And UI Sound Cues — after 53A, 53B, 44 |
@@ -468,6 +469,8 @@ order.
     - **66C:** first public release outside Steam — after 66A.
     - **66D:** a Steamworks app ID — after 66A.
     - **66E:** first release-candidate tag — after 52C.
+    - **66F:** a Steamworks app ID, after the VoidLight port slices (owner
+      2026-10-16) — after 66D.
     - **69D:** first scripted-weather consumer — after 59, 69B.
     - **69E:** benches show off-view weather is a measurable cost share — after 59, 60.
     - **69F:** worlds that cannot hold every chunk expanded in memory — after 64G, 58, 46, 74, 75.

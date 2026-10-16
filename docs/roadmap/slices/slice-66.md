@@ -18,6 +18,7 @@ hardware rather than shared CI VMs.
 | [**66C**](slice-66c.md) | Windows Authenticode, macOS Developer ID + notarization + `.dmg`, Linux AppImage; Flatpak rejected | first non-prerelease public release outside Steam |
 | [**66D**](slice-66d.md) | SteamPipe upload automation with fixed branch mapping | a Steamworks app ID exists |
 | [**66E**](slice-66e.md) | Authoritative perf runner on fixed reference hardware | first release-candidate tag |
+| [**66F**](slice-66f.md) | Steamworks runtime: achievements, overlay pause, Auto-Cloud, Steam Deck readiness | a Steamworks app ID exists; after the VoidLight port slices |
 
 ### Architecture notes
 
