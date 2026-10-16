@@ -3807,6 +3807,8 @@ test "shared batch blocks each start a cache line of their own and fit in it" {
 
 const ParticipantRanges = struct {
     ranges: usize = 0,
+    // The index of the first range this participant ran in the batch.
+    first_range: usize = std.math.maxInt(usize),
 };
 
 const ParticipantCountContext = struct {
@@ -3822,7 +3824,9 @@ fn countParticipantRanges(context: *anyopaque, range: ParallelRange, id: WorkerI
     for (range.start..range.end) |index| {
         _ = counts.hits[index].fetchAdd(1, .monotonic);
     }
-    counts.ranges_by_participant[id.index].value.ranges += 1;
+    const slot = &counts.ranges_by_participant[id.index].value;
+    if (slot.ranges == 0) slot.first_range = range.index;
+    slot.ranges += 1;
 }
 
 test "per-participant range counts stay exact under heavy claiming" {
@@ -3848,7 +3852,8 @@ test "per-participant range counts stay exact under heavy claiming" {
 }
 
 // Runs one fixed threaded batch over `range_count` one-item ranges capped at
-// `worker_cap` workers, and checks coverage and every participant's range count.
+// `worker_cap` workers, and checks coverage, every participant's range count, and that
+// every counted worker woke and ran its own first range before any claim.
 fn expectExactFixedBatch(
     threads: *ThreadSystem,
     slots: *SlotList(ParticipantRanges),
@@ -3875,6 +3880,7 @@ fn expectExactFixedBatch(
         const ranges = slots.items[threads.scratchSlotForWorker(worker.id)].value.ranges;
         if (index < expected_workers) {
             try std.testing.expect(ranges >= 1);
+            try std.testing.expectEqual(worker.id.index - 1, slots.items[threads.scratchSlotForWorker(worker.id)].value.first_range);
         } else {
             try std.testing.expectEqual(@as(usize, 0), ranges);
         }
@@ -3904,6 +3910,52 @@ test "back-to-back threaded dispatches stay exact as worker and range counts cyc
     for (0..10_000) |dispatch| {
         const worker_cap = 1 + dispatch % worker_count;
         const range_count = 2 + dispatch % (max_ranges - 1);
+        try expectExactFixedBatch(&threads, &slots, &hits, range_count, worker_cap);
+    }
+}
+
+test "every counted worker wakes once and runs its first range at every worker count" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const worker_count = 23;
+    const max_ranges = 4 * (worker_count + 1);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
+    defer threads.deinit();
+
+    var slots: SlotList(ParticipantRanges) = .empty;
+    defer slots.deinit(std.testing.allocator);
+    try slots.ensureTotalCapacity(std.testing.allocator, threads.participantSlotCount());
+    var hits: [max_ranges]std.atomic.Value(u32) = @splat(.init(0));
+
+    for (1..worker_count + 1) |worker_cap| {
+        // One range per participant, then enough that every participant claims.
+        try expectExactFixedBatch(&threads, &slots, &hits, worker_cap + 1, worker_cap);
+        try expectExactFixedBatch(&threads, &slots, &hits, 4 * (worker_cap + 1), worker_cap);
+    }
+}
+
+test "back-to-back batches stay exact as the counted set changes out of order with stale permits" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const worker_count = 15;
+    const max_ranges = 2 * (worker_count + 1);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
+    defer threads.deinit();
+    const io = threads.shared.descriptor.io;
+
+    var slots: SlotList(ParticipantRanges) = .empty;
+    defer slots.deinit(std.testing.allocator);
+    try slots.ensureTotalCapacity(std.testing.allocator, threads.participantSlotCount());
+    var hits: [max_ranges]std.atomic.Value(u32) = @splat(.init(0));
+
+    // The counted set grows and shrinks out of order, and every other batch a stale permit
+    // lets one worker, counted or not, wake before main publishes or posts it. A worker
+    // that drops its batch's wake hangs here; one that runs a batch that did not count it
+    // fails the range checks.
+    for (0..5_000) |batch| {
+        const worker_cap = 1 + (batch * 7) % worker_count;
+        if (batch % 2 == 0) threads.workers[(batch / 2) % worker_count].wake.post(io);
+        const range_count = worker_cap + 1 + batch % (worker_cap + 1);
         try expectExactFixedBatch(&threads, &slots, &hits, range_count, worker_cap);
     }
 }
