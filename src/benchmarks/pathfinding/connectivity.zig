@@ -214,8 +214,9 @@ fn checkOnewayIsolated(fixture: *const ReactFixture, stats: NavUpdateStats, tail
     if (fixture.system.graph.connectivity.closure.tail.capacity != tail_capacity) return error.ConnectivityOnewayBallastTail;
 }
 
-// Blocks `cells` (open before) and runs the nav reaction, then reopens them and runs it again.
-fn runToggle(io: std.Io, fixture: *ReactFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks) !ToggleSample {
+// Blocks `cells` (open before) and runs the nav reaction, then reopens them and runs it again
+// on `revert_tuners` (swapped in and out untimed).
+fn runToggle(io: std.Io, fixture: *ReactFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks, revert_tuners: *fixtures.NavTuners) !ToggleSample {
     const tail_capacity = fixture.system.graph.connectivity.closure.tail.capacity;
     const change = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
     if (checks.isolated) try checkOnewayIsolated(fixture, change.stats, tail_capacity);
@@ -226,7 +227,11 @@ fn runToggle(io: std.Io, fixture: *ReactFixture, cells: []const CellCoord, threa
         stats.conn_closure_candidates_batch, stats.conn_closure_resolve_batch, stats.conn_closure_mask_batch,
         stats.conn_closure_plan_batch,       stats.conn_closure_rows_batch,    stats.conn_closure_land_batch,
     };
-    const revert = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
+    const revert = revert: {
+        fixtures.swapNavTuners(&fixture.system, revert_tuners);
+        defer fixtures.swapNavTuners(&fixture.system, revert_tuners);
+        break :revert try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
+    };
     if (checks.isolated) try checkOnewayIsolated(fixture, revert.stats, tail_capacity);
     // A toggle and its revert never resize a one-way block.
     if (checks.fixed_blocks and (change.stats.closure_shrinks != 0 or revert.stats.closure_shrinks != 0)) return error.ConnectivityOnewayShrinkFlip;
@@ -329,17 +334,20 @@ const ToggleReport = struct {
 
 // Times `options.iterations` toggles of `cells` after `options.warmup_iterations` untimed
 // ones, each toggle after an untimed retire of `ballast` when there is one. Items/s is the
-// cells flipped per second.
+// cells flipped per second. The revert runs on its own stage tuner set, copied from the
+// fixture's, so each set learns one workload; the retire's reactions keep the tuners as
+// they were (`OnewayBallast.untimedReaction`).
 fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *ReactFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks, ballast: ?*OnewayBallast) !suite.RunStats {
+    var revert_tuners = fixture.system.tuners;
     for (0..options.warmup_iterations) |_| {
         if (ballast) |chain| try chain.retire(io, fixture, thread_system);
-        _ = try runToggle(io, fixture, cells, thread_system, checks);
+        _ = try runToggle(io, fixture, cells, thread_system, checks, &revert_tuners);
     }
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = ToggleReport{};
     for (0..options.iterations) |_| {
         if (ballast) |chain| try chain.retire(io, fixture, thread_system);
-        const sample = try runToggle(io, fixture, cells, thread_system, checks);
+        const sample = try runToggle(io, fixture, cells, thread_system, checks, &revert_tuners);
         accumulator.record(sample.elapsedNs(), sample.change.stats.remask_batch);
         report.add(sample);
         if (ballast) |chain| chain.addSample(sample);
@@ -1030,8 +1038,9 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
         cell.* = room.cell;
     }
     try fixture.changed.ensureTotalCapacity(allocator, @max(cells.len, ballast_cells.len));
-    fixtures.setNavTuners(&fixture.system, case);
     if (config.variant == .shrunk) try cutOnewayChain(allocator, io, &fixture, rooms[0 .. config.terminals - oneway_shrunk_live], thread_ptr);
+    // After the cut, so neither toggle tuner set starts trained on the cut's reaction.
+    fixtures.setNavTuners(&fixture.system, case);
     // The ballast starts retired: every sample reopens it first.
     var ballast = OnewayBallast{ .cells = ballast_cells, .size_config = size_config, .item_count = item_count, .block_words = if (ballast_cells.len == 0) 0 else try onewayBlockWords(ballast_cells.len) };
     if (config.variant == .ballast) try ballast.closeAll(io, &fixture, thread_ptr);

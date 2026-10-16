@@ -157,10 +157,25 @@ pub fn setNavTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void 
     };
 }
 
+/// A pathfinding system's stage tuners. A sample that runs a change and then its revert
+/// runs the revert on its own set (`swapNavTuners` around it, untimed), so each set learns
+/// one workload with one sample per step, as production's one reaction per step does.
+pub const NavTuners = @FieldType(PathfindingSystem, "tuners");
+
+/// Swaps `system`'s stage tuners with `other`.
+pub fn swapNavTuners(system: *PathfindingSystem, other: *NavTuners) void {
+    std.mem.swap(NavTuners, &system.tuners, other);
+}
+
 /// The connectivity flood tuner's workers after a case that runs it adaptive on workers
 /// (zero: it chose inline); null for any other case.
 pub fn floodTunerWorkers(system: *const PathfindingSystem, case: suite.BenchmarkCase) ?usize {
+    return floodTunerWorkersOf(&system.tuners, case);
+}
+
+/// `floodTunerWorkers` for the flood tuner of the stage tuner set `tuners`.
+pub fn floodTunerWorkersOf(tuners: *const NavTuners, case: suite.BenchmarkCase) ?usize {
     if (!case.adaptive or !case.usesThreadSystem()) return null;
-    const tuner = system.tuners.nav.getPtrConst(.conn_flood).report();
+    const tuner = tuners.nav.getPtrConst(.conn_flood).report();
     return if (tuner.has_threaded_profile) tuner.current_profile.worker_threads else 0;
 }

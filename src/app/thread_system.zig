@@ -76,6 +76,13 @@ pub const AdaptiveWorkProfile = struct {
     items_per_range: usize = (ThreadSystemConfig{}).items_per_range,
 };
 
+// A threaded profile and the dispatch overhead its batches measured beyond the
+// inline model's split work.
+const ProfileOverhead = struct {
+    profile: AdaptiveWorkProfile,
+    overhead_ns: u64,
+};
+
 /// Inputs to `ThreadSystem.selectBatchProfile` — the single entry point every stage
 /// (and `parallelForWithOptions`) uses to resolve a batch's shape. `available` and
 /// the config fallback are filled from the ThreadSystem.
@@ -112,9 +119,10 @@ pub const AdaptiveWorkTunerConfig = struct {
     threaded_commit_threshold_percent: u8 = 5,
     /// Item-count shift that, sustained for a full sample window, relearns.
     item_count_reset_percent: u8 = 25,
-    /// Thread-pool wake/join floor: batches finishing faster than this stay inline
-    /// without probing workers. Property of dispatch cost, not of any game stage.
-    threaded_batch_ns: u64 = 250_000,
+    /// Window median below which an inline stage stays inline without probing, and the
+    /// inline cost below which a settled threaded stage demotes (and above which a
+    /// demoted one restores). Sized from the full-pool wake/join cost, not any stage.
+    threaded_batch_ns: u64 = 60_000,
     retune_after_settled_windows: usize = 120,
     min_ranges_per_participant: usize = 1,
     max_ranges_per_participant: usize = 16,
@@ -128,7 +136,9 @@ pub const AdaptiveWorkPhase = enum {
     settled,
 };
 
-// Cost-model seeds until EWMA learns from real batches. Sub-microsecond defaults
+// Cost-model terms. `default_participant_overhead_ns` is a permanent floor under the
+// learned participant overhead in the worker-count prediction, not only a seed; the
+// range overhead floors the range-size model the same way. Sub-microsecond values
 // over-predicted worker counts for ~100µs work versus real wake/join overhead.
 const default_participant_overhead_ns: f64 = 25_000;
 const min_participant_overhead_ns: f64 = 5_000;
@@ -216,6 +226,10 @@ pub const AdaptiveWorkTuner = struct {
     // Set by a restore: the bound rule is skipped until the next retune probe or
     // sustained item-count shift. Implies `has_threaded_profile`.
     bound_rule_suppressed: bool = false,
+    // Dispatch overhead of the settled threaded profile, measured when it became
+    // policy: its best mean minus the inline model's work split across its
+    // participants. Null with no settled threaded profile or no inline model.
+    settled_overhead: ?ProfileOverhead = null,
     // Set by a sustained item-count shift on a threaded stage; consumed by the next
     // probe start, which then re-bases on the incumbent at the new count.
     retune_at_new_count: bool = false,
@@ -450,16 +464,14 @@ pub const AdaptiveWorkTuner = struct {
             self.startPredictedProbe(profile, sample_mean_ns);
             return;
         }
-        // Conservative per-window demotion with NO inline backprobe. The threaded
-        // duration times the participant count is an upper bound on the serial
-        // (inline) cost — it over-counts by all the parallel overhead. If even that
-        // upper bound is below the gate, inline is provably cheap enough, so drop
-        // back to inline. Using only the threaded measurement, this catches both a
-        // shrinking item count and a genuine per-item cost collapse, without the
-        // frozen-while-threaded inline cost model the previous prediction relied on.
+        // Bound rule, with no inline backprobe: a settled threaded window whose
+        // estimated inline cost (`inlineEstimateNs`) is below the gate demotes. The
+        // estimate removes the overhead this profile measured when it settled, so a
+        // per-item cost collapse at a constant item count demotes at any worker count;
+        // without that measurement it is the window times its participants. A wrong
+        // demotion is judged by the first inline window, which restores it.
         std.debug.assert(!self.bound_rule_suppressed or self.has_threaded_profile);
-        const participants = profile.worker_threads + 1;
-        if (!self.bound_rule_suppressed and @as(u128, sample_mean_ns) * participants < self.config.threaded_batch_ns) {
+        if (!self.bound_rule_suppressed and self.inlineEstimateNs(profile, sample_mean_ns) < self.config.threaded_batch_ns) {
             self.demoteToInline();
             return;
         }
@@ -657,6 +669,31 @@ pub const AdaptiveWorkTuner = struct {
         self.candidate_profile = null;
         self.failed_profile_count = 0;
         self.settled_window_count = 0;
+        self.settled_overhead = self.measuredOverhead();
+    }
+
+    // The settled threaded profile's best mean minus the inline model's work split
+    // across its participants, clamped at zero; null without both measurements.
+    fn measuredOverhead(self: *const AdaptiveWorkTuner) ?ProfileOverhead {
+        const profile = self.best_profile;
+        if (!self.has_threaded_profile or profile.worker_threads == 0) return null;
+        if (self.best_mean_batch_duration_ns == 0 or self.model_work_ns_per_item <= 0) return null;
+        const request = self.last_request orelse return null;
+        const participants: f64 = @floatFromInt(profile.worker_threads + 1);
+        const split_work_ns = self.model_work_ns_per_item * @as(f64, @floatFromInt(request.item_count)) / participants;
+        const overhead_ns = @max(@as(f64, @floatFromInt(self.best_mean_batch_duration_ns)) - split_work_ns, 0);
+        return .{ .profile = profile, .overhead_ns = @intFromFloat(overhead_ns) };
+    }
+
+    // Inline cost estimated from one threaded window: the window minus the profile's
+    // measured overhead, times its participants. Without a measured overhead for this
+    // profile it is the window times its participants, an upper bound.
+    fn inlineEstimateNs(self: *const AdaptiveWorkTuner, profile: AdaptiveWorkProfile, sample_mean_ns: u64) u128 {
+        const overhead_ns: u64 = if (self.settled_overhead) |measured|
+            (if (profilesEqual(measured.profile, profile)) measured.overhead_ns else 0)
+        else
+            0;
+        return @as(u128, sample_mean_ns -| overhead_ns) * (profile.worker_threads + 1);
     }
 
     // The bound rule (or a retune predicting inline) says inline is cheap enough:
@@ -676,6 +713,7 @@ pub const AdaptiveWorkTuner = struct {
         self.retune_climb = false;
         self.phase = .settled;
         self.has_threaded_profile = false;
+        self.settled_overhead = null;
         self.best_profile = self.initial_profile;
         self.current_profile = self.initial_profile;
         self.candidate_profile = null;
@@ -699,6 +737,7 @@ pub const AdaptiveWorkTuner = struct {
         self.inline_probe_cooldown_windows = 0;
         self.bound_rule_suppressed = true;
         self.retune_at_new_count = false;
+        self.settled_overhead = null;
     }
 
     // A sustained shift keeps a won threaded profile and re-tunes it from the next
@@ -707,6 +746,10 @@ pub const AdaptiveWorkTuner = struct {
     fn retuneAtNewCount(self: *AdaptiveWorkTuner) void {
         self.bound_rule_suppressed = false;
         if (self.phase != .settled) self.settle();
+        // The best mean was measured at the old count, so its overhead no longer pairs with
+        // the inline model at the new one; the bound uses the window x participants form
+        // until the retune at the new count settles again.
+        self.settled_overhead = null;
         self.retune_at_new_count = true;
         self.settled_window_count = self.config.retune_after_settled_windows - 1;
         self.resetSamples();
@@ -724,6 +767,7 @@ pub const AdaptiveWorkTuner = struct {
         self.retune_at_new_count = false;
         self.retune_climb = false;
         self.has_threaded_profile = false;
+        self.settled_overhead = null;
         self.best_mean_batch_duration_ns = 0;
         self.baseline_mean_batch_duration_ns = 0;
         self.failed_profile_count = 0;
@@ -2572,7 +2616,7 @@ test "adaptive work tuner default threshold requires full slow inline window" {
     });
     const request = tunerTestRequest(1024, 4, 16, 64);
 
-    // Above the default 250µs gate so learning eventually probes threading.
+    // Above the default gate so learning eventually probes threading.
     const slow_inline_ns: u64 = 300_000;
     var sample_index: usize = 0;
     while (sample_index < tuner.config.sample_window - 1) : (sample_index += 1) {
@@ -2653,12 +2697,12 @@ test "adaptive work tuner commits verified predicted profile" {
     try std.testing.expectEqual(@as(u64, 40_000), report.best_mean_batch_duration_ns);
 }
 
-test "adaptive work tuner default gate keeps sub quarter ms batches inline" {
+test "adaptive work tuner default gate keeps sub gate batches inline" {
     const request = tunerTestRequest(90, 9, 4, 64);
-    const cheap_durations_ns = [_]u64{ 48_000, 171_000, 100_000 };
+    const cheap_durations_ns = [_]u64{ 8_000, 30_000, 59_999 };
     for (cheap_durations_ns) |cheap_ns| {
         var tuner = AdaptiveWorkTuner.init(.{});
-        try std.testing.expectEqual(@as(u64, 250_000), tuner.config.threaded_batch_ns);
+        try std.testing.expectEqual(@as(u64, 60_000), tuner.config.threaded_batch_ns);
         const inline_profile = tuner.selectProfile(request);
         for (0..tuner.config.sample_window) |_| {
             tuner.record(tunerTestBatchWithProfile(90, inline_profile, cheap_ns));
@@ -2667,6 +2711,20 @@ test "adaptive work tuner default gate keeps sub quarter ms batches inline" {
         try std.testing.expectEqual(AdaptiveWorkPhase.settled, report.phase);
         try std.testing.expect(!report.has_threaded_profile);
         try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(request).worker_threads);
+    }
+}
+
+test "adaptive work tuner default gate probes batches from the gate up" {
+    const request = tunerTestRequest(1024, 4, 16, 64);
+    const gated_durations_ns = [_]u64{ 60_000, 100_000, 249_000 };
+    for (gated_durations_ns) |gated_ns| {
+        var tuner = AdaptiveWorkTuner.init(.{});
+        const inline_profile = tuner.selectProfile(request);
+        for (0..tuner.config.sample_window) |_| {
+            tuner.record(tunerTestBatchWithProfile(1024, inline_profile, gated_ns));
+        }
+        try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.report().phase);
+        try std.testing.expect(tuner.selectProfile(request).worker_threads > 0);
     }
 }
 
@@ -3023,7 +3081,7 @@ test "adaptive work tuner a sustained shift while demoted drops the remembered p
 }
 
 test "adaptive work tuner keeps a stage threaded when its inline run absorbs work the threaded run does not" {
-    var tuner = AdaptiveWorkTuner.init(.{ .initial_range_items = 64, .smallest_range_items = 16, .largest_range_items = 1024 });
+    var tuner = AdaptiveWorkTuner.init(.{ .initial_range_items = 64, .smallest_range_items = 16, .largest_range_items = 1024, .threaded_batch_ns = 250_000 });
 
     // Inline 270 us is above the 250 us gate; threaded 120 us / P + 20 us keeps
     // duration x participants below it for every reachable P, so the bound rule fires.
@@ -3047,6 +3105,75 @@ test "adaptive work tuner keeps a stage threaded when its inline run absorbs wor
     try std.testing.expect(demotions_after_warmup <= 4);
     try std.testing.expect(inline_steps_after_warmup <= (steps / retune_steps + 1) * window);
     try std.testing.expect(workers > 0);
+}
+
+// Drives `tuner` at a fixed work cost until it settles threaded, then to a window boundary.
+fn settleWideThreaded(tuner: *AdaptiveWorkTuner, item_count: usize, work_ns: u64) !usize {
+    var workers: usize = 0;
+    for (0..600) |_| workers = tunerScenarioStepWithFloor(tuner, item_count, work_ns);
+    try std.testing.expect(tuner.isSettled());
+    while (tuner.report().sample_count != 0) workers = tunerScenarioStepWithFloor(tuner, item_count, work_ns);
+    try std.testing.expect(tuner.isSettled());
+    return workers;
+}
+
+test "adaptive work tuner demotes a wide threaded stage whose per-item cost collapses at a constant count" {
+    var tuner = AdaptiveWorkTuner.init(.{});
+    const item_count = 4096;
+    const workers = try settleWideThreaded(&tuner, item_count, 200_000);
+    try std.testing.expect(workers >= 8);
+    const settled_profile = tuner.report().current_profile;
+
+    // About 20 us threaded: window x participants stays above the gate; less the overhead
+    // measured at settling, it does not.
+    for (0..tuner.config.sample_window) |_| {
+        try std.testing.expect(tunerScenarioStepWithFloor(&tuner, item_count, 5_000) > 0);
+    }
+    try std.testing.expect(!tuner.report().has_threaded_profile);
+    try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(tunerTestRequest(item_count, 23, 16, 64)).worker_threads);
+
+    // The cost returns: the first inline window at or above the gate restores the profile.
+    for (0..tuner.config.sample_window) |_| {
+        try std.testing.expectEqual(@as(usize, 0), tunerScenarioStepWithFloor(&tuner, item_count, 200_000));
+    }
+    try std.testing.expect(tuner.report().has_threaded_profile);
+    try std.testing.expectEqual(settled_profile, tuner.report().current_profile);
+}
+
+test "adaptive work tuner never demotes a wide threaded stage above the gate" {
+    var tuner = AdaptiveWorkTuner.init(.{});
+    const item_count = 4096;
+    try std.testing.expect(try settleWideThreaded(&tuner, item_count, 200_000) >= 8);
+    const demotions_before = tuner.report().demotion_count;
+
+    // Several retune periods at the same cost: every dispatch stays threaded.
+    const steps = 4 * tuner.config.retune_after_settled_windows * tuner.config.sample_window;
+    for (0..steps) |_| {
+        try std.testing.expect(tunerScenarioStepWithFloor(&tuner, item_count, 200_000) > 0);
+    }
+    try std.testing.expect(tuner.report().has_threaded_profile);
+    if (comptime diagnostics_enabled) {
+        try std.testing.expectEqual(demotions_before, tuner.report().demotion_count);
+    }
+}
+
+test "adaptive work tuner keeps a wide threaded stage threaded through a shift found mid-probe" {
+    var tuner = AdaptiveWorkTuner.init(.{});
+    _ = try settleWideThreaded(&tuner, 4096, 200_000);
+    while (tuner.report().phase != .probing) {
+        try std.testing.expect(tunerScenarioStepWithFloor(&tuner, 4096, 200_000) > 0);
+    }
+    const demotions_before = tuner.report().demotion_count;
+
+    // Half the items at the same per-item cost: 100 us inline, still above the gate.
+    const steps = 2 * tuner.config.retune_after_settled_windows * tuner.config.sample_window;
+    for (0..steps) |_| {
+        try std.testing.expect(tunerScenarioStepWithFloor(&tuner, 2048, 100_000) > 0);
+    }
+    try std.testing.expect(tuner.report().has_threaded_profile);
+    if (comptime diagnostics_enabled) {
+        try std.testing.expectEqual(demotions_before, tuner.report().demotion_count);
+    }
 }
 
 test "adaptive work tuner demotes a wait dominated threaded batch whose work is tiny" {
@@ -3703,10 +3830,10 @@ test "adaptive work tuner does not sample a single out-of-band batch" {
 }
 
 test "adaptive work tuner keeps a threaded stage threaded when main mostly waits on workers" {
-    var tuner = AdaptiveWorkTuner.init(.{ .initial_range_items = 64, .smallest_range_items = 16, .largest_range_items = 1024 });
+    var tuner = AdaptiveWorkTuner.init(.{ .initial_range_items = 64, .smallest_range_items = 16, .largest_range_items = 1024, .threaded_batch_ns = 250_000 });
 
-    // 600 us inline; threaded on 5 participants about 140 us, below the gate, with main
-    // waiting four fifths of it.
+    // 600 us inline; threaded on 5 participants about 140 us, below the 250 us gate, with
+    // main waiting four fifths of it: its busy time times participants is below the gate.
     var inline_steps_after_warmup: usize = 0;
     for (0..240) |step| {
         const workers = tunerScenarioStepWithWait(&tuner, 4000, 150);
@@ -4692,6 +4819,23 @@ fn tunerTestBatch(item_count: usize, items_per_range: usize, duration_ns: u64) B
 // fixed wake/join cost. Returns the active worker count.
 fn tunerScenarioStep(tuner: *AdaptiveWorkTuner, item_count: usize, ns_per_item: u64) usize {
     return tunerScenarioStepShaped(tuner, item_count, ns_per_item, 0, 0);
+}
+
+// A scenario step against a dispatch floor shaped like the measured one: inline costs
+// `work_ns`; threaded costs its participant share plus 8.5 us for the first worker and
+// 1 us for each further one.
+fn tunerScenarioStepWithFloor(tuner: *AdaptiveWorkTuner, item_count: usize, work_ns: u64) usize {
+    const max_workers = 23;
+    const shape = shapeBatch(item_count, tuner.selectProfile(tunerTestRequest(item_count, max_workers, 16, 64)), max_workers, 16, true);
+    const duration_ns = if (shape.worker_threads == 0)
+        work_ns
+    else
+        work_ns / (shape.worker_threads + 1) + 8_500 + 1_000 * (shape.worker_threads - 1);
+    tuner.record(tunerTestBatchWithProfile(item_count, .{
+        .worker_threads = shape.worker_threads,
+        .items_per_range = shape.items_per_range,
+    }, duration_ns));
+    return shape.worker_threads;
 }
 
 // `tunerScenarioStep` where a threaded batch's main thread waits on workers for four

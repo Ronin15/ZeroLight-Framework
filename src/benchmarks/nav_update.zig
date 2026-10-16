@@ -145,8 +145,11 @@ const Fixture = struct {
     events: std.ArrayList(SimulationEvent) = .empty,
     // Chunks each update must remask, when the footprint fixes it.
     expected_dirty_chunks: ?usize = null,
-    // The stats of the most recent timed update.
+    // The stats of the most recent timed update, and of the most recent opening half.
     last_stats: NavUpdateStats = .{},
+    open_stats: NavUpdateStats = .{},
+    // The re-blocking half's stage tuners (`fixtures.NavTuners`), set with the opening set.
+    revert_tuners: fixtures.NavTuners = .{},
 
     fn deinit(self: *Fixture) void {
         self.events.deinit(self.allocator);
@@ -251,12 +254,15 @@ fn setFootprint(fixture: *Fixture, allocator: std.mem.Allocator, variant: Varian
 }
 
 // One open-then-blocked toggle of the footprint: the first half opens it (grass), the second
-// re-blocks it (tree), each one nav update; only the updates are timed. Returns both halves'
-// sum.
+// re-blocks it (tree) on the revert stage tuners (swapped untimed), each one nav update; only
+// the updates are timed. Returns both halves' sum.
 fn runToggle(fixture: *Fixture, io: std.Io, thread_system: ?*ThreadSystem) !u64 {
     var elapsed: u64 = 0;
     try writeFootprint(fixture, fixture.grass);
     elapsed += try timeNavUpdate(fixture, io, thread_system);
+    fixture.open_stats = fixture.last_stats;
+    fixtures.swapNavTuners(&fixture.system, &fixture.revert_tuners);
+    defer fixtures.swapNavTuners(&fixture.system, &fixture.revert_tuners);
     try writeFootprint(fixture, fixture.tree);
     elapsed += try timeNavUpdate(fixture, io, thread_system);
     return elapsed;
@@ -287,6 +293,11 @@ fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: ?*ThreadSystem) !
     return elapsed;
 }
 
+// A toggle stage tuner set's plan, remask, and patch tuners settled.
+fn toggleTunersSettled(tuners: *const fixtures.NavTuners) bool {
+    return tuners.nav.getPtrConst(.plan).isSettled() and tuners.nav.getPtrConst(.remask).isSettled() and tuners.nav.getPtrConst(.patch).isSettled();
+}
+
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, variant: Variant) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var threads = try fixtures.initCaseThreads(allocator, io, case);
@@ -303,6 +314,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     fixture.system.recordTerrainNavEvents(fixture.events.items, &fixture.world, null);
     _ = try fixture.system.applyBufferedNavUpdates(&fixture.colliders, &fixture.world, null);
     fixtures.setNavTuners(&fixture.system, case);
+    fixture.revert_tuners = fixture.system.tuners;
 
     // Warm so the abstract buffers are at high-water capacity (the steady path is
     // allocation-free) and the tuners have trained an inline baseline before timing.
@@ -310,7 +322,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.system.tuners.nav.getPtrConst(.plan).isSettled() or !fixture.system.tuners.nav.getPtrConst(.remask).isSettled() or !fixture.system.tuners.nav.getPtrConst(.patch).isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+        while ((!toggleTunersSettled(&fixture.system.tuners) or !toggleTunersSettled(&fixture.revert_tuners)) and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try runToggle(&fixture, io, thread_ptr);
         }
     }
@@ -326,10 +338,11 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         accumulator.record(elapsed / 2, inlineBatch(edited_cells, 1));
     }
     var stats = accumulator.finish();
-    // The stages each update ran, so a threaded row the tuner kept inline reads inline.
-    stats.batch = suite.batchSummaryFromBatch(fixture.last_stats.remask_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.last_stats.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.last_stats.patch_batch);
+    // The stages the opening update ran (the reported tuners' set), so a threaded row the
+    // tuner kept inline reads inline.
+    stats.batch = suite.batchSummaryFromBatch(fixture.open_stats.remask_batch);
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.open_stats.plan_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.open_stats.patch_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.remask).report(), remask_settled);
         stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.patch).report(), patch_settled);

@@ -1131,11 +1131,19 @@ const BatchTiming = struct {
     // Stage time spent on workers: a stage that ran inline reports its duration but
     // ran on the main thread.
     off_main_ns: u64 = 0,
+    // The forward edit's batches, the ones the reported (forward) tuners chose.
+    forward_plan: BatchStats = .{},
+    forward_write: BatchStats = .{},
 
     fn add(self: *BatchTiming, world: *const WorldSystem) void {
         for ([_]BatchStats{ world.last_terrain_edit_plan_batch, world.last_terrain_edit_write_batch }) |batch| self.off_main_ns += offMainNs(batch);
         self.plan_ns += world.last_terrain_edit_plan_batch.batch_duration_ns;
         self.write_ns += world.last_terrain_edit_write_batch.batch_duration_ns;
+    }
+
+    fn captureForward(self: *BatchTiming, world: *const WorldSystem) void {
+        self.forward_plan = world.last_terrain_edit_plan_batch;
+        self.forward_write = world.last_terrain_edit_write_batch;
     }
 };
 
@@ -1144,17 +1152,48 @@ fn applyBatch(world: *WorldSystem, chunks: []const DenseChunkWrites, events: *st
     try world.applyDenseCellWrites(chunks, threads, events);
 }
 
-// One timed batched change and its reversal; returns the cells written.
-fn runBatchIteration(fixture: *Fixture, edit: *BatchEdit, threads: ?TerrainEditThreads, timing: *BatchTiming) !usize {
+// The reversal's terrain-edit tuners: a sample that runs a batched change and then its
+// reversal runs the reversal on these, so each pair learns one workload with one sample
+// per step, as production's one batched edit per step does.
+const RevertEditTuners = struct {
+    plan: AdaptiveWorkTuner,
+    write: AdaptiveWorkTuner,
+
+    fn forCase(case: suite.BenchmarkCase) RevertEditTuners {
+        return .{ .plan = editTunerForCase(case), .write = editTunerForCase(case) };
+    }
+
+    // `forward` with its tuners replaced by these; null when it is.
+    fn threads(self: *RevertEditTuners, forward: ?TerrainEditThreads) ?TerrainEditThreads {
+        var revert = forward orelse return null;
+        revert.plan_tuner = &self.plan;
+        revert.write_tuner = &self.write;
+        return revert;
+    }
+
+    fn settled(self: *const RevertEditTuners) bool {
+        return self.plan.isSettled() and self.write.isSettled();
+    }
+};
+
+// A terrain-edit stage tuner for `case`, partitioned by chunk.
+fn editTunerForCase(case: suite.BenchmarkCase) AdaptiveWorkTuner {
+    return suite.adaptiveTunerForPartition(case, suite.chunk_partition_items, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+}
+
+// One timed batched change and its reversal, the reversal on `revert`'s tuners; returns the
+// cells written.
+fn runBatchIteration(fixture: *Fixture, edit: *BatchEdit, threads: ?TerrainEditThreads, revert: *RevertEditTuners, timing: *BatchTiming) !usize {
     try applyBatch(&fixture.world, edit.forward_chunks.items, &edit.events, threads);
     timing.add(&fixture.world);
-    try applyBatch(&fixture.world, edit.back_chunks.items, &edit.events, threads);
+    timing.captureForward(&fixture.world);
+    try applyBatch(&fixture.world, edit.back_chunks.items, &edit.events, revert.threads(threads));
     timing.add(&fixture.world);
     return edit.forward.items.len + edit.back.items.len;
 }
 
-fn tunersSettled(world: *const WorldSystem) bool {
-    return world.terrain_edit_plan_tuner.isSettled() and world.terrain_edit_write_tuner.isSettled();
+fn tunersSettled(world: *const WorldSystem, revert: *const RevertEditTuners) bool {
+    return world.terrain_edit_plan_tuner.isSettled() and world.terrain_edit_write_tuner.isSettled() and revert.settled();
 }
 
 fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: BatchWorkload) !suite.RunStats {
@@ -1190,8 +1229,9 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     }
 
     const world = &fixture.world;
-    world.terrain_edit_plan_tuner = suite.adaptiveTunerForPartition(case, suite.chunk_partition_items, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-    world.terrain_edit_write_tuner = suite.adaptiveTunerForPartition(case, suite.chunk_partition_items, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    world.terrain_edit_plan_tuner = editTunerForCase(case);
+    world.terrain_edit_write_tuner = editTunerForCase(case);
+    var revert_tuners = RevertEditTuners.forCase(case);
     const edit_threads: ?TerrainEditThreads = if (threads) |*thread_system| .{
         .thread_system = thread_system,
         .plan_tuner = &world.terrain_edit_plan_tuner,
@@ -1201,14 +1241,14 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     var unused_timing: BatchTiming = .{};
     for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
-        _ = try runBatchIteration(&fixture, &edit, edit_threads, &unused_timing);
+        _ = try runBatchIteration(&fixture, &edit, edit_threads, &revert_tuners, &unused_timing);
         _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!tunersSettled(world) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runBatchIteration(&fixture, &edit, edit_threads, &unused_timing);
+        while (!tunersSettled(world, &revert_tuners) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runBatchIteration(&fixture, &edit, edit_threads, &revert_tuners, &unused_timing);
             _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
         }
     }
@@ -1220,12 +1260,14 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var write_total: u128 = 0;
     var main_total: u128 = 0;
     var cells_changed: usize = 0;
+    var forward_timing: BatchTiming = .{};
     for (0..options.iterations) |_| {
         var timing: BatchTiming = .{};
         const start_ns = suite.nowNs(io);
-        cells_changed = try runBatchIteration(&fixture, &edit, edit_threads, &timing);
+        cells_changed = try runBatchIteration(&fixture, &edit, edit_threads, &revert_tuners, &timing);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        accumulator.record(elapsed_ns, world.last_terrain_edit_write_batch);
+        forward_timing = timing;
+        accumulator.record(elapsed_ns, timing.forward_write);
         plan_total += timing.plan_ns;
         write_total += timing.write_ns;
         // Main is everything but the stages that ran on workers.
@@ -1237,8 +1279,9 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     // batches' item count is the chunks one edit touched.
     stats.output_count = cells_changed;
     stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(world.last_terrain_edit_write_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(world.last_terrain_edit_plan_batch);
+    // The forward edit's shapes, beside the forward tuners reported below.
+    stats.batch = suite.batchSummaryFromBatch(forward_timing.forward_write);
+    stats.secondary_batch = suite.batchSummaryFromBatch(forward_timing.forward_plan);
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         stats.terrain_edit_phases = .{
@@ -1324,6 +1367,12 @@ const NavFixture = struct {
     // The most recent reaction's stats and wall time.
     last_stats: NavUpdateStats = .{},
     last_reaction_ns: u64 = 0,
+    // The revert reaction's stage tuners (`fixtures.NavTuners`), set with the forward set.
+    revert_tuners: fixtures.NavTuners = .{},
+    // Items each set's last reaction flooded: a set whose half floods nothing records no
+    // flood sample, so its flood tuner is not waited on.
+    forward_flood_items: usize = 0,
+    revert_flood_items: usize = 0,
 
     fn deinit(self: *NavFixture) void {
         self.changes.deinit();
@@ -1331,6 +1380,30 @@ const NavFixture = struct {
         self.colliders.deinit();
         self.base.deinit();
         self.* = undefined;
+    }
+
+    // Gives the forward and revert stage tuner sets the same fresh tuners for `case`.
+    fn setTuners(self: *NavFixture, case: suite.BenchmarkCase) void {
+        fixtures.setNavTuners(&self.system, case);
+        self.revert_tuners = self.system.tuners;
+    }
+
+    // Swaps the revert stage tuners in or back out (untimed).
+    fn swapRevertTuners(self: *NavFixture) void {
+        fixtures.swapNavTuners(&self.system, &self.revert_tuners);
+    }
+
+    // Both stage tuner sets settled (`navStageTunersSettled`), each flood tuner gated on
+    // its own half's last flood.
+    fn stageTunersSettled(self: *const NavFixture, reaction: bool) bool {
+        return navStageTunersSettled(&self.system.tuners, self.forward_flood_items == 0, reaction) and
+            navStageTunersSettled(&self.revert_tuners, self.revert_flood_items == 0, reaction);
+    }
+
+    // Records the last reaction's flood items against the set that ran it.
+    fn noteFlood(self: *NavFixture, reverting: bool) void {
+        const items = self.last_stats.conn_flood_batch.item_count;
+        if (reverting) self.revert_flood_items = items else self.forward_flood_items = items;
     }
 
     // Records the step's changes as each dig writer does (its reserve, then the inline
@@ -1434,11 +1507,11 @@ fn navFixtureOver(allocator: std.mem.Allocator, io: std.Io, fixture: Fixture, ca
 }
 
 // `reaction`: the workload runs the post-commit reaction, so its mark stage dispatches too.
-fn navStageTunersSettled(system: *const PathfindingSystem, reaction: bool) bool {
-    return (!reaction or system.tuners.nav_mark.isSettled()) and system.tuners.nav.getPtrConst(.plan).isSettled() and
-        system.tuners.nav.getPtrConst(.remask).isSettled() and system.tuners.nav.getPtrConst(.patch).isSettled() and
-        system.tuners.nav.getPtrConst(.conn_seed).isSettled() and system.tuners.nav.getPtrConst(.conn_gather).isSettled() and
-        (system.tuners.nav.getPtrConst(.conn_flood).isSettled() or system.graph.connectivity.last_flood_batch.item_count == 0);
+fn navStageTunersSettled(tuners: *const fixtures.NavTuners, flood_idle: bool, reaction: bool) bool {
+    return (!reaction or tuners.nav_mark.isSettled()) and tuners.nav.getPtrConst(.plan).isSettled() and
+        tuners.nav.getPtrConst(.remask).isSettled() and tuners.nav.getPtrConst(.patch).isSettled() and
+        tuners.nav.getPtrConst(.conn_seed).isSettled() and tuners.nav.getPtrConst(.conn_gather).isSettled() and
+        (tuners.nav.getPtrConst(.conn_flood).isSettled() or flood_idle);
 }
 
 const NavWorkload = enum { dig, ramp };
@@ -1484,47 +1557,48 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     defer nav.deinit();
     try nav_size.checkNavBytes(group_name, item_count, size_config, &nav.system);
     nav.threads = thread_ptr;
-    fixtures.setNavTuners(&nav.system, case);
+    nav.setTuners(case);
 
     for (0..options.warmup_iterations) |_| {
-        _ = try runNavIteration(&nav, workload);
+        _ = try runNavIteration(io, &nav, workload);
         if (workload == .ramp) try resetNavRamps(&nav);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!navStageTunersSettled(&nav.system, false) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runNavIteration(&nav, workload);
+        while (!nav.stageTunersSettled(false) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runNavIteration(io, &nav, workload);
             if (workload == .ramp) try resetNavRamps(&nav);
         }
     }
-    const remask_settled = if (case.adaptive) nav.system.tuners.nav.getPtrConst(.remask).isSettled() else false;
-    const patch_settled = if (case.adaptive) nav.system.tuners.nav.getPtrConst(.patch).isSettled() else false;
+    const reported_tuners = reportedNavTuners(&nav, workload);
+    const remask_settled = if (case.adaptive) reported_tuners.nav.getPtrConst(.remask).isSettled() else false;
+    const patch_settled = if (case.adaptive) reported_tuners.nav.getPtrConst(.patch).isSettled() else false;
     var accumulator = suite.StatsAccumulator.init(item_count);
     var cells_changed: usize = 0;
-    // The last timed reaction, read before the ramp reset's reaction replaces it.
+    // The last timed reported reaction, read before the ramp reset's reaction replaces it.
     var timed_stats: NavUpdateStats = .{};
     var timed_main = suite.NavMainSummary{};
     for (0..options.iterations) |_| {
-        const start_ns = suite.nowNs(io);
-        cells_changed = try runNavIteration(&nav, workload);
-        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), nav.last_stats.remask_batch);
-        timed_stats = nav.last_stats;
-        timed_main = nav.lastNavMain();
+        const sample = try runNavIteration(io, &nav, workload);
+        cells_changed = sample.cells;
+        accumulator.record(sample.elapsed_ns, sample.reported_stats.remask_batch);
+        timed_stats = sample.reported_stats;
+        timed_main = sample.reported_main;
         if (workload == .ramp) try resetNavRamps(&nav);
     }
     try nav_size.checkNavBytes(group_name, item_count, size_config, &nav.system);
     var stats = accumulator.finish();
     stats.output_count = cells_changed;
     stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
-    stats.nav_conn = suite.navConnSummary(timed_stats, fixtures.floodTunerWorkers(&nav.system, case));
+    stats.nav_conn = suite.navConnSummary(timed_stats, fixtures.floodTunerWorkersOf(reported_tuners, case));
     stats.nav_main = timed_main;
     stats.batch = suite.batchSummaryFromBatch(timed_stats.remask_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(timed_stats.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(timed_stats.patch_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(nav.system.tuners.nav.getPtrConst(.remask).report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(nav.system.tuners.nav.getPtrConst(.patch).report(), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(reported_tuners.nav.getPtrConst(.remask).report(), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(reported_tuners.nav.getPtrConst(.patch).report(), patch_settled);
     }
     return stats;
 }
@@ -1533,29 +1607,62 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
 // and refills its 64 cells in two steps; the ramp workload digs its 64 ramps. Each step's
 // writers record their blocking changes, every workload cell among them, and the reaction
 // applies them.
-fn runNavIteration(nav: *NavFixture, workload: NavWorkload) !usize {
+// One nav iteration's timed span, the cells it changed, and its forward reaction.
+// One nav iteration's timed span, the cells it changed, and its reported reaction: the
+// dig's refill (the half that blocks cells, so splits and floods), the ramp's ramp.
+const NavIterationSample = struct {
+    elapsed_ns: u64,
+    cells: usize,
+    reported_stats: NavUpdateStats,
+    reported_main: suite.NavMainSummary,
+};
+
+// The stage tuner set that ran a workload's reported reaction (`NavIterationSample`).
+fn reportedNavTuners(nav: *const NavFixture, workload: NavWorkload) *const fixtures.NavTuners {
+    return switch (workload) {
+        .dig => &nav.revert_tuners,
+        .ramp => &nav.system.tuners,
+    };
+}
+
+// Times the workload's change and reaction; a dig also times its refill and reaction, run
+// on the revert tuners (the swaps are untimed).
+fn runNavIteration(io: std.Io, nav: *NavFixture, workload: NavWorkload) !NavIterationSample {
     const level = nav.base.levels - 1;
-    switch (workload) {
-        .dig => {
-            _ = try digCells(&nav.base, level, nav.base.tunnel, &nav.changes, dig_window_chunks);
-            try nav.reactToChanges(dig_cell_count);
-            _ = try digCells(&nav.base, level, nav.base.dirt, &nav.changes, dig_window_chunks);
-            try nav.reactToChanges(dig_cell_count);
-            return @as(usize, dig_cell_count) * 2;
-        },
-        .ramp => {
-            const ramps = try digRamps(&nav.base, &nav.changes);
-            try nav.reactToChanges(dig_cell_count);
-            return ramps;
-        },
-    }
+    var start_ns = suite.nowNs(io);
+    const cells = switch (workload) {
+        .dig => try digCells(&nav.base, level, nav.base.tunnel, &nav.changes, dig_window_chunks),
+        .ramp => try digRamps(&nav.base, &nav.changes),
+    };
+    try nav.reactToChanges(dig_cell_count);
+    nav.noteFlood(false);
+    var sample = NavIterationSample{
+        .elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io)),
+        .cells = if (workload == .dig) @as(usize, dig_cell_count) * 2 else cells,
+        .reported_stats = nav.last_stats,
+        .reported_main = nav.lastNavMain(),
+    };
+    if (workload == .ramp) return sample;
+    nav.swapRevertTuners();
+    defer nav.swapRevertTuners();
+    start_ns = suite.nowNs(io);
+    _ = try digCells(&nav.base, level, nav.base.dirt, &nav.changes, dig_window_chunks);
+    try nav.reactToChanges(dig_cell_count);
+    sample.elapsed_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+    nav.noteFlood(true);
+    sample.reported_stats = nav.last_stats;
+    sample.reported_main = nav.lastNavMain();
+    return sample;
 }
 
 // Returns the ramp workload's terrain and its nav to the start state (untimed): the refill's
 // marks re-derive the ramp and exit chunks, and the links stay, dead.
 fn resetNavRamps(nav: *NavFixture) !void {
+    nav.swapRevertTuners();
+    defer nav.swapRevertTuners();
     try undoRamps(&nav.base, &nav.changes);
     try nav.reactToChanges(dig_cell_count);
+    nav.noteFlood(true);
 }
 
 fn runNavCaveInCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -1575,33 +1682,42 @@ const NavBatchTiming = struct {
     nav_ns: u64 = 0,
     // Nav reaction stage time spent on workers.
     nav_off_main_ns: u64 = 0,
-    // The first (forward) edit's reaction.
+    // The first (forward) edit's reaction and its mark dispatch.
     forward: NavUpdateStats = .{},
+    forward_mark: BatchStats = .{},
     // Both reactions' main-thread split, summed.
     nav_main: suite.NavMainSummary = .{},
 };
 
-fn navTunersSettled(nav: *const NavFixture) bool {
-    return tunersSettled(&nav.base.world) and navStageTunersSettled(&nav.system, true);
+fn navTunersSettled(nav: *const NavFixture, revert: *const RevertEditTuners) bool {
+    return tunersSettled(&nav.base.world, revert) and nav.stageTunersSettled(true);
 }
 
 // One batched change and its reversal, each followed by the writer's nav record of its
 // published tile events and the post-commit nav reaction (interpretation, marking, and
 // apply, timed as the nav stage); returns the cells written. The record is reserved from
 // the cells written before each write, as a terrain writer reserves from its event budget.
-// Publishing the events is untimed setup.
-fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, frame: *SimulationFrame, edit_threads: ?TerrainEditThreads, thread_system: ?*ThreadSystem, timing: *NavBatchTiming) !usize {
+// Publishing the events is untimed setup. The reversal runs on `revert`'s edit tuners and
+// the fixture's revert stage tuners (swapped in and out untimed).
+fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, frame: *SimulationFrame, edit_threads: ?TerrainEditThreads, revert: *RevertEditTuners, thread_system: ?*ThreadSystem, timing: *NavBatchTiming) !usize {
     for ([_][]const DenseChunkWrites{ edit.forward_chunks.items, edit.back_chunks.items }, [_]usize{ edit.forward.items.len, edit.back.items.len }) |chunks, cell_count| {
+        const reverting = chunks.ptr == edit.back_chunks.items.ptr;
+        if (reverting) nav.swapRevertTuners();
+        defer if (reverting) nav.swapRevertTuners();
         try nav.system.reserveTerrainNavRecord(cell_count);
         const edit_start_ns = suite.nowNs(io);
-        try applyBatch(&nav.base.world, chunks, &edit.events, edit_threads);
+        try applyBatch(&nav.base.world, chunks, &edit.events, if (reverting) revert.threads(edit_threads) else edit_threads);
         timing.elapsed_ns += suite.elapsedNs(edit_start_ns, suite.nowNs(io));
         timing.terrain.add(&nav.base.world);
         try publishBatchEvents(frame, edit.events.items);
         const nav_start_ns = suite.nowNs(io);
         const nav_stats = try nav.reactToFrame(frame, thread_system);
         const nav_elapsed_ns = suite.elapsedNs(nav_start_ns, suite.nowNs(io));
-        if (chunks.ptr == edit.forward_chunks.items.ptr) timing.forward = nav_stats;
+        nav.noteFlood(reverting);
+        if (!reverting) {
+            timing.forward = nav_stats;
+            timing.forward_mark = nav.system.last_mark_batch;
+        }
         timing.nav_ns += nav_elapsed_ns;
         timing.elapsed_ns += nav_elapsed_ns;
         timing.nav_off_main_ns += nav_stats.off_main_stage_ns;
@@ -1785,9 +1901,10 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     const world = &nav.base.world;
     const system = &nav.system;
-    world.terrain_edit_plan_tuner = suite.adaptiveTunerForPartition(case, suite.chunk_partition_items, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-    world.terrain_edit_write_tuner = suite.adaptiveTunerForPartition(case, suite.chunk_partition_items, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-    fixtures.setNavTuners(system, case);
+    world.terrain_edit_plan_tuner = editTunerForCase(case);
+    world.terrain_edit_write_tuner = editTunerForCase(case);
+    var revert_tuners = RevertEditTuners.forCase(case);
+    nav.setTuners(case);
     const edit_threads: ?TerrainEditThreads = if (threads) |*thread_system| .{
         .thread_system = thread_system,
         .plan_tuner = &world.terrain_edit_plan_tuner,
@@ -1797,13 +1914,13 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     var unused_timing: NavBatchTiming = .{};
     for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
-        _ = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, thread_ptr, &unused_timing);
+        _ = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, &revert_tuners, thread_ptr, &unused_timing);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!navTunersSettled(&nav) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, thread_ptr, &unused_timing);
+        while (!navTunersSettled(&nav, &revert_tuners) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, &revert_tuners, thread_ptr, &unused_timing);
         }
     }
     const remask_settled = if (case.adaptive) system.tuners.nav.getPtrConst(.remask).isSettled() else false;
@@ -1816,11 +1933,13 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var main_total: u128 = 0;
     var cells_changed: usize = 0;
     var forward: NavUpdateStats = .{};
+    var forward_mark: BatchStats = .{};
     var nav_main = suite.NavMainSummary{};
     for (0..options.iterations) |_| {
         var timing: NavBatchTiming = .{};
-        cells_changed = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, thread_ptr, &timing);
+        cells_changed = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, &revert_tuners, thread_ptr, &timing);
         forward = timing.forward;
+        forward_mark = timing.forward_mark;
         nav_main.merge(timing.nav_main);
         nav_main.endSample();
         if (enclose) |config| {
@@ -1842,7 +1961,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     stats.nav_conn = suite.navConnSummary(forward, fixtures.floodTunerWorkers(&nav.system, case));
     stats.nav_main = nav_main;
     stats.batch = suite.batchSummaryFromBatch(forward.remask_batch);
-    stats.nav_mark_batch = suite.batchSummaryFromBatch(system.last_mark_batch);
+    stats.nav_mark_batch = suite.batchSummaryFromBatch(forward_mark);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(forward.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(forward.patch_batch);
     if (stats.iterations > 0) {
@@ -1896,7 +2015,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     defer nav.deinit();
     try nav_size.checkNavBytes(nav_level_add_group.name, item_count, size_config, &nav.system);
     nav.threads = thread_ptr;
-    fixtures.setNavTuners(&nav.system, case);
+    nav.setTuners(case);
     var frame = SimulationFrame.init(allocator);
     defer frame.deinit();
     for (0..options.warmup_iterations) |_| _ = try levelAddIteration(io, &nav, &frame, replace);
@@ -1917,15 +2036,19 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
 // One level-add iteration; returns its timed span. The main case adds a level with a
 // solid floor band, then runs the nav reaction on a step with no events (it builds the
 // added level). The replace case first adds a level with a walkable floor and reacts
-// (untimed), then adds a blocking band to that newest level and reacts (it rebuilds that
-// level), so each level gains at most one band.
+// (untimed, on the revert stage tuners), then adds a blocking band to that newest level and
+// reacts (it rebuilds that level), so each level gains at most one band.
 fn levelAddIteration(io: std.Io, nav: *NavFixture, frame: *SimulationFrame, replace: bool) !u64 {
     const world = &nav.base.world;
     const new_level_z = -@as(i32, @intCast(world.levelCount())) * level_z_step;
     if (replace) {
         const level = try world.addLevel(new_level_z);
         _ = try world.addDenseLayer(level, 0, .floor, nav.base.tunnel);
-        try reactToLevelChange(nav, frame);
+        {
+            nav.swapRevertTuners();
+            defer nav.swapRevertTuners();
+            try reactToLevelChange(nav, frame);
+        }
         const start_ns = suite.nowNs(io);
         _ = try world.addDenseLayer(level, 0, .obstacle, nav.base.dirt);
         try reactToLevelChange(nav, frame);
