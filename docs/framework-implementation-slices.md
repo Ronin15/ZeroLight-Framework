@@ -138,7 +138,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**44**](roadmap/slices/slice-44.md) | Not started | Input Rebinding And Extended Gamepad Controls — after 53B, 54 |
 | [**46**](roadmap/slices/slice-46.md) | Not started | Save/Load Persistence — after 49, 51, 53B, 54, 64B, 64G, 74 |
 | [**49**](roadmap/slices/slice-49.md) | In progress | Session Seed And Determinism Checksum Harness — after 64G |
-| [**50**](roadmap/slices/slice-50.md) | Not started | Thread System Hardening |
+| [**50**](roadmap/slices/slice-50.md) | Landed (acceptance runs pending) | Thread System Hardening |
 | [**51**](roadmap/slices/slice-51.md) | Not started | Background Job Lane With Deterministic Step Handoff — after 49, 50, 64A |
 | [**52**](roadmap/slices/slice-52.md) | Not started (umbrella) | Release Build Baseline, Pinned Dependencies, And CI — after 49 |
 | [**52A**](roadmap/slices/slice-52a.md) | In progress | Release CPU Baseline, Toolchain Pins, Pinned SDL, Committed Shaders |
@@ -264,9 +264,11 @@ roadmap flow (Suggested Order) resumes after the AI branch.
 2. **Core systems:** opens with [50](roadmap/slices/slice-50.md) (owner
    2026-10-12), so the branch's threaded rework runs under the race
    detector; then spatial index, steering, collision, tile gate, render
-   prep, inert rows, and Slice 75's tier mechanics. Findings the 64G combined
-   review routed here (file:line at `e2b9b2c`), written into slice checklists
-   when the branch opens:
+   prep, inert rows, and Slice 75's tier mechanics. Slice 50 landed on
+   `core_systems` (`e56e37b`..`65434f7`); its final TSan, `verify`,
+   ReleaseFast, and owner Windows/Mac runs are open in the slice. Findings
+   the 64G combined review routed here (file:line at `e2b9b2c`), written into
+   slice checklists when the branch opens:
    - [ ] Tile gate on main (64G area D H1): `world_gate.apply`
      (`simulation_pipeline.zig:1556`) runs `gateNpcEntitiesToWalkableTiles`
      (`world_gate.zig:36`) and `clampAiEntitiesToBounds` (`:114`), two serial
@@ -436,7 +438,7 @@ order.
 1. **64G** Chunk-Owned Terrain And Nav.
 2. **82** Split The World Module — landed (archived).
 3. **81** Split The Pathfinding Module — landed (archived).
-4. **50** Thread System Hardening (opens the core-systems branch).
+4. **50** Thread System Hardening (opens the core-systems branch) — landed on `core_systems`.
 5. **76** Cave-Ins — after 64G.
 6. **77** Explosions — after 64G, 76.
 7. **49** Session Seed And Determinism Checksum Harness — after 64G.

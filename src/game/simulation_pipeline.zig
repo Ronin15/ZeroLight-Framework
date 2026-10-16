@@ -5354,8 +5354,8 @@ const contactsNaming = @import("systems/collision_response_test_support.zig").co
 
 /// Pins every pipeline batch tuner to one settled threaded `profile` that never
 /// re-probes, demotes, or resets on item-count drift, so the multi-worker path runs a
-/// deterministic multi-range partition. The tuners would otherwise keep this small
-/// test workload inline (below `threaded_batch_ns`). The tuners are found by walking the
+/// deterministic multi-range partition. The tuners would otherwise pick the shape from
+/// timing (inline below `threaded_batch_ns`). The tuners are found by walking the
 /// pipeline's fields at comptime, so a tuner a system adds is pinned with it.
 /// Test-only local fixture.
 fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveWorkProfile) void {

@@ -121,9 +121,10 @@ with `spirv-cross --hlsl --shader-model 60`, and HLSL to DXIL with `dxc` using
 
 `build.zig` uses Zig's default backend and linker selection for every target.
 On x86_64 Linux, Debug builds use Zig's self-hosted backend and linker, which
-compile much faster; release builds use LLVM and LLD. The one explicit override is the app
-executable in `ReleaseFast` with LTO, which always sets LLVM and LLD because
-LTO requires them.
+compile much faster; release builds use LLVM and LLD. Two explicit overrides: the
+app executable in `ReleaseFast` with LTO sets LLVM and LLD (LTO requires them),
+and `-Dsanitize-thread` sets LLVM on the test and bench artifacts
+([Thread Sanitizer](#thread-sanitizer)).
 
 ## Windows SDL Packages
 
@@ -164,8 +165,9 @@ absolute SDL DLL directories to the launched process's `PATH` (Zig 0.17 removed
 `Run.addPathDir`). That value is computed from the configure-time environment,
 which Zig 0.17's configure cache does not key on, so `build.zig` poisons the
 configure cache on Windows hosts and the configure phase re-runs on every
-`zig build` there. Non-Windows hosts, including Windows cross-builds, are
-unaffected.
+`zig build` there. A `-Dsanitize-thread` build poisons it on every host
+([Thread Sanitizer](#thread-sanitizer)); other builds on non-Windows hosts,
+including Windows cross-builds, are unaffected.
 
 ## Diagnostics And Log Levels
 
@@ -317,6 +319,36 @@ lint, idiom lint, and a `zig fmt --check` over `build.zig`, `build.zig.zon`, and
 `src/` (files edited outside the format hook fail here; `zig build fmt` fixes
 them).
 
+## Thread Sanitizer
+
+```sh
+zig build test -Dsanitize-thread=true
+zig build test -Dsanitize-thread=true -Dtest-filter=thread_system
+zig build bench -Dsanitize-thread=true -- --group thread-dispatch
+```
+
+`-Dsanitize-thread=true` builds the unit-test and bench artifacts with
+ThreadSanitizer and forces the LLVM backend on them (the self-hosted backend
+does not instrument). The app and `gpu-smoke` are never instrumented, and SDL
+and GPU driver threads stay uninstrumented. The option is enabled for x86_64
+and aarch64 on Linux (glibc), macOS, and FreeBSD; on any other target every
+step that builds a sanitized artifact (`check`, `test`, `bench`, `verify`)
+fails with one message. Only x86_64-linux-gnu has run; cross-compiling the
+macOS runtime from Linux needs the macOS SDK.
+
+The test and bench run steps set `TSAN_OPTIONS` to `halt_on_error=1
+second_deadlock_stack=1` followed by any value you set, so your flags win one
+by one; the first report halts the run (exit 66) and fails the step. The value
+is always set, so a changed `TSAN_OPTIONS` reruns a cached passing run.
+Environment reads are invisible to Zig 0.17's configure cache, so a sanitizing
+build reconfigures on every invocation. No suppressions ship
+(`.claude/rules/threading.md`).
+
+The full suite takes about 3 minutes under TSan (x86_64 Linux, Debug), and
+the option is not part of `verify`. A landing that touches threaded code runs
+the `thread_system` tests under TSan; the full suite runs under TSan at a
+slice's or branch's final commit.
+
 ## Benchmarks
 
 `zig build bench` pins its default log level to `warn` in every optimize mode
@@ -332,7 +364,18 @@ fixed small/large-range, and adaptive cases.
 `thread-adaptive-fixed-range` isolates adaptive worker-count selection with a
 fixed range size; `thread-adaptive-tuned-range` uses the production
 processor-owned worker and range tuner. Fixed cases are controls for scheduler
-overhead, worker scaling, and range size. Some groups take their sizes from the
+overhead, worker scaling, and range size. Fixed range controls scale from the
+group's partition (the default range size, or one chunk for chunk-partitioned
+stages): default is the partition, small is half of it (at least 1), large is
+4×, each aligned to the stage's range alignment, and
+`thread-adaptive-fixed-range` uses the partition too. In a group that declares
+its `fixed_range_shape`, a fixed case that resolves to an earlier case's
+configuration reports `same shape as <case>`, untimed and out of the
+best-control pick. Groups that time an edit and its revert (terrain edits, nav
+batch, nav dig and update toggles, connectivity toggles) run each half on its
+own tuner set, so each tuner takes one sample per step as production does
+(`.claude/rules/threading.md`); reported shapes and settle checks follow each
+set's own half. Some groups take their sizes from the
 profile: the processor and render-prep groups share a count ladder
 (quick 1,024, 4,096, and 10,000; standard adds 25,000 and 50,000; stress 10,000,
 25,000, and 50,000), and most pathfinding request-load groups keep their own lists
@@ -396,6 +439,19 @@ Reading results:
   selected group; `--group-prefix P` runs every group whose name starts with
   `P` (a family such as `chunk-scale-`); `--fallback-budget N` compares
   hard-fallback caps against the runtime default in ReleaseFast tuning.
+
+Thread system group:
+
+- `thread-dispatch`: one stage dispatch through the production path
+  (`Dispatch.select`, then `Dispatch.run`) over a trivial range-local job that
+  increments each item of its range once, on a ladder of 64, 1,024, 16,384,
+  and 262,144 items (1, 16, 256, and 4,096 ranges at the default range size).
+  A threaded batch costs O(ranges) claims plus O(workers) wakes. `--details`
+  prints `shape=` (`inline` or workers/ranges), `per_item=`, and `per_range=`.
+  In Debug the `wait` column is the protocol signal: per-dispatch spread at
+  16,384 items exceeds a 15–25% win. On multi-CCD parts the `thread-fixed-1`
+  and `thread-fixed-2` rows swing with CCD placement (bimodal unpinned), so a
+  run pinned to one CCD is the diagnostic.
 
 Stage groups (counts 1,024, 4,096, and 16,384 unless noted; each passes linear in
 its count, the adaptive case judged against its controls):

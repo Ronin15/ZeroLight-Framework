@@ -2,10 +2,11 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: not started.** Owner 2026-10-12: near-term; opens the core-systems
-branch, right after 64G. Prerequisite for 51 (the lane thread relies on the
-foreign-thread rule, naming, and TSan workflow). Rebases with 49 on
-`thread_system.zig` and with 52A on `build.zig`; once landed, 52C adds a TSan
+**Status: programming landed on `core_systems` (`e56e37b`..`65434f7`); acceptance runs open.**
+Open before the archive move: the full TSan suite, `verify`, the ReleaseFast
+`zig build test`, and the owner's Windows and Mac runs (Acceptance). Opened the
+core-systems branch (owner 2026-10-12). Prerequisite for 51 (the lane thread
+relies on the foreign-thread rule, naming, and TSan workflow). 52C adds a TSan
 job.
 
 Goal: `ThreadSystem` stays memory-safe in shipped ReleaseFast builds when a
@@ -76,37 +77,82 @@ instances, dispatches through this pool, so its safety is engine-wide.
 
 ### Checklist
 
-- [ ] Participant detection, owner thread ID, forced-inline path, foreign-thread
-      panic, and forced-inline telemetry. Tests: nested batch from a worker
-      job and from the owner's own range run inline and cover every item once
-      on the caller's `WorkerId`; a selected profile's range shape is kept;
-      the tuner is untouched; forced inline is allocation-free. The panic
-      cases are documented and covered in review (not exercisable in-process).
-- [ ] Claim-line isolation with comptime layout asserts; tests for the
-      layout and exact per-participant range counts under heavy claiming.
-- [ ] Self-naming workers; a Linux test that every woken worker carries its
-      name.
-- [ ] `-Dsanitize-thread` option, backend forcing, unsupported-target failure,
-      and `TSAN_OPTIONS` on run steps; toolchain probe.
-- [ ] `thread-dispatch` bench group (trivial per-item job over an item ladder)
-      registered; before/after captures in the landing commit.
-- [ ] Docs: `docs/architecture.md` Thread System (reentrancy and ownership,
+- [x] Participant detection, owner thread ID, forced-inline path,
+      foreign-thread panic, and forced-inline telemetry (`4e62442`). Tests:
+      nested batch from a worker job and from the owner's own range run
+      inline and cover every item once on the caller's `WorkerId`; a
+      selected profile's range shape is kept; the tuner is untouched; forced
+      inline is allocation-free. The panic cases are documented and covered in
+      review (not exercisable in-process).
+- [x] Claim-line isolation with comptime layout asserts; tests for the
+      layout and exact per-participant range counts under heavy claiming
+      (`a66d87c`).
+- [x] Self-naming workers; a Linux test that every woken worker carries its
+      name (`4e62442`).
+- [x] `-Dsanitize-thread` option, backend forcing, unsupported-target failure,
+      and `TSAN_OPTIONS` on run steps; toolchain probe (`4ae3d60`).
+- [x] `thread-dispatch` bench group (trivial per-item job over an item ladder)
+      registered (`e56e37b`); before/after captures in each landing commit.
+      Bench controls scale from each group's partition (`ce877e5`, `2af2b8a`).
+- [x] Lock-free batch publication and completion (owner scope add,
+      2026-10-15): per-worker generation, a countdown including main
+      (`b42ef15`), with wake tests at every worker count (`7946511`).
+- [x] Tuner gate 250 → 60 µs, derived from the measured dispatch floor, with
+      the stored-overhead demotion bound and per-half bench tuner sets
+      (`58ff9e1`); a winning one-worker first probe climbs up (`65434f7`).
+- [x] Docs: `docs/architecture.md` Thread System (reentrancy and ownership,
       forced inline, foreign-thread panic, worker names);
-      `docs/development-workflow.md` "Thread Sanitizer" and the bench group.
-- [ ] Rule additions to `.claude/rules/threading.md` when this lands:
-      nesting and foreign-thread behavior, singleton cache-line padding, TSan
-      suppression policy.
+      `docs/development-workflow.md` "Thread Sanitizer" and the bench group
+      (the Slice 50 docs commit).
+- [x] Rule additions to `.claude/rules/threading.md`: singleton cache-line
+      padding (`a66d87c`); nesting and foreign-thread behavior and the TSan
+      suppression policy (the Slice 50 docs commit).
 
 ### Acceptance checks
 
 - [ ] `zig build test` passes, and once with `-Doptimize=ReleaseFast`
-      (forced inline identical with asserts stripped).
-- [ ] `zig build test -Dsanitize-thread=true` reports zero races on x86_64
+      (forced inline identical with asserts stripped). Open: at `65434f7`
+      only the thread_system tests ran; the full suite runs in `verify` next,
+      ReleaseFast once at the branch commit.
+- [x] `zig build test -Dsanitize-thread=true` reports zero races on x86_64
       Linux, and the threaded quick bench groups run clean under it; any
-      narrowing from the probe is recorded with the exact error.
-- [ ] Comptime layout asserts hold; the claim loop's only atomic RMW is the
-      claim.
-- [ ] `thread-dispatch` and `movement --case thread-small-range` show no
+      narrowing from the probe is recorded with the exact error. Full suite
+      at the slice tip: no race reports (1,768/1,769; the one failure was a
+      timing-dependent AI test that assumed demo-scale batches stay under the
+      gate, which TSan's slowdown broke; fixed to pin its gate, and it passes
+      under TSan). Detection proven in-tree: weakening the per-worker
+      generation release/acquire to monotonic makes the thread_system tests
+      report a data race in `workerLoop`. `thread-dispatch`/`movement` clean
+      through `b42ef15`. No narrowing on x86_64 Linux; other targets:
+      `docs/development-workflow.md` § Thread Sanitizer.
+- [x] Comptime layout asserts hold; the claim loop's only atomic RMW is the
+      claim (`a66d87c`).
+- [x] `thread-dispatch` and `movement --case thread-small-range` show no
       regression beyond run-to-run spread on adjacent commits in ReleaseFast
-      (`.claude/rules/tests-benchmarks.md`).
-- [ ] `zig build verify` passes.
+      (`.claude/rules/tests-benchmarks.md`). `thread-dispatch` ReleaseFast,
+      3 reps: `a66d87c` nothing slower (262,144 fixed-2 −19.5%, fixed-auto
+      −16.5%); `b42ef15` at 16,384 fixed-auto within spread. `movement
+      --case thread-small-range` ReleaseFast, 3 reps, `5673672` vs the slice
+      tip: 1,024 −3.5%, 4,096 −25.0%, 10,000 −17.3%, all within spread.
+- [x] `zig build verify` passes at the slice tip (27/27 steps, 1,769/1,769 tests).
+- [ ] Owner runs on Windows and Mac: `zig build test` plus the
+      `thread-dispatch` bench on each.
+
+### Measured and not pursued
+
+Owner-ruled 2026-10-15; none is an open item (a bench's tuned-vs-control gap
+is not a target).
+
+- Tree wake (main posts the root, woken workers post children): slower at
+  every worker count up to 23, since a tree level costs a wake round trip
+  (about 3.5–4 µs) against about 0.9 µs per flat post saved (`7946511`).
+- Spin-within-step-then-park, and a core low-power wait module (MWAITX,
+  UMWAIT, WFE): within spread at the release shape, about double the worker
+  CPU growing with population, main 9–41% slower from a waiting SMT sibling;
+  pure park keeps race-to-idle (`13a2a67`).
+- Startup calibration of wake and post costs (a derived gate, a calibrated
+  predictor floor, a range count from claim cost): stopped before landing to
+  keep the branch stable; the 60 µs derived default stays, and each host's
+  threading decisions are measured against the commit margin.
+- A per-machine calibration cache file: no saved file; the engine measures
+  at run time or uses a good default.

@@ -54,6 +54,16 @@ paths:
   writing rows that are disjoint by contract but scattered across a column are
   allowed when a scattered-order bench is within spread of the same stream in
   row order.
+- A batch dispatched from inside a batch of the same `ThreadSystem` (a worker
+  job, or the owner in its own ranges) runs forced inline on its caller's
+  `WorkerId`, keeping its range set and touching no tuner; it is a recovered
+  composition mistake, never a design. A thread that neither owns nor serves
+  the system panics, so jobs on any other thread (another system's worker, a
+  lane or service thread) run serial code paths, never `parallelFor`.
+- ThreadSanitizer (`-Dsanitize-thread`) ships no suppressions for framework
+  code; a suppression covers only uninstrumented third-party code and cites
+  its root cause. Changes to `thread_system.zig`, a lane thread, or any
+  threaded range write merge only after a clean TSan run.
 - Keep state transitions, structural changes, SDL/GPU/audio, asset and save
   I/O, and resource ownership off workers unless a deferred boundary is
   designed. Workers never mutate `DataSystem` structurally; structural commits

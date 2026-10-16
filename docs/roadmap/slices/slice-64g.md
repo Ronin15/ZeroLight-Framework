@@ -148,7 +148,7 @@ a design open for this slice):
   plan merge and mark loop B2a-1 then removed (plan 824 → 228 µs, mark 428 → 24 µs,
   `d11f1d9`).
 - **Dense-dig threading.** `pathfinding-evict 640010000 --details` (`83172ce`):
-  the eviction stage costs about 0.7 ms inline, above the 250 µs gate; the tuner
+  the eviction stage costs about 0.7 ms inline, above the gate (250 µs then); the tuner
   probes workers, they do not win on wall time beyond spread (2.62–2.91 ms across
   cases), and it settles inline or threaded run to run: a measured choice with the
   threaded path present.

@@ -458,6 +458,65 @@ when there is no work, no available worker, only one splittable range, an
 explicit serial override, or a processor range-alignment constraint leaves no
 safe split.
 
+The thread that calls `init` owns the system and must outlive it:
+`deinit` runs on the owner, outside any batch, with nothing pending. Every
+`selectBatchProfile` and `parallelForWithOptions` call first classifies its
+caller (O(1) for the owner, O(workers) for any other thread):
+
+- the owner outside a batch takes the normal path;
+- a participant (the owner inside one of its own batches, or a worker of this
+  system) runs the nested batch forced inline on its own `WorkerId`, in every
+  build mode: the selected profile's ranges, or the untuned fixed shape when
+  none is given, never consulting or recording a tuner (`Dispatch.select` and
+  `RoundDispatch` included). The range set and indices are kept, so output
+  stays deterministic. Forced inline sets `BatchStats.forced_inline`, adds to
+  `forcedInlineBatchCount()`, and logs one warning per system lifetime, in
+  shipped builds too. On a worker its ranges count as worker ranges with
+  `ran_inline` set, so a proof that a batch ran on workers checks
+  `!ran_inline`;
+- any other thread (a participant of a different `ThreadSystem` included)
+  panics in every build mode before touching shared or tuner state. Slice
+  51's lane thread is foreign, so lane jobs run serial code paths
+  (`.claude/rules/threading.md`).
+
+Workers name themselves `zl-worker-<index>` after their startup permit
+(Darwin can name only the calling thread); the main thread is never renamed,
+since on Linux that renames the process.
+
+Shared batch state is four blocks, each one `std.atomic.cache_line` (128 B on
+x86_64 and aarch64; comptime asserts pin the layout, 512 B per system;
+`.claude/rules/threading.md`): the descriptor (written only by main: `io`,
+`accepting_work`, the published batch), the claim (`next_range` alone), the
+completion state (`pending`, `worker_ranges`, the `done` event), and a cold
+control block (the forced-inline counter and warning flag). Each participant
+copies the batch into a private `BatchView` once and counts its ranges
+locally; a worker adds its count to `worker_ranges` once, main keeps its own.
+The claim is the claim loop's only atomic RMW.
+
+Dispatch is lock-free:
+
+- publish: main writes the descriptor and resets `next_range`,
+  `worker_ranges`, `pending` (active workers + 1, main included), and `done`;
+  then, per counted worker, it stores that worker's `batch_generation`
+  (release) and posts its semaphore;
+- worker: after the wake it loads `accepting_work`, then its generation
+  (acquire). An unchanged generation (a stale permit, or a wake for a batch
+  that did not count it) reads nothing shared and waits again. Otherwise it
+  runs its first range (worker *i* runs range *i* − 1), claims the rest, adds
+  its range count, and decrements `pending` (acq_rel); the last finisher sets
+  `done`;
+- join: main claims ranges too, then decrements; it waits on `done` only when
+  it was not last;
+- shutdown: `accepting_work` stored false (release), then one counted permit
+  per worker before the join.
+
+Workers park on their semaphore after every batch. Spin-within-step-then-park
+was measured and rejected (`13a2a67`): at the release shape it saved 0.04–0.07
+ms per step (within spread) while roughly doubling worker CPU and slowing
+main's serial work 9–41% from a waiting SMT sibling. The flat wake floor is
+about 6.6 µs + 0.9 µs per worker in ReleaseFast, 8.5 µs at 1 worker to 29.8 µs
+at 23 in Debug (`7946511`).
+
 Adaptive work tuning chooses a complete batch profile: inline or threaded,
 worker threads, and items per claimed range. Worker count and range size remain
 distinct knobs, but `AdaptiveWorkTuner` measures them together so one controller
@@ -481,6 +540,28 @@ slower hardware or expensive small-N processors train their own threaded
 profile. The tuner counts closed probe windows and demotions for `--details`
 (`probes=`, `demotes=`); the counters compile to nothing in ReleaseFast and
 ReleaseSmall and no policy reads them.
+
+The gate, `threaded_batch_ns` (60 µs), is a probe floor: an inline window
+median below it settles inline without probing, and it bounds demotion and
+restore. It never decides that threading wins; that is measured on the host,
+where a first threaded profile commits only at the 5% commit margin.
+Derivation (`58ff9e1`): break-even is T ≥ F / (0.95 − 1/P) for dispatch floor
+F at P participants, and 60 µs is twice the measured Debug full-pool floor, so
+a batch at the gate clears the margin at every worker count.
+
+A settled threaded window demotes when its inline estimate,
+(window − stored overhead) × P, is below the gate. The stored overhead is
+what the profile measured when it settled: its best mean minus the inline
+model's work split over P, clamped at 0. With none stored for the sampled
+profile the estimate is window × P, an upper bound. It clears on demote,
+restore, relearn, and a sustained item-count shift.
+
+A probe starts at the predicted worker count and climbs one worker at a time,
+descending first: a win continues from the new best, a loss reverses once
+from the best, then the tuner settles. A one-worker prediction climbs up
+instead, unless a wider threaded best exists; then it descends, so a losing
+one-worker retune probe reverses upward from the best.
+
 Reported `worker_threads` counts are background worker threads only; the main
 thread is not included in that count and may also process ranges while waiting
 for the batch barrier.
