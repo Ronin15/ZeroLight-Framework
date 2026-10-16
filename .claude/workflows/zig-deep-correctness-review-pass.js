@@ -20,7 +20,7 @@ const REVIEW_UNITS = [
   },
   {
     unit: 'threaded-processor-dispatch',
-    files: ['src/game/systems/movement.zig', 'src/game/systems/steering.zig', 'src/game/systems/collision.zig', 'src/game/systems/particle.zig'],
+    files: ['src/game/systems/movement.zig', 'src/game/systems/steering/system.zig', 'src/game/systems/steering/selection.zig', 'src/game/systems/steering/directions.zig', 'src/game/systems/steering/agent_grid.zig', 'src/game/systems/steering/avoidance.zig', 'src/game/systems/collision.zig', 'src/game/systems/particle.zig'],
     focus: 'Threaded processor dispatch correctness: are per-worker write ranges provably DISJOINT, is every shared output buffer reserved before dispatch sized from the value dispatch uses, is the serial-vs-threaded result bit-identical (deterministic merge, no worker-order dependence), and does any worker read a column another worker is concurrently writing? Flag nondeterminism across worker counts.',
   },
   {

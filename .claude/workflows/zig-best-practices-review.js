@@ -19,7 +19,7 @@ const REVIEW_UNITS = [
   { unit: 'pathfinding-support', files: ['src/game/systems/pathfinding/caches.zig', 'src/game/systems/pathfinding/solve.zig', 'src/game/systems/pathfinding/group_field.zig', 'src/game/systems/pathfinding/scratch.zig', 'src/game/systems/pathfinding/goal_table.zig', 'src/game/systems/pathfinding/types.zig'] },
   { unit: 'ai', files: ['src/game/systems/ai.zig', 'src/game/systems/ai_memory.zig', 'src/game/ai_archetypes.zig'] },
   { unit: 'perception', files: ['src/game/systems/perception.zig', 'src/game/data_system/perception.zig'] },
-  { unit: 'steering-arbitration', files: ['src/game/systems/steering.zig', 'src/game/systems/arbitration.zig'] },
+  { unit: 'steering-arbitration', files: ['src/game/systems/steering/system.zig', 'src/game/systems/steering/selection.zig', 'src/game/systems/steering/directions.zig', 'src/game/systems/steering/agent_grid.zig', 'src/game/systems/steering/avoidance.zig', 'src/game/systems/arbitration.zig'] },
   { unit: 'collision', files: ['src/game/systems/collision.zig', 'src/game/systems/collision_response.zig', 'src/game/systems/spatial_index.zig'] },
   { unit: 'movement-particle-affect', files: ['src/game/systems/movement.zig', 'src/game/systems/particle.zig', 'src/game/systems/affect.zig'] },
   { unit: 'data-system-core', files: ['src/game/data_system/system.zig', 'src/game/data_system/types.zig', 'src/game/data_system/structural.zig'] },
