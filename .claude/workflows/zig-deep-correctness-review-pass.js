@@ -40,7 +40,7 @@ const REVIEW_UNITS = [
   },
   {
     unit: 'pipeline-ordering-determinism',
-    files: ['src/game/simulation_pipeline.zig', 'src/game/simulation.zig', 'src/game/simulation_scope.zig', 'src/game/systems/simulation_scope.zig', 'src/game/systems/arbitration.zig', 'src/game/dig_controller.zig'],
+    files: ['src/game/simulation_pipeline.zig', 'src/game/pipeline_test_support.zig', 'src/game/simulation.zig', 'src/game/simulation_scope.zig', 'src/game/systems/simulation_scope.zig', 'src/game/systems/arbitration.zig', 'src/game/dig_controller.zig'],
     focus: 'Integration/determinism: does every stage declare the PipelineResource read/write tags it actually touches; is stage_order a correct topological order of real data dependencies; are deferred structural changes (spawn/destroy) committed in a deterministic order that is frame-to-frame reproducible; do controllers (arbitration/dig) apply conflict policy deterministically; and is there any read-before-write or stale-this-frame hazard between stages that the resource graph does not catch?',
   },
   {
