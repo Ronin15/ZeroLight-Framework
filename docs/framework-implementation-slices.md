@@ -317,6 +317,13 @@ roadmap flow (Suggested Order) resumes after the AI branch.
      worlds created in play. Assessed in the branch's opening measurement with a
      world-create bench at three sizes; its storage rework lands with the core
      storage work, ahead of Slice 74 (world instances), which builds on it.
+   - [ ] Collision, whole subsystem, against the current cost model and rules:
+     gather, sort, broadphase, narrowphase, response, static colliders, the
+     destructible resolve, contact streams, level handling, inert rows, scope
+     tiers, and benches at worst-case shapes. Measured at `13a2a67`, production
+     step with 32,768 agents: `gatherBodies` and `sortWarm`
+     (`collision.zig:326-337`) run scalar on main, 11.4 ms Debug and 0.53 ms
+     ReleaseFast; the broadphase sweep is already SIMD and threaded.
    - [ ] Render backend pass, last on this branch, after render collect moves to
      visible chunks (same files, touched once): the renderer, sprite batch, text,
      and GPU buffers checked against the cost model and `render.md`
