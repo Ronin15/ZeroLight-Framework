@@ -528,6 +528,12 @@ pub const AdaptiveWorkTuner = struct {
             self.settle();
             return;
         }
+        // A one-worker prediction cannot descend, so it climbs up when it wins. With a
+        // wider threaded best it keeps descending: a loss then reverses upward from the
+        // best instead of back toward the losing one-worker profile.
+        if (predicted.worker_threads == 1 and !(self.has_threaded_profile and self.best_profile.worker_threads > 1)) {
+            self.climb_direction = 1;
+        }
 
         self.candidate_profile = predicted;
         self.phase = .probing;
@@ -3288,6 +3294,84 @@ test "adaptive work tuner worker hill-climb converges to a cheaper neighbor" {
     // Settled below the initial sqrt guess: the climb found a cheaper worker count.
     try std.testing.expect(tuner.report().best_profile.worker_threads >= 1);
     try std.testing.expect(tuner.report().best_profile.worker_threads <= 2);
+}
+
+test "adaptive work tuner climbs up from a winning one-worker first probe" {
+    // A first probe at one worker cannot descend; when it wins and more workers are
+    // faster, the climb goes up instead of settling at one worker.
+    var tuner = AdaptiveWorkTuner.init(.{
+        .initial_range_items = 16,
+        .smallest_range_items = 16,
+        .largest_range_items = 4096,
+        .sample_window = 1,
+        .threaded_batch_ns = 60_000,
+        .improvement_threshold_percent = 1,
+        .threaded_commit_threshold_percent = 5,
+    });
+    const request = tunerTestRequest(8192, 10, 16, 64);
+
+    const inline_profile = tuner.selectProfile(request);
+    tuner.record(tunerTestBatchWithProfile(8192, inline_profile, 100_000));
+    const first = tuner.selectProfile(request);
+    try std.testing.expectEqual(@as(usize, 1), first.worker_threads);
+
+    // Synthetic timing: split work plus a per-worker cost, fastest at several workers.
+    var guard: usize = 0;
+    var selected = first;
+    while (!tuner.isSettled() and guard < 256) : (guard += 1) {
+        const workers = selected.worker_threads;
+        const duration: u64 = if (workers == 0) 100_000 else 100_000 / (@as(u64, workers) + 1) + 2_000 * @as(u64, workers);
+        tuner.record(tunerTestBatchWithProfile(8192, selected, duration));
+        selected = tuner.selectProfile(request);
+    }
+
+    try std.testing.expect(tuner.isSettled());
+    try std.testing.expect(tuner.report().best_profile.worker_threads > 1);
+}
+
+test "adaptive work tuner reverses upward from a wider best after a one-worker retune probe loses" {
+    // Settled at three workers, a retune that predicts one worker and loses tries
+    // the best plus one next, never back down toward the profile that just lost.
+    var tuner = AdaptiveWorkTuner.init(.{
+        .initial_range_items = 16,
+        .smallest_range_items = 16,
+        .largest_range_items = 4096,
+        .sample_window = 1,
+        .threaded_batch_ns = 60_000,
+        .improvement_threshold_percent = 1,
+        .threaded_commit_threshold_percent = 5,
+        .retune_after_settled_windows = 2,
+    });
+    const request = tunerTestRequest(8192, 10, 16, 64);
+    const timing = struct {
+        fn duration(workers: usize) u64 {
+            // Fastest at three workers.
+            return if (workers == 0) 100_000 else 100_000 / (@as(u64, workers) + 1) + 6_000 * @as(u64, workers);
+        }
+    };
+
+    var selected = tuner.selectProfile(request);
+    var guard: usize = 0;
+    while (!tuner.isSettled() and guard < 256) : (guard += 1) {
+        tuner.record(tunerTestBatchWithProfile(8192, selected, timing.duration(selected.worker_threads)));
+        selected = tuner.selectProfile(request);
+    }
+    try std.testing.expect(tuner.isSettled());
+    try std.testing.expectEqual(@as(usize, 3), tuner.report().best_profile.worker_threads);
+
+    // Settled windows until the retune probe starts.
+    guard = 0;
+    while (tuner.isSettled() and guard < 64) : (guard += 1) {
+        tuner.record(tunerTestBatchWithProfile(8192, selected, timing.duration(selected.worker_threads)));
+        selected = tuner.selectProfile(request);
+    }
+    try std.testing.expect(!tuner.isSettled());
+    try std.testing.expectEqual(@as(usize, 1), selected.worker_threads);
+
+    // The one-worker probe loses; the next probe is one above the three-worker best.
+    tuner.record(tunerTestBatchWithProfile(8192, selected, timing.duration(selected.worker_threads)));
+    const next = tuner.selectProfile(request);
+    try std.testing.expectEqual(@as(usize, 4), next.worker_threads);
 }
 
 test "adaptive work tuner computes more workers for larger measured work" {
