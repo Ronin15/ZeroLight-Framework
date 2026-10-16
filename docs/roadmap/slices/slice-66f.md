@@ -45,8 +45,10 @@ Steam Deck readiness; a build without it is unchanged.
       `src/app/` service: init (with the release-build restart-through-Steam
       check), one manual callback pump per frame on the main thread outside
       the fixed step, and shutdown.
-- [ ] Steam not running: the failure mode is an owner call (continue
-      without Steam, or quit). Open question below.
+- [ ] Steam not running (owner 2026-10-16): a Steam build requires Steam.
+      The restart check relaunches through Steam; if init still fails, the
+      game shows an error and quits. Running without Steam is the
+      `-Dsteam=false` build.
 - [ ] Achievements and stats: game code sends unlocks and stat updates
       through the service; they are queued and stored in batches, never
       per step. Unlocks can be tested against Valve's Spacewar app (480).
@@ -69,17 +71,13 @@ Workshop and mods (no mod loading exists), Steam networking and lobbies,
 leaderboards, DLC and in-game purchases, and the Steam Input action-set API
 (SDL3's gamepad layer covers controllers).
 
-### Open questions (owner)
-
-- If Steam isn't running when a Steam build starts, should the game keep
-  going without Steam or quit?
-
 ### Acceptance checks
 
 - [ ] `-Dsteam=false` builds, tests, and runs as before, and links no Steam
       symbols.
 - [ ] `-Dsteam=true` on Windows, Linux, and macOS: init, an achievement
-      unlock (app 480), overlay open and close with pause, clean shutdown.
+      unlock (app 480), overlay open and close with pause, clean shutdown;
+      a start without Steam shows the error and quits.
 - [ ] Auto-Cloud round trip of a save and the settings file.
 - [ ] The Steam Deck checklist items pass on a Deck.
 - [ ] `zig build verify` passes.
