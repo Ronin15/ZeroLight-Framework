@@ -2,9 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: programming landed on `core_systems` (`e56e37b`..`65434f7`); acceptance runs open.**
-Open before the archive move: the full TSan suite, `verify`, the ReleaseFast
-`zig build test`, and the owner's Windows and Mac runs (Acceptance). Opened the
+**Status: landed on `core_systems` (`e56e37b`..`987b342`); TSan and `verify` pass.**
+Open before the archive move: the ReleaseFast `zig build test` (once, at the
+branch commit) and the owner's Windows and Mac runs (Acceptance). Opened the
 core-systems branch (owner 2026-10-12). Prerequisite for 51 (the lane thread
 relies on the foreign-thread rule, naming, and TSan workflow). 52C adds a TSan
 job.
@@ -111,9 +111,8 @@ instances, dispatches through this pool, so its safety is engine-wide.
 ### Acceptance checks
 
 - [ ] `zig build test` passes, and once with `-Doptimize=ReleaseFast`
-      (forced inline identical with asserts stripped). Open: at `65434f7`
-      only the thread_system tests ran; the full suite runs in `verify` next,
-      ReleaseFast once at the branch commit.
+      (forced inline identical with asserts stripped). Debug passes in
+      `verify` at the slice tip; ReleaseFast runs once at the branch commit.
 - [x] `zig build test -Dsanitize-thread=true` reports zero races on x86_64
       Linux, and the threaded quick bench groups run clean under it; any
       narrowing from the probe is recorded with the exact error. Full suite

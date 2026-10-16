@@ -265,8 +265,8 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    2026-10-12), so the branch's threaded rework runs under the race
    detector; then spatial index, steering, collision, tile gate, render
    prep, inert rows, and Slice 75's tier mechanics. Slice 50 landed on
-   `core_systems` (`e56e37b`..`65434f7`); its final TSan, `verify`,
-   ReleaseFast, and owner Windows/Mac runs are open in the slice. Findings
+   `core_systems` (`e56e37b`..`987b342`); TSan and `verify` pass, and its
+   ReleaseFast and owner Windows/Mac runs are open in the slice. Findings
    the 64G combined review routed here (file:line at `e2b9b2c`), written into
    slice checklists when the branch opens:
    - [ ] Tile gate on main (64G area D H1): `world_gate.apply`
