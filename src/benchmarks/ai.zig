@@ -166,12 +166,13 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     // timed/warmup/settle call, so the group's timed window measures only
     // `system.update`/`updateSerial` (query + intent emission), not the index
     // build — that cost has its own dedicated `spatial_index` bench group.
+    // Built with a worker, so queries run on the banded directory production builds.
     var spatial_sys = SpatialIndexSystem.init(allocator);
     defer spatial_sys.deinit();
-    const ai_slice = fixture.data.aiAgentSliceConst();
-    const movement_slice = fixture.data.movementBodySliceConst();
-    try spatial_sys.reserve(ai_slice.entities.len, .{});
-    _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &fixture.data, .{});
+    var index_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 1 });
+    defer index_threads.deinit();
+    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, &index_threads, .{});
+    std.debug.assert(spatial_sys.directory.splitter_count != 0);
     const spatial_view = spatial_sys.view();
 
     for (0..options.warmup_iterations) |_| {

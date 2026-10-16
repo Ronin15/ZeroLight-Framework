@@ -461,13 +461,10 @@ const default_ai_perception_cos_half_fov: f32 = 0.5;
 /// and held across steps otherwise.
 pub const AiPerception = struct {
     // Balanced against `ai.zig`'s separation_radius (48) / cohere_radius (96)
-    // as a consistent 2x step per tier (48 -> 96 -> 192), not an arbitrary
-    // larger number: spatial-index cell-scan cost is quadratic in radius
-    // (queryNeighbors walks every cell in the radius-derived scan square,
-    // populated or not, before max_candidate_checks ever bounds per-candidate
-    // work), so the previous 240 (2.5x cohere_radius by raw distance) was a
-    // ~6x scan-area jump, not 2.5x. 192 keeps vision meaningfully longer-range
-    // than cohere/separation while keeping that per-tier ratio consistent.
+    // as a consistent 2x step per tier (48 -> 96 -> 192). A neighbor query
+    // costs O(r) probes over its scan square's 2r + 1 cell rows plus the
+    // entries it visits, capped by max_candidate_checks. 192 keeps vision
+    // longer-range than cohere and separation at that per-tier ratio.
     vision_range: f32 = 192.0,
     fov_half_angle_radians: f32 = default_ai_perception_fov_half_angle_radians,
     cos_half_fov: f32 = default_ai_perception_cos_half_fov,

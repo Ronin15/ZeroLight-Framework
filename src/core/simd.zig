@@ -48,9 +48,8 @@ pub fn loadInt4(values: []const i32) Int4 {
 }
 
 /// Loads four contiguous `u32` values into lane order. Used for direct
-/// (non-gathered) loads over row-major dense storage where consecutive
-/// indices are already adjacent in memory (see `spatial_index.zig`'s
-/// `DenseCellLookupView` occupancy scan).
+/// (non-gathered) loads over dense storage where consecutive indices are
+/// already adjacent in memory.
 pub fn loadUint4(values: []const u32) Uint4 {
     std.debug.assert(values.len >= lane_count);
     return .{ values[0], values[1], values[2], values[3] };

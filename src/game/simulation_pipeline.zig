@@ -91,7 +91,6 @@ const cognition_halo_chunks = @import("simulation_scope.zig").cognition_halo_chu
 const SimulationScopeSystem = @import("systems/simulation_scope.zig").SimulationScopeSystem;
 const SpatialIndexStats = @import("systems/spatial_index.zig").SpatialIndexStats;
 const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSystem;
-const SpatialIndexDenseWindowGeometry = @import("systems/spatial_index.zig").DenseWindowGeometry;
 const CellCoord = @import("world/system.zig").CellCoord;
 const WorldSystem = @import("world/system.zig").WorldSystem;
 const Rect = @import("../render/renderer.zig").Rect;
@@ -192,13 +191,19 @@ fn stageContract(stage: StageId) StageContract {
         // before perception reads the live bus.
         .dig_world_edit => .{ .reads = .empty, .writes = resources(&.{ .world_tiles, .world_events, .stimuli }) },
         .scope_advance_and_ai_gather => .{ .reads = .empty, .writes = resources(&.{ .ai_halo_indices, .ai_cognition_indices }) },
-        .spatial_index_build => .{ .reads = resources(&.{.ai_halo_indices}), .writes = resources(&.{.spatial_index}) },
-        // Queries the spatial index for hostile candidates (halo) and writes sensed
+        // Indexes the halo at the previous step's positions and levels, which this
+        // step's movement and plane traversal write later.
+        .spatial_index_build => .{
+            .reads = resources(&.{.ai_halo_indices}),
+            .writes = resources(&.{.spatial_index}),
+            .carried = resources(&.{ .movement_positions, .world_level }),
+        },
+        // Queries the spatial index for hostile candidates and writes sensed
         // state for this step's observers (think set); also emits acquisition/loss
         // transition events. Reads world_tiles for line-of-sight /
         // occlusion against the dig-authored floor state from dig_world_edit.
         // Reads `stimuli` authored at dig_world_edit (live bus + hearing scratch).
-        .perception_update => .{ .reads = resources(&.{ .ai_halo_indices, .ai_cognition_indices, .spatial_index, .world_tiles, .stimuli }), .writes = resources(&.{ .perception_sensed, .perception_events }) },
+        .perception_update => .{ .reads = resources(&.{ .ai_cognition_indices, .spatial_index, .world_tiles, .stimuli }), .writes = resources(&.{ .perception_sensed, .perception_events }) },
         // Refreshes from this step's perception transition events,
         // reading the acquired target's last-seen position from perception_sensed.
         .ai_memory_update => .{ .reads = resources(&.{ .ai_cognition_indices, .perception_events, .perception_sensed }), .writes = resources(&.{.ai_memory}) },
@@ -211,7 +216,7 @@ fn stageContract(stage: StageId) StageContract {
             .carried = resources(&.{.ai_behavior}),
         },
         .ai_decide => .{
-            .reads = resources(&.{ .ai_cognition_indices, .ai_halo_indices, .spatial_index, .perception_sensed, .ai_memory, .affect_drives }),
+            .reads = resources(&.{ .ai_cognition_indices, .spatial_index, .perception_sensed, .ai_memory, .affect_drives }),
             .writes = resources(&.{ .navigation_intents, .ai_behavior }),
             .carried = resources(&.{.interest_markers}),
         },
@@ -538,7 +543,8 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.scope_stagger_skips, metric(scope_stats.stagger_skips));
         perf.recordMetric(.scope_chunk_filtered_entities, metric(scope_stats.chunk_filtered_entities));
 
-        perf.recordBatch(.spatial_index_build, spatial_index_stats.batch);
+        perf.recordBatch(.spatial_index_build, spatial_index_stats.bucket_batch);
+        perf.recordBatch(.spatial_index_build, spatial_index_stats.sort_batch);
 
         perf.recordMetric(.perception_observers, metric(perception_stats.observer_count));
         perf.recordMetric(.perception_sensed, metric(perception_stats.sensed_count));
@@ -682,12 +688,11 @@ pub const SimulationPipeline = struct {
     /// cognition halo and the stagger-filtered think set, and drives auto tier
     /// wake/sleep.
     scope: SimulationScopeSystem,
-    /// Shared per-step spatial index, built once from the unstaggered
-    /// cognition halo. Perception candidates and AI separation/cohere query it
-    /// read-only; think rows map in via `spatial_self_index`.
+    /// Shared per-step neighbor index, built once on workers from the unstaggered
+    /// cognition halo. Perception and AI separation/cohere query it read-only.
     spatial_index: SpatialIndexSystem,
     /// AI perception substrate: queries the shared spatial index for
-    /// hostile candidates (halo) within vision/FOV/line-of-sight and writes
+    /// hostile candidates within vision/FOV/line-of-sight and writes
     /// sensed state to `PerceptionStore` for this step's think-set observers.
     perception: PerceptionSystem,
     /// AI short-term memory: decays staleness/familiarity/ring contacts for the
@@ -782,11 +787,7 @@ pub const SimulationPipeline = struct {
         try scope.reserve(population);
         var spatial_index = SpatialIndexSystem.init(allocator);
         errdefer spatial_index.deinit();
-        const spatial_geometry: SpatialIndexDenseWindowGeometry = if (config.navigation_world) |world|
-            .{ .chunk_size_tiles = world.chunk_size_tiles, .tile_size = world.tile_size }
-        else
-            .{};
-        try spatial_index.reserve(population, spatial_geometry);
+        try spatial_index.reserve(population);
         // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
         var perception = PerceptionSystem.init(allocator);
         errdefer perception.deinit();
@@ -987,7 +988,7 @@ pub const SimulationPipeline = struct {
         if (body_grew) {
             try self.scope.reserve(body);
             try self.plane_entry.reserve(body);
-            try self.spatial_index.reserveRows(body);
+            try self.spatial_index.reserve(body);
             try self.collision.reserve(body);
             try self.dig.ensurePlaneScratchReserve(body + 1);
             try self.pathfinding.reserveTerrainNavRecord(maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = body }));
@@ -1361,26 +1362,23 @@ pub const SimulationPipeline = struct {
         step.ai_cognition_indices = ai_pops.cognition;
     }
 
-    /// Shared spatial index: built once from the unstaggered halo, from
-    /// the same prior positions the candidate walks read. Index row `i` matches
-    /// PerceptionSystem/AiSystem candidate row `i`; think rows map via
-    /// `spatial_self_index`.
+    /// Shared neighbor index: built once from the unstaggered halo, at the
+    /// previous positions perception and AI read.
     fn stageSpatialIndexBuild(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         const data = context.data;
         var spatial_index_timer = StageTimer.start();
         step.spatial_index = try self.spatial_index.build(
-            data.aiAgentSliceConst(),
-            data.movementBodySliceConst(),
             data,
+            .{ .entities = data.aiAgentSliceConst().entities, .rows = step.ai_halo_indices },
             context.thread_system,
-            .{ .scope_dense_indices = step.ai_halo_indices },
+            .{},
         );
         spatial_index_timer.stop(context.perf, .pipeline_spatial_index);
     }
 
     /// Perception: hostile candidates within vision/FOV/line-of-sight
-    /// over the halo, writing sensed state only for this step's think-set observers.
+    /// from the shared index, writing sensed state only for this step's think-set observers.
     /// The player is folded in as an extra hostile candidate. Sticky dig/impact
     /// stimuli advance after this step's hearing read.
     fn stagePerceptionUpdate(self: *SimulationPipeline, step: *StepState) !void {
@@ -1409,7 +1407,6 @@ pub const SimulationPipeline = struct {
             context.thread_system,
             .{
                 .scope_dense_indices = step.ai_cognition_indices,
-                .candidate_dense_indices = step.ai_halo_indices,
                 .player_candidate = perception_player_candidate,
                 .stimuli = hearing_stimuli,
                 .max_events_per_step = maxEventsPerStep(.perception_update, self.eventBudgets()),
@@ -1477,7 +1474,6 @@ pub const SimulationPipeline = struct {
                 .nav_request_kind = .individual,
                 .navigation_intents = &context.frame.navigation_intents,
                 .scope_dense_indices = step.ai_cognition_indices,
-                .spatial_population_indices = step.ai_halo_indices,
                 .perception_slice = data.aiPerceptionSliceConst(),
                 .memory_slice = data.aiMemorySliceConst(),
                 .affect_slice = data.aiAffectSliceConst(),
@@ -5436,6 +5432,8 @@ test "production steps on workers record nothing into the thread system's shared
     frame.beginStep();
     const stats = try pipeline.update(context);
     const stage_batches = [_]BatchStats{
+        stats.spatial_index.bucket_batch,
+        stats.spatial_index.sort_batch,
         stats.perception.batch,
         stats.ai_memory.batch,
         stats.affect.batch,
@@ -5475,7 +5473,7 @@ test "collision response runs on workers in the pipeline, allocation-free and ma
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial.triggers[0..serial.trigger_count]), std.mem.sliceAsBytes(threaded.triggers[0..threaded.trigger_count]));
 }
 
-test "population sync at an unchanged population allocates nothing and never re-memsets the spatial window" {
+test "population sync at an unchanged population allocates nothing" {
     var world = try minimalSyncWorld();
     defer world.deinit();
     var data = DataSystem.init(std.testing.allocator);
@@ -5497,17 +5495,10 @@ test "population sync at an unchanged population allocates nothing and never re-
         try data.setAiAgent(entity, .{ .active_behavior = .wander });
     }
 
-    const lookup = &pipeline.spatial_index.dense_lookup;
-    const starts_ptr = lookup.starts.items.ptr;
-    const capacity_cells_x = lookup.capacity_cells_x;
-    lookup.starts.items[0] = 7;
     const grown = try pipeline.syncPopulationCapacity(&frame, &data);
     try std.testing.expect(grown.grew);
     try std.testing.expectEqual(grownPopulationCapacity(30), pipeline.movement_body_capacity);
-    try std.testing.expectEqual(starts_ptr, lookup.starts.items.ptr);
-    try std.testing.expectEqual(capacity_cells_x, lookup.capacity_cells_x);
-    try std.testing.expectEqual(@as(u32, 7), lookup.starts.items[0]);
-    lookup.starts.items[0] = 0;
+    try std.testing.expect(pipeline.spatial_index.keys.capacity >= pipeline.movement_body_capacity);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();

@@ -13,24 +13,11 @@
 //! per-row `prev_*`/`final_nearest_threat_*` columns the workers already
 //! write (`emitTransitionEvents`) — no per-range event scratch.
 //!
-//! Two-index-space contract (population-domain equivalence with
-//! `spatial_index.zig`, mirrors `ai.zig`'s cross-file contract): this
-//! system's own gather is a FILTERED SUBSET of the scoped population (only
-//! entities that also carry `AiPerception`), so it cannot reuse its own row
-//! index as `SpatialIndexView.queryNeighbors`'s self-exclusion index. Instead
-//! it duplicates the same scoped walk `SpatialIndexSystem`/`AiSystem` use
-//! (`candidate_dense_indices`/`scope_dense_indices` +
-//! `movementBodyDenseIndex(entity) orelse continue`, identical skip, identical
-//! order) to build a `candidates` side table (entity/faction/level) aligned 1:1
-//! with `spatial`'s own row order, and records each observer row's position in
-//! *that* full-population walk as `spatial_self_index` — the value actually
-//! passed to `queryNeighbors`. Pipeline passes the unstaggered halo as
-//! `candidate_dense_indices` and the think set as `scope_dense_indices`; a null
-//! candidate list walks `scope_dense_indices` for both (tests / benches).
-//! `perception_dense_index` is the unrelated, separate index: the entity's
-//! own row in `PerceptionStore`, used only to write results back.
-//! `std.debug.assert(self.candidates.len == spatial.pos_x.len)` is the
-//! population-domain guard (Debug/ReleaseSafe only, mirrors `ai.zig`).
+//! Observers are the think set's agents with `AiPerception`; each queries the
+//! caller's shared `SpatialIndexView`, skipping itself by entity, and reads a
+//! candidate's entity, faction, and level from the view's entry columns.
+//! `perception_dense_index` is the observer's own row in `PerceptionStore`, used
+//! only to write results back.
 //!
 //! Sign convention: `SpatialIndexView.queryNeighbors` hands its visitor
 //! `dx/dy = origin - candidate`. This system negates that once, at the single
@@ -157,15 +144,9 @@ pub const PlayerPerceptionCandidate = struct {
 
 pub const PerceptionConfig = struct {
     /// Think/observer set: dense ai-store indices that may write `PerceptionStore`
-    /// this step (stagger-filtered cognition). Null = all agents on the single-list
-    /// path, or all halo rows when `candidate_dense_indices` is set. Pipeline
-    /// passes `ai_cognition_indices`.
+    /// this step (stagger-filtered cognition). Null = all agents. Pipeline passes
+    /// `ai_cognition_indices`.
     scope_dense_indices: ?[]const u32 = null,
-    /// Halo/candidate set: unstaggered cognition-halo indices walked into
-    /// `candidates` (1:1 with spatial rows). Null = walk `scope_dense_indices`
-    /// for both candidates and observers (single-list tests / benches). Pipeline
-    /// always passes `ai_halo_indices`.
-    candidate_dense_indices: ?[]const u32 = null,
     /// Optional player entity, resolved by the caller once per step (null if
     /// no player entity exists yet).
     player_candidate: ?PlayerPerceptionCandidate = null,
@@ -184,6 +165,7 @@ pub const PerceptionConfig = struct {
 
 pub const PerceptionStats = struct {
     observer_count: usize = 0,
+    // Entries of the queried index.
     candidate_population_count: usize = 0,
     // FOV-surviving hostile candidates summed across every observer this step
     // (post range/FOV gate, pre-LOS) — a selectivity signal for how much the
@@ -242,22 +224,6 @@ const PerceptionRangeStats = struct {
     transition_events: usize = 0,
 };
 
-const CandidateRow = struct {
-    entity: EntityId,
-    faction: Faction,
-    level: u16,
-};
-
-fn appendCandidateRow(
-    rows: *std.MultiArrayList(CandidateRow),
-    row_slice: *std.MultiArrayList(CandidateRow).Slice,
-    row: CandidateRow,
-) void {
-    _ = rows.addOneAssumeCapacity();
-    row_slice.len = rows.len;
-    row_slice.set(rows.len - 1, row);
-}
-
 const PerceptionGatherRow = struct {
     entity: EntityId,
     pos_x: f32,
@@ -269,13 +235,7 @@ const PerceptionGatherRow = struct {
     hearing_range: f32,
     faction: Faction,
     level: u16,
-    // Row index in the FULL scoped population walk (same order as
-    // SpatialIndexSystem/AiSystem's own gather) — passed to
-    // `queryNeighbors` as `self_index`. See the module doc's
-    // two-index-space contract.
-    spatial_self_index: usize,
-    // This entity's own row in `PerceptionStore` — used only to write
-    // results back, unrelated to `spatial_self_index`.
+    // This entity's own row in `PerceptionStore`, used only to write results back.
     perception_dense_index: usize,
     facing_x: f32,
     facing_y: f32,
@@ -295,12 +255,6 @@ fn appendPerceptionGatherRow(
     row_slice.set(rows.len - 1, row);
 }
 
-const ConstCandidateSlice = struct {
-    entities: []const EntityId,
-    faction: []const Faction,
-    level: []const u16,
-};
-
 const PerceptionRangeStatsSlot = struct {
     // Each worker writes only its assigned slot, once, at the end of its
     // range (see `PerceptionRangeStats`'s doc comment). Padding keeps that
@@ -316,7 +270,6 @@ pub const PerceptionSystem = struct {
     // Gathered work memory (main-thread only; workers read only copies in
     // job context, except their own rows' `final_nearest_threat_*` columns
     // and their own padded `range_stats` slot).
-    candidates: std.MultiArrayList(CandidateRow) = .{},
     rows: std.MultiArrayList(PerceptionGatherRow) = .{},
     range_stats: PerceptionRangeStatsSlotList = .empty,
     /// Once-only flag for the emit-cap drop warn. The pipeline's derived share makes a
@@ -334,11 +287,10 @@ pub const PerceptionSystem = struct {
     pub fn deinit(self: *PerceptionSystem) void {
         self.range_stats.deinit(self.allocator);
         self.rows.deinit(self.allocator);
-        self.candidates.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Sizes candidate/observer rows and the per-range stats tallies
+    /// Sizes observer rows and the per-range stats tallies
     /// (`maxRangeCount`, every partition the tuner can pick) for `pop` agents;
     /// nothing partition-sized remains, so `update`/`updateSerial` allocate
     /// nothing after this under any `items_per_range`. Grow-only; re-run by
@@ -346,7 +298,6 @@ pub const PerceptionSystem = struct {
     pub fn reserve(self: *PerceptionSystem, pop: usize) !void {
         if (pop == 0) return;
         const cap = hotStoreCapacity(pop);
-        try self.candidates.ensureTotalCapacity(self.allocator, cap);
         try self.rows.ensureTotalCapacity(self.allocator, cap);
         try self.prepareRangeStats(maxRangeCount(cap, perception_range_alignment_items));
     }
@@ -363,15 +314,9 @@ pub const PerceptionSystem = struct {
         config: PerceptionConfig,
     ) !PerceptionStats {
         const perception_slice = data.perceptionSlice();
-        try self.gatherPerceptionData(ai_agents, movement, data, perception_slice, config.scope_dense_indices, config.candidate_dense_indices);
+        try self.gatherPerceptionData(ai_agents, movement, data, perception_slice, config.scope_dense_indices);
         const observer_count = self.rows.len;
-        if (observer_count == 0) return .{ .candidate_population_count = self.candidates.len };
-
-        // Population-domain contract with spatial_index.zig (see module doc):
-        // the shared index built for this step must have gathered the
-        // identical row count as this system's own full-population candidate
-        // walk. Debug/ReleaseSafe-only guard, compiles out in ReleaseFast.
-        std.debug.assert(self.candidates.len == spatial.pos_x.len);
+        if (observer_count == 0) return .{ .candidate_population_count = spatial.entity.len };
 
         self.computeFacingDense(perception_slice);
 
@@ -392,7 +337,7 @@ pub const PerceptionSystem = struct {
         const merge = try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
         return .{
             .observer_count = observer_count,
-            .candidate_population_count = self.candidates.len,
+            .candidate_population_count = spatial.entity.len,
             .sensed_count = totals.sensed_count,
             .nearest_threat_found_count = totals.nearest_threat_found,
             .los_checks = totals.los_checks,
@@ -416,11 +361,9 @@ pub const PerceptionSystem = struct {
         config: PerceptionConfig,
     ) !PerceptionStats {
         const perception_slice = data.perceptionSlice();
-        try self.gatherPerceptionData(ai_agents, movement, data, perception_slice, config.scope_dense_indices, config.candidate_dense_indices);
+        try self.gatherPerceptionData(ai_agents, movement, data, perception_slice, config.scope_dense_indices);
         const observer_count = self.rows.len;
-        if (observer_count == 0) return .{ .candidate_population_count = self.candidates.len };
-
-        std.debug.assert(self.candidates.len == spatial.pos_x.len);
+        if (observer_count == 0) return .{ .candidate_population_count = spatial.entity.len };
 
         self.computeFacingDense(perception_slice);
 
@@ -434,7 +377,7 @@ pub const PerceptionSystem = struct {
         const merge = try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
         return .{
             .observer_count = observer_count,
-            .candidate_population_count = self.candidates.len,
+            .candidate_population_count = spatial.entity.len,
             .sensed_count = totals.sensed_count,
             .nearest_threat_found_count = totals.nearest_threat_found,
             .los_checks = totals.los_checks,
@@ -456,7 +399,6 @@ pub const PerceptionSystem = struct {
         stimuli: []const WorldStimulus,
         range_count: usize,
     ) PerceptionJobContext {
-        const candidate_slice = self.candidates.slice();
         const rows = self.rows.slice();
         return .{
             .entities = rows.items(.entity),
@@ -468,7 +410,6 @@ pub const PerceptionSystem = struct {
             .stimuli = stimuli,
             .faction = rows.items(.faction),
             .level = rows.items(.level),
-            .spatial_self_index = rows.items(.spatial_self_index),
             .perception_dense_index = rows.items(.perception_dense_index),
             .facing_x = rows.items(.facing_x),
             .facing_y = rows.items(.facing_y),
@@ -476,11 +417,6 @@ pub const PerceptionSystem = struct {
             .prev_nearest_threat_generation = rows.items(.prev_nearest_threat_generation),
             .final_nearest_threat_index = rows.items(.final_nearest_threat_index),
             .final_nearest_threat_generation = rows.items(.final_nearest_threat_generation),
-            .candidates = .{
-                .entities = candidate_slice.items(.entity),
-                .faction = candidate_slice.items(.faction),
-                .level = candidate_slice.items(.level),
-            },
             .perception_slice = perception_slice,
             .spatial = spatial,
             .world = world,
@@ -489,14 +425,8 @@ pub const PerceptionSystem = struct {
         };
     }
 
-    // Population-domain contract with spatial_index.zig/ai.zig (see module
-    // doc): walks `candidate_dense_indices` (halo) or `scope_dense_indices`
-    // (single-list / all agents) resolving `data.movementBodyDenseIndex(entity)
-    // orelse continue`, in the exact same order SpatialIndexSystem's own gather
-    // does — a deliberate duplicate gather, not shared code, so `candidates`
-    // row `i` and `spatial`'s row `i` refer to the same agent. Observer rows
-    // are the subset that carry `AiPerception` and, on the dual-list path,
-    // also appear in the think set (`scope_dense_indices`, two-pointer).
+    // Walks the think set (`scope_dense_indices`, or every agent): an observer
+    // row per agent with a movement body and `AiPerception`.
     fn gatherPerceptionData(
         self: *PerceptionSystem,
         ai_agents: ConstAiAgentSlice,
@@ -504,89 +434,48 @@ pub const PerceptionSystem = struct {
         data: *const DataSystem,
         perception_slice: PerceptionSlice,
         scope_dense_indices: ?[]const u32,
-        candidate_dense_indices: ?[]const u32,
     ) !void {
         self.clearWork();
-        const spatial_indices = candidate_dense_indices orelse scope_dense_indices;
-        const think_indices: ?[]const u32 = if (candidate_dense_indices) |halo|
-            (scope_dense_indices orelse halo)
-        else
-            spatial_indices;
-        const n = if (spatial_indices) |idx| idx.len else ai_agents.entities.len;
+        const n = if (scope_dense_indices) |idx| idx.len else ai_agents.entities.len;
         if (n == 0) return;
-        const observer_cap = if (think_indices) |idx| idx.len else n;
-        try self.candidates.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
-        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(observer_cap));
+        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
 
-        var candidate_slice = self.candidates.slice();
         var row_slice = self.rows.slice();
-        var k: usize = 0;
-        var think_k: usize = 0;
-        var spatial_row_index: usize = 0;
-        while (k < n) : (k += 1) {
-            const i: usize = if (spatial_indices) |idx| idx[k] else k;
-            const ai_index: u32 = @intCast(i);
+        for (0..n) |k| {
+            const i: usize = if (scope_dense_indices) |idx| idx[k] else k;
             const ent = ai_agents.entities[i];
-            const mi = data.movementBodyDenseIndex(ent) orelse {
-                if (think_indices) |think| {
-                    if (think_k < think.len and think[think_k] == ai_index) think_k += 1;
-                }
-                continue;
-            };
-
-            const ent_faction = data.factionConst(ent) orelse .neutral;
-            const ent_level = data.worldLevelConst(ent) orelse 0;
-            appendCandidateRow(&self.candidates, &candidate_slice, .{
+            const mi = data.movementBodyDenseIndex(ent) orelse continue;
+            const perception_index = data.aiPerceptionDenseIndex(ent) orelse continue;
+            const prev_nearest = perception_slice.nearest_threat[perception_index];
+            appendPerceptionGatherRow(&self.rows, &row_slice, .{
                 .entity = ent,
-                .faction = ent_faction,
-                .level = ent_level,
+                .pos_x = movement.previous_x[mi],
+                .pos_y = movement.previous_y[mi],
+                .velocity_x = movement.velocity_x[mi],
+                .velocity_y = movement.velocity_y[mi],
+                .vision_range = perception_slice.vision_range[perception_index],
+                .cos_half_fov = perception_slice.cos_half_fov[perception_index],
+                .hearing_range = perception_slice.hearing_range[perception_index],
+                .faction = data.factionConst(ent) orelse .neutral,
+                .level = data.worldLevelConst(ent) orelse 0,
+                .perception_dense_index = perception_index,
+                .facing_x = perception_slice.facing_x[perception_index],
+                .facing_y = perception_slice.facing_y[perception_index],
+                .prev_nearest_threat_index = @bitCast(prev_nearest.index),
+                .prev_nearest_threat_generation = @bitCast(prev_nearest.generation),
+                .final_nearest_threat_index = invalid_index_bits,
+                .final_nearest_threat_generation = invalid_generation_bits,
             });
-
-            const in_think_set = if (think_indices) |think|
-                think_k < think.len and think[think_k] == ai_index
-            else
-                true;
-            if (in_think_set) {
-                if (think_indices != null) think_k += 1;
-                if (data.aiPerceptionDenseIndex(ent)) |perception_index| {
-                    const prev_nearest = perception_slice.nearest_threat[perception_index];
-                    appendPerceptionGatherRow(&self.rows, &row_slice, .{
-                        .entity = ent,
-                        .pos_x = movement.previous_x[mi],
-                        .pos_y = movement.previous_y[mi],
-                        .velocity_x = movement.velocity_x[mi],
-                        .velocity_y = movement.velocity_y[mi],
-                        .vision_range = perception_slice.vision_range[perception_index],
-                        .cos_half_fov = perception_slice.cos_half_fov[perception_index],
-                        .hearing_range = perception_slice.hearing_range[perception_index],
-                        .faction = ent_faction,
-                        .level = ent_level,
-                        .spatial_self_index = spatial_row_index,
-                        .perception_dense_index = perception_index,
-                        .facing_x = perception_slice.facing_x[perception_index],
-                        .facing_y = perception_slice.facing_y[perception_index],
-                        .prev_nearest_threat_index = @bitCast(prev_nearest.index),
-                        .prev_nearest_threat_generation = @bitCast(prev_nearest.generation),
-                        .final_nearest_threat_index = invalid_index_bits,
-                        .final_nearest_threat_generation = invalid_generation_bits,
-                    });
-                }
-            }
-
-            spatial_row_index += 1;
         }
-        if (think_indices) |think| std.debug.assert(think_k == think.len);
     }
 
     fn clearWork(self: *PerceptionSystem) void {
-        self.candidates.clearRetainingCapacity();
         self.rows.clearRetainingCapacity();
     }
 
     /// Derives every gathered row's unit facing vector from its previous-step
     /// velocity, run once (main thread, before the compute dispatch) over the
-    /// full contiguous `rows` set — same shape as spatial_index.zig's
-    /// `assignCellsDense`: a dense batch pass after the scattered/branchy
+    /// full contiguous `rows` set: a dense batch pass after the scattered/branchy
     /// gather, shared verbatim by both `update` and `updateSerial` so
     /// threaded/serial facing is identical by construction (nothing left to
     /// parity-test between them). Near-stationary agents (speed^2 at or below
@@ -752,7 +641,6 @@ const PerceptionJobContext = struct {
     stimuli: []const WorldStimulus,
     faction: []const Faction,
     level: []const u16,
-    spatial_self_index: []const usize,
     perception_dense_index: []const usize,
     facing_x: []const f32,
     facing_y: []const f32,
@@ -760,8 +648,6 @@ const PerceptionJobContext = struct {
     prev_nearest_threat_generation: []const i32,
     final_nearest_threat_index: []i32,
     final_nearest_threat_generation: []i32,
-
-    candidates: ConstCandidateSlice,
 
     perception_slice: PerceptionSlice,
     spatial: SpatialIndexView,
@@ -819,25 +705,22 @@ const CandidateScratch = struct {
     }
 };
 
-const NeighborVisitContext = struct {
+/// Scalar: the stance lookup (a 4-value enum table index, not float math) is
+/// branchy and sparse, not dense uniform work. Negates `queryNeighbors`'s
+/// `origin - candidate` into `candidate - observer` once, here, before buffering
+/// (see the module doc's sign-convention note).
+const PerceptionVisitor = struct {
     observer_faction: Faction,
     candidate_faction: []const Faction,
     scratch: *CandidateScratch,
-};
 
-/// Scalar: the spatial cell-scan traversal itself (shared spatial-index infra) and
-/// the stance lookup (a 4-value enum table index, not float math) are both
-/// branchy/sparse, not dense uniform work, so this callback stays scalar —
-/// same shape as ai.zig's `separationNeighborVisit`. Negates
-/// `queryNeighbors`'s `origin - candidate` into `candidate - observer` once,
-/// here, before buffering (see the module doc's sign-convention note).
-fn perceptionNeighborVisit(context: *anyopaque, candidate_index: usize, dx: f32, dy: f32, dist2: f32) NeighborVisitResult {
-    const ctx: *NeighborVisitContext = @ptrCast(@alignCast(context));
-    if (stance(ctx.observer_faction, ctx.candidate_faction[candidate_index]) != .hostile) return .keep_going;
-    ctx.scratch.append(candidate_index, -dx, -dy, dist2);
-    if (ctx.scratch.count >= max_perception_candidates) return .stop;
-    return .keep_going;
-}
+    pub fn visit(self: *PerceptionVisitor, entry: u32, dx: f32, dy: f32, dist2: f32) NeighborVisitResult {
+        if (stance(self.observer_faction, self.candidate_faction[entry]) != .hostile) return .keep_going;
+        self.scratch.append(entry, -dx, -dy, dist2);
+        if (self.scratch.count >= max_perception_candidates) return .stop;
+        return .keep_going;
+    }
+};
 
 /// Dense SIMD FOV filter (pack-then-vectorize over the already-packed
 /// `scratch` arrays, per simd.zig's `gatherFloat4` doc comment), with a
@@ -899,7 +782,7 @@ const ResolvedCandidate = struct {
 
 const SurvivorSortContext = struct {
     scratch: *const CandidateScratch,
-    candidates: ConstCandidateSlice,
+    spatial: *const SpatialIndexView,
     player_candidate: ?PlayerPerceptionCandidate,
 };
 
@@ -909,7 +792,7 @@ fn resolveCandidate(ctx: SurvivorSortContext, slot: usize) ResolvedCandidate {
         const player = ctx.player_candidate.?;
         return .{ .entity = player.entity, .level = player.level };
     }
-    return .{ .entity = ctx.candidates.entities[candidate_index], .level = ctx.candidates.level[candidate_index] };
+    return .{ .entity = ctx.spatial.entity[candidate_index], .level = ctx.spatial.level[candidate_index] };
 }
 
 // Branchy comparator resolving an entity per compare. Scalar: each observer
@@ -1048,26 +931,22 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
     const cos_half_fov = job.cos_half_fov[i];
     const observer_faction = job.faction[i];
     const observer_level = job.level[i];
-    const self_index = job.spatial_self_index[i];
     const facing_x = job.facing_x[i];
     const facing_y = job.facing_y[i];
 
     var scratch = CandidateScratch{};
-    var visit_ctx = NeighborVisitContext{
+    var visitor = PerceptionVisitor{
         .observer_faction = observer_faction,
-        .candidate_faction = job.candidates.faction,
+        .candidate_faction = job.spatial.faction,
         .scratch = &scratch,
     };
-    const scan_radius = spatial_index_mod.cellScanRadius(vision_range, job.spatial.cell_size);
-    const query_stats = job.spatial.queryNeighbors(
-        ox,
-        oy,
-        self_index,
-        scan_radius,
-        .{ .radius = vision_range, .max_candidate_checks = max_perception_candidate_checks },
-        &visit_ctx,
-        perceptionNeighborVisit,
-    );
+    const query_stats = job.spatial.queryNeighbors(.{
+        .x = ox,
+        .y = oy,
+        .radius = vision_range,
+        .max_candidate_checks = max_perception_candidate_checks,
+        .self = job.entities[i],
+    }, &visitor);
     range_stats.candidate_checks += query_stats.candidate_checks;
 
     if (job.player_candidate) |player| {
@@ -1086,7 +965,7 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
 
     const sort_ctx = SurvivorSortContext{
         .scratch = &scratch,
-        .candidates = job.candidates,
+        .spatial = &job.spatial,
         .player_candidate = job.player_candidate,
     };
     std.mem.sort(usize, survivors[0..survivor_count], sort_ctx, survivorLessThan);
@@ -1209,7 +1088,6 @@ const TransitionSink = struct {
 
 const testing = std.testing;
 const AiPerception = @import("../data_system.zig").AiPerception;
-const SpatialIndexSystem = spatial_index_mod.SpatialIndexSystem;
 
 fn addAgent(
     data: *DataSystem,
@@ -1245,17 +1123,8 @@ fn addObserver(
     return entity;
 }
 
-fn testSpatialIndex(
-    ai_slice: ConstAiAgentSlice,
-    movement_slice: ConstMovementBodySlice,
-    data: *const DataSystem,
-) !SpatialIndexSystem {
-    var sys = SpatialIndexSystem.init(testing.allocator);
-    errdefer sys.deinit();
-    try sys.reserve(ai_slice.entities.len, .{});
-    _ = try sys.buildSerial(ai_slice, movement_slice, data, .{});
-    return sys;
-}
+const testSpatialIndex = @import("spatial_index_test_support.zig").testSpatialIndex;
+const testHaloIndex = @import("spatial_index_test_support.zig").testHaloIndex;
 
 fn minimalWorld(allocator: std.mem.Allocator, width: u16, height: u16, tile_size: f32) !WorldSystem {
     var world = WorldSystem{
@@ -1335,7 +1204,7 @@ test "computeFacingDense matches computeFacingScalar lane-for-lane, including th
         entities[i] = try addObserver(&data, @floatFromInt(i * 10), 0, v[0], v[1], .neutral, .{});
     }
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
 
     var events = SimulationEvents.init(testing.allocator);
@@ -1365,13 +1234,11 @@ test "computeFacingDense matches computeFacingScalar lane-for-lane, including th
     }
 }
 
-test "gather uses the full-population spatial row index for self-exclusion, not the filtered observer row index" {
+test "an observer skips itself by entity, not by its filtered observer row" {
     // X and Z carry AiPerception (observers); Y sits between them in
     // scope_dense_indices but has no AiPerception, so it is a candidate only.
-    // If the self_index passed to queryNeighbors were wrongly the filtered
-    // observer-row index (1) instead of the true spatial row index (2) for Z,
-    // Z's query would self-exclude Y instead of itself, and Y (hostile, right
-    // next to Z) would never be found.
+    // Z is observer row 1 and index entry 2: a self skip keyed by the observer
+    // row would skip Y, the hostile right next to Z, instead of Z itself.
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
 
@@ -1382,7 +1249,7 @@ test "gather uses the full-population spatial row index for self-exclusion, not 
     const z = try addObserver(&data, 1010, 1000, -100, 0, .player, .{});
 
     const scope = [_]u32{ 0, 1, 2 };
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
 
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
@@ -1417,10 +1284,8 @@ test "think observer acquires an off-phase hostile from the halo candidate set" 
 
     const halo = [_]u32{ 0, 1 };
     const think = [_]u32{0};
-    var spatial_sys = SpatialIndexSystem.init(testing.allocator);
+    var spatial_sys = try testHaloIndex(&data, &halo);
     defer spatial_sys.deinit();
-    try spatial_sys.reserve(data.aiAgentSliceConst().entities.len, .{});
-    _ = try spatial_sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{ .scope_dense_indices = &halo });
 
     var world = try minimalWorld(testing.allocator, 8, 8, 32);
     defer world.deinit();
@@ -1431,7 +1296,6 @@ test "think observer acquires an off-phase hostile from the halo candidate set" 
 
     const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .scope_dense_indices = &think,
-        .candidate_dense_indices = &halo,
     });
 
     try testing.expectEqual(@as(usize, 1), stats.observer_count);
@@ -1455,10 +1319,8 @@ test "off-phase observer acquires the on-phase ally on the reverse think step" {
 
     const halo = [_]u32{ 0, 1 };
     const think = [_]u32{1};
-    var spatial_sys = SpatialIndexSystem.init(testing.allocator);
+    var spatial_sys = try testHaloIndex(&data, &halo);
     defer spatial_sys.deinit();
-    try spatial_sys.reserve(data.aiAgentSliceConst().entities.len, .{});
-    _ = try spatial_sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{ .scope_dense_indices = &halo });
 
     var world = try minimalWorld(testing.allocator, 8, 8, 32);
     defer world.deinit();
@@ -1469,7 +1331,6 @@ test "off-phase observer acquires the on-phase ally on the reverse think step" {
 
     _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .scope_dense_indices = &think,
-        .candidate_dense_indices = &halo,
     });
 
     const hostile_perception = data.aiPerceptionConst(hostile).?;
@@ -1481,7 +1342,7 @@ test "off-phase observer acquires the on-phase ally on the reverse think step" {
     try testing.expectEqual(EntityId.invalid, ally_perception.nearest_threat);
 }
 
-test "gapped think set two-pointer assigns spatial_self_index for both observers" {
+test "gapped think set: both observers skip themselves and acquire the off-phase hostile" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
 
@@ -1493,10 +1354,8 @@ test "gapped think set two-pointer assigns spatial_self_index for both observers
 
     const halo = [_]u32{ 0, 1, 2 };
     const think = [_]u32{ 0, 2 };
-    var spatial_sys = SpatialIndexSystem.init(testing.allocator);
+    var spatial_sys = try testHaloIndex(&data, &halo);
     defer spatial_sys.deinit();
-    try spatial_sys.reserve(data.aiAgentSliceConst().entities.len, .{});
-    _ = try spatial_sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{ .scope_dense_indices = &halo });
 
     var world = try minimalWorld(testing.allocator, 8, 8, 32);
     defer world.deinit();
@@ -1507,14 +1366,10 @@ test "gapped think set two-pointer assigns spatial_self_index for both observers
 
     const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .scope_dense_indices = &think,
-        .candidate_dense_indices = &halo,
     });
 
     try testing.expectEqual(@as(usize, 2), stats.observer_count);
     try testing.expectEqual(@as(usize, 3), stats.candidate_population_count);
-    const self_index = sys.rows.slice().items(.spatial_self_index);
-    try testing.expectEqual(@as(usize, 0), self_index[0]);
-    try testing.expectEqual(@as(usize, 2), self_index[1]);
 
     try testing.expect(data.aiPerceptionConst(a).?.target_visible);
     try testing.expectEqual(b.index, data.aiPerceptionConst(a).?.nearest_threat.index);
@@ -1529,7 +1384,7 @@ test "candidate outside vision_range is never selected" {
     const observer = try addObserver(&data, 0, 0, 10, 0, .player, .{ .vision_range = 50 });
     _ = try addAgent(&data, 200, 0, 0, 0, .hostile); // outside vision_range
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1551,7 +1406,7 @@ test "FOV gating: candidate outside the cone is not perceived, inside is" {
     // Directly behind the observer: outside any <= 90 degree cone.
     _ = try addAgent(&data, -50, 0, 0, 0, .hostile);
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1569,7 +1424,7 @@ test "FOV gating: candidate outside the cone is not perceived, inside is" {
     const observer2 = try addObserver(&data2, 0, 0, 100, 0, .player, .{ .fov_half_angle_radians = std.math.pi / 4.0 });
     _ = try addAgent(&data2, 50, 0, 0, 0, .hostile);
 
-    var spatial_sys2 = try testSpatialIndex(data2.aiAgentSliceConst(), data2.movementBodySliceConst(), &data2);
+    var spatial_sys2 = try testSpatialIndex(&data2);
     defer spatial_sys2.deinit();
     var sys2 = PerceptionSystem.init(testing.allocator);
     defer sys2.deinit();
@@ -1587,7 +1442,7 @@ test "stance gating: only hostile candidates ever become nearest_threat" {
     _ = try addAgent(&data, 12, 0, 0, 0, .ally);
     const threat = try addAgent(&data, 14, 0, 0, 0, .hostile);
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1611,7 +1466,7 @@ test "candidate_checks counts every visited candidate, not just hostile-stance s
     _ = try addAgent(&data, 12, 0, 0, 0, .ally);
     _ = try addAgent(&data, 14, 0, 0, 0, .hostile);
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1640,7 +1495,7 @@ test "same-level gating skips cross-level candidates even when closest" {
     try data.setWorldLevel(near_other_level, 1);
     const far_same_level = try addAgent(&data, 40, 0, 0, 0, .hostile);
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1663,7 +1518,7 @@ test "hearing detects an in-range same-level stimulus" {
     defer data.deinit();
     const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1687,7 +1542,7 @@ test "hearing ignores zero-intensity in-range stimulus" {
     defer data.deinit();
     const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1707,7 +1562,7 @@ test "hearing ignores an out-of-range stimulus" {
     defer data.deinit();
     const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1727,7 +1582,7 @@ test "hearing ignores a stimulus on a different level" {
     defer data.deinit();
     const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1747,7 +1602,7 @@ test "hearing picks the nearest of multiple in-range stimuli" {
     defer data.deinit();
     const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1772,7 +1627,7 @@ test "hearing intensity ranking prefers louder stimulus over nearer quieter one"
     defer data.deinit();
     const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 100 });
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1800,7 +1655,7 @@ test "hearing acquires non-dig footstep and impact kinds" {
     defer data.deinit();
     const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -1863,7 +1718,7 @@ test "LOS gating skips a blocked nearer candidate in favor of a farther clear on
     });
     _ = nearer_blocked;
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var sys = PerceptionSystem.init(testing.allocator);
     defer sys.deinit();
@@ -1919,7 +1774,7 @@ test "LOS blocks a diagonal ray through a mid-segment occluder's interior, not j
         .vision_range = tile_size * 10,
     });
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var sys = PerceptionSystem.init(testing.allocator);
     defer sys.deinit();
@@ -2064,7 +1919,7 @@ test "a same-step blocking edit between observer and target occludes LOS with no
         .vision_range = tile_size * 10,
     });
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var sys = PerceptionSystem.init(testing.allocator);
     defer sys.deinit();
@@ -2255,7 +2110,7 @@ test "player-candidate detection: hostile player within vision/FOV becomes neare
     defer data.deinit();
     const observer = try addObserver(&data, 0, 0, 10, 0, .hostile, .{});
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -2280,7 +2135,7 @@ test "transitions: invalid to valid emits entity_perceived" {
     const observer = try addObserver(&data, 0, 0, 10, 0, .player, .{});
     const threat = try addAgent(&data, 10, 0, 0, 0, .hostile);
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -2303,7 +2158,7 @@ test "transitions: valid to invalid emits entity_lost" {
     const observer = try addObserver(&data, 0, 0, 10, 0, .player, .{});
     const threat = try addAgent(&data, 10, 0, 0, 0, .hostile);
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 2048, 2048, 32);
     defer world.deinit();
@@ -2319,7 +2174,7 @@ test "transitions: valid to invalid emits entity_lost" {
     // Move the threat far outside vision_range and rebuild the spatial index
     // (positions are read from previous_x/y, so update the movement body).
     try data.setMovementBody(threat, .{ .position = .{ .x = 5000, .y = 0 }, .previous_position = .{ .x = 5000, .y = 0 }, .velocity = .{}, .speed = 0 });
-    var spatial_sys2 = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys2 = try testSpatialIndex(&data);
     defer spatial_sys2.deinit();
 
     const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys2.view(), &world, &data, &events, .{});
@@ -2337,7 +2192,7 @@ test "transitions: unchanged nearest_threat emits no event" {
     _ = try addObserver(&data, 0, 0, 10, 0, .player, .{});
     _ = try addAgent(&data, 10, 0, 0, 0, .hostile);
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -2361,7 +2216,7 @@ test "transitions: identity swap without passing through invalid emits lost then
     const observer = try addObserver(&data, 0, 0, 10, 0, .player, .{ .vision_range = 500 });
     const first_threat = try addAgent(&data, 10, 0, 0, 0, .hostile);
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 2048, 2048, 32);
     defer world.deinit();
@@ -2379,7 +2234,7 @@ test "transitions: identity swap without passing through invalid emits lost then
     // invalid step.
     try data.setMovementBody(first_threat, .{ .position = .{ .x = 5000, .y = 0 }, .previous_position = .{ .x = 5000, .y = 0 }, .velocity = .{}, .speed = 0 });
     const second_threat = try addAgent(&data, 12, 0, 0, 0, .hostile);
-    var spatial_sys2 = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys2 = try testSpatialIndex(&data);
     defer spatial_sys2.deinit();
 
     const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys2.view(), &world, &data, &events, .{});
@@ -2400,7 +2255,7 @@ test "PerceptionSystem enforces its own per-step event cap and records the drop 
     _ = try addObserver(&data, 100, 0, 10, 0, .player, .{});
     _ = try addAgent(&data, 110, 0, 0, 0, .hostile);
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 256, 256, 32);
     defer world.deinit();
@@ -2483,7 +2338,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
 
     // Warm step: A acquires first_threat; fillers and B have no threat yet.
     {
-        var spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
+        var spatial = try testSpatialIndex(&serial_data);
         defer spatial.deinit();
         var sys = PerceptionSystem.init(testing.allocator);
         defer sys.deinit();
@@ -2493,7 +2348,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         try testing.expectEqual(serial_ids.first_threat.index, serial_data.aiPerceptionConst(serial_ids.observer_a).?.nearest_threat.index);
     }
     {
-        var spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
+        var spatial = try testSpatialIndex(&threaded_data);
         defer spatial.deinit();
         var sys = PerceptionSystem.init(testing.allocator);
         defer sys.deinit();
@@ -2519,7 +2374,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         .max_events_per_step = 1,
     };
 
-    var serial_spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
+    var serial_spatial = try testSpatialIndex(&serial_data);
     defer serial_spatial.deinit();
     var serial_sys = PerceptionSystem.init(testing.allocator);
     defer serial_sys.deinit();
@@ -2541,7 +2396,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         multi_range_cfg,
     );
 
-    var threaded_spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
+    var threaded_spatial = try testSpatialIndex(&threaded_data);
     defer threaded_spatial.deinit();
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = range_items });
     defer threads.deinit();
@@ -2600,9 +2455,9 @@ test "serial and threaded PerceptionSystem updates route through identical math"
         _ = try addObserver(&threaded_data, fi * 6 + 3, 4, 1, 1, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100, .hearing_range = 5 });
     }
 
-    var serial_spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
+    var serial_spatial = try testSpatialIndex(&serial_data);
     defer serial_spatial.deinit();
-    var threaded_spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
+    var threaded_spatial = try testSpatialIndex(&threaded_data);
     defer threaded_spatial.deinit();
 
     var world = try minimalWorld(testing.allocator, 512, 64, 32);
@@ -2670,7 +2525,7 @@ test "threaded PerceptionSystem update records one sample into the compute tuner
         _ = try addObserver(&data, fj * 10, 10, 0, -10, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100 });
     }
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 512, 64, 32);
     defer world.deinit();
@@ -2698,7 +2553,7 @@ test "PerceptionSystem has no steady-state allocation after warmup (FailingAlloc
     _ = try addObserver(&data, 0, 0, 10, 0, .player, .{ .hearing_range = 50 });
     _ = try addAgent(&data, 10, 0, 0, 0, .hostile);
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 64, 64, 32);
     defer world.deinit();
@@ -2730,7 +2585,7 @@ test "PerceptionSystem has no steady-state allocation after warmup (FailingAlloc
     try testing.expect(data.aiPerceptionConst(data.aiAgentSliceConst().entities[0]).?.heard_stimulus);
 }
 
-test "PerceptionSystem dual-list gather has no steady-state allocation after warmup (FailingAllocator)" {
+test "PerceptionSystem think-set gather over a halo index has no steady-state allocation after warmup (FailingAllocator)" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     _ = try addObserver(&data, 0, 0, 100, 0, .ally, .{});
@@ -2740,10 +2595,8 @@ test "PerceptionSystem dual-list gather has no steady-state allocation after war
 
     const halo = [_]u32{ 0, 1, 2, 3 };
     const think = [_]u32{ 0, 2 };
-    var spatial_sys = SpatialIndexSystem.init(testing.allocator);
+    var spatial_sys = try testHaloIndex(&data, &halo);
     defer spatial_sys.deinit();
-    try spatial_sys.reserve(4, .{});
-    _ = try spatial_sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{ .scope_dense_indices = &halo });
     var world = try minimalWorld(testing.allocator, 8, 8, 32);
     defer world.deinit();
 
@@ -2753,7 +2606,6 @@ test "PerceptionSystem dual-list gather has no steady-state allocation after war
     defer events.deinit();
     const cfg: PerceptionConfig = .{
         .scope_dense_indices = &think,
-        .candidate_dense_indices = &halo,
     };
 
     try sys.reserve(4);
@@ -2772,7 +2624,6 @@ test "PerceptionSystem dual-list gather has no steady-state allocation after war
     const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, cfg);
     try testing.expectEqual(@as(usize, 2), stats.observer_count);
     try testing.expectEqual(@as(usize, 4), stats.candidate_population_count);
-    try testing.expectEqual(@as(usize, 4), sys.candidates.len);
     try testing.expectEqual(@as(usize, 2), sys.rows.len);
 }
 
@@ -2798,7 +2649,7 @@ test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item
         _ = try addObserver(&data, fj * 12.5, 10, 0, -10, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100, .hearing_range = 5 });
     }
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
     var world = try minimalWorld(testing.allocator, 512, 64, 32);
     defer world.deinit();

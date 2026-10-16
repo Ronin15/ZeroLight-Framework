@@ -2,235 +2,87 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Pipeline-owned shared spatial index. Builds one uniform grid per
-//! fixed step from the unstaggered cognition-halo population and exposes a bounded,
-//! radius-parameterized neighbor-query API. Replaces the private per-step grid
-//! `AiSystem` used to build for separation and is the substrate perception
-//! queries reuse instead of building a second grid.
-//! Collision broadphase is intentionally NOT ported onto this index: it runs a
-//! tuned sweep-and-prune order (`systems/collision.zig`) that is a different,
-//! already-tuned algorithm, not a duplicate grid build.
+//! The shared neighbor index: one per pipeline, built each step from a handed population
+//! and read by every neighbor query that step. Slot k of the population is its row; a slot
+//! whose entity has no movement body holds no entry. Entries are sorted by
+//! (cell_y, cell_x, slot), so each populated cell's entries are contiguous, and carry the
+//! slot's previous position, entity, faction, and level in entry order.
 //!
-//! Scope: indexes the cognition-halo population passed via
-//! `SpatialIndexConfig.scope_dense_indices` (tier + camera halo, **no** stagger),
-//! not every movement body. Perception candidates walk the same list; think-set
-//! observers/deciders are a stagger subset and map into these rows via
-//! `spatial_self_index`. Indexing the full movement population would spend
-//! build cost on entities nothing queries this step.
+//! A query scans the cells within its radius cell_y outer, cell_x inner, and visits each
+//! cell's entries in slot order; consumers that sum floats depend on that order. A band's
+//! cells in one cell row's aligned 64-cell span form a row segment with an occupancy mask,
+//! found by (cell_y, span) through a band directory and a per-band hash table: a query
+//! probes once per row piece, empty cells cost nothing, and no storage follows the
+//! populated extent.
 //!
-//! Population-domain contract (also documented in `ai.zig`/`perception.zig`):
-//! `build`/`buildSerial` walk `scope_dense_indices` (or all ai agents) resolving
-//! `data.movementBodyDenseIndex(entity) orelse continue`, exactly mirroring the
-//! halo candidate walks. This is a deliberate duplicate gather (not shared
-//! code): index row `i` and each system's `candidates` row `i` refer to the
-//! same agent. Think rows are a subset and must not be used as spatial
-//! self-indices. Single-list callers (null halo, think == halo) keep the
-//! equal-length path.
+//! Serial build (also when no stage can get a worker): one fill and one sort in a single
+//! band. Threaded, the main thread samples the band splitters, `index_bucket` resolves each
+//! range's slots and places their keys by band in its window, and `index_sort` sorts each
+//! band in its own slice and writes its cells, table, and entries; each stage runs inline or
+//! on workers as its own tuner selects. A cell lies in one band and the bands follow key
+//! order, so the entries, and every cell's entries, are identical for any splitters and
+//! partition.
 //!
-//! Determinism-critical: floating-point neighbor-direction summation is not
-//! associative, so callers that need bit-exact parity with a per-cell scan
-//! depend on `queryNeighbors` visiting candidates in exactly cell_y-outer,
-//! cell_x-inner, ascending-stored-index-within-cell order. This falls out of
-//! `entries` being sorted with a cell-major (y then x), index-minor comparator
-//! and ranges walked in that same cell order — do not silently change the scan
-//! order (e.g. to x-outer) without re-checking every consumer's parity tests.
-//!
-//! Build shape: the per-entity gather (`spatialGatherJob`/`buildSerial`'s loop)
-//! is a scattered, branchy dense-index lookup with a real skip, so it stays
-//! scalar — the same shape as `AiSystem.gatherAiData` and the scope system's AI
-//! gather job. Cell assignment is deliberately deferred to a separate dense
-//! pass (`assignCellsDense`) over the merged, contiguous `rows` columns, run 4
-//! rows at a time through `simd.floorToI4` with a scalar tail: gather into
-//! packed SoA scratch, then vectorize the dense math.
-//!
-//! Populated-cell lookup: a row-major dense grid over a bounded,
-//! camera-relative window (`DenseCellLookup`), direct-indexed rather than
-//! hashed, so consecutive `cell.x` values at a fixed `cell.y` land on
-//! consecutive flat indices. `queryNeighbors` exploits exactly that: it loads
-//! 4 cells' `starts`/`ends` per batch with a plain contiguous
-//! `simd.loadUint4` and tests occupancy with one `simd.equalUint4` compare
-//! (see its doc comment). See `max_dense_window_side_cells`'s doc comment for
-//! how the window is sized and the assumption it rests on.
+//! Collision broadphase keeps its own sweep-and-prune order and does not use this index.
 
 const std = @import("std");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
-const cognition_halo_chunks = @import("../simulation_scope.zig").cognition_halo_chunks;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const SlotList = @import("../../app/thread_system.zig").SlotList;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
-const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const setRowCount = @import("../../app/thread_system.zig").setRowCount;
+const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
-const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
+const Faction = @import("../data_system.zig").Faction;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 
 pub const spatial_index_range_alignment_items: usize = movement_range_alignment_items;
 
-pub const SpatialCell = struct {
-    x: i32,
-    y: i32,
-};
+// Partition width of the threaded build, not a capacity: the index is the same for any
+// band count and splitters, and a range's band histogram stays on the worker stack.
+const band_count: usize = 64;
+// Population slots sampled per step for the band splitters: four per band, a fixed count.
+// Balance only.
+const splitter_sample_count: usize = 4 * band_count;
+// The golden ratio's fractional part in 0.64 fixed point.
+const sample_fraction_step: u64 = 0x9E3779B97F4A7C15;
 
-pub const SpatialEntry = struct {
-    cell: SpatialCell,
-    index: usize,
-};
+/// The rows one build indexes: slot k is `entities[rows[k]]`, or `entities[k]` without
+/// `rows`. Read during the build only.
+pub const IndexPopulation = struct {
+    entities: []const EntityId,
+    rows: ?[]const u32 = null,
 
-pub const SpatialCellRange = struct {
-    cell: SpatialCell,
-    start: usize,
-    end: usize,
-};
-
-/// Fixed cap on the camera-visible region's own span, in spatial-index cells,
-/// added on top of the cognition-halo margin when sizing the dense window.
-/// Camera zoom is hardcoded to 1.0 everywhere in today's production code
-/// (`game_demo_state.zig`), so the visible region's cell span has no live,
-/// reachable path to grow beyond this assumed worst case right now; see
-/// `SpatialIndexSystem.reserve`'s doc comment for the margin math this
-/// combines with, and `max_dense_window_side_cells`'s doc comment for the
-/// caveat on how long that assumption holds.
-pub const max_expected_visible_window_cells: u32 = 256;
-
-/// Fixed capacity the dense window's side length is reserved to, independent
-/// of any world config.
-///
-/// Camera zoom is hardcoded to 1.0 in today's production code, but zoom-out is
-/// a planned future feature for this genre (top-down, multi-agent AI battles
-/// with 2048+ NPCs) with no min-zoom value decided yet. Rather than size only
-/// to today's literal zoom=1.0 state and have to redo this the moment zoom
-/// ships, this ceiling is sized by extrapolating a reasonable future zoom
-/// range for the genre (~0.2-0.25x is typical) combined with a generously
-/// large display: at 0.2x zoom on a ~20000x8600px display, the visible window
-/// alone reaches roughly 3125x1350 cells, and adding the ~512-cell halo margin
-/// at this project's real defaults gives roughly 3637x1862 cells needed. 4096
-/// covers that with real headroom (4096x4096 cells is ~134MB at 8 bytes/cell
-/// entry — a trivial one-time reserve).
-///
-/// This is still a documented, revisit-when-decided assumption, not a
-/// proven-forever bound: if/when camera zoom becomes an adjustable, designed
-/// feature, this constant and the debug-assert-based invariant in
-/// `buildEntriesAndRanges` must be revisited against that feature's actual
-/// designed min-zoom value, not left as-is.
-pub const max_dense_window_side_cells: u32 = 4096;
-
-/// World-config inputs the dense window's halo-margin formula needs. Callers
-/// (the pipeline) already hold these from the loaded WorldSystem; this struct
-/// keeps spatial_index.zig decoupled from importing WorldSystem itself.
-pub const DenseWindowGeometry = struct {
-    cell_size: f32 = 32.0,
-    chunk_size_tiles: u16 = 16,
-    tile_size: f32 = 32.0,
-};
-
-/// Row-major dense grid over a bounded, camera-relative window, re-anchored
-/// every build to that step's own populated-cell bounding box (not to
-/// absolute world coordinates) so a fixed-size buffer represents any camera
-/// position without growing. `starts`/`ends` are u32 (population/entries
-/// counts are bounded well under u32 by movement_body_capacity; assert the
-/// narrowing cast at write time). `start == end` at a slot means "not
-/// populated" — buildEntriesAndRanges never emits an empty [start,end), so
-/// this sentinel can't collide with a real range.
-pub const DenseCellLookup = struct {
-    starts: std.ArrayList(u32) = .empty,
-    ends: std.ArrayList(u32) = .empty,
-    // Flat indices written by the last build; cleared at the start of the
-    // next build before that build's new writes land. Capacity == population
-    // capacity (same bound as entries/ranges), so this never grows the
-    // O(window) direction — clear cost tracks populated-cell count, not
-    // window area. THIS is the mechanism that keeps per-step clear cost
-    // bounded by population, not by window area — get this right, it's the
-    // main way this design could quietly regress despite passing tests.
-    touched: std.ArrayList(usize) = .empty,
-    origin: SpatialCell = .{ .x = 0, .y = 0 },
-    width: u32 = 0,
-    height: u32 = 0,
-    capacity_cells_x: u32 = 0,
-    capacity_cells_y: u32 = 0,
-
-    /// Grow-only `touched` reserve (population-sized). Preserves the last build's
-    /// touched indices, so a population growth never re-memsets the window.
-    fn reserveTouched(self: *DenseCellLookup, allocator: std.mem.Allocator, population_capacity: usize) !void {
-        try self.touched.ensureTotalCapacity(allocator, population_capacity);
+    fn len(self: IndexPopulation) usize {
+        return if (self.rows) |rows| rows.len else self.entities.len;
     }
 
-    fn reserveWindow(self: *DenseCellLookup, allocator: std.mem.Allocator, width: u32, height: u32) !void {
-        const total = @as(usize, width) * @as(usize, height);
-
-        // Re-entrant: a second call with the same grid size must not append
-        // another full window of zeros (would desync len from capacity and
-        // inflate O(window) storage). Grow-or-shrink paths re-init to exactly
-        // `total` so starts/ends always match the reserved side lengths.
-        if (self.capacity_cells_x == width and self.capacity_cells_y == height and
-            self.starts.items.len == total and self.ends.items.len == total)
-        {
-            return;
-        }
-
-        try self.starts.ensureTotalCapacity(allocator, total);
-        try self.ends.ensureTotalCapacity(allocator, total);
-        self.starts.clearRetainingCapacity();
-        self.ends.clearRetainingCapacity();
-        self.touched.clearRetainingCapacity();
-        self.starts.appendNTimesAssumeCapacity(0, total);
-        self.ends.appendNTimesAssumeCapacity(0, total);
-        self.capacity_cells_x = width;
-        self.capacity_cells_y = height;
+    fn entity(self: IndexPopulation, slot: usize) EntityId {
+        return self.entities[if (self.rows) |rows| rows[slot] else slot];
     }
-
-    fn clearTouched(self: *DenseCellLookup) void {
-        for (self.touched.items) |idx| {
-            self.starts.items[idx] = 0;
-            self.ends.items[idx] = 0;
-        }
-        self.touched.clearRetainingCapacity();
-    }
-
-    fn deinit(self: *DenseCellLookup, allocator: std.mem.Allocator) void {
-        self.starts.deinit(allocator);
-        self.ends.deinit(allocator);
-        self.touched.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-/// Read-only per-step slice into DenseCellLookup, embedded in SpatialIndexView.
-/// `queryNeighbors` is the sole reader; it indexes `starts`/`ends` directly
-/// (batched 4-wide within a row) rather than through a per-cell lookup method,
-/// since row-major layout makes consecutive `cell.x` values consecutive flat
-/// indices — see `queryNeighbors`'s doc comment.
-pub const DenseCellLookupView = struct {
-    starts: []const u32,
-    ends: []const u32,
-    origin: SpatialCell,
-    width: u32,
-    height: u32,
 };
 
 pub const SpatialIndexConfig = struct {
-    /// World-unit size of one grid cell. Callers that share a population (AI
-    /// today) must agree on this with their query's `cellScanRadius` call.
+    /// World-unit side of one cell, finite and positive; a query's scan radius in cells
+    /// derives from it.
     cell_size: f32 = 32.0,
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    /// When non-null, only these dense ai-store indices participate this step
-    /// (the unstaggered cognition halo; mirrors perception's candidate list).
-    /// Null = all ai agents.
-    scope_dense_indices: ?[]const u32 = null,
 };
 
-pub const NeighborQueryLimits = struct {
-    radius: f32,
-    max_candidate_checks: u16,
-};
+const StageThreads = @import("../../app/thread_system.zig").StageThreads(SpatialIndexConfig);
 
 pub const NeighborVisitResult = enum { keep_going, stop };
 
@@ -238,1353 +90,1498 @@ pub const NeighborQueryStats = struct {
     candidate_checks: u16 = 0,
 };
 
-pub const NeighborVisitFn = *const fn (context: *anyopaque, candidate_index: usize, dx: f32, dy: f32, dist2: f32) NeighborVisitResult;
-
-pub const SpatialIndexStats = struct {
-    entity_count: usize = 0,
-    batch: BatchStats = .{},
+/// One neighbor query: the entries strictly within `radius` of `(x, y)`, visited in scan
+/// order (see the module doc). Every scanned entry but `self` counts as a candidate check
+/// before its radius test; the scan stops before the check that would pass
+/// `max_candidate_checks`.
+pub const NeighborQuery = struct {
+    x: f32,
+    y: f32,
+    /// Finite and at least 0.
+    radius: f32,
+    max_candidate_checks: u16,
+    /// Skipped without counting as a candidate.
+    self: EntityId = EntityId.invalid,
 };
 
-/// Converts a world-space query radius into an integer cell-scan radius for a
-/// given cell size (ceil-based, so a radius that spans partway into the next
-/// cell still scans it). Shared by every consumer of this index so scan radius
-/// is computed identically instead of each caller hand-rolling it. Built from
-/// `math.floorToI32` (`ceil(x) == -floor(-x)`) rather than a raw float-to-int
-/// cast, so it inherits that helper's NaN/inf/out-of-range saturation.
-pub fn cellScanRadius(query_radius: f32, cell_size: f32) i32 {
-    return -math.floorToI32(-(query_radius / cell_size));
-}
+pub const SpatialIndexStats = struct {
+    /// Entries built: the population's slots with a movement body.
+    entity_count: usize = 0,
+    bucket_batch: BatchStats = .{},
+    sort_batch: BatchStats = .{},
+};
 
-/// Immutable snapshot of one step's built index. Workers and query callers
-/// read this; nothing here is mutated after `SpatialIndexSystem.build*` returns.
+// The populated cells of one build's bands, found by key.
+const BandDirectory = struct {
+    splitters: [band_count - 1]CellKey = @splat(max_cell_key),
+    // 0 for the serial build's one band, else `band_count - 1`.
+    splitter_count: usize = 0,
+    bands: [band_count]BandExtent = @splat(.{}),
+
+    // A cell's band is the count of splitters at or below it; the splitters are
+    // nondecreasing, so the bands follow key order and every cell lies in exactly one.
+    fn bandOfCell(self: *const BandDirectory, cell: CellKey) usize {
+        return std.sort.partitionPoint(CellKey, self.splitters[0..self.splitter_count], cell, splitterAtOrBelow);
+    }
+
+    // One predicate call per probe, as `agent_grid`'s directory measured faster than
+    // `std.sort.upperBound`'s order wrapper.
+    fn splitterAtOrBelow(cell: CellKey, splitter: CellKey) bool {
+        return cellKeyOrder(cell, splitter) != .lt;
+    }
+};
+
+// Band b's entries, cells, and segments start at `start` in their lists; its table is
+// `segment_table[2 * start, 2 * (start + entry_count))`, at most half full.
+const BandExtent = struct {
+    start: u32 = 0,
+    entry_count: u32 = 0,
+    cell_count: u32 = 0,
+    segment_count: u32 = 0,
+};
+
+/// One step's built index, read-only. Valid until the next build or reserve of its system.
 pub const SpatialIndexView = struct {
-    pos_x: []const f32,
-    pos_y: []const f32,
-    entries: []const SpatialEntry,
-    ranges: []const SpatialCellRange,
-    // O(1) direct-indexed populated-cell lookup, built alongside `ranges`
-    // from the exact same data (see `SpatialIndexSystem.buildEntriesAndRanges`
-    // and `DenseCellLookup`'s doc comment). `ranges` itself stays (existing
-    // parity tests read it directly); this is a second, redundant index over
-    // the same rows purely for query-time lookup.
-    dense_lookup: DenseCellLookupView,
+    /// Entry-order columns: a visit's entry index reads them.
+    x: []const f32,
+    y: []const f32,
+    entity: []const EntityId,
+    faction: []const Faction,
+    level: []const u16,
+    cells: []const SpatialCell,
+    segments: []const RowSegment,
+    segment_table: []const u32,
+    directory: *const BandDirectory,
     cell_size: f32,
 
-    /// Scans the `cell_scan_radius` block of cells around `(origin_x, origin_y)`
-    /// in cell_y-outer, cell_x-inner order, visiting entries within each found
-    /// cell in ascending stored order (see the module doc's determinism note).
-    /// `self_index`, when set, is skipped without counting as a candidate.
-    /// `candidate_checks` increments before the radius test on every other
-    /// scanned entry and the scan stops once it reaches
-    /// `limits.max_candidate_checks` (checked before increment, so the entry
-    /// that would tip the count over is never processed). The radius prefilter
-    /// is strict `<` — an entry exactly at `limits.radius` is excluded and
-    /// never reaches `visit_fn`. `visit_fn` receives `origin - candidate` for
-    /// `dx`/`dy` and the already-computed `dist2`; returning `.stop` ends the
-    /// whole scan immediately (not just the current cell).
-    ///
-    /// Occupancy is checked 4 cells at a time within a row: the dense window's
-    /// row-major layout means consecutive `cell_x` values at a fixed `cell_y`
-    /// are consecutive flat indices into `dense_lookup.starts`/`ends`, so a
-    /// plain contiguous `simd.loadUint4` (not a gather) loads 4 lanes at once
-    /// and `simd.equalUint4` tests all 4 for "unpopulated" (`start == end`) in
-    /// one compare. Each populated lane is then finished scalarly, in ascending
-    /// lane order, with the exact same per-entry visiting logic used before
-    /// vectorization — this changes only how occupancy is tested, never the
-    /// order entries are visited (see the determinism note above). The row's
-    /// x-span is first clipped to the dense window's bounds so the batch loop
-    /// never reads outside `starts`/`ends`; the row itself is skipped up front
-    /// when `cell_y` falls outside the window's y-span, exactly as
-    /// `DenseCellLookupView.get` would reject every cell in it today. A row's
-    /// clipped span not landing on a multiple of 4 finishes with a plain
-    /// scalar per-cell tail.
-    pub fn queryNeighbors(
-        self: SpatialIndexView,
-        origin_x: f32,
-        origin_y: f32,
-        self_index: ?usize,
-        cell_scan_radius: i32,
-        limits: NeighborQueryLimits,
-        context: *anyopaque,
-        visit_fn: NeighborVisitFn,
-    ) NeighborQueryStats {
-        const own_cell = cellForPosition(origin_x, origin_y, self.cell_size);
+    /// Visits `query`'s neighbors in scan order through `visitor`, a pointer to a value
+    /// with `visit(entry: u32, dx: f32, dy: f32, dist2: f32) NeighborVisitResult`, where
+    /// `dx, dy` is the query point minus the entry's position. `.stop` ends the whole
+    /// query. Scans the `2r + 1` cell rows of its box, r = ceil(radius / cell_size), with one
+    /// probe per row piece: a row's run within one 64-cell span and one band.
+    pub fn queryNeighbors(self: SpatialIndexView, query: NeighborQuery, visitor: anytype) NeighborQueryStats {
+        std.debug.assert(std.math.isFinite(query.radius) and query.radius >= 0);
         var stats = NeighborQueryStats{};
-        const radius2 = limits.radius * limits.radius;
-
-        // Row-independent x clip: the scanned x-span never depends on cell_y,
-        // so it is computed once against the dense window's bounds rather than
-        // once per row.
-        // Widen before narrowing: `own_cell.x +/- cell_scan_radius` on i32 cell
-        // coordinates (from saturating `floorToI32`, so possibly `minInt`/
-        // `maxInt`) can overflow i32, which is UB in ReleaseFast. Compute the
-        // clip in i64; the offsets that feed `@intCast` are provably in range
-        // (`clipped_min_x >= window_min_x`, and the span is `>= 1` past the
-        // early return), so the result is identical for well-formed inputs.
-        const window_min_x: i64 = self.dense_lookup.origin.x;
-        const window_max_x: i64 = window_min_x + @as(i64, self.dense_lookup.width) - 1;
-        const clipped_min_x = @max(@as(i64, own_cell.x) - cell_scan_radius, window_min_x);
-        const clipped_max_x = @min(@as(i64, own_cell.x) + cell_scan_radius, window_max_x);
-        if (clipped_min_x > clipped_max_x) return stats;
-        const row_x_offset: usize = @intCast(clipped_min_x - window_min_x);
-        const n_cells: usize = @intCast(clipped_max_x - clipped_min_x + 1);
-        const vectorized_len = simd.vectorizedEnd(n_cells);
-
-        // Same widen-before-narrow clip for the y-scan bounds: `own_cell.y +/-
-        // cell_scan_radius` on i32 cell coordinates (saturating `floorToI32`, so
-        // possibly `minInt`/`maxInt`) can overflow i32, UB in ReleaseFast.
-        // Clamping the range to the window's y-span while wide makes each row's
-        // `rel_y` in-bounds by construction — it drops the old `rel_y < 0 or
-        // rel_y >= height` `continue` skip while visiting exactly the same rows
-        // in the same order for well-formed inputs, and bounds the loop to the
-        // reserved window instead of the raw (possibly saturated) scan span.
-        const window_min_y: i64 = self.dense_lookup.origin.y;
-        const window_max_y: i64 = window_min_y + @as(i64, self.dense_lookup.height) - 1;
-        const clipped_min_y = @max(@as(i64, own_cell.y) - cell_scan_radius, window_min_y);
-        const clipped_max_y = @min(@as(i64, own_cell.y) + cell_scan_radius, window_max_y);
-        if (clipped_min_y > clipped_max_y) return stats;
-
-        var cell_y: i64 = clipped_min_y;
-        while (cell_y <= clipped_max_y) : (cell_y += 1) {
-            const rel_y: usize = @intCast(cell_y - window_min_y);
-            const row_base = rel_y * self.dense_lookup.width + row_x_offset;
-
-            var j: usize = 0;
-            while (j < vectorized_len) : (j += simd.lane_count) {
-                const idx = row_base + j;
-                const starts_vec = simd.loadUint4(self.dense_lookup.starts[idx..]);
-                const ends_vec = simd.loadUint4(self.dense_lookup.ends[idx..]);
-                const unpopulated_mask = simd.equalUint4(starts_vec, ends_vec);
-                inline for (0..simd.lane_count) |lane| {
-                    if (!unpopulated_mask[lane]) {
-                        if (self.visitEntryRange(
-                            origin_x,
-                            origin_y,
-                            self_index,
-                            radius2,
-                            limits,
-                            context,
-                            visit_fn,
-                            @intCast(starts_vec[lane]),
-                            @intCast(ends_vec[lane]),
-                            &stats,
-                        )) return stats;
-                    }
+        if (self.entity.len == 0) return stats;
+        const scan = cellScanRadius(query.radius, self.cell_size);
+        const own = cellForPosition(query.x, query.y, self.cell_size);
+        const lanes = QueryLanes.init(query);
+        // Cell keys are i32: widen the box, then clamp it to the key range.
+        const key_min: i64 = std.math.minInt(i32);
+        const key_max: i64 = std.math.maxInt(i32);
+        // Clamped to the i32 range.
+        const min_x: i32 = @intCast(std.math.clamp(@as(i64, own.cell_x) - scan, key_min, key_max));
+        const max_x: i32 = @intCast(std.math.clamp(@as(i64, own.cell_x) + scan, key_min, key_max));
+        const min_y: i32 = @intCast(std.math.clamp(@as(i64, own.cell_y) - scan, key_min, key_max));
+        const max_y: i32 = @intCast(std.math.clamp(@as(i64, own.cell_y) + scan, key_min, key_max));
+        // Keys ascend through the box's rows and pieces, so the band only advances: one
+        // search, then at most `band_count - 1` steps per query.
+        var band = self.directory.bandOfCell(.{ .cell_y = min_y, .cell_x = min_x });
+        var cell_y: i64 = min_y;
+        while (cell_y <= max_y) : (cell_y += 1) {
+            // In [min_y, max_y], both i32.
+            const row_y: i32 = @intCast(cell_y);
+            var piece_lo: i64 = min_x;
+            while (piece_lo <= max_x) {
+                // piece_lo is in [min_x, max_x], both i32.
+                const key = CellKey{ .cell_y = row_y, .cell_x = @intCast(piece_lo) };
+                // A row crosses the splitters in order as cell_x grows.
+                while (band < self.directory.splitter_count and cellKeyOrder(key, self.directory.splitters[band]) != .lt) band += 1;
+                // The piece ends at the box, its segment's last cell, or before the band's
+                // next splitter in this row; the splitter is above `key`, so past piece_lo.
+                // In i64: the last span's end is exactly `maxInt(i32)`.
+                var piece_hi: i64 = @min(max_x, segment_cells * @divFloor(piece_lo, segment_cells) + segment_cells - 1);
+                if (band < self.directory.splitter_count) {
+                    const splitter = self.directory.splitters[band];
+                    if (splitter.cell_y == row_y and splitter.cell_x <= piece_hi) piece_hi = @as(i64, splitter.cell_x) - 1;
                 }
-            }
-            while (j < n_cells) : (j += 1) {
-                const idx = row_base + j;
-                const start = self.dense_lookup.starts[idx];
-                const end = self.dense_lookup.ends[idx];
-                if (start == end) continue;
-                if (self.visitEntryRange(
-                    origin_x,
-                    origin_y,
-                    self_index,
-                    radius2,
-                    limits,
-                    context,
-                    visit_fn,
-                    @intCast(start),
-                    @intCast(end),
-                    &stats,
-                )) return stats;
+                // Both in [min_x, max_x], i32.
+                const cells = self.pieceCells(band, row_y, @intCast(piece_lo), @intCast(piece_hi));
+                piece_lo = piece_hi + 1;
+                if (cells.len == 0) continue;
+                // The piece's cells are adjacent, so their entries are one run.
+                if (self.visitEntries(query, lanes, cells[0].start, cells[cells.len - 1].end, visitor, &stats)) return stats;
             }
         }
         return stats;
     }
 
-    /// Visits `entries[start..end]` in ascending stored order with the
-    /// unvectorized per-entry logic (self-skip, candidate-check counting/cap,
-    /// strict radius prefilter, `visit_fn`). Returns `true` when the whole scan
-    /// must stop immediately (either the candidate-check cap was reached or
-    /// `visit_fn` returned `.stop`), letting the caller unwind out of the
-    /// vectorized-batch, row, and `cell_y` loops in one propagated signal.
-    fn visitEntryRange(
-        self: SpatialIndexView,
-        origin_x: f32,
-        origin_y: f32,
-        self_index: ?usize,
-        radius2: f32,
-        limits: NeighborQueryLimits,
-        context: *anyopaque,
-        visit_fn: NeighborVisitFn,
-        start: usize,
-        end: usize,
-        stats: *NeighborQueryStats,
-    ) bool {
-        for (self.entries[start..end]) |entry| {
-            if (self_index) |self_i| {
-                if (entry.index == self_i) continue;
-            }
-            if (stats.candidate_checks >= limits.max_candidate_checks) return true;
-            stats.candidate_checks += 1;
+    // Band `band`'s cells in row `cell_y` from `lo_x` to `hi_x`, a span inside one segment,
+    // in cell_x order. Scalar: a dependent, scattered probe chain and a bit rank.
+    fn pieceCells(self: SpatialIndexView, band: usize, cell_y: i32, lo_x: i32, hi_x: i32) []const SpatialCell {
+        std.debug.assert(lo_x <= hi_x and @divFloor(lo_x, segment_cells) == @divFloor(hi_x, segment_cells));
+        const segment = self.findSegment(band, cell_y, @divFloor(lo_x, segment_cells)) orelse return &.{};
+        // `@mod` by 64 is in [0, 63].
+        const lo_bit: u6 = @intCast(@mod(lo_x, segment_cells));
+        const hi_bit: u6 = @intCast(@mod(hi_x, segment_cells));
+        // The bits below lo_bit, and the bits lo_bit..hi_bit, as plain shifts: once per piece,
+        // where `setRangeValue`'s general range checks do not pay.
+        const below = (@as(u64, 1) << lo_bit) - 1;
+        const through_hi = ~@as(u64, 0) >> (63 - hi_bit);
+        const rank = @popCount(segment.occupied.mask & below);
+        const count = @popCount(segment.occupied.mask & through_hi & ~below);
+        return self.cells[segment.first_cell + rank ..][0..count];
+    }
 
-            const dx = origin_x - self.pos_x[entry.index];
-            const dy = origin_y - self.pos_y[entry.index];
-            const dist2 = dx * dx + dy * dy;
-            if (dist2 < radius2) {
-                if (visit_fn(context, entry.index, dx, dy, dist2) == .stop) return true;
+    // Scalar: a probe is a short chain of scattered, data-dependent loads.
+    fn findSegment(self: SpatialIndexView, band: usize, cell_y: i32, segment_x: i32) ?RowSegment {
+        const extent = self.directory.bands[band];
+        if (extent.segment_count == 0) return null;
+        const table_len = 2 * @as(usize, extent.entry_count);
+        const table = self.segment_table[2 * @as(usize, extent.start) ..][0..table_len];
+        var slot = tableSlot(cell_y, segment_x, table_len);
+        while (true) {
+            const stored = table[slot];
+            if (stored == 0) return null;
+            const segment = self.segments[stored - 1];
+            if (segment.cell_y == cell_y and segment.segment_x == segment_x) return segment;
+            slot += 1;
+            if (slot == table_len) slot = 0;
+        }
+    }
+
+    // The distance test runs in lanes over the contiguous entry columns, with the scalar
+    // tail; lanes are then taken in entry order for the self skip, the check, and the visit.
+    // Returns true when the query ends.
+    fn visitEntries(self: SpatialIndexView, query: NeighborQuery, lanes: QueryLanes, start: u32, end: u32, visitor: anytype, stats: *NeighborQueryStats) bool {
+        var entry: usize = start;
+        const vector_end = start + simd.vectorizedEnd(end - start);
+        while (entry < vector_end) : (entry += simd.lane_count) {
+            const dx = simd.subFloat4(lanes.x, simd.loadFloat4(self.x[entry..]));
+            const dy = simd.subFloat4(lanes.y, simd.loadFloat4(self.y[entry..]));
+            const dist2 = simd.lengthSquared2Float4(dx, dy);
+            const inside = simd.lessThanFloat4(dist2, lanes.radius2);
+            inline for (0..simd.lane_count) |lane| {
+                if (self.visitEntry(query, entry + lane, inside[lane], dx[lane], dy[lane], dist2[lane], visitor, stats)) return true;
             }
+        }
+        return self.visitEntriesScalar(query, lanes.radius2[0], entry, end, visitor, stats);
+    }
+
+    // `visitEntries` one entry at a time: its tail, and its parity reference.
+    fn visitEntriesScalar(self: SpatialIndexView, query: NeighborQuery, radius2: f32, start: usize, end: usize, visitor: anytype, stats: *NeighborQueryStats) bool {
+        for (start..end) |entry| {
+            const dx = query.x - self.x[entry];
+            const dy = query.y - self.y[entry];
+            const dist2 = dx * dx + dy * dy;
+            if (self.visitEntry(query, entry, dist2 < radius2, dx, dy, dist2, visitor, stats)) return true;
         }
         return false;
     }
+
+    fn visitEntry(self: SpatialIndexView, query: NeighborQuery, entry: usize, inside: bool, dx: f32, dy: f32, dist2: f32, visitor: anytype, stats: *NeighborQueryStats) bool {
+        // The index compare rejects every other entry with one u32 compare.
+        const candidate = self.entity[entry];
+        if (candidate.index == query.self.index and candidate.eql(query.self)) return false;
+        if (stats.candidate_checks >= query.max_candidate_checks) return true;
+        stats.candidate_checks += 1;
+        if (!inside) return false;
+        // Entries are below the slot count, at most maxInt(u32) (`SpatialIndexSystem.beginBuild`).
+        return visitor.visit(@as(u32, @intCast(entry)), dx, dy, dist2) == .stop;
+    }
 };
 
-const SpatialIndexRow = struct {
+// A query's point and squared radius in every lane, splatted once per query.
+const QueryLanes = struct {
+    x: simd.Float4,
+    y: simd.Float4,
+    radius2: simd.Float4,
+
+    fn init(query: NeighborQuery) QueryLanes {
+        return .{ .x = simd.splatFloat4(query.x), .y = simd.splatFloat4(query.y), .radius2 = simd.splatFloat4(query.radius * query.radius) };
+    }
+};
+
+// Cells per row segment: one occupancy bit each.
+const segment_cells = 64;
+const SegmentMask = std.bit_set.Integer(segment_cells);
+
+// One band's populated cells in row `cell_y` within cells
+// `[segment_cells * segment_x, segment_cells * segment_x + segment_cells - 1]`: bit
+// `cell_x mod segment_cells` per cell, which are `cells[first_cell..]` in cell_x order,
+// one per set bit.
+const RowSegment = struct {
+    cell_y: i32,
+    segment_x: i32,
+    first_cell: u32,
+    occupied: SegmentMask,
+};
+
+// A populated cell and its entries `[start, end)`.
+const SpatialCell = struct {
+    cell_y: i32,
+    cell_x: i32,
+    start: u32,
+    end: u32,
+};
+
+// A spatial cell, ordered by (cell_y, cell_x).
+const CellKey = struct {
+    cell_y: i32,
+    cell_x: i32,
+};
+
+// The largest cell key; splitters at it leave the bands after them empty.
+const max_cell_key = CellKey{ .cell_y = std.math.maxInt(i32), .cell_x = std.math.maxInt(i32) };
+
+// `cell` against `key` in (cell_y, cell_x) order. Plain comparisons: per-field
+// `std.math.order` calls measure slower on a per-query lookup (`agent_grid`).
+fn cellKeyOrder(cell: CellKey, key: CellKey) std.math.Order {
+    if (cell.cell_y != key.cell_y) return if (cell.cell_y < key.cell_y) .lt else .gt;
+    if (cell.cell_x != key.cell_x) return if (cell.cell_x < key.cell_x) .lt else .gt;
+    return .eq;
+}
+
+fn cellKeyLessThan(_: void, lhs: CellKey, rhs: CellKey) bool {
+    return cellKeyOrder(lhs, rhs) == .lt;
+}
+
+// A segment's slot in a band's table of `table_len` slots: a 64-bit integer hash of
+// (cell_y, segment_x), scaled to the table without a division.
+fn tableSlot(cell_y: i32, segment_x: i32, table_len: usize) usize {
+    const packed_key = (@as(u64, @as(u32, @bitCast(cell_y))) << 32) | @as(u32, @bitCast(segment_x));
+    // The high word of hash * table_len is below table_len.
+    return @intCast(std.math.mulWide(u64, std.hash.int(packed_key), table_len) >> 64);
+}
+
+// An entry's sort key: total over a build, since slots are distinct.
+const SortKey = struct {
+    cell_y: i32,
+    cell_x: i32,
+    slot: u32,
+
+    fn cell(self: SortKey) CellKey {
+        return .{ .cell_y = self.cell_y, .cell_x = self.cell_x };
+    }
+};
+
+fn sortKeyLessThan(_: void, lhs: SortKey, rhs: SortKey) bool {
+    if (lhs.cell_y != rhs.cell_y) return lhs.cell_y < rhs.cell_y;
+    if (lhs.cell_x != rhs.cell_x) return lhs.cell_x < rhs.cell_x;
+    return lhs.slot < rhs.slot;
+}
+
+// One population slot as resolved this build; `entity` is invalid for a slot with no
+// movement body.
+const SlotRow = struct {
     entity: EntityId,
-    pos_x: f32,
-    pos_y: f32,
-    cell: SpatialCell,
+    x: f32,
+    y: f32,
+    level: u16,
+    faction: Faction,
 };
 
-fn appendSpatialRow(
-    rows: *std.MultiArrayList(SpatialIndexRow),
-    row_slice: *std.MultiArrayList(SpatialIndexRow).Slice,
-    row: SpatialIndexRow,
-) void {
-    _ = rows.addOneAssumeCapacity();
-    row_slice.len = rows.len;
-    row_slice.set(rows.len - 1, row);
+const EntryRow = struct {
+    x: f32,
+    y: f32,
+    entity: EntityId,
+    faction: Faction,
+    level: u16,
+};
+
+// With a 16-slot range alignment every bucket range's windows start on a cache line.
+const SlotRowList = std.array_list.Aligned(SlotRow, .fromByteUnits(thread_shared_record_alignment));
+const SortKeyList = std.array_list.Aligned(SortKey, .fromByteUnits(thread_shared_record_alignment));
+
+comptime {
+    std.debug.assert(spatial_index_range_alignment_items * @sizeOf(SlotRow) % thread_shared_record_alignment == 0);
+    std.debug.assert(spatial_index_range_alignment_items * @sizeOf(SortKey) % thread_shared_record_alignment == 0);
 }
 
-fn hotStoreCapacity(min_len: usize) usize {
-    return std.mem.alignForwardAnyAlign(usize, min_len, spatial_index_range_alignment_items);
+// A bucket range's keys before each band: band b's are `[offsets[b], offsets[b + 1])` of its
+// staging window.
+const BandOffsets = struct {
+    offsets: [band_count + 1]u32 = @splat(0),
+};
+
+const BandTally = struct {
+    cell_count: u32 = 0,
+    segment_count: u32 = 0,
+};
+
+comptime {
+    for ([_]type{ BandOffsets, BandTally }) |T| std.debug.assert(@sizeOf(PaddedSlot(T)) % thread_shared_record_alignment == 0);
 }
+
+// The two stages of a threaded build, each under its own tuner.
+const BuildStages = struct {
+    bucket: Dispatch,
+    sort: Dispatch,
+};
 
 pub const SpatialIndexSystem = struct {
     allocator: std.mem.Allocator,
-    // Gathered work memory (main-thread only; workers write only their own
-    // reserved range slot). Population order: row `i` is the `i`-th surviving
-    // agent walked from `scope_dense_indices` (or all ai agents).
-    rows: std.MultiArrayList(SpatialIndexRow) = .{},
-    entries: std.ArrayList(SpatialEntry) = .empty,
-    ranges: std.ArrayList(SpatialCellRange) = .empty,
-    // O(1) query-time index over the same populated cells as `ranges` --
-    // rebuilt alongside `ranges` every step, not a separate source of truth.
-    // Sized in `reserve` from the halo/world geometry; see `DenseCellLookup`'s
-    // doc comment.
-    dense_lookup: DenseCellLookup = .{},
-    // Threaded gather staging: range r writes only its own `[range.start, range.end)`
-    // window (at most one row per candidate) and its count into its padded tally; the
-    // main thread copies the windows into `rows` in range order.
-    gather_staging: RowStagingList = .empty,
-    gather_tallies: RowCountTallyList = .empty,
-    build_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    cell_size: f32 = 32.0,
+    // By population slot.
+    slot_rows: SlotRowList = .empty,
+    // Sorted entry keys; a threaded build first fills each bucket range's window of it.
+    keys: SortKeyList = .empty,
+    // A threaded build's band-ordered bucket windows.
+    staging: SortKeyList = .empty,
+    entries: std.MultiArrayList(EntryRow) = .{},
+    // Band b's cells sit in its own slice from its entry start; the rest of the slice is
+    // unused.
+    cells: std.ArrayList(SpatialCell) = .empty,
+    // Band b's row segments, laid out like its cells.
+    segments: std.ArrayList(RowSegment) = .empty,
+    // Per band, linear-probe slots holding 0 or a segment index + 1. Hand-rolled: a std
+    // hash map owns its storage, and each band's table is written by its sort range inside
+    // one seam-reserved buffer.
+    segment_table: std.ArrayList(u32) = .empty,
+    directory: BandDirectory = .{},
+    band_offsets: SlotList(BandOffsets) = .empty,
+    band_tallies: SlotList(BandTally) = .empty,
+    bucket_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    cell_size: f32 = (SpatialIndexConfig{}).cell_size,
 
     pub fn init(allocator: std.mem.Allocator) SpatialIndexSystem {
-        return .{
-            .allocator = allocator,
-            .build_tuner = AdaptiveWorkTuner.init(.{}),
-        };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *SpatialIndexSystem) void {
-        self.gather_tallies.deinit(self.allocator);
-        self.gather_staging.deinit(self.allocator);
-        self.dense_lookup.deinit(self.allocator);
-        self.ranges.deinit(self.allocator);
+        self.band_tallies.deinit(self.allocator);
+        self.band_offsets.deinit(self.allocator);
+        self.segment_table.deinit(self.allocator);
+        self.segments.deinit(self.allocator);
+        self.cells.deinit(self.allocator);
         self.entries.deinit(self.allocator);
-        self.rows.deinit(self.allocator);
+        self.staging.deinit(self.allocator);
+        self.keys.deinit(self.allocator);
+        self.slot_rows.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Pre-sizes `rows`/`entries`/`ranges`/`dense_lookup` to `capacity`
-    /// movement bodies (worst case: one entity per cell) so the per-step
-    /// build is allocation-free after init, serial or threaded under any
-    /// partition (see `reserveRows`).
-    ///
-    /// `geometry` sizes the dense lookup window: the cognition-halo margin
-    /// (`2 * cognition_halo_chunks * chunk_size_tiles * tile_size` world
-    /// units, converted to cells by `cell_size`) plus a fixed assumed
-    /// visible-region span (`max_expected_visible_window_cells`), clamped to
-    /// `max_dense_window_side_cells`. At this project's real defaults
-    /// (`cognition_halo_chunks` 16, `chunk_size_tiles` 16, `tile_size`/
-    /// `cell_size` ~32) the margin alone is 512 cells — see
-    /// `max_dense_window_side_cells`'s doc comment for the headroom this
-    /// leaves and the assumption it rests on.
-    pub fn reserve(self: *SpatialIndexSystem, capacity: usize, geometry: DenseWindowGeometry) !void {
-        try self.reserveRows(capacity);
-        try self.reserveWindow(geometry);
-    }
-
-    /// Population-sized half of `reserve`: `rows`/`entries`/`ranges`/the dense
-    /// lookup's `touched` list, the gather staging (one window slot per candidate),
-    /// and the gather tallies (`maxRangeCount(capacity)`, every partition the tuner
-    /// can pick). Grow-only and never touches the dense window, so the pipeline's
-    /// population seam re-runs it without a re-memset.
-    pub fn reserveRows(self: *SpatialIndexSystem, capacity: usize) !void {
-        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(capacity));
+    /// Sizes every build buffer for a population of `capacity` slots under any partition
+    /// the tuners can pick, so a build at or below it allocates nothing. Grow-only; the
+    /// pipeline calls it at init and at its population seam.
+    pub fn reserve(self: *SpatialIndexSystem, capacity: usize) error{OutOfMemory}!void {
+        // The u32 widths are exhausted only past maxInt(u32) slots, which the population
+        // cannot reach (`beginBuild`); past it this is allocator exhaustion.
+        if (capacity > std.math.maxInt(u32)) return error.OutOfMemory;
+        try self.slot_rows.ensureTotalCapacity(self.allocator, capacity);
+        try self.keys.ensureTotalCapacity(self.allocator, capacity);
+        try self.staging.ensureTotalCapacity(self.allocator, capacity);
         try self.entries.ensureTotalCapacity(self.allocator, capacity);
-        try self.ranges.ensureTotalCapacity(self.allocator, capacity);
-        try self.dense_lookup.reserveTouched(self.allocator, capacity);
-        try self.gather_staging.ensureTotalCapacityPrecise(self.allocator, capacity);
-        try self.gather_tallies.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(capacity, spatial_index_range_alignment_items));
+        try self.cells.ensureTotalCapacity(self.allocator, capacity);
+        try self.segments.ensureTotalCapacity(self.allocator, capacity);
+        try self.segment_table.ensureTotalCapacity(self.allocator, 2 * capacity);
+        try self.band_offsets.ensureTotalCapacity(self.allocator, maxRangeCount(capacity, spatial_index_range_alignment_items));
+        try self.band_tallies.ensureTotalCapacity(self.allocator, band_count);
     }
 
-    /// World-geometry half of `reserve`: sizes the dense lookup window (idempotent
-    /// for an unchanged window).
-    pub fn reserveWindow(self: *SpatialIndexSystem, geometry: DenseWindowGeometry) !void {
-        const halo_world_units = 2.0 * @as(f32, @floatFromInt(cognition_halo_chunks)) *
-            @as(f32, @floatFromInt(geometry.chunk_size_tiles)) * geometry.tile_size;
-        const margin_cells: u32 = @intFromFloat(@ceil(halo_world_units / geometry.cell_size));
-        const window_side = @min(margin_cells + max_expected_visible_window_cells, max_dense_window_side_cells);
-
-        try self.dense_lookup.reserveWindow(self.allocator, window_side, window_side);
-    }
-
-    /// Read-only snapshot of the most recently built index.
+    /// The last build's index.
     pub fn view(self: *const SpatialIndexSystem) SpatialIndexView {
-        const slice = self.rows.slice();
+        const entries = self.entries.slice();
         return .{
-            .pos_x = slice.items(.pos_x),
-            .pos_y = slice.items(.pos_y),
-            .entries = self.entries.items,
-            .ranges = self.ranges.items,
-            .dense_lookup = .{
-                .starts = self.dense_lookup.starts.items,
-                .ends = self.dense_lookup.ends.items,
-                .origin = self.dense_lookup.origin,
-                .width = self.dense_lookup.width,
-                .height = self.dense_lookup.height,
-            },
+            .x = entries.items(.x),
+            .y = entries.items(.y),
+            .entity = entries.items(.entity),
+            .faction = entries.items(.faction),
+            .level = entries.items(.level),
+            .cells = self.cells.items,
+            .segments = self.segments.items,
+            .segment_table = self.segment_table.items,
+            .directory = &self.directory,
             .cell_size = self.cell_size,
         };
     }
 
-    /// Threaded build: gathers the scoped population into `rows` (per-range
-    /// windows of `gather_staging`, copied in range order so threaded and serial
-    /// output are byte-identical), then sorts `entries` and derives `ranges` serially.
+    /// Builds the index of `population`'s slots from their previous positions. Both stages
+    /// run on workers under the index's tuners, or inline as they select; with no worker
+    /// available it builds serially. Allocates only past `reserve`'s capacity, on the
+    /// calling thread before any dispatch.
     pub fn build(
         self: *SpatialIndexSystem,
-        ai_agents: ConstAiAgentSlice,
-        movement: ConstMovementBodySlice,
         data: *const DataSystem,
+        population: IndexPopulation,
         thread_system: *ThreadSystem,
         config: SpatialIndexConfig,
     ) !SpatialIndexStats {
-        self.clearWork();
-        self.cell_size = config.cell_size;
-        const n = if (config.scope_dense_indices) |idx| idx.len else ai_agents.entities.len;
-        if (n == 0) return .{};
+        const slot_count = try self.beginBuild(population, config);
+        if (slot_count == 0) return .{};
+        const threads = StageThreads.withWorkers(.{ .thread_system = thread_system, .config = config }) orelse return self.buildDirect(data, population);
+        const stages = BuildStages{ .bucket = threads.stage(&self.bucket_tuner), .sort = threads.stage(&self.sort_tuner) };
+        return self.buildBanded(data, population, stages, chooseSplitters(data, population, self.cell_size));
+    }
 
-        const owned_tuner = if (config.adaptive and config.items_per_range == null) &self.build_tuner else null;
-        const selection = thread_system.selectBatchProfile(owned_tuner, .{
-            .item_count = n,
-            .items_per_range = config.items_per_range,
-            .max_worker_threads = config.max_worker_threads,
-            .range_alignment_items = spatial_index_range_alignment_items,
-            .adaptive = config.adaptive,
-        });
-        try self.prepareGatherStaging(n, selection.range_count);
-        var context = SpatialGatherContext{
-            .ai_entities = ai_agents.entities,
-            .movement = movement,
+    /// `build` on the calling thread alone.
+    pub fn buildSerial(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation, config: SpatialIndexConfig) !SpatialIndexStats {
+        const slot_count = try self.beginBuild(population, config);
+        if (slot_count == 0) return .{};
+        return self.buildDirect(data, population);
+    }
+
+    // Clears the last build, so an empty one leaves no cells, and sizes every buffer for
+    // `population`. Returns its slot count.
+    fn beginBuild(self: *SpatialIndexSystem, population: IndexPopulation, config: SpatialIndexConfig) !usize {
+        std.debug.assert(std.math.isFinite(config.cell_size) and config.cell_size > 0);
+        self.directory = .{};
+        self.cell_size = config.cell_size;
+        self.entries.clearRetainingCapacity();
+        self.cells.clearRetainingCapacity();
+        self.segments.clearRetainingCapacity();
+        self.segment_table.clearRetainingCapacity();
+        const slot_count = population.len();
+        // Slots, entries, cells, and segments are u32. The pipeline's population is its
+        // halo, at most the AI rows, at most the entity slots, which `createEntity` refuses
+        // past maxInt(u32).
+        std.debug.assert(slot_count <= std.math.maxInt(u32));
+        try self.reserve(slot_count);
+        std.debug.assert(self.slot_rows.capacity >= slot_count and self.keys.capacity >= slot_count and self.staging.capacity >= slot_count);
+        self.slot_rows.items.len = slot_count;
+        self.keys.items.len = slot_count;
+        return slot_count;
+    }
+
+    // The serial build: one fill straight into the keys and one band.
+    fn buildDirect(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation) SpatialIndexStats {
+        const slot_count = population.len();
+        const fill = self.fillContext(data, population);
+        // At most slot_count <= maxInt(u32) keys.
+        const entry_count: u32 = @intCast(fillSlots(&fill, 0, slot_count, self.keys.items));
+        self.setEntryCount(entry_count);
+        const counts = self.bandWriter().finishBand(0, entry_count);
+        self.directory.bands[0] = .{ .start = 0, .entry_count = entry_count, .cell_count = counts.cell_count, .segment_count = counts.segment_count };
+        return .{
+            .entity_count = entry_count,
+            .bucket_batch = inlineBatch(slot_count, spatial_index_range_alignment_items),
+            .sort_batch = inlineBatch(entry_count, spatial_index_range_alignment_items),
+        };
+    }
+
+    // `index_bucket` over the slots into the bands of `splitters` (nondecreasing), the band
+    // starts on the main thread, then `index_sort` over the keys and the band directory.
+    fn buildBanded(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation, stages: BuildStages, splitters: [band_count - 1]CellKey) SpatialIndexStats {
+        const slot_count = population.len();
+        std.debug.assert(slot_count > 0 and self.slot_rows.items.len == slot_count and self.keys.items.len == slot_count);
+        for (splitters[0 .. band_count - 2], splitters[1..]) |lower, upper| std.debug.assert(cellKeyOrder(upper, lower) != .lt);
+        const bucket_selection = stages.bucket.select(slot_count, spatial_index_range_alignment_items);
+        std.debug.assert(self.band_offsets.capacity >= bucket_selection.range_count and self.band_tallies.capacity >= band_count);
+        self.staging.items.len = slot_count;
+        setSlotCount(BandOffsets, &self.band_offsets, bucket_selection.range_count);
+        self.directory = .{ .splitters = splitters, .splitter_count = band_count - 1 };
+        var bucket = BucketJob{
+            .fill = self.fillContext(data, population),
+            .directory = &self.directory,
+            .scratch = self.keys.items,
+            .staging = self.staging.items,
+            .items_per_range = bucket_selection.items_per_range,
+            .band_offsets = self.band_offsets.items,
+        };
+        var stats = SpatialIndexStats{};
+        stats.bucket_batch = stages.bucket.run(bucket_selection, slot_count, spatial_index_range_alignment_items, &bucket, bucketJob);
+
+        // Each band's keys start after every range's keys of the earlier bands.
+        var band_start: [band_count + 1]u32 = @splat(0);
+        for (self.band_offsets.items) |slot| {
+            for (&band_start, slot.value.offsets) |*start, range_offset| start.* += range_offset;
+        }
+        const entry_count = band_start[band_count];
+        self.setEntryCount(entry_count);
+        setSlotCount(BandTally, &self.band_tallies, band_count);
+        stats.entity_count = entry_count;
+        if (entry_count != 0) {
+            const sort_selection = stages.sort.select(entry_count, spatial_index_range_alignment_items);
+            var sort = SortJob{
+                .staging = self.staging.items,
+                .band_offsets = self.band_offsets.items,
+                .bucket_items_per_range = bucket_selection.items_per_range,
+                .band_start = band_start,
+                .writer = self.bandWriter(),
+                .tallies = self.band_tallies.items,
+                .range_count = sort_selection.range_count,
+            };
+            stats.sort_batch = stages.sort.run(sort_selection, entry_count, spatial_index_range_alignment_items, &sort, sortJob);
+        }
+
+        for (&self.directory.bands, self.band_tallies.items, band_start[0..band_count], band_start[1..]) |*band, tally, start, end| {
+            band.* = .{ .start = start, .entry_count = end - start, .cell_count = tally.value.cell_count, .segment_count = tally.value.segment_count };
+        }
+        return stats;
+    }
+
+    fn fillContext(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation) FillContext {
+        return .{
+            .population = population,
             .data = data,
-            .scope_dense_indices = config.scope_dense_indices,
-            .out = self.gather_staging.items,
-            .items_per_range = selection.items_per_range,
-            .tallies = self.gather_tallies.items,
-            .item_count = n,
+            .movement = data.movementBodySliceConst(),
+            .cell_size = self.cell_size,
+            .slot_rows = self.slot_rows.items,
         };
-        const batch = thread_system.parallelForWithOptions(n, &context, spatialGatherJob, .{
-            .max_worker_threads = selection.worker_threads,
-            .range_alignment_items = spatial_index_range_alignment_items,
-            .adaptive_tuner = selection.active_tuner,
-            .selected_profile = selection.profile,
-        });
-        try self.mergeRowWindows(selection.items_per_range);
-
-        const gathered = self.rows.len;
-        if (gathered == 0) return .{ .entity_count = 0, .batch = batch };
-        self.assignCellsDense();
-        try self.buildEntriesAndRanges();
-        return .{ .entity_count = gathered, .batch = batch };
     }
 
-    /// Serial build: same population selection and cell-major/index-minor
-    /// sort as `build`, single pass, no thread system. Drives the serial
-    /// bench/test path and the threaded==serial parity checks.
-    pub fn buildSerial(
-        self: *SpatialIndexSystem,
-        ai_agents: ConstAiAgentSlice,
-        movement: ConstMovementBodySlice,
-        data: *const DataSystem,
-        config: SpatialIndexConfig,
-    ) !SpatialIndexStats {
-        self.clearWork();
-        self.cell_size = config.cell_size;
-        const n = if (config.scope_dense_indices) |idx| idx.len else ai_agents.entities.len;
-        if (n == 0) return .{};
-
-        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
-        var row_slice = self.rows.slice();
-        var k: usize = 0;
-        while (k < n) : (k += 1) {
-            const i: usize = if (config.scope_dense_indices) |idx| idx[k] else k;
-            const ent = ai_agents.entities[i];
-            const mi = data.movementBodyDenseIndex(ent) orelse continue;
-            // Cell is assigned afterward by a dense SIMD pass over the gathered
-            // rows (see `assignCellsDense`) — this branchy, scattered-lookup
-            // walk only resolves entity + position.
-            appendSpatialRow(&self.rows, &row_slice, .{
-                .entity = ent,
-                .pos_x = movement.previous_x[mi],
-                .pos_y = movement.previous_y[mi],
-                .cell = .{ .x = 0, .y = 0 },
-            });
-        }
-
-        const gathered = self.rows.len;
-        if (gathered == 0) return .{};
-        self.assignCellsDense();
-        try self.buildEntriesAndRanges();
-        return .{ .entity_count = gathered, .batch = inlineBatch(gathered, spatial_index_range_alignment_items) };
+    // Sizes the entry, cell, segment, and table lists for `entry_count` entries, within
+    // capacity.
+    fn setEntryCount(self: *SpatialIndexSystem, entry_count: u32) void {
+        std.debug.assert(self.cells.capacity >= entry_count and self.segments.capacity >= entry_count);
+        std.debug.assert(self.segment_table.capacity >= 2 * @as(usize, entry_count));
+        setRowCount(EntryRow, &self.entries, entry_count);
+        self.cells.items.len = entry_count;
+        self.segments.items.len = entry_count;
+        self.segment_table.items.len = 2 * @as(usize, entry_count);
     }
 
-    fn clearWork(self: *SpatialIndexSystem) void {
-        self.rows.clearRetainingCapacity();
-        self.entries.clearRetainingCapacity();
-        self.ranges.clearRetainingCapacity();
-    }
-
-    /// Sizes the staging to `item_count` window slots and resets `range_count`
-    /// tallies. Main thread, before dispatch. Grow-only safety nets: after
-    /// `reserveRows` at the population seam they never allocate, whatever partition
-    /// the tuner picked.
-    fn prepareGatherStaging(self: *SpatialIndexSystem, item_count: usize, range_count: usize) !void {
-        try self.gather_staging.ensureTotalCapacity(self.allocator, item_count);
-        self.gather_staging.items.len = item_count;
-        try self.gather_tallies.ensureTotalCapacity(self.allocator, range_count);
-        self.gather_tallies.items.len = range_count;
-        for (self.gather_tallies.items) |*slot| slot.count = 0;
-    }
-
-    /// Copies each range's staging window (`count` rows at `r * items_per_range`) into
-    /// `rows` in range order, copying each row once.
-    fn mergeRowWindows(self: *SpatialIndexSystem, items_per_range: usize) !void {
-        self.rows.clearRetainingCapacity();
-        var total: usize = 0;
-        for (self.gather_tallies.items) |*slot| total += slot.count;
-        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(total));
-        var row_slice = self.rows.slice();
-        const staging = self.gather_staging.items;
-        for (self.gather_tallies.items, 0..) |*slot, range_index| {
-            const window_start = range_index * items_per_range;
-            for (staging[window_start..][0..slot.count]) |record| {
-                appendSpatialRow(&self.rows, &row_slice, record);
-            }
-        }
-    }
-
-    /// Derives every row's `SpatialCell` from its already-gathered, contiguous
-    /// `pos_x`/`pos_y` columns: dense, uniform, branch-light float math over an
-    /// SoA column, so it runs 4 rows at a time through `simd.floorToI4` with a
-    /// scalar tail. Called after
-    /// the scattered/branchy gather (`spatialGatherJob`/`buildSerial`'s loop)
-    /// has finished — both leave `.cell` as a placeholder for this pass to fill.
-    /// Uses `simd.divFloat4` (true division), not a precomputed reciprocal
-    /// multiply, so results are bit-identical to the scalar `cellForPosition`.
-    fn assignCellsDense(self: *SpatialIndexSystem) void {
-        const slice = self.rows.slice();
-        const pos_x = slice.items(.pos_x);
-        const pos_y = slice.items(.pos_y);
-        const cells = slice.items(.cell);
-        const n = cells.len;
-        const cell_size_vec = simd.splatFloat4(self.cell_size);
-        var i: usize = 0;
-        const vend = simd.vectorizedEnd(n);
-        while (i < vend) : (i += simd.lane_count) {
-            const px = simd.loadFloat4(pos_x[i..]);
-            const py = simd.loadFloat4(pos_y[i..]);
-            const cx = simd.toIntArray(simd.floorToI4(simd.divFloat4(px, cell_size_vec)));
-            const cy = simd.toIntArray(simd.floorToI4(simd.divFloat4(py, cell_size_vec)));
-            inline for (0..simd.lane_count) |lane| {
-                cells[i + lane] = .{ .x = cx[lane], .y = cy[lane] };
-            }
-        }
-        while (i < n) : (i += 1) {
-            cells[i] = cellForPosition(pos_x[i], pos_y[i], self.cell_size);
-        }
-    }
-
-    /// Builds `entries` (one per row) and derives `ranges` from the sorted
-    /// order, then writes the populated ranges into `dense_lookup`, re-anchored
-    /// to this step's own populated-cell bounding box. `entries`/`ranges` are
-    /// reserved to `self.rows.len` up front (a no-op once `reserve` has already
-    /// sized them, matching the reserve-then-ensureTotalCapacity
-    /// belt-and-suspenders pattern the other processors use).
-    ///
-    /// The bounding box fitting inside `dense_lookup`'s reserved capacity is a
-    /// program invariant that `reserve`'s sizing keeps comfortably true for
-    /// every world/camera configuration reachable in this codebase today (see
-    /// `max_dense_window_side_cells`'s doc comment for the caveat on that
-    /// assumption). It is not enforced with `std.debug.assert`, since this
-    /// project ships ReleaseFast (which strips asserts) — an assert-only guard
-    /// would let a violation silently corrupt `dense_lookup.starts`/`ends` in
-    /// the shipped build. Instead the write loop below unconditionally clamps
-    /// the window and skips any cell that falls outside it in every build
-    /// mode: a violation just can't be found via the dense lookup for that
-    /// step (a correctness gap, not memory corruption or a crash) —
-    /// `entries`/`ranges` themselves are unaffected.
-    fn buildEntriesAndRanges(self: *SpatialIndexSystem) !void {
-        self.dense_lookup.clearTouched();
-        const n = self.rows.len;
-        const cells = self.rows.items(.cell);
-        try self.entries.ensureTotalCapacity(self.allocator, n);
-        self.entries.clearRetainingCapacity();
-        for (0..n) |i| {
-            self.entries.appendAssumeCapacity(.{ .cell = cells[i], .index = i });
-        }
-        std.mem.sort(SpatialEntry, self.entries.items, {}, entryLessThan);
-
-        try self.ranges.ensureTotalCapacity(self.allocator, n);
-        self.ranges.clearRetainingCapacity();
-        if (n == 0) return;
-
-        // min_y/max_y fall out of the cell-major sort (first/last entry); x
-        // only sorts within a fixed y, so min_x/max_x need a scan.
-        var min_x: i32 = self.entries.items[0].cell.x;
-        var max_x: i32 = min_x;
-        for (self.entries.items) |entry| {
-            min_x = @min(min_x, entry.cell.x);
-            max_x = @max(max_x, entry.cell.x);
-        }
-        const min_y = self.entries.items[0].cell.y;
-        const max_y = self.entries.items[self.entries.items.len - 1].cell.y;
-        // Widen before narrowing: `max - min` on i32 cell coordinates (produced
-        // from possibly-inf/huge positions via saturating `floorToI32`) can
-        // overflow i32, and an out-of-range `@intCast` to u32 is UB in
-        // ReleaseFast (safety checks stripped) — and it would run *before* the
-        // capacity clamp meant to contain an oversized window. Compute the span
-        // in i64, clamp against the reserved capacity while still wide, then
-        // narrow the already-bounded value to u32.
-        const width_span = @as(i64, max_x) - @as(i64, min_x) + 1;
-        const height_span = @as(i64, max_y) - @as(i64, min_y) + 1;
-        const width: u32 = @intCast(@min(width_span, @as(i64, self.dense_lookup.capacity_cells_x)));
-        const height: u32 = @intCast(@min(height_span, @as(i64, self.dense_lookup.capacity_cells_y)));
-
-        self.dense_lookup.origin = .{ .x = min_x, .y = min_y };
-        self.dense_lookup.width = width;
-        self.dense_lookup.height = height;
-        // Belt-and-suspenders growth, matching entries/ranges above: `touched`
-        // is reserved once in `reserve()` to the configured movement-body
-        // capacity (a no-op here in steady state), but a step whose
-        // population exceeds that capacity (e.g. `reserve` was called with a
-        // deliberately small capacity) still needs at most one touched slot
-        // per distinct populated cell, which is bounded by `n`.
-        try self.dense_lookup.touched.ensureTotalCapacity(self.allocator, n);
-
-        var entry_index: usize = 0;
-        while (entry_index < self.entries.items.len) {
-            const cell = self.entries.items[entry_index].cell;
-            const start = entry_index;
-            while (entry_index < self.entries.items.len and cellsEqual(self.entries.items[entry_index].cell, cell)) {
-                entry_index += 1;
-            }
-            const range = SpatialCellRange{ .cell = cell, .start = start, .end = entry_index };
-            self.ranges.appendAssumeCapacity(range);
-
-            std.debug.assert(range.start <= std.math.maxInt(u32) and range.end <= std.math.maxInt(u32));
-            const rel_x: u32 = @intCast(cell.x - min_x);
-            const rel_y: u32 = @intCast(cell.y - min_y);
-            // Skip cells the clamp above pushed outside the reserved window
-            // rather than index past `starts`/`ends` — see this function's
-            // doc comment on why a clamp+skip backs the debug assert.
-            if (rel_x >= width or rel_y >= height) continue;
-            const idx = @as(usize, rel_y) * width + rel_x;
-            self.dense_lookup.starts.items[idx] = @intCast(range.start);
-            self.dense_lookup.ends.items[idx] = @intCast(range.end);
-            self.dense_lookup.touched.appendAssumeCapacity(idx);
-        }
+    fn bandWriter(self: *SpatialIndexSystem) BandWriter {
+        const entries = self.entries.slice();
+        return .{
+            .keys = self.keys.items,
+            .slot_rows = self.slot_rows.items,
+            .entry_x = entries.items(.x),
+            .entry_y = entries.items(.y),
+            .entry_entity = entries.items(.entity),
+            .entry_faction = entries.items(.faction),
+            .entry_level = entries.items(.level),
+            .cells = self.cells.items,
+            .segments = self.segments.items,
+            .segment_table = self.segment_table.items,
+        };
     }
 };
 
-// ---- Cell math ---------------------------------------------------------------
+// ---- Build stages -------------------------------------------------------------
 
-fn cellForPosition(x: f32, y: f32, cell_size: f32) SpatialCell {
-    return .{
-        .x = math.floorToI32(x / cell_size),
-        .y = math.floorToI32(y / cell_size),
-    };
+fn cellScanRadius(radius: f32, cell_size: f32) i32 {
+    // ceil(r / c) == -floor(-r / c), through the saturating `floorToI32`.
+    return -math.floorToI32(-(radius / cell_size));
 }
 
-fn cellsEqual(lhs: SpatialCell, rhs: SpatialCell) bool {
-    return lhs.x == rhs.x and lhs.y == rhs.y;
+fn cellForPosition(x: f32, y: f32, cell_size: f32) CellKey {
+    return .{ .cell_y = math.floorToI32(y / cell_size), .cell_x = math.floorToI32(x / cell_size) };
 }
 
-/// Cell-major total order: y then x. Ties broken by `entryLessThan`'s index
-/// term. Determinism-critical — see the module doc comment.
-fn cellLessThan(lhs: SpatialCell, rhs: SpatialCell) bool {
-    if (lhs.y != rhs.y) return lhs.y < rhs.y;
-    return lhs.x < rhs.x;
-}
-
-fn entryLessThan(_: void, lhs: SpatialEntry, rhs: SpatialEntry) bool {
-    if (!cellsEqual(lhs.cell, rhs.cell)) return cellLessThan(lhs.cell, rhs.cell);
-    return lhs.index < rhs.index;
-}
-
-// ---- Threaded gather ----------------------------------------------------------
-
-/// Cache-line-aligned staging: with a 16-item range alignment every range's window
-/// starts on a cache-line boundary for 24-byte rows, so concurrent range writes never
-/// share a line.
-const RowStagingList = std.array_list.Aligned(SpatialIndexRow, .fromByteUnits(thread_shared_record_alignment));
-
-/// One range's gathered-row count, written once by the range's job.
-const RowCountTally = struct {
-    // Padding keeps concurrently written tallies off shared cache lines.
-    count: usize = 0,
-    padding: [paddingForCacheLine(usize)]u8 = @splat(0),
-};
-
-comptime {
-    std.debug.assert(@sizeOf(RowCountTally) % thread_shared_record_alignment == 0);
-}
-
-const RowCountTallyList = std.array_list.Aligned(RowCountTally, .fromByteUnits(thread_shared_record_alignment));
-
-const SpatialGatherContext = struct {
-    ai_entities: []const EntityId,
-    movement: ConstMovementBodySlice,
+const FillContext = struct {
+    population: IndexPopulation,
     data: *const DataSystem,
-    scope_dense_indices: ?[]const u32,
-    /// Item-count staging; range r writes only its own `[range.start, range.end)` window.
-    out: []SpatialIndexRow,
-    items_per_range: usize,
-    tallies: []RowCountTally,
-    /// Candidate count the dispatch was shaped for (scoped subset or full AI
-    /// population); dual-asserted against `range.end` at job entry.
-    item_count: usize,
+    movement: ConstMovementBodySlice,
+    cell_size: f32,
+    // Written at the filled slots only.
+    slot_rows: []SlotRow,
+
+    // Scalar: a scattered dense-index lookup per component, with a skip.
+    fn resolveSlot(self: *const FillContext, slot: usize) SlotRow {
+        const entity = self.population.entity(slot);
+        const row: SlotRow = if (self.data.movementBodyDenseIndex(entity)) |body| .{
+            .entity = entity,
+            .x = self.movement.previous_x[body],
+            .y = self.movement.previous_y[body],
+            .level = self.data.worldLevelConst(entity) orelse 0,
+            .faction = self.data.factionConst(entity) orelse .neutral,
+        } else .{ .entity = EntityId.invalid, .x = 0, .y = 0, .level = 0, .faction = .neutral };
+        self.slot_rows[slot] = row;
+        return row;
+    }
 };
 
-/// Scattered/branchy per-entity resolution: `movementBodyDenseIndex` is a
-/// dense-index lookup with a real skip (some scoped agents lack a movement
-/// body), so this stays scalar — the same shape as `AiSystem.gatherAiData`'s
-/// gather and `SimulationScopeSystem`'s AI gather job. Cell assignment is
-/// deliberately not done here; it runs afterward as one dense SIMD pass over
-/// the merged, contiguous `rows` columns (`assignCellsDense`): gather into
-/// packed SoA scratch, then vectorize the dense math.
-fn spatialGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *SpatialGatherContext = @ptrCast(@alignCast(context));
-    // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs
-    // dispatched range count AND range.end vs the candidate buffer this job walks.
-    // Guards the reserve-before-dispatch invariant: the tallies were sized to this
-    // dispatch's range count, the range is the window the merge expects, and it stays
-    // inside the staging.
-    std.debug.assert(range.index < job.tallies.len);
-    std.debug.assert(range.start <= range.end);
-    std.debug.assert(range.end <= job.item_count);
-    std.debug.assert(range.start == range.index * job.items_per_range);
-    std.debug.assert(range.end <= job.out.len);
-    const window = job.out[range.start..range.end];
+// Resolves slots `[start, end)` into their rows and writes a key to `keys` for each with a
+// movement body, in slot order; returns the key count. Cells in lanes over the packed
+// positions with a scalar tail, bit for bit `cellForPosition`.
+fn fillSlots(fill: *const FillContext, start: usize, end: usize, keys: []SortKey) usize {
+    std.debug.assert(start <= end and end <= fill.slot_rows.len and keys.len >= end - start);
+    const cell_size_lanes = simd.splatFloat4(fill.cell_size);
     var count: usize = 0;
-    for (range.start..range.end) |k| {
-        const i: usize = if (job.scope_dense_indices) |idx| idx[k] else k;
-        const ent = job.ai_entities[i];
-        const mi = job.data.movementBodyDenseIndex(ent) orelse continue;
-        window[count] = .{
-            .entity = ent,
-            .pos_x = job.movement.previous_x[mi],
-            .pos_y = job.movement.previous_y[mi],
-            .cell = .{ .x = 0, .y = 0 },
-        };
+    var slot = start;
+    const vector_end = start + simd.vectorizedEnd(end - start);
+    while (slot < vector_end) : (slot += simd.lane_count) {
+        var x: [simd.lane_count]f32 = undefined;
+        var y: [simd.lane_count]f32 = undefined;
+        var has_body: [simd.lane_count]bool = undefined;
+        inline for (0..simd.lane_count) |lane| {
+            const row = fill.resolveSlot(slot + lane);
+            x[lane] = row.x;
+            y[lane] = row.y;
+            has_body[lane] = row.entity.isValid();
+        }
+        const cell_x = simd.toIntArray(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&x), cell_size_lanes)));
+        const cell_y = simd.toIntArray(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&y), cell_size_lanes)));
+        inline for (0..simd.lane_count) |lane| {
+            if (has_body[lane]) {
+                // A slot is below slot_count <= maxInt(u32).
+                keys[count] = .{ .cell_y = cell_y[lane], .cell_x = cell_x[lane], .slot = @intCast(slot + lane) };
+                count += 1;
+            }
+        }
+    }
+    while (slot < end) : (slot += 1) {
+        const row = fill.resolveSlot(slot);
+        if (!row.entity.isValid()) continue;
+        const cell = cellForPosition(row.x, row.y, fill.cell_size);
+        // A slot is below slot_count <= maxInt(u32).
+        keys[count] = .{ .cell_y = cell.cell_y, .cell_x = cell.cell_x, .slot = @intCast(slot) };
         count += 1;
     }
-    job.tallies[range.index].count = count;
+    return count;
+}
+
+// `index_bucket`: one range of population slots.
+const BucketJob = struct {
+    fill: FillContext,
+    // Its splitters, written before dispatch.
+    directory: *const BandDirectory,
+    // Range r's windows start at `r * items_per_range`.
+    scratch: []SortKey,
+    staging: []SortKey,
+    items_per_range: usize,
+    band_offsets: []PaddedSlot(BandOffsets),
+};
+
+// Fills the range's keys into its scratch window, then places them in its staging window
+// by band, in slot order within a band, and records the band offsets. The band search runs
+// twice per key rather than storing each band: scalar, a six-step binary search.
+fn bucketJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *BucketJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.band_offsets.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.fill.population.len());
+    std.debug.assert(range.end <= job.scratch.len and range.end <= job.staging.len and range.end <= job.fill.slot_rows.len);
+    std.debug.assert(job.directory.splitter_count == band_count - 1);
+    const filled = job.scratch[range.start..][0..fillSlots(&job.fill, range.start, range.end, job.scratch[range.start..range.end])];
+    var offsets: [band_count + 1]u32 = @splat(0);
+    for (filled) |key| offsets[job.directory.bandOfCell(key.cell()) + 1] += 1;
+    for (1..band_count + 1) |band| offsets[band] += offsets[band - 1];
+    job.band_offsets[range.index].value.offsets = offsets;
+    var cursor = offsets;
+    for (filled) |key| {
+        const band = job.directory.bandOfCell(key.cell());
+        job.staging[range.start + cursor[band]] = key;
+        cursor[band] += 1;
+    }
+}
+
+// `index_sort`: one range of entry keys. A range owns every nonempty band that starts in
+// it, so each band has one owner and the ranges' work follows their key counts.
+const SortJob = struct {
+    staging: []const SortKey,
+    band_offsets: []const PaddedSlot(BandOffsets),
+    bucket_items_per_range: usize,
+    // Band b's keys, cells, and entries go to `[band_start[b], band_start[b + 1])`.
+    band_start: [band_count + 1]u32,
+    writer: BandWriter,
+    tallies: []PaddedSlot(BandTally),
+    range_count: usize,
+};
+
+// Each owned band gathers every bucket range's segment of it in range order into its slice
+// of the keys, then finishes there.
+fn sortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *SortJob = @ptrCast(@alignCast(context));
+    const entry_count = job.band_start[band_count];
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end and range.end <= entry_count);
+    std.debug.assert(entry_count <= job.writer.keys.len and entry_count <= job.writer.cells.len and entry_count <= job.writer.entry_x.len);
+    std.debug.assert(entry_count <= job.writer.segments.len and 2 * @as(usize, entry_count) <= job.writer.segment_table.len and job.tallies.len == band_count);
+    var band = std.sort.partitionPoint(u32, job.band_start[0..band_count], range.start, startsBefore);
+    while (band < band_count and job.band_start[band] < range.end) : (band += 1) {
+        const start = job.band_start[band];
+        const end = job.band_start[band + 1];
+        if (start == end) continue;
+        var cursor: usize = start;
+        for (job.band_offsets, 0..) |slot, bucket_range| {
+            const window = job.staging[bucket_range * job.bucket_items_per_range ..];
+            const segment = window[slot.value.offsets[band]..slot.value.offsets[band + 1]];
+            @memcpy(job.writer.keys[cursor..][0..segment.len], segment);
+            cursor += segment.len;
+        }
+        std.debug.assert(cursor == end);
+        job.tallies[band].value = job.writer.finishBand(start, end);
+    }
+}
+
+fn startsBefore(range_start: usize, band_start: u32) bool {
+    return band_start < range_start;
+}
+
+// Writes one band's slice of the sorted keys, cells, table, and entries.
+const BandWriter = struct {
+    keys: []SortKey,
+    slot_rows: []const SlotRow,
+    entry_x: []f32,
+    entry_y: []f32,
+    entry_entity: []EntityId,
+    entry_faction: []Faction,
+    entry_level: []u16,
+    cells: []SpatialCell,
+    segments: []RowSegment,
+    segment_table: []u32,
+
+    // Sorts the band's keys `[start, end)`, writes one cell per run from `cells[start]` and
+    // one row segment per (cell_y, segment_x) run of cells from `segments[start]`, inserts
+    // the segments into the band's table, and gathers the entries' payload. pdqsort: the
+    // key is total, so an unstable sort is exact. Scalar: a comparison sort, run
+    // compaction, probe chains, and record copies.
+    fn finishBand(self: BandWriter, start: u32, end: u32) BandTally {
+        std.sort.pdq(SortKey, self.keys[start..end], {}, sortKeyLessThan);
+        var cell_count: u32 = 0;
+        var segment_count: u32 = 0;
+        var entry: u32 = start;
+        while (entry < end) {
+            const cell_start = entry;
+            const key = self.keys[entry];
+            while (entry < end and self.keys[entry].cell_y == key.cell_y and self.keys[entry].cell_x == key.cell_x) entry += 1;
+            const cell_index = start + cell_count;
+            self.cells[cell_index] = .{ .cell_y = key.cell_y, .cell_x = key.cell_x, .start = cell_start, .end = entry };
+            cell_count += 1;
+            const segment_x: i32 = @divFloor(key.cell_x, segment_cells);
+            const open = segment_count != 0 and self.segments[start + segment_count - 1].cell_y == key.cell_y and self.segments[start + segment_count - 1].segment_x == segment_x;
+            if (!open) {
+                self.segments[start + segment_count] = .{ .cell_y = key.cell_y, .segment_x = segment_x, .first_cell = cell_index, .occupied = .empty };
+                segment_count += 1;
+            }
+            // `@mod` by 64 is in [0, 63].
+            self.segments[start + segment_count - 1].occupied.set(@intCast(@mod(key.cell_x, segment_cells)));
+        }
+
+        const table = self.segment_table[2 * @as(usize, start) .. 2 * @as(usize, end)];
+        @memset(table, 0);
+        for (start..start + segment_count) |segment_index| {
+            const segment = self.segments[segment_index];
+            var slot = tableSlot(segment.cell_y, segment.segment_x, table.len);
+            while (table[slot] != 0) {
+                slot += 1;
+                if (slot == table.len) slot = 0;
+            }
+            // segment_index + 1 <= entry count <= maxInt(u32).
+            table[slot] = @intCast(segment_index + 1);
+        }
+
+        for (start..end) |index| {
+            const row = self.slot_rows[self.keys[index].slot];
+            self.entry_x[index] = row.x;
+            self.entry_y[index] = row.y;
+            self.entry_entity[index] = row.entity;
+            self.entry_faction[index] = row.faction;
+            self.entry_level[index] = row.level;
+        }
+        return .{ .cell_count = cell_count, .segment_count = segment_count };
+    }
+};
+
+// The `band_count - 1` band splitters: the cells at the band quantiles of up to
+// `splitter_sample_count` slots (slots without a body skipped), sorted. Every slot when they
+// fit the sample, else slots at a golden-ratio sequence of fractions of the slot count,
+// which shares no period with a periodic slot order. Fixed work on the main thread; with no
+// sampled body every splitter is `max_cell_key`.
+fn chooseSplitters(data: *const DataSystem, population: IndexPopulation, cell_size: f32) [band_count - 1]CellKey {
+    const slot_count = population.len();
+    const sample_count = @min(splitter_sample_count, slot_count);
+    const movement = data.movementBodySliceConst();
+    var samples: [splitter_sample_count]CellKey = undefined;
+    var valid: usize = 0;
+    var fraction: u64 = 0;
+    for (0..sample_count) |sample| {
+        fraction +%= sample_fraction_step;
+        // The high word of fraction * slot_count is below slot_count.
+        const slot: usize = if (slot_count <= splitter_sample_count) sample else @intCast(std.math.mulWide(u64, fraction, slot_count) >> 64);
+        const body = data.movementBodyDenseIndex(population.entity(slot)) orelse continue;
+        samples[valid] = cellForPosition(movement.previous_x[body], movement.previous_y[body], cell_size);
+        valid += 1;
+    }
+    var splitters: [band_count - 1]CellKey = @splat(max_cell_key);
+    if (valid == 0) return splitters;
+    std.sort.pdq(CellKey, samples[0..valid], {}, cellKeyLessThan);
+    for (&splitters, 1..) |*splitter, band| splitter.* = samples[band * valid / band_count];
+    return splitters;
 }
 
 // ---- Tests --------------------------------------------------------------------
 
 const testing = std.testing;
+const builtin = @import("builtin");
 
-/// Builds a `SpatialIndexView` over caller-owned fixture data for
-/// `queryNeighbors`'s scan/visit/stop-semantics tests, which construct
-/// `entries`/`ranges` by hand rather than going through `buildEntriesAndRanges`.
-/// `dense_starts`/`dense_ends` are caller-owned scratch sized to at least the
-/// populated cells' bounding box; that box is computed here from `ranges` the
-/// same way production code does, just without an allocator.
-fn makeFixtureView(
-    pos_x: []const f32,
-    pos_y: []const f32,
-    entries: []const SpatialEntry,
-    ranges: []const SpatialCellRange,
-    dense_starts: []u32,
-    dense_ends: []u32,
-    cell_size: f32,
-) SpatialIndexView {
-    var origin = SpatialCell{ .x = 0, .y = 0 };
-    var width: u32 = 1;
-    var height: u32 = 1;
-    if (ranges.len > 0) {
-        var min_x = ranges[0].cell.x;
-        var max_x = min_x;
-        var min_y = ranges[0].cell.y;
-        var max_y = min_y;
-        for (ranges) |range| {
-            min_x = @min(min_x, range.cell.x);
-            max_x = @max(max_x, range.cell.x);
-            min_y = @min(min_y, range.cell.y);
-            max_y = @max(max_y, range.cell.y);
-        }
-        origin = .{ .x = min_x, .y = min_y };
-        width = @intCast(max_x - min_x + 1);
-        height = @intCast(max_y - min_y + 1);
-    }
-    const cell_count = @as(usize, width) * @as(usize, height);
-    @memset(dense_starts[0..cell_count], 0);
-    @memset(dense_ends[0..cell_count], 0);
-    for (ranges) |range| {
-        const rel_x: u32 = @intCast(range.cell.x - origin.x);
-        const rel_y: u32 = @intCast(range.cell.y - origin.y);
-        const idx = @as(usize, rel_y) * width + rel_x;
-        dense_starts[idx] = @intCast(range.start);
-        dense_ends[idx] = @intCast(range.end);
-    }
-    return .{
-        .pos_x = pos_x,
-        .pos_y = pos_y,
-        .entries = entries,
-        .ranges = ranges,
-        .dense_lookup = .{
-            .starts = dense_starts[0..cell_count],
-            .ends = dense_ends[0..cell_count],
-            .origin = origin,
-            .width = width,
-            .height = height,
-        },
-        .cell_size = cell_size,
-    };
-}
-
+// A query visitor that records every visit, stopping after `stop_after` visits.
 const RecordingVisitor = struct {
-    visited: [64]usize = undefined,
+    entries: [256]u32 = undefined,
+    dx: [256]f32 = undefined,
+    dy: [256]f32 = undefined,
+    dist2: [256]f32 = undefined,
     count: usize = 0,
+    stop_after: usize = std.math.maxInt(usize),
 
-    fn record(context: *anyopaque, candidate_index: usize, _: f32, _: f32, _: f32) NeighborVisitResult {
-        const self: *RecordingVisitor = @ptrCast(@alignCast(context));
-        self.visited[self.count] = candidate_index;
-        self.count += 1;
-        return .keep_going;
-    }
-};
-
-test "cellScanRadius matches AI's fixed 48/32 constant" {
-    try testing.expectEqual(@as(i32, 2), cellScanRadius(48.0, 32.0));
-    try testing.expectEqual(@as(i32, 0), cellScanRadius(0.0, 32.0));
-    try testing.expectEqual(@as(i32, 1), cellScanRadius(32.0, 32.0));
-}
-
-test "queryNeighbors visits candidates in ascending stored order, excludes self and strict-boundary radius" {
-    // All five points fall in cell (0,0) at cell_size 10, so the whole scan is
-    // one range and traversal order is exactly ascending stored index.
-    const pos_x = [_]f32{ 0, 3, 5, 4.9, 1 };
-    const pos_y = [_]f32{ 0, 0, 0, 0, 0 };
-    const entries = [_]SpatialEntry{
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 0 },
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 1 },
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 2 },
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 3 },
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 4 },
-    };
-    const ranges = [_]SpatialCellRange{.{ .cell = .{ .x = 0, .y = 0 }, .start = 0, .end = 5 }};
-    var dense_starts: [1]u32 = undefined;
-    var dense_ends: [1]u32 = undefined;
-    const view = makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &dense_starts, &dense_ends, 10.0);
-
-    var visitor = RecordingVisitor{};
-    const stats = view.queryNeighbors(0, 0, 0, 1, .{ .radius = 5.0, .max_candidate_checks = 128 }, &visitor, RecordingVisitor.record);
-
-    // index 2 sits exactly at radius 5 (dist2 == 25) so the strict `<` prefilter
-    // excludes it from `visit_fn` — but it is still a scanned non-self candidate,
-    // so it counts toward `candidate_checks` (4 total: indices 1,2,3,4). Index 0
-    // is self and is skipped before the count, and never visited even though
-    // dist2 == 0.
-    try testing.expectEqual(@as(usize, 3), visitor.count);
-    try testing.expectEqualSlices(usize, &.{ 1, 3, 4 }, visitor.visited[0..visitor.count]);
-    try testing.expectEqual(@as(u16, 4), stats.candidate_checks);
-}
-
-test "queryNeighbors stops at max_candidate_checks before processing the tipping candidate" {
-    const pos_x = [_]f32{ 0, 1, 2, 3 };
-    const pos_y = [_]f32{ 0, 0, 0, 0 };
-    const entries = [_]SpatialEntry{
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 0 },
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 1 },
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 2 },
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 3 },
-    };
-    const ranges = [_]SpatialCellRange{.{ .cell = .{ .x = 0, .y = 0 }, .start = 0, .end = 4 }};
-    var dense_starts: [1]u32 = undefined;
-    var dense_ends: [1]u32 = undefined;
-    const view = makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &dense_starts, &dense_ends, 10.0);
-
-    var visitor = RecordingVisitor{};
-    const stats = view.queryNeighbors(0, 0, 0, 1, .{ .radius = 100.0, .max_candidate_checks = 1 }, &visitor, RecordingVisitor.record);
-
-    try testing.expectEqual(@as(usize, 1), visitor.count);
-    try testing.expectEqualSlices(usize, &.{1}, visitor.visited[0..visitor.count]);
-    try testing.expectEqual(@as(u16, 1), stats.candidate_checks);
-}
-
-test "queryNeighbors with no self_index scans every entry including index 0" {
-    const pos_x = [_]f32{ 0, 1 };
-    const pos_y = [_]f32{ 0, 0 };
-    const entries = [_]SpatialEntry{
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 0 },
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 1 },
-    };
-    const ranges = [_]SpatialCellRange{.{ .cell = .{ .x = 0, .y = 0 }, .start = 0, .end = 2 }};
-    var dense_starts: [1]u32 = undefined;
-    var dense_ends: [1]u32 = undefined;
-    const view = makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &dense_starts, &dense_ends, 10.0);
-
-    var visitor = RecordingVisitor{};
-    _ = view.queryNeighbors(5, 0, null, 1, .{ .radius = 100.0, .max_candidate_checks = 128 }, &visitor, RecordingVisitor.record);
-
-    try testing.expectEqualSlices(usize, &.{ 0, 1 }, visitor.visited[0..visitor.count]);
-}
-
-/// Builds a `SpatialIndexView` directly from an explicit dense window
-/// (`origin`/`width`/`height`/`dense_starts`/`dense_ends`), for the
-/// vectorized-batch tests below that need to place unpopulated gaps or
-/// out-of-window scan bounds precisely rather than deriving the window from a
-/// populated bounding box (as `makeFixtureView` does). `ranges` is left empty
-/// since `queryNeighbors` only reads `entries` and `dense_lookup`.
-fn makeDenseFixtureView(
-    pos_x: []const f32,
-    pos_y: []const f32,
-    entries: []const SpatialEntry,
-    dense_starts: []const u32,
-    dense_ends: []const u32,
-    origin: SpatialCell,
-    width: u32,
-    height: u32,
-    cell_size: f32,
-) SpatialIndexView {
-    return .{
-        .pos_x = pos_x,
-        .pos_y = pos_y,
-        .entries = entries,
-        .ranges = &[_]SpatialCellRange{},
-        .dense_lookup = .{
-            .starts = dense_starts,
-            .ends = dense_ends,
-            .origin = origin,
-            .width = width,
-            .height = height,
-        },
-        .cell_size = cell_size,
-    };
-}
-
-test "queryNeighbors vectorized batch visits mixed populated/unpopulated cells in ascending order across a row" {
-    // cell_size 10, one row (cell_y=0) spanning cell_x 0..4 (5 cells, so the
-    // 4-wide vectorized batch covers x=0..3 and the scalar tail covers x=4):
-    // populated at x=0 (indices 0,1), x=2 (index 2), x=3 (indices 3,4); x=1
-    // and x=4 are unpopulated gaps the batch/tail must skip without visiting.
-    const pos_x = [_]f32{ 0, 0, 0, 0, 0 };
-    const pos_y = [_]f32{ 0, 0, 0, 0, 0 };
-    const entries = [_]SpatialEntry{
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 0 },
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 1 },
-        .{ .cell = .{ .x = 2, .y = 0 }, .index = 2 },
-        .{ .cell = .{ .x = 3, .y = 0 }, .index = 3 },
-        .{ .cell = .{ .x = 3, .y = 0 }, .index = 4 },
-    };
-    const dense_starts = [_]u32{ 0, 0, 2, 3, 0 };
-    const dense_ends = [_]u32{ 2, 0, 3, 5, 0 };
-    const view = makeDenseFixtureView(&pos_x, &pos_y, &entries, &dense_starts, &dense_ends, .{ .x = 0, .y = 0 }, 5, 1, 10.0);
-
-    var visitor = RecordingVisitor{};
-    const stats = view.queryNeighbors(25, 5, null, 2, .{ .radius = 1000.0, .max_candidate_checks = 64 }, &visitor, RecordingVisitor.record);
-
-    try testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3, 4 }, visitor.visited[0..visitor.count]);
-    try testing.expectEqual(@as(u16, 5), stats.candidate_checks);
-}
-
-test "queryNeighbors clips a scan radius extending past the dense window's edges without reading out of bounds" {
-    // Dense window covers only cell_y=0, cell_x in {0,1}. own_cell resolves to
-    // (0,0) and the scan radius (3) reaches x=-3..3 and y=-3..3, far past the
-    // window on every side; only the in-window cells may contribute.
-    const pos_x = [_]f32{ 0, 0, 0, 0 };
-    const pos_y = [_]f32{ 0, 0, 0, 0 };
-    const entries = [_]SpatialEntry{
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 0 },
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 1 },
-        .{ .cell = .{ .x = 1, .y = 0 }, .index = 2 },
-        .{ .cell = .{ .x = 1, .y = 0 }, .index = 3 },
-    };
-    const dense_starts = [_]u32{ 0, 2 };
-    const dense_ends = [_]u32{ 2, 4 };
-    const view = makeDenseFixtureView(&pos_x, &pos_y, &entries, &dense_starts, &dense_ends, .{ .x = 0, .y = 0 }, 2, 1, 10.0);
-
-    var visitor = RecordingVisitor{};
-    const stats = view.queryNeighbors(5, 5, null, 3, .{ .radius = 1000.0, .max_candidate_checks = 64 }, &visitor, RecordingVisitor.record);
-
-    try testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3 }, visitor.visited[0..visitor.count]);
-    try testing.expectEqual(@as(u16, 4), stats.candidate_checks);
-}
-
-test "queryNeighbors scalar tail covers row spans that aren't a multiple of the lane count" {
-    const row_lengths = .{ 1, 2, 3, 5, 6, 7 };
-    inline for (row_lengths) |n| {
-        var pos_x: [n]f32 = undefined;
-        var pos_y: [n]f32 = undefined;
-        var entries: [n]SpatialEntry = undefined;
-        var dense_starts: [n]u32 = undefined;
-        var dense_ends: [n]u32 = undefined;
-        inline for (0..n) |i| {
-            pos_x[i] = 0;
-            pos_y[i] = 0;
-            entries[i] = .{ .cell = .{ .x = i, .y = 0 }, .index = i };
-            dense_starts[i] = i;
-            dense_ends[i] = i + 1;
-        }
-        // own_cell resolves to (0,0); scan_radius == n guarantees the window
-        // (width n) clips the scan down to exactly x in [0, n-1].
-        const view = makeDenseFixtureView(&pos_x, &pos_y, &entries, &dense_starts, &dense_ends, .{ .x = 0, .y = 0 }, n, 1, 10.0);
-
-        var visitor = RecordingVisitor{};
-        const stats = view.queryNeighbors(5, 5, null, n, .{ .radius = 1000.0, .max_candidate_checks = 64 }, &visitor, RecordingVisitor.record);
-
-        var expected: [n]usize = undefined;
-        inline for (0..n) |i| expected[i] = i;
-        try testing.expectEqualSlices(usize, &expected, visitor.visited[0..visitor.count]);
-        try testing.expectEqual(@as(u16, n), stats.candidate_checks);
-    }
-}
-
-const StoppingVisitor = struct {
-    visited: [64]usize = undefined,
-    count: usize = 0,
-    stop_after: usize,
-
-    fn record(context: *anyopaque, candidate_index: usize, _: f32, _: f32, _: f32) NeighborVisitResult {
-        const self: *StoppingVisitor = @ptrCast(@alignCast(context));
-        self.visited[self.count] = candidate_index;
+    fn visit(self: *RecordingVisitor, entry: u32, dx: f32, dy: f32, dist2: f32) NeighborVisitResult {
+        self.entries[self.count] = entry;
+        self.dx[self.count] = dx;
+        self.dy[self.count] = dy;
+        self.dist2[self.count] = dist2;
         self.count += 1;
         return if (self.count >= self.stop_after) .stop else .keep_going;
     }
+
+    fn visited(self: *const RecordingVisitor) []const u32 {
+        return self.entries[0..self.count];
+    }
+
+    fn expectEqual(self: *const RecordingVisitor, other: *const RecordingVisitor) !void {
+        try testing.expectEqualSlices(u32, self.visited(), other.visited());
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(self.dx[0..self.count]), std.mem.sliceAsBytes(other.dx[0..other.count]));
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(self.dy[0..self.count]), std.mem.sliceAsBytes(other.dy[0..other.count]));
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(self.dist2[0..self.count]), std.mem.sliceAsBytes(other.dist2[0..other.count]));
+    }
 };
 
-test "queryNeighbors propagates an early .stop out of a vectorized batch, its row, and the outer scan" {
-    // Two-row window (cell_y 0 and 1), row 0 spanning x=0..4 like the batch
-    // test above, row 1 also populated at x=0. stop_after=1 fires inside the
-    // very first visited cell's range (x=0 has two entries), before the
-    // vectorized batch even reaches x=2/x=3, before the scalar tail (x=4),
-    // and before row 1 is ever scanned.
-    const pos_x = [_]f32{ 0, 0, 0, 0, 0, 0 };
-    const pos_y = [_]f32{ 0, 0, 0, 0, 0, 0 };
-    const entries = [_]SpatialEntry{
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 0 },
-        .{ .cell = .{ .x = 0, .y = 0 }, .index = 1 },
-        .{ .cell = .{ .x = 2, .y = 0 }, .index = 2 },
-        .{ .cell = .{ .x = 3, .y = 0 }, .index = 3 },
-        .{ .cell = .{ .x = 3, .y = 0 }, .index = 4 },
-        .{ .cell = .{ .x = 0, .y = 1 }, .index = 5 },
-    };
-    const dense_starts = [_]u32{
-        0, 0, 2, 3, 0, // row y=0: x=0..4
-        5, 0, 0, 0, 0, // row y=1: x=0..4
-    };
-    const dense_ends = [_]u32{
-        2, 0, 3, 5, 0,
-        6, 0, 0, 0, 0,
-    };
-    const view = makeDenseFixtureView(&pos_x, &pos_y, &entries, &dense_starts, &dense_ends, .{ .x = 0, .y = 0 }, 5, 2, 10.0);
-
-    var visitor = StoppingVisitor{ .stop_after = 1 };
-    _ = view.queryNeighbors(5, 5, null, 4, .{ .radius = 1000.0, .max_candidate_checks = 64 }, &visitor, StoppingVisitor.record);
-
-    try testing.expectEqualSlices(usize, &.{0}, visitor.visited[0..visitor.count]);
+// An AI agent with a movement body at `(x, y)`.
+fn addTestBody(data: *DataSystem, x: f32, y: f32) !EntityId {
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = x, .y = y }, .previous_position = .{ .x = x, .y = y }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    return entity;
 }
 
-const SpatialTestFixture = struct {
-    data: DataSystem,
+// An AI agent with no movement body.
+fn addTestBodiless(data: *DataSystem) !EntityId {
+    const entity = try data.createEntity();
+    try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    return entity;
+}
 
-    fn init(allocator: std.mem.Allocator, count: usize) !SpatialTestFixture {
-        var data = DataSystem.init(allocator);
-        errdefer data.deinit();
-        for (0..count) |i| {
-            const entity = try data.createEntity();
-            const position = math.Vec2{
-                .x = @as(f32, @floatFromInt(i % 23)) * 7.0 - 40.0,
-                .y = @as(f32, @floatFromInt(i / 23)) * 5.0 - 20.0,
-            };
-            try data.setMovementBody(entity, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 20 });
-            try data.setAiAgent(entity, .{ .active_behavior = .wander });
+fn aiPopulation(data: *const DataSystem) IndexPopulation {
+    return .{ .entities = data.aiAgentSliceConst().entities };
+}
+
+// Index test layouts of `layout_slot_count` AI agents, every seventh from slot 3 without a
+// body: every body in one cell row across about 200 cells; spread over many cell rows; at
+// negative coordinates with a NaN y, a -inf x, a +inf y, and a -inf y; every body in one
+// cell; a 10x10-cell cluster with one body far outside it; and cells on both sides of
+// row-segment edges on both signs in four rows, with one body at each i32 cell extreme.
+// Factions and levels vary.
+const TestLayout = enum { one_row, spread, negative, one_cell, cluster_outlier, segment_edges };
+const segment_edge_cells = [_]i32{ -129, -128, -65, -64, -1, 0, 63, 64, 127, 128 };
+const layout_slot_count: usize = 1000;
+const layout_cell_size: f32 = 20;
+const layout_outlier_slot: usize = layout_slot_count - 1;
+
+fn fillTestLayout(data: *DataSystem, layout: TestLayout) !void {
+    var prng = std.Random.DefaultPrng.init(0x6e1d_b4d5);
+    const random = prng.random();
+    for (0..layout_slot_count) |slot| {
+        if (slot % 7 == 3) {
+            _ = try addTestBodiless(data);
+            continue;
         }
-        return .{ .data = data };
+        var x: f32 = 0;
+        var y: f32 = 0;
+        switch (layout) {
+            .one_row => {
+                x = random.float(f32) * 4000;
+                y = 3 + random.float(f32) * 6;
+            },
+            .spread => {
+                x = random.float(f32) * 120;
+                y = random.float(f32) * 640;
+            },
+            .negative => {
+                x = random.float(f32) * 120 - 300;
+                y = -20 - random.float(f32) * 640;
+            },
+            .one_cell => {
+                x = 1 + random.float(f32) * 18;
+                y = 1 + random.float(f32) * 18;
+            },
+            .cluster_outlier => {
+                x = random.float(f32) * 200;
+                y = random.float(f32) * 200;
+                if (slot == layout_outlier_slot) {
+                    x = 1e6;
+                    y = 1e6;
+                }
+            },
+            .segment_edges => {
+                const cell_x = segment_edge_cells[slot % segment_edge_cells.len];
+                const cell_y: i32 = @as(i32, @intCast(slot / segment_edge_cells.len % 4)) - 2;
+                x = (@as(f32, @floatFromInt(cell_x)) + 0.1 + random.float(f32) * 0.8) * layout_cell_size;
+                y = (@as(f32, @floatFromInt(cell_y)) + 0.1 + random.float(f32) * 0.8) * layout_cell_size;
+                // Finite, and past the i32 cell range on each side.
+                if (slot == layout_outlier_slot) {
+                    x = 3e38;
+                    y = 3e38;
+                }
+                if (slot == layout_outlier_slot - 1) {
+                    x = -3e38;
+                    y = -3e38;
+                }
+            },
+        }
+        const entity = try addTestBody(data, x, y);
+        try data.setFaction(entity, @fromBackingInt(@intCast(slot % 4)));
+        if (slot % 5 == 0) try data.setWorldLevel(entity, @intCast(slot % 3));
+    }
+    if (layout == .negative) {
+        // The store refuses non-finite positions; a column write is how one arrives.
+        const entities = data.aiAgentSliceConst().entities;
+        const movement = data.movementBodySlice();
+        movement.previous_y[data.movementBodyDenseIndex(entities[501]).?] = std.math.nan(f32);
+        movement.previous_x[data.movementBodyDenseIndex(entities[502]).?] = -std.math.inf(f32);
+        movement.previous_y[data.movementBodyDenseIndex(entities[503]).?] = std.math.inf(f32);
+        movement.previous_y[data.movementBodyDenseIndex(entities[504]).?] = -std.math.inf(f32);
+    }
+}
+
+// Explicit band splitter sets, each nondecreasing: all past every cell; all one populated
+// cell; populated cells at a stride; the i32 extremes around populated cells; and
+// populated cells in equal pairs.
+const TestSplitters = enum { all_max, one_cell, stride, extremes, pairs };
+
+fn testSplitters(set: TestSplitters, cells: []const SpatialCell) [band_count - 1]CellKey {
+    std.debug.assert(cells.len > 0);
+    const min_key = CellKey{ .cell_y = std.math.minInt(i32), .cell_x = std.math.minInt(i32) };
+    var splitters: [band_count - 1]CellKey = @splat(max_cell_key);
+    for (&splitters, 0..) |*splitter, index| {
+        const pick: usize = switch (set) {
+            .all_max => continue,
+            .one_cell => cells.len / 2,
+            .stride, .extremes => index * cells.len / (band_count - 1),
+            .pairs => (index / 2) * cells.len / (band_count / 2),
+        };
+        splitter.* = .{ .cell_y = cells[pick].cell_y, .cell_x = cells[pick].cell_x };
+        if (set == .extremes and index < 8) splitter.* = min_key;
+        if (set == .extremes and index >= band_count - 9) splitter.* = max_cell_key;
+    }
+    return splitters;
+}
+
+// A copy of a build's entries and of every band's cells, in key order.
+const TestCapture = struct {
+    x: std.ArrayList(f32) = .empty,
+    y: std.ArrayList(f32) = .empty,
+    entity: std.ArrayList(EntityId) = .empty,
+    faction: std.ArrayList(Faction) = .empty,
+    level: std.ArrayList(u16) = .empty,
+    cells: std.ArrayList(SpatialCell) = .empty,
+
+    fn capture(system: *const SpatialIndexSystem) !TestCapture {
+        var copy = TestCapture{};
+        errdefer copy.deinit();
+        const index = system.view();
+        try copy.x.appendSlice(testing.allocator, index.x);
+        try copy.y.appendSlice(testing.allocator, index.y);
+        try copy.entity.appendSlice(testing.allocator, index.entity);
+        try copy.faction.appendSlice(testing.allocator, index.faction);
+        try copy.level.appendSlice(testing.allocator, index.level);
+        for (index.directory.bands) |band| try copy.cells.appendSlice(testing.allocator, index.cells[band.start..][0..band.cell_count]);
+        return copy;
     }
 
-    fn deinit(self: *SpatialTestFixture) void {
-        self.data.deinit();
+    fn deinit(self: *TestCapture) void {
+        self.cells.deinit(testing.allocator);
+        self.level.deinit(testing.allocator);
+        self.faction.deinit(testing.allocator);
+        self.entity.deinit(testing.allocator);
+        self.y.deinit(testing.allocator);
+        self.x.deinit(testing.allocator);
     }
 };
 
-test "SpatialIndexSystem serial and threaded builds produce identical rows/entries/ranges/dense_lookup" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+const parity_query_radii = [_]f32{ 0, 48, 96, 192 };
+const parity_query_checks: u16 = 64;
+// Cells sampled for the query battery, at a stride over the reference's cells.
+const parity_query_cells: usize = 48;
 
-    var fixture = try SpatialTestFixture.init(testing.allocator, 63);
-    defer fixture.deinit();
-    const ai_slice = fixture.data.aiAgentSliceConst();
-    const move_slice = fixture.data.movementBodySliceConst();
+// `system`'s index holds exactly the reference's entries, finds every reference cell
+// through its directory and tables with the same range, and answers the query battery
+// with the same visits and stats.
+fn expectIndexMatches(system: *const SpatialIndexSystem, reference: *const TestCapture, reference_system: *const SpatialIndexSystem) !void {
+    const index = system.view();
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.x.items), std.mem.sliceAsBytes(index.x));
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.y.items), std.mem.sliceAsBytes(index.y));
+    try testing.expectEqualSlices(EntityId, reference.entity.items, index.entity);
+    try testing.expectEqualSlices(Faction, reference.faction.items, index.faction);
+    try testing.expectEqualSlices(u16, reference.level.items, index.level);
+    var cell_count: usize = 0;
+    var segment_count: usize = 0;
+    for (index.directory.bands) |band| {
+        cell_count += band.cell_count;
+        segment_count += band.segment_count;
+    }
+    try testing.expectEqual(reference.cells.items.len, cell_count);
+    // One segment per (cell_y, segment_x) the cells hold, plus one per band boundary
+    // inside a segment, so at most one per cell.
+    var distinct_segments: usize = 0;
+    for (reference.cells.items, 0..) |cell, cell_index| {
+        if (cell_index == 0) {
+            distinct_segments += 1;
+            continue;
+        }
+        const previous = reference.cells.items[cell_index - 1];
+        if (previous.cell_y != cell.cell_y or @divFloor(previous.cell_x, segment_cells) != @divFloor(cell.cell_x, segment_cells)) distinct_segments += 1;
+    }
+    try testing.expect(segment_count >= distinct_segments and segment_count <= cell_count);
+    for (reference.cells.items) |cell| {
+        const key = CellKey{ .cell_y = cell.cell_y, .cell_x = cell.cell_x };
+        const found = index.pieceCells(index.directory.bandOfCell(key), cell.cell_y, cell.cell_x, cell.cell_x);
+        try testing.expectEqualSlices(SpatialCell, &.{cell}, found);
+    }
 
-    var serial_sys = SpatialIndexSystem.init(testing.allocator);
-    defer serial_sys.deinit();
-    try serial_sys.reserve(ai_slice.entities.len, .{});
-    const serial_stats = try serial_sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
+    const reference_index = reference_system.view();
+    const stride = @max(reference.cells.items.len / parity_query_cells, 1);
+    var cell_index: usize = 0;
+    while (cell_index < reference.cells.items.len) : (cell_index += stride) {
+        const cell = reference.cells.items[cell_index];
+        const centre_x = (@as(f32, @floatFromInt(cell.cell_x)) + 0.5) * index.cell_size;
+        const centre_y = (@as(f32, @floatFromInt(cell.cell_y)) + 0.5) * index.cell_size;
+        for (parity_query_radii) |radius| {
+            const query = NeighborQuery{ .x = centre_x, .y = centre_y, .radius = radius, .max_candidate_checks = parity_query_checks, .self = reference.entity.items[cell.start] };
+            var expected = RecordingVisitor{};
+            const expected_stats = reference_index.queryNeighbors(query, &expected);
+            var actual = RecordingVisitor{};
+            const actual_stats = index.queryNeighbors(query, &actual);
+            try testing.expectEqual(expected_stats, actual_stats);
+            try expected.expectEqual(&actual);
+        }
+    }
+}
 
-    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3, .items_per_range = 8 });
+test "serial and threaded index builds match across layouts, splitters, range sizes, and worker counts" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3, .items_per_range = 16 });
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
-    var threaded_sys = SpatialIndexSystem.init(testing.allocator);
-    defer threaded_sys.deinit();
-    try threaded_sys.reserve(ai_slice.entities.len, .{});
-    const threaded_stats = try threaded_sys.build(ai_slice, move_slice, &fixture.data, &threads, .{
-        .items_per_range = 8,
-        .max_worker_threads = 3,
-        .adaptive = false,
-    });
+    for (std.meta.tags(TestLayout)) |layout| {
+        var data = DataSystem.init(testing.allocator);
+        defer data.deinit();
+        try fillTestLayout(&data, layout);
+        const population = aiPopulation(&data);
+        const config = SpatialIndexConfig{ .cell_size = layout_cell_size };
 
-    try testing.expectEqual(serial_stats.entity_count, threaded_stats.entity_count);
-    try testing.expectEqual(serial_sys.rows.len, threaded_sys.rows.len);
-    const serial_rows = serial_sys.rows.slice();
-    const threaded_rows = threaded_sys.rows.slice();
-    for (0..serial_sys.rows.len) |i| {
-        try testing.expectEqual(serial_rows.items(.entity)[i].index, threaded_rows.items(.entity)[i].index);
-        try testing.expectEqual(serial_rows.items(.pos_x)[i], threaded_rows.items(.pos_x)[i]);
-        try testing.expectEqual(serial_rows.items(.pos_y)[i], threaded_rows.items(.pos_y)[i]);
-        try testing.expectEqual(serial_rows.items(.cell)[i], threaded_rows.items(.cell)[i]);
-    }
-    try testing.expectEqual(serial_sys.entries.items.len, threaded_sys.entries.items.len);
-    for (serial_sys.entries.items, threaded_sys.entries.items) |a, b| {
-        try testing.expectEqual(a.cell, b.cell);
-        try testing.expectEqual(a.index, b.index);
-    }
-    try testing.expectEqual(serial_sys.ranges.items.len, threaded_sys.ranges.items.len);
-    for (serial_sys.ranges.items, threaded_sys.ranges.items) |a, b| {
-        try testing.expectEqual(a.cell, b.cell);
-        try testing.expectEqual(a.start, b.start);
-        try testing.expectEqual(a.end, b.end);
-    }
+        var reference_system = SpatialIndexSystem.init(testing.allocator);
+        defer reference_system.deinit();
+        _ = try reference_system.buildSerial(&data, population, config);
+        try testing.expectEqual(@as(usize, 0), reference_system.directory.splitter_count);
+        var reference = try TestCapture.capture(&reference_system);
+        defer reference.deinit();
+        try testing.expectEqual(layout == .one_cell, reference.cells.items.len == 1);
 
-    try testing.expectEqual(serial_sys.dense_lookup.origin, threaded_sys.dense_lookup.origin);
-    try testing.expectEqual(serial_sys.dense_lookup.width, threaded_sys.dense_lookup.width);
-    try testing.expectEqual(serial_sys.dense_lookup.height, threaded_sys.dense_lookup.height);
-    for (serial_sys.ranges.items) |range| {
-        const rel_x: u32 = @intCast(range.cell.x - serial_sys.dense_lookup.origin.x);
-        const rel_y: u32 = @intCast(range.cell.y - serial_sys.dense_lookup.origin.y);
-        const idx = @as(usize, rel_y) * serial_sys.dense_lookup.width + rel_x;
-        try testing.expectEqual(serial_sys.dense_lookup.starts.items[idx], threaded_sys.dense_lookup.starts.items[idx]);
-        try testing.expectEqual(serial_sys.dense_lookup.ends.items[idx], threaded_sys.dense_lookup.ends.items[idx]);
-    }
-}
+        var system = SpatialIndexSystem.init(testing.allocator);
+        defer system.deinit();
+        var tuners = [2]AdaptiveWorkTuner{ AdaptiveWorkTuner.init(.{}), AdaptiveWorkTuner.init(.{}) };
 
-test "assignCellsDense matches an independently computed scalar cellForPosition, including the non-multiple-of-4 scalar tail" {
-    // 25 is not a multiple of simd.lane_count (4): this exercises the
-    // vectorized block (24 rows) AND the scalar tail (1 row) in the same run.
-    // cell_size 30 (non-power-of-2) so a reciprocal-multiply implementation of
-    // the division would diverge from `divFloat4`'s true division and this
-    // test would catch it; a power-of-2 size like the 32 default cannot.
-    var fixture = try SpatialTestFixture.init(testing.allocator, 25);
-    defer fixture.deinit();
-    const ai_slice = fixture.data.aiAgentSliceConst();
-    const move_slice = fixture.data.movementBodySliceConst();
-
-    var sys = SpatialIndexSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.reserve(ai_slice.entities.len, .{});
-    const stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{ .cell_size = 30.0 });
-    try testing.expectEqual(@as(usize, 25), stats.entity_count);
-
-    const rows = sys.rows.slice();
-    for (0..sys.rows.len) |i| {
-        // Recomputed from the entity's own known input position (the same
-        // formula SpatialTestFixture.init used to seed it), independent of
-        // anything read back from the system, so this checks ground truth
-        // rather than internal self-consistency.
-        const entity_index = rows.items(.entity)[i].index;
-        const expected_x = @as(f32, @floatFromInt(entity_index % 23)) * 7.0 - 40.0;
-        const expected_y = @as(f32, @floatFromInt(entity_index / 23)) * 5.0 - 20.0;
-        const expected_cell = cellForPosition(expected_x, expected_y, sys.cell_size);
-        try testing.expectEqual(expected_cell, rows.items(.cell)[i]);
-    }
-}
-
-test "SpatialIndexSystem builds correctly above a small reserved capacity" {
-    var fixture = try SpatialTestFixture.init(testing.allocator, 40);
-    defer fixture.deinit();
-    const ai_slice = fixture.data.aiAgentSliceConst();
-    const move_slice = fixture.data.movementBodySliceConst();
-
-    var sys = SpatialIndexSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.reserve(4, .{});
-
-    const stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
-    try testing.expectEqual(@as(usize, 40), stats.entity_count);
-    try testing.expectEqual(@as(usize, 40), sys.entries.items.len);
-    try testing.expect(sys.ranges.items.len > 0);
-}
-
-test "SpatialIndexSystem empty population yields zero stats and touches nothing" {
-    var data = DataSystem.init(testing.allocator);
-    defer data.deinit();
-
-    var sys = SpatialIndexSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.reserve(8, .{});
-
-    const ai_slice = data.aiAgentSliceConst();
-    const move_slice = data.movementBodySliceConst();
-    const serial_stats = try sys.buildSerial(ai_slice, move_slice, &data, .{});
-    try testing.expectEqual(@as(usize, 0), serial_stats.entity_count);
-    try testing.expectEqual(@as(usize, 0), sys.rows.len);
-    try testing.expectEqual(@as(usize, 0), sys.entries.items.len);
-
-    if (!@import("builtin").single_threaded) {
-        var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 1 });
-        defer threads.deinit();
-        const threaded_stats = try sys.build(ai_slice, move_slice, &data, &threads, .{});
-        try testing.expectEqual(@as(usize, 0), threaded_stats.entity_count);
-    }
-
-    // Scoped to an explicit empty index list too (real per-step "nothing in
-    // halo this step" case, distinct from "no ai agents exist at all").
-    const empty_scope = &[_]u32{};
-    const scoped_stats = try sys.buildSerial(ai_slice, move_slice, &data, .{ .scope_dense_indices = empty_scope });
-    try testing.expectEqual(@as(usize, 0), scoped_stats.entity_count);
-}
-
-test "after reserveRows, threaded builds at 32- then 16-item ranges allocate nothing" {
-    // No warm build: the population seam's reserve alone covers every partition the tuner
-    // can pick (item-count staging windows + maxRangeCount tallies), so a first threaded
-    // build and a retune to more ranges both allocate nothing.
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
-    const population: usize = 64;
-    var fixture = try SpatialTestFixture.init(testing.allocator, population);
-    defer fixture.deinit();
-    const ai_slice = fixture.data.aiAgentSliceConst();
-    const move_slice = fixture.data.movementBodySliceConst();
-
-    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
-    defer threads.deinit();
-    // Without real workers the threaded build falls back to inline on the main
-    // thread and this proof becomes a silent serial false pass.
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-
-    var sys = SpatialIndexSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.reserve(population, .{});
-
-    var reference = SpatialIndexSystem.init(testing.allocator);
-    defer reference.deinit();
-    _ = try reference.buildSerial(ai_slice, move_slice, &fixture.data, .{});
-
-    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    const original_allocator = sys.allocator;
-    sys.allocator = failing.allocator();
-    defer sys.allocator = original_allocator;
-
-    for ([_]usize{ 32, 16 }) |items_per_range| {
-        const stats = try sys.build(ai_slice, move_slice, &fixture.data, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
-        try testing.expectEqual(population, stats.entity_count);
-        try testing.expect(!stats.batch.ran_inline);
-        try testing.expectEqual(population / items_per_range, stats.batch.range_count);
-        try testing.expectEqualSlices(SpatialEntry, reference.entries.items, sys.entries.items);
-    }
-    const serial_stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
-    try testing.expectEqual(population, serial_stats.entity_count);
-    try testing.expectEqual(@as(usize, 0), failing.allocations);
-
-    var visitor = RecordingVisitor{};
-    _ = sys.view().queryNeighbors(0, 0, null, 4, .{ .radius = 1000.0, .max_candidate_checks = 16 }, &visitor, RecordingVisitor.record);
-}
-
-test "queryNeighbors on the dense lookup finds exactly the entities within radius" {
-    var fixture = try SpatialTestFixture.init(testing.allocator, 30);
-    defer fixture.deinit();
-    const ai_slice = fixture.data.aiAgentSliceConst();
-    const move_slice = fixture.data.movementBodySliceConst();
-
-    var sys = SpatialIndexSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.reserve(30, .{});
-    const stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
-    try testing.expectEqual(@as(usize, 30), stats.entity_count);
-
-    const view = sys.view();
-    const query_radius = 64.0;
-    const scan_radius = cellScanRadius(query_radius, sys.cell_size);
-    for (0..view.pos_x.len) |origin_i| {
-        var visitor = RecordingVisitor{};
-        _ = view.queryNeighbors(
-            view.pos_x[origin_i],
-            view.pos_y[origin_i],
-            origin_i,
-            scan_radius,
-            .{ .radius = query_radius, .max_candidate_checks = 64 },
-            &visitor,
-            RecordingVisitor.record,
-        );
-
-        // Brute-force expected set: every other row strictly within radius,
-        // independent of the dense lookup under test.
-        var expected: [64]usize = undefined;
-        var expected_count: usize = 0;
-        for (0..view.pos_x.len) |j| {
-            if (j == origin_i) continue;
-            const dx = view.pos_x[origin_i] - view.pos_x[j];
-            const dy = view.pos_y[origin_i] - view.pos_y[j];
-            if (dx * dx + dy * dy < query_radius * query_radius) {
-                expected[expected_count] = j;
-                expected_count += 1;
+        // Bucket and sort range sizes and worker counts under the production splitters.
+        for ([_]usize{ 1, 3 }) |workers| {
+            for ([_]usize{ 16, 64 }) |bucket_items| {
+                for ([_]usize{ 16, 1024 }) |sort_items| {
+                    const stages = BuildStages{
+                        .bucket = Dispatch.init(&threads, &tuners[0], .{ .items_per_range = bucket_items, .max_worker_threads = workers, .adaptive = false }),
+                        .sort = Dispatch.init(&threads, &tuners[1], .{ .items_per_range = sort_items, .max_worker_threads = workers, .adaptive = false }),
+                    };
+                    _ = try system.beginBuild(population, config);
+                    const stats = system.buildBanded(&data, population, stages, chooseSplitters(&data, population, system.cell_size));
+                    try testing.expect(!stats.bucket_batch.ran_inline);
+                    try expectIndexMatches(&system, &reference, &reference_system);
+                }
             }
         }
 
-        std.mem.sort(usize, expected[0..expected_count], {}, std.sort.asc(usize));
-        var visited_sorted = visitor.visited;
-        std.mem.sort(usize, visited_sorted[0..visitor.count], {}, std.sort.asc(usize));
-        try testing.expectEqualSlices(usize, expected[0..expected_count], visited_sorted[0..visitor.count]);
+        // Explicit splitter sets over one partition.
+        const stages = BuildStages{
+            .bucket = Dispatch.init(&threads, &tuners[0], .{ .items_per_range = 64, .max_worker_threads = 3, .adaptive = false }),
+            .sort = Dispatch.init(&threads, &tuners[1], .{ .items_per_range = 64, .max_worker_threads = 3, .adaptive = false }),
+        };
+        for (std.meta.tags(TestSplitters)) |set| {
+            _ = try system.beginBuild(population, config);
+            const stats = system.buildBanded(&data, population, stages, testSplitters(set, reference.cells.items));
+            try testing.expect(!stats.bucket_batch.ran_inline and !stats.sort_batch.ran_inline);
+            try expectIndexMatches(&system, &reference, &reference_system);
+        }
+
+        // The production build, and a config that allows no worker builds serially.
+        const threaded = try system.build(&data, population, &threads, .{ .cell_size = layout_cell_size, .items_per_range = 64, .max_worker_threads = 3, .adaptive = false });
+        try testing.expect(!threaded.bucket_batch.ran_inline and !threaded.sort_batch.ran_inline);
+        try testing.expectEqual(band_count - 1, system.directory.splitter_count);
+        try expectIndexMatches(&system, &reference, &reference_system);
+        _ = try system.build(&data, population, &threads, .{ .cell_size = layout_cell_size, .max_worker_threads = 0 });
+        try testing.expectEqual(@as(usize, 0), system.directory.splitter_count);
+        try expectIndexMatches(&system, &reference, &reference_system);
     }
 }
 
-test "reserve sizes the dense window from cognition halo margin plus fixed visible-window slack" {
-    var sys = SpatialIndexSystem.init(testing.allocator);
-    defer sys.deinit();
-    // halo_world_units = 2 * cognition_halo_chunks(16) * 8 tiles * 4.0 px = 1024;
-    // margin_cells = ceil(1024 / 8.0) = 128.
-    try sys.reserve(4, .{ .cell_size = 8.0, .chunk_size_tiles = 8, .tile_size = 4.0 });
-    const expected_margin_cells: u32 = 128;
-    try testing.expectEqual(expected_margin_cells + max_expected_visible_window_cells, sys.dense_lookup.capacity_cells_x);
-    try testing.expectEqual(sys.dense_lookup.capacity_cells_x, sys.dense_lookup.capacity_cells_y);
+// The most entries any band of `system`'s index holds.
+fn largestBandEntries(system: *const SpatialIndexSystem) usize {
+    var largest: usize = 0;
+    for (system.directory.bands) |band| largest = @max(largest, band.entry_count);
+    return largest;
 }
 
-test "DenseCellLookup reserve twice keeps grid length; query still finds neighbors" {
-    // Re-entrancy proof: a second reserve at the same size must not append
-    // another full starts/ends grid, and a subsequent build+query still works.
+test "the threaded index splits a one-row corridor and a cluster with a far outlier across bands" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    for ([_]TestLayout{ .one_row, .cluster_outlier }) |layout| {
+        var data = DataSystem.init(testing.allocator);
+        defer data.deinit();
+        try fillTestLayout(&data, layout);
+        var system = SpatialIndexSystem.init(testing.allocator);
+        defer system.deinit();
+        const stats = try system.build(&data, aiPopulation(&data), &threads, .{ .cell_size = layout_cell_size, .items_per_range = 64, .max_worker_threads = 3, .adaptive = false });
+        try testing.expect(stats.entity_count > 0);
+        try testing.expect(largestBandEntries(&system) <= stats.entity_count / 8);
+    }
+}
+
+test "queryNeighbors visits a cell's entries in slot order, skipping self without a check, inside a strict radius" {
+    // Every body in cell (0, 0) at cell size 10; slot 2 sits exactly at the radius.
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
-    const a = try data.createEntity();
-    try data.setMovementBody(a, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
-    try data.setAiAgent(a, .{ .active_behavior = .wander });
-    const b = try data.createEntity();
-    try data.setMovementBody(b, .{ .position = .{ .x = 8, .y = 0 }, .previous_position = .{ .x = 8, .y = 0 }, .velocity = .{}, .speed = 20 });
-    try data.setAiAgent(b, .{ .active_behavior = .wander });
-
-    var sys = SpatialIndexSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.reserve(4, .{ .cell_size = 32.0, .chunk_size_tiles = 8, .tile_size = 4.0 });
-    const cells_after_first = sys.dense_lookup.starts.items.len;
-    try testing.expect(cells_after_first > 0);
-    try testing.expectEqual(cells_after_first, sys.dense_lookup.ends.items.len);
-
-    try sys.reserve(4, .{ .cell_size = 32.0, .chunk_size_tiles = 8, .tile_size = 4.0 });
-    try testing.expectEqual(cells_after_first, sys.dense_lookup.starts.items.len);
-    try testing.expectEqual(cells_after_first, sys.dense_lookup.ends.items.len);
-    try testing.expectEqual(sys.dense_lookup.capacity_cells_x, sys.dense_lookup.capacity_cells_y);
-
-    const ai_slice = data.aiAgentSliceConst();
-    const move_slice = data.movementBodySliceConst();
-    const stats = try sys.buildSerial(ai_slice, move_slice, &data, .{});
-    try testing.expectEqual(@as(usize, 2), stats.entity_count);
+    const self_entity = try addTestBody(&data, 0, 0);
+    _ = try addTestBody(&data, 3, 0);
+    _ = try addTestBody(&data, 5, 0);
+    _ = try addTestBody(&data, 4.9, 0);
+    _ = try addTestBody(&data, 1, 0);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), .{ .cell_size = 10 });
+    const index = system.view();
 
     var visitor = RecordingVisitor{};
-    _ = sys.view().queryNeighbors(0, 0, 0, 1, .{ .radius = 32.0, .max_candidate_checks = 8 }, &visitor, RecordingVisitor.record);
-    try testing.expectEqual(@as(usize, 1), visitor.count);
+    const stats = index.queryNeighbors(.{ .x = 0, .y = 0, .radius = 5, .max_candidate_checks = 128, .self = self_entity }, &visitor);
+    // Slot 2 (dist2 == 25) is checked but not visited; self is neither.
+    try testing.expectEqualSlices(u32, &.{ 1, 3, 4 }, visitor.visited());
+    try testing.expectEqual(@as(u16, 4), stats.candidate_checks);
+    try testing.expectEqual(@as(f32, -3), visitor.dx[0]);
+    try testing.expectEqual(@as(f32, 9), visitor.dist2[0]);
+
+    // Without a self, slot 0 is a candidate at distance 0.
+    var all = RecordingVisitor{};
+    _ = index.queryNeighbors(.{ .x = 0, .y = 0, .radius = 5, .max_candidate_checks = 128 }, &all);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 3, 4 }, all.visited());
 }
 
-test "reserve clamps the dense window to the hard ceiling for a pathological world geometry" {
-    var sys = SpatialIndexSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.reserve(4, .{ .cell_size = 1.0, .chunk_size_tiles = 60000, .tile_size = 500.0 });
-    try testing.expectEqual(max_dense_window_side_cells, sys.dense_lookup.capacity_cells_x);
-    try testing.expectEqual(max_dense_window_side_cells, sys.dense_lookup.capacity_cells_y);
-}
-
-test "buildEntriesAndRanges clamps the dense window and skips out-of-window cells instead of writing past reserved capacity" {
+test "queryNeighbors stops at its check budget before the tipping entry, and on a visitor stop" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
+    const self_entity = try addTestBody(&data, 0, 0);
+    _ = try addTestBody(&data, 1, 0);
+    _ = try addTestBody(&data, 2, 0);
+    _ = try addTestBody(&data, 3, 0);
+    // Cell rows below and a cell to the right, past the first cell's entries.
+    _ = try addTestBody(&data, 15, 0);
+    _ = try addTestBody(&data, 5, 15);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), .{ .cell_size = 10 });
+    const index = system.view();
 
-    const near = try data.createEntity();
-    try data.setMovementBody(near, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
-    try data.setAiAgent(near, .{ .active_behavior = .wander });
+    var capped = RecordingVisitor{};
+    const capped_stats = index.queryNeighbors(.{ .x = 0, .y = 0, .radius = 100, .max_candidate_checks = 1, .self = self_entity }, &capped);
+    try testing.expectEqualSlices(u32, &.{1}, capped.visited());
+    try testing.expectEqual(@as(u16, 1), capped_stats.candidate_checks);
 
-    // Cell (1250, 1250) at cell_size 32 -- far outside the deliberately tiny
-    // 4x4 window reserved below, forcing the bounding box to exceed reserved
-    // capacity the way a real violation of the dense-window sizing assumption
-    // would.
-    const far = try data.createEntity();
-    try data.setMovementBody(far, .{ .position = .{ .x = 40000.0, .y = 40000.0 }, .previous_position = .{ .x = 40000.0, .y = 40000.0 }, .velocity = .{}, .speed = 20 });
-    try data.setAiAgent(far, .{ .active_behavior = .wander });
+    // A stop in the first cell ends the row and the scan.
+    var stopped = RecordingVisitor{ .stop_after = 2 };
+    const stopped_stats = index.queryNeighbors(.{ .x = 0, .y = 0, .radius = 100, .max_candidate_checks = 64 }, &stopped);
+    try testing.expectEqualSlices(u32, &.{ 0, 1 }, stopped.visited());
+    try testing.expectEqual(@as(u16, 2), stopped_stats.candidate_checks);
 
-    var sys = SpatialIndexSystem.init(testing.allocator);
-    defer sys.deinit();
-    // Bypass reserve()'s own sizing (which would comfortably cover this case)
-    // to directly force the undersized-window path this test targets.
-    try sys.dense_lookup.reserveTouched(testing.allocator, 2);
-    try sys.dense_lookup.reserveWindow(testing.allocator, 4, 4);
-    sys.cell_size = 32.0;
+    // Unbounded, the scan runs cell_y outer, cell_x inner: (0, 0), (0, 1), then (1, 0).
+    var full = RecordingVisitor{};
+    _ = index.queryNeighbors(.{ .x = 0, .y = 0, .radius = 100, .max_candidate_checks = 64 }, &full);
+    try testing.expectEqual(@as(usize, 6), full.count);
+    try testing.expectEqual(@as(f32, 15), index.x[full.entries[4]]);
+    try testing.expectEqual(@as(f32, 15), index.y[full.entries[5]]);
+}
 
-    const ai_slice = data.aiAgentSliceConst();
-    const move_slice = data.movementBodySliceConst();
-    const stats = try sys.buildSerial(ai_slice, move_slice, &data, .{});
+test "an index over population rows maps each slot to its row's entity and skips bodiless slots" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const near = try addTestBody(&data, 4, 4);
+    _ = try addTestBody(&data, 6, 6);
+    const bodiless = try addTestBodiless(&data);
+    const far = try addTestBody(&data, 12, 4);
+    try data.setFaction(far, .hostile);
+    try data.setWorldLevel(far, 2);
+    _ = bodiless;
+    // Agent 1 is outside the rows; agent 2 has no body.
+    const rows = [_]u32{ 3, 2, 0 };
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    const stats = try system.buildSerial(&data, .{ .entities = data.aiAgentSliceConst().entities, .rows = &rows }, .{ .cell_size = 10 });
     try testing.expectEqual(@as(usize, 2), stats.entity_count);
-
-    // Window is clamped to the reserved 4x4 capacity, not the true ~1251-cell span.
-    try testing.expectEqual(@as(u32, 4), sys.dense_lookup.width);
-    try testing.expectEqual(@as(u32, 4), sys.dense_lookup.height);
-
-    // ranges/entries still hold both cells for parity consumers...
-    try testing.expectEqual(@as(usize, 2), sys.ranges.items.len);
-    try testing.expectEqual(@as(usize, 2), sys.entries.items.len);
-
-    // ...but the dense lookup only finds the in-window cell (0,0): the
-    // out-of-window cell was skipped on write rather than indexed past
-    // starts/ends, so this must not panic/corrupt even under bounds checking.
-    const view = sys.view();
-    var visitor = RecordingVisitor{};
-    _ = view.queryNeighbors(0, 0, null, 1, .{ .radius = 10.0, .max_candidate_checks = 8 }, &visitor, RecordingVisitor.record);
-    try testing.expectEqual(@as(usize, 1), visitor.count);
+    const index = system.view();
+    // Cell (0, 0) holds slot 2 (`near`), cell (0, 1) slot 0 (`far`).
+    try testing.expectEqualSlices(EntityId, &.{ near, far }, index.entity);
+    try testing.expectEqual(Faction.hostile, index.faction[1]);
+    try testing.expectEqual(@as(u16, 2), index.level[1]);
+    try testing.expectEqual(Faction.neutral, index.faction[0]);
+    try testing.expectEqual(@as(u16, 0), index.level[0]);
 }
 
-test "reserveRows grows population storage without touching the dense window" {
+// A query's visits by brute force: every entry whose cell lies in the query's box, in
+// ascending entry order (the box scan's (cell_y, cell_x, slot) order), self skipped,
+// counted against the budget, then visited inside the strict radius.
+fn bruteForceVisits(index: SpatialIndexView, query: NeighborQuery, expected: *RecordingVisitor) NeighborQueryStats {
+    var stats = NeighborQueryStats{};
+    const scan = cellScanRadius(query.radius, index.cell_size);
+    const own = cellForPosition(query.x, query.y, index.cell_size);
+    for (0..index.x.len) |entry| {
+        if (index.entity[entry].eql(query.self)) continue;
+        const cell = cellForPosition(index.x[entry], index.y[entry], index.cell_size);
+        if (@abs(@as(i64, cell.cell_x) - own.cell_x) > scan or @abs(@as(i64, cell.cell_y) - own.cell_y) > scan) continue;
+        if (stats.candidate_checks >= query.max_candidate_checks) break;
+        stats.candidate_checks += 1;
+        const dx = query.x - index.x[entry];
+        const dy = query.y - index.y[entry];
+        const dist2 = dx * dx + dy * dy;
+        if (dist2 < query.radius * query.radius) _ = expected.visit(@intCast(entry), dx, dy, dist2);
+    }
+    return stats;
+}
+
+test "queryNeighbors visits exactly a brute-force scan's in-box entries in ascending entry order, up to its check budget" {
+    // Bodies over cells -75..74 at cell size 4, in 20 cell rows: radius 300 spans several
+    // row segments and bands per row.
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
-    const entity = try data.createEntity();
-    try data.setMovementBody(entity, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
-    try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    var prng = std.Random.DefaultPrng.init(0x0b5e_55ed);
+    const random = prng.random();
+    for (0..200) |_| _ = try addTestBody(&data, random.float(f32) * 600 - 300, random.float(f32) * 80 - 40);
+    const population = aiPopulation(&data);
+    const config = SpatialIndexConfig{ .cell_size = 4 };
 
-    var sys = SpatialIndexSystem.init(testing.allocator);
-    defer sys.deinit();
-    try sys.reserve(4, .{});
-    _ = try sys.buildSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, .{});
-    const touched_len = sys.dense_lookup.touched.items.len;
-    try testing.expect(touched_len > 0);
+    var serial = SpatialIndexSystem.init(testing.allocator);
+    defer serial.deinit();
+    _ = try serial.buildSerial(&data, population, config);
+    var reference = try TestCapture.capture(&serial);
+    defer reference.deinit();
 
-    const starts_ptr = sys.dense_lookup.starts.items.ptr;
-    const starts_len = sys.dense_lookup.starts.items.len;
-    const capacity_cells_x = sys.dense_lookup.capacity_cells_x;
-    // Sentinel in an untouched window slot: a re-memset would wipe it.
-    const sentinel_index = starts_len - 1;
-    sys.dense_lookup.starts.items[sentinel_index] = 7;
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = if (builtin.single_threaded) 0 else 3 });
+    defer threads.deinit();
+    var tuners = [2]AdaptiveWorkTuner{ AdaptiveWorkTuner.init(.{}), AdaptiveWorkTuner.init(.{}) };
+    var banded = SpatialIndexSystem.init(testing.allocator);
+    defer banded.deinit();
+    _ = try banded.beginBuild(population, config);
+    _ = banded.buildBanded(&data, population, .{
+        .bucket = Dispatch.init(&threads, &tuners[0], .{ .items_per_range = 16, .max_worker_threads = 3, .adaptive = false }),
+        .sort = Dispatch.init(&threads, &tuners[1], .{ .items_per_range = 16, .max_worker_threads = 3, .adaptive = false }),
+    }, testSplitters(.pairs, reference.cells.items));
 
-    try sys.reserveRows(200);
+    for ([_]*const SpatialIndexSystem{ &serial, &banded }) |system| {
+        const index = system.view();
+        for (0..index.x.len) |origin| {
+            for ([_]f32{ 0, 20, 100, 300 }) |radius| {
+                for ([_]u16{ 64, 1000 }) |checks| {
+                    const query = NeighborQuery{ .x = index.x[origin], .y = index.y[origin], .radius = radius, .max_candidate_checks = checks, .self = index.entity[origin] };
+                    var expected = RecordingVisitor{};
+                    const expected_stats = bruteForceVisits(index, query, &expected);
+                    var actual = RecordingVisitor{};
+                    const actual_stats = index.queryNeighbors(query, &actual);
+                    try testing.expectEqual(expected_stats, actual_stats);
+                    try expected.expectEqual(&actual);
+                }
+            }
+        }
+    }
+}
 
-    try testing.expectEqual(starts_ptr, sys.dense_lookup.starts.items.ptr);
-    try testing.expectEqual(starts_len, sys.dense_lookup.starts.items.len);
-    try testing.expectEqual(capacity_cells_x, sys.dense_lookup.capacity_cells_x);
-    try testing.expectEqual(@as(u32, 7), sys.dense_lookup.starts.items[sentinel_index]);
-    try testing.expectEqual(touched_len, sys.dense_lookup.touched.items.len);
-    try testing.expect(sys.entries.capacity >= 200);
-    try testing.expect(sys.dense_lookup.touched.capacity >= 200);
-    try testing.expect(sys.gather_staging.capacity >= 200);
-    try testing.expect(sys.gather_tallies.capacity >= maxRangeCount(200, spatial_index_range_alignment_items));
-    sys.dense_lookup.starts.items[sentinel_index] = 0;
+test "row segments hold each 64-cell span's cells, split where a splitter falls inside one" {
+    // One cell row at cell size 10: cells -65 | -64, -1 | 0, 63 | 64 lie in spans -2..1.
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    for ([_]i32{ -65, -64, -1, 0, 63, 64 }) |cell_x| _ = try addTestBody(&data, @as(f32, @floatFromInt(cell_x)) * 10 + 5, 5);
+    const population = aiPopulation(&data);
+    const config = SpatialIndexConfig{ .cell_size = 10 };
+
+    var serial = SpatialIndexSystem.init(testing.allocator);
+    defer serial.deinit();
+    _ = try serial.buildSerial(&data, population, config);
+    const one_band = serial.view();
+    try testing.expectEqual(@as(u32, 4), one_band.directory.bands[0].segment_count);
+    const expected = [_]struct { segment_x: i32, first_cell: u32, mask: u64 }{
+        .{ .segment_x = -2, .first_cell = 0, .mask = 1 << 63 },
+        .{ .segment_x = -1, .first_cell = 1, .mask = 1 | 1 << 63 },
+        .{ .segment_x = 0, .first_cell = 3, .mask = 1 | 1 << 63 },
+        .{ .segment_x = 1, .first_cell = 5, .mask = 1 },
+    };
+    for (expected, one_band.segments[0..expected.len]) |want, segment| {
+        try testing.expectEqual(@as(i32, 0), segment.cell_y);
+        try testing.expectEqual(want.segment_x, segment.segment_x);
+        try testing.expectEqual(want.first_cell, segment.first_cell);
+        try testing.expectEqual(want.mask, segment.occupied.mask);
+    }
+
+    // A splitter at cell 32 gives span 0 one record in each band.
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = if (builtin.single_threaded) 0 else 2 });
+    defer threads.deinit();
+    var tuners = [2]AdaptiveWorkTuner{ AdaptiveWorkTuner.init(.{}), AdaptiveWorkTuner.init(.{}) };
+    var splitters: [band_count - 1]CellKey = @splat(max_cell_key);
+    splitters[0] = .{ .cell_y = 0, .cell_x = 32 };
+    var banded = SpatialIndexSystem.init(testing.allocator);
+    defer banded.deinit();
+    _ = try banded.beginBuild(population, config);
+    _ = banded.buildBanded(&data, population, .{
+        .bucket = Dispatch.init(&threads, &tuners[0], .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false }),
+        .sort = Dispatch.init(&threads, &tuners[1], .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false }),
+    }, splitters);
+    const two_bands = banded.view();
+    const lower = two_bands.directory.bands[0];
+    const upper = two_bands.directory.bands[1];
+    try testing.expectEqual(@as(u32, 3), lower.segment_count);
+    try testing.expectEqual(@as(u32, 2), upper.segment_count);
+    const lower_span = two_bands.segments[lower.start + 2];
+    const upper_span = two_bands.segments[upper.start];
+    try testing.expectEqual(@as(i32, 0), lower_span.segment_x);
+    try testing.expectEqual(@as(u64, 1), lower_span.occupied.mask);
+    try testing.expectEqual(@as(i32, 0), upper_span.segment_x);
+    try testing.expectEqual(@as(u64, 1 << 63), upper_span.occupied.mask);
+    try testing.expectEqual(upper.start, upper_span.first_cell);
+
+    // Both indexes visit every entry, in order, across the split span.
+    const query = NeighborQuery{ .x = 325, .y = 5, .radius = 1000, .max_candidate_checks = 64 };
+    var one_band_visits = RecordingVisitor{};
+    _ = one_band.queryNeighbors(query, &one_band_visits);
+    var two_band_visits = RecordingVisitor{};
+    _ = two_bands.queryNeighbors(query, &two_band_visits);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5 }, one_band_visits.visited());
+    try one_band_visits.expectEqual(&two_band_visits);
+}
+
+test "index cells in lanes match cellForPosition, including the scalar tail" {
+    // 25 slots: six lane blocks and a one-slot tail. Cell size 30 is not a power of two,
+    // so a reciprocal multiply in place of the division would diverge.
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    for (0..25) |slot| {
+        _ = try addTestBody(&data, @as(f32, @floatFromInt(slot % 23)) * 7.0 - 40.0, @as(f32, @floatFromInt(slot / 23)) * 5.0 - 20.0);
+    }
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), .{ .cell_size = 30 });
+
+    const index = system.view();
+    var keys_checked: usize = 0;
+    for (index.cells[0..index.directory.bands[0].cell_count]) |cell| {
+        for (cell.start..cell.end) |entry| {
+            // Recomputed from the fixture's own formula, not read back from the index.
+            const slot = system.keys.items[entry].slot;
+            const expected = cellForPosition(@as(f32, @floatFromInt(slot % 23)) * 7.0 - 40.0, @as(f32, @floatFromInt(slot / 23)) * 5.0 - 20.0, 30);
+            try testing.expectEqual(expected, CellKey{ .cell_y = cell.cell_y, .cell_x = cell.cell_x });
+            keys_checked += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 25), keys_checked);
+}
+
+test "the entry visit in lanes matches the scalar visit, including NaN and the tail" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    // Nine bodies in cell (0, 0): one NaN position, one exactly at the radius.
+    const positions = [_][2]f32{ .{ 1, 1 }, .{ 2, 3 }, .{ 0, 0 }, .{ 4, 4 }, .{ 9, 1 }, .{ 3, 0 }, .{ 5, 5 }, .{ 1, 8 }, .{ 7, 7 } };
+    for (positions) |position| _ = try addTestBody(&data, position[0], position[1]);
+    data.movementBodySlice().previous_x[4] = std.math.nan(f32);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), .{ .cell_size = 10 });
+    const index = system.view();
+    try testing.expectEqual(@as(u32, 1), index.directory.bands[0].cell_count);
+
+    for (1..positions.len + 1) |length| {
+        for ([_]u16{ 2, 64 }) |checks| {
+            const query = NeighborQuery{ .x = 2, .y = 1, .radius = 3, .max_candidate_checks = checks, .self = index.entity[1] };
+            var lanes = RecordingVisitor{};
+            var lane_stats = NeighborQueryStats{};
+            const lane_stop = index.visitEntries(query, QueryLanes.init(query), 0, @intCast(length), &lanes, &lane_stats);
+            var scalar = RecordingVisitor{};
+            var scalar_stats = NeighborQueryStats{};
+            const scalar_stop = index.visitEntriesScalar(query, query.radius * query.radius, 0, length, &scalar, &scalar_stats);
+            try testing.expectEqual(scalar_stop, lane_stop);
+            try testing.expectEqual(scalar_stats, lane_stats);
+            try scalar.expectEqual(&lanes);
+        }
+    }
+}
+
+test "a build after a populated one leaves no stale cells, serial and threaded" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    for (0..40) |slot| _ = try addTestBody(&data, @floatFromInt(slot * 3), 0);
+    var empty_data = DataSystem.init(testing.allocator);
+    defer empty_data.deinit();
+    // Slots, none with a body.
+    for (0..20) |_| _ = try addTestBodiless(&empty_data);
+
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = if (builtin.single_threaded) 0 else 2 });
+    defer threads.deinit();
+
+    const empties = [_]IndexPopulation{ aiPopulation(&empty_data), .{ .entities = &.{} } };
+    for (empties) |empty| {
+        for ([_]bool{ false, true }) |threaded| {
+            _ = try system.buildSerial(&data, aiPopulation(&data), .{});
+            try testing.expect(system.view().entity.len == 40);
+            const stats = if (threaded)
+                try system.build(&empty_data, empty, &threads, .{ .items_per_range = 16, .adaptive = false })
+            else
+                try system.buildSerial(&empty_data, empty, .{});
+            try testing.expectEqual(@as(usize, 0), stats.entity_count);
+            const index = system.view();
+            try testing.expectEqual(@as(usize, 0), index.entity.len);
+            for (index.directory.bands) |band| {
+                try testing.expectEqual(@as(u32, 0), band.cell_count);
+                try testing.expectEqual(@as(u32, 0), band.segment_count);
+            }
+            var visitor = RecordingVisitor{};
+            const query_stats = index.queryNeighbors(.{ .x = 3, .y = 0, .radius = 64, .max_candidate_checks = 64 }, &visitor);
+            try testing.expectEqual(@as(usize, 0), visitor.count);
+            try testing.expectEqual(@as(u16, 0), query_stats.candidate_checks);
+        }
+    }
+}
+
+test "the index builds correctly above a small reserved capacity" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    for (0..40) |slot| _ = try addTestBody(&data, @floatFromInt(slot * 7), @floatFromInt(slot % 5));
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    try system.reserve(4);
+    const stats = try system.buildSerial(&data, aiPopulation(&data), .{});
+    try testing.expectEqual(@as(usize, 40), stats.entity_count);
+    try testing.expectEqual(@as(usize, 40), system.view().entity.len);
+    try testing.expect(system.directory.bands[0].cell_count > 0);
+}
+
+test "after reserve, threaded builds at 2 and 4 partitions per stage, a serial build, and a query allocate nothing" {
+    // No warm build: the reserve alone covers every partition the tuners can pick.
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const population_count: usize = 64;
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    for (0..population_count) |slot| {
+        _ = try addTestBody(&data, @as(f32, @floatFromInt(slot % 23)) * 7.0 - 40.0, @as(f32, @floatFromInt(slot / 23)) * 5.0 - 20.0);
+    }
+    const population = aiPopulation(&data);
+
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    // Without real workers the threaded build runs serially and this proof passes falsely.
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var reference = SpatialIndexSystem.init(testing.allocator);
+    defer reference.deinit();
+    _ = try reference.buildSerial(&data, population, .{});
+
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    try system.reserve(population_count);
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const original_allocator = system.allocator;
+    system.allocator = failing.allocator();
+    defer system.allocator = original_allocator;
+
+    for ([_]usize{ 32, 16 }) |items_per_range| {
+        const stats = try system.build(&data, population, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
+        try testing.expectEqual(population_count, stats.entity_count);
+        try testing.expect(!stats.bucket_batch.ran_inline and !stats.sort_batch.ran_inline);
+        try testing.expectEqual(population_count / items_per_range, stats.bucket_batch.range_count);
+        try testing.expectEqual(population_count / items_per_range, stats.sort_batch.range_count);
+        try testing.expectEqualSlices(EntityId, reference.view().entity, system.view().entity);
+    }
+    const serial_stats = try system.buildSerial(&data, population, .{});
+    try testing.expectEqual(population_count, serial_stats.entity_count);
+    var visitor = RecordingVisitor{};
+    _ = system.view().queryNeighbors(.{ .x = 0, .y = 0, .radius = 128, .max_candidate_checks = 16 }, &visitor);
+    try testing.expectEqual(@as(usize, 16), visitor.count);
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
 }

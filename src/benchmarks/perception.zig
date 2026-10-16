@@ -104,8 +104,7 @@ fn crowdItemCounts(_: suite.Profile) []const usize {
 }
 
 // Observers on a square grid of clusters. The pitch keeps every other cluster's members
-// past the observer's vision range, and the grid inside the spatial index's dense window
-// at the world's chunk geometry.
+// past the observer's vision range.
 const crowd_grid_side: usize = 32;
 const crowd_observers: usize = crowd_grid_side * crowd_grid_side;
 const crowd_cluster_pitch: f32 = 384;
@@ -380,12 +379,13 @@ fn runCaseImpl(
     // steady-state gather/FOV/LOS cost, not movement), so the shared spatial
     // index is built once, outside every timed/warmup/settle call -- mirrors
     // `ai.zig`'s own bench, which times only `system.update`/`updateSerial`.
+    // Built with a worker, so queries run on the banded directory production builds.
     var spatial_sys = SpatialIndexSystem.init(allocator);
     defer spatial_sys.deinit();
-    const ai_slice = fixture.data.aiAgentSliceConst();
-    const movement_slice = fixture.data.movementBodySliceConst();
-    try spatial_sys.reserve(ai_slice.entities.len, .{});
-    _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &fixture.data, .{});
+    var index_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 1 });
+    defer index_threads.deinit();
+    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, &index_threads, .{});
+    std.debug.assert(spatial_sys.directory.splitter_count != 0);
     const spatial_view = spatial_sys.view();
 
     for (0..options.warmup_iterations) |_| {
@@ -537,13 +537,14 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
-    // Positions never change, so the shared index is built once, untimed, at the world's
-    // chunk geometry as the pipeline reserves it.
+    // Positions never change, so the shared index is built once, untimed.
+    // Built with a worker, so queries run on the banded directory production builds.
     var spatial_sys = SpatialIndexSystem.init(allocator);
     defer spatial_sys.deinit();
-    const ai_slice = fixture.data.aiAgentSliceConst();
-    try spatial_sys.reserve(ai_slice.entities.len, .{ .chunk_size_tiles = fixture.world.chunk_size_tiles, .tile_size = fixture.world.tile_size });
-    _ = try spatial_sys.buildSerial(ai_slice, fixture.data.movementBodySliceConst(), &fixture.data, .{});
+    var index_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 1 });
+    defer index_threads.deinit();
+    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, &index_threads, .{});
+    std.debug.assert(spatial_sys.directory.splitter_count != 0);
     const spatial_view = spatial_sys.view();
     const thread_ptr = if (threads) |*thread_system| thread_system else null;
 

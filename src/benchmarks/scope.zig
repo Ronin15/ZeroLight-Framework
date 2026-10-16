@@ -42,6 +42,7 @@ const movement = @import("../game/systems/movement.zig");
 const MovementSystem = @import("../game/systems/movement.zig").MovementSystem;
 const AiSystem = @import("../game/systems/ai.zig").AiSystem;
 const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
+const IndexPopulation = @import("../game/systems/spatial_index.zig").IndexPopulation;
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
 const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
@@ -176,7 +177,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer scope.deinit();
     var spatial_index = SpatialIndexSystem.init(allocator);
     defer spatial_index.deinit();
-    try spatial_index.reserve(item_count, .{});
+    try spatial_index.reserve(item_count);
     var ai = AiSystem.init(allocator);
     defer ai.deinit();
     var collision = CollisionSystem.init(allocator);
@@ -247,7 +248,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
 /// True once every stage's adaptive tuner has settled. The measured window times
 /// the scope gathers + tier policy alongside AI + collision + movement, so all of
-/// their tuners must settle first. The spatial-index build tuner is gated too even
+/// their tuners must settle first. The spatial-index build tuners are gated too even
 /// though its own wall-clock cost is excluded from the reported window (see
 /// `runCase`), so warmup/settle iterations reflect the same dispatch shape the
 /// measured iterations will use.
@@ -257,7 +258,7 @@ fn allTunersSettled(ai: *const AiSystem, collision: *const CollisionSystem, move
         collision.broadphase_tuner.isSettled() and collision.narrowphase_tuner.isSettled() and
         scope.chunk_derive_tuner.isSettled() and scope.collision_gather_tuner.isSettled() and
         scope.ai_gather_tuner.isSettled() and scope.tier_policy_tuner.isSettled() and
-        spatial_index.build_tuner.isSettled();
+        spatial_index.bucket_tuner.isSettled() and spatial_index.sort_tuner.isSettled();
 }
 
 const RunContext = struct {
@@ -309,14 +310,15 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
     const ai_slice = fixture.data.aiAgentSliceConst();
     const move_slice_const = fixture.data.movementBodySliceConst();
 
-    // Build the shared spatial index from this step's unstaggered halo (same
-    // positions the AI candidate walk reads). Timed separately and excluded from
-    // the returned batch's reported window — see the `runCase` comment.
+    // Build the shared spatial index from this step's unstaggered halo (the
+    // previous positions AI reads). Timed separately and excluded from the
+    // returned batch's reported window — see the `runCase` comment.
     const spatial_start_ns = suite.nowNs(io);
+    const halo_population = IndexPopulation{ .entities = ai_slice.entities, .rows = ai_halo_indices };
     const spatial_stats = if (thread_system) |ts|
-        try ctx.spatial_index.build(ai_slice, move_slice_const, &fixture.data, ts, .{ .scope_dense_indices = ai_halo_indices })
+        try ctx.spatial_index.build(&fixture.data, halo_population, ts, .{})
     else
-        try ctx.spatial_index.buildSerial(ai_slice, move_slice_const, &fixture.data, .{ .scope_dense_indices = ai_halo_indices });
+        try ctx.spatial_index.buildSerial(&fixture.data, halo_population, .{});
     _ = spatial_stats;
     const spatial_end_ns = suite.nowNs(io);
     const excluded_ns = suite.elapsedNs(spatial_start_ns, spatial_end_ns);
@@ -334,7 +336,6 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
             .intent_seed = intent_seed,
             .focus_target = .{ .x = 480, .y = 270 },
             .scope_dense_indices = ai_cognition_indices,
-            .spatial_population_indices = ai_halo_indices,
         });
         _ = try ctx.collision.updateSerialScoped(&fixture.data, &fixture.contacts, collision_indices);
         var slice = fixture.data.movementBodySlice();
@@ -353,7 +354,6 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
         .intent_seed = intent_seed,
         .focus_target = .{ .x = 480, .y = 270 },
         .scope_dense_indices = ai_cognition_indices,
-        .spatial_population_indices = ai_halo_indices,
     });
     _ = try ctx.collision.update(&fixture.data, &fixture.contacts, thread_system.?, .{
         .items_per_range = ctx.case.stageItemsPerRange(collision_range_alignment_items),
