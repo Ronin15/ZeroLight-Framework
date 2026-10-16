@@ -13,15 +13,24 @@ keeps the apply local.
 
 ### Current foundation
 
-- Private grid (`src/game/systems/steering.zig`): `buildAgentGrid` (`:689`),
-  banded build (`:716`), `sortCellEntries` (`:2023`). It sorts the positions
-  the spatial index already sorted.
-- `changeInvalidatesSteeringMovementIndexCache` (`:2122`) drops the whole
-  movement-index cache on any `entity_created`.
-- `accumulateAgentAvoidanceBounded` (`:1938`) is scalar over up to 64
-  candidates per agent and states no SIMD verdict; the sibling obstacle push
-  is SIMD.
-- Steering writes the movement intents (`:1794`) that
+- Private grid, whole in `src/game/systems/steering/agent_grid.zig`:
+  `buildAgentGrid` (`:35`), banded build (`:62`), `sortCellEntries` (`:263`).
+  It sorts the positions the spatial index already sorted.
+- Grid state outside `agent_grid.zig` that goes with it (`steering/system.zig`):
+  - the grid buffers' `deinit` (`:198`, `:203-205`) and reserve (`:507-509`,
+    `:512`; `band_rows` at `:519-520` is shared with `select_resolve`);
+  - the grid tuners (`:190-191`), stats (`:127-129`, `:135`), and step timer
+    (`:317-319`);
+  - `spatial_cell_size` in the `agents` stage (`:395-397`), `largestReach`
+    (`:730`), and `AgentsTally.largest_reach` (`:584`);
+  - test expectations at `system.zig:1256-1263` and `:1391-1420`, and
+    `steering/test_support.zig:21`.
+- `changeInvalidatesSteeringMovementIndexCache` (`system.zig:747`) drops the
+  whole movement-index cache on any `entity_created`.
+- `accumulateAgentAvoidanceBounded` (`steering/avoidance.zig:360`) is scalar
+  over up to 64 candidates per agent and states no SIMD verdict; the sibling
+  obstacle push is SIMD.
+- Steering writes the movement intents (`avoidance.zig:216`) that
   `apply_ai_movement_intents` applies.
 - Measured:
   - `production-step` tuned `--details` (Debug, `5d5a089`): `steering_grid`
@@ -47,13 +56,14 @@ keeps the apply local.
       `steering_grid` 0.59 ms above. Pass: one sort per step in the
       `production-step` census; `steering` within spread or faster.
 - [ ] A create or destroy invalidates only the cache entries it affects
-      (`:2122`). Failure scenario (derived): a spawn burst makes every
+      (`system.zig:747`). Failure scenario (derived): a spawn burst makes every
       steering row re-resolve its movement index that step, nanoseconds per
       row, threaded. Pass: a test that unrelated rows keep their cached
       index; a spawn-churn `steering` case flat in population for a fixed
       churn.
-- [ ] A SIMD verdict at `accumulateAgentAvoidanceBounded` (`:1938`): scalar
-      with its reason at the site until 35 vectorizes it.
+- [ ] A SIMD verdict at `accumulateAgentAvoidanceBounded`
+      (`avoidance.zig:360`): scalar with its reason at the site until 35
+      vectorizes it.
 - [ ] Movement intents in movement-row order if the ordering costs less than
       the apply gain. Measured gain above (ReleaseFast only; Debug numbers
       come first, `.claude/rules/build-validation.md`). Pass:

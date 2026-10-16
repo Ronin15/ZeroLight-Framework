@@ -47,7 +47,7 @@ that does not grow with them.
 - Neighbor queries use the shared index (`.claude/rules/simulation.md`). The
   build sorts, which is per-item work that grows, so it threads with a serial
   path and bitwise parity (`.claude/rules/threading.md`). Steering's banded
-  grid build (`steering.zig:716`) is the proven threaded pattern.
+  grid build (`steering/agent_grid.zig:62`) is the proven threaded pattern.
 - Per-query budgets stay fixed counts (`.claude/rules/budgets-capacities.md`).
 - 75 owns indexing the whole population in every band; this index takes any
   population 75 hands it at the same per-row cost.

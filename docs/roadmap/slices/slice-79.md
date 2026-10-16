@@ -23,7 +23,7 @@ with its invariant held in code and tested, and no unreachable branch.
   last-step latch: `DigController.captureIntent`
   (`src/game/dig_controller.zig:155`) for `dig_hole`/`dig_down`/`dig_ramp`,
   and `SimulationPipeline.captureActionIntent`
-  (`src/game/simulation_pipeline.zig:1132`) for `interact`.
+  (`src/game/simulation_pipeline.zig:1159`) for `interact`.
 - Failure scenario (derived from code, not reproduced): a press and its
   release that both arrive between two fixed steps leave `isHeld` false at
   every step, so no dig or interact intent is emitted. The window is the

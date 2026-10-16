@@ -32,10 +32,10 @@ traversal, and audio treat it through the same paths as any entity.
 - Dig: `DigController` (`src/game/dig_controller.zig:155`) captures dig
   presses and plans the cell the player faces on the player's level.
 - Interact: `SimulationPipeline.captureActionIntent`
-  (`src/game/simulation_pipeline.zig:1132`) builds intents for
+  (`src/game/simulation_pipeline.zig:1159`) builds intents for
   `player.entity`.
 - Perception: a separate `PlayerPerceptionCandidate`
-  (`simulation_pipeline.zig:1353`) beside the halo candidates.
+  (`simulation_pipeline.zig:1389`) beside the halo candidates.
 - Tile gate: `gatePlayerToWalkableTiles` and `Player.clampToBounds`
   (`src/game/systems/world_gate.zig:25`) apart from the NPC gate.
 - Plane traversal: NPC entries exclude the player

@@ -128,7 +128,9 @@ Designs start here, then read the live structure below (rules:
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
-  orchestration, reusable gameplay systems, and full-active scope stats.
+  orchestration, reusable gameplay systems, and full-active scope stats;
+  `src/game/pipeline_test_support.zig` holds its test-only scenario fixtures
+  (fixtures that reach private pipeline code stay in the pipeline file).
 - `src/game/simulation_scope.zig` defines simulation tiers, active-region
   scaffolding, per-entity scope metadata types, stagger/halo constants, and scope
   counters.
@@ -175,9 +177,17 @@ Designs start here, then read the live structure below (rules:
 - `src/game/ai_debug_overlay.zig` draws read-only AI introspection (vision,
   drives, memory, active behavior) under the existing debug toggle; never
   mutates simulation.
-- `src/game/systems/steering.zig` consumes navigation intents and path status,
+- `src/game/systems/steering/` consumes navigation intents and path status,
   then emits final NPC movement intents with local avoidance (same-level agent
-  neighbor gating mirrors collision).
+  neighbor gating mirrors collision). One file per stage, with no facade;
+  each stage file holds free functions over `*SteeringSystem`:
+  - `system.zig`: `SteeringSystem`, its lifecycle and reserve, the step, and the
+    `agents` stage;
+  - `selection.zig`: `select_resolve` and `select_claim`;
+  - `directions.zig`: `directions` (path status and base direction);
+  - `agent_grid.zig`: the agent grid (`grid_bucket`, `grid_sort`);
+  - `avoidance.zig`: the avoidance pass and the movement-intent write;
+  - `test_support.zig`: test-only fixtures shared across the files.
 - `src/game/systems/collision.zig` generates deterministic contact streams.
 - `src/game/systems/collision_response.zig` consumes contacts and applies
   response-policy movement corrections;
@@ -565,9 +575,12 @@ one-worker retune probe reverses upward from the best.
 Reported `worker_threads` counts are background worker threads only; the main
 thread is not included in that count and may also process ranges while waiting
 for the batch barrier.
-Production processors own their own tuner state so movement, particles,
-collision, and future systems never train each other with unrelated batch
-timings; `ThreadSystem` keeps shared fallback state for generic callers. Batches
+Every production stage dispatches through a `Dispatch` built on a tuner its
+system owns (`Dispatch.init` or `StageThreads.stage`), scope's `chunk_derive`
+included, so no stage trains on another's batch timings
+(`.claude/rules/threading.md`). No config field carries a tuner, and no stage
+falls back to `ThreadSystem.adaptive_tuner`: that shared tuner serves only
+generic callers, a `parallelForWithOptions` call that passes none. Batches
 can still force explicit fixed profiles through `items_per_range`,
 `max_worker_threads`, and `adaptive = false`. Worker threads are reused across
 frame batches, parked when idle, and joined during `ThreadSystem` shutdown.

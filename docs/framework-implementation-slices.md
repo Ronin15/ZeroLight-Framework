@@ -207,7 +207,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
-| [**83**](roadmap/slices/slice-83.md) | Not started | Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners — after 50 |
+| [**83**](roadmap/slices/slice-83.md) | Landed | Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners |
 | [**84**](roadmap/slices/slice-84.md) | Not started | Level-Aware Shared Neighbor Index — after 83 |
 | [**85**](roadmap/slices/slice-85.md) | Not started | Steering On The Shared Neighbor Index — after 84, 86 |
 | [**86**](roadmap/slices/slice-86.md) | Not started | Collision Subsystem Pass — after 83, 84 |
@@ -274,7 +274,8 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    and `verify` pass, and its ReleaseFast and owner Windows/Mac runs are open
    in the slice. The measuring landing (`5d5a089`) benched today's code; each
    finding, with its `file:line` re-checked there, its measured number, and
-   its pass shape, lives in its slice. Order:
+   its pass shape, lives in its slice. 83 landed (`3c42b4f`, `176ed03`,
+   `13e88ad`; `verify` passes). Order:
    [83](roadmap/slices/slice-83.md) prep →
    [84](roadmap/slices/slice-84.md) spatial index →
    [86](roadmap/slices/slice-86.md) collision →
@@ -290,7 +291,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    - Missing SIMD verdicts (M4): agent avoidance 85, response gather 86.
    - Commit-seam order in the demo state (L5): 74.
    - Any create re-resolves every steering row (L10): 85.
-   - File splits (L11) and per-system tuner fields: 83.
+   - File splits (L11) and per-system tuner fields: 83 (landed).
    - Render collect and GPU sync copying (area C): 87.
    - Movement intent order: 85.
    - World creation and worldgen: measured; its findings are in 74.
@@ -404,7 +405,7 @@ order.
 2. **82** Split The World Module — landed (archived).
 3. **81** Split The Pathfinding Module — landed (archived).
 4. **50** Thread System Hardening (opens the core-systems branch) — landed on `core_systems`.
-5. **83** Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners — after 50 (core-systems branch).
+5. **83** Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners — landed on `core_systems`.
 6. **84** Level-Aware Shared Neighbor Index — after 83 (core-systems branch).
 7. **86** Collision Subsystem Pass — after 83, 84 (core-systems branch).
 8. **85** Steering On The Shared Neighbor Index — after 84, 86 (core-systems branch).

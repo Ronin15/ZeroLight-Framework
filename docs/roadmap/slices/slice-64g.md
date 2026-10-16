@@ -119,7 +119,7 @@ Failure and limits:
   `WorldBuildConfig` and 8 in `default_chunk_size_tiles`
   (`world_system.zig:48,125`), nav chunks 16 nav cells (`types.zig:130`) with
   the nav cell size set apart from the tile size
-  (`simulation_pipeline.zig:288`), test fixtures 4 and 8.
+  (`simulation_pipeline.zig:407`), test fixtures 4 and 8.
 - No bench varies level size or depth at a fixed change: `nav-update-*` runs
   one 256² world (`nav_update.zig:52`), and `pathfinding*` stays at or below
   256² on one level.

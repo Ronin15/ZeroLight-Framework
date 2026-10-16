@@ -16,16 +16,18 @@ and the `world-gate` bench that measures it.
 ### Current foundation
 
 - AI separation accumulation and `decideDir` (`src/game/systems/ai.zig`) and
-  steering neighbor/obstacle avoidance (`src/game/systems/steering.zig`) are
-  scalar: sparse-index gathers and per-element early exits.
+  steering agent avoidance (`accumulateAgentAvoidanceBounded`,
+  `src/game/systems/steering/avoidance.zig:360`) are scalar: sparse-index
+  gathers and per-element early exits. The obstacle push (`pushObstacles`,
+  `avoidance.zig:295`) is SIMD.
 - Fixed per-query budgets: `max_separation_neighbors` = 32 and
   `max_separation_candidate_checks` = 128 (`ai.zig`);
-  `max_agent_candidate_checks` = 64 and `max_obstacle_candidate_checks` = 64
-  (`steering.zig`).
+  `max_agent_candidate_checks` = 64, `max_obstacle_hits` = 64, and
+  `max_obstacle_work` = 512 (`steering/avoidance.zig:44-50`).
 - Gather, rsqrt, normalize, sincos, and the packed-SoA-scratch idiom exist in
   `src/core/simd.zig` and `src/core/math.zig` (archive Slice 34).
 - `world_gate.apply` (`src/game/systems/world_gate.zig`, staged at
-  `simulation_pipeline.zig:1571`) runs two scalar population walks on main,
+  `simulation_pipeline.zig:1566`) runs two scalar population walks on main,
   `gateNpcEntitiesToWalkableTiles` (`world_gate.zig:36`) and
   `clampAiEntitiesToBounds` (`world_gate.zig:114`), with no threaded path.
 - Measured (Debug, `5d5a089`):

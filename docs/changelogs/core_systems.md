@@ -6,9 +6,10 @@ Range: `main..core_systems`
 
 Base: `5673672` (`Merge pull request #12 from Ronin15/module_layout`)
 
-Tip: in progress. Slice 50 landed (programming complete); its full TSan suite,
-`verify`, ReleaseFast `zig build test`, and the owner's Windows and Mac runs are
-open in the slice.
+Tip: in progress. Slice 50 landed (programming complete); its ReleaseFast
+`zig build test` and the owner's Windows and Mac runs are open in the slice.
+The measuring landing benched the branch's baseline; Slice 83 landed, its
+`verify` open in the slice.
 
 ## Summary
 
@@ -17,7 +18,10 @@ rework runs under the race detector. `ThreadSystem` is now safe against
 nested and foreign callers in every build mode, its dispatch is lock-free with
 the claim counter on its own cache line, workers carry names, tests and
 benches run under ThreadSanitizer, and the tuner gate is derived from the
-measured dispatch floor. Measured numbers are Debug unless labelled.
+measured dispatch floor. A bench-only measuring landing then measured today's
+code and wrote each finding into its slice, and Slice 83 split steering and the
+pipeline tests and gave every production stage its own tuner. Measured numbers
+are Debug unless labelled.
 
 ## Slice 50: Thread System Hardening
 
@@ -71,6 +75,44 @@ measured dispatch floor. Measured numbers are Debug unless labelled.
   at one worker; a losing one-worker retune probe reverses upward from the
   best.
 
+## Measuring Landing
+
+- `5d5a089`: bench-only (the one production change makes
+  `GameDemoState.initWithWorld` `pub`). New groups `production-step`,
+  `world-create`, `world-gate`, `collision-tall`, `collision-stacked`,
+  `perception-crowd`, `render-game-prep-offview`; collision prints
+  `per_body`, `gather`, `sort`, `main`, and the spatial index `main`; groups
+  list only the cases they run (`BenchmarkGroup.cases`). Baseline (23-worker
+  host):
+  - `production-step` tuned: spread P 16,384 9.8 ms (collision 2.7, clamp
+    1.9 ms); crowd P 16,384 38.8 ms (collision 11.0, spatial index 8.0, AI
+    4.8 ms); main carries 75–88% of the step in every config. Half the rows
+    are dormant at the base config, 87% at 32 levels.
+  - `perception-crowd`: 0/1,024 observers find their hostile behind 256 allies
+    or at 32 levels (the hostile scratch fills before the level check).
+  - Collision per body, serial: 2.9 → 26.2 µs as aspect goes 1 → 256, and
+    2.0 → 18.2 µs as levels go 1 → 16.
+  - `render-game-prep-offview`: collect 0.44 → 8.6 ms as off-view rows go
+    4,096 → 262,144 with 1,088 collected.
+  - `world-gate` serial: 17.2 ms at 65,536 bodies.
+  - `world-create` tuned: 142 ms at 2048² × 8 (nav 122 ms); 0 bytes after
+    destroy.
+
+## Slice 83: Core-Branch Prep
+
+- `3c42b4f`: `steering.zig` (4,538 lines) becomes `systems/steering/`
+  (`system`, `selection`, `directions`, `agent_grid`, `avoidance`,
+  `test_support`), with the agent grid whole in `agent_grid.zig` for 85;
+  no facade, no behavior change. Test counts unchanged.
+- `176ed03`: the pipeline's scenario fixtures move to
+  `pipeline_test_support.zig`; `simulation_pipeline.zig` 7,599 → 6,328
+  lines. Test names and order unchanged.
+- `13e88ad`: every production stage dispatches with a tuner it owns: nine
+  caller-settable tuner fields and four fallbacks to the shared tuner are
+  gone, and scope's `deriveChunks` gets the same treatment. An own-tuner
+  test per stage, and a pipeline test that 11 stage batches ran on workers
+  with the shared tuner untouched. Debug A/B on nine groups: nothing slower.
+
 ## Other Changes
 
 - `7ee55b0`: `chunk-scale-nav-level-add` charges one open added level, not
@@ -79,6 +121,14 @@ measured dispatch floor. Measured numbers are Debug unless labelled.
 - `5989a6a`: the Engine-Core core-branch list gains a whole-subsystem
   collision pass, with the measured main-thread gather and sort (32,768
   agents: 11.4 ms Debug, 0.53 ms ReleaseFast).
+- `95aaa95`, `b07f1cc`, `57b3e16`: the measured findings become Slices
+  83–87 and items in 35, 56, 57, 61, 62, 72, 74, 75, 76, and 77; Slice 88
+  covers `DataSystem`, the step contracts, the pipeline, and the core
+  kernels; every system gets a whole-subsystem pass, with a coverage map in
+  the index. Core order (owner): 83 → 84 → 86 → 85 → tile gate (35) → 87 →
+  88 → inert rows → 75's tier mechanics.
+- `9af57be`, `041c5e3`: Slice 66F, Steamworks runtime integration behind an
+  opt-in `-Dsteam` build; a Steam build requires Steam (owner).
 
 ## Conventions And Tooling
 
@@ -99,6 +149,12 @@ measured dispatch floor. Measured numbers are Debug unless labelled.
   `alignBackwardAnyAlign` / `alignForward`, and `std.math.clamp` replace the
   hand-rolled ceil-div, alignment, and clamp helpers tree-wide; the bench
   `rangeCount` is gone and bench reserves call `thread_system.maxRangeCount`.
+- **Measuring landings (`5d5a089`).** `tests-benchmarks.md` (owner
+  approved): a branch's measuring landing states each finding's pass shape
+  in the group doc and asserts only fixture invariants; the shape assert
+  lands with the fix. A group lists the cases its workload runs
+  (`BenchmarkGroup.cases`, `suite.casesNamed`), and a row with no batch
+  prints `-`.
 - **`std.mem.print` (`43f9a11`).** The 14 deprecated `std.fmt.bufPrint`
   calls move to `std.mem.print`; idiom-lint rejects `bufPrint`,
   `bufPrintSentinel`, and `BufPrintError`, and `zig-style.md` lists the
@@ -122,3 +178,14 @@ measured dispatch floor. Measured numbers are Debug unless labelled.
 - `5989a6a` Engine-Core core branch: whole-subsystem collision pass, with the measured main-thread gather and sort
 - `58ff9e1` Slice 50: tuner gate 250 -> 60 us, derived from the measured dispatch floor
 - `65434f7` Slice 50: tuner climb goes up from a winning one-worker first probe
+- `987b342` Slice 50 docs: thread system architecture, TSan workflow, rules, changelog
+- `ddd551d` Slice 50 docs: status reflects passing TSan and verify; ReleaseFast and owner runs stay open
+- `5d5a089` Engine-Core core branch: measuring landing (baseline benches on today's code)
+- `95aaa95` Engine-Core core branch: measured findings into slices 83-87 and their owning slices
+- `3c42b4f` Slice 83: split steering.zig into systems/steering/ by stage
+- `b07f1cc` Engine-Core: slices 84, 85, 87 audit their whole subsystem against the cost model
+- `57b3e16` Engine-Core: every system gets a whole-subsystem pass; Slice 88 covers DataSystem, contracts, pipeline, kernels
+- `176ed03` Slice 83: move the pipeline's scenario fixtures to pipeline_test_support.zig
+- `9af57be` Roadmap: Slice 66F, Steamworks runtime integration
+- `041c5e3` Slice 66F: a Steam build requires Steam; the non-Steam build is -Dsteam=false (owner 2026-10-16)
+- `13e88ad` Slice 83: every production stage dispatches with a tuner it owns

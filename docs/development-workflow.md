@@ -359,8 +359,12 @@ It runs non-interactive CPU benchmarks for movement bodies and movement intents,
 particles, AI, memory, affect, perception, the spatial index, scoped simulation,
 steering, collision and collision response, plane traversal, nav updates,
 chunk-owned terrain and its nav reaction, pathfinding (request load and nav
-scaling), and render prep. Each case set has a serial baseline, fixed-worker,
-fixed small/large-range, and adaptive cases.
+scaling), render prep, the world gate, world creation, and the production fixed
+step. The default case set has a serial baseline, fixed-worker, fixed
+small/large-range, and adaptive cases. A group lists the cases its workload runs
+(`BenchmarkGroup.cases`, default every case): `suite.casesNamed` builds a subset in
+default-case order (`suite.serial_cases`, `suite.serial_and_tuned_cases`), and a
+case the workload has no path for is left out, never skipped.
 `thread-adaptive-fixed-range` isolates adaptive worker-count selection with a
 fixed range size; `thread-adaptive-tuned-range` uses the production
 processor-owned worker and range tuner. Fixed cases are controls for scheduler
@@ -369,9 +373,9 @@ group's partition (the default range size, or one chunk for chunk-partitioned
 stages): default is the partition, small is half of it (at least 1), large is
 4×, each aligned to the stage's range alignment, and
 `thread-adaptive-fixed-range` uses the partition too. In a group that declares
-its `fixed_range_shape`, a fixed case that resolves to an earlier case's
-configuration reports `same shape as <case>`, untimed and out of the
-best-control pick. Groups that time an edit and its revert (terrain edits, nav
+its `fixed_range_shape` (default case list only), a fixed case that resolves to
+an earlier case's configuration reports `same shape as <case>`, untimed and out
+of the best-control pick. Groups that time an edit and its revert (terrain edits, nav
 batch, nav dig and update toggles, connectivity toggles) run each half on its
 own tuner set, so each tuner takes one sample per step as production does
 (`.claude/rules/threading.md`); reported shapes and settle checks follow each
@@ -394,9 +398,14 @@ What rows report:
 - AI: bounded separation checks (transient spatial grid, bounded neighbor and
   candidate samples), emitted navigation intents, and intent-stage worker/range
   tuning.
-- Collision: candidate-pair and contact counts, and narrowphase as
-  `narrow=inline` or `narrow=worker_threads/items_per_range` (broadphase and
-  narrowphase tune independently).
+- Collision: candidate-pair and contact counts, `per_body=` (mean time per
+  body), and narrowphase as `narrow=inline` or
+  `narrow=worker_threads/items_per_range` (broadphase and narrowphase tune
+  independently). `--details` adds `gather=` and `sort=` (the main-thread gather
+  and sort ahead of the broadphase batch) and `main=`.
+- Spatial index: `entities=`; `--details` adds `main=`.
+- `main=` is the sample's main-thread time and share: its wall time minus the
+  off-main time of the stages that ran on workers.
 - Steering: avoidance candidate checks, accepted samples, emitted movement
   intents (a threaded stage with serial fallback and range-owned output).
 - Render-prep (CPU only, no window or GPU submission): draw commands, valid
@@ -427,6 +436,9 @@ Reading results:
   thread (which also processes ranges). `0/10` means adaptive stayed inline; it
   can still trail `serial-direct` in tiny ReleaseFast movement workloads because
   `serial-direct` has no ThreadSystem submission overhead.
+- A row whose sample spans many stages carries no batch (`production-step`,
+  `world-create`): its worker, range, and wait cells print `-`, and the summary
+  names no worker use.
 - Adaptive cases run `--warmup` iterations, then a bounded settle phase before
   timing, so the mean excludes tuner search. A tuner that fails to settle shows
   its probing phase and candidate: an adaptive coverage failure, not a clean
@@ -477,6 +489,58 @@ its count, the adaptive case judged against its controls):
 - `steering-static-change` (10, 1,000, or 10,000 statics; flat) and
   `steering-static-dense` (4, 16, or 64 statics per chunk): a static moved through
   the commit seam then a steering step, and a steering step among dense statics.
+
+Step, world, and shape groups, from the core branch's measuring landing
+(`5d5a089`). Each group doc states its finding's pass shape; its asserts check
+fixture invariants only until the fix lands (`.claude/rules/tests-benchmarks.md`):
+
+- `production-step` (serial and tuned cases): the production fixed step
+  (`GameDemoState.update`: the pipeline, then the structural-commit seam) on a
+  banded walkable world, one axis moved at a time from 4,096 `spread` agents (a
+  uniform grid over every level) at 1024² × 8: population 1,024, 4,096, or 16,384
+  for `spread` and for `crowd` (a square around the observer on the surface),
+  levels 1 or 32, side 512 or 2048, and 1 or 4 inert rows per agent (code `shape *
+  10^14 + inert per agent * 10^13 + level side * 10^9 + levels * 10^6 +
+  population`). Passes when step and main time are linear in population for both
+  shapes, the cost per advancing row is flat in side and levels, and the step is
+  flat in inert rows. Rows print `main=` (the step minus the off-main time of the
+  perf-log batches that ran on workers; an upper bound), `untimed=` (time no
+  top-level stage timer holds), `tiers=` (cognition/locomotion/kinematic/dormant
+  rows), `thinking=` (rows the AI stage ran), and `top_main=` (the three stages
+  with the most main time). `--details` adds `shared_tuner=` (the thread system's
+  shared tuner after the run), each stage's wall, off-main, and main time with its
+  batches' threaded steps, the nested timers, and the census counters. ReleaseFast
+  compiles the perf log out, so only the step total prints.
+- `world-create` (serial and tuned cases): one world built and destroyed through
+  the production phases, `surface` (`initProceduralFromMeta`), `stack`
+  (`addUndergroundLevelStack`), `nav` (`SimulationPipeline.init`: the static
+  colliders and the nav build), and `destroy`, at sides 256, 1024, 2048 × 8 levels
+  and 256² × 32 or 128 (code `level side * 1000 + levels`). An untimed counted pass
+  prints `live_kb` after each phase and `after_destroy_bytes=`. Passes when each
+  phase's time and bytes are at most linear in level area × levels and destroy
+  frees every byte; it asserts the zero and that the phases build what
+  `initProcedural` builds.
+- `world-gate` (serial only): one `world_gate.apply` over 4,096, 16,384, or
+  65,536 bodies on a 256² level whose floor alternates walkable and solid tiles,
+  plus the player on the surface. Passes linear in bodies, dispatched across
+  workers with a SIMD tile test.
+- `collision-tall` (aspect, rows over columns, of 1, 16, or 256 at 4,096
+  bodies) and `collision-stacked` (a 32 × 32 grid on 1, 4, or 16 levels): the
+  `collision` dense grid's broadphase shapes (code `variant * 10^6 + axis`). Candidate pairs
+  equal contacts by construction, so the sweep's rejected visits show only in
+  time: each passes when `per_body=` is flat in its axis.
+- `perception-crowd`: 1,024 separated clusters of one observer and one hostile on
+  its level (code `variant * 10^6 + axis`). `allies` puts the hostile at half the
+  vision range among 16, 64, or 256 allies; `levels` stacks one hostile per level
+  below the observer's (2, 8, or 32 levels) and puts the same-level one past the
+  stack. Passes when every observer finds its hostile (`threat_found=`), nothing
+  is sensed across levels (`sensed=`), and `checks_per_observer=` is flat in
+  allies and levels.
+- `render-game-prep-offview` (serial only): `collectDynamicRecords` alone under
+  the production camera window, 1,024 rows inside it and 4,096, 32,768, or 262,144
+  outside it on one 1024² level. Passes when collect time and the capacities
+  (`record_capacity=`, `command_capacity=` under `--details`) are flat in off-view
+  rows.
 
 Terrain and nav scaling groups (a config the bench's nav size limit, 512 MiB, cannot
 hold fails with its figure, never skips; every nav group checks each part of the
@@ -633,6 +697,7 @@ zig build bench -- --group pathfinding-hard-fallback-budget --items 256 --detail
 zig build bench -- --group nav-update-scattered --details
 zig build bench -- --group nav-update-multichunk --details
 zig build bench -- --group scope --details
+zig build bench -- --group production-step --case thread-adaptive-tuned-range --details
 zig build bench -- --group-prefix chunk-scale- --case serial-direct
 zig build bench -- --group-prefix render-sparse-window- --case serial-direct
 zig build bench -- --group pathfinding-hard-fallback-budget --items 2000 --fallback-budget 128 --case thread-adaptive-tuned-range --details
