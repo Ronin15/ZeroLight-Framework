@@ -2,7 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 55](slice-55.md), [Slice 52D](slice-52d.md) (archive [34](../archive/slice-34.md), [24](../archive/slice-24.md), [32](../archive/slice-32.md) landed) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: not started.** Measure after Slice 55 and 52D land.
+**Status: not started.** Measure after Slice 55 and 52D land. The
+`world_gate` items land first, on the core branch (Engine-Core Overhaul
+order), independent of 55 and 52D; the `world-gate` bench landed there.
 
 Goal: the scalar per-agent and per-neighbor loops in AI separation, AI
 decision math, and steering avoidance become packed-scratch SIMD kernels, so
@@ -22,8 +24,15 @@ and the `world-gate` bench that measures it.
   (`steering.zig`).
 - Gather, rsqrt, normalize, sincos, and the packed-SoA-scratch idiom exist in
   `src/core/simd.zig` and `src/core/math.zig` (archive Slice 34).
-- `world_gate.apply` (`src/game/systems/world_gate.zig`) is scalar and serial;
-  no `world-gate` bench exists.
+- `world_gate.apply` (`src/game/systems/world_gate.zig`, staged at
+  `simulation_pipeline.zig:1571`) runs two scalar population walks on main,
+  `gateNpcEntitiesToWalkableTiles` (`world_gate.zig:36`) and
+  `clampAiEntitiesToBounds` (`world_gate.zig:114`), with no threaded path.
+- Measured (Debug, `5d5a089`):
+  - `world-gate`, serial: 1.48 / 5.88 / 17.19 ms at 4,096 / 16,384 / 65,536
+    bodies (linear).
+  - `production-step` tuned, spread P 16,384: `clamp_bounds` 1.92 ms, all on
+    main, about a fifth of a 9.8 ms step.
 - ReleaseSafe trend data at 2048 movers puts the avoidance batch near 0.40 ms
   ([Scaling Gaps](../scaling-gaps.md); diagnostic, not a perf claim).
 
@@ -58,11 +67,13 @@ and the `world-gate` bench that measures it.
       boxes packed into scratch, vectorized force math, the sampling bound as
       a mask.
 - [ ] Gather scratch sized from the fixed per-query budgets.
-- [ ] `world-gate` bench group (`src/benchmarks/world_gate.zig`): bodies on an
-      underground level of alternating solid and walkable cells, standard case
-      set, at least three body counts.
+- [x] `world-gate` bench group: serial baseline at three body counts
+      (`5d5a089`); its threaded cases join the threaded gate below.
 - [ ] `world_gate.apply` NPC clamp and tile gate as a threaded SIMD range
-      job with its serial path, with scalar/SIMD and serial/threaded parity
+      job with its serial path. Failure scenario: main time grows with every
+      AI body in the world each step. Pass (group doc): linear in bodies,
+      dispatched across workers with a SIMD tile test, `world-gate` gaining
+      the threaded cases. Scalar/SIMD and serial/threaded parity
       covering the 0.5-unit edge-sample inset, off-world cells, level-0 pass-through,
       non-movement tiers, x-then-y resolve order, and any elevation (38) or
       knockback (68B) reads present then; `FailingAllocator` proof for serial

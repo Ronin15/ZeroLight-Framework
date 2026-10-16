@@ -44,6 +44,22 @@ Scope comes from one camera and puts far entities to sleep.
 - Full-active fallback: a world with no chunks yields no region, so no halo,
   stagger, or demotion applies and everything runs at full cost.
 - One observer, one view, one world (74).
+- Movement integrates every row (`src/game/systems/movement.zig:47`) and the
+  tier policy scans every row (`scanTierPolicy`,
+  `src/game/systems/simulation_scope.zig:689`), rows at rest included.
+- Measured, `production-step` tuned (Debug, `5d5a089`):
+  - At the base config (spread P 4,096, 1024², 8 levels), half the rows are
+    dormant and 101 think per step. At L 32, 87% are dormant; at side
+    2048, 68%. Across spread P 1,024 → 16,384, only 28 → 436 rows think per
+    step.
+  - The step gets cheaper as rows freeze: 4.76 / 2.29 / 1.09 ms at L 1 / 8 /
+    32, and 3.12 / 2.29 / 1.28 ms at side 512 / 1024 / 2048. The group's pass
+    shape requires every row to advance.
+  - Inert rows (0, 1, 4 per agent at P 4,096) take tiers like agents and
+    raise the step 2.29 → 3.42 → 7.31 ms.
+  - `untimed` (stages with no perf-log timer: scope advance, tier policy,
+    collision scope gather, plane traversal, action react, dig) is 2–20% of
+    the step.
 
 ### Architecture notes
 
@@ -95,6 +111,14 @@ Scope comes from one camera and puts far entities to sleep.
       fidelity per band set by the design pass.
 - [ ] `dormant` reserved for inert rows, which still advance (57 schedules
       item decay); agents are never dormant.
+- [ ] Rows at rest cost no per-step movement or tier-scan work
+      (`movement.zig:47`, `simulation_scope.zig:689`). Failure scenario: items
+      and resource nodes at rest raise every step's cost (measured above).
+      Pass: `production-step` flat in inert rows. Collision's share is
+      [86](slice-86.md); render collect's is [87](slice-87.md).
+- [ ] Perf-log timers for the untimed stages, so the census attributes the
+      2–20% `untimed` share (`.claude/rules/threading.md`: per-stage timing
+      before a policy change).
 - [ ] A deterministic far-from-observer signal for 62's ambient
       recycling.
 - [ ] Far path requests over the whole-world nav within the fixed request
@@ -116,6 +140,8 @@ Scope comes from one camera and puts far entities to sleep.
 - [ ] `far-sim` matches the cost model (linear in population ÷ cadence);
       `scope`, `ai`, and `steering` show no near-observer regression beyond
       run-to-run spread.
+- [ ] `production-step` meets its pass shape on the level-count and
+      level-side axes with every row advancing at its tier.
 - [ ] Manual (display, Debug): NPCs revisited after travelling far away have
       moved and acted.
 - [ ] `zig build verify` passes.

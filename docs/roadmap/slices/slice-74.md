@@ -49,6 +49,22 @@ One world per gameplay state; nothing models a set of worlds.
 - No load-time check refuses a world: 64G deleted the nav memory gate, band
   lists grow, the GPU store keeps only the render window, and ids that grow in
   play fail only as `OutOfMemory` at their growth seam.
+- The commit seam's order lives in the demo state:
+  `commitStructuralAndReact` (`src/game/game_demo_state.zig:675`) orders the
+  structural commit, population sync, collider sync, and nav and steering
+  reactions.
+- Measured, `world-create` tuned (Debug, `5d5a089`):
+  - 10.3 / 44.9 / 141.7 ms at 256² / 1024² / 2048² × 8 levels, of which the
+    nav phase is 7.5 / 35.3 / 117.5 ms; 10.3 / 16.1 / 34.7 ms at 8 / 32 / 128
+    levels of 256². Time and bytes are at most linear in level area × levels,
+    and 0 bytes stay live after destroy.
+  - The nav phase (`SimulationPipeline.init`: static colliders, nav build, and
+    each processor's init) holds about 12.4 MB at 256² × 8 and about 18.9 MB at
+    2048² × 8; cause not identified.
+  - The nav build barely gains from workers: 117.5 ms tuned against
+    127.9 ms serial at 2048² × 8, while the surface paint goes 182.7 →
+    18.1 ms. Its batches are not exposed (`nav_reaction.zig:113` discards the
+    rebuild result), so its main share is unmeasured.
 
 ### Architecture notes
 
@@ -115,6 +131,19 @@ One world per gameplay state; nothing models a set of worlds.
       and the connections its links carried are removed at the reachability
       maintenance cost (`.claude/rules/budgets-capacities.md`), never a
       world-wide rebuild.
+- [ ] The commit-seam order moves out of the demo state into the per-world
+      step, so every world (and any second gameplay state) runs the same
+      order. Failure scenario (derived): a stepper that reorders the seam's
+      calls desyncs the collider or nav sync.
+- [ ] A world's create-time memory follows its content. Failure scenario:
+      every small dungeon pays the nav phase's ~12.4 MB floor (measured
+      above; cause not identified, so the first step is finding it). Pass:
+      `world-create` nav-phase bytes follow what exists (group doc).
+- [ ] The create-time nav build reports its batches and threads its
+      per-chunk work. Failure scenario: a world created in play spends most of
+      its nav build on one thread (measured above). Pass: `world-create`
+      shows the nav phase's main share as the ordered merge only; serial ==
+      threaded.
 - [ ] Per-world state classified for 49/64B; included in 46's v1.
 - [ ] Tests: create, step, and destroy leak nothing; an entity moved
       between worlds keeps its identity as designed; one world's step is

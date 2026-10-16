@@ -75,6 +75,13 @@ render pick it up the same step as any other terrain change.
 - [ ] The collapse's dense write records its cost-driver stage
       (`terrain_edit_write`) in the runtime perf log at its call site.
 - [ ] Entities caught in a collapse are handled (the rule decides how).
+- [ ] Collapse entity commands past the structural share defer
+      deterministically to a later step
+      (`.claude/rules/budgets-capacities.md`); the step never fails for them.
+      Today a commit past the `.structural_commit` share fails the whole step
+      (`simulation.zig:491`, raised through `game_demo_state.zig:689`;
+      derived, no bench). Contract test: an over-share burst defers and the
+      step succeeds.
 - [ ] Tests: serial equals threaded; OOM leaves terrain intact and the
       retry gives the same result; a collapse spanning chunks and levels in
       one step; repeated dig/collapse/refill; a chain collapse advances one
