@@ -70,11 +70,13 @@ enabled by the current `--fetch` mode.
 **Packaged builds ship `ReleaseFast`** (no safety checks; why reserves need
 proofs: `.claude/rules/memory-performance.md`).
 
-CPU floor: every release mode (ReleaseSafe soaks included) defaults to the
-shipped CPU minimum, `x86_64_v2` (SSE4.2, POPCNT) on x86-64, `apple_m1` on
-macOS arm64, and the baseline model (NEON) on other aarch64, so gates and
-soaks test what ships. Debug builds for the native CPU. `-Dcpu` or `-Dtarget` overrides; moving the floor
-(for example to v3) is a deliberate decision.
+CPU floor: every optimize mode, Debug included, defaults to the shipped CPU
+minimum, `x86_64_v2` (SSE4.2, POPCNT) on x86-64, `apple_m1` on macOS arm64,
+and the baseline model (NEON) on other aarch64. Gates and soaks test what
+ships; Debug benches measure the shipped instruction set on every machine; and Debug binaries carry no AVX-512, so they run under
+valgrind ([Profiling](#profiling)). `-Dcpu` or `-Dtarget` overrides
+(`-Dcpu=native` builds for the host); moving the floor (for example to v3) is a
+deliberate decision.
 
 LTO: on Linux (ELF), `build.zig` enables `-flto=full` for the shipped **app
 executable only** in `ReleaseFast`, explicitly selecting LLVM + LLD (which LTO
@@ -165,8 +167,8 @@ absolute SDL DLL directories to the launched process's `PATH` (Zig 0.17 removed
 `Run.addPathDir`). That value is computed from the configure-time environment,
 which Zig 0.17's configure cache does not key on, so `build.zig` poisons the
 configure cache on Windows hosts and the configure phase re-runs on every
-`zig build` there. A `-Dsanitize-thread` build poisons it on every host
-([Thread Sanitizer](#thread-sanitizer)); other builds on non-Windows hosts,
+`zig build` there. A `-Dsanitize-thread` build ([Thread Sanitizer](#thread-sanitizer)) and a
+`-Dcallgrind` build ([Profiling](#profiling)) poison it on every host; other builds on non-Windows hosts,
 including Windows cross-builds, are unaffected.
 
 ## Diagnostics And Log Levels
@@ -348,6 +350,46 @@ The full suite takes about 3 minutes under TSan (x86_64 Linux, Debug), and
 the option is not part of `verify`. A landing that touches threaded code runs
 the `thread_system` tests under TSan; the full suite runs under TSan at a
 slice's or branch's final commit.
+
+## Profiling
+
+```sh
+zig build bench -Dcallgrind=true -- --group ai --items 256 --warmup 1 --iterations 1 --case serial-direct
+callgrind_annotate --inclusive=yes benchmark_outputs/callgrind/callgrind.out | less
+```
+
+`-Dcallgrind=true` runs the bench binary under `valgrind --tool=callgrind`
+with the same `--` arguments. The profile goes to
+`benchmark_outputs/callgrind/callgrind.out` (gitignored, overwritten each run;
+`-Dcallgrind-out=<path>`, relative to the repo root, picks another file) and
+valgrind's own messages to the same path plus `.log`, so the bench table stays
+readable. Valgrind warns there about the Debug binary's DWARF line tables;
+function names still resolve, and some file names show as `???`. The `bench` step
+(only it) fails with one message when valgrind is not on `PATH`, when the host or target
+is not native Linux, when the target CPU has AVX-512 (valgrind cannot run it,
+for example `-Dcpu=native` on an AVX-512 host), or with `-Dsanitize-thread`.
+
+`callgrind_annotate --inclusive=yes` lists instructions (`Ir`) per function,
+callees included; drop `--inclusive` for self cost, and use `--tree=both` or
+`kcachegrind` for call counts and the call graph. Process startup is in the
+totals (the environment map under the Debug allocator's stack-trace capture
+is a large share of a small run), so read the bench stage's own inclusive line,
+not the program total.
+
+What it answers: which functions execute the instructions, how often each is
+called, and a Debug regression broken down by function without timing noise
+(Debug wall time has tracked instruction count closely). What it does not answer:
+
+- wall time and threading: valgrind runs one thread at a time, so profile
+  serial cases (`--case serial-direct`);
+- SIMD-vs-scalar and inlining choices, which stay the release question of
+  `.claude/rules/memory-performance.md` § SIMD;
+- cache misses and memory stalls (the default run simulates no cache);
+- other OSes: valgrind runs on Linux only.
+
+Callgrind runs tens of times slower than the plain binary (about 25× on the
+example above), so callgrind runs use low entity counts only: about 256 to
+1,024 items, one warmup, one iteration.
 
 ## Benchmarks
 
@@ -706,10 +748,13 @@ zig build bench -- --details
 
 Before/after comparisons use `tools/bench_ab.py`: targeted groups only, a base
 ref vs the working tree, one Debug run per side (`--reps 3` confirms a slower
-case with medians and spread). Each side's runs are
-cached by its build inputs (`src/`, `build.zig*`, `assets/`) for six hours, so
-a landing's measured tree is reused as the next landing's base; `--fresh`
-reruns both sides interleaved. Full-suite
+case with medians and spread). Both sides build with the same explicit
+`-Dcpu`, the host's shipped CPU floor by default (`--cpu native` overrides
+both), so a base ref from before Debug defaulted to the floor builds at the
+same CPU as the tree. Each side's runs are
+cached by its build inputs (`src/`, `build.zig*`, `assets/`) and the CPU for
+six hours, so a landing's measured tree is reused as the next landing's base;
+`--fresh` reruns both sides interleaved. Full-suite
 capture with timestamped output under `benchmark_outputs/` uses
 `tools/bench_run.py`. Both: [tools/README.md](../tools/README.md).
 

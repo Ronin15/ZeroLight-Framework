@@ -23,11 +23,18 @@ unless the forwarded bench args set them.
 Each side's raw outputs are cached under `benchmark_outputs/ab-cache/`, keyed
 by the side's build inputs (`src/`, `build.zig*`, `assets/` as git trees, the
 working tree's content included, so a landing's measured tree is the next
-landing's cached base), the build mode, the case, and the
+landing's cached base), the build mode, the CPU, the case, and the
 forwarded args. A side with enough cached reps younger than
 `CACHE_MAX_AGE_S` is not rerun; that side is then not interleaved with the
 other, so `--fresh` reruns both when a verdict sits at the edge of spread. `--optimize ReleaseFast` is only for a
 question Debug cannot answer (`.claude/rules/build-validation.md`).
+
+Both sides build with the same explicit `-Dcpu`, by default the host's shipped
+CPU floor (the mapping in `build.zig`'s `shippedCpuFloor`: `x86_64_v2` on
+x86-64, `apple_m1` on macOS arm64, `baseline` elsewhere), so a base ref from
+before Debug defaulted to the floor still builds at the tree's CPU. `--cpu`
+overrides it for both sides (`--cpu native`). The CPU is part of the cache key,
+so runs at another CPU are never reused.
 
 Usage:
     tools/bench_ab.py --group chunk-scale-dig -- --items 1024032
@@ -36,6 +43,7 @@ Usage:
     tools/bench_ab.py --base none --grid --group chunk-scale-dig   # shape: tree only, every config
     tools/bench_ab.py --group pathfinding -- --items 2000         # forward bench args
     tools/bench_ab.py --optimize ReleaseFast --group movement-apply-intents -- --items 16384
+    tools/bench_ab.py --cpu native --group ai -- --items 1024         # both sides at the host CPU
 """
 
 from __future__ import annotations
@@ -45,6 +53,7 @@ import datetime
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import statistics
@@ -70,6 +79,29 @@ DEFAULT_CASES = ("serial-direct", "thread-adaptive-tuned-range")
 NOISE_PCT = 10.0
 # A regression check needs medians and spread over reps, not long runs per config.
 DEFAULT_TIMING = ("--warmup", "2", "--iterations", "10")
+
+
+def host_target() -> tuple[str, str]:
+    """(arch, os) of the host as Zig resolves it (`zig env` `.target`), so an emulated
+    Python interpreter (Rosetta) never picks the wrong floor."""
+    try:
+        out = subprocess.run(["zig", "env"], capture_output=True, text=True, check=True).stdout
+        match = re.search(r'\.target = "([^-"]+)-([^-."]+)', out)
+        if match:
+            return match.group(1), match.group(2)
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return platform.machine().lower(), sys.platform
+
+
+def shipped_cpu_floor() -> str:
+    """The host's shipped CPU floor, matching `shippedCpuFloor` in build.zig."""
+    arch, os_name = host_target()
+    if arch in ("x86_64", "amd64"):
+        return "x86_64_v2"
+    if arch in ("arm64", "aarch64") and os_name in ("macos", "darwin"):
+        return "apple_m1"
+    return "baseline"
 
 
 def repo_root() -> Path:
@@ -119,8 +151,8 @@ def tree_of(root: Path, ref: str | None) -> str:
     return hashlib.sha256(" ".join(parts).encode()).hexdigest()
 
 
-def cache_path(root: Path, tree: str, optimize: str, bench_args: list[str]) -> Path:
-    digest = hashlib.sha256(json.dumps([optimize, bench_args]).encode()).hexdigest()[:16]
+def cache_path(root: Path, tree: str, optimize: str, cpu: str, bench_args: list[str]) -> Path:
+    digest = hashlib.sha256(json.dumps([optimize, cpu, bench_args]).encode()).hexdigest()[:16]
     return root / OUTPUT_DIRNAME / CACHE_DIRNAME / tree[:16] / f"{digest}.json"
 
 
@@ -134,10 +166,10 @@ def cached_texts(path: Path, reps: int) -> list[str] | None:
     return entry["texts"][:reps]
 
 
-def run_bench(cwd: Path, bench_args: list[str], cache_dir: Path, optimize: str) -> tuple[int, str]:
+def run_bench(cwd: Path, bench_args: list[str], cache_dir: Path, optimize: str, cpu: str) -> tuple[int, str]:
     # Both sides share the repo's local cache: it is content-addressed, so a base
     # export of a new parent commit rebuilds only what differs instead of cold.
-    cmd = ["zig", "build", "bench", f"-Doptimize={optimize}", "--cache-dir", str(cache_dir), "--", *bench_args]
+    cmd = ["zig", "build", "bench", f"-Doptimize={optimize}", f"-Dcpu={cpu}", "--cache-dir", str(cache_dir), "--", *bench_args]
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -194,6 +226,11 @@ def main() -> int:
         default="Debug",
         help="build mode for both sides (default: Debug; ReleaseFast only for what Debug cannot show)",
     )
+    parser.add_argument(
+        "--cpu",
+        default=shipped_cpu_floor(),
+        help="-Dcpu for both sides (default: the host's shipped CPU floor, %(default)s; e.g. native)",
+    )
     parser.add_argument("--fresh", action="store_true", help="ignore cached reps and rerun both sides")
     parser.add_argument("bench_args", nargs="*", help="extra args forwarded to the bench binary (after --)")
     args = parser.parse_args()
@@ -232,7 +269,7 @@ def main() -> int:
         for c, case in enumerate(cases):
             for s, (name, _, tree) in enumerate(sides):
                 bench_args = target + (["--case", case] if case else []) + timing + args.bench_args
-                hit = None if args.fresh else cached_texts(cache_path(root, tree, args.optimize, bench_args), args.reps)
+                hit = None if args.fresh else cached_texts(cache_path(root, tree, args.optimize, args.cpu, bench_args), args.reps)
                 if hit is not None:
                     texts[(t, c, s)] = hit
                     cached_sides.add(name)
@@ -247,11 +284,11 @@ def main() -> int:
                     if (t, c, s) in texts:
                         continue
                     bench_args = target + (["--case", case] if case else []) + timing + args.bench_args
-                    code, text = run_bench(cwd, bench_args, root / ".zig-cache", args.optimize)
+                    code, text = run_bench(cwd, bench_args, root / ".zig-cache", args.optimize, args.cpu)
                     tag = "_".join([name.replace(":", "-").replace("/", "-"), target[1], case or "all", str(rep)])
                     (out_dir / f"{tag}.txt").write_text(text)
                     done += 1
-                    print(f"[{done}/{total}] {name} {' '.join(bench_args)}", file=sys.stderr)
+                    print(f"[{done}/{total}] {name} -Dcpu={args.cpu} {' '.join(bench_args)}", file=sys.stderr)
                     if code != 0:
                         print(text[-4000:], file=sys.stderr)
                         print(f"bench failed on {name} (exit {code}); raw output in {out_dir}", file=sys.stderr)
@@ -260,9 +297,9 @@ def main() -> int:
 
     for (t, c, s), runs in fresh.items():
         bench_args = targets[t] + (["--case", cases[c]] if cases[c] else []) + timing + args.bench_args
-        path = cache_path(root, sides[s][2], args.optimize, bench_args)
+        path = cache_path(root, sides[s][2], args.optimize, args.cpu, bench_args)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"created": time.time(), "args": bench_args, "texts": runs}))
+        path.write_text(json.dumps({"created": time.time(), "cpu": args.cpu, "args": bench_args, "texts": runs}))
     for (t, c, s), runs in {**texts, **fresh}.items():
         for text in runs:
             for (group, item, case_name), us in parse(text, cases[c]).items():
@@ -272,7 +309,7 @@ def main() -> int:
     names = [n for n, _, _ in sides]
     lines = [
         f"# bench_ab  {stamp}  head={git(root, 'rev-parse', '--short', 'HEAD')}"
-        f"{'-dirty' if git(root, 'status', '--porcelain') else ''}  reps={args.reps}  {args.optimize}",
+        f"{'-dirty' if git(root, 'status', '--porcelain') else ''}  reps={args.reps}  {args.optimize}  cpu={args.cpu}",
         f"# args  {' '.join(sum(targets, []))}  cases={'all' if args.all_cases else ','.join(c for c in cases)}  extra={' '.join(args.bench_args) or '-'}",
         f"# cached (not interleaved): {', '.join(sorted(cached_sides)) or 'none'}",
         "",

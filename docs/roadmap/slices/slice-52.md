@@ -19,7 +19,7 @@ local fixes.
 
 | Concern | Decision | Owner |
 | --- | --- | --- |
-| CPU baseline | `-Dcpu-baseline=native\|ship\|compat`: `ship` = `x86_64_v2` / `apple_m1` / arch baseline, `compat` = `x86_64` (SSE2), `native` dev/bench only and never packaged; Debug defaults to `native`, release modes to `ship`. | 52A |
+| CPU baseline | `-Dcpu-baseline=native\|ship\|compat`: `ship` = `x86_64_v2` / `apple_m1` / arch baseline, `compat` = `x86_64` (SSE2), `native` dev/bench only and never packaged; every mode, Debug included, defaults to `ship` (owner 2026-10-16). | 52A |
 | SDL | SDL 3.4.18, SDL_ttf 3.2.2, SDL_mixer 3.2.4 on every OS (re-check the newest 3.4 patch at landing): Windows prebuilt, Linux/macOS upstream-CMake source build, `-Dsystem-sdl` floor-checked fallback. | 52A |
 | Zig | `build.zig.zon` `.minimum_zig_version` is the exact pin, guarded in `build.zig`; `mise.toml` pins the dev toolchain; documented upgrade policy. | 52A |
 | Shaders | Committed SPIR-V/MSL/DXIL with a source-hash lock gated by `verify`; compile mode kept; CI regenerates with pinned tools. | 52A (+ 52C job) |

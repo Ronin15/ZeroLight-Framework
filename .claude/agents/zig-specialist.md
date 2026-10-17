@@ -53,7 +53,8 @@ After folding review fixes, report to the main session for verification; a
 second review round is not the next step (one review per landing). An
 explanation of a bench result is a hypothesis unless a measurement tests it;
 say which, and never write an untested explanation into a bench's pass
-condition or comment. Run long jobs in the foreground or poll for a done
+condition or comment. Callgrind on a small serial case is one way to test it
+(`docs/development-workflow.md` § Profiling). Run long jobs in the foreground or poll for a done
 marker; never wait on `tail -f` with a timeout.
 
 Concise: cost model (each order marked measured with its bench group, or

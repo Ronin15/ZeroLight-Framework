@@ -53,14 +53,17 @@ The tool for agent and day-to-day perf checks. It refuses to run without
 exports are kept); the working tree is the after side. Reps interleave base and
 tree per group and case, except a side whose reps are cached: each side's raw
 outputs are cached under `benchmark_outputs/ab-cache/`, keyed by its build
-inputs (`src/`, `build.zig*`, `assets/`), mode, case, and args, and reused for
+inputs (`src/`, `build.zig*`, `assets/`), mode, CPU, case, and args, and reused for
 six hours, so a landing's measured tree is the next landing's base. `--fresh`
 reruns both sides interleaved. With one run per side (the default) the verdict
 is `slower`/`faster` past 10%, otherwise `within noise`; a `slower` case is
 confirmed with `--reps 3` on that case alone, where the summary prints each
 side's median and min-max spread and calls `slower`/`faster` only when the two
 ranges do not overlap, otherwise `within spread`. Raw outputs and `summary.txt` go to
-`benchmark_outputs/ab-<stamp>/`. Always Debug. Cases default to
+`benchmark_outputs/ab-<stamp>/`. Debug by default; `--optimize ReleaseFast` follows
+`.claude/rules/build-validation.md`. Both sides build with the
+same `-Dcpu`, the shipped floor by default (`--cpu native` to override), so a
+base from before Debug moved to the floor still compares like for like. Cases default to
 `serial-direct` and `thread-adaptive-tuned-range` (`--all-cases` for every
 scheduler case) and to `--warmup 2 --iterations 10` per run (forward
 `-- --iterations N` to override). A run must name its config with `-- --items N`, or

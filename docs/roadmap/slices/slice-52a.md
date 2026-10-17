@@ -3,7 +3,8 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: in progress.** The Windows LTO-off item landed 2026-10-05
-(`01754ec`); 64G set the release-mode CPU default (`46d3b7f`, `83f36a6`);
+(`01754ec`); 64G set the release-mode CPU default (`46d3b7f`, `83f36a6`); Debug
+moved to the same floor on the core branch (owner 2026-10-16);
 everything else is not started. First of 52A → 52B → 52C; 52D
 needs its `-Dcpu-baseline`. Rebases on Slice 50's `build.zig` edits.
 
@@ -15,10 +16,10 @@ Linux and macOS; no shader compilers are needed for a normal build.
 
 ### Current foundation
 
-- `build.zig` defaults every release mode (ReleaseSafe soaks included) to the
-  shipped CPU: `x86_64_v2` on x86-64, `apple_m1` on macOS arm64, the arch
-  baseline elsewhere (64G P1, `build.zig:80-83`, `:750-758`); Debug resolves to
-  the host CPU; `-Dcpu`/`-Dtarget` override. There is no `-Dcpu-baseline`
+- `build.zig` defaults every optimize mode, Debug included (owner
+  2026-10-16), to the shipped CPU: `x86_64_v2` on x86-64, `apple_m1` on macOS
+  arm64, the arch baseline elsewhere (`shippedCpuFloor`); `-Dcpu`/`-Dtarget`
+  override, and `-Dcpu=native` is the dev opt-in. There is no `-Dcpu-baseline`
   option yet. A `-Dtarget` cross build without `-Dcpu` takes that target's
   default CPU (derived, not run).
 - `core/simd.zig` derives every lane count from one 16-byte register constant
@@ -49,8 +50,8 @@ Linux and macOS; no shader compilers are needed for a normal build.
 
 - CPU baseline (decision): `-Dcpu-baseline=native|ship|compat`. `ship` =
   `x86_64_v2` / `apple_m1` / arch baseline; `compat` = `x86_64` (SSE2,
-  maximum reach); `native` untouched query, dev/bench only. Debug defaults to
-  `native`, every release mode to `ship`. An explicit `-Dcpu` wins; passing
+  maximum reach); `native` untouched query, dev/bench only. Every mode,
+  Debug included, defaults to `ship` (owner 2026-10-16). An explicit `-Dcpu` wins; passing
   both fails at configure. One resolved target reaches every artifact. The SDL
   source build never receives the baseline (SDL dispatches at runtime). glibc
   and macOS floors come from 52C's release `-Dtarget`, not this option.
@@ -102,6 +103,11 @@ Linux and macOS; no shader compilers are needed for a normal build.
 
 - [ ] `-Dcpu-baseline` with `ship` / `compat` / `native` resolution, `-Dcpu`
       precedence, and the configure-time conflict error.
+- [ ] `tools/bench_ab.py` `shipped_cpu_floor` (`:84`) mirrors `build.zig`
+      `shippedCpuFloor`. Failure scenario: `-Dcpu-baseline` lands or the floor
+      moves, and bench_ab keeps A/B-ing at the old CPU with no error. Pass:
+      bench_ab takes the baseline from the build (or the same option), never a
+      copy.
 - [ ] `package` refuses a `native` baseline or explicit `-Dcpu`, with a fix-it.
 - [ ] Float-mode lint rules in `tools/lint_idioms.py`.
 - [ ] Zig pin guard, `mise.toml`, and a pin-consistency check in `verify`.
@@ -132,8 +138,8 @@ Linux and macOS; no shader compilers are needed for a normal build.
 
 - [ ] `zig build verify` passes on the Linux host with defaults, with
       `-Dsystem-sdl=true`, and with no shader tools on `PATH`.
-- [ ] The bench header shows `cpu_model=x86_64_v2` for a ReleaseFast run, the
-      host model in Debug, and `x86_64` under `compat`; `-Dcpu` with
+- [ ] The bench header shows `cpu_model=x86_64_v2` for a ReleaseFast run and in
+      Debug, and `x86_64` under `compat`; `-Dcpu` with
       `-Dcpu-baseline` fails at configure.
 - [ ] `package` with a `native` baseline or explicit `-Dcpu` fails with the
       fix-it.

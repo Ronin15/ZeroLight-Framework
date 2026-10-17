@@ -74,14 +74,12 @@ const shader_programs = [_]ShaderProgram{
 
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
-    // Release modes default to the shipped CPU floor (x86-64-v2: SSE4.2 and
-    // POPCNT, which the chunk bit ops use; apple_m1 on macOS arm64; otherwise
-    // the arch baseline, NEON on aarch64); Debug stays native. -Dtarget/-Dcpu
-    // override.
-    const target = b.standardTargetOptions(.{ .default_target = switch (optimize) {
-        .safe, .fast, .small => shippedCpuFloor(b.graph.host.result),
-        .debug => .{},
-    } });
+    // Every mode, Debug included, defaults to the shipped CPU floor (x86-64-v2:
+    // SSE4.2 and POPCNT, which the chunk bit ops use; apple_m1 on macOS arm64;
+    // otherwise the arch baseline, NEON on aarch64), so Debug benches measure the
+    // shipped instruction set and stay runnable under valgrind. -Dtarget/-Dcpu
+    // override; -Dcpu=native builds for the host.
+    const target = b.standardTargetOptions(.{ .default_target = shippedCpuFloor(b.graph.host.result) });
     const app_name = b.option([]const u8, "app-name", "Executable name") orelse "my-sdl3-game";
     const window_title = b.option([]const u8, "window-title", "SDL window title") orelse "SDL3 Zig Game";
     const asset_root = b.option([]const u8, "asset-root", "Runtime asset directory") orelse "assets";
@@ -110,6 +108,8 @@ pub fn build(b: *std.Build) void {
     // the LLVM backend, so those two artifacts force it. Not part of `verify`.
     const sanitize_thread = b.option(bool, "sanitize-thread", "Build unit tests and benchmarks with ThreadSanitizer (LLVM backend)") orelse false;
     const sanitize_thread_supported = tsanSupportedForTarget(target.result);
+    const callgrind = b.option(bool, "callgrind", "Run `zig build bench` under valgrind --tool=callgrind (Linux)") orelse false;
+    const callgrind_out = b.option([]const u8, "callgrind-out", "Callgrind output file, relative to the build root or absolute") orelse "benchmark_outputs/callgrind/callgrind.out";
     const windows_sdl = configureWindowsSdl(b, target.result, system_sdl, sdl_root);
     const windows_sdl_checks = windowsSdlValidateSteps(windows_sdl);
 
@@ -256,7 +256,10 @@ pub fn build(b: *std.Build) void {
     addWindowsSdlRunRuntime(test_run, windows_sdl_runtime);
     test_step.dependOn(&test_run.step);
 
-    const bench_run = b.addRunArtifact(bench_exe);
+    const bench_run = if (callgrind)
+        addCallgrindBenchRun(b, target.result, sanitize_thread, bench_exe, callgrind_out)
+    else
+        b.addRunArtifact(bench_exe);
     addWindowsSdlRunRuntime(bench_run, windows_sdl_runtime);
     // Halt on the first report. A user-set TSAN_OPTIONS follows the defaults, so its flags
     // win one by one (e.g. halt_on_error=0 to collect every report). The value is always set
@@ -779,6 +782,52 @@ comptime {
                 @compileError("msl_entry_signature must be the generated MSL entry-point parameter list starting with main0(: " ++ stage_source.output_stem);
         }
     }
+}
+
+/// The bench binary under callgrind, writing the profile to `out_path` (relative to the
+/// build root, or absolute) and valgrind's own messages to `<out_path>.log` on every run, so
+/// the bench table stays readable. Fails the bench step (and only it) on what valgrind cannot
+/// run: a non-Linux or foreign-arch build, AVX-512 code (valgrind decodes no EVEX), and
+/// ThreadSanitizer (both intercept the same threads and memory).
+fn addCallgrindBenchRun(
+    b: *std.Build,
+    target: std.Target,
+    sanitize_thread: bool,
+    bench_exe: *std.Build.Step.Compile,
+    out_path: []const u8,
+) *std.Build.Step.Run {
+    const host = b.graph.host.result;
+    const valgrind = b.findProgram(.{ .names = &.{"valgrind"} });
+    const refusal: ?[]const u8 = if (sanitize_thread)
+        "-Dcallgrind=true cannot combine with -Dsanitize-thread=true; profile and sanitize in separate runs"
+    else if (host.os.tag != .linux or target.os.tag != .linux or target.cpu.arch != host.cpu.arch)
+        b.fmt("-Dcallgrind=true needs a native Linux build (valgrind); host {s}-{s}, target {s}-{s}", .{
+            @tagName(host.cpu.arch), @tagName(host.os.tag), @tagName(target.cpu.arch), @tagName(target.os.tag),
+        })
+    else if (target.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(target.cpu.features, .avx512f))
+        b.fmt("-Dcallgrind=true cannot run AVX-512 code (valgrind has no AVX-512 support); target CPU {s} has it, so drop -Dcpu or pass -Dcpu=x86_64_v2", .{target.cpu.model.name})
+    else if (valgrind == null)
+        "-Dcallgrind=true needs valgrind on PATH"
+    else
+        null;
+
+    const out_dir = b.addSystemCommand(&.{ "mkdir", "-p", std.fs.path.dirname(out_path) orelse "." });
+    out_dir.setCwd(b.path("."));
+    const run = b.addSystemCommand(&.{
+        valgrind orelse "valgrind",
+        "--tool=callgrind",
+        b.fmt("--callgrind-out-file={s}", .{out_path}),
+        b.fmt("--log-file={s}.log", .{out_path}),
+    });
+    run.setCwd(b.path("."));
+    run.addArtifactArg(bench_exe);
+    run.step.dependOn(&out_dir.step);
+    if (refusal) |message| {
+        const fail = b.addFail(message);
+        out_dir.step.dependOn(&fail.step);
+        run.step.dependOn(&fail.step);
+    }
+    return run;
 }
 
 fn shippedCpuFloor(host: std.Target) std.Target.Query {

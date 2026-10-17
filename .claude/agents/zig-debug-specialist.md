@@ -73,6 +73,8 @@ dispatch, logging, resource recreation, excess submissions, pacing). For
 multi-stage processors, isolate stage timing and tuner state first. Check the
 two MAL regression signatures early: `rows.items(.field)` in a loop and per-row
 `appendAssumeCapacity` in a hot gather. Measure with a targeted bench group.
+Attribute a Debug perf regression to functions with callgrind on a small
+serial case (`docs/development-workflow.md` § Profiling).
 
 A `zig build check` failure naming a `SimulationPipeline` stage that reads a
 resource before any earlier stage writes it is the stage contract working: fix
