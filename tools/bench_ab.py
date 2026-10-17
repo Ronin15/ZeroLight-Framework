@@ -17,7 +17,7 @@ only what differs). Raw outputs and the summary go to
 `thread-adaptive-tuned-range`; the forced-thread cases are scheduler controls
 (`--all-cases` runs every case). A run must name its config with
 `-- --items N` (or pass `--grid` for every config): one config answers a
-regression question; a full grid is rarely the right signal. Runs use `--warmup 2 --iterations 10`
+regression question; a full grid is rarely the right signal. Runs use `--warmup 1 --iterations 3`
 unless the forwarded bench args set them.
 
 Each side's raw outputs are cached under `benchmark_outputs/ab-cache/`, keyed
@@ -72,13 +72,13 @@ CACHE_DIRNAME = "ab-cache"
 CACHE_MAX_AGE_S = 6 * 3600
 
 GROUP_HEADER = re.compile(r"^(\S+)\s+(\d+)\s+\S")
-CASE_ROW = re.compile(r"^(\S+)\s+([\d.]+)\s+(ns|us|ms|s)\s")
+CASE_ROW = re.compile(r"^(\S+)\s+([\d.]+)\s+(ns|us|ms|s)\s+\S+\s+\S+\s+(\S+)")
 UNIT_US = {"ns": 1e-3, "us": 1.0, "ms": 1e3, "s": 1e6}
 DEFAULT_CASES = ("serial-direct", "thread-adaptive-tuned-range")
 # Single-run verdict band; a regression past it is confirmed with --reps 3.
 NOISE_PCT = 10.0
 # A regression check needs medians and spread over reps, not long runs per config.
-DEFAULT_TIMING = ("--warmup", "2", "--iterations", "10")
+DEFAULT_TIMING = ("--warmup", "1", "--iterations", "3")
 
 
 def host_target() -> tuple[str, str]:
@@ -174,8 +174,8 @@ def run_bench(cwd: Path, bench_args: list[str], cache_dir: Path, optimize: str, 
     return proc.returncode, proc.stdout + proc.stderr
 
 
-def parse(text: str, case_filter: str | None) -> dict[tuple[str, str, str], float]:
-    """(group, item code, case) -> mean in microseconds."""
+def parse(text: str, case_filter: str | None, workers: dict | None = None) -> dict[tuple[str, str, str], float]:
+    """(group, item code, case) -> mean in microseconds; fills `workers` with each row's worker_threads cell."""
     out: dict[tuple[str, str, str], float] = {}
     group = item = None
     for line in text.splitlines():
@@ -185,6 +185,8 @@ def parse(text: str, case_filter: str | None) -> dict[tuple[str, str, str], floa
             # First row per case is the compact table's mean; --details rows follow.
             if (case_filter is None or case == case_filter) and (group, item, case) not in out:
                 out[(group, item, case)] = float(row.group(2)) * UNIT_US[row.group(3)]
+                if workers is not None:
+                    workers[(group, item, case)] = row.group(4)
             continue
         header = GROUP_HEADER.match(line)
         if header and not line.startswith(("case ", "summary", "details", "benchmark", "purpose", "worker")):
@@ -300,10 +302,14 @@ def main() -> int:
         path = cache_path(root, sides[s][2], args.optimize, args.cpu, bench_args)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"created": time.time(), "cpu": args.cpu, "args": bench_args, "texts": runs}))
+    workers: dict[tuple[str, str, str, str], str] = {}
     for (t, c, s), runs in {**texts, **fresh}.items():
         for text in runs:
-            for (group, item, case_name), us in parse(text, cases[c]).items():
+            side_workers: dict[tuple[str, str, str], str] = {}
+            for (group, item, case_name), us in parse(text, cases[c], side_workers).items():
                 samples.setdefault((group, item, case_name, sides[s][0]), []).append(us)
+            for key, cell in side_workers.items():
+                workers[key + (sides[s][0],)] = cell
 
     keys = sorted({k[:3] for k in samples})
     names = [n for n, _, _ in sides]
@@ -341,6 +347,9 @@ def main() -> int:
             else:
                 verdict = "slower" if tlo > bhi else "faster" if thi < blo else "within spread"
             row += f" {delta:+7.1f}%  {verdict}"
+        if key[2] == "thread-adaptive-tuned-range":
+            # Workers used/available: 0/N means the tuner kept the stage inline (serial is production).
+            row += "  workers " + " ".join(f"{n}={workers.get(key + (n,), '-')}" for n in names)
         lines.append(row)
     summary = "\n".join(lines) + "\n"
     (out_dir / "summary.txt").write_text(summary)
