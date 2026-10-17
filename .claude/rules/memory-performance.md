@@ -6,6 +6,21 @@ paths:
 
 # Memory And Performance
 
+## Data-oriented design
+
+- Design data-first: name the data each hot loop reads and writes and the
+  order it reads it, store it as dense SoA columns in that order (§ Dense
+  SoA storage), and stream it in batches (§ SIMD and core math). Keys a
+  loop filters on (level, faction, kind) order the data ahead of position,
+  so it reads contiguous runs.
+- A hot loop pays no per-item indirection: no pointer or linked-list walk,
+  no read through an index permutation, no per-row lookup into another
+  store. A stage that needs another store's columns gathers them once into
+  packed scratch. Inherently indirect access is exempt: search frontiers,
+  pair streams, and hash point lookups.
+- A layout that fails either bullet fails the design and is fixed in the
+  layout.
+
 ## Hot paths
 
 - Performance is correctness on hot and frame-adjacent paths: fixed-step
@@ -91,11 +106,6 @@ paths:
   `clearRetainingCapacity`, and capacity helpers on the owning store.
 - Publish hot float columns as `[]f32`, never `[]align(64) f32`; MAL does not
   guarantee aligned column bases.
-- Order every sorted store and index by its hot queries' access pattern: the
-  keys a query filters on (level, faction, kind) come before position, so
-  each hot query reads its rows as long contiguous runs that fill lane blocks.
-  A layout that hands a hot query fragments fails the design and is fixed in
-  the layout, never with a separate short-run or fragment path.
 
 ```zig
 fn appendMalRow(

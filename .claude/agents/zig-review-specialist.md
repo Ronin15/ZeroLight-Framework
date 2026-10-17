@@ -68,10 +68,10 @@ model; routes to design) or **local**.
    changes and every inherited loop whose cost or thread placement it
    changes. A serial/inline path that does more work than the code it
    replaces is a finding.
-   **Contiguity**, every review: for each sorted store or index the change
-   adds or touches, name its hot queries and the keys each filters on, and
-   check its order against `memory-performance.md` § Dense SoA storage. A
-   failure is a High structural finding.
+   **Data layout**, every review: for each hot loop, store, or index the
+   change adds or touches, name the data it reads, the order it reads it,
+   and the keys it filters on, and check them against `memory-performance.md`
+   § Data-oriented design. A failure is a High structural finding.
    Is each claimed order measured by a scaling bench at three or more sizes
    (`.claude/rules/tests-benchmarks.md`), or marked derived? A flat-cost claim
    for a local change with no such bench is a finding.
