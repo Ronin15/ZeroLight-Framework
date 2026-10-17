@@ -75,7 +75,7 @@ Every design, and every fix touching storage or per-change work, states:
   part go with it and are never design references or correctness baselines.
   The redesign is then tuned within reason against the replaced code's
   timings, same mode: a gap the added correctness or rule compliance costs is
-  reported, a gap from overhead is tuned out.
+  reported, a gap from overhead is a regression (`tests-benchmarks.md`).
 - Default is keep: replace only the parts that fail the cost model; replacing
   a part that passes needs a concrete performance or efficiency benefit
   against its cost and risk.

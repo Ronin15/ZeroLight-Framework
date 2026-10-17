@@ -53,14 +53,11 @@ paths:
 - Bench only changes that can move a hot path, once, at the right-sized
   scales. Compare before/after on adjacent commits in Debug (ReleaseFast only
   per `build-validation.md`) with one run per side (`tools/bench_ab.py`); a
-  case more than 10% slower is rerun alone with 3 reps, and a regression is a
-  change beyond their run-to-run spread. When the change alters a bench's
-  fixture or input order, the base code also runs on the new fixture; the
-  like-for-like gap is the code's. Act on one only when it shows a worse growth
-  order or a material total; a nanosecond-per-item constant is reported, not
-  redesigned. A constant is material when it moves the stage's total beyond
-  the run-to-run spread at the bench's sizes; a few ns per item on a stage
-  dominated by other work is not. A threaded stage is judged on its
+  case more than 10% slower is rerun alone with 3 reps. When the change
+  alters a bench's fixture or input order, the base code also runs on the
+  new fixture; the like-for-like gap is the code's. A constant is material
+  when it moves the stage's total beyond the run-to-run spread at the
+  bench's sizes. A threaded stage is judged on its
   `thread-adaptive-tuned-range` case (the production tuner) against its base;
   the other cases are controls, and the tuned case matches or beats the best
   of them within spread. The tuned case's report says which path is
@@ -70,9 +67,10 @@ paths:
   scan or indirection), never for a constant gap.
 - A landing's before/after runs once, after its code is done. Each slower
   case gets one verdict: noise (within spread after 3 reps), planned cost
-  (work the design adds, named and reported), an immaterial constant
-  (reported), or a regression (material overhead or a worse growth order on
-  the path that is production), which is what gets optimized. A regression
+  (work the design or a SIMD shape adds, named and reported), a control's
+  gap (a path that is not production at that size; reported), or a
+  regression (material overhead or a worse growth order on the path that is
+  production), which is what gets optimized. A regression
   gets one attribution, one fix, and one re-measure of that case; if it is
   still slower, it is reported and becomes a checklist item in its owning
   slice.

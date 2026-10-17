@@ -27,11 +27,9 @@ Commands and options: `docs/development-workflow.md`.
   - It answers only that question and is never a baseline or a gate.
   - Modes compare only with themselves: Debug against Debug, ReleaseFast
     against ReleaseFast.
-  - It never excuses a Debug finding: a regression Debug shows is judged by
-    `engine-design.md` § Cost model (overhead is tuned out; the cost of rule
-    compliance or a SIMD shape is reported), never waved off because
-    ReleaseFast is faster. Debug at a size stands in for release at larger
-    sizes.
+  - It never excuses a Debug finding: a slower Debug case gets its verdict
+    per `tests-benchmarks.md`, never waved off because ReleaseFast is faster.
+    Debug at a size stands in for release at larger sizes.
   - The fix never reverts a SIMD-shaped loop to scalar
     (`memory-performance.md` § SIMD and core math).
 - Before a ReleaseFast release candidate, a multi-hour ReleaseSafe soak across
