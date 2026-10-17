@@ -10,9 +10,10 @@ paths:
 
 - Design data-first: name the data each hot loop reads and writes and the
   order it reads it, store it as dense SoA columns in that order (§ Dense
-  SoA storage), and stream it in batches (§ SIMD and core math). Keys a
-  loop filters on (level, faction, kind) order the data ahead of position,
-  so it reads contiguous runs.
+  SoA storage), and stream it in batches (§ SIMD and core math). Data is
+  grouped by its storage unit (the chunk `(level, cx, cy)`); within it,
+  keys a loop filters on (faction, kind) order the data ahead of position,
+  so a filtered loop reads contiguous runs it streams whole in SIMD lanes.
 - A hot loop pays no per-item indirection: no pointer or linked-list walk,
   no read through an index permutation, no per-row lookup into another
   store. A stage that needs another store's columns gathers them once into
@@ -136,6 +137,9 @@ fn appendMalRow(
 - Judge per-agent and per-neighbor loops at target scale, never as "low count".
 - Vectorize a gather-bound or branchy hot per-agent loop by gathering into
   packed local SoA scratch and masking branches with `select`.
+- A SIMD loop's results stay in lanes through their consumer (vectors plus
+  a pass mask); draining them into per-item scalar calls or branches works
+  around the SIMD and fails the loop's shape.
 - Leave scalar only irreducible loops (A*/BFS frontier, compaction, rare
   setup), stating why.
 - SIMD or scalar is decided by the loop's shape (above), never by Debug
