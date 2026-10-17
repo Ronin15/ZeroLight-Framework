@@ -35,6 +35,12 @@ paths:
   only when std has no API for the job or a bench shows it beats std on a hot
   path; state that reason at the site. Code that duplicates std without that
   reason is replaced with the std version as soon as it is found.
+- Sorts on a production path use `src/core/sort.zig` (`pdq`, `insertion`):
+  std's sorts swap through `std.mem.swap`, a per-byte loop (measured). Where a
+  stable `std.mem.sort` has a comparator that is a total order, it moves to
+  `pdq`; where ties are possible, it keeps `std.mem.sort`, or uses `insertion`
+  when the input is small and bounded. Test, bench, and cold one-off sorts keep
+  std.
 - Current spellings (`idiom-lint` enforces most):
   - `std.ArrayList` (unmanaged, `.empty`), never `std.ArrayListUnmanaged` or
     managed constructors.
