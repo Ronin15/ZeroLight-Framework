@@ -40,7 +40,7 @@ const suite = @import("suite.zig");
 pub const group = suite.BenchmarkGroup{
     .name = "thread-dispatch",
     .item_label = "items",
-    .defaultItemCounts = itemCounts,
+    .item_counts = &item_counts,
     .runCase = runCase,
     .write_workload = writeWorkload,
 };
@@ -48,10 +48,6 @@ pub const group = suite.BenchmarkGroup{
 const Item = u32;
 const range_alignment_items = thread_shared_record_alignment / @sizeOf(Item);
 const item_counts = [_]usize{ 64, 1_024, 16_384, 262_144 };
-
-fn itemCounts(_: suite.Profile) []const usize {
-    return &item_counts;
-}
 
 const DispatchContext = struct {
     items: []Item,

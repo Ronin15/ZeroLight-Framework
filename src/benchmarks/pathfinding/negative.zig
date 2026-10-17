@@ -44,7 +44,7 @@ const pocketDigCell = @import("nav_fixtures.zig").pocketDigCell;
 pub const negative_steady_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-steady",
     .item_label = "unreachable path requests per step",
-    .defaultItemCounts = negativeSteadyItemCounts,
+    .item_counts = &negative_steady_item_counts,
     .runCase = runNegativeSteadyCase,
     .write_workload = writeUnavailableWorkload,
 };
@@ -59,7 +59,7 @@ pub const negative_steady_group = suite.BenchmarkGroup{
 pub const negative_dig_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-dig",
     .item_label = NegativeDigCode.label,
-    .defaultItemCounts = negativeDigItemCounts,
+    .item_counts = &negative_dig_item_counts,
     .runCase = runNegativeDigCase,
     .write_workload = writeUnavailableWorkload,
 };
@@ -78,7 +78,7 @@ pub const negative_dig_group = suite.BenchmarkGroup{
 pub const negative_burst_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-burst",
     .item_label = BurstCode.label,
-    .defaultItemCounts = negativeBurstItemCounts,
+    .item_counts = &negative_burst_item_counts,
     .runCase = runNegativeBurstCase,
     .write_workload = writeBurstWorkload,
 };
@@ -105,14 +105,6 @@ const negative_dig_item_counts = [_]usize{
     NegativeDigCode.of(.{ .level_side = 2048, .requests = 64 }),
 };
 
-fn negativeSteadyItemCounts(_: suite.Profile) []const usize {
-    return &negative_steady_item_counts;
-}
-
-fn negativeDigItemCounts(_: suite.Profile) []const usize {
-    return &negative_dig_item_counts;
-}
-
 const negative_burst_item_counts = [_]usize{
     BurstCode.of(.{ .variant = .open_goals, .requests = 1024 }),
     BurstCode.of(.{ .variant = .open_goals, .requests = 4096 }),
@@ -121,10 +113,6 @@ const negative_burst_item_counts = [_]usize{
     BurstCode.of(.{ .variant = .blocked_crowd, .requests = 4096 }),
     BurstCode.of(.{ .variant = .blocked_crowd, .requests = 12288 }),
 };
-
-fn negativeBurstItemCounts(_: suite.Profile) []const usize {
-    return &negative_burst_item_counts;
-}
 
 fn writeUnavailableWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("unavailable={}", .{stats.output_count});

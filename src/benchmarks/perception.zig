@@ -55,7 +55,7 @@ const suite = @import("suite.zig");
 pub const group = suite.BenchmarkGroup{
     .name = "perception",
     .item_label = "perception agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = writePerceptionWorkload,
 };
@@ -63,7 +63,7 @@ pub const group = suite.BenchmarkGroup{
 pub const los_dense_group = suite.BenchmarkGroup{
     .name = "perception-los-dense",
     .item_label = "perception agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runLosDenseCase,
     .write_workload = writePerceptionWorkload,
 };
@@ -71,7 +71,7 @@ pub const los_dense_group = suite.BenchmarkGroup{
 pub const scattered_dense_index_group = suite.BenchmarkGroup{
     .name = "perception-scattered-dense-index",
     .item_label = "perception agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runScatteredDenseIndexCase,
     .write_workload = writePerceptionWorkload,
 };
@@ -79,7 +79,7 @@ pub const scattered_dense_index_group = suite.BenchmarkGroup{
 pub const cell_ordered_group = suite.BenchmarkGroup{
     .name = "perception-cell-ordered",
     .item_label = "perception agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCellOrderedCase,
     .write_workload = writePerceptionWorkload,
 };
@@ -87,14 +87,10 @@ pub const cell_ordered_group = suite.BenchmarkGroup{
 pub const crowd_group = suite.BenchmarkGroup{
     .name = "perception-crowd",
     .item_label = CrowdCode.label,
-    .defaultItemCounts = crowdItemCounts,
+    .item_counts = &crowd_item_counts,
     .runCase = runCrowdCase,
     .write_workload = writeCrowdWorkload,
 };
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
 
 const CrowdVariant = enum(u8) { allies, levels };
 // `axis` is the allies per observer (`allies`) or the level count (`levels`).
@@ -108,10 +104,6 @@ const crowd_item_counts = [_]usize{
     CrowdCode.of(.{ .variant = .levels, .axis = 8 }),
     CrowdCode.of(.{ .variant = .levels, .axis = 32 }),
 };
-
-fn crowdItemCounts(_: suite.Profile) []const usize {
-    return &crowd_item_counts;
-}
 
 // Observers on a square grid of clusters. The pitch keeps every other cluster's members
 // past the observer's vision range.

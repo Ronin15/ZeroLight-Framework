@@ -64,20 +64,18 @@ fn cognitionHaloRegion() ActiveRegion {
 pub const cognition_group = suite.BenchmarkGroup{
     .name = "scope-cognition",
     .item_label = CognitionCode.label,
-    .defaultItemCounts = cognitionItemCounts,
+    .item_counts = &cognition_item_counts,
     .runCase = runCognitionCase,
     .write_workload = writeCognitionWorkload,
 };
-
-fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
 
 // `spread` banded over the x-chunks; `dense_chunk` puts every agent in chunk (0, 0).
 const CognitionLayout = enum(u8) { spread, dense_chunk };
 const CognitionCode = suite.ItemCode(struct { layout: CognitionLayout, agents: u32 }, &.{6});
 
 // Each layout at the event-scale sizes.
+const cognition_item_counts = cognitionCodes(&suite.event_scale_counts);
+
 fn cognitionCodes(comptime counts: []const usize) [2 * counts.len]usize {
     var codes: [2 * counts.len]usize = undefined;
     for (counts, 0..) |count, index| {
@@ -85,15 +83,6 @@ fn cognitionCodes(comptime counts: []const usize) [2 * counts.len]usize {
         codes[counts.len + index] = CognitionCode.of(.{ .layout = .dense_chunk, .agents = count });
     }
     return codes;
-}
-
-fn cognitionItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        inline else => |comptime_profile| blk: {
-            const codes = comptime cognitionCodes(suite.eventScaleCounts(comptime_profile));
-            break :blk &codes;
-        },
-    };
 }
 
 // `count` AI agents spread over the 16 x-chunks, rows stepping in y, each tiered by its chunk
@@ -192,7 +181,7 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     }
     const settled_before_measurement = if (case.adaptive) scope.cognition_tuner.isSettled() else false;
 
-    const counts = defaultItemCounts(options.profile);
+    const counts = &suite.event_scale_counts;
     // `dense_chunk` runs inline where its tuner measures that cheaper.
     const expect_off_main = fields.layout == .spread and case.adaptive and case.adaptive_range_mode == .tuned and fields.agents == counts[counts.len - 1];
     var accumulator = suite.StatsAccumulator.init(item_count);

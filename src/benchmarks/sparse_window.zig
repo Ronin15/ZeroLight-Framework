@@ -65,7 +65,7 @@ const sparse_tile_counts = [_]usize{ 1_000, 16_000, 256_000 };
 pub const frame_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-frame",
     .item_label = "sparse tiles in the world",
-    .defaultItemCounts = sparseTileCounts,
+    .item_counts = &sparse_tile_counts,
     .runCase = runFrameCase,
     .write_workload = writeSparseWorkload,
     .cases = &suite.serial_cases,
@@ -74,7 +74,7 @@ pub const frame_group = suite.BenchmarkGroup{
 pub const pan_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-pan",
     .item_label = "sparse tiles in the world",
-    .defaultItemCounts = sparseTileCounts,
+    .item_counts = &sparse_tile_counts,
     .runCase = runPanCase,
     .write_workload = writeSparseWorkload,
     .cases = &suite.serial_cases,
@@ -83,15 +83,11 @@ pub const pan_group = suite.BenchmarkGroup{
 pub const add_group = suite.BenchmarkGroup{
     .name = "render-sparse-window-add",
     .item_label = "sparse tiles in the world",
-    .defaultItemCounts = sparseTileCounts,
+    .item_counts = &sparse_tile_counts,
     .runCase = runAddCase,
     .write_workload = writeSparseWorkload,
     .cases = &suite.serial_cases,
 };
-
-fn sparseTileCounts(_: suite.Profile) []const usize {
-    return &sparse_tile_counts;
-}
 
 const Workload = enum { frame, pan, add };
 

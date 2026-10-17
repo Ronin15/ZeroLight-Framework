@@ -72,7 +72,7 @@ const default_fixture_config = FixtureConfig{};
 pub const offview_group = suite.BenchmarkGroup{
     .name = "render-game-prep-offview",
     .item_label = "off-view render rows",
-    .defaultItemCounts = offviewItemCounts,
+    .item_counts = &offview_item_counts,
     .runCase = runOffviewCase,
     .write_workload = writeOffviewWorkload,
     // Collect runs on the main thread: the serial case is its only path.
@@ -82,7 +82,7 @@ pub const offview_group = suite.BenchmarkGroup{
 pub const group = suite.BenchmarkGroup{
     .name = "render-game-prep",
     .item_label = "render entities",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = writeRenderGamePrepWorkload,
 };
@@ -90,14 +90,10 @@ pub const group = suite.BenchmarkGroup{
 pub const dense_deep_group = suite.BenchmarkGroup{
     .name = "render-game-prep-dense-deep",
     .item_label = "render entities",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runDenseDeepCase,
     .write_workload = writeRenderGamePrepWorkload,
 };
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
 
 const Fixture = struct {
     data: DataSystem,
@@ -716,10 +712,6 @@ const offview_particles: usize = 64;
 const offview_body_size: f32 = 14;
 
 const offview_item_counts = [_]usize{ 4_096, 32_768, 262_144 };
-
-fn offviewItemCounts(_: suite.Profile) []const usize {
-    return &offview_item_counts;
-}
 
 const OffviewFixture = struct {
     data: DataSystem,

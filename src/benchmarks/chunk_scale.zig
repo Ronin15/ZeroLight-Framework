@@ -227,7 +227,7 @@ const dig_window_chunks: u16 = 8;
 pub const dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-dig",
     .item_label = ScaleCode.label,
-    .defaultItemCounts = scaleItemCounts,
+    .item_counts = &scale_item_counts,
     .runCase = runDigCase,
     .write_workload = writeCellsWorkload,
     .cases = &suite.serial_cases,
@@ -236,7 +236,7 @@ pub const dig_group = suite.BenchmarkGroup{
 pub const ramp_group = suite.BenchmarkGroup{
     .name = "chunk-scale-ramp",
     .item_label = ScaleCode.label,
-    .defaultItemCounts = scaleItemCounts,
+    .item_counts = &scale_item_counts,
     .runCase = runRampCase,
     .write_workload = writeCellsWorkload,
     .cases = &suite.serial_cases,
@@ -245,7 +245,7 @@ pub const ramp_group = suite.BenchmarkGroup{
 pub const cave_in_group = suite.BenchmarkGroup{
     .name = "chunk-scale-cave-in",
     .item_label = RegionCode.label,
-    .defaultItemCounts = regionItemCounts,
+    .item_counts = &region_item_counts,
     .runCase = runCaveInCase,
     .write_workload = writeBatchWorkload,
     .fixed_range_shape = edit_fixed_range_shape,
@@ -254,7 +254,7 @@ pub const cave_in_group = suite.BenchmarkGroup{
 pub const explosion_fill_group = suite.BenchmarkGroup{
     .name = "chunk-scale-explosion-fill",
     .item_label = RegionCode.label,
-    .defaultItemCounts = explosionItemCounts,
+    .item_counts = &explosion_item_counts,
     .runCase = runExplosionFillCase,
     .write_workload = writeBatchWorkload,
     .fixed_range_shape = edit_fixed_range_shape,
@@ -263,7 +263,7 @@ pub const explosion_fill_group = suite.BenchmarkGroup{
 pub const gpu_sync_dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-gpu-sync-dig",
     .item_label = GpuSyncDigCode.label,
-    .defaultItemCounts = gpuSyncDigItemCounts,
+    .item_counts = &gpu_sync_dig_item_counts,
     .runCase = runGpuSyncDigCase,
     .write_workload = writeUploadsWorkload,
     .cases = &suite.serial_cases,
@@ -272,7 +272,7 @@ pub const gpu_sync_dig_group = suite.BenchmarkGroup{
 pub const gpu_sync_level_enter_group = suite.BenchmarkGroup{
     .name = "chunk-scale-gpu-sync-level-enter",
     .item_label = WindowCode.label,
-    .defaultItemCounts = levelEnterItemCounts,
+    .item_counts = &level_enter_item_counts,
     .runCase = runGpuSyncLevelEnterCase,
     .write_workload = writeUploadsWorkload,
     .cases = &suite.serial_cases,
@@ -281,7 +281,7 @@ pub const gpu_sync_level_enter_group = suite.BenchmarkGroup{
 pub const gpu_sync_pan_group = suite.BenchmarkGroup{
     .name = "chunk-scale-gpu-sync-pan",
     .item_label = WindowCode.label,
-    .defaultItemCounts = panItemCounts,
+    .item_counts = &pan_item_counts,
     .runCase = runGpuSyncPanCase,
     .write_workload = writeUploadsWorkload,
     .cases = &suite.serial_cases,
@@ -290,7 +290,7 @@ pub const gpu_sync_pan_group = suite.BenchmarkGroup{
 pub const nav_dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-dig",
     .item_label = ScaleCode.label,
-    .defaultItemCounts = scaleItemCounts,
+    .item_counts = &scale_item_counts,
     .runCase = runNavDigCase,
     .write_workload = writeNavCellsWorkload,
 };
@@ -298,7 +298,7 @@ pub const nav_dig_group = suite.BenchmarkGroup{
 pub const nav_ramp_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-ramp",
     .item_label = ScaleCode.label,
-    .defaultItemCounts = scaleItemCounts,
+    .item_counts = &scale_item_counts,
     .runCase = runNavRampCase,
     .write_workload = writeNavCellsWorkload,
 };
@@ -306,7 +306,7 @@ pub const nav_ramp_group = suite.BenchmarkGroup{
 pub const nav_cave_in_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-cave-in",
     .item_label = RegionCode.label,
-    .defaultItemCounts = regionItemCounts,
+    .item_counts = &region_item_counts,
     .runCase = runNavCaveInCase,
     .write_workload = writeNavBatchWorkload,
 };
@@ -314,7 +314,7 @@ pub const nav_cave_in_group = suite.BenchmarkGroup{
 pub const nav_explosion_fill_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-explosion-fill",
     .item_label = RegionCode.label,
-    .defaultItemCounts = regionItemCounts,
+    .item_counts = &region_item_counts,
     .runCase = runNavExplosionFillCase,
     .write_workload = writeNavBatchWorkload,
 };
@@ -322,7 +322,7 @@ pub const nav_explosion_fill_group = suite.BenchmarkGroup{
 pub const nav_enclose_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-enclose",
     .item_label = EncloseCode.label,
-    .defaultItemCounts = encloseItemCounts,
+    .item_counts = &enclose_item_counts,
     .runCase = runNavEncloseCase,
     .write_workload = writeNavBatchWorkload,
 };
@@ -330,7 +330,7 @@ pub const nav_enclose_group = suite.BenchmarkGroup{
 pub const nav_level_add_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-level-add",
     .item_label = LevelAddCode.label,
-    .defaultItemCounts = levelAddItemCounts,
+    .item_counts = &level_add_item_counts,
     .runCase = runNavLevelAddCase,
     .write_workload = writeLevelAddWorkload,
 };
@@ -408,34 +408,6 @@ const enclose_item_counts = [_]usize{
     EncloseCode.of(.{ .variant = .tunnel, .count = 32, .level_side = 1024, .levels = 1 }),
     EncloseCode.of(.{ .variant = .tunnel, .count = 62, .level_side = 1024, .levels = 1 }),
 };
-
-fn encloseItemCounts(_: suite.Profile) []const usize {
-    return &enclose_item_counts;
-}
-
-fn levelAddItemCounts(_: suite.Profile) []const usize {
-    return &level_add_item_counts;
-}
-
-fn scaleItemCounts(_: suite.Profile) []const usize {
-    return &scale_item_counts;
-}
-
-fn regionItemCounts(_: suite.Profile) []const usize {
-    return &region_item_counts;
-}
-
-fn explosionItemCounts(_: suite.Profile) []const usize {
-    return &explosion_item_counts;
-}
-
-fn panItemCounts(_: suite.Profile) []const usize {
-    return &pan_item_counts;
-}
-
-fn levelEnterItemCounts(_: suite.Profile) []const usize {
-    return &level_enter_item_counts;
-}
 
 const Workload = enum { dig, ramp, gpu_sync_dig, gpu_sync_level_enter, gpu_sync_pan };
 
@@ -573,10 +545,6 @@ const gpu_sync_dig_item_counts = blk: {
     }
     break :blk counts;
 };
-
-fn gpuSyncDigItemCounts(_: suite.Profile) []const usize {
-    return &gpu_sync_dig_item_counts;
-}
 
 const Fixture = struct {
     world: WorldSystem,

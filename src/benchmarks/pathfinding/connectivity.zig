@@ -51,7 +51,7 @@ const toggleSizeConfig = @import("nav_fixtures.zig").toggleSizeConfig;
 pub const connectivity_split_group = suite.BenchmarkGroup{
     .name = "pathfinding-connectivity-split",
     .item_label = SplitCode.label,
-    .defaultItemCounts = connectivitySplitItemCounts,
+    .item_counts = &connectivity_split_item_counts,
     .runCase = runConnectivitySplitCase,
     .write_workload = writeSplitWorkload,
 };
@@ -89,7 +89,7 @@ pub const connectivity_split_group = suite.BenchmarkGroup{
 pub const connectivity_oneway_group = suite.BenchmarkGroup{
     .name = "pathfinding-connectivity-oneway",
     .item_label = OnewayCode.label,
-    .defaultItemCounts = connectivityOnewayItemCounts,
+    .item_counts = &connectivity_oneway_item_counts,
     .runCase = runConnectivityOnewayCase,
     .write_workload = writeOnewayWorkload,
 };
@@ -118,10 +118,6 @@ const connectivity_split_item_counts = [_]usize{
     splitItemCode(.tunnel, 8, 256),
     splitItemCode(.tunnel, 8, 2048),
 };
-
-fn connectivitySplitItemCounts(_: suite.Profile) []const usize {
-    return &connectivity_split_item_counts;
-}
 
 fn onewayItemCode(comptime variant: OnewayVariant, comptime terminals: usize, comptime systems: usize) usize {
     return OnewayCode.of(.{ .variant = variant, .terminals_per_system = terminals, .systems = systems });
@@ -153,10 +149,6 @@ const connectivity_oneway_item_counts = [_]usize{
     onewayItemCode(.ballast, 8, 512),
     onewayItemCode(.ballast, 8, 2048),
 };
-
-fn connectivityOnewayItemCounts(_: suite.Profile) []const usize {
-    return &connectivity_oneway_item_counts;
-}
 
 fn writeSplitWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("cells={} structure_chunks={}", .{ stats.output_count, stats.candidate_pairs });

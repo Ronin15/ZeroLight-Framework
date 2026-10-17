@@ -63,7 +63,7 @@ const PlanarRoute = @import("nav_fixtures.zig").PlanarRoute;
 pub const group = suite.BenchmarkGroup{
     .name = "pathfinding",
     .item_label = "path requests",
-    .defaultItemCounts = coldSolveItemCounts,
+    .item_counts = &cold_solve_counts,
     .runCase = runCase,
     .write_workload = writeSolveWorkload,
 };
@@ -74,7 +74,7 @@ pub const group = suite.BenchmarkGroup{
 pub const dedup_group = suite.BenchmarkGroup{
     .name = "pathfinding-shared-goal",
     .item_label = "path requests to one goal",
-    .defaultItemCounts = sharedGoalItemCounts,
+    .item_counts = &shared_goal_counts,
     .runCase = runDedupCase,
     .write_workload = writeDedupWorkload,
 };
@@ -85,7 +85,7 @@ pub const dedup_group = suite.BenchmarkGroup{
 pub const drain_group = suite.BenchmarkGroup{
     .name = "pathfinding-drain",
     .item_label = "queued path requests",
-    .defaultItemCounts = drainItemCounts,
+    .item_counts = &drain_counts,
     .runCase = runDrainCase,
     .write_workload = writeSolveWorkload,
 };
@@ -95,7 +95,7 @@ pub const drain_group = suite.BenchmarkGroup{
 pub const fallback_group = suite.BenchmarkGroup{
     .name = "pathfinding-cache-open",
     .item_label = "cached path requests",
-    .defaultItemCounts = fallbackDefaultItemCounts,
+    .item_counts = &fallback_counts,
     .runCase = runFallbackCase,
     .write_workload = writeCacheWorkload,
 };
@@ -104,7 +104,7 @@ pub const fallback_group = suite.BenchmarkGroup{
 pub const fallback_detour_group = suite.BenchmarkGroup{
     .name = "pathfinding-cache-detour",
     .item_label = "cached detour path requests",
-    .defaultItemCounts = fallbackDefaultItemCounts,
+    .item_counts = &fallback_counts,
     .runCase = runFallbackDetourCase,
     .write_workload = writeCacheWorkload,
 };
@@ -114,7 +114,7 @@ pub const fallback_detour_group = suite.BenchmarkGroup{
 pub const hard_fallback_group = suite.BenchmarkGroup{
     .name = "pathfinding-hard-fallback",
     .item_label = "hard fallback path requests",
-    .defaultItemCounts = fallbackDefaultItemCounts,
+    .item_counts = &fallback_counts,
     .runCase = runHardFallbackCase,
     .write_workload = writeFallbackWorkload,
 };
@@ -125,7 +125,7 @@ pub const hard_fallback_group = suite.BenchmarkGroup{
 pub const hard_fallback_budget_group = suite.BenchmarkGroup{
     .name = "pathfinding-hard-fallback-budget",
     .item_label = "hard fallback path requests",
-    .defaultItemCounts = fallbackDefaultItemCounts,
+    .item_counts = &fallback_counts,
     .runCase = runHardFallbackBudgetCase,
     .write_workload = writeFallbackWorkload,
 };
@@ -139,7 +139,7 @@ pub const hard_fallback_budget_group = suite.BenchmarkGroup{
 pub const escalated_detour_group = suite.BenchmarkGroup{
     .name = "pathfinding-escalated-detour",
     .item_label = "level side (cells)",
-    .defaultItemCounts = escalatedDetourItemCounts,
+    .item_counts = &escalated_detour_counts,
     .runCase = runEscalatedDetourCase,
     .write_workload = writeSolveWorkload,
 };
@@ -151,7 +151,7 @@ pub const escalated_detour_group = suite.BenchmarkGroup{
 pub const group_field_detour_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-detour",
     .item_label = "pack agents",
-    .defaultItemCounts = groupFieldDetourItemCounts,
+    .item_counts = &group_field_detour_counts,
     .runCase = runGroupFieldDetourCase,
     .write_workload = writeFieldSampleWorkload,
 };
@@ -163,7 +163,7 @@ pub const group_field_detour_group = suite.BenchmarkGroup{
 pub const group_field_detour_moving_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-detour-moving",
     .item_label = "pack agents",
-    .defaultItemCounts = groupFieldDetourItemCounts,
+    .item_counts = &group_field_detour_counts,
     .runCase = runGroupFieldDetourMovingCase,
     .write_workload = writeFieldMovingWorkload,
 };
@@ -175,7 +175,7 @@ pub const group_field_detour_moving_group = suite.BenchmarkGroup{
 pub const group_field_detour_moving_hysteresis_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-detour-moving-hysteresis",
     .item_label = "pack agents",
-    .defaultItemCounts = groupFieldDetourItemCounts,
+    .item_counts = &group_field_detour_counts,
     .runCase = runGroupFieldDetourMovingHysteresisCase,
     .write_workload = writeFieldMovingWorkload,
 };
@@ -188,7 +188,7 @@ pub const group_field_detour_moving_hysteresis_group = suite.BenchmarkGroup{
 pub const group_field_packs_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-packs",
     .item_label = "packs",
-    .defaultItemCounts = groupFieldPacksItemCounts,
+    .item_counts = &group_field_packs_item_counts,
     .runCase = runGroupFieldPacksCase,
     .write_workload = writePacksWorkload,
 };
@@ -200,7 +200,7 @@ pub const group_field_packs_group = suite.BenchmarkGroup{
 pub const group_field_tunnel_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-tunnel",
     .item_label = "field cell cap",
-    .defaultItemCounts = groupFieldTunnelItemCounts,
+    .item_counts = &group_field_tunnel_item_counts,
     .runCase = runGroupFieldTunnelCase,
     .write_workload = writeTunnelWorkload,
 };
@@ -211,103 +211,25 @@ pub const group_field_tunnel_group = suite.BenchmarkGroup{
 pub const query_group = suite.BenchmarkGroup{
     .name = "pathfinding-query",
     .item_label = "querying agents",
-    .defaultItemCounts = queryDefaultItemCounts,
+    .item_counts = &query_counts,
     .runCase = runQueryCase,
     .write_workload = writeQueryWorkload,
 };
 
 // Cold solve counts: three below the per-step solve ceiling, the ceiling, and three past it,
 // so both regimes show their shape.
-const cold_solve_quick_counts = [_]usize{ 128, 256, 384, 512, 1024, 2048, 4096 };
-const cold_solve_standard_counts = [_]usize{ 128, 256, 384, 512, 1024, 4096, 8192 };
-const cold_solve_stress_counts = [_]usize{ 128, 256, 384, 512, 2048, 4096, 8192 };
-const shared_goal_quick_counts = [_]usize{ 128, 512, 2048 };
-const shared_goal_standard_counts = [_]usize{ 512, 2048, 8192 };
-const shared_goal_stress_counts = [_]usize{ 2048, 8192, 32768 };
+const cold_solve_counts = [_]usize{ 128, 256, 384, 512, 1024, 2048, 4096 };
+const shared_goal_counts = [_]usize{ 128, 512, 2048 };
 // Queue depths past the ceiling, so every drain step solves a full ceiling.
-const drain_quick_counts = [_]usize{ 1024, 2048, 4096 };
-const drain_standard_counts = [_]usize{ 1024, 4096, 16384 };
-const drain_stress_counts = [_]usize{ 2048, 8192, 16384 };
-const fallback_quick_counts = [_]usize{ 16, 64, 128 };
-const fallback_standard_counts = [_]usize{ 64, 128, 256, 1024 };
-const fallback_stress_counts = [_]usize{ 256, 512, 1024 };
-const query_quick_counts = [_]usize{ 256, 1024, 4096 };
-const query_standard_counts = [_]usize{ 1024, 4096, 16384 };
-const query_stress_counts = [_]usize{ 2048, 8192, 16384 };
+const drain_counts = [_]usize{ 1024, 2048, 4096 };
+const fallback_counts = [_]usize{ 16, 64, 128 };
+const query_counts = [_]usize{ 256, 1024, 4096 };
 // Level sides, in whole chunks, up to the largest whose detour the fixed tier-1 budget solves.
-const escalated_detour_quick_counts = [_]usize{ 64, 128, 256 };
-const escalated_detour_standard_counts = [_]usize{ 128, 256, 512 };
-const escalated_detour_stress_counts = [_]usize{ 128, 256, 512 };
+const escalated_detour_counts = [_]usize{ 64, 128, 256 };
 // Pack sizes.
-const group_field_detour_quick_counts = [_]usize{ 16, 64, 256 };
-const group_field_detour_standard_counts = [_]usize{ 16, 64, 256 };
-const group_field_detour_stress_counts = [_]usize{ 64, 256, 1024 };
+const group_field_detour_counts = [_]usize{ 16, 64, 256 };
 const group_field_packs_item_counts = [_]usize{ 1, 4, 16 };
 const group_field_tunnel_item_counts = [_]usize{ 2048, 16384, 65536 };
-
-fn coldSolveItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &cold_solve_quick_counts,
-        .standard => &cold_solve_standard_counts,
-        .stress => &cold_solve_stress_counts,
-    };
-}
-
-fn sharedGoalItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &shared_goal_quick_counts,
-        .standard => &shared_goal_standard_counts,
-        .stress => &shared_goal_stress_counts,
-    };
-}
-
-fn drainItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &drain_quick_counts,
-        .standard => &drain_standard_counts,
-        .stress => &drain_stress_counts,
-    };
-}
-
-fn fallbackDefaultItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &fallback_quick_counts,
-        .standard => &fallback_standard_counts,
-        .stress => &fallback_stress_counts,
-    };
-}
-
-fn queryDefaultItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &query_quick_counts,
-        .standard => &query_standard_counts,
-        .stress => &query_stress_counts,
-    };
-}
-
-fn escalatedDetourItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &escalated_detour_quick_counts,
-        .standard => &escalated_detour_standard_counts,
-        .stress => &escalated_detour_stress_counts,
-    };
-}
-
-fn groupFieldDetourItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &group_field_detour_quick_counts,
-        .standard => &group_field_detour_standard_counts,
-        .stress => &group_field_detour_stress_counts,
-    };
-}
-
-fn groupFieldPacksItemCounts(_: suite.Profile) []const usize {
-    return &group_field_packs_item_counts;
-}
-
-fn groupFieldTunnelItemCounts(_: suite.Profile) []const usize {
-    return &group_field_tunnel_item_counts;
-}
 
 fn writeSolveWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("solves={} results={} deferred={}", .{ stats.candidate_pairs, stats.output_count, stats.deferred_count });

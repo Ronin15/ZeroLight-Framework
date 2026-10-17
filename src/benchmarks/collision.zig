@@ -12,8 +12,9 @@
 //! levels. Asserts check the contact count (the grid's analytic same-level overlap count),
 //! the entries (at most one per strip a body spans), and the sweep's visits per entry
 //! against the grid's bound: the entries of one strip in the columns a body's width reaches,
-//! flat in column height, row width, and level count. `collision` and `collision-sparse`: no
-//! pass shape asserted.
+//! flat in column height, row width, and level count. `collision` and `collision-sparse`:
+//! time linear in bodies; asserts check the analytic contact count (the 512-wide grid's
+//! neighbour pairs; one pair per group of 20 sparse bodies).
 //!
 //! The static groups hold the item count of one-tile statics on a two-tile pitch, so the
 //! world grows with the static count, plus a fixed 2,048 dynamic bodies, half of them
@@ -63,7 +64,7 @@ const suite = @import("suite.zig");
 pub const group = suite.BenchmarkGroup{
     .name = "collision",
     .item_label = "collision bodies",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = writeCollisionWorkload,
 };
@@ -71,7 +72,7 @@ pub const group = suite.BenchmarkGroup{
 pub const sparse_group = suite.BenchmarkGroup{
     .name = "collision-sparse",
     .item_label = "collision bodies",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runSparseCase,
     .write_workload = writeCollisionWorkload,
 };
@@ -79,7 +80,7 @@ pub const sparse_group = suite.BenchmarkGroup{
 pub const tall_group = suite.BenchmarkGroup{
     .name = "collision-tall",
     .item_label = ShapeCode.label,
-    .defaultItemCounts = tallItemCounts,
+    .item_counts = &tall_item_counts,
     .runCase = runShapeCase,
     .write_workload = writeCollisionWorkload,
 };
@@ -87,7 +88,7 @@ pub const tall_group = suite.BenchmarkGroup{
 pub const stacked_group = suite.BenchmarkGroup{
     .name = "collision-stacked",
     .item_label = ShapeCode.label,
-    .defaultItemCounts = stackedItemCounts,
+    .item_counts = &stacked_item_counts,
     .runCase = runShapeCase,
     .write_workload = writeCollisionWorkload,
 };
@@ -95,7 +96,7 @@ pub const stacked_group = suite.BenchmarkGroup{
 pub const thin_group = suite.BenchmarkGroup{
     .name = "collision-thin",
     .item_label = ShapeCode.label,
-    .defaultItemCounts = thinItemCounts,
+    .item_counts = &thin_item_counts,
     .runCase = runShapeCase,
     .write_workload = writeCollisionWorkload,
 };
@@ -103,7 +104,7 @@ pub const thin_group = suite.BenchmarkGroup{
 pub const static_heavy_sap_group = suite.BenchmarkGroup{
     .name = "collision-static-heavy-sap",
     .item_label = "static bodies",
-    .defaultItemCounts = staticItemCounts,
+    .item_counts = &static_item_counts,
     .runCase = runStaticHeavySapCase,
     .write_workload = writeStaticWorkload,
 };
@@ -111,7 +112,7 @@ pub const static_heavy_sap_group = suite.BenchmarkGroup{
 pub const static_heavy_group = suite.BenchmarkGroup{
     .name = "collision-static-heavy",
     .item_label = "static bodies",
-    .defaultItemCounts = staticItemCounts,
+    .item_counts = &static_item_counts,
     .runCase = runStaticHeavyCase,
     .write_workload = writeStaticWorkload,
 };
@@ -119,7 +120,7 @@ pub const static_heavy_group = suite.BenchmarkGroup{
 pub const static_index_change_group = suite.BenchmarkGroup{
     .name = "collision-static-index-change",
     .item_label = "static bodies",
-    .defaultItemCounts = staticItemCounts,
+    .item_counts = &static_item_counts,
     .runCase = runStaticIndexChangeCase,
     .write_workload = writeStaticWorkload,
 };
@@ -160,22 +161,6 @@ const thin_item_counts = [_]usize{
     ShapeCode.of(.{ .variant = .thin, .axis = 16 }),
     ShapeCode.of(.{ .variant = .thin, .axis = 256 }),
 };
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
-
-fn tallItemCounts(_: suite.Profile) []const usize {
-    return &tall_item_counts;
-}
-
-fn stackedItemCounts(_: suite.Profile) []const usize {
-    return &stacked_item_counts;
-}
-
-fn thinItemCounts(_: suite.Profile) []const usize {
-    return &thin_item_counts;
-}
 
 // A grid of `columns` x `rows` dense bodies on each of `levels` levels, the same xy on
 // every level; levels are set only when `stamp_levels`.
@@ -298,7 +283,31 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     var data = try createFixtureWithMode(allocator, item_count, mode);
     defer data.deinit();
-    return measureCase(allocator, io, options, case, item_count, &data, null);
+    const stats = try measureCase(allocator, io, options, case, item_count, &data, null);
+    if (stats.iterations > 0 and stats.output_count != fixtureContacts(item_count, mode)) return error.CollisionContactCountMismatch;
+    return stats;
+}
+
+// Contacts of `count` bodies in `mode`: a dense body overlaps its row, column, and diagonal
+// neighbours in the 512-wide grid; a sparse group of 20 holds one overlapping pair.
+fn fixtureContacts(count: usize, mode: FixtureMode) usize {
+    const columns: usize = 512;
+    switch (mode) {
+        .sparse => return count / 20 + @intFromBool(count % 20 >= 2),
+        .dense => {
+            var contacts: usize = 0;
+            var row_start: usize = 0;
+            var above: usize = 0;
+            while (row_start < count) : (row_start += columns) {
+                const width: usize = @min(columns, count - row_start);
+                contacts += width - 1;
+                // Vertical pairs, then both diagonals against the full row above.
+                if (above != 0) contacts += width + (width - 1) + @min(width, above - 1);
+                above = width;
+            }
+            return contacts;
+        },
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -319,10 +328,6 @@ const free_slot_offset: f32 = tile_size + 12;
 const cluster_cells_side: usize = 32;
 
 const DynamicPlacement = enum { clustered, spread };
-
-fn staticItemCounts(_: suite.Profile) []const usize {
-    return &static_item_counts;
-}
 
 const StaticHeavyFixture = struct {
     data: DataSystem,

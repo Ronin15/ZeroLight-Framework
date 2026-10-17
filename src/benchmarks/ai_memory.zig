@@ -41,7 +41,7 @@ const suite = @import("suite.zig");
 pub const group = suite.BenchmarkGroup{
     .name = "ai-memory",
     .item_label = "AI agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = writeMemoryWorkload,
 };
@@ -49,7 +49,7 @@ pub const group = suite.BenchmarkGroup{
 pub const shuffled_group = suite.BenchmarkGroup{
     .name = "ai-memory-shuffled",
     .item_label = "AI agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runShuffledCase,
     .write_workload = writeMemoryWorkload,
 };
@@ -57,7 +57,7 @@ pub const shuffled_group = suite.BenchmarkGroup{
 pub const sparse_group = suite.BenchmarkGroup{
     .name = "ai-memory-sparse",
     .item_label = "memory rows",
-    .defaultItemCounts = sparseItemCounts,
+    .item_counts = &sparse_item_counts,
     .runCase = runSparseCase,
     .write_workload = writeMemoryWorkload,
 };
@@ -87,14 +87,6 @@ const Fixture = struct {
         self.* = undefined;
     }
 };
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
-
-fn sparseItemCounts(_: suite.Profile) []const usize {
-    return &sparse_item_counts;
-}
 
 fn perceivedEventCount(count: usize) usize {
     if (count == 0) return 0;

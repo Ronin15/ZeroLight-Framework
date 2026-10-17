@@ -80,7 +80,7 @@ const toggleSizeConfig = @import("nav_fixtures.zig").toggleSizeConfig;
 pub const level_size_group = suite.BenchmarkGroup{
     .name = "pathfinding-level-size",
     .item_label = LevelCode.label,
-    .defaultItemCounts = levelSizeItemCounts,
+    .item_counts = &level_size_item_counts,
     .runCase = runLevelSizeCase,
     .write_workload = writeRouteWorkload,
 };
@@ -88,7 +88,7 @@ pub const level_size_group = suite.BenchmarkGroup{
 pub const cross_level_depth_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-depth",
     .item_label = CrossLevelCode.label,
-    .defaultItemCounts = crossLevelItemCounts,
+    .item_counts = &cross_level_item_counts,
     .runCase = runCrossLevelDepthCase,
     .write_workload = writeRouteWorkload,
 };
@@ -96,7 +96,7 @@ pub const cross_level_depth_group = suite.BenchmarkGroup{
 pub const cross_level_teleport_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-teleport",
     .item_label = CrossLevelCode.label,
-    .defaultItemCounts = teleportItemCounts,
+    .item_counts = &teleport_item_counts,
     .runCase = runCrossLevelTeleportCase,
     .write_workload = writeRouteWorkload,
 };
@@ -104,7 +104,7 @@ pub const cross_level_teleport_group = suite.BenchmarkGroup{
 pub const cross_level_shaft_group = suite.BenchmarkGroup{
     .name = "pathfinding-cross-level-shaft",
     .item_label = LevelCode.label,
-    .defaultItemCounts = crossLevelItemCounts,
+    .item_counts = &cross_level_item_counts,
     .runCase = runCrossLevelShaftCase,
     .write_workload = writeRouteWorkload,
 };
@@ -163,7 +163,7 @@ pub const cross_level_shaft_group = suite.BenchmarkGroup{
 pub const long_path_group = suite.BenchmarkGroup{
     .name = "pathfinding-long-path",
     .item_label = LongPathCode.label,
-    .defaultItemCounts = longPathItemCounts,
+    .item_counts = &long_path_item_counts,
     .runCase = runLongPathCase,
     .write_workload = writeLongPathWorkload,
     .cases = &suite.serial_cases,
@@ -192,7 +192,7 @@ pub const long_path_group = suite.BenchmarkGroup{
 pub const link_fold_group = suite.BenchmarkGroup{
     .name = "pathfinding-link-fold",
     .item_label = LinkFoldCode.label,
-    .defaultItemCounts = linkFoldItemCounts,
+    .item_counts = &link_fold_item_counts,
     .runCase = runLinkFoldCase,
     .write_workload = writeLinkFoldWorkload,
 };
@@ -227,10 +227,6 @@ const teleport_item_counts = cross_level_item_counts ++ [_]usize{
     teleportCode(.random_pads, 16, 256),
 };
 
-fn teleportItemCounts(_: suite.Profile) []const usize {
-    return &teleport_item_counts;
-}
-
 // Teleport-count configs place their teleports on level-0 cells this close to the border.
 const teleport_border_band: u16 = 16;
 // The strip layout's rows: this many, from this far north of the level center.
@@ -259,18 +255,6 @@ const link_fold_item_counts = [_]usize{
     LinkFoldCode.of(.{ .axis = .probe, .probe_preload = 4, .background_pads = 8192 }),
     LinkFoldCode.of(.{ .axis = .probe, .probe_preload = 64, .background_pads = 8192 }),
 };
-
-fn levelSizeItemCounts(_: suite.Profile) []const usize {
-    return &level_size_item_counts;
-}
-
-fn crossLevelItemCounts(_: suite.Profile) []const usize {
-    return &cross_level_item_counts;
-}
-
-fn linkFoldItemCounts(_: suite.Profile) []const usize {
-    return &link_fold_item_counts;
-}
 
 fn writeRouteWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("abstract_nodes={} routes_solved={}", .{ stats.candidate_pairs, stats.output_count });
@@ -760,10 +744,6 @@ const long_path_item_counts = [_]usize{
     LongPathConfig.code(.hops, .deep_wide, 8),
     LongPathConfig.code(.hops, .deep_wide, 16),
 };
-
-fn longPathItemCounts(_: suite.Profile) []const usize {
-    return &long_path_item_counts;
-}
 
 // Walls on every `serpentine_pitch`-th row, odd walls open at the east end and even walls at
 // the west end; returns the cells blocked.

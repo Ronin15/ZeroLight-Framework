@@ -54,7 +54,7 @@ const grid_pitch_y: f32 = 9.0;
 pub const group = suite.BenchmarkGroup{
     .name = "ai",
     .item_label = "AI agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = writeAiWorkload,
 };
@@ -62,7 +62,7 @@ pub const group = suite.BenchmarkGroup{
 pub const cell_ordered_group = suite.BenchmarkGroup{
     .name = "ai-cell-ordered",
     .item_label = "AI agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCellOrderedCase,
     .write_workload = writeAiWorkload,
 };
@@ -84,10 +84,6 @@ const Fixture = struct {
         self.* = undefined;
     }
 };
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
 
 pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     return createFixtureInOrder(allocator, count, null);

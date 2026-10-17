@@ -59,7 +59,7 @@ const suite = @import("suite.zig");
 pub const group = suite.BenchmarkGroup{
     .name = "steering",
     .item_label = "steering agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &agent_counts,
     .runCase = runCase,
     .write_workload = writeSteeringWorkload,
 };
@@ -67,7 +67,7 @@ pub const group = suite.BenchmarkGroup{
 pub const shuffled_group = suite.BenchmarkGroup{
     .name = "steering-shuffled",
     .item_label = "steering agents",
-    .defaultItemCounts = layoutItemCounts,
+    .item_counts = &layout_counts,
     .runCase = runShuffledCase,
     .write_workload = writeSteeringWorkload,
 };
@@ -75,7 +75,7 @@ pub const shuffled_group = suite.BenchmarkGroup{
 pub const corridor_group = suite.BenchmarkGroup{
     .name = "steering-corridor",
     .item_label = "steering agents",
-    .defaultItemCounts = layoutItemCounts,
+    .item_counts = &layout_counts,
     .runCase = runCorridorCase,
     .write_workload = writeSteeringWorkload,
 };
@@ -83,7 +83,7 @@ pub const corridor_group = suite.BenchmarkGroup{
 pub const cluster_outlier_group = suite.BenchmarkGroup{
     .name = "steering-cluster-outlier",
     .item_label = "steering agents",
-    .defaultItemCounts = layoutItemCounts,
+    .item_counts = &layout_counts,
     .runCase = runClusterOutlierCase,
     .write_workload = writeSteeringWorkload,
 };
@@ -91,7 +91,7 @@ pub const cluster_outlier_group = suite.BenchmarkGroup{
 pub const static_change_group = suite.BenchmarkGroup{
     .name = "steering-static-change",
     .item_label = "static bodies",
-    .defaultItemCounts = staticChangeItemCounts,
+    .item_counts = &static_change_counts,
     .runCase = runStaticChangeCase,
     .write_workload = writeStaticChangeWorkload,
 };
@@ -99,14 +99,12 @@ pub const static_change_group = suite.BenchmarkGroup{
 pub const static_dense_group = suite.BenchmarkGroup{
     .name = "steering-static-dense",
     .item_label = StaticDenseCode.label,
-    .defaultItemCounts = staticDenseItemCounts,
+    .item_counts = &static_dense_counts,
     .runCase = runStaticDenseCase,
     .write_workload = writeStaticDenseWorkload,
 };
 
-const quick_counts = [_]usize{ 128, 512, 1024 };
-const standard_counts = [_]usize{ 512, 1024, 4096 };
-const stress_counts = [_]usize{ 4096, 10000 };
+const agent_counts = [_]usize{ 128, 512, 1024 };
 const layout_counts = [_]usize{ 1024, 4096, 16384 };
 
 // Where the steering agent groups place their agents.
@@ -147,18 +145,6 @@ const Fixture = struct {
         self.* = undefined;
     }
 };
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &quick_counts,
-        .standard => &standard_counts,
-        .stress => &stress_counts,
-    };
-}
-
-fn layoutItemCounts(_: suite.Profile) []const usize {
-    return &layout_counts;
-}
 
 fn createFixture(allocator: std.mem.Allocator, count: usize, layout: Layout) !Fixture {
     var data = DataSystem.init(allocator);
@@ -490,10 +476,6 @@ const StaticChangeFixture = struct {
     }
 };
 
-fn staticChangeItemCounts(_: suite.Profile) []const usize {
-    return &static_change_counts;
-}
-
 // `static_count` statics: `near_static_count` among the agents, one mover, and the rest as
 // filler at `statics_per_filler_chunk` per chunk in a square chunk block right of the agents,
 // so the block's side grows with the square root of the static count.
@@ -640,10 +622,6 @@ const StaticDenseFixture = struct {
         self.* = undefined;
     }
 };
-
-fn staticDenseItemCounts(_: suite.Profile) []const usize {
-    return &static_dense_counts;
-}
 
 // `statics_per_chunk` statics in every chunk the agent grid overlaps, each centered in its slot
 // of a square slot grid spanning the chunk, so every chunk the agents query holds exactly

@@ -24,7 +24,7 @@ const suite = @import("suite.zig");
 pub const stage_group = suite.BenchmarkGroup{
     .name = "collision-response-stage",
     .item_label = "contacts",
-    .defaultItemCounts = stageItemCounts,
+    .item_counts = &stage_item_counts,
     .runCase = runStageCase,
     .write_workload = writeResponseStageWorkload,
 };
@@ -34,10 +34,6 @@ const stage_item_counts = [_]usize{ 1_024, 4_096, 16_384 };
 // contact count so the order visits every contact once.
 const stage_scatter_stride_seed: usize = 7_919;
 const stage_bounce_restitution: f32 = 0.5;
-
-fn stageItemCounts(_: suite.Profile) []const usize {
-    return &stage_item_counts;
-}
 
 const StageFixture = struct {
     data: DataSystem,

@@ -59,7 +59,7 @@ const chunkCells = @import("nav_fixtures.zig").chunkCells;
 pub const evict_group = suite.BenchmarkGroup{
     .name = "pathfinding-evict",
     .item_label = EvictCode.label,
-    .defaultItemCounts = evictItemCounts,
+    .item_counts = &evict_item_counts,
     .runCase = runEvictCase,
     .write_workload = writeEvictWorkload,
 };
@@ -73,7 +73,7 @@ pub const evict_group = suite.BenchmarkGroup{
 pub const elastic_ramp_group = suite.BenchmarkGroup{
     .name = "pathfinding-elastic-ramp",
     .item_label = "agents at the ramp's top",
-    .defaultItemCounts = elasticRampItemCounts,
+    .item_counts = &elastic_ramp_item_counts,
     .runCase = runElasticRampCase,
     .write_workload = writeElasticRampWorkload,
 };
@@ -90,7 +90,7 @@ pub const elastic_ramp_group = suite.BenchmarkGroup{
 pub const elastic_shrink_group = suite.BenchmarkGroup{
     .name = "pathfinding-elastic-shrink",
     .item_label = "agents before the drop",
-    .defaultItemCounts = elasticRampItemCounts,
+    .item_counts = &elastic_ramp_item_counts,
     .runCase = runElasticShrinkCase,
     .write_workload = writeElasticShrinkWorkload,
 };
@@ -112,14 +112,6 @@ const evict_item_counts = [_]usize{
     EvictCode.of(.{ .registry = .churned, .region_chunks = 64, .cached_results = 10_000 }),
 };
 const elastic_ramp_item_counts = [_]usize{ 1_000, 4_000, 16_000 };
-
-fn evictItemCounts(_: suite.Profile) []const usize {
-    return &evict_item_counts;
-}
-
-fn elasticRampItemCounts(_: suite.Profile) []const usize {
-    return &elastic_ramp_item_counts;
-}
 
 fn writeEvictWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("cached={} evicted={}", .{ stats.candidate_pairs, stats.output_count });

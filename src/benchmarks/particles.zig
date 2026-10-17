@@ -15,19 +15,15 @@ const delta_seconds: f32 = 1.0 / 60.0;
 const benchmark_particle_depths = [_]WorldDepth{ .actor, .effect, .marker };
 
 // `particles`: one `ParticleSystem` update over N particles across three render depths,
-// each living past the run so every row stays live. Prints no workload fields. No pass
-// shape asserted.
+// each living past the run so every row stays live. Prints no workload fields. Pass shape:
+// time linear in rows; asserts check every row stays live and each step covers them all.
 pub const group = suite.BenchmarkGroup{
     .name = "particles",
     .item_label = "particle rows",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = suite.writeNoWorkload,
 };
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
 
 pub fn createFixture(allocator: std.mem.Allocator, count: usize) !ParticleSystem {
     var particles = try ParticleSystem.init(allocator, .{ .capacity = count });
@@ -90,8 +86,10 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const start_ns = suite.nowNs(io);
         const batch = runOnce(&particles, if (threads) |*thread_system| thread_system else null, case);
         const end_ns = suite.nowNs(io);
+        std.debug.assert(batch.item_count == item_count);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
     }
+    std.debug.assert(particles.activeCount() == item_count);
 
     var stats = accumulator.finish();
     if (case.adaptive) {

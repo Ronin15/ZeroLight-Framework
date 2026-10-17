@@ -55,7 +55,7 @@ const suite = @import("suite.zig");
 pub const group = suite.BenchmarkGroup{
     .name = "spatial_index",
     .item_label = "indexed entities",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = writeIndexWorkload,
 };
@@ -63,7 +63,7 @@ pub const group = suite.BenchmarkGroup{
 pub const shape_group = suite.BenchmarkGroup{
     .name = "spatial_index-shape",
     .item_label = ShapeCode.label,
-    .defaultItemCounts = shapeItemCounts,
+    .item_counts = &shape_item_counts,
     .runCase = runShapeCase,
     .write_workload = writeShapeWorkload,
     .cases = &suite.serial_and_tuned_cases,
@@ -72,7 +72,7 @@ pub const shape_group = suite.BenchmarkGroup{
 pub const query_group = suite.BenchmarkGroup{
     .name = "spatial_index-query",
     .item_label = QueryCode.label,
-    .defaultItemCounts = queryItemCounts,
+    .item_counts = &query_item_counts,
     .runCase = runQueryCase,
     .write_workload = writeQueryWorkload,
     .cases = &suite.serial_cases,
@@ -88,10 +88,6 @@ const Fixture = struct {
 
 // One world chunk's side in world units, from the world defaults.
 const chunk_world: f32 = required_tile_size * @as(f32, @floatFromInt(default_chunk_size_tiles));
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
 
 // Grid point `grid[slot]` for each slot: a fixed-seed shuffle of `0..count`, so keys reach
 // the sort in store order, not key order. The caller frees it.
@@ -137,7 +133,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var fixture = try createFixture(allocator, item_count);
     defer fixture.deinit();
-    const counts = defaultItemCounts(options.profile);
+    const counts = &suite.event_scale_counts;
     const expect_off_main = item_count == counts[counts.len - 1];
     const rows = (item_count + 127) / 128;
     const geometry = fixtures.indexGeometryCovering(128 * 11.0, @as(f32, @floatFromInt(rows)) * 9.0, 1);
@@ -257,10 +253,6 @@ const shape_item_counts = [_]usize{
     ShapeCode.of(.{ .variant = .deep_levels, .axis = 32 }),
 };
 
-fn shapeItemCounts(_: suite.Profile) []const usize {
-    return &shape_item_counts;
-}
-
 // The fixed world: room for one body per chunk at the largest H.
 const shape_world_chunks: u32 = 128;
 // The chunk every `dense_chunk` body lies in, mid-world.
@@ -371,10 +363,6 @@ const query_item_counts = [_]usize{
     QueryCode.of(.{ .shape = .dense_cell, .factions = .full, .axis = 1024 }),
     QueryCode.of(.{ .shape = .dense_cell, .factions = .full, .axis = 4096 }),
 };
-
-fn queryItemCounts(_: suite.Profile) []const usize {
-    return &query_item_counts;
-}
 
 // A world past the largest box on every side of the field.
 const query_world_chunks: u32 = 16;

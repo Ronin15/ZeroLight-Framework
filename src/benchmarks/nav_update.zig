@@ -71,14 +71,10 @@ const max_digs_per_chunk: usize = 16;
 pub const group = suite.BenchmarkGroup{
     .name = "nav-update-scattered",
     .item_label = "digs in one step",
-    .defaultItemCounts = scatteredItemCounts,
+    .item_counts = &scattered_counts,
     .runCase = runCase,
     .write_workload = writeNavStagesWorkload,
 };
-
-fn scatteredItemCounts(_: suite.Profile) []const usize {
-    return &scattered_counts;
-}
 
 // A dig footprint's nav stages, under `--details`.
 fn writeNavStagesWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
@@ -288,7 +284,7 @@ const dynamic_body_counts = [_]usize{ 1_000, 10_000, 50_000 };
 pub const entity_obstacle_group = suite.BenchmarkGroup{
     .name = "nav-update-entity-obstacles",
     .item_label = "other static bodies",
-    .defaultItemCounts = otherStaticItemCounts,
+    .item_counts = &other_static_counts,
     .runCase = runEntityObstacleCase,
     .write_workload = writeStaticMoveWorkload,
 };
@@ -296,18 +292,10 @@ pub const entity_obstacle_group = suite.BenchmarkGroup{
 pub const static_population_group = suite.BenchmarkGroup{
     .name = "nav-update-static-population",
     .item_label = "dynamic bodies",
-    .defaultItemCounts = dynamicBodyItemCounts,
+    .item_counts = &dynamic_body_counts,
     .runCase = runStaticPopulationCase,
     .write_workload = writeStaticMoveWorkload,
 };
-
-fn otherStaticItemCounts(_: suite.Profile) []const usize {
-    return &other_static_counts;
-}
-
-fn dynamicBodyItemCounts(_: suite.Profile) []const usize {
-    return &dynamic_body_counts;
-}
 
 fn runEntityObstacleCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runStaticMoveCase(allocator, io, options, case, item_count, 0);
@@ -501,7 +489,7 @@ const dense_changes_per_chunk: usize = dense_statics_per_chunk / 2;
 pub const static_dense_group = suite.BenchmarkGroup{
     .name = "nav-update-static-dense",
     .item_label = "statics changed in one commit",
-    .defaultItemCounts = denseChangeItemCounts,
+    .item_counts = &dense_change_counts,
     .runCase = runStaticDenseCase,
     .write_workload = writeStaticDenseWorkload,
 };
@@ -509,14 +497,10 @@ pub const static_dense_group = suite.BenchmarkGroup{
 pub const static_dense_tail_group = suite.BenchmarkGroup{
     .name = "nav-update-static-dense-tail",
     .item_label = "statics changed in one commit",
-    .defaultItemCounts = denseChangeItemCounts,
+    .item_counts = &dense_change_counts,
     .runCase = runStaticDenseTailCase,
     .write_workload = writeStaticDenseWorkload,
 };
-
-fn denseChangeItemCounts(_: suite.Profile) []const usize {
-    return &dense_change_counts;
-}
 
 const StaticDenseFixture = struct {
     allocator: std.mem.Allocator,

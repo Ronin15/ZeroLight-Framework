@@ -104,7 +104,7 @@ const Layout = struct {
 pub const group = suite.BenchmarkGroup{
     .name = "plane-traversal",
     .item_label = "AI agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &item_counts,
     .runCase = runNoFallsCase,
     .write_workload = writePlaneAgentsWorkload,
 };
@@ -112,7 +112,7 @@ pub const group = suite.BenchmarkGroup{
 pub const falls_group = suite.BenchmarkGroup{
     .name = "plane-traversal-falls",
     .item_label = "AI agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &item_counts,
     .runCase = runFallsCase,
     .write_workload = writePlaneAgentsWorkload,
 };
@@ -120,7 +120,7 @@ pub const falls_group = suite.BenchmarkGroup{
 pub const dense_falls_group = suite.BenchmarkGroup{
     .name = "plane-traversal-dense-falls",
     .item_label = "AI agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &item_counts,
     .runCase = runDenseFallsCase,
     .write_workload = writePlaneAgentsWorkload,
 };
@@ -128,18 +128,10 @@ pub const dense_falls_group = suite.BenchmarkGroup{
 pub const banded_falls_group = suite.BenchmarkGroup{
     .name = "plane-traversal-dense-falls-banded",
     .item_label = std.fmt.comptimePrint("landing-level bands ({} AI agents)", .{banded_agent_count}),
-    .defaultItemCounts = defaultBandCounts,
+    .item_counts = &band_counts,
     .runCase = runBandedFallsCase,
     .write_workload = writePlaneBandsWorkload,
 };
-
-fn defaultItemCounts(_: suite.Profile) []const usize {
-    return &item_counts;
-}
-
-fn defaultBandCounts(_: suite.Profile) []const usize {
-    return &band_counts;
-}
 
 const Faller = struct {
     entity: EntityId,

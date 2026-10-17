@@ -20,7 +20,7 @@ const suite = @import("suite.zig");
 pub const group = suite.BenchmarkGroup{
     .name = "world-gate",
     .item_label = "gated bodies",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &item_counts,
     .runCase = runCase,
     .write_workload = writeGateWorkload,
     .cases = &suite.serial_cases,
@@ -34,10 +34,6 @@ const gate_level: u16 = 1;
 const body_size: f32 = 20;
 // Each body's settled step from its previous position, so both gate axes test a move.
 const step_offset = math.Vec2{ .x = 3, .y = 2 };
-
-fn defaultItemCounts(_: suite.Profile) []const usize {
-    return &item_counts;
-}
 
 const Fixture = struct {
     world: WorldSystem,

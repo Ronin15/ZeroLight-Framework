@@ -18,18 +18,15 @@ const suite = @import("suite.zig");
 const delta_seconds: f32 = 1.0 / 60.0;
 
 // `movement`: one `MovementSystem` update over N movement bodies with varied velocities,
-// with no reset between iterations. Prints no workload fields. No pass shape asserted.
+// with no reset between iterations. Prints no workload fields. Pass shape: time linear in
+// bodies; asserts check each step covers every body.
 pub const group = suite.BenchmarkGroup{
     .name = "movement",
     .item_label = "movement bodies",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = suite.writeNoWorkload,
 };
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
 
 pub fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
     var data = DataSystem.init(allocator);
@@ -89,6 +86,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const start_ns = suite.nowNs(io);
         const batch = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
         const end_ns = suite.nowNs(io);
+        std.debug.assert(batch.item_count == item_count);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
     }
 
@@ -129,7 +127,7 @@ fn runOnce(
 pub const apply_intents_group = suite.BenchmarkGroup{
     .name = "movement-apply-intents",
     .item_label = "moving agents",
-    .defaultItemCounts = applyIntentsItemCounts,
+    .item_counts = &apply_intents_item_counts,
     .runCase = runApplyIntentsScatteredCase,
     .write_workload = writeApplyWorkload,
 };
@@ -137,7 +135,7 @@ pub const apply_intents_group = suite.BenchmarkGroup{
 pub const apply_intents_sorted_group = suite.BenchmarkGroup{
     .name = "movement-apply-intents-sorted",
     .item_label = "moving agents",
-    .defaultItemCounts = applyIntentsItemCounts,
+    .item_counts = &apply_intents_item_counts,
     .runCase = runApplyIntentsSortedCase,
     .write_workload = writeApplyWorkload,
 };
@@ -153,10 +151,6 @@ const zero_speed_every: usize = 5;
 const scatter_stride_seed: usize = 7_919;
 // The apply's speed for a row whose speed is not positive.
 const default_intent_speed: f32 = 40.0;
-
-fn applyIntentsItemCounts(_: suite.Profile) []const usize {
-    return &apply_intents_item_counts;
-}
 
 const ApplyIntentsFixture = struct {
     data: DataSystem,

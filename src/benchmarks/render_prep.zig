@@ -21,18 +21,15 @@ const ordered_ui_depths = [_]sprite_batch.UiDepth{ .background, .panel, .highlig
 // 23rd on a dead texture) into one `SpriteBatch`, then snapshots, emits vertices (the
 // threaded stage), and builds draw groups. Prints `vertices=`, `sprites=` (valid),
 // `skipped=` (unresolved textures), `groups=`, and the bench's own phase timers
-// (`ordered_submit`, `snapshot`, `vertex_emit`, `draw_groups`). No pass shape asserted.
+// (`ordered_submit`, `snapshot`, `vertex_emit`, `draw_groups`). Pass shape: time linear in
+// commands; asserts check every command is emitted or skipped, the dead-texture ones skipped.
 pub const group = suite.BenchmarkGroup{
     .name = "render-prep",
     .item_label = "draw commands",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = writeRenderPrepWorkload,
 };
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
 
 pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
@@ -76,6 +73,10 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         last_prep = measured.stats;
     }
 
+    if (options.iterations > 0) {
+        std.debug.assert(last_prep.skipped_invalid_count == @divCeil(item_count, 23));
+        std.debug.assert(last_prep.valid_sprite_count + last_prep.skipped_invalid_count == item_count);
+    }
     var stats = accumulator.finish();
     stats.candidate_pairs = last_prep.vertex_count;
     stats.output_count = last_prep.valid_sprite_count;

@@ -30,7 +30,7 @@ const suite = @import("suite.zig");
 pub const group = suite.BenchmarkGroup{
     .name = "world-create",
     .item_label = ScaleCode.label,
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &item_counts,
     .runCase = runCase,
     .write_workload = writeCreateWorkload,
     // The paint and the nav build thread; every other control has no path of its own.
@@ -49,10 +49,6 @@ const item_counts = blk: {
     for (level_counts[1..], level_sides.len..) |levels, index| counts[index] = ScaleCode.of(.{ .level_side = level_sides[0], .levels = levels });
     break :blk counts;
 };
-
-fn defaultItemCounts(_: suite.Profile) []const usize {
-    return &item_counts;
-}
 
 const PhaseTimes = struct {
     surface_ns: u64 = 0,

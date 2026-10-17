@@ -26,26 +26,10 @@ pub const default_items_per_range = (ThreadSystemConfig{}).items_per_range;
 /// The fixed partition of a chunk-partitioned stage: one chunk per range.
 pub const chunk_partition_items: usize = 1;
 
-pub const Profile = enum {
-    quick,
-    standard,
-    stress,
-};
-
-const event_scale_quick_counts = [_]usize{ 1_024, 4_096, 10_000 };
-const event_scale_standard_counts = [_]usize{ 1_024, 4_096, 10_000, 25_000, 50_000 };
-const event_scale_stress_counts = [_]usize{ 10_000, 25_000, 50_000 };
-
-pub fn eventScaleCounts(profile: Profile) []const usize {
-    return switch (profile) {
-        .quick => &event_scale_quick_counts,
-        .standard => &event_scale_standard_counts,
-        .stress => &event_scale_stress_counts,
-    };
-}
+/// The population counts of a group that scales one entity count.
+pub const event_scale_counts = [_]usize{ 1_024, 4_096, 10_000 };
 
 pub const Options = struct {
-    profile: Profile = .quick,
     warmup_iterations: usize = 5,
     iterations: usize = 30,
     case_filter: ?[]const u8 = null,
@@ -62,7 +46,8 @@ pub const BenchmarkGroup = struct {
     /// What one item count names: the unit counted, or an item code's layout
     /// (`ItemCode(...).label`).
     item_label: []const u8,
-    defaultItemCounts: *const fn (Profile) []const usize,
+    /// The item counts (or item codes) the group runs; `--items` runs one instead.
+    item_counts: []const usize,
     runCase: *const fn (std.mem.Allocator, std.Io, Options, BenchmarkCase, usize) anyerror!RunStats,
     /// Writes a case's workload: its counters in the group's own terms, and under
     /// `--details` its stage shapes too. Writing nothing prints no workload.
@@ -713,13 +698,7 @@ pub fn parseOptions(args: []const []const u8) !Options {
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--profile")) {
-            index += 1;
-            if (index >= args.len) return error.MissingArgument;
-            options.profile = try parseProfile(args[index]);
-        } else if (stripPrefix(arg, "--profile=")) |value| {
-            options.profile = try parseProfile(value);
-        } else if (std.mem.eql(u8, arg, "--warmup")) {
+        if (std.mem.eql(u8, arg, "--warmup")) {
             index += 1;
             if (index >= args.len) return error.MissingArgument;
             options.warmup_iterations = try parsePositiveUsize(args[index]);
@@ -842,7 +821,7 @@ fn itemCountsForOptions(group: BenchmarkGroup, options: Options, explicit_item_c
         explicit_item_count[0] = item_count;
         return explicit_item_count[0..1];
     }
-    return group.defaultItemCounts(options.profile);
+    return group.item_counts;
 }
 
 pub fn printUsage() void {
@@ -850,7 +829,6 @@ pub fn printUsage() void {
         \\Usage: zig build bench -- [options]
         \\
         \\Options:
-        \\  --profile quick|standard|stress   (count groups; item-code groups run fixed configs)
         \\  --warmup N
         \\  --iterations N
         \\  --case name
@@ -884,13 +862,6 @@ pub fn elapsedNs(start_ns: i96, end_ns: i96) u64 {
     return if (end_ns > start_ns) @intCast(end_ns - start_ns) else 0;
 }
 
-fn parseProfile(value: []const u8) !Profile {
-    if (std.mem.eql(u8, value, "quick")) return .quick;
-    if (std.mem.eql(u8, value, "standard")) return .standard;
-    if (std.mem.eql(u8, value, "stress")) return .stress;
-    return error.InvalidArgument;
-}
-
 fn parsePositiveUsize(value: []const u8) !usize {
     const parsed = try std.fmt.parseInt(usize, value, 10);
     if (parsed == 0) return error.InvalidArgument;
@@ -915,8 +886,8 @@ fn shouldIncludeBaselineForFilter(filter: []const u8, case: BenchmarkCase) bool 
 
 fn printHeader(options: Options) void {
     std.debug.print(
-        "\nbenchmark profile={s} warmup={} iterations={} default_cases={}\n",
-        .{ @tagName(options.profile), options.warmup_iterations, options.iterations, default_cases.len },
+        "\nbenchmark warmup={} iterations={} default_cases={}\n",
+        .{ options.warmup_iterations, options.iterations, default_cases.len },
     );
     std.debug.print("worker_threads_available={}\n", .{availableWorkerThreads()});
     std.debug.print("purpose: exercise benchmark flows, prove adaptive behavior, and catch regressions\n", .{});
@@ -1672,7 +1643,7 @@ test "a group's named cases keep default-case order, and the default list is eve
     try std.testing.expectEqualStrings("serial-direct", named[0].name);
     try std.testing.expectEqualStrings("thread-adaptive-tuned-range", named[1].name);
     try std.testing.expect(named[1].adaptive);
-    const group = BenchmarkGroup{ .name = "test", .item_label = "items", .defaultItemCounts = testItemCounts, .runCase = testRunCase, .write_workload = writeNoWorkload };
+    const group = BenchmarkGroup{ .name = "test", .item_label = "items", .item_counts = &test_item_counts, .runCase = testRunCase, .write_workload = writeNoWorkload };
     try std.testing.expectEqual(default_cases.len, group.cases.len);
 }
 
@@ -1683,8 +1654,6 @@ test "a grid side covers its count with the fewest cells" {
 
 test "benchmark options parse scaling and filtering arguments" {
     const args = [_][]const u8{
-        "--profile",
-        "standard",
         "--warmup=2",
         "--iterations",
         "9",
@@ -1697,7 +1666,6 @@ test "benchmark options parse scaling and filtering arguments" {
         "--details",
     };
     const options = try parseOptions(&args);
-    try std.testing.expectEqual(Profile.standard, options.profile);
     try std.testing.expectEqual(@as(usize, 2), options.warmup_iterations);
     try std.testing.expectEqual(@as(usize, 9), options.iterations);
     try std.testing.expectEqualStrings("thread-fixed-1", options.case_filter.?);
@@ -1896,17 +1864,7 @@ test "adaptive settle budget covers multiple tuner windows" {
     try std.testing.expectEqual(@as(usize, 100), adaptiveSettleIterationLimit(.{ .iterations = 100 }));
 }
 
-test "event scale profiles cover low through high signal counts" {
-    try std.testing.expectEqualSlices(usize, &[_]usize{ 1_024, 4_096, 10_000 }, eventScaleCounts(.quick));
-    try std.testing.expectEqualSlices(usize, &[_]usize{ 1_024, 4_096, 10_000, 25_000, 50_000 }, eventScaleCounts(.standard));
-    try std.testing.expectEqualSlices(usize, &[_]usize{ 10_000, 25_000, 50_000 }, eventScaleCounts(.stress));
-}
-
 const test_item_counts = [_]usize{ 4, 8 };
-
-fn testItemCounts(_: Profile) []const usize {
-    return &test_item_counts;
-}
 
 fn testRunCase(_: std.mem.Allocator, _: std.Io, _: Options, _: BenchmarkCase, _: usize) anyerror!RunStats {
     return .{};
@@ -1921,7 +1879,7 @@ test "benchmark items option overrides registered counts" {
     const group = BenchmarkGroup{
         .name = "test",
         .item_label = "test items",
-        .defaultItemCounts = testItemCounts,
+        .item_counts = &test_item_counts,
         .runCase = testRunCase,
         .write_workload = writeNoWorkload,
     };
@@ -1970,14 +1928,14 @@ test "benchmark table formatters keep compact text" {
     const group = BenchmarkGroup{
         .name = "test",
         .item_label = "test items",
-        .defaultItemCounts = testItemCounts,
+        .item_counts = &test_item_counts,
         .runCase = testRunCase,
         .write_workload = writeTestWorkload,
     };
     var workload_buffer: [64]u8 = undefined;
     try std.testing.expectEqualStrings("hits=4", formatWorkloadInto(&workload_buffer, group, .{ .output_count = 4 }, .summary));
     try std.testing.expectEqualStrings("hits=4 main=250 ns (25%)", formatWorkloadInto(&workload_buffer, group, .{ .output_count = 4 }, .details));
-    const silent = BenchmarkGroup{ .name = "silent", .item_label = "items", .defaultItemCounts = testItemCounts, .runCase = testRunCase, .write_workload = writeNoWorkload };
+    const silent = BenchmarkGroup{ .name = "silent", .item_label = "items", .item_counts = &test_item_counts, .runCase = testRunCase, .write_workload = writeNoWorkload };
     try std.testing.expectEqualStrings("", formatWorkloadInto(&workload_buffer, silent, .{ .output_count = 4 }, .details));
 }
 

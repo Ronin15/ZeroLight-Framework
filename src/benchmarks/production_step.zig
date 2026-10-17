@@ -76,7 +76,7 @@ const Timing = runtime_perf_log.Timing;
 pub const group = suite.BenchmarkGroup{
     .name = "production-step",
     .item_label = StepCode.label,
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &item_counts,
     .runCase = runCase,
     .write_workload = writeStepWorkload,
     // The step runs its own stage tuners; the fixed controls live in the stage groups.
@@ -113,10 +113,6 @@ const item_counts = [_]usize{
     baseWith(.{ .shape = .stacked, .levels = 4, .population = 1_024 }),
     baseWith(.{ .shape = .stacked, .levels = 8, .population = 2_048 }),
 };
-
-fn defaultItemCounts(_: suite.Profile) []const usize {
-    return &item_counts;
-}
 
 // Presentation size of the observer's view; the simulation scope derives from it.
 const viewport_width: f32 = 1280;

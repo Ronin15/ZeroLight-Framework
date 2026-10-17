@@ -7,7 +7,8 @@
 //! `AiPerception` and `AiMemory` with a visible hostile and low familiarity in its hot
 //! columns, set at fixture creation; nothing is injected per step. Both groups print
 //! `processed=` (rows appraised) and `threshold_crossings=`.
-//! - `ai-affect`: every agent, the think set in store order. No pass shape asserted.
+//! - `ai-affect`: every agent, the think set in store order. Pass shape: time linear in
+//!   agents; asserts check every agent is appraised each step.
 //! - `ai-affect-shuffled`: the same step over a stride shuffle of every agent as the think
 //!   set, so ranges write scattered affect rows, as a cell-major think set does. Pass shape:
 //!   within spread of `ai-affect`.
@@ -25,7 +26,7 @@ const suite = @import("suite.zig");
 pub const group = suite.BenchmarkGroup{
     .name = "ai-affect",
     .item_label = "AI agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
     .write_workload = writeAffectWorkload,
 };
@@ -33,7 +34,7 @@ pub const group = suite.BenchmarkGroup{
 pub const shuffled_group = suite.BenchmarkGroup{
     .name = "ai-affect-shuffled",
     .item_label = "AI agents",
-    .defaultItemCounts = defaultItemCounts,
+    .item_counts = &suite.event_scale_counts,
     .runCase = runShuffledCase,
     .write_workload = writeAffectWorkload,
 };
@@ -54,10 +55,6 @@ const Fixture = struct {
         self.* = undefined;
     }
 };
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
 
 pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     var data = DataSystem.init(allocator);
@@ -125,6 +122,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.batch);
     }
 
+    std.debug.assert(options.iterations == 0 or last_stats.processed_count == item_count);
     var stats = accumulator.finish();
     stats.candidate_pairs = last_stats.processed_count;
     stats.output_count = last_stats.threshold_crossed_count;
