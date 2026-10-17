@@ -121,6 +121,9 @@ Direct `Renderer.submitOrderedSprite` and `submitOrderedRectInSpace` calls are
 for paths that already submit in nondecreasing `RenderOrder`, such as world
 z-layer passes, simple smoke tests, or stack-aware UI helpers.
 
+States gate debug draws on `RenderContext.debug_overlay_visible` (set by
+`Engine` from the debug overlay) and own no toggle of their own.
+
 For atlas-backed actors, keep entity data on stable `SpriteAssetId` values plus
 numeric atlas entry IDs. Authoring names stay in source assets and metadata;
 runtime render prep resolves entry IDs through `RuntimeAssets` metadata to

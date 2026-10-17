@@ -20,69 +20,66 @@ How the renderer works: `docs/rendering-assets-shaders.md`.
 
 ## Boundaries
 
-- Game-facing draws reference `Material` tags only; no SDL_GPU handles,
-  pipeline pointers, or shader-format strings cross into game code.
-- Material descriptors list resource counts only and build shader paths with
-  `shader_paths` helpers, never literal strings. Adding a material or shader
-  follows the checklist in the rendering doc.
-- World render state (visibility window, draw records, GPU tile residency and
-  mirror) lives in `WorldSystem`'s render path (`docs/architecture.md`); other
-  presentation and debug-UI state stays in the renderer and debug-overlay
-  path. None of it is in `DataSystem` or read by simulation. States gate
-  debug draws on `RenderContext.debug_overlay_visible` and own no toggle.
+- Game code describes draws by intent (material tags, render order), never by
+  GPU handles, pipeline pointers, or shader formats; only `Renderer` touches
+  SDL_GPU.
+- Shader paths are built with the `shader_paths` helpers, never literal
+  strings; descriptors carry counts and intent only. Adding a
+  material or shader follows the rendering doc's checklist.
+- Presentation state (visibility window, draw records, GPU residency, debug
+  UI) lives on the render side, never in `DataSystem`, and simulation never
+  reads it. States gate debug drawing on the render context and own no
+  toggle.
 - The main view renders only the camera-focused world; a secondary view (a
   mini camera) may show the same world or another one. A world in no view
   simulates with no render state or render work.
-- Workers never read live renderer resource slots: snapshot texture metadata
-  before dispatch and build draw groups on the main thread.
+- Workers never read live renderer resources: snapshot what they need before
+  dispatch, and build GPU-facing groups on the main thread.
 
 ## Ordering and visibility
 
-- Submit through `submitOrdered*` only from render-prep phases that walk
-  nondecreasing `RenderOrder` (world z, then UI, then debug). A producer that
-  can interleave depths owns an explicit ordering phase; `SpriteBatch` is a
-  strict ordered-stream consumer, never a sorter.
-- Dense multi-level compositing is back-to-front at submit and in
-  `mergeDrawList`; a sparse tile at any in-window depth gets its own interleave
-  point. Draw count scales with interleave points, never window depth or world
-  size.
-- Render visibility is camera chunk window plus AABB only; never gate drawing
-  on `SimulationTier`.
-- Apply the camera in the vertex shader for `.world`; a pan re-uploads only
-  chunks entering the resident window, never vertices or resident chunks.
+- Draws reach the GPU in nondecreasing render order (world depth, then UI,
+  then debug). A producer that can interleave depths owns an explicit ordering
+  phase; the batcher consumes an ordered stream and never sorts.
+- Draw count scales with real interleave points, never with window depth or
+  world size: dense levels composite back to front, and a sparse tile gets
+  its own interleave point.
+- Visibility is the camera's chunk window plus bounds only; simulation tiers
+  never gate drawing.
+- The camera transform is applied on the GPU; a pan uploads only chunks
+  entering the window, never vertices or resident chunks.
 
 ## Frame and uploads
 
-- Keep CPU sprite prep before swapchain acquisition where practical; the
-  acquired interval does only presentation uniforms, upload, encode, and
-  submit. Never hold the swapchain texture across CPU prep.
-- A buffer fully re-staged every frame and reused cycles; a retained, partially
-  written buffer never does (the tile-data buffer upload is `cycle=false`).
-- The CPU tile field is the source of truth; a changed chunk uploads once per
-  sync (directory word or whole block), and all uploads flush in one batched copy
-  pass per frame.
-- Visible rendering is swapchain-paced; non-renderable frames use the fallback
-  delay and pause policy. A failed swapchain acquire skips the frame
+- CPU prep runs before swapchain acquisition; the acquired interval only sets
+  presentation uniforms, uploads, encodes, and submits. The swapchain texture
+  is never held across CPU work.
+- A buffer fully re-staged every frame may cycle; a retained, partially
+  written buffer never does.
+- The CPU copy is the source of truth: a change uploads once per sync, and all
+  uploads flush in one batched copy pass per frame.
+- Visible rendering is swapchain-paced; non-rendering frames use the fallback
+  delay and pause policy, and a failed acquire skips the frame
   deterministically.
-- Uploads are validated (size, format, bounds) before they are staged.
+- Uploads are validated (size, format, bounds) before staging.
 
 ## Shaders
 
 - Storage-buffer layouts never need 16-bit storage extensions.
-- Keep `TilemapParams` and `tilemap.frag.glsl`'s `TilemapUniform` in one
-  field order and std140 layout.
+- A CPU struct mirrored by a shader uniform keeps one field order and std140
+  layout (`TilemapParams` and `TilemapUniform` today).
 - Bindings follow the SDL_GPU sets: 0 vertex resources, 1 vertex UBO, 2
-  fragment resources, 3 fragment UBO. For MSL, the first storage-buffer binding
-  equals that stage's UBO count and vertex buffer bindings stay below 14;
-  samplers are combined `sampler2D`. A layout that cannot meet this needs
-  explicit MSL remapping.
-- Every `shader_programs` stage sets `msl_entry_signature`; when resources
-  change, recheck the bindings and copy the signature from the generated
-  `.msl`.
+  fragment resources, 3 fragment UBO. For MSL, the first storage-buffer
+  binding equals that stage's UBO count, vertex buffer bindings stay below 14,
+  and samplers are combined; a layout that cannot meet this needs explicit
+  MSL remapping.
+- Every `shader_programs` stage sets `msl_entry_signature`; when its
+  resources change, recheck the bindings and copy the signature from the
+  generated `.msl`.
 
 ## Text
 
-- UI states store text intent and non-owning `PreparedText` and draw prepared
-  views each frame without re-checking the cache.
+- UI states store text intent and non-owning prepared views, and draw them
+  each frame without re-checking the cache.
 - High-cardinality dynamic text needs eviction, explicit release, or an atlas
   policy before it ships. System font probing is not part of the runtime path.

@@ -63,8 +63,7 @@ paths:
   impossible by construction; it is UB in ReleaseFast. Recoverable or
   data-influenced failures return an error or assert. `idiom-lint` accepts
   non-test `catch`/`orelse unreachable` only on the capacity-bounded handle
-  constructors (`TextureId`, `FontId`, `TextTextureId`, `EntityId`,
-  `LeaseHandle` `.init`) or with `// lint:allow catch-unreachable: <reason>`;
+  constructors it lists or with `// lint:allow catch-unreachable: <reason>`;
   never annotate a recoverable failure.
 - In hot or worker loops, capture an optional as a non-optional local at
   dispatch or assert it non-null at entry; never rely on cross-thread ordering.
@@ -95,31 +94,18 @@ paths:
   AoS pools, sparse slot maps.
 - Store `rows: std.MultiArrayList(Row)` with one field per column; expose hot
   paths through `slice()`/`sliceConst()` column-slice helpers.
-- Reserve with `hotStoreCapacity(n)` where threading/SIMD ranges need item
-  alignment.
+- A store whose ranges thread or run SIMD reserves an item-aligned capacity.
 - Call `rows.slice()` once per stage, function, or accessor; never
   `rows.items(.field)` in a loop. Per-row helpers take const column slices from
   the caller and never call `.slice()`.
-- Hot gather loops capture `var row_slice = rows.slice()` once and append with
-  `appendMalRow` (below), never `appendAssumeCapacity`. A per-row store append
-  uses a private `ensureCapacityForOne` + `appendAssumeCapacity`, never
-  `ensureCapacity(n)` + `append`.
+- Hot gather loops capture the row slice once and append by adding a row
+  and setting it on that slice (`docs/architecture.md` § Gameplay Data), never
+  `appendAssumeCapacity`. A per-row store append reserves one row, then
+  appends assuming capacity, never reserves `n` and then appends.
 - Compact with `swapRemove` when order does not matter; keep `deinit`,
   `clearRetainingCapacity`, and capacity helpers on the owning store.
 - Publish hot float columns as `[]f32`, never `[]align(64) f32`; MAL does not
   guarantee aligned column bases.
-
-```zig
-fn appendMalRow(
-    rows: *std.MultiArrayList(Row),
-    row_slice: *std.MultiArrayList(Row).Slice,
-    row: Row,
-) void {
-    _ = rows.addOneAssumeCapacity();
-    row_slice.len = rows.len;
-    row_slice.set(rows.len - 1, row);
-}
-```
 
 ## SIMD and core math
 

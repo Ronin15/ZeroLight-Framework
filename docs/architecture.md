@@ -187,7 +187,8 @@ Designs start here, then read the live structure below (rules:
     `agents` stage;
   - `selection.zig`: `select_resolve` and `select_claim`;
   - `directions.zig`: `directions` (path status and base direction);
-  - `agent_grid.zig`: the agent grid (`grid_bucket`, `grid_sort`);
+  - `agent_grid.zig`: the agent grid (`grid_bucket`, `grid_sort`); a private
+    grid that Slice 85 replaces with the shared spatial index;
   - `avoidance.zig`: the avoidance pass and the movement-intent write;
   - `test_support.zig`: test-only fixtures shared across the files.
 - `src/game/systems/collision.zig` generates deterministic contact streams.
@@ -611,6 +612,23 @@ once and records one tuner sample per step). Beside them: the 64-byte
 `compactRowWindows`/`compactSliceWindows` (main's range-order merge of a
 windowed gather's MAL rows or slice items).
 
+`selectBatchProfile` and `parallelForWithOptions` are the raw calls beneath
+`Dispatch`/`StageThreads`; a stage calls them directly only where the wrappers
+do not fit (collision broadphase's replay). A pass with at most one output per
+item tallies into a range tally sized by `maxRangeCount(item_count,
+range_alignment_items)`, the bound on ranges any partition can produce, so a
+retune never allocates in-stage. Per-range and per-row slots pad to the 64-byte
+`thread_shared_record_alignment` (slot arrays multiply); a contended singleton
+shared record aligns to `std.atomic.cache_line` (`shared_line`). A batched
+`RangeOutputStream` or `SimulationEvents` calls `finishWrite` once per commit
+after every range has written; it walks all range offsets, so a per-record call
+is O(N x ranges).
+
+`runtime_perf_log.BatchStage` names the stages whose batch timing the runtime
+perf log records (`recordBatch`); the change paths log their cost-driver stage
+(`nav_connect`, `nav_closure`, `path_resize_copy`, ...). Other timings are
+bench output (`--details`).
+
 ## Gameplay Data
 
 Gameplay states own their own `DataSystem`; it is not an app singleton. The
@@ -620,17 +638,52 @@ primitive visual intent, and stable sprite asset references.
 Collision bounds are stored as dedicated persistent gameplay data rather than
 being inferred from render visuals.
 
-Hot gameplay data is stored as scalar columns. The movement-body store exposes
-64-byte-aligned `position_x`, `position_y`, `previous_x`, `previous_y`,
-`velocity_x`, `velocity_y`, and `speed` slices so update processors can load
-lanes directly with `src/core/simd.zig`. Movement processor ranges align
+Hot gameplay data is stored as scalar columns. The movement-body store is one
+`MultiArrayList` row (`MovementBodyStore.rows`, `data_system/movement.zig`); it
+exposes `position_x`, `position_y`, `previous_x`, `previous_y`, `velocity_x`,
+`velocity_y`, and `speed` as `[]f32` columns (`HotF32Slice`) that update
+processors stream in `src/core/simd.zig` lanes with unaligned loads, since the
+list does not guarantee aligned column bases. Movement processor ranges align
 to `data_system.movement_range_alignment_items`, which maps one cache line to
-sixteen `f32` elements. The same store carries the dense simulation-scope columns
-(`tier`, `chunk_x/y`, `stagger_phase`, `always_active`) as separate aligned arrays
-in lockstep with the movement rows; the movement processor's slice omits them, so
-movement integration never touches their cache lines. Component masks decide
-whether an entity belongs to a system; hot processors iterate already aligned SoA
-slices.
+sixteen `f32` elements. The simulation-scope columns (`tier`, `chunk_x/y`,
+`stagger_phase`, `always_active`) are fields of the same row; the movement
+processor's slice omits them, so movement integration never reads their
+columns. Component masks decide whether an entity belongs to a system; hot
+processors iterate the SoA columns.
+
+A new per-entity concept follows the component-store pattern
+(`.claude/rules/simulation.md`); `PerceptionStore` in
+`data_system/perception.zig` is the compact example. Each piece lives in
+`data_system/`:
+
+- a `Component` tag appended in `types.zig`, and its `component_masks` entry;
+- an optional field on `EntityTemplate` and a `set_*` variant on
+  `StructuralCommand` (`types.zig`), handled in `structural.zig`: validation,
+  the preflight projection, the commit, and the component-change record;
+- a capacity need: a count in `StructuralCapacityNeeds` (`structural.zig`)
+  with its `u32` row-count limit, reserved before the commit applies;
+- the SoA store, a `std.MultiArrayList(Row)` with `append`, `set`, `get`,
+  `removeAt` (swap-remove; returns the entity moved into the hole), `slice`,
+  and `sliceConst`; the mutable slice exposes only the hot columns a system
+  writes, and the cold tunables stay const;
+- a dense-index field on the entity slot (`ai_perception_index`) that
+  `DataSystem` rekeys when `removeAt` moves a row;
+- `DataSystem` helpers: a validated `setX` (upsert; a retune keeps hot state),
+  `xConst`, `xSliceConst`, `xDenseIndex`, and `xSlice`.
+
+A store appends one row at a time through a private `ensureCapacityForOne`
+(reserve one, then `appendAssumeCapacity`), never reserving `n` and then
+`append`. A store whose ranges thread or run SIMD reserves
+`data_system.hotStoreCapacity(n)` (`n` rounded up to
+`movement_range_alignment_items`); `systems/affect.zig`, `particle.zig`,
+`collision.zig`, `perception.zig`, `ai_memory.zig`, and
+`collision_response.zig` hold file-local copies for their scratch rows. A hot
+gather loop captures `var row_slice = rows.slice()` once and appends with
+`addOneAssumeCapacity`, then `row_slice.len = rows.len` and
+`row_slice.set(rows.len - 1, row)`, so the slice stays valid without
+re-slicing per row. There is no shared helper: each row type carries its own
+copy (`appendAffectGatherRow` in `systems/affect.zig`, `appendParticleRow` in
+`systems/particle.zig`, `appendProxyRow` in `systems/collision.zig`).
 
 Gameplay states own their `DataSystem`, a transient `SimulationFrame`, and a
 state-owned `SimulationPipeline` for each fixed step. The state clears the
@@ -735,7 +788,7 @@ Simulation tiers and active scope belong in the same pipeline boundary. Tier and
 chunk metadata are dense SoA columns on the movement-body store
 (`tier`, `chunk_x/y`, `stagger_phase`, `always_active`), in lockstep with the
 movement rows so they exist exactly for simulated entities and the O(N) scope
-passes read/write aligned columns rather than scattered slots. The pipeline-owned
+passes read/write dense columns rather than scattered slots. The pipeline-owned
 `SimulationScopeSystem` (`src/game/systems/simulation_scope.zig`) is the backbone
 that derives the camera cognition halo from `WorldSystem` and selects which entities
 enter each stage; entity chunk columns are derived by the dedicated late `chunk_derive`
@@ -786,7 +839,8 @@ per-entity baseline, decay rate, and threshold. `AffectSystem` appraises them
 from perception/memory (optional per row) and emits rising/falling threshold
 edges only. Behavior arbitration (`src/game/systems/arbitration.zig`, Slice
 32) consumes these drive columns directly: `scoreBehaviors` sums each drive
-against a fixed `[drive_count][behavior_count]f32` weight table (fear→flee,
+against a fixed `[drive_count][behavior_count]f32` weight table whose rows follow
+the append-only `AiAffectDrive` declaration order (fear→flee,
 aggression→pursue, curiosity→investigate, fatigue→wander), scaled by the
 agent's own `AiAgent.gain_*` personality gains. `AiConfig.affect_slice`
 threads `DataSystem.aiAffectSliceConst()` into `AiSystem`, and
@@ -861,7 +915,7 @@ columns, which `threading.md` allows: `movement-apply-intents-sorted` is its
 row-order control.
 
 `CollisionSystem` is a high-throughput contact generator over entities that have
-both movement bodies and collision bounds. It owns warmed, 64-byte-aligned AABB
+both movement bodies and collision bounds. It owns warmed AABB
 proxy scratch, preserves a sorted sweep-and-prune order across fixed steps, and
 threads broadphase anchor ranges through `ThreadSystem` to emit candidate pairs
 once with SIMD Y-overlap filtering. Narrowphase then uses its own threaded batch

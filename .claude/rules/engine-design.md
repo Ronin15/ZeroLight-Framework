@@ -1,11 +1,14 @@
 # Engine Design
 
 Rules live only in `.claude/rules/`; docs describe and cite them. No two rules
-conflict. The rules and `docs/architecture.md` win over code: code that
-disagrees with them is wrong and is fixed. When a rule blocks a sound design,
-propose the edit with its reason; it changes in its rule file in the same
-change, never by loosening a rule to ease work. Owner decisions are not
-reopened.
+conflict. A rule states a principle specifically enough to act on. It names
+owner modules, boundaries, contract types, tools, and the stable APIs it
+guards against misuse; implementation details (helper sets, fields, stages,
+benches, examples) live in the doc it cites, which docs commits keep current.
+The rules and `docs/architecture.md` win over code: code that disagrees with
+them is wrong and is fixed. When a rule blocks a sound design, propose the
+edit with its reason; it changes in its rule file in the same change, never
+by loosening a rule to ease work. Owner decisions are not reopened.
 
 ## Target scale
 

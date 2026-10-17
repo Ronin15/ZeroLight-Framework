@@ -5,91 +5,79 @@ paths:
 
 # Threading
 
-- Work scaling with population, terrain change, or world size runs through the
-  thread system (across chunks, levels, and independent world instances) and
-  ships serial and threaded paths with parity tests in its first
-  implementation, under a named owner with immutable inputs and deterministic
-  owned outputs. Small fixed or cold one-off work may stay serial; the cost
-  model (`engine-design.md`) decides.
-- New threaded processor or stage work follows the existing stage pattern (an
-  optional stage-threads value with its own tuner, `selectBatchProfile`,
-  `parallelForWithOptions`, per-participant scratch, an inline path); changes
-  to the threading machinery itself belong to `ThreadSystem` in `src/app/`.
-  Each change path (dig/build, dense terrain change, the per-step request
-  load, a capacity resize) records the stage its design names as its cost
-  driver under its own `runtime_perf_log` `BatchStage`; every other stage
-  stays bench-only (`--details`), so the log is never flooded.
-- Multi-threaded writes go, verifiably at the call site, to disjoint per-worker
-  or per-range slots, never a shared appendable collection.
-- Reserve on the main thread strictly before dispatch, sized from the value the
-  dispatch uses; an undersized threaded reserve is a data race, not a clean
-  OOM.
-- Each worker job opens by asserting its write range against buffer length and
-  `range.index` against the dispatched range count.
-- The `FailingAllocator` proof exercises the real multi-worker `ThreadSystem`.
-- Merged output is deterministic from range order (count, prefix offsets,
-  write, range-index merge, batch commit), never worker timing, IDs, or global
-  atomics.
-- Call a batched `RangeOutputStream`/`SimulationEvents` `finishWrite` once per
-  commit, after every range writes; per-record `finishWrite` is O(N²).
-- A pass with at most one output per item writes its `[range.start, range.end)`
-  window of one aligned item-capacity buffer, counting into a padded tally
-  sized by `thread_system.maxRangeCount`; the main thread compacts or streams
-  the windows in range order.
-- Only data-dependent output (broadphase pairs) keeps per-range slots, reserved
-  at the seam to the per-item bound times the most items any range can cover
-  (never clamped to the total), with counted grow-and-replay on overflow.
-- Events that are a pure function of worker-written row state are emitted by
-  the main thread in row order after the join, with no event scratch (an
-  ordered merge, O(changed rows)).
-- A partitioned processor with a capped event stream emits in canonical row and
-  sub-kind order before the cap, with parity tests crossing event kinds across
-  ranges plus a capped case.
-- Hot loops iterate dense SoA columns; component masks are membership only,
-  never dynamic joins.
-- Worker ranges never share writable cache lines; pad only shared records with
-  real false-sharing risk. Per-range and per-row slots use the 64-byte
-  quantum, because slot arrays multiply; a contended singleton shared record (a
-  hot atomic every participant touches) aligns to `std.atomic.cache_line`. Ranges
-  writing rows that are disjoint by contract but scattered across a column are
-  allowed when a scattered-order bench is within spread of the same stream in
-  row order.
-- A batch dispatched from inside a batch of the same `ThreadSystem` (a worker
-  job, or the owner in its own ranges) runs forced inline on its caller's
-  `WorkerId`, keeping its range set and touching no tuner; it is a recovered
-  composition mistake, never a design. A thread that neither owns nor serves
-  the system panics, so jobs on any other thread (another system's worker, a
-  lane or service thread) run serial code paths, never `parallelFor`.
-- ThreadSanitizer (`-Dsanitize-thread`) ships no suppressions for framework
-  code; a suppression covers only uninstrumented third-party code and cites
-  its root cause. Changes to `thread_system.zig`, a lane thread, or any
-  threaded range write merge only after a clean TSan run.
-- Keep state transitions, structural changes, SDL/GPU/audio, asset and save
-  I/O, and resource ownership off workers unless a deferred boundary is
-  designed. Workers never mutate `DataSystem` structurally; structural commits
-  batch at the commit seam.
-- The main thread is not a fallback owner: it holds only those boundaries,
-  orchestration, and ordered merge/commit with O(1) work per item (claims,
-  index writes, fixed-size record copies, event appends). Per-item work that
-  grows (path cells, bytes, scans, sorts) threads, even under a per-step
-  budget. Never move scalable work to the main thread to ease ordering or
-  testing. A stage the tuner runs inline below its gate is the measured
-  efficiency choice, not a violation, as long as the stage has a threaded
-  path.
-- Multi-stage processors have per-stage tuners and visible timing stats; a
-  production processor owns its tuner state (`ThreadSystem`'s shared tuner is
-  for generic callers). A stage that preselects a thread profile passes its own
-  tuner with it.
-- Before changing thread policy or algorithm shape, isolate per-stage timing
-  and tuner state.
-- Worker participation follows measured timing and structural constraints,
-  never static item-count floors.
-- A tuner judges its stage's median dispatch against the gate, never the step
-  total, so many small dispatches keep a large step inline. A step's work
-  reaches its tuner as one sample: one dispatch, or rounds under one selected
-  profile recorded once; each design states dispatches per step, items per
-  dispatch, and per-item cost at each bench size. A stage's items are units
-  whose count tracks its work (runs, keys, rows), never a fixed partition
-  count whose work varies behind it.
-- Bench and diagnostic output reports inline stages as `inline`, never as a
-  zero-worker range size.
+How the thread system works: `docs/architecture.md` § Thread System.
+
+## What runs where
+
+- Work that grows with population, change size, or world size runs on
+  workers, across chunks, levels, and world instances. Small fixed or cold
+  one-off work may stay serial; the cost model (`engine-design.md`) decides.
+- The main thread is never a fallback owner. It holds only orchestration,
+  boundaries, and ordered merges with O(1) work per item. Per-item work that
+  grows threads, even under a per-step budget; scalable work never moves to
+  main to ease ordering or testing.
+- State transitions, structural changes, platform/GPU/audio calls, I/O, and
+  resource ownership stay off workers unless a deferred boundary is designed.
+  Workers never change `DataSystem` structure; structural commits batch at the
+  commit seam.
+- Every threaded stage ships a serial path with identical results and parity
+  tests in its first implementation, under a named owner with immutable inputs
+  and owned outputs. Running inline below the tuner's gate is a measured
+  choice, not a violation, as long as the threaded path exists.
+
+## Building a stage
+
+- There is one stage pattern, owned by `ThreadSystem`; new threaded work uses
+  it, and a change to threading machinery is a change to `ThreadSystem`, never
+  a local variant.
+- A stage's items are units of its work (rows, runs, keys), so the item count
+  tracks the work; never a fixed partition count with varying work behind it.
+- Each production stage owns its tuner and reports its own timing. A step's
+  work reaches the tuner as one sample, judged against the gate per dispatch,
+  never per step total. A design states dispatches per step, items per
+  dispatch, and per-item cost at each bench size.
+- Worker participation follows measured timing, never fixed item-count
+  floors. Before changing thread policy or a stage's shape, isolate that
+  stage's timing and tuner state.
+- A dispatch from inside a dispatch runs inline on its caller and touches no
+  tuner; it is a recovered mistake, never a design. A thread that neither owns
+  nor serves the thread system never dispatches.
+
+## Writes, capacity, and determinism
+
+- Workers write only to slots they exclusively own (per range or per worker),
+  verifiable at the call site; never to a shared appendable collection. Each
+  job opens by asserting its write range against the buffer length and its
+  range index against the dispatched range count.
+- Output capacity is reserved on the main thread before dispatch, sized from
+  the value the dispatch uses. An undersized reserve is a data race, not an
+  out-of-memory error.
+- Output with at most one record per item writes the item's own window; output
+  whose size depends on the data keeps per-range slots bounded at the seam by
+  the per-item bound times the most items a range can cover (never clamped to
+  the total), with counted grow-and-replay on overflow.
+- Results merge in range order and never depend on worker count, timing, IDs,
+  or global atomics. A batched stream commits once per batch, never per record.
+- Events derived from worker-written state are emitted by the main thread
+  after the join, in row order. A capped stream emits in canonical order
+  before the cap, with parity tests that cross ranges and hit the cap.
+- Hot loops iterate dense columns; membership masks never become dynamic
+  joins.
+
+## Memory between workers
+
+- Worker ranges never share a writable cache line. Pad only records with real
+  false-sharing risk: per-range and per-row slots to the cache-line quantum, a
+  contended shared record to the platform cache line. Disjoint but scattered
+  writes are allowed when a scattered-order bench is within spread of the same
+  work in row order.
+
+## Verification and diagnostics
+
+- Threaded code passes ThreadSanitizer with no suppressions for framework
+  code; a change to the thread system, a lane thread, or any threaded write
+  merges only after a clean run.
+- Allocation-free proofs run on the real multi-worker thread system.
+- The runtime perf log records each change path's cost-driver stage only;
+  every other stage's timing is bench output, so the log stays readable. Bench
+  output reports an inline stage as inline, never as a zero-worker range.

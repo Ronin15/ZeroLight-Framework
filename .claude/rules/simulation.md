@@ -8,128 +8,121 @@ paths:
 
 # Simulation, Events, Persistent Data
 
-## Pipeline and stage ordering
+How the pipeline works: `docs/simulation-tiers-and-pipeline.md`,
+`docs/architecture.md`.
 
-- `SimulationPipeline.update()` is the only fixed-step scheduler; never add a
-  second or promote it to a global ECS scheduler or app service. It only
-  iterates `stage_order`; no reflection, dynamic dependency graphs, or callback
+## One scheduler, declared dependencies
+
+- `SimulationPipeline` is the only fixed-step scheduler; never add a second or
+  promote it to a global ECS scheduler or app service. It iterates a fixed
+  stage order: no reflection, dynamic dependency graphs, or callback
   registries.
-- New features are pipeline-owned controllers or SoA processors; never grow
-  `GameDemoState.update` or `SimulationPipeline.update`.
-- Stage order is comptime-enforced in `simulation_pipeline.zig`:
-  `stageContract()` declares reads, writes, and carried inputs; `stage_order`
-  permutes `StageId`; reading an unwritten resource fails the build.
-- `carried` is a value no earlier stage writes (pre-`update` input, world
-  authoring, or next-step state from a later stage), disjoint from reads and
-  writes; anything an earlier stage writes is a read.
-- A new or reordered stage adds, in one change, its `PipelineResource` tags
-  (coarse, not one-off), `stage_order` position where its real dependencies
-  require, `stageContract()` arm, and `runStage` arm.
-- An ordering dependency not expressible as a resource gets a causal-effect
-  test, co-located in `simulation_pipeline.zig`, where the wrong order
-  observably changes the result. Fix ordering bugs in the contract, never by
-  weakening the check.
-- Event tags are distinct: `world_events` does not satisfy `perception_events`,
-  `affect_events`, or `structural_events`; `structural_events` are commit-seam
-  payloads outside the stage graph.
-- Entity chunk columns are written only by `chunk_derive`, after every position
-  writer.
+- Every stage declares what it reads, writes, and carries in, and the build
+  rejects an order where a stage reads what no earlier stage wrote. A carried
+  input is one no earlier stage writes (pre-step input, world authoring, or
+  next-step state); anything an earlier stage writes is a read.
+- A new or reordered stage declares all of it in one change, at the position
+  its real dependencies require; resource tags stay coarse, never one-off.
+- An ordering dependency the declarations cannot express gets a test, beside
+  the pipeline, where the wrong order changes the result. Order bugs are fixed
+  in the declarations, never by weakening the check.
+- Each kind of event is its own resource; one never satisfies another.
+  Structural events are commit-seam payloads outside the stage graph.
+- A derived column has exactly one writer, a derive stage that runs after
+  every writer of its source.
 
 ## Controllers and processors
 
-- Controllers own phase order, budgets, and handoff; they emit frame outputs or
+- New behavior is a pipeline-owned controller or SoA processor; it never
+  grows a state's update or the pipeline's update.
+- Controllers own phase order, budgets, and handoff, and emit frame outputs or
   deferred commands through typed `DataSystem` views. They never hold
-  per-entity stores, handles, or hidden RNG, and never replace SoA processors.
-- AI, pathfinding, and rules emit intents or deferred commands, never mutating
-  unrelated stores; incompatible requests have a defined priority.
+  per-entity stores, handles, or hidden RNG, and never replace processors.
+- A system changes only state it owns; toward anything else it emits intents
+  or deferred commands, and competing requests have a defined priority.
 - RNG is explicit state passed through the processor boundary, never hidden or
   thread-local.
-- Enemies, hazards, pickups, and world objects are plain entities processed by
-  systems. Collision bounds are dedicated data, never inferred from visuals.
+- Gameplay objects are plain entities processed by systems. Each concern has
+  its own data (collision bounds are never inferred from visuals).
 - A static body changes position, bounds, or level only through structural
-  commands; consumers of the static-collider rows rely on it.
-- Neighbor queries use the shared `SpatialIndexSystem`, never a private grid
-  (collision sweep-and-prune is the exception).
-- Locomotion flows `navigation_intents` → steering → `intents`; non-locomotion
-  uses `action_intents`; never dual-write or overload `NavigationIntent`.
-- Audio policy lives in `AudioController`; cognition never reads
-  `AudioCommandBuffer`.
+  commands; consumers of static data rely on it.
+- Neighbor queries share the one `SpatialIndexSystem`, never a private grid;
+  collision's sweep-and-prune is the one exception.
+- Each purpose has one intent stream: locomotion flows from navigation
+  intents through steering to movement intents, everything else is an action
+  intent; never dual-write or overload a stream.
+- A service's policy lives in its controller (audio in `AudioController`);
+  cognition never reads output command buffers.
 - World surfaces live in `WorldSystem`; the pipeline owns no tile storage,
   atlas metadata, or camera policy.
 
 ## Scope and tiers
 
-- Simulation scope (tiers, bands, cadence) derives only from the
-  fixed-step `sim_view` through `simViewRegion`; simulation never reads the
-  render window (`visibleChunkRegion()`).
-- Tiers are capability-based and set fidelity, never whether an entity
-  advances (`engine-design.md` § Target scale); render visibility controls draw
-  construction only; a scope pin never bypasses render visibility.
-- A test that must exclude distance effects (every agent in the nearest band)
-  uses a full-extent rect or `always_active`; in play, fidelity falls with
-  distance.
+- Simulation fidelity derives only from the fixed-step simulation view, never
+  from the render window.
+- Tiers set fidelity, never whether an entity advances (`engine-design.md`
+  § Target scale). Render visibility controls drawing only, and a scope pin
+  never bypasses it.
+- A test that must exclude distance effects puts every agent in the nearest
+  band (a full-extent view or always-active rows); in play, fidelity falls
+  with distance.
 
 ## Determinism
 
 - Same seed, initial state, and per-step input give bit-identical persistent
   state for any worker count, range size, tuner decision, render cadence, or
   wall-clock timing.
-- No wall-clock value, worker ID, `BatchStats`/tuner state, or render state
-  feeds simulation state.
-- No `@setFloatMode(.optimized)` or `@mulAdd` in `src/`.
-- A partition-dependent result is fixed in its owning module with a
+- No wall-clock value, worker ID, batch or tuner state, or render state feeds
+  simulation state.
+- No relaxed float modes (`@setFloatMode(.optimized)`) or fused multiply-add
+  (`@mulAdd`) in `src/`; both change results across targets.
+- A partition-dependent result is fixed in its owning module, with a
   serial-vs-threaded parity test there.
 
 ## Events and streams
 
-- Events are low-volume state transitions only; high-volume per-step data lives
-  in component columns or frame streams.
-- Event payloads are scalar: IDs, enums, coordinates, small values; never
-  pointers, slices, handles, asset paths, allocators, or services.
+- Events are low-volume state transitions; high-volume per-step data lives in
+  component columns or frame streams.
+- Event payloads are scalar (IDs, enums, coordinates, small values), never
+  pointers, slices, handles, paths, allocators, or services.
 - Events are phase outputs, never callbacks, string topics, or pub/sub. A
   consumer that emits more events names the next phase or defers to the next
   step; no recursive redispatch.
-- Every `EventProducerId` declares `maxEventsPerStep`; capacity is reserved
-  before the step. Required events protect correctness and a required-append
-  failure is a bug; diagnostic events may drop with a count.
-- Frame streams are valid only within the current step; `RangeOutputStream`
-  writers write exactly the declared count.
-- Preflight structural and event capacity before queuing; commits are
+- Every event producer declares its maximum per step, and capacity is reserved
+  before the step. A required event protects correctness and failing to append
+  it is a bug; a diagnostic event may drop with a count.
+- Frame streams live for one step; a stream writer writes exactly the count it
+  declared.
+- Structural and event capacity is preflighted before queuing; commits are
   all-or-fail and publish events only after success. `DataSystem` is the only
-  structural-command applier. Post-commit reactions touch disjoint state and
-  stay order-independent.
+  structural-command applier, and post-commit reactions touch disjoint state
+  in any order.
 
 ## Persistent data
 
-- `DataSystem` owns persistent gameplay data (entity IDs, generations, masks,
-  dense typed SoA stores). App, render, SDL/GPU, input-frame, thread, and event
-  services, asset-loading state, and per-step scratch are never persistent
-  `DataSystem` fields; processors borrow slices plus runtime services.
-- A new per-entity concept follows the component-store pattern in
-  `data_system/` (`Component` tag, mask, `EntityTemplate` field,
-  `StructuralCommand` variant, capacity need, SoA store, const slice, slot
-  index, validated set/get/slice helpers). Component tags append in landing
-  order.
-- Persistent gameplay and render-prep data store stable IDs (`SpriteAssetId`,
-  `AudioAssetId`) and render depth as enum intent, never string paths,
-  `TextureId`, leases, prepared sprite records, audio handles, or
-  renderer-owned resources. Stable IDs convert to texture IDs at the
-  render-prep boundary.
+- `DataSystem` owns persistent gameplay data. Services (app, render, platform,
+  input, threads, events), asset-loading state, and per-step scratch are never
+  persistent fields; processors borrow slices plus runtime services.
+- A new per-entity concept follows the one component-store pattern
+  (`docs/architecture.md` § Gameplay Data), never a side store. Component
+  tags append in landing order.
+- Persistent and render-prep data store stable IDs and enum intent, never
+  paths, GPU or texture handles, leases, prepared records, or renderer-owned
+  resources; stable IDs convert at the render-prep boundary.
 - A version number (format, schema, checksum tag) bumps relative to its live
   value (live + 1) in the change that needs it.
 
 ## AI and affect
 
-- `scoreBehaviors` / `selectSticky` / `resolveGoal` stay the expandable path:
-  utility scores plus sticky selection, never exclusive FSMs or behavior trees.
-- Emotion drives behavior through a table over `AiAffectDrive`; a new feeling
-  appends an `AiAffectDrive` tag (append-only), its columns, one appraisal path,
-  and one weight-table row; never a parallel emotion system or a hard-coded
-  drive branch.
+- AI decisions stay the expandable path: utility scores plus sticky
+  selection and goal resolution, never exclusive FSMs or behavior trees.
+- Emotion drives behavior through a weight table over an append-only drive
+  enum; a new feeling adds a drive, its columns, one appraisal path, and one
+  table row, never a parallel emotion system or a hard-coded branch.
 - Drives are independent continuous `[0,1]` columns; discrete states derive
-  from thresholds with hysteresis; only threshold crossings become events.
+  from thresholds with hysteresis, and only threshold crossings become events.
 - Missing perception, memory, or affect contributes zero signal and never
   excludes an agent.
 - Goals are per-agent and multi-source, never broadcast.
-- Authoring is data resolved at load into enums and gain tables; hot paths
-  never parse JSON or hash behavior names.
+- Authoring is data resolved at load into enums and tables; hot paths never
+  parse or hash names.

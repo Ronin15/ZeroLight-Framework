@@ -484,6 +484,10 @@ other threaded stage; production leaves them at their defaults.
 - reserves renderer command capacity after structural commits and before render
   submission.
 
+New behavior is a pipeline-owned controller or SoA processor reached through
+`stage_order`; `GameDemoState.update` and `SimulationPipeline.update` (an
+`inline for` over `stage_order`) take no per-feature logic.
+
 Render prep is outside `simulation.zig`. Persistent render intent stays in
 `DataSystem`; render code resolves stable asset IDs through `RuntimeAssets` and
 submits ordered renderer commands from explicit world/entity z-layer passes.

@@ -18,8 +18,8 @@ How it works: `docs/architecture.md` (pathfinding sections).
 - The per-step request budget is a fixed count, independent of worker count;
   requests past it defer deterministically.
 - Path results are consumed on later steps and never stall same-step movement.
-- Cache and pending keys are goal-keyed (`nav_version`, `agent_class`,
-  `goal_level`, `goal_cell`).
+- Cache and pending keys are goal-keyed: nav version, agent class, goal
+  level, and goal cell.
 - Reachability is maintained at every nav batch as connectivity IDs plus a
   one-way reach closure, and answered in O(1) at intake, status, and solve.
   It is never cached and never discovered by a failed search. `unavailable`

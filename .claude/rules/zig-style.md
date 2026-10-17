@@ -66,8 +66,7 @@ paths:
 ## Errors and resources
 
 - Keep error sets explicit (`error{SdlError}`), except `*anyopaque` +
-  `anyerror!T` vtables at cold type-erased service boundaries (`state.zig`,
-  `audio.zig`, `cache.zig`).
+  `anyerror!T` vtables at cold type-erased service boundaries.
 - Never swallow an error where diagnosis matters. Advance edge/latch state only
   on the success path (`enqueue(...) catch return; latch = true;`); otherwise it
   desyncs from the engine.
@@ -99,9 +98,9 @@ paths:
 
 ## Logging
 
-- Route runtime diagnostics through `src/core/logging.zig` scoped loggers
-  (`app`, `assets`, `audio`, `core`, `game`, `render`, `platform`,
-  `debug_overlay`, `perf`): `const log = @import("../core/logging.zig").render;`.
+- Route runtime diagnostics through the owning module's scoped logger in
+  `src/core/logging.zig`:
+  `const log = @import("../core/logging.zig").render;`.
 - Never call `std.log`/`std.log.scoped(...)` directly; `std.debug.print` is for
   `src/benchmarks/` CLI stdout only.
 - `info`/`debug` for lifecycle, config, and fallback; `warn` for recovered

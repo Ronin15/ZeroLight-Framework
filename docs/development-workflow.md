@@ -26,7 +26,11 @@ zig build idiom-lint # lint Zig naming, stdlib currency, and unsafe catch unreac
 `zig build idiom-lint` (`tools/lint_idioms.py`, also part of `verify`) checks
 the mechanical subset of `.claude/rules/zig-style.md` and
 `.claude/rules/memory-performance.md`; the script's docstring lists exactly what
-it enforces.
+it enforces. `catch unreachable` and `orelse unreachable` are allowed only on
+the `.init` constructors of the generational handles `TextureId`, `FontId`,
+`TextTextureId`, `EntityId`, and `LeaseHandle` (guarded at every call site),
+inside `test` blocks, or with a `// lint:allow catch-unreachable: <reason>`
+comment at the site.
 
 `zig build package` installs the selected-mode game binary and runtime assets.
 It does not install the `gpu-smoke` development executable.
@@ -516,6 +520,15 @@ Group index (files under `src/benchmarks/`):
 - `nav_size.zig`: not a group; the nav scaling groups' memory estimate and byte
   checks. A config whose nav storage exceeds the bench nav-size limit fails with
   its figure, never skips.
+
+Shared harness pieces live once, each in its owning file; a group declares its
+label and formatter in its definition (`.claude/rules/tests-benchmarks.md`).
+`suite.zig` owns options, cases, item codes, labels, stage shapes, and
+reporting; `fixtures.zig` owns worlds, bodies, thread systems, and tuners;
+`nav_size.zig` owns the nav memory estimate. `src/tests.zig` imports only
+`suite.zig` and `nav_size.zig`, so only their tests of their own pure utilities
+run under `zig build test`; no group file is called from a test, and fixture
+correctness rests on the asserts that fire in a real bench run.
 
 Optional arguments narrow or scale the run. Day-to-day runs target a group
 (`.claude/rules/tests-benchmarks.md`); the full-suite forms (`--profile`, bare
