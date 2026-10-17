@@ -15,10 +15,12 @@ paths:
   optional stage-threads value with its own tuner, `selectBatchProfile`,
   `parallelForWithOptions`, per-participant scratch, an inline path); changes
   to the threading machinery itself belong to `ThreadSystem` in `src/app/`.
-  Each change path (dig/build, dense terrain change, the per-step request
-  load, a capacity resize) records the stage its design names as its cost
-  driver under its own `runtime_perf_log` `BatchStage`; every other stage
-  stays bench-only (`--details`), so the log is never flooded.
+  Each change path (dig/build, dense terrain change, a capacity resize)
+  records the stage its design names as its cost driver under its own
+  `runtime_perf_log` `BatchStage`, and each threaded batch of the per-step
+  load records its own, so `production-step` splits every stage's main time;
+  every other stage stays bench-only (`--details`), so the log is never
+  flooded.
 - Multi-threaded writes go, verifiably at the call site, to disjoint per-worker
   or per-range slots, never a shared appendable collection.
 - Reserve on the main thread strictly before dispatch, sized from the value the
