@@ -71,6 +71,7 @@ comptime {
     _ = @import("game/systems/ai_memory.zig");
     _ = @import("game/systems/affect.zig");
     _ = @import("game/systems/arbitration.zig");
+    _ = @import("game/systems/banded_sort.zig");
     _ = @import("game/systems/chunk_list_map.zig");
     _ = @import("game/systems/collision.zig");
     _ = @import("game/systems/collision_response.zig");

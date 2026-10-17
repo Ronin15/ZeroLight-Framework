@@ -21,6 +21,10 @@ const std = @import("std");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const pdqSort = @import("../../core/sort.zig").pdq;
+const banded_sort = @import("banded_sort.zig");
+const BandOffsets = banded_sort.BandOffsets;
+const OwnedBands = banded_sort.OwnedBands;
+const band_count = banded_sort.band_count;
 const shl = simd.shiftLeftUint4;
 const builtin = @import("builtin");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
@@ -47,15 +51,6 @@ const cognition_stagger_n = @import("../simulation_scope.zig").cognition_stagger
 const keep_stagger_phase = @import("../simulation_scope.zig").keep_stagger_phase;
 
 pub const spatial_index_range_alignment_items: usize = movement_range_alignment_items;
-
-// Partition width of the threaded build, not a capacity: the index is the same for any
-// band count and splitters, and a range's band histogram stays on the worker stack.
-const band_count: usize = 64;
-// Population slots sampled per step for the band splitters: four per band, a fixed count.
-// Balance only.
-const splitter_sample_count: usize = 4 * band_count;
-// The golden ratio's fractional part in 0.64 fixed point.
-const sample_fraction_step: u64 = 0x9E3779B97F4A7C15;
 
 // The most cells per chunk edge: a row part's cells are one 64-bit mask. A format width,
 // never a refusal: a finer configured cell gets a coarser effective one.
@@ -889,6 +884,12 @@ const EntryRow = struct {
 // With a 16-slot range alignment every bucket range's windows start on a cache line.
 const SlotRowList = std.array_list.Aligned(SlotRow, .fromByteUnits(thread_shared_record_alignment));
 const SortKeyList = std.array_list.Aligned(SortKey, .fromByteUnits(thread_shared_record_alignment));
+// The build's banded sort over its entry keys, each its own sort key.
+const KeySort = banded_sort.BandedSort(SortKey, sortKeyOf);
+
+fn sortKeyOf(key: SortKey) SortKey {
+    return key;
+}
 
 comptime {
     // The cognition phase sits in the row's padding.
@@ -896,12 +897,6 @@ comptime {
     std.debug.assert(spatial_index_range_alignment_items * @sizeOf(SlotRow) % thread_shared_record_alignment == 0);
     std.debug.assert(spatial_index_range_alignment_items * @sizeOf(SortKey) % thread_shared_record_alignment == 0);
 }
-
-// A bucket range's keys before each band: band b's are `[offsets[b], offsets[b + 1])` of its
-// staging window.
-const BandOffsets = struct {
-    offsets: [band_count + 1]u32 = @splat(0),
-};
 
 // One sorted band's cells, and its row-part and chunk starts after its first entry: the
 // main thread adds whether the first entry starts each.
@@ -914,7 +909,7 @@ const BandTally = struct {
 };
 
 comptime {
-    for ([_]type{ BandOffsets, BandTally }) |T| std.debug.assert(@sizeOf(PaddedSlot(T)) % thread_shared_record_alignment == 0);
+    std.debug.assert(@sizeOf(PaddedSlot(BandTally)) % thread_shared_record_alignment == 0);
 }
 
 // The three stages of a threaded build, each under its own tuner.
@@ -1141,7 +1136,7 @@ pub const SpatialIndexSystem = struct {
     // `index_bucket` over the slots into the bands of `splitters` (nondecreasing cell
     // starts), the band starts on the main thread, `index_sort` over the keys, the band
     // prefixes and levels on the main thread, then `index_link` over the cells.
-    fn buildBanded(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation, stages: BuildStages, splitters: [band_count - 1]SortKey) !SpatialIndexStats {
+    fn buildBanded(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation, stages: BuildStages, splitters: KeySort.Splitters) !SpatialIndexStats {
         const slot_count = population.len();
         std.debug.assert(slot_count > 0 and self.slot_rows.items.len == slot_count and self.keys.items.len == slot_count);
         for (splitters[0 .. band_count - 2], splitters[1..]) |lower, upper| std.debug.assert(lower <= upper);
@@ -1173,9 +1168,7 @@ pub const SpatialIndexSystem = struct {
         if (entry_count == 0) return self.finishEmptyBuild(stats);
         const sort_selection = stages.sort.select(entry_count, spatial_index_range_alignment_items);
         var sort = SortJob{
-            .staging = self.staging.items,
-            .band_offsets = self.band_offsets.items,
-            .bucket_items_per_range = bucket_selection.items_per_range,
+            .windows = .{ .staging = self.staging.items, .band_offsets = self.band_offsets.items, .window_stride = bucket_selection.items_per_range },
             .band_start = band_start,
             .writer = self.bandWriter(),
             .tallies = self.band_tallies.items,
@@ -1409,20 +1402,11 @@ fn fillSlots(fill: *const FillContext, start: usize, end: usize, keys: []SortKey
     return count;
 }
 
-// A key's band among nondecreasing `splitters`: the count at or below it. Splitters sit at
-// cell starts, so a cell lies in exactly one band and the bands follow key order.
-fn bandOfKey(splitters: *const [band_count - 1]SortKey, key: SortKey) usize {
-    return std.sort.partitionPoint(SortKey, splitters, key, splitterAtOrBelow);
-}
-
-fn splitterAtOrBelow(key: SortKey, splitter: SortKey) bool {
-    return splitter <= key;
-}
-
-// `index_bucket`: one range of population slots.
+// `index_bucket`: one range of population slots. Splitters sit at cell starts, so a cell
+// lies in exactly one band and the bands follow key order.
 const BucketJob = struct {
     fill: FillContext,
-    splitters: [band_count - 1]SortKey,
+    splitters: KeySort.Splitters,
     // Range r's windows start at `r * items_per_range`.
     scratch: []SortKey,
     staging: []SortKey,
@@ -1431,8 +1415,7 @@ const BucketJob = struct {
 };
 
 // Fills the range's keys into its scratch window, then places them in its staging window
-// by band, in slot order within a band, and records the band offsets. The band search runs
-// twice per key rather than storing each band: scalar, a six-step binary search.
+// by band, in slot order within a band, and records the band offsets.
 fn bucketJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *BucketJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.band_offsets.len);
@@ -1440,24 +1423,14 @@ fn bucketJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start <= range.end and range.end <= job.fill.population.len());
     std.debug.assert(range.end <= job.scratch.len and range.end <= job.staging.len and range.end <= job.fill.slot_rows.len);
     const filled = job.scratch[range.start..][0..fillSlots(&job.fill, range.start, range.end, job.scratch[range.start..range.end])];
-    var offsets: [band_count + 1]u32 = @splat(0);
-    for (filled) |key| offsets[bandOfKey(&job.splitters, key) + 1] += 1;
-    for (1..band_count + 1) |band| offsets[band] += offsets[band - 1];
-    job.band_offsets[range.index].value.offsets = offsets;
-    var cursor = offsets;
-    for (filled) |key| {
-        const band = bandOfKey(&job.splitters, key);
-        job.staging[range.start + cursor[band]] = key;
-        cursor[band] += 1;
-    }
+    job.band_offsets[range.index].value = KeySort.placeByBand(&job.splitters, filled, job.staging[range.start..range.end]);
 }
 
 // `index_sort`: one range of entry keys. A range owns every nonempty band that starts in
 // it, so each band has one owner and the ranges' work follows their key counts.
 const SortJob = struct {
-    staging: []const SortKey,
-    band_offsets: []const PaddedSlot(BandOffsets),
-    bucket_items_per_range: usize,
+    // The bucket ranges' band-placed staging windows.
+    windows: KeySort.WindowSource,
     // Band b's keys, cell starts, and entries go to `[band_start[b], band_start[b + 1])`.
     band_start: [band_count + 1]u32,
     writer: BandWriter,
@@ -1474,25 +1447,14 @@ fn sortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start <= range.end and range.end <= entry_count);
     std.debug.assert(entry_count <= job.writer.keys.len and entry_count <= job.writer.band_cells.len and entry_count <= job.writer.entry_x.len);
     std.debug.assert(job.tallies.len == band_count);
-    var band = std.sort.partitionPoint(u32, job.band_start[0..band_count], range.start, startsBefore);
-    while (band < band_count and job.band_start[band] < range.end) : (band += 1) {
+    var owned = OwnedBands.init(&job.band_start, range.start, range.end);
+    while (owned.next()) |band| {
         const start = job.band_start[band];
         const end = job.band_start[band + 1];
-        if (start == end) continue;
-        var cursor: usize = start;
-        for (job.band_offsets, 0..) |slot, bucket_range| {
-            const window = job.staging[bucket_range * job.bucket_items_per_range ..];
-            const segment = window[slot.value.offsets[band]..slot.value.offsets[band + 1]];
-            @memcpy(job.writer.keys[cursor..][0..segment.len], segment);
-            cursor += segment.len;
-        }
-        std.debug.assert(cursor == end);
+        const gathered = KeySort.gatherBand(job.writer.keys[start..end], band, .{job.windows});
+        std.debug.assert(gathered == end - start);
         job.tallies[band].value = job.writer.finishBand(start, end);
     }
-}
-
-fn startsBefore(range_start: usize, band_start: u32) bool {
-    return band_start < range_start;
 }
 
 // Writes one band's slice of the sorted keys, cell starts, and entries.
@@ -1584,10 +1546,8 @@ fn linkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start <= range.end and range.end <= job.cell_prefix[band_count]);
     std.debug.assert(job.cells.len == job.cell_prefix[band_count] + 1 and job.rows.len == job.row_prefix[band_count] and job.chunk_records.len == job.chunk_prefix[band_count]);
     std.debug.assert(job.band_start[band_count] <= job.band_cells.len);
-    var band = std.sort.partitionPoint(u32, job.cell_prefix[0..band_count], range.start, startsBefore);
-    while (band < band_count and job.cell_prefix[band] < range.end) : (band += 1) {
-        if (job.cell_counts[band] != 0) linkBand(job, band);
-    }
+    var owned = OwnedBands.init(&job.cell_prefix, range.start, range.end);
+    while (owned.next()) |band| linkBand(job, band);
 }
 
 // The cell after `cell` in key order across the bands from `band`, or null past the last:
@@ -1673,34 +1633,23 @@ fn linkBand(job: *LinkJob, band: usize) void {
     }
 }
 
-// The `band_count - 1` band splitters: the cells at the band quantiles of up to
-// `splitter_sample_count` slots (slots without a body skipped), sorted, as cell start keys.
-// Every slot when they fit the sample, else slots at a golden-ratio sequence of fractions of
-// the slot count, which shares no period with a periodic slot order. Fixed work on the main
-// thread; with no sampled body every splitter is `max_key`.
-fn chooseSplitters(data: *const DataSystem, population: IndexPopulation, grid: Grid) [band_count - 1]SortKey {
+// The band splitters: the cells at the band quantiles of the sampled slots' bodies (slots
+// without a body skipped), as cell start keys. Fixed work on the main thread; with no
+// sampled body every splitter is `max_key`.
+fn chooseSplitters(data: *const DataSystem, population: IndexPopulation, grid: Grid) KeySort.Splitters {
     const slot_count = population.len();
-    const sample_count = @min(splitter_sample_count, slot_count);
     const movement = data.movementBodySliceConst();
-    var samples: [splitter_sample_count]SortKey = undefined;
+    var samples: [banded_sort.splitter_sample_count]SortKey = undefined;
     var valid: usize = 0;
-    var fraction: u64 = 0;
-    for (0..sample_count) |sample| {
-        fraction +%= sample_fraction_step;
-        // The high word of fraction * slot_count is below slot_count.
-        const slot: usize = if (slot_count <= splitter_sample_count) sample else @intCast(std.math.mulWide(u64, fraction, slot_count) >> 64);
-        const found = data.bodyLevelFaction(population.entity(slot)) orelse continue;
+    for (0..banded_sort.sampleCount(slot_count)) |sample| {
+        const found = data.bodyLevelFaction(population.entity(banded_sort.sampleSlot(sample, slot_count))) orelse continue;
         // The faction sits above the cell in the key, so a sample carries its body's.
         const faction = FactionSet.Indexer.indexOf(found.faction orelse .neutral);
         const key = keyForPosition(grid, found.level orelse 0, movement.previous_x[found.movement_body], movement.previous_y[found.movement_body], faction, 0);
         samples[valid] = key & ~cell_low_bits;
         valid += 1;
     }
-    var splitters: [band_count - 1]SortKey = @splat(max_key);
-    if (valid == 0) return splitters;
-    pdqSort(SortKey, samples[0..valid], {}, keyLessThan);
-    for (&splitters, 1..) |*splitter, band| splitter.* = samples[band * valid / band_count];
-    return splitters;
+    return KeySort.splittersFromSamples(samples[0..valid]);
 }
 
 // ---- Tests --------------------------------------------------------------------
@@ -2264,7 +2213,7 @@ test "the threaded index splits a one-row corridor, a cluster with a far outlier
         var band_start: usize = 0;
         for (0..band_count) |band| {
             var band_end: usize = band_start;
-            while (band_end < stats.entity_count and bandOfKey(&splitters, system.keys.items[band_end]) == band) band_end += 1;
+            while (band_end < stats.entity_count and KeySort.bandOfKey(&splitters, system.keys.items[band_end]) == band) band_end += 1;
             largest = @max(largest, band_end - band_start);
             band_start = band_end;
         }
