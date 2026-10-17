@@ -63,7 +63,11 @@ paths:
   dominated by other work is not. A threaded stage is judged on its
   `thread-adaptive-tuned-range` case (the production tuner) against its base;
   the other cases are controls, and the tuned case matches or beats the best
-  of them within spread.
+  of them within spread. The tuned case's report says which path is
+  production at a size: where it runs inline, the serial path is production
+  and is judged like the tuned case; where it threads, `serial-direct` is a
+  control, judged only for a worse growth order or added per-item work (a new
+  scan or indirection), never for a constant gap.
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).
