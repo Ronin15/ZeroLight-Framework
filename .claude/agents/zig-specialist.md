@@ -43,10 +43,12 @@ touch. Follow them and cite them by file; never restate them.
 5. Validate per `.claude/rules/build-validation.md`. Write `zig build test`
    output to a file and judge it by the exit code; a "failed command:" line
    echoing warn output is not a failure; on a real failure keep the failing
-   test's name and message. Run benches only to check a scaling bench's
-   asserts; the main session runs the landing's before/after, and profiling
-   goes to zig-debug-specialist. Never tune for a bench number unless the
-   brief names that case.
+   test's name and message.
+6. After validation, run the landing's one before/after with
+   `tools/bench_ab.py` on the groups the brief names, read only its summary
+   lines, and give each slower case its verdict (`tests-benchmarks.md`).
+   Never profile: a regression goes to zig-debug-specialist through the main
+   session. Never tune for a bench number unless the brief names that case.
 
 ## Report
 
