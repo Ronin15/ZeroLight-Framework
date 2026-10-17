@@ -140,7 +140,8 @@ pub const MovementBodyStore = struct {
         s.items(.tier)[index] = metadata.tier;
         s.items(.chunk_x)[index] = metadata.chunk.x;
         s.items(.chunk_y)[index] = metadata.chunk.y;
-        s.items(.level)[index] = metadata.level;
+        // Resolved by the caller: a scope row always holds a level.
+        s.items(.level)[index] = metadata.level.?;
         s.items(.stagger_phase)[index] = metadata.stagger_phase;
         s.items(.always_active)[index] = metadata.always_active;
     }

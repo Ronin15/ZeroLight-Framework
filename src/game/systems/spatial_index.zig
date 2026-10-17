@@ -44,6 +44,7 @@ const FactionSet = @import("../faction.zig").FactionSet;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 const WorldSystem = @import("../world/system.zig").WorldSystem;
 const cognition_stagger_n = @import("../simulation_scope.zig").cognition_stagger_n;
+const keep_stagger_phase = @import("../simulation_scope.zig").keep_stagger_phase;
 
 pub const spatial_index_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -2263,9 +2264,9 @@ const test_phases = [_]TestPhase{
     .{ .always_active = false, .stagger_phase = 3, .stored = 3 },
     .{ .always_active = false, .stagger_phase = 1, .stored = 1 },
     .{ .always_active = true, .stagger_phase = 2, .stored = every_cognition_phase },
-    .{ .always_active = false, .stagger_phase = 254, .stored = 254 },
-    .{ .always_active = false, .stagger_phase = 255, .stored = 254 },
-    .{ .always_active = true, .stagger_phase = 255, .stored = every_cognition_phase },
+    .{ .always_active = false, .stagger_phase = 2, .stored = 2 },
+    .{ .always_active = true, .stagger_phase = keep_stagger_phase, .stored = every_cognition_phase },
+    .{ .always_active = true, .stagger_phase = 0, .stored = every_cognition_phase },
 };
 
 // An odd count, so rows of one parity still meet every phase.

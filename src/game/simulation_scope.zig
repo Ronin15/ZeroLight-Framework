@@ -11,6 +11,13 @@ const std = @import("std");
 /// once every cognition_stagger_n fixed steps per entity, rotating by stagger_phase.
 pub const cognition_stagger_n: u8 = 4;
 
+/// `EntitySimulationMetadata.stagger_phase` sentinel: a metadata write keeps the row's phase.
+pub const keep_stagger_phase: u8 = std.math.maxInt(u8);
+
+comptime {
+    std.debug.assert(cognition_stagger_n <= keep_stagger_phase);
+}
+
 /// Simulation LOD bands as chunk distance from the camera-visible border. An
 /// entity's tier is the band its chunk falls into: within cognition_halo it
 /// thinks; out to locomotion_halo it moves+collides; out to kinematic_halo it
@@ -135,22 +142,26 @@ pub const ActiveRegion = struct {
 pub const EntitySimulationMetadata = struct {
     tier: SimulationTier = .cognition,
     chunk: ChunkCoord = .{},
-    /// Depth/level this entity occupies. NPCs are all level 0 today, so this
-    /// defaults to the surface; the tier policy weighs it through the cube LOD
-    /// distance so a multi-level world demotes off-level entities correctly.
-    level: u16 = 0,
-    /// Which step within the stagger cycle this entity runs cognition. Assigned at
-    /// movement-body append as dense_index % cognition_stagger_n: stable per entity,
-    /// preserved by setSimulationTier, but not index-correlated after swap-remove
-    /// churn. A full setSimulationMetadata write replaces it with the supplied value.
-    stagger_phase: u8 = 0,
+    /// Depth/level this entity occupies; the tier policy weighs it through the cube LOD
+    /// distance so a multi-level world demotes off-level entities correctly. A
+    /// setSimulationMetadata write takes it from the entity's `world_level` row when it has
+    /// one (a supplied level must match), else keeps the row's level at `null` (the default)
+    /// and writes any other value; a read returns the row's level.
+    level: ?u16 = null,
+    /// Which step within the stagger cycle this entity runs cognition, below
+    /// `cognition_stagger_n`. Assigned at movement-body append as
+    /// dense_index % cognition_stagger_n: stable per entity, preserved by
+    /// setSimulationTier, but not index-correlated after swap-remove churn. A
+    /// setSimulationMetadata write keeps the row's phase at `keep_stagger_phase` (the
+    /// default) and writes any other value; a read returns the row's phase.
+    stagger_phase: u8 = keep_stagger_phase,
     /// When true, the cognition-halo tier policy never demotes this entity
     /// regardless of its distance from the camera. Use for bosses, scripted
     /// enemies, and any NPC that must keep thinking even when far off-screen.
     always_active: bool = false,
 
-    pub fn validate(self: EntitySimulationMetadata) !void {
-        _ = self;
+    pub fn validate(self: EntitySimulationMetadata) error{InvalidStaggerPhase}!void {
+        if (self.stagger_phase != keep_stagger_phase and self.stagger_phase >= cognition_stagger_n) return error.InvalidStaggerPhase;
     }
 };
 

@@ -103,6 +103,8 @@ const StructuralPlanScratch = structural.StructuralPlanScratch;
 const NullStructuralChangeSink = structural.NullStructuralChangeSink;
 const NullStructuralCommitPreparer = structural.NullStructuralCommitPreparer;
 const EntitySimulationMetadata = @import("../simulation_scope.zig").EntitySimulationMetadata;
+const cognition_stagger_n = @import("../simulation_scope.zig").cognition_stagger_n;
+const keep_stagger_phase = @import("../simulation_scope.zig").keep_stagger_phase;
 const SimulationScopeStats = @import("../simulation_scope.zig").SimulationScopeStats;
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
 const simd = @import("../../core/simd.zig");
@@ -258,15 +260,28 @@ pub const DataSystem = struct {
         return self.movement_bodies.scopeMetadataAt(di);
     }
 
-    /// Writes the full scope metadata for an entity into its dense scope row.
-    /// Requires a movement body; returns error.InvalidEntity otherwise.
+    /// Writes the full scope metadata for an entity into its dense scope row, keeping the
+    /// row's stagger phase when `metadata.stagger_phase` is `keep_stagger_phase`. The level
+    /// comes from the entity's `world_level` row when it has one, and a supplied level must
+    /// match it; without one, a `null` level keeps the row's.
+    /// Requires a movement body; returns error.InvalidEntity otherwise, and
+    /// error.InvalidStaggerPhase for any other phase not below `cognition_stagger_n`.
     pub fn setSimulationMetadata(self: *DataSystem, id: EntityId, metadata: EntitySimulationMetadata) !void {
         try metadata.validate();
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         const di: usize = slot.movement_body_index orelse return error.InvalidEntity;
-        self.tier_counts[@backingInt(self.movement_bodies.tierAt(di))] -= 1;
+        const stored = self.movement_bodies.scopeMetadataAt(di);
+        var resolved = metadata;
+        if (resolved.stagger_phase == keep_stagger_phase) resolved.stagger_phase = stored.stagger_phase;
+        std.debug.assert(resolved.stagger_phase < cognition_stagger_n);
+        if (slot.world_level_index) |world_level_index| {
+            const world_level = self.world_levels.get(@intCast(world_level_index));
+            if (metadata.level) |level| std.debug.assert(level == world_level);
+            resolved.level = world_level;
+        } else if (resolved.level == null) resolved.level = stored.level;
+        self.tier_counts[@backingInt(stored.tier)] -= 1;
         self.tier_counts[@backingInt(metadata.tier)] += 1;
-        self.movement_bodies.setScopeMetadata(di, metadata);
+        self.movement_bodies.setScopeMetadata(di, resolved);
         self.snapInterpolationIfStill(di, metadata.tier);
     }
 
@@ -433,7 +448,7 @@ pub const DataSystem = struct {
         // sync it onto the new scope row.
         if (slot.world_level_index) |world_level_index| {
             const level = self.world_levels.get(@intCast(world_level_index));
-            try self.syncScopeLevelFromWorldLevel(id, level);
+            self.syncScopeLevelFromWorldLevel(id, level);
         }
     }
 
@@ -761,7 +776,7 @@ pub const DataSystem = struct {
             slot.world_level_index = dense_index;
             slot.addComponent(.world_level);
         }
-        try self.syncScopeLevelFromWorldLevel(id, level);
+        self.syncScopeLevelFromWorldLevel(id, level);
     }
 
     pub fn worldLevelConst(self: *const DataSystem, id: EntityId) ?u16 {
@@ -952,12 +967,15 @@ pub const DataSystem = struct {
         return @intCast(dense_index);
     }
 
-    fn syncScopeLevelFromWorldLevel(self: *DataSystem, id: EntityId, level: u16) !void {
-        const metadata = self.simulationMetadata(id) orelse return;
+    // Rewrites only the scope row's level; the rest of the row is as stored.
+    fn syncScopeLevelFromWorldLevel(self: *DataSystem, id: EntityId, level: u16) void {
+        const slot = self.resolveSlotConst(id) orelse return;
+        const di: usize = slot.movement_body_index orelse return;
+        var metadata = self.movement_bodies.scopeMetadataAt(di);
         if (metadata.level == level) return;
-        var updated = metadata;
-        updated.level = level;
-        try self.setSimulationMetadata(id, updated);
+        metadata.level = level;
+        self.movement_bodies.setScopeMetadata(di, metadata);
+        self.snapInterpolationIfStill(di, metadata.tier);
     }
 
     pub const applyStructuralCommands = structural.applyStructuralCommands;
@@ -1311,7 +1329,7 @@ test "entity simulation metadata defaults and rejects stale ids" {
     const entity = try data.createEntity();
     try std.testing.expect(data.simulationMetadata(entity) == null);
     try data.setMovementBody(entity, .{});
-    try std.testing.expectEqual(EntitySimulationMetadata{}, data.simulationMetadata(entity).?);
+    try std.testing.expectEqual(EntitySimulationMetadata{ .level = 0, .stagger_phase = 0 }, data.simulationMetadata(entity).?);
     try data.setSimulationMetadata(entity, .{
         .tier = .locomotion,
         .chunk = .{ .x = 4, .y = -2 },
@@ -1321,6 +1339,7 @@ test "entity simulation metadata defaults and rejects stale ids" {
         .tier = .locomotion,
         .chunk = .{ .x = 4, .y = -2 },
         .level = 3,
+        .stagger_phase = 0,
     }, data.simulationMetadata(entity).?);
     // The scope columns view exposes the same level the metadata round-tripped.
     try std.testing.expectEqual(@as(u16, 3), data.scopeColumnsSliceConst().level[0]);
@@ -1332,7 +1351,57 @@ test "entity simulation metadata defaults and rejects stale ids" {
     const reused = try data.createEntity();
     try std.testing.expectEqual(entity.index, reused.index);
     try data.setMovementBody(reused, .{});
-    try std.testing.expectEqual(EntitySimulationMetadata{}, data.simulationMetadata(reused).?);
+    try std.testing.expectEqual(EntitySimulationMetadata{ .level = 0, .stagger_phase = 0 }, data.simulationMetadata(reused).?);
+}
+
+test "a simulation metadata write keeps the row's stagger phase and level unless it names them" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    // Movement row 1's append-assigned phase is 1 % cognition_stagger_n.
+    try data.setMovementBody(try data.createEntity(), .{});
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{});
+    const appended_phase = data.simulationMetadata(entity).?.stagger_phase;
+    try std.testing.expectEqual(@as(u8, 1 % cognition_stagger_n), appended_phase);
+
+    try data.setSimulationMetadata(entity, .{ .tier = .locomotion, .chunk = .{ .x = 3, .y = 1 }, .level = 2 });
+    const kept = data.simulationMetadata(entity).?;
+    try std.testing.expectEqual(appended_phase, kept.stagger_phase);
+    try std.testing.expectEqual(SimulationTier.locomotion, kept.tier);
+    try std.testing.expectEqual(@as(u16, 2), kept.level);
+
+    try data.setSimulationMetadata(entity, .{ .tier = .cognition, .stagger_phase = 3 });
+    try std.testing.expectEqual(@as(u8, 3), data.simulationMetadata(entity).?.stagger_phase);
+    try std.testing.expectEqual(@as(?u16, 2), data.simulationMetadata(entity).?.level);
+    try data.setSimulationMetadata(entity, .{ .tier = .cognition });
+    try std.testing.expectEqual(@as(u8, 3), data.simulationMetadata(entity).?.stagger_phase);
+    try std.testing.expectEqual(@as(?u16, 2), data.simulationMetadata(entity).?.level);
+
+    try std.testing.expectError(error.InvalidStaggerPhase, data.setSimulationMetadata(entity, .{ .stagger_phase = cognition_stagger_n }));
+    try std.testing.expectEqual(@as(u8, 3), data.simulationMetadata(entity).?.stagger_phase);
+}
+
+test "a simulation metadata write takes the level from the entity's world level row" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{});
+    try data.setWorldLevel(entity, 5);
+    try std.testing.expectEqual(@as(?u16, 5), data.simulationMetadata(entity).?.level);
+
+    // An omitted level reads the world-level row, never the field default.
+    try data.setSimulationMetadata(entity, .{ .tier = .locomotion, .chunk = .{ .x = 2, .y = 7 } });
+    try std.testing.expectEqual(@as(?u16, 5), data.simulationMetadata(entity).?.level);
+    try std.testing.expectEqual(@as(u16, 5), data.scopeColumnsSliceConst().level[0]);
+    try data.setSimulationMetadata(entity, .{ .tier = .cognition, .level = 5 });
+    try std.testing.expectEqual(@as(?u16, 5), data.simulationMetadata(entity).?.level);
+
+    // A later world-level move carries onto the row, and the next write keeps it.
+    try data.setWorldLevel(entity, 0);
+    try data.setSimulationMetadata(entity, .{ .tier = .kinematic });
+    try std.testing.expectEqual(@as(?u16, 0), data.simulationMetadata(entity).?.level);
 }
 
 test "entity simulation metadata resets with retained capacity" {
@@ -1350,7 +1419,7 @@ test "entity simulation metadata resets with retained capacity" {
     const reused = try data.createEntity();
     try std.testing.expectEqual(entity.index, reused.index);
     try data.setMovementBody(reused, .{});
-    try std.testing.expectEqual(EntitySimulationMetadata{}, data.simulationMetadata(reused).?);
+    try std.testing.expectEqual(EntitySimulationMetadata{ .level = 0, .stagger_phase = 0 }, data.simulationMetadata(reused).?);
 }
 
 test "full active scope stats count tiers and current stage slices" {

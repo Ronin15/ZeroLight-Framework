@@ -1911,7 +1911,7 @@ fn fillCognitionPopulation(data: *DataSystem, count: usize) !void {
 }
 
 // `count` cognition-tier AI agents in one chunk of the test grid on one level, of every
-// faction, at every stagger phase and one no step reaches, some `always_active`.
+// faction, at every stagger phase, some `always_active`.
 fn fillDenseCognitionPopulation(data: *DataSystem, count: usize) !void {
     const chunk_world: f32 = 512;
     var prng = std.Random.DefaultPrng.init(0xd3_95e1);
@@ -1922,8 +1922,7 @@ fn fillDenseCognitionPopulation(data: *DataSystem, count: usize) !void {
         try data.setMovementBody(e, .{ .position = position, .previous_position = position });
         try data.setAiAgent(e, .{ .active_behavior = .wander });
         try data.setFaction(e, @fromBackingInt(@intCast(index % 4)));
-        const stagger_phase: u8 = if (index % 17 == 5) 200 else @intCast(index % cognition_stagger_n);
-        try data.setSimulationMetadata(e, .{ .tier = .cognition, .stagger_phase = stagger_phase, .always_active = index % 13 == 0 });
+        try data.setSimulationMetadata(e, .{ .tier = .cognition, .stagger_phase = @intCast(index % cognition_stagger_n), .always_active = index % 13 == 0 });
     }
 }
 
