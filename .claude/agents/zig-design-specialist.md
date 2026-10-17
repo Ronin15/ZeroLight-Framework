@@ -75,16 +75,20 @@ section with nothing new is omitted.
   pipeline/controller placement.
 - **Data layout and lifetime** for every persistent and transient set,
   settled before any kernel (`memory-performance.md` § Data-oriented design);
-  each SIMD verdict follows from the loop shape that layout produces.
+  each SIMD verdict follows from the loop shape that layout produces. A
+  change to an order or layout other stages consume lists every consumer
+  and how it reads under the new order, checked against the same section.
+  A design that relies on a bench-gated allowance (`threading.md` scattered
+  writes) names the layout it falls back to if the bench fails.
 - **Ordered processor list**: reads, writes, output buffers, position; a new or
   reordered stage names its `PipelineResource` tags and `stage_order` position.
 - **Budgets, capacities, thresholds**: class, sizing, growth point, degradation
   path, and proofs, checked against destruction-scale workloads.
 - **Hot-loop table** (mandatory whenever the change adds a loop or changes a
-  loop's cost or thread placement; otherwise one line saying none): one row
-  for every per-step, per-frame, per-request, and per-change loop the change
-  adds or changes, plus inherited loops in the area whose cost or thread
-  placement it changes. Columns:
+  loop's cost, thread placement, or access order; otherwise one line saying
+  none): one row for every per-step, per-frame, per-request, and per-change
+  loop the change adds or changes, plus inherited loops whose cost, thread
+  placement, or access order it changes. Columns:
   loop (`file:line`), what it scales with, runs on (workers / main), threaded
   path (the existing stage pattern it copies, `file:line`) or why it stays
   serial (fixed count and small, by the cost model; work under a per-step

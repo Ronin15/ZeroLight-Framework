@@ -55,10 +55,10 @@ orchestrates, verifies every agent claim against live code, and reports.
 - `zig-review-specialist` reviews each slice, or each landing of a
   multi-commit slice, before it is committed; fixes fold into that commit.
   Every real finding is reported and checked against live code and
-  `docs/architecture.md`; structural findings go to design, local ones to
-  `zig-specialist`. A finding not fixed in its landing becomes a checklist
-  item in the owning slice with its `file:line` and failure scenario, never
-  only a memory note.
+  `docs/architecture.md`; a finding with a stated local fix goes to
+  `zig-specialist`, one whose fix is an open choice to design. A finding
+  not fixed in its landing becomes a checklist item in the owning slice
+  with its `file:line` and failure scenario, never only a memory note.
 - A failure that shows the design was not planned against a critical
   project need (the cost model, threading, chunk ownership, scale) goes to a
   design pass; a defect inside a design that meets them is fixed in its

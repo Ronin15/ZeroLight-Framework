@@ -45,7 +45,10 @@ Report every real finding, ranked. Severity:
 - **Low**: maintainability, naming, duplication, doc drift.
 
 Tag each finding **structural** (a symptom of a design that fails the cost
-model; routes to design) or **local**.
+model) or **local**. Every finding gives its fix direction; a structural
+finding whose fix the review can state as one local change routes to
+zig-specialist with that call, and only one whose fix is an open choice
+routes to design.
 
 ## Procedure
 
