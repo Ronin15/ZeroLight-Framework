@@ -167,14 +167,8 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr = if (threads) |*thread_system| thread_system else null;
 
-    for (0..options.warmup_iterations) |_| _ = try runOnce(&system, data, geometry, thread_ptr, case);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!system.bucket_tuner.isSettled() or !system.sort_tuner.isSettled() or !system.link_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runOnce(&system, data, geometry, thread_ptr, case);
-        }
-    }
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(system.bucket_tuner.isSettled() and system.sort_tuner.isSettled() and system.link_tuner.isSettled())) _ = try runOnce(&system, data, geometry, thread_ptr, case);
     const bucket_settled_before_measurement = if (case.adaptive) system.bucket_tuner.isSettled() else false;
     const sort_settled_before_measurement = if (case.adaptive) system.sort_tuner.isSettled() else false;
 

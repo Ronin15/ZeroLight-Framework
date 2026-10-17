@@ -1183,17 +1183,10 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     } else null;
 
     var unused_timing: BatchTiming = .{};
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.next(tunersSettled(world, &revert_tuners))) {
         _ = try runBatchIteration(&fixture, &edit, edit_threads, &revert_tuners, &unused_timing);
         _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!tunersSettled(world, &revert_tuners) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runBatchIteration(&fixture, &edit, edit_threads, &revert_tuners, &unused_timing);
-            _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
-        }
     }
     const plan_settled = if (case.adaptive) world.terrain_edit_plan_tuner.isSettled() else false;
     const write_settled = if (case.adaptive) world.terrain_edit_write_tuner.isSettled() else false;
@@ -1502,17 +1495,10 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     nav.threads = thread_ptr;
     nav.setTuners(case);
 
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(nav.stageTunersSettled(false))) {
         _ = try runNavIteration(io, &nav, workload);
         if (workload == .ramp) try resetNavRamps(&nav);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!nav.stageTunersSettled(false) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runNavIteration(io, &nav, workload);
-            if (workload == .ramp) try resetNavRamps(&nav);
-        }
     }
     const reported_tuners = reportedNavTuners(&nav, workload);
     const remask_settled = if (case.adaptive) reported_tuners.nav.getPtrConst(.remask).isSettled() else false;
@@ -1856,15 +1842,9 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     } else null;
 
     var unused_timing: NavBatchTiming = .{};
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.next(navTunersSettled(&nav, &revert_tuners))) {
         _ = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, &revert_tuners, thread_ptr, &unused_timing);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!navTunersSettled(&nav, &revert_tuners) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, &revert_tuners, thread_ptr, &unused_timing);
-        }
     }
     const remask_settled = if (case.adaptive) system.tuners.nav.getPtrConst(.remask).isSettled() else false;
     const patch_settled = if (case.adaptive) system.tuners.nav.getPtrConst(.patch).isSettled() else false;

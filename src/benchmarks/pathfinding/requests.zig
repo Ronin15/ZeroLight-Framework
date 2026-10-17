@@ -396,17 +396,10 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const system = &fixture.system;
     setPathStageTuners(system, case);
 
-    for (0..1 + coldWarmup(options)) |_| {
+    var warm = suite.Warmup.custom(case, 1 + coldWarmup(options), coldSettleLimit(options));
+    while (warm.next(system.tuners.solve.isSettled())) {
         system.clearRuntimeState();
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            system.clearRuntimeState();
-            _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
-        }
     }
     const settled = if (case.adaptive) system.tuners.solve.isSettled() else false;
 
@@ -465,17 +458,11 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     const warmup_count = if (mode.isCold()) coldWarmup(options) else options.warmup_iterations;
     const measure_count = if (mode.isCold()) coldIterations(options) else options.iterations;
-    for (0..warmup_count) |_| {
+    // Only a cold mode settles: the hot cache's steps never train the solve tuner.
+    var warm = suite.Warmup.custom(case, warmup_count, if (mode.isCold()) coldSettleLimit(options) else 0);
+    while (warm.next(system.tuners.solve.isSettled())) {
         if (mode.isCold()) system.clearRuntimeState();
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
-    }
-    if (case.adaptive and mode.isCold()) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            system.clearRuntimeState();
-            _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
-        }
     }
     const settled_before_measurement = if (case.adaptive) system.tuners.solve.isSettled() else false;
 

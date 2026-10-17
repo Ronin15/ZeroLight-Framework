@@ -131,17 +131,10 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var fixed_tuner = suite.adaptiveTunerForCase(case, range_alignment_items);
 
     var dispatches: usize = 0;
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.custom(case, options.warmup_iterations, suite.adaptiveSettleIterationLimit(options));
+    while (warm.next(case.adaptive and tunerSettled(thread_ptr.?, &fixed_tuner))) {
         _ = dispatchOnce(&context, thread_ptr, &fixed_tuner, case);
         dispatches += 1;
-    }
-    if (case.adaptive) {
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        var settle_guard: usize = 0;
-        while (!tunerSettled(thread_ptr.?, &fixed_tuner) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = dispatchOnce(&context, thread_ptr, &fixed_tuner, case);
-            dispatches += 1;
-        }
     }
     const settled_before_measurement = case.adaptive and tunerSettled(thread_ptr.?, &fixed_tuner);
 

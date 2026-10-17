@@ -242,14 +242,8 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 
     // Warm so the abstract buffers are at high-water capacity (the steady path is
     // allocation-free) and the tuners have trained an inline baseline before timing.
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try runToggle(&fixture, io, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!toggleTunersSettled(&fixture.system.tuners) or !toggleTunersSettled(&fixture.revert_tuners)) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runToggle(&fixture, io, thread_ptr);
-        }
-    }
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.next(toggleTunersSettled(&fixture.system.tuners) and toggleTunersSettled(&fixture.revert_tuners))) _ = try runToggle(&fixture, io, thread_ptr);
     const remask_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.remask).isSettled() else false;
     const patch_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.patch).isSettled() else false;
 
@@ -438,14 +432,8 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     fixtures.setNavTuners(&fixture.system, case);
     fixtures.setSpliceTuners(&fixture.colliders, case);
 
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try fixture.moveAndReact(io, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.system.tuners.nav_mark.isSettled() or !fixture.system.tuners.nav.getPtrConst(.plan).isSettled() or !fixture.system.tuners.nav.getPtrConst(.remask).isSettled() or !fixture.system.tuners.nav.getPtrConst(.patch).isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try fixture.moveAndReact(io, thread_ptr);
-        }
-    }
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.next(fixture.system.tuners.nav_mark.isSettled() and fixture.system.tuners.nav.getPtrConst(.plan).isSettled() and fixture.system.tuners.nav.getPtrConst(.remask).isSettled() and fixture.system.tuners.nav.getPtrConst(.patch).isSettled())) _ = try fixture.moveAndReact(io, thread_ptr);
     const remask_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.remask).isSettled() else false;
     const patch_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.patch).isSettled() else false;
 
@@ -747,14 +735,8 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     fixtures.setNavTuners(&fixture.system, case);
     fixtures.setSpliceTuners(&fixture.colliders, case);
 
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try fixture.changeAndReact(io, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!fixture.colliders.splice_tuner.isSettled() or !fixture.colliders.query_splice_tuner.isSettled() or !fixture.system.tuners.nav.getPtrConst(.plan).isSettled() or !fixture.system.tuners.nav.getPtrConst(.remask).isSettled() or !fixture.system.tuners.nav.getPtrConst(.patch).isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try fixture.changeAndReact(io, thread_ptr);
-        }
-    }
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.next(fixture.colliders.splice_tuner.isSettled() and fixture.colliders.query_splice_tuner.isSettled() and fixture.system.tuners.nav.getPtrConst(.plan).isSettled() and fixture.system.tuners.nav.getPtrConst(.remask).isSettled() and fixture.system.tuners.nav.getPtrConst(.patch).isSettled())) _ = try fixture.changeAndReact(io, thread_ptr);
     const remask_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.remask).isSettled() else false;
     const patch_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.patch).isSettled() else false;
 

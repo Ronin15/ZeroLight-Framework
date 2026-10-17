@@ -299,17 +299,10 @@ fn measureCase(
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
     var last_stats = SteeringStats{};
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(stageTunersSettled(&system))) {
         try prepare(context);
         last_stats = try step(&system, context, thread_ptr, case);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!stageTunersSettled(&system) and settle_guard < settle_limit) : (settle_guard += 1) {
-            try prepare(context);
-            last_stats = try step(&system, context, thread_ptr, case);
-        }
     }
     const settled_before_measurement = if (case.adaptive) stageTunersSettled(&system) else false;
 

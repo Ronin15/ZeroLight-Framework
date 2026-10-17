@@ -473,15 +473,9 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(stageTunersSettled(&system))) {
         _ = try runOnce(&system, data, mover, &contacts, thread_ptr, case);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!stageTunersSettled(&system) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runOnce(&system, data, mover, &contacts, thread_ptr, case);
-        }
     }
     const fill_settled_before_measurement = case.adaptive and system.fill_tuner.isSettled();
     const sort_settled_before_measurement = case.adaptive and system.sort_tuner.isSettled();

@@ -329,17 +329,10 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     const expect_dispatch = !case.adaptive and threads.workerThreadCount() > 0 and item_count > plane_entry.config.items_per_range.?;
 
     try fixture.resetStep();
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.next(plane_entry.tuner.isSettled())) {
         _ = try runStage(&fixture, thread_ptr);
         try fixture.resetStep();
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!plane_entry.tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runStage(&fixture, thread_ptr);
-            try fixture.resetStep();
-        }
     }
     const settled_before_measurement = if (case.adaptive) plane_entry.tuner.isSettled() else false;
 

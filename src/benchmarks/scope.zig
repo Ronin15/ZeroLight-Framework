@@ -171,14 +171,8 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     };
     defer allocator.free(serial_think);
 
-    for (0..options.warmup_iterations) |_| _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!scope.cognition_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
-        }
-    }
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(scope.cognition_tuner.isSettled())) _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
     const settled_before_measurement = if (case.adaptive) scope.cognition_tuner.isSettled() else false;
 
     const counts = &suite.event_scale_counts;

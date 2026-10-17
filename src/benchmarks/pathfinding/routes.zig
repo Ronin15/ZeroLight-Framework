@@ -1573,17 +1573,10 @@ fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_syste
 fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *RouteFixture, thread_system: ?*ThreadSystem, unsolved_routes: UnsolvedRoutes) !suite.RunStats {
     const system = &fixture.system;
     setPathStageTuners(system, case);
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.custom(case, options.warmup_iterations, coldSettleLimit(options));
+    while (warm.next(system.tuners.solve.isSettled())) {
         system.clearRuntimeState();
         _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!system.tuners.solve.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            system.clearRuntimeState();
-            _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
-        }
     }
     const settled = if (case.adaptive) system.tuners.solve.isSettled() else false;
 

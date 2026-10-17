@@ -249,14 +249,8 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     try nav_size.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
     setPathStageTuners(&fixture.system, case);
 
-    for (0..coldWarmup(options)) |_| _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!fixture.system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
-        }
-    }
+    var warm = suite.Warmup.custom(case, coldWarmup(options), coldSettleLimit(options));
+    while (warm.next(fixture.system.tuners.intake.isSettled())) _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
     const settled_before_measurement = if (case.adaptive) fixture.system.tuners.intake.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -347,14 +341,8 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
 
     var dig = NegativeDig{ .cell = pocketDigCell(side) };
-    for (0..coldWarmup(options)) |_| _ = try dig.step(io, case, &fixture, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!fixture.system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try dig.step(io, case, &fixture, thread_ptr);
-        }
-    }
+    var warm = suite.Warmup.custom(case, coldWarmup(options), coldSettleLimit(options));
+    while (warm.next(fixture.system.tuners.intake.isSettled())) _ = try dig.step(io, case, &fixture, thread_ptr);
     const settled_before_measurement = if (case.adaptive) fixture.system.tuners.intake.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -615,14 +603,8 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     setPathStageTuners(&fixture.system, case);
 
     // At least one untimed burst: the first grows the capacity from the reserve floor.
-    for (0..@max(1, coldWarmup(options))) |_| _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = coldSettleLimit(options);
-        while (!fixture.system.tuners.intake.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
-        }
-    }
+    var warm = suite.Warmup.custom(case, @max(1, coldWarmup(options)), coldSettleLimit(options));
+    while (warm.next(fixture.system.tuners.intake.isSettled())) _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
     const settled_before_measurement = if (case.adaptive) fixture.system.tuners.intake.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);

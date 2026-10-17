@@ -235,15 +235,9 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         for (think_set, 0..) |row, rank| std.debug.assert(row == rank);
     }
 
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(system.gather_tuner.isSettled() and system.separation_tuner.isSettled() and system.intent_tuner.isSettled())) {
         _ = try runOnce(&system, fixture, spatial_view, think_set, if (threads) |*thread_system| thread_system else null, case);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!system.gather_tuner.isSettled() or !system.separation_tuner.isSettled() or !system.intent_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runOnce(&system, fixture, spatial_view, think_set, if (threads) |*thread_system| thread_system else null, case);
-        }
     }
     const separation_settled_before_measurement = if (case.adaptive) system.separation_tuner.isSettled() else false;
     const intent_settled_before_measurement = if (case.adaptive) system.intent_tuner.isSettled() else false;

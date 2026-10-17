@@ -180,7 +180,8 @@ fn runCaseWithConfig(
         batch.adaptive_tuner = tuner;
     }
 
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(batch.adaptive_tuner.isSettled())) {
         _ = try runMeasuredOnce(
             io,
             fixture,
@@ -191,22 +192,6 @@ fn runCaseWithConfig(
             case,
             allocator,
         );
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!batch.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runMeasuredOnce(
-                io,
-                fixture,
-                &batch,
-                &draw_list,
-                table.resolver(),
-                if (threads) |*thread_system| thread_system else null,
-                case,
-                allocator,
-            );
-        }
     }
     const settled_before_measurement = if (case.adaptive) batch.adaptive_tuner.isSettled() else false;
 

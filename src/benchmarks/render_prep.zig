@@ -49,15 +49,9 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     // Warm up and settle through the same decomposed path used for measurement so
     // settled_before_measurement and work_tuning reflect the path actually timed.
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(batch.adaptive_tuner.isSettled())) {
         _ = try runMeasuredOnce(item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!batch.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runMeasuredOnce(item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
-        }
     }
     const settled_before_measurement = if (case.adaptive) batch.adaptive_tuner.isSettled() else false;
 

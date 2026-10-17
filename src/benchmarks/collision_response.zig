@@ -241,17 +241,10 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     else
         false;
 
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.next(stageTunersSettled(&system))) {
         fixture.restoreMovement();
         _ = try stageRunOnce(&system, &fixture, thread_ptr, case);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!stageTunersSettled(&system) and settle_guard < settle_limit) : (settle_guard += 1) {
-            fixture.restoreMovement();
-            _ = try stageRunOnce(&system, &fixture, thread_ptr, case);
-        }
     }
     const settled_before_measurement = if (case.adaptive) stageTunersSettled(&system) else false;
 

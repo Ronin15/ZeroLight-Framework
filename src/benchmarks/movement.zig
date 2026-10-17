@@ -69,15 +69,9 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         system.adaptive_tuner = tuner;
     }
 
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(system.adaptive_tuner.isSettled())) {
         _ = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!system.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
-        }
     }
     const settled_before_measurement = if (case.adaptive) system.adaptive_tuner.isSettled() else false;
 
@@ -265,15 +259,9 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     else
         false;
 
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.next(system.apply_intents_tuner.isSettled())) {
         _ = applyIntentsOnce(&system, &fixture, thread_ptr, case);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!system.apply_intents_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = applyIntentsOnce(&system, &fixture, thread_ptr, case);
-        }
     }
     const settled_before_measurement = if (case.adaptive) system.apply_intents_tuner.isSettled() else false;
 

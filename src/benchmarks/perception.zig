@@ -389,15 +389,9 @@ fn runCaseImpl(
     defer scope.deinit();
     const think_set = (try scope.compactCognitionSerial(&spatial_view, 0, false)).cognition;
 
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(system.gather_tuner.isSettled() and system.compute_tuner.isSettled())) {
         _ = try runOnce(&system, &fixture, spatial_view, think_set, &events, if (threads) |*thread_system| thread_system else null, case);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!system.gather_tuner.isSettled() or !system.compute_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runOnce(&system, &fixture, spatial_view, think_set, &events, if (threads) |*thread_system| thread_system else null, case);
-        }
     }
     const settled_before_measurement = if (case.adaptive) system.compute_tuner.isSettled() else false;
 
@@ -583,15 +577,9 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     defer scope.deinit();
     const think_set = (try scope.compactCognitionSerial(&spatial_view, 0, false)).cognition;
 
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(system.gather_tuner.isSettled() and system.compute_tuner.isSettled())) {
         _ = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!system.gather_tuner.isSettled() or !system.compute_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
-        }
     }
     const settled_before_measurement = if (case.adaptive) system.compute_tuner.isSettled() else false;
 

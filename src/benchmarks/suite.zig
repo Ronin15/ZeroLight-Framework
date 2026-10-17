@@ -712,6 +712,34 @@ pub fn adaptiveSettleIterationLimit(options: Options) usize {
     return @max(options.iterations, settle_iterations);
 }
 
+/// A case's warmup and adaptive settle, driven by `while (warm.next(tuners_settled)) step();`:
+/// the warmup steps, then, for an adaptive case only, steps until the case's tuners settle or
+/// the settle limit runs out.
+pub const Warmup = struct {
+    warmup_left: usize,
+    settle_left: usize,
+
+    /// `options`' warmup (at least `min_warmup` steps) and the default settle limit.
+    pub fn init(options: Options, case: BenchmarkCase, min_warmup: usize) Warmup {
+        return custom(case, @max(min_warmup, options.warmup_iterations), adaptiveSettleIterationLimit(options));
+    }
+
+    pub fn custom(case: BenchmarkCase, warmup_steps: usize, settle_limit: usize) Warmup {
+        return .{ .warmup_left = warmup_steps, .settle_left = if (case.adaptive) settle_limit else 0 };
+    }
+
+    /// Whether to run one more step; `tuners_settled` is the case's tuners' state now.
+    pub fn next(self: *Warmup, tuners_settled: bool) bool {
+        if (self.warmup_left != 0) {
+            self.warmup_left -= 1;
+            return true;
+        }
+        if (tuners_settled or self.settle_left == 0) return false;
+        self.settle_left -= 1;
+        return true;
+    }
+};
+
 pub fn parseOptions(args: []const []const u8) !Options {
     var options = Options{};
     var index: usize = 0;
@@ -1883,6 +1911,17 @@ test "benchmark fixed case resolving to an earlier case's configuration is repor
     };
     try std.testing.expectEqualStrings("thread-fixed-auto", bestFixedThreadedResult(&results).?.case.name);
     try std.testing.expectEqualStrings("thread-fixed-auto", bestMeasured(&results).?.case.name);
+}
+
+test "a warmup runs its steps, then settles an adaptive case until its tuners settle or the limit" {
+    const fixed = default_cases[0];
+    const adaptive = default_cases[default_cases.len - 1];
+    var warm = Warmup.custom(fixed, 2, 5);
+    try std.testing.expect(warm.next(false) and warm.next(false) and !warm.next(false));
+    warm = Warmup.custom(adaptive, 1, 3);
+    try std.testing.expect(warm.next(true) and warm.next(false) and warm.next(false) and !warm.next(true));
+    warm = Warmup.custom(adaptive, 0, 2);
+    try std.testing.expect(warm.next(false) and warm.next(false) and !warm.next(false));
 }
 
 test "adaptive settle budget covers multiple tuner windows" {
