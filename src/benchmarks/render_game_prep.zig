@@ -2,9 +2,19 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Extended game render-prep benchmark (R29/R32): dynamic record collection,
-//! depth-bucket sparse/dynamic emit, sprite-batch snapshot/vertex prep, and
-//! realistic static+dynamic `mergeDrawList` group counts. CPU-only; no SDL_GPU.
+//! Game render prep, CPU only, no SDL_GPU: the production-shaped frame's dynamic record
+//! collection, depth-bucket emit with sparse visible-tile submission through `WorldSystem`,
+//! sprite-batch snapshot and vertex emit, and a `mergeDrawList` against the static groups.
+//!
+//! `render-game-prep` and `render-game-prep-dense-surface` (play level 0) and
+//! `render-game-prep-dense-deep` (play level `bench_mid_player_level`): N render entities.
+//! Timed: the bench's own phase timers, `entity_collect` (collect plus emit), `merge`,
+//! `snapshot`, and `vertex_emit` (the threaded stage); the render window sets stay untimed.
+//! Prints `vertices=`, `sprites=`, `skipped=`, `merged_groups=`, `sparse=` (sparse tiles
+//! submitted), `dynamic_records=`, `static_groups=`, `merged_tilemap_groups=`, and the phases.
+//! Pass shape: one merged `.tilemap` group at every count and play level, so draw groups never
+//! grow with dense window depth. Asserts check that group count and that the collect returns
+//! every entity and active particle.
 //!
 //! `render-game-prep-offview` times `collectDynamicRecords` alone under the production
 //! camera window: a fixed set of rows inside it and a growing count of rows outside it on

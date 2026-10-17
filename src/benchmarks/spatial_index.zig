@@ -13,6 +13,9 @@
 //!   at the largest H; `deep_levels` flat in levels, its storage linear in levels. Asserts
 //!   check every body indexed, the sort on workers, and the directories' bytes whole against
 //!   `chunk_slot_bytes` x chunks x levels.
+//!   Both build groups print `entities=`, `--details` adding `main=` and the `sort=` and
+//!   `link=` stage shapes; `spatial_index-shape` also prints `directory_bytes=`, the level
+//!   directories' bytes.
 //! - `spatial_index-query`: one query per body from its own position, in the index's
 //!   cell-major order, through one neighbor block. `field` is a uniform four-faction field at
 //!   the `ai` density, radius a quarter, one, or four chunks, over `full`, `friendly`, or

@@ -12,6 +12,20 @@
 //! in the static count. `steering-static-dense` times one steering step for a fixed agent
 //! population among chunks holding the item count of statics each. Each reports the main
 //! thread's share: the iteration minus its off-main stage time.
+//!
+//! Pass shape: `steering` and the three layout groups linear in agents, the tuned case
+//! judged against its controls; `steering-static-change` flat in statics;
+//! `steering-static-dense` linear in statics per chunk. Asserts check that every agent
+//! writes a movement intent, that the static groups sample statics, and that
+//! `steering-static-dense` repeats its first step's obstacle visits and samples.
+//!
+//! The agent groups print `avoidance_checks=`, `samples=`, and `intents=`;
+//! `steering-static-change` prints `obstacle_checks=` and `obstacle_samples=`;
+//! `steering-static-dense` prints `obstacle_visits=` (with visits per agent),
+//! `obstacle_samples=`, and `intents=`. `--details` adds each prepare stage's shape
+//! (`agents=`, `resolve=`, `claim=`, `dir=`, `bucket=` the agent grid's bucket pass, `sort=`
+//! its sort; `-` for a stage that did not run), `steer=` (the avoidance pass), and `main=`;
+//! the agent groups also print `band_max=`, the entries in the agent grid's largest band.
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;

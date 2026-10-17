@@ -19,6 +19,9 @@
 //!   Pass shape: per-step time flat in memory rows.
 //! Asserts check every think row carries memory, the translate, decay, and visibility stages
 //! each run over the think set, and the order stage over its touched words.
+//! Each prints `processed=` (memory rows stepped), `refreshed=`, and `main=` with
+//! `main_per_item=` (per processed row); `--details` adds the `translate=`, `order=`, and
+//! `visible=` stage shapes (the decay stage is the row's batch).
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;

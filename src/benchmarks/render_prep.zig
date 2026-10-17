@@ -19,6 +19,12 @@ const ordered_workload_ui_parts: usize = 1;
 const ordered_world_depth_buckets: usize = 16;
 const ordered_ui_depths = [_]sprite_batch.UiDepth{ .background, .panel, .highlight, .text };
 
+// `render-prep` (CPU only, no window or GPU submission): each iteration submits an ordered
+// stream of N sprites (world depth buckets, then UI depths, then the debug overlay; every
+// 23rd on a dead texture) into one `SpriteBatch`, then snapshots, emits vertices (the
+// threaded stage), and builds draw groups. Prints `vertices=`, `sprites=` (valid),
+// `skipped=` (unresolved textures), `groups=`, and the bench's own phase timers
+// (`ordered_submit`, `snapshot`, `vertex_emit`, `draw_groups`). No pass shape asserted.
 pub const group = suite.BenchmarkGroup{
     .name = "render-prep",
     .item_label = "draw commands",

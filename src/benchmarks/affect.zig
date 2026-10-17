@@ -2,18 +2,15 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! AffectSystem throughput bench: isolates the per-step cost of appraising
-//! every gathered agent's four drives (fear/curiosity/aggression/fatigue).
-//! A fixed fraction of the fixture carries `AiPerception`/`AiMemory` too, with
-//! a visible-hostile/heard-stimulus/low-familiarity signal already baked into
-//! the hot columns at fixture creation time -- unlike ai_memory.zig's bench,
-//! affect's inputs are hot component state, not per-step events, so there is
-//! no per-iteration injection loop here (and so no risk of the O(n^2)
-//! per-event `appendRequired` pitfall that file's bench comment warns about).
-//!
-//! `ai-affect-shuffled`: the same step over a stride shuffle of every agent as the think
-//! set, so ranges write scattered affect rows, as a cell-major think set does. Pass shape:
-//! within spread of `ai-affect`.
+//! Affect throughput: one `AffectSystem` step appraising each think row's four drives (fear,
+//! curiosity, aggression, fatigue). Every `affect_signal_stride`th agent also carries
+//! `AiPerception` and `AiMemory` with a visible hostile and low familiarity in its hot
+//! columns, set at fixture creation; nothing is injected per step. Both groups print
+//! `processed=` (rows appraised) and `threshold_crossings=`.
+//! - `ai-affect`: every agent, the think set in store order. No pass shape asserted.
+//! - `ai-affect-shuffled`: the same step over a stride shuffle of every agent as the think
+//!   set, so ranges write scattered affect rows, as a cell-major think set does. Pass shape:
+//!   within spread of `ai-affect`.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -42,7 +39,7 @@ pub const shuffled_group = suite.BenchmarkGroup{
 };
 
 // Every Nth agent (creation order) also carries AiPerception/AiMemory with a
-// visible-hostile/heard-stimulus/low-familiarity signal baked in, so the
+// visible-hostile/low-familiarity signal baked in, so the
 // mixed population (some rows with both optional components, most without)
 // exercises the common gather path, not just the all-absent one.
 const affect_signal_stride: usize = 4;

@@ -5,12 +5,15 @@
 //! `world-create`: one world created and destroyed through the production build, timed by
 //! phase: `surface` (`initProceduralFromMeta`, the threaded paint), `stack`
 //! (`addUndergroundLevelStack`), `nav` (`SimulationPipeline.init` on the world, the static
-//! colliders and the nav build), and `destroy` (`pipeline.deinit`, then the world). One
-//! untimed pass per config on a zero-worker thread system counts live bytes after each
-//! create phase and after destroy. Pass shape: each phase's time and bytes at most linear
-//! in level area times levels, memory following what exists, and zero bytes after destroy.
-//! Asserts check the zero after destroy and, once per case at the smallest config, that the
-//! phases build the world `initProcedural` builds.
+//! colliders and the nav build), and `destroy` (`pipeline.deinit`, then the world), on the
+//! serial and tuned cases. Configs: sides 256, 1024, and 2048 at 8 levels, then 32 and 128
+//! levels at side 256 (item code `level side * 1000 + levels`). One untimed pass per config
+//! on a zero-worker thread system counts live bytes after each create phase and after
+//! destroy. Prints each phase's mean time, `live_kb` after `surface`, `stack`, and `nav`
+//! (the counted pass), and `after_destroy_bytes=`. Pass shape: each phase's time and bytes
+//! at most linear in level area times levels, memory following what exists, and zero bytes
+//! after destroy. Asserts check the zero after destroy and, once per case at the smallest
+//! config, that the phases build the world `initProcedural` builds.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;

@@ -35,7 +35,8 @@ const suite = @import("suite.zig");
 // index against the selected range count, and that every item was incremented once per
 // dispatch.
 // `--details` prints the shape (`inline` or workers/ranges), the time per item, and the
-// time per range.
+// time per range. On multi-CCD parts the `thread-fixed-1` and `thread-fixed-2` rows swing
+// with CCD placement (bimodal unpinned); a run pinned to one CCD is the diagnostic.
 pub const group = suite.BenchmarkGroup{
     .name = "thread-dispatch",
     .item_label = "items",

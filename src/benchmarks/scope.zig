@@ -5,16 +5,18 @@
 //! - `scope`: the scoped step (AI cognition, collision, movement, chunk derive, gathers, the
 //!   think set, and tier policy) over N entities whose levels (`index % 5`) give a mixed-tier
 //!   population: cognition, locomotion, kinematic, and dormant. The index build runs every
-//!   step outside the window (its own group times it). `output_count` is the rows that ran
-//!   cognition. Pass shape: time linear in the active (cognition + locomotion) rows, never in
-//!   N; asserts check fewer than N rows ran cognition.
+//!   step outside the window (its own group times it). Prints `cognition_active=`, the rows
+//!   that ran cognition. Pass shape: time linear in the active (cognition + locomotion) rows,
+//!   never in N; asserts check fewer than N rows ran cognition.
 //! - `scope-cognition`: the think set alone (`compactCognition`) over a halo index built once
 //!   untimed: `spread` over the `scope` fixture, `dense_chunk` with every agent in one chunk
 //!   (one index record), whose ranges split the chunk. Pass shape: linear in the H indexed
 //!   rows in both layouts, `spread` on workers at the largest size on the tuned case, the
 //!   main thread's share (the window merges) flat per row. Asserts check `spread`'s tuned case
 //!   off main at the largest size, one record for `dense_chunk`, every case's think set equal
-//!   to the serial pass's, and every indexed row counted once, thinking or skipped.
+//!   to the serial pass's, and every indexed row counted once, thinking or skipped. Item
+//!   code `layout * 10^6 + agents` (layout 0 `spread`, 1 `dense_chunk`). Prints `indexed=`
+//!   (H) and `thinking=`; `--details` adds `main=` with `main_per_item=` (per indexed row).
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;

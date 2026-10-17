@@ -10,7 +10,13 @@
 //! Pass shape (both shape groups): time per body flat in aspect and in levels. The counted
 //! candidate pairs are the same-level overlapping pairs, flat by construction; the sweep's
 //! visits to bodies it then rejects show only in time. Asserts check the contact count
-//! only: the grid's analytic same-level overlap count.
+//! only: the grid's analytic same-level overlap count. `collision` and `collision-sparse`:
+//! no pass shape asserted.
+//!
+//! Every group prints `candidate_pairs=`, `contacts=`, and `per_body=` (mean time per body);
+//! `--details` adds `gather=` and `sort=` (the main-thread gather and sort ahead of the
+//! broadphase batch, the row's batch), `main=`, `narrow=` (the narrowphase shape; the two
+//! phases tune independently), and `tuned=` when the narrowphase ran inline.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;

@@ -16,6 +16,8 @@ const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
 
+// `movement`: one `MovementSystem` update over N movement bodies with varied velocities,
+// with no reset between iterations. Prints no workload fields. No pass shape asserted.
 pub const group = suite.BenchmarkGroup{
     .name = "movement",
     .item_label = "movement bodies",

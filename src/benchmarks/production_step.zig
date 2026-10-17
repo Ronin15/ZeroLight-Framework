@@ -10,11 +10,21 @@
 //! spawn and the production pathfinding defaults; the population is committed through the
 //! production structural applier and grown through the population seam.
 //!
+//! Item code: `shape * 10^14 + inert per agent * 10^13 + level side * 10^9 + levels * 10^6 +
+//! population` (shape 0 `spread`, 1 `crowd`). The base is 4,096 `spread` agents at 1024² x 8
+//! levels; the axes are population 1,024 and 16,384 for each shape, levels 1 and 32, side 512
+//! and 2048, and 1 or 4 inert rows per agent.
+//!
 //! Each sample binds a fresh runtime perf log: `main` is the step's wall time minus the
 //! off-main time of the logged batches that ran on workers (an upper bound: unlogged batches
 //! count as main), and `untimed` is the wall time no top-level stage timer holds. `tiers=`
-//! splits the rows by scope tier and `thinking=` counts the rows the AI stage ran. ReleaseFast
-//! compiles the log out, so only the step total prints there.
+//! splits the rows by scope tier (cognition/locomotion/kinematic/dormant), `thinking=` counts
+//! the rows the AI stage ran, and `top_main=` names the three top-level stages with the most
+//! main time. `--details` adds `shared_tuner=` (the thread system's shared tuner after the
+//! run: phase, samples, settled windows), each top-level stage's `wall=`, `off_main=`, and
+//! `main=` with its batches' `threaded=` steps over the measured steps, the nested stage
+//! timers, and the census counters as means per step. ReleaseFast compiles the log out, so
+//! only the step total prints there.
 //!
 //! Pass shape: step and main time linear in population for both shapes; in level side and in
 //! level count at a fixed population, every row advances at its tier and the cost per

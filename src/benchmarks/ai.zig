@@ -12,6 +12,11 @@
 //! - `ai-cell-ordered`: the same agents created in the think set's order, so every per-row
 //!   store read and write (`ai_agent_hot` by AI index) ascends. Pass shape: `ai` within
 //!   spread of it, the scattered-write control; asserts check the think set ascends.
+//! Both print `separation_checks=`, `intents=`, `separation_fills=`, and `cohere_fills=`
+//! (neighbor-block fills per query kind); the summary adds the behavior histogram, and
+//! `--details` adds `main=` with `main_per_item=` (per intent), `gather=` and `intent=` (stage
+//! shapes; the separation stage is the row's batch), and `tuned=` when the intent stage ran
+//! inline.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;

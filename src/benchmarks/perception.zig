@@ -17,14 +17,18 @@
 //!   `PerceptionStore` access ascends with the rows. Pass shape: `perception` within spread
 //!   of it; asserts check the store slots ascend.
 //! These four assert at most one neighbor-block fill per run of observer rows sharing a cell,
-//! level, and faction, plus one per range.
+//! level, and faction, plus one per range. They print `sensed=`, `los_checks=`, `los_blocked=`,
+//! `found=` (observers with a nearest threat), `events=` (perceived plus lost),
+//! `dropped_events=`, and `block_fills=`; `--details` adds `main=` with `main_per_item=` and
+//! `gather=` (the gather stage's shape).
 //! - `perception-crowd`: separated clusters of one observer and one hostile ahead of it on
 //!   its level. Variant `allies` puts the hostile at half the vision range with allies inside
 //!   the range; `levels` stacks one hostile per level below at half the range and puts the
 //!   same-level hostile past the stack. Pass shape: every observer finds its hostile, nothing
 //!   is sensed across levels, and checks per observer stay flat in allies and levels. Asserts
 //!   check a threat found per observer, one FOV survivor each, and at most
-//!   `crowd_max_checks_per_observer` checks.
+//!   `crowd_max_checks_per_observer` checks. Prints `threat_found=` (found over observers),
+//!   `sensed=`, `block_fills=`, and `checks_per_observer=`.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;

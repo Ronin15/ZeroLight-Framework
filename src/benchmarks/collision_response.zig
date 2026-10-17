@@ -16,6 +16,11 @@ const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
+// `collision-response-solid`, `-bounce`, `-trigger`, and `-mixed`: one serial response step
+// (`updateSerial`) over N contacts, each between its own pair: a dynamic solid against a
+// static solid, a dynamic bounce against a static solid, a static trigger against a dynamic
+// solid, or those three plus a dynamic solid against a dynamic bounce in turn. Serial case
+// only. Prints `triggers=` and `intents=`. No pass shape asserted.
 pub const solid_group = suite.BenchmarkGroup{
     .name = "collision-response-solid",
     .item_label = "contacts",

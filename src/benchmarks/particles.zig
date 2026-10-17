@@ -14,6 +14,9 @@ const suite = @import("suite.zig");
 const delta_seconds: f32 = 1.0 / 60.0;
 const benchmark_particle_depths = [_]WorldDepth{ .actor, .effect, .marker };
 
+// `particles`: one `ParticleSystem` update over N particles across three render depths,
+// each living past the run so every row stays live. Prints no workload fields. No pass
+// shape asserted.
 pub const group = suite.BenchmarkGroup{
     .name = "particles",
     .item_label = "particle rows",
