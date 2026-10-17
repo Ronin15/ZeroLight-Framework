@@ -153,7 +153,7 @@ function verifyPrompt(f) {
     `Detail: ${f.detail}`,
     `Claimed durable via: ${f.durable_mechanism} — ${f.durable_rationale}`,
     ``,
-    `Check: (1) Does the cited code actually do what the finding says at/near that line? (2) Is it genuinely a Zig best-practice violation for THIS codebase, or is it sanctioned by an existing convention (e.g. a documented handle constructor, a // lint:allow annotation, a deliberate scalar tail, a stated reason)? (3) If durable, would the proposed lint rule or rule edit be low-false-positive and generalizable, or would it misfire on legitimate existing code?`,
+    `Check: (1) Does the cited code actually do what the finding says at/near that line? (2) Is it genuinely a Zig best-practice violation for THIS codebase, or is it sanctioned by an existing convention (e.g. a documented handle constructor, a // lint:allow annotation, a stated reason)? (3) If durable, would the proposed lint rule or rule edit be low-false-positive and generalizable, or would it misfire on legitimate existing code?`,
     ``,
     `Verdict CONFIRMED only if the code truly exhibits the issue and it matters. PLAUSIBLE if likely but you cannot fully confirm from the code. REJECTED if the code does not exhibit it or it is sanctioned. Set durable_confirmed only if the durability claim survives scrutiny.`,
   ].join('\n')

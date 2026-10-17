@@ -134,7 +134,7 @@ fn appendMalRow(
 - Use `simd.zig` helpers with a scalar tail for dense uniform float math over
   SoA columns; a loop whose results feed a lane consumer ends in one masked
   lane batch instead, so the consumer has one lane path. Prefer scalar for
-  tiny fixed-size batches or simple logic; short runs inside a population
+  tiny fixed-size batches; short runs inside a population
   loop are a layout problem, fixed in the layout (§ Data-oriented design).
 - Prefer scalar-to-`@Vector` loads unless an aligned load is measured and
   owned.
@@ -150,8 +150,7 @@ fn appendMalRow(
   timings: SIMD gains come with scale and in release builds, while benches
   run in Debug. A Debug slowdown never reverts a loop whose shape fits SIMD.
   A choice that needs a number gets the targeted ReleaseFast run
-  (`build-validation.md`) at target-scale sizes, and the reason goes at the
-  site.
+  (`build-validation.md`), and the reason goes at the site.
 - A new or restructured hot float loop ships scalar/SIMD and serial/threaded
   parity tests.
 - Never add a helper that only wraps plain arithmetic.
