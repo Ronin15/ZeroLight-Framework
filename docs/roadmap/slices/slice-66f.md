@@ -1,6 +1,6 @@
 ## Slice 66F: Steamworks Runtime Integration
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 66D](slice-66d.md), the VoidLight port slices (owner 2026-10-16); per item: [Slice 64A](slice-64a.md) (overlay pause), [Slice 46](slice-46.md) and [Slice 54](slice-54.md) (cloud), [Slice 67C](slice-67c.md) (gamepad text input) · Track: [VoidLight port](../tracks/voidlight-port.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 66D](slice-66d.md), the [VoidLight port slices](../tracks/voidlight-port.md) (owner 2026-10-16); per item: [Slice 64A](slice-64a.md) (overlay pause), [Slice 46](slice-46.md) and [Slice 54](slice-54.md) (cloud), [Slice 67C](slice-67c.md) (gamepad text input) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: not started. Gated on a Steamworks app ID existing**, as 66D is,
 and lands after the VoidLight port slices (owner 2026-10-16). 66D uploads
@@ -20,7 +20,7 @@ Steam Deck readiness; a build without it is unchanged.
 - Saves are 46's; settings are 54's (app preferences, never save data).
 - Pause that simulation cannot see is 64A's.
 
-### Constraints
+### Architecture notes
 
 - Ownership and dependency direction: `.claude/rules/engine-design.md`
   § Ownership boundaries. The Steamworks SDK qualifies as a dependency only
@@ -32,8 +32,8 @@ Steam Deck readiness; a build without it is unchanged.
 - Steam calls stay off workers (`.claude/rules/threading.md`).
 - No Steam state feeds simulation (`.claude/rules/simulation.md`
   § Determinism); simulation emits, Steam receives.
-- Shipping builds do no per-frame logging (`.claude/rules/zig-style.md`
-  § Logging).
+- The callback pump and the service log nothing per frame in shipping
+  builds (`.claude/rules/zig-style.md` § Logging).
 
 ### Checklist
 
@@ -65,11 +65,12 @@ Steam Deck readiness; a build without it is unchanged.
       dev `steam_appid.txt` kept out of git); `docs/architecture.md` (the
       service).
 
-### Out of scope until confirmed
+### Out of scope
 
-Workshop and mods (no mod loading exists), Steam networking and lobbies,
-leaderboards, DLC and in-game purchases, and the Steam Input action-set API
-(SDL3's gamepad layer covers controllers).
+Not planned, with no owning slice: workshop and mods (no mod loading exists),
+Steam networking and lobbies, leaderboards, DLC and in-game purchases, and the
+Steam Input action-set API (SDL3's gamepad layer covers controllers). A slice
+is written for one only when the owner confirms it.
 
 ### Acceptance checks
 

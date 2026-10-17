@@ -43,9 +43,9 @@ and the `world-gate` bench that measures it.
 - Restructures existing loops only; the utility/sticky arbitration contract
   stays (`.claude/rules/simulation.md` § AI and affect). It measures against
   the cognition structure 55 lands on (re-based on 73).
-- Per-query budgets stay fixed counts; gather scratch is sized from them,
-  never from population or a high-water mark, so per-range scratch needs no
-  reserve (`.claude/rules/budgets-capacities.md`).
+- The per-query budgets above stay unchanged, and the packed scratch is
+  sized from them, so per-range scratch needs no reserve
+  (`.claude/rules/budgets-capacities.md`).
 - Vector math goes through `core`; branches become masks; only irreducible
   loops stay scalar, each with its reason at the site
   (`.claude/rules/memory-performance.md` § SIMD and core math).
@@ -86,6 +86,10 @@ and the `world-gate` bench that measures it.
 - [ ] Tests: scalar/SIMD and serial/threaded parity per restructured path; a
       `FailingAllocator` proof over a real multi-worker AI + steering step
       with agents at the full neighbor and candidate caps.
+- [ ] This slice's refs (docs audit M3): the foundation's
+      `simulation_pipeline.zig:1566` is `:1562` at HEAD (`d51e8ae`) and
+      `:1564` in the uncommitted 84 tree. Pass: labelled or re-pointed by the
+      refs convention the owner picks (index, owner questions).
 
 ### Acceptance checks
 

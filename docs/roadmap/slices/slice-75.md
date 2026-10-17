@@ -55,8 +55,8 @@ Scope comes from one camera and puts far entities to sleep.
   - The step gets cheaper as rows freeze: 4.76 / 2.29 / 1.09 ms at L 1 / 8 /
     32, and 3.12 / 2.29 / 1.28 ms at side 512 / 1024 / 2048. The group's pass
     shape requires every row to advance.
-  - Inert rows (0, 1, 4 per agent at P 4,096) take tiers like agents and
-    raise the step 2.29 → 3.42 → 7.31 ms.
+  - Inert rows take tiers like agents and raise the step on the
+    `production-step` inert axis ([86](slice-86.md) holds the numbers).
   - `untimed` (stages with no perf-log timer: scope advance, tier policy,
     collision scope gather, plane traversal, action react, dig) is 2–20% of
     the step.
@@ -116,9 +116,11 @@ Scope comes from one camera and puts far entities to sleep.
       and resource nodes at rest raise every step's cost (measured above).
       Pass: `production-step` flat in inert rows. Collision's share is
       [86](slice-86.md); render collect's is [87](slice-87.md).
-- [ ] Perf-log timers for the untimed stages, so the census attributes the
-      2–20% `untimed` share (`.claude/rules/threading.md`: per-stage timing
-      before a policy change).
+- [ ] Timers for the untimed stages, so the `production-step` census
+      attributes the 2–20% `untimed` share before a policy change: bench-only
+      (`--details`) timers, with a `runtime_perf_log` `BatchStage` only for a
+      stage its design names as a change path's cost driver
+      (`.claude/rules/threading.md`; docs audit L18).
 - [ ] A deterministic far-from-observer signal for 62's ambient
       recycling.
 - [ ] Far path requests over the whole-world nav within the fixed request
@@ -135,6 +137,10 @@ Scope comes from one camera and puts far entities to sleep.
       sizes with most agents far from the observer.
 - [ ] Docs: `docs/architecture.md` tier model; `docs/simulation-tiers-and-pipeline.md`
       scope, bands, and cadences.
+- [ ] This slice's refs (docs audit M3): `movement.zig:47` (foundation and
+      checklist) is `update` at `:49`, and `simulation_scope.zig:689`
+      (`scanTierPolicy`) is `:686`. Pass: labelled or re-pointed by the refs
+      convention the owner picks (index, owner questions).
 
 ### Acceptance checks
 

@@ -49,13 +49,8 @@ up the same step.
       stage.
 - [ ] Entities in the region hit through deferred commands; required events
       reserved before the step.
-- [ ] Explosion entity commands past the structural share defer
-      deterministically to a later step
-      (`.claude/rules/budgets-capacities.md`); the step never fails for them.
-      Today a commit past the `.structural_commit` share fails the whole step
-      (`simulation.zig:491`, raised through `game_demo_state.zig:689`;
-      derived, no bench). Contract test: an over-share burst defers and the
-      step succeeds.
+- [ ] Explosion entity commands past the structural share
+      use [Slice 88](slice-88.md)'s deferral (docs audit M7).
 - [ ] Downstream reactions take an explosion without a per-cell event cap.
 - [ ] The explosion writer reserves its nav record before its write and records
       every applied write on every exit path, as the dig stage does.

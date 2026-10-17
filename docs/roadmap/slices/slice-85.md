@@ -46,15 +46,28 @@ keeps the apply local.
 - A create costs work in what it changed (`.claude/rules/engine-design.md`
   § Cost model).
 - Each hot loop carries a SIMD verdict (`.claude/rules/memory-performance.md`
-  § SIMD); 35 lands the vectorized avoidance.
+  § SIMD).
 - Serial == threaded bitwise (`.claude/rules/threading.md`).
 
 ### Checklist
 
 - [ ] Steering reads 84's index; its grid and sort are deleted. Failure
-      scenario: two sorts of the same positions every step. Measured:
-      `steering_grid` 0.59 ms above. Pass: one sort per step in the
-      `production-step` census; `steering` within spread or faster.
+      scenario: two sorts of the same positions every step. The grid has no
+      level key: entries hold only cell and row index (`agent_grid.zig:247`),
+      sorted by `(cell_y, cell_x, row)` (`:263`, `:339`), and
+      `accumulateAgentAvoidanceBounded` counts each entry against
+      `max_agent_candidate_checks` (64, `avoidance.zig:44`) at `:395`, before
+      its level gate at `:400`, then gathers 5 snapshot columns per
+      candidate through the row index (contiguity audit H1, code audit H2;
+      `.claude/rules/memory-performance.md` § Dense SoA storage). Failure
+      scenario (derived): a shaft of L levels with k agents per cell at the
+      same xy; with L·k > 64 the budget runs out on other-level rows, a
+      same-level neighbor gives no push, and bodies overlap; avoidance cost
+      per agent grows with L. Measured: `steering_grid` 0.59 ms above. Pass:
+      one sort per step in the `production-step` census; `steering` within
+      spread or faster; a levels axis on the `steering` bench with avoidance
+      samples and checks per agent flat in L; the fix is 84's index order,
+      never a level check added to this grid.
 - [ ] A create or destroy invalidates only the cache entries it affects
       (`system.zig:747`). Failure scenario (derived): a spawn burst makes every
       steering row re-resolve its movement index that step, nanoseconds per
@@ -62,13 +75,22 @@ keeps the apply local.
       index; a spawn-churn `steering` case flat in population for a fixed
       churn.
 - [ ] A SIMD verdict at `accumulateAgentAvoidanceBounded`
-      (`avoidance.zig:360`): scalar with its reason at the site until 35
-      vectorizes it.
+      (`avoidance.zig:360`). The loop is per-neighbor float math, so a
+      scalar verdict needs a shape reason
+      (`.claude/rules/memory-performance.md` § SIMD), never a slice reference
+      at the site (`.claude/rules/zig-style.md` § Comments) (docs audit M9).
+      Whether 85, which rewrites this loop onto 84's index, lands the
+      vectorized accumulate (moved from 35's steering avoidance item) is an
+      owner question (index). Pass: the site states its verdict; a vectorized
+      loop ships its scalar/SIMD parity test.
 - [ ] Movement intents in movement-row order if the ordering costs less than
-      the apply gain. Measured gain above (ReleaseFast only; Debug numbers
-      come first, `.claude/rules/build-validation.md`). Pass:
-      `movement-apply-intents` within spread of `-sorted`, with the ordering
-      cost counted in steering.
+      the apply gain. Failure scenario: `frame.intents` is written in
+      steering's selected order (`avoidance.zig:216`), so the apply resolves
+      each intent's movement row (`movement.zig:133`) and writes the rows
+      scattered (contiguity audit M3). Measured gain above (ReleaseFast
+      only; Debug numbers come first, `.claude/rules/build-validation.md`).
+      Pass: `movement-apply-intents` within spread of `-sorted`, with the
+      ordering cost counted in steering.
 - [ ] The whole subsystem checked against the cost model and the rules
       (owner 2026-10-16), not only the items above: every file in
       `src/game/systems/steering/` (selection, directions, avoidance, the

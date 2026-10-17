@@ -98,13 +98,8 @@ step's commit seam. No sessions, timers, or per-harvester state.
       visual refill under a fixed per-step budget.
 - [ ] `action_react` structural share re-derived for the largest claimant;
       capacity-limit test re-pinned.
-- [ ] Harvest commands (depletion, removal) past the structural share defer
-      deterministically to a later step
-      (`.claude/rules/budgets-capacities.md`); the step never fails for them.
-      Today a commit past the `.structural_commit` share fails the whole step
-      (`simulation.zig:491`, raised through `game_demo_state.zig:689`;
-      derived, no bench). Contract test: an over-share burst defers and the
-      step succeeds.
+- [ ] Harvest commands (depletion, removal) past the structural share
+      use [Slice 88](slice-88.md)'s deferral (docs audit M7).
 - [ ] Affect-impulse substrate with per-producer budgets and the
       commit-seam drain; `FailingAllocator` proof.
 - [ ] `need` drive and `forage` behavior as Slice 73 content; forage

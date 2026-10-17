@@ -137,8 +137,13 @@ One world per gameplay state; nothing models a set of worlds.
       calls desyncs the collider or nav sync. The pipeline test fixture
       `commitAndSyncLikeDemo` (`pipeline_test_support.zig:535-553`) copies
       the seam step by step, so a reorder of the demo seam leaves every
-      growth, OOM, and nav-seam pipeline test passing on the old order; the
-      fixture calls the moved seam once it exists.
+      growth, OOM, and nav-seam pipeline test passing on the old order. The
+      steering fixture `commitStaticsForTest`
+      (`steering/test_support.zig:95-107`) is a second copy (collider
+      reserve, commit, capture, sync), so the multi-level and static
+      avoidance tests also pass on the old order (code audit M3;
+      `.claude/rules/tests-benchmarks.md` § Tests). Both fixtures call the
+      moved seam once it exists.
 - [ ] A world's create-time memory follows its content. Failure scenario:
       every small dungeon pays the nav phase's ~12.4 MB floor (measured
       above; cause not identified, so the first step is finding it). Pass:
@@ -148,6 +153,15 @@ One world per gameplay state; nothing models a set of worlds.
       its nav build on one thread (measured above). Pass: `world-create`
       shows the nav phase's main share as the ordered merge only; serial ==
       threaded.
+- [ ] `production-step` spawns through the production path (code audit L4).
+      Failure: `spawnPopulation` (`src/benchmarks/production_step.zig:220-271`)
+      repeats `spawnDemoMover`'s post-create steps (`snapZ` and cognition
+      metadata, `:264-265`; `game_demo_state.zig:940`) and commits through
+      `DataSystem.applyStructuralCommands` outside the seam (`:258`)
+      (`.claude/rules/tests-benchmarks.md` § Tests). Failure scenario: a
+      change to the spawn defaults or the seam order drifts the census with
+      no failure. Pass: the bench spawns through the production spawn path
+      and commits through the moved seam.
 - [ ] Per-world state classified for 49/64B; included in 46's v1.
 - [ ] Tests: create, step, and destroy leak nothing; an entity moved
       between worlds keeps its identity as designed; one world's step is

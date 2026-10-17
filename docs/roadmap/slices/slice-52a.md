@@ -103,7 +103,7 @@ Linux and macOS; no shader compilers are needed for a normal build.
 
 - [ ] `-Dcpu-baseline` with `ship` / `compat` / `native` resolution, `-Dcpu`
       precedence, and the configure-time conflict error.
-- [ ] `tools/bench_ab.py` `shipped_cpu_floor` (`:84`) mirrors `build.zig`
+- [ ] `tools/bench_ab.py` `shipped_cpu_floor` (`:97`) mirrors `build.zig`
       `shippedCpuFloor`. Failure scenario: `-Dcpu-baseline` lands or the floor
       moves, and bench_ab keeps A/B-ing at the old CPU with no error. Pass:
       bench_ab takes the baseline from the build (or the same option), never a
@@ -127,6 +127,12 @@ Linux and macOS; no shader compilers are needed for a normal build.
 - [x] (added by Slice 66) Windows LTO off under Zig 0.17: `ltoSupportedForTarget`
       excludes `.coff`; windows-gnu ReleaseFast `check` passes.
 - [ ] (added by Slice 66) "windows-gnu LTO links" on the upgrade re-check list.
+- [ ] The `addCallgrindBenchRun` doc comment points to
+      `docs/development-workflow.md § Profiling` (`build.zig:788`) (code
+      audit L9, docs audit L14; `.claude/rules/zig-style.md` § Comments).
+      Failure scenario: the section moves or is renamed, and the comment
+      sends readers to nothing. Pass: the comment states the step's contract
+      only.
 - [ ] Docs: DW sections CPU Baseline (with the A/B table and minimum spec), SDL
       Versions And Sources, Shader Artifacts, Toolchain Pins And Upgrades;
       `docs/setup.md`; `docs/rendering-assets-shaders.md` Shader Build;

@@ -100,13 +100,8 @@ only committed state and the fixed-step sim view.
 - [ ] Merchant roster entry with 63's ledger and 57's stock.
 - [ ] Population capacity terms flow through the commit-seam sync; structural
       share for spawn and recycle bursts.
-- [ ] Spawn and recycle commands past the structural share defer
-      deterministically to a later step
-      (`.claude/rules/budgets-capacities.md`); the step never fails for them.
-      Today a commit past the `.structural_commit` share fails the whole step
-      (`simulation.zig:491`, raised through `game_demo_state.zig:689`;
-      derived, no bench). Contract test: an over-share burst defers and the
-      step succeeds.
+- [ ] Spawn and recycle commands past the structural share
+      use [Slice 88](slice-88.md)'s deferral (docs audit M7).
 - [ ] (added by Slice 67) Strings as `StringId`s if this lands after 67E.
 - [ ] Docs: `docs/architecture.md` (anchors, classes, controller),
       `docs/simulation-tiers-and-pipeline.md` (stage, bands, sim-view

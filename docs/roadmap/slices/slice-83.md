@@ -43,24 +43,15 @@ no stage falls back to `ThreadSystem`'s shared tuner.
 
 - [x] Split `steering.zig` by responsibility (`3c42b4f`): six files in
       `src/game/systems/steering/`, the agent grid whole in `agent_grid.zig`.
-- [x] Move `simulation_pipeline.zig`'s scenario fixtures to a
-      `pipeline_test_support.zig`; split further only along a responsibility
-      boundary (`176ed03`: 7,599 → 6,328 lines; no further split).
-- [x] Stage-owned tuners at every site above, and scope's `deriveChunks`
-      (`13e88ad`): a test per stage that it records only into its own tuner;
-      `production-step --details` keeps `shared_tuner` untrained
-      (`learning/samples:0`, every config and case).
+- [x] Pipeline scenario fixtures moved to `pipeline_test_support.zig`, no
+      further split (`176ed03`).
+- [x] Stage-owned tuners at every site above and scope's `deriveChunks`,
+      each with its own-tuner test (`13e88ad`).
 - [x] Docs: `docs/architecture.md` § Source Layout and § Thread System (the
       Slice 83 docs commit).
 
 ### Acceptance checks
 
-- [x] The splits change no test count or test result: `systems.steering`
-      39/39 and `game.simulation_pipeline` 89/89 before and after, same named
-      tests (`3c42b4f`, `176ed03`).
-- [x] Touched stage groups (`collision`, `movement`, `particles`, `perception`,
-      `ai`, `render-game-prep`) within run-to-run spread
-      (`.claude/rules/tests-benchmarks.md`): Debug A/B of `13e88ad` against
-      `176ed03`, plus `ai-memory`, `ai-affect`, `movement-apply-intents`;
-      nothing slower (`movement` serial +12.6% on one run, −0.7% over 3 reps).
-- [x] `zig build verify` passes at `13e88ad` (27/27 steps, 1,776/1,776 tests).
+- [x] The splits change no test count or result (`3c42b4f`, `176ed03`).
+- [x] Touched stage groups within run-to-run spread (Debug A/B, `13e88ad`).
+- [x] `zig build verify` passes at `13e88ad`.

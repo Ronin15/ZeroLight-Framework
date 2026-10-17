@@ -83,6 +83,15 @@ sensing (Slice 55 rejects it).
       self-validating lookup; module doc updated.
 - [ ] Perception and AI drop their candidate tables and halo walks; config
       fields that described the pairing are deleted; pairing asserts added.
+- [ ] The think-set compact leaves main (contiguity audit, noticed in
+      passing). Failure: `compactCognitionFromHalo`
+      (`src/game/systems/simulation_scope.zig:418-445`) resolves each halo
+      row's movement slot and tests its stagger phase on main, per-row work
+      beyond an ordered merge (`.claude/rules/threading.md`). Failure
+      scenario: once 75 indexes the whole population, main pays a slot
+      resolve per agent in the world every step to pick the rows that think.
+      Pass: main holds only the ordered merge of the think set; serial ==
+      threaded; `decide-consumers` shows main cost linear in decide rows.
 - [ ] Slice 56's arc query maps rows through the table's entity column.
 - [ ] Contract: `spatial_index_build` carries `world_level`.
 - [ ] Tests: view columns equal direct lookups; stale-map and swap-remove

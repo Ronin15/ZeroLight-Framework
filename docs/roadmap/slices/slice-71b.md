@@ -82,7 +82,6 @@ Goal:
       with its proving test. Steering's queries landed (`173cc17`);
       collision's moved to Slice 86.
 - [x] **71B.1** Steering reads the shared rows (64G `173cc17`).
-- **71B.2** (collision static split): moved to Slice 86.
 - [ ] **71B.3** Prewarm origin, empty-slot claim, demand promotion and
       eviction, level- or chunk-scoped field drop on nav change (the
       chunk-scoped drop landed with 64G, `83172ce`, `a869e15`).
