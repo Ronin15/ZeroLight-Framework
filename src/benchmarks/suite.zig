@@ -319,7 +319,7 @@ pub const RunStats = struct {
     /// Mean main-thread time per iteration: wall time minus the dispatch time of the
     /// stages that ran on workers.
     main_ns: ?u64 = null,
-    collision_phases: ?CollisionPhaseSummary = null,
+    collision_stages: ?CollisionStageSummary = null,
     render_capacities: ?RenderCapacitySummary = null,
     production_step: ?ProductionStepSummary = null,
     world_create: ?WorldCreateSummary = null,
@@ -512,11 +512,16 @@ pub const AiBehaviorHistogramSummary = struct {
     cohere: usize = 0,
 };
 
-/// Mean per-iteration time of collision's main-thread gather and sort, ahead of the
-/// broadphase batch.
-pub const CollisionPhaseSummary = struct {
-    gather_ns: u64 = 0,
-    sort_ns: u64 = 0,
+/// A collision step's fill and sort batches (the last measured step) and their tuners at the
+/// measurement boundary (null without an adaptive case), its sweep entries, and the
+/// candidates its sweep tested.
+pub const CollisionStageSummary = struct {
+    fill: BatchSummary = .{},
+    sort: BatchSummary = .{},
+    fill_tuning: ?WorkTuningSummary = null,
+    sort_tuning: ?WorkTuningSummary = null,
+    entries: usize = 0,
+    visits: usize = 0,
 };
 
 /// Render-prep capacities after a collect: the dynamic record reserve and the sprite
@@ -1234,7 +1239,8 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
     return writer.buffered();
 }
 
-fn writeWorkTuning(writer: *std.Io.Writer, summary: WorkTuningSummary) std.Io.Writer.Error!void {
+/// A tuner's phase, whether it settled before measurement, and its best and final profiles.
+pub fn writeWorkTuning(writer: *std.Io.Writer, summary: WorkTuningSummary) std.Io.Writer.Error!void {
     try writer.print("{s} settled={s}", .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement) });
     if (summary.has_threaded_profile) {
         try writer.print(

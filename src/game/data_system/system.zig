@@ -109,6 +109,12 @@ const SimulationScopeStats = @import("../simulation_scope.zig").SimulationScopeS
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
 const simd = @import("../../core/simd.zig");
 
+// `collisionBodyRefs`' result: a collider's movement row and world level.
+const CollisionBodyRefs = struct {
+    movement_body: u32,
+    level: ?u16,
+};
+
 pub const DataSystem = struct {
     allocator: std.mem.Allocator,
     slots: std.ArrayList(EntitySlot) = .empty,
@@ -487,6 +493,18 @@ pub const DataSystem = struct {
             .movement_body = @intCast(movement_body),
             .level = if (slot.world_level_index) |index| self.world_levels.get(@intCast(index)) else null,
             .faction = if (slot.faction_index) |index| self.factions.factionAt(@intCast(index)) else null,
+        };
+    }
+
+    /// A collider's movement row and world level (null without the component), read
+    /// through the caller's `worldLevelSliceConst().levels`: one slot resolve per call and no
+    /// store slice.
+    pub fn collisionBodyRefs(self: *const DataSystem, id: EntityId, levels: []const u16) ?CollisionBodyRefs {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const movement_body = slot.movement_body_index orelse return null;
+        return .{
+            .movement_body = movement_body,
+            .level = if (slot.world_level_index) |index| levels[index] else null,
         };
     }
 

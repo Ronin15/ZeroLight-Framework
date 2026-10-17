@@ -115,7 +115,6 @@ pub const Metric = enum {
     collision_candidate_pairs,
     collision_contacts,
     collision_broadphase_simd_groups,
-    collision_full_sorts,
     collision_response_contacts,
     collision_response_intents,
     collision_response_triggers,
@@ -210,9 +209,6 @@ pub const Timing = enum {
     steering_snapshot,
     steering_directions,
     steering_grid,
-    // Collision update breakdown before/around the broadphase batch.
-    collision_gather,
-    collision_sort,
     state_transitions,
     audio_drain,
     loading_build,
@@ -600,19 +596,6 @@ const EnabledRuntimePerfLog = struct {
                 millis(steering_grid_timing.max_ns),
             },
         );
-        const collision_gather_timing = self.timingValue(.collision_gather);
-        const collision_sort_timing = self.timingValue(.collision_sort);
-        log.debug(
-            "perf {d:.1}s collision_setup gather_avg_ms={d:.3} gather_max_ms={d:.3} sort_avg_ms={d:.3} sort_max_ms={d:.3} full_sorts={}",
-            .{
-                elapsed_s,
-                millis(collision_gather_timing.averageNs()),
-                millis(collision_gather_timing.max_ns),
-                millis(collision_sort_timing.averageNs()),
-                millis(collision_sort_timing.max_ns),
-                self.metricValue(.collision_full_sorts),
-            },
-        );
         log.debug(
             "perf {d:.1}s dispatch state_updates={} state_renders={} render_enqueue_avg_ms={d:.3} render_enqueue_max_ms={d:.3} overlay_avg_ms={d:.3} overlay_max_ms={d:.3} end_frame_avg_ms={d:.3} end_frame_max_ms={d:.3} sprites commands={} valid={} skipped={} sprites_per_frame={d:.1} vertices={} groups={} overflow_grows={}",
             .{
@@ -763,7 +746,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s steering path_requests={} available={} pending={} unavailable={} replans={} unavailable_backoff={} stuck={} agent_samples={} obstacle_samples={} agent_checks={} obstacle_checks={} ai_sep_checks={} ai_sep_samples={} collision_simd_groups={} full_sorts={}",
+            "perf {d:.1}s steering path_requests={} available={} pending={} unavailable={} replans={} unavailable_backoff={} stuck={} agent_samples={} obstacle_samples={} agent_checks={} obstacle_checks={} ai_sep_checks={} ai_sep_samples={} collision_simd_groups={}",
             .{
                 elapsed_s,
                 self.metricValue(.steering_path_requests),
@@ -780,7 +763,6 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.ai_separation_candidate_checks),
                 self.metricValue(.ai_separation_neighbor_samples),
                 self.metricValue(.collision_broadphase_simd_groups),
-                self.metricValue(.collision_full_sorts),
             },
         );
 

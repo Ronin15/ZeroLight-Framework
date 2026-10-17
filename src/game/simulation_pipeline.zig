@@ -46,6 +46,7 @@ const AiMemorySystem = @import("systems/ai_memory.zig").AiMemorySystem;
 const AffectStats = @import("systems/affect.zig").AffectStats;
 const AffectSystem = @import("systems/affect.zig").AffectSystem;
 const CollisionStats = @import("systems/collision.zig").CollisionStats;
+const CollisionStrips = @import("systems/collision.zig").CollisionStrips;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
 const CollisionResponseStats = @import("systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("systems/collision_response.zig").CollisionResponseSystem;
@@ -251,7 +252,12 @@ fn stageContract(stage: StageId) StageContract {
         // before plane_traversal / chunk_derive see the pose.
         .bounds_and_tile_gate => .{ .reads = resources(&.{ .movement_positions, .world_tiles }), .writes = resources(&.{.movement_positions}) },
         .collision_scope_gather => .{ .reads = .empty, .writes = resources(&.{.collision_scope_indices}) },
-        .collision_detect => .{ .reads = resources(&.{ .movement_positions, .collision_scope_indices }), .writes = resources(&.{.contacts}) },
+        // Body levels are next-step state: plane_traversal writes them after collision.
+        .collision_detect => .{
+            .reads = resources(&.{ .movement_positions, .collision_scope_indices }),
+            .writes = resources(&.{.contacts}),
+            .carried = resources(&.{.world_level}),
+        },
         .collision_respond => .{ .reads = resources(&.{.contacts}), .writes = resources(&.{ .movement_positions, .collision_triggers }) },
         // Reads hole/ramp walkability from world_tiles; may carve landing cells
         // (writes world_tiles + world_events) and snaps body x/y/z on fall
@@ -626,12 +632,9 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_candidate_pairs, metric(collision_stats.candidate_pair_count));
         perf.recordMetric(.collision_contacts, metric(collision_stats.contact_count));
         perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
-        if (collision_stats.used_full_sort) perf.recordMetric(.collision_full_sorts, 1);
         if (collision_stats.pair_bound_exceeded) perf.recordMetric(.collision_pair_bound_exceeded, 1);
         perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
         perf.recordBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
-        perf.recordTiming(.collision_gather, collision_stats.gather_ns);
-        perf.recordTiming(.collision_sort, collision_stats.sort_ns);
 
         perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
         perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
@@ -1546,6 +1549,7 @@ pub const SimulationPipeline = struct {
         const context = step.context;
         var collision_timer = StageTimer.start();
         step.collision = try self.collision.update(context.data, &context.frame.contacts, context.thread_system, .{
+            .strips = CollisionStrips.ofWorld(context.world),
             .scope_dense_indices = step.collision_scope_indices,
         });
         collision_timer.stop(context.perf, .pipeline_collision);

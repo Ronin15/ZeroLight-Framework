@@ -8,11 +8,12 @@
 //! - `collision-tall`: the grid's aspect (rows over columns) grows.
 //! - `collision-thin`: the grid's aspect (columns over rows) grows.
 //! - `collision-stacked`: a 32 x 32 grid copied onto more levels.
-//! Pass shape (the three shape groups): time per body flat in aspect and in levels. The
-//! counted candidate pairs are the same-level overlapping pairs, flat by construction; the
-//! sweep's visits to bodies it then rejects show only in time. Asserts check the contact
-//! count only: the grid's analytic same-level overlap count. `collision` and
-//! `collision-sparse`: no pass shape asserted.
+//! Pass shape (the three shape groups): time and sweep work per body flat in aspect and in
+//! levels. Asserts check the contact count (the grid's analytic same-level overlap count),
+//! the entries (at most one per strip a body spans), and the sweep's visits per entry
+//! against the grid's bound: the entries of one strip in the columns a body's width reaches,
+//! flat in column height, row width, and level count. `collision` and `collision-sparse`: no
+//! pass shape asserted.
 //!
 //! The static groups hold the item count of one-tile statics on a two-tile pitch, so the
 //! world grows with the static count, plus a fixed 2,048 dynamic bodies, half of them
@@ -29,17 +30,23 @@
 //! count, and that each move commits, syncs, and changes chunks.
 //!
 //! Every group prints `candidate_pairs=` and `contacts=`, the shape groups `per_body=`
-//! (mean time per body), the static groups `per_dynamic=`; `--details` adds `gather=` and
-//! `sort=` (the main-thread gather and sort ahead of the broadphase batch, the row's batch),
-//! `main=`, `narrow=` (the narrowphase shape; the two phases tune independently), and
-//! `tuned=` when the narrowphase ran inline.
+//! (mean time per body), the static groups `per_dynamic=`; `--details` adds each stage's
+//! shape and batch time, `fill=`, `sort=`, `broad=` (the row's batch, its mean time; the
+//! others the last step's), and `narrow=`, with the fill, sort, and narrowphase tuners'
+//! state in brackets (each stage tunes on its own; the broadphase's is the row's tuning
+//! cell), then `entries=` (sweep entries), `visits_per_body=` (candidates the sweep tested,
+//! counted with the perf log only), and `main=` with `main_per_item=` per body: the time
+//! outside the four stages' worker dispatches.
 
 const std = @import("std");
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const CollisionStats = @import("../game/systems/collision.zig").CollisionStats;
+const CollisionStrips = @import("../game/systems/collision.zig").CollisionStrips;
 const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
 const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -211,6 +218,20 @@ fn gridShapeFor(code: usize) !GridShape {
     }
 }
 
+// The most strips a dense body spans.
+fn denseStripsPerBodyBound() usize {
+    return @as(usize, @intFromFloat(@ceil(dense_body_size / CollisionStrips.default.height))) + 1;
+}
+
+// The dense grid's sweep candidates per entry: the entries one strip holds in a column (rows
+// whose span meets the strip) times the columns starting inside a body's width, its own
+// included, less the entry itself.
+fn denseVisitsPerEntryBound() usize {
+    const rows_per_strip: usize = @intFromFloat(@ceil((CollisionStrips.default.height + dense_body_size) / dense_pitch));
+    const columns_reached: usize = @intFromFloat(@ceil(dense_body_size / dense_pitch));
+    return rows_per_strip * columns_reached - 1;
+}
+
 fn createGridFixture(allocator: std.mem.Allocator, shape: GridShape) !DataSystem {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
@@ -272,6 +293,10 @@ fn runShapeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     defer data.deinit();
     var stats = try measureCase(allocator, io, options, case, shape.bodies(), &data, null);
     std.debug.assert(stats.output_count == shape.contacts());
+    const stages = stats.collision_stages.?;
+    if (stages.entries > shape.bodies() * denseStripsPerBodyBound()) return error.CollisionEntriesPastStripBound;
+    // The sweep counts its visits only with the perf log.
+    if (runtime_perf_log.enabled and stages.visits > stages.entries * denseVisitsPerEntryBound()) return error.CollisionVisitsPastStripBound;
     // The header names the config; throughput stays per body.
     stats.item_count = item_count;
     return stats;
@@ -450,15 +475,12 @@ const StaticMover = struct {
     }
 };
 
-// Warms up, settles both phase tuners, and times one step per iteration: `mover`'s static
+// Warms up, settles the stage tuners, and times one step per iteration: `mover`'s static
 // move through the commit seam when set, then the collision update over `data`.
 fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, data: *DataSystem, mover: ?*StaticMover) !suite.RunStats {
     var system = CollisionSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, collision_range_alignment_items)) |tuner| {
-        system.broadphase_tuner = tuner;
-        system.narrowphase_tuner = suite.adaptiveTunerForCase(case, collision_range_alignment_items).?;
-    }
+    useCaseTuners(&system, case);
     var contacts = RangeOutputStream(CollisionContact).init(allocator);
     defer contacts.deinit();
 
@@ -472,17 +494,17 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while ((!system.broadphase_tuner.isSettled() or !system.narrowphase_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+        while (!stageTunersSettled(&system) and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try runOnce(&system, data, mover, &contacts, thread_ptr, case);
         }
     }
+    const fill_settled_before_measurement = case.adaptive and system.fill_tuner.isSettled();
+    const sort_settled_before_measurement = case.adaptive and system.sort_tuner.isSettled();
     const broadphase_settled_before_measurement = if (case.adaptive) system.broadphase_tuner.isSettled() else false;
     const narrowphase_settled_before_measurement = if (case.adaptive) system.narrowphase_tuner.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_collision_stats = CollisionStats{};
-    var gather_total: u128 = 0;
-    var sort_total: u128 = 0;
     var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
@@ -490,20 +512,22 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_collision_stats.broadphase_batch);
-        gather_total += last_collision_stats.gather_ns;
-        sort_total += last_collision_stats.sort_ns;
         const mover_off_main_ns = if (mover) |static_mover| static_mover.spliceOffMainNs() else 0;
-        main_total += elapsed_ns -| offMainNs(last_collision_stats.broadphase_batch) -| offMainNs(last_collision_stats.narrowphase_batch) -| mover_off_main_ns;
+        const off_main_ns = offMainNs(last_collision_stats.fill_batch) + offMainNs(last_collision_stats.sort_batch) +
+            offMainNs(last_collision_stats.broadphase_batch) + offMainNs(last_collision_stats.narrowphase_batch);
+        main_total += elapsed_ns -| off_main_ns -| mover_off_main_ns;
     }
 
     var stats = accumulator.finish();
-    if (stats.iterations > 0) {
-        stats.collision_phases = .{
-            .gather_ns = @intCast(gather_total / stats.iterations),
-            .sort_ns = @intCast(sort_total / stats.iterations),
-        };
-        stats.main_ns = @intCast(main_total / stats.iterations);
-    }
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    stats.collision_stages = .{
+        .fill = suite.batchSummaryFromBatch(last_collision_stats.fill_batch),
+        .sort = suite.batchSummaryFromBatch(last_collision_stats.sort_batch),
+        .fill_tuning = if (case.adaptive) suite.workTuningSummary(system.fill_tuner.report(), fill_settled_before_measurement) else null,
+        .sort_tuning = if (case.adaptive) suite.workTuningSummary(system.sort_tuner.report(), sort_settled_before_measurement) else null,
+        .entries = last_collision_stats.entry_count,
+        .visits = last_collision_stats.broadphase_visits,
+    };
     stats.sample_count = item_count;
     stats.candidate_pairs = last_collision_stats.candidate_pair_count;
     stats.output_count = last_collision_stats.contact_count;
@@ -513,6 +537,19 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         stats.secondary_work_tuning = suite.workTuningSummary(system.narrowphase_tuner.report(), narrowphase_settled_before_measurement);
     }
     return stats;
+}
+
+/// Gives each of `system`'s stage tuners the case's own tuner (an adaptive case only).
+pub fn useCaseTuners(system: *CollisionSystem, case: suite.BenchmarkCase) void {
+    for ([_]*AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner }) |tuner| {
+        tuner.* = suite.adaptiveTunerForCase(case, collision_range_alignment_items) orelse return;
+    }
+}
+
+/// Every stage tuner of `system` settled.
+pub fn stageTunersSettled(system: *const CollisionSystem) bool {
+    return system.fill_tuner.isSettled() and system.sort_tuner.isSettled() and
+        system.broadphase_tuner.isSettled() and system.narrowphase_tuner.isSettled();
 }
 
 fn runOnce(
@@ -572,16 +609,27 @@ fn writeStaticWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suit
     try writeCollisionDetails(writer, stats);
 }
 
+// ` <label>=<shape>(<batch time>)`, then the stage tuner's state when the case has one.
+fn writeStage(writer: *std.Io.Writer, label: []const u8, batch: suite.BatchSummary, tuning: ?suite.WorkTuningSummary) std.Io.Writer.Error!void {
+    try writer.print(" {s}=", .{label});
+    try suite.writeStageShape(writer, batch);
+    try writer.print("({f})", .{suite.formatDuration(batch.batch_duration_ns)});
+    if (tuning) |summary| {
+        try writer.writeAll("[");
+        try suite.writeWorkTuning(writer, summary);
+        try writer.writeAll("]");
+    }
+}
+
 fn writeCollisionDetails(writer: *std.Io.Writer, stats: suite.RunStats) std.Io.Writer.Error!void {
-    if (stats.collision_phases) |phases| {
-        try suite.writeShare(writer, "gather", phases.gather_ns, stats.mean_ns);
-        try suite.writeShare(writer, "sort", phases.sort_ns, stats.mean_ns);
-    }
-    if (stats.main_ns) |main_ns| try suite.writeShare(writer, "main", main_ns, stats.mean_ns);
-    const narrow = stats.secondary_batch orelse return;
-    try writer.writeAll(" narrow=");
-    try suite.writeStageShape(writer, narrow);
-    if (narrow.ran_inline or narrow.active_worker_threads == 0) {
-        if (stats.secondary_work_tuning) |summary| try writer.print(" tuned={s}", .{if (summary.has_threaded_profile) "threaded" else "none"});
-    }
+    const stages = stats.collision_stages orelse return;
+    try writeStage(writer, "fill", stages.fill, stages.fill_tuning);
+    try writeStage(writer, "sort", stages.sort, stages.sort_tuning);
+    // The primary batch is the broadphase, its tuner the primary tuning cell.
+    try writeStage(writer, "broad", stats.batch, null);
+    if (stats.secondary_batch) |narrow| try writeStage(writer, "narrow", narrow, stats.secondary_work_tuning);
+    // `sample_count` holds the body (or dynamic) count.
+    const bodies = @max(stats.sample_count, 1);
+    try writer.print(" entries={} visits_per_body={d:.2}", .{ stages.entries, @as(f64, @floatFromInt(stages.visits)) / @as(f64, @floatFromInt(bodies)) });
+    try suite.writeMainShare(writer, stats, bodies);
 }

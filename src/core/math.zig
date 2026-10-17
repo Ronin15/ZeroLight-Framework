@@ -59,6 +59,16 @@ pub fn lastCellOfSpan(min_pos: f32, max_pos: f32, cell_size: f32, max_cells: u32
     return @max(first, worldPosToCell(end_cells - 1, 1, max_cells));
 }
 
+/// `value`'s bits as a key whose unsigned order is the float order: negatives reversed below
+/// positives, `-0` canonicalized to `+0` so equal floats share a key. NaNs sort past the
+/// infinity of their sign. Scalar counterpart of `simd.orderedBitsFloat4`.
+pub fn orderedBits(value: f32) u32 {
+    // Adding +0 turns -0 into +0 and leaves every other value as it is.
+    const bits: u32 = @bitCast(value + 0.0);
+    const sign_fill: u32 = @bitCast(@as(i32, @bitCast(bits)) >> 31);
+    return bits ^ (sign_fill | 0x8000_0000);
+}
+
 /// Linearly interpolates between `start` and `end` by `amount`. Scalar
 /// counterpart of `simd.lerpFloat4`.
 pub fn lerp(start: f32, end: f32, amount: f32) f32 {
@@ -237,6 +247,20 @@ test "lastCellOfSpan excludes the cell a max edge lands on, at every f32 magnitu
     try std.testing.expectEqual(cells - 1, lastCellOfSpan(0, 1.0e9, 32, cells));
     try std.testing.expectEqual(cells - 1, lastCellOfSpan(0, std.math.inf(f32), 32, cells));
     try std.testing.expectEqual(@as(u32, 0), lastCellOfSpan(0, 100, 32, 0));
+}
+
+test "orderedBits orders like the floats and gives -0 and +0 one key" {
+    const inf = std.math.inf(f32);
+    const subnormal = std.math.floatTrueMin(f32);
+    // Ascending, each strictly above the last as a float.
+    const ascending = [_]f32{ -inf, -std.math.floatMax(f32), -1.5, -subnormal, 0, subnormal, std.math.floatMin(f32), 1, 1.5, std.math.floatMax(f32), inf };
+    for (ascending[0 .. ascending.len - 1], ascending[1..]) |lower, upper| {
+        try std.testing.expect(orderedBits(lower) < orderedBits(upper));
+    }
+    try std.testing.expectEqual(orderedBits(0.0), orderedBits(-0.0));
+    // NaNs sort past the infinity of their sign.
+    try std.testing.expect(orderedBits(std.math.nan(f32)) > orderedBits(inf));
+    try std.testing.expect(orderedBits(-std.math.nan(f32)) < orderedBits(-inf));
 }
 
 test "lerpVec2 interpolates between points" {

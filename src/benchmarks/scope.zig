@@ -36,6 +36,7 @@ const IndexPopulation = @import("../game/systems/spatial_index.zig").IndexPopula
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const CognitionResult = @import("../game/systems/simulation_scope.zig").CognitionResult;
 const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
+const collision_bench = @import("collision.zig");
 const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
 const SimulationScopeSystem = @import("../game/systems/simulation_scope.zig").SimulationScopeSystem;
 const ScopeConfig = @import("../game/systems/simulation_scope.zig").ScopeConfig;
@@ -214,10 +215,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         ai.separation_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
         ai.intent_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
     }
-    if (suite.adaptiveTunerForCase(case, collision_range_alignment_items)) |tuner| {
-        collision.broadphase_tuner = tuner;
-        collision.narrowphase_tuner = suite.adaptiveTunerForCase(case, collision_range_alignment_items).?;
-    }
+    collision_bench.useCaseTuners(&collision, case);
     // The reported primary batch is the movement stage; settle its tuner like the
     // movement bench so the measured profile is the trained one.
     if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
@@ -276,7 +274,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 fn allTunersSettled(ai: *const AiSystem, collision: *const CollisionSystem, move: *const MovementSystem, scope: *const SimulationScopeSystem, spatial_index: *const SpatialIndexSystem) bool {
     return move.adaptive_tuner.isSettled() and
         ai.gather_tuner.isSettled() and ai.separation_tuner.isSettled() and ai.intent_tuner.isSettled() and
-        collision.broadphase_tuner.isSettled() and collision.narrowphase_tuner.isSettled() and
+        collision_bench.stageTunersSettled(collision) and
         scope.chunk_derive_tuner.isSettled() and scope.collision_gather_tuner.isSettled() and
         scope.ai_gather_tuner.isSettled() and scope.cognition_tuner.isSettled() and scope.tier_policy_tuner.isSettled() and
         spatial_index.bucket_tuner.isSettled() and spatial_index.sort_tuner.isSettled() and spatial_index.link_tuner.isSettled();

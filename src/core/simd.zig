@@ -162,6 +162,15 @@ pub fn lastCellOfSpan4(min_pos: Float4, max_pos: Float4, cell_size: f32, max_cel
     return selectInt4(greaterThanFloat4(max_pos, min_pos), maxInt4(first, last), first);
 }
 
+/// Vectorized counterpart of `math.orderedBits`, lane for lane: each lane's bits as a key
+/// whose unsigned order is the float order, `-0` and `+0` one key.
+pub inline fn orderedBitsFloat4(values: Float4) Uint4 {
+    // Adding +0 turns -0 into +0 and leaves every other value as it is.
+    const bits: Uint4 = @bitCast(values + splatFloat4(0));
+    const sign_fill: Uint4 = @bitCast(@as(Int4, @bitCast(bits)) >> @splat(31));
+    return bits ^ (sign_fill | splatUint4(0x8000_0000));
+}
+
 /// Vectorized counterpart of `math.floorToI32`: floors each lane to `i32`,
 /// saturating identically to the scalar form (NaN -> 0; at/below `minInt(i32)`
 /// -> `minInt(i32)`; at/above the f32 rounding of `maxInt(i32)` -> `maxInt(i32)`).
@@ -1012,6 +1021,23 @@ test "lastCellOfSpan4 matches math.lastCellOfSpan lane-for-lane" {
         @as(i32, @intCast(math.lastCellOfSpan(0, 100, 32, 0))),
         toIntArray(lastCellOfSpan4(splatFloat4(0), splatFloat4(100), 32, 0))[0],
     );
+}
+
+test "orderedBitsFloat4 matches math.orderedBits lane-for-lane" {
+    const inf = std.math.inf(f32);
+    const subnormal = std.math.floatTrueMin(f32);
+    const cases = [_]f32{
+        0,                      -0.0,                    subnormal,  -subnormal,
+        std.math.floatMin(f32), -std.math.floatMin(f32), inf,        -inf,
+        std.math.floatMax(f32), -std.math.floatMax(f32), 1.5,        -1.5,
+        std.math.nan(f32),      -std.math.nan(f32),      123_456.75, -0.001,
+    };
+    comptime std.debug.assert(cases.len % lane_count == 0);
+    var start: usize = 0;
+    while (start < cases.len) : (start += lane_count) {
+        const lanes: [lane_count]u32 = orderedBitsFloat4(loadFloat4(cases[start..]));
+        for (0..lane_count) |lane| try std.testing.expectEqual(math.orderedBits(cases[start + lane]), lanes[lane]);
+    }
 }
 
 test "sin and cos match scalar builtins per lane" {
