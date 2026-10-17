@@ -57,9 +57,8 @@ unchanged is one line citing the plan or code where it is settled, and a
 section with nothing new is omitted.
 
 - **Cost model first** (`.claude/rules/engine-design.md`): a table of each
-  operation's work and memory growth order for each of a local change, a
-  dense one-step change, and world/level/dungeon create and destroy that the
-  change affects, each marked measured or derived. If the existing structure
+  operation's work and memory growth order for each case the cost model
+  names that the change affects, each marked measured or derived. If the existing structure
   fails, the design replaces the parts that fail
   (`.claude/rules/engine-design.md`).
 - **Shared results** (`.claude/rules/engine-design.md` § Cost model): name
@@ -92,11 +91,8 @@ section with nothing new is omitted.
   placement, or access order it changes. Columns:
   loop (`file:line`), what it scales with, runs on (workers / main), threaded
   path (the existing stage pattern it copies, `file:line`) or why it stays
-  serial (fixed count and small, by the cost model; work under a per-step
-  budget still scales with what the step handled: main keeps only the
-  ordered merge/commit of `threading.md` with O(1) work per item (claims,
-  index writes, fixed-size record compaction, event appends), and per-item
-  work that grows (path cells, bytes, scans, sorts) threads), SIMD verdict (the
+  serial (fixed count and small, by the cost model; main-thread limits:
+  `threading.md`), SIMD verdict (the
   `simd.zig` pattern it copies, `file:line`, or scalar with the reason),
   serial/threaded and scalar/SIMD parity tests, the serial/inline path's cost
   against today's code (never more work than the code it replaces), and bench
@@ -105,12 +101,9 @@ section with nothing new is omitted.
   world size and runs on the main thread fails the design (`threading.md`),
   and the design fixes it.
 - **Stage shape on today's `ThreadSystem`**: each threaded stage fits the
-  thread system and tuner as they are, never a change to them (owner). The
-  tuner sizes batches by item count, so a stage's items are units whose
-  count tracks its work (owner runs, keys, rows), never a fixed partition
-  count such as shards whose work varies behind them. State the item unit
-  and why its count tracks the work, with the dispatch figures
-  `threading.md` requires.
+  thread system and tuner as they are, never a change to them (owner). State
+  the item unit (`threading.md`) and why its count tracks the work, with the
+  dispatch figures `threading.md` requires.
 - **Main-thread and deferred boundaries**: what stays on the main thread (only
   boundaries, orchestration, ordered merge/commit proportional to what
   changed) and the deterministic merge.
@@ -121,13 +114,9 @@ section with nothing new is omitted.
   scaling bench group and sizes that will measure it
   (`.claude/rules/tests-benchmarks.md`); a slice that replaces a structure
   measures the old one first, so the baseline is measured, not derived (the
-  bench lands first, on today's code). A threaded stage gets serial ==
-  threaded bitwise parity across range sizes and worker counts, the
-  `FailingAllocator` proof on a real multi-worker `ThreadSystem`, and a
-  pipeline-level test that proves the stage ran on workers, not inline. Its
-  bench reports the threaded case's main-thread share. The landing A/B names
-  only groups whose code the change touches, one size each, plus each scaling
-  bench's sizes. Name each change
+  bench lands first, on today's code). A threaded stage gets the tests and
+  bench output `threading.md` and `tests-benchmarks.md` require; the landing
+  A/B follows `tests-benchmarks.md`. Name each change
   path's cost-driver stage, the one that gets a `runtime_perf_log` entry
   (`threading.md`).
 - **Std usage** (`zig-style.md` std-first): every container, heap, bitset,

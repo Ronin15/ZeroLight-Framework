@@ -88,6 +88,8 @@ paths:
   total, so many small dispatches keep a large step inline. A step's work
   reaches its tuner as one sample: one dispatch, or rounds under one selected
   profile recorded once; each design states dispatches per step, items per
-  dispatch, and per-item cost at each bench size.
+  dispatch, and per-item cost at each bench size. A stage's items are units
+  whose count tracks its work (runs, keys, rows), never a fixed partition
+  count whose work varies behind it.
 - Bench and diagnostic output reports inline stages as `inline`, never as a
   zero-worker range size.

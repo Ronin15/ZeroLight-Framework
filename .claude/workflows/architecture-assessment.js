@@ -140,7 +140,7 @@ Write a structured assessment report covering:
 3. **Critical Gaps and Risks** (what's missing or fragile, severity: High/Medium/Low, each tagged structural or local)
 
 4. **Scalability Analysis**
-   - Cost growth order per core operation (local change, dense change, world/level create and destroy); flag anything scaling with extent or world count
+   - Cost growth order per core operation (each case in .claude/rules/engine-design.md § Cost model); flag anything scaling with extent or world count
    - System interaction model scalability
    - Threading/parallelism headroom
    - World state dynamism

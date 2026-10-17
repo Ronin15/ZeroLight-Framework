@@ -65,11 +65,9 @@ routes to design.
    `simd.zig` pattern, or scalar with the reason)? Threading and SIMD are
    standard, never optional: a scalable loop left on the main thread or a hot
    float/compare loop with no SIMD verdict is a finding; so is main-thread
-   per-item work that grows (path cells, bytes, scans, sorts), even under a
-   per-step budget: main keeps O(1) work per item in its ordered merge. When reviewing a
-   design, check its hot-loop table covers every loop the change adds or
-   changes and every inherited loop whose cost or thread placement it
-   changes. A serial/inline path that does more work than the code it
+   work `threading.md` forbids. When reviewing a design, check its hot-loop
+   table covers every loop the change adds or changes and every inherited
+   loop whose cost, thread placement, or access order it changes. A serial/inline path that does more work than the code it
    replaces is a finding.
    **Data layout**, every review: for each hot loop, store, or index the
    change adds or touches, name the data it reads, the order it reads it,
@@ -98,9 +96,9 @@ routes to design.
 4. **Tests**: for a weak test, name the untested contract and a narrow
    scenario that would expose a regression. For each new test, name the
    mutation it catches, from the code; one that would pass with the change
-   reverted is a finding. A threaded stage needs a test proving it ran on workers; an
-   inline run proves no threaded parity. The bench reports the threaded
-   case's main-thread share, and main's time per item stays flat across sizes.
+   reverted is a finding. A threaded stage's tests and bench output meet
+   `threading.md` and `tests-benchmarks.md`; an inline run proves no threaded
+   parity.
    A change path whose named cost-driver stage has no `runtime_perf_log`
    entry is a finding; so is logging stages beyond the cost drivers
    (`threading.md`).

@@ -15,6 +15,7 @@ paths:
 - A fix ships with a test that would fail without it, judged from the code,
   never by revert-and-rerun runs. Never drop a proof test or
   `FailingAllocator` proof to save time.
+- A threaded stage has a test proving it ran on workers, not inline.
 - Terrain contract tests cover a multi-chunk one-step change and repeated
   dig/fill.
 - An incremental path (nav patch, terrain or link change) gets an
@@ -50,8 +51,10 @@ paths:
 - Run benches targeted to the code being tested or changed
   (`--group <name> --items N`), never the full suite; full sweeps only when
   the owner or a slice asks.
-- Bench only changes that can move a hot path, once, at the right-sized
-  scales. Compare before/after on adjacent commits in Debug (ReleaseFast only
+- Bench only changes that can move a hot path, once: one right-sized config
+  per group the change touches, plus each scaling bench's sizes. A threaded
+  stage's bench reports its main-thread share, and main's time per item stays
+  flat across sizes. Compare before/after on adjacent commits in Debug (ReleaseFast only
   per `build-validation.md`) with one run per side (`tools/bench_ab.py`); a
   case more than 10% slower is rerun alone with 3 reps. When the change
   alters a bench's fixture or input order, the base code also runs on the
