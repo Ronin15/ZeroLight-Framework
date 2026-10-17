@@ -21,11 +21,17 @@ Commands and options: `docs/development-workflow.md`.
   builds ship `ReleaseFast`.
 - Exception: a question Debug cannot answer by construction (false sharing
   between worker ranges, a SIMD or inlining gain) gets one targeted
-  `tools/bench_ab.py --optimize ReleaseFast` run of the group that asks it,
-  reported beside its Debug numbers. It answers that question only (a SIMD
-  or scalar choice follows `memory-performance.md`); it is never a baseline
-  or gate, and never dismisses a Debug finding: Debug at a size stands in for
-  release at larger sizes.
+  ReleaseFast run of the group that asks it
+  (`tools/bench_ab.py --optimize ReleaseFast`): ReleaseFast base against
+  ReleaseFast tree.
+  - It answers only that question and is never a baseline or a gate.
+  - Modes compare only with themselves: Debug against Debug, ReleaseFast
+    against ReleaseFast.
+  - It never excuses a Debug finding: a regression Debug shows is fixed,
+    never waved off because ReleaseFast is faster. Debug at a size stands in
+    for release at larger sizes.
+  - The fix never reverts a SIMD-shaped loop to scalar
+    (`memory-performance.md` § SIMD and core math).
 - Before a ReleaseFast release candidate, a multi-hour ReleaseSafe soak across
   realistic to extreme entity counts and spawn/despawn churn must pass;
   ReleaseFast corrupts memory silently where ReleaseSafe reports.
