@@ -36,26 +36,45 @@ in its owning slice.
 
 ### Checklist
 
-- [ ] Every agent keeps a spread stagger phase. Failure: the append stripes
-      `stagger_phase = index % cognition_stagger_n`
-      (`data_system/movement.zig:76`), but every live spawn then calls
-      `setSimulationMetadata` with no phase (`game_demo_state.zig:1010`,
-      `src/benchmarks/production_step.zig:265`), which writes the default 0
-      (`src/game/simulation_scope.zig:146`, through
-      `data_system/movement.zig:144`), against the metadata's stated contract
-      that the phase is stable per entity
-      (`src/game/simulation_scope.zig:142-145`). Failure scenario: the whole
-      halo thinks on one step in four and none on the other three, so
-      cognition cost lands on every fourth step and the `production-step`
-      think counts that 75 and 88 cite describe that step. Pass: agents
-      spawned through the production spawn path spread across the phases; a
-      test that would fail with the overwrite
-      (`.claude/rules/tests-benchmarks.md` § Tests); serial == threaded.
-      Phase is the think set's one membership test (`cognitionJob`,
-      `src/game/systems/simulation_scope.zig:866`, over the phase the index
-      stores, `spatial_index.zig:393`), so spreading the phases changes
-      membership only; per-entity phases stay
-      (`src/game/simulation_scope.zig:142-145`).
+- [ ] Every agent keeps a spread stagger phase. Landed in `5c4babb`: the
+      overwrite is fixed; `stagger_phase` defaults to `keep_stagger_phase`
+      (`src/game/simulation_scope.zig:15`, `:157`), so
+      `setSimulationMetadata` without a phase keeps the append-assigned phase
+      (tests `a simulation metadata write keeps the row's stagger phase and
+      level unless it names them` and `a simulation metadata write takes the
+      level from the entity's world level row`,
+      `src/game/data_system/system.zig:1357`, `:1385`). Still open, the
+      assignment: the append stripes `stagger_phase = dense_index %
+      cognition_stagger_n` (`data_system/movement.zig:76`, n = 4,
+      `src/game/simulation_scope.zig:12`), which aliases with any spawn order
+      whose period shares a factor with n. The `production-step` spread
+      fixture places agents round-robin over levels (`level = agent %
+      fields.levels`, `src/benchmarks/production_step.zig:229`), so with 8
+      levels every agent on one level gets the same phase. Measured (Debug,
+      `production-step --items 1024008002048`, spread, 2,048 agents, 2,053
+      rows, serial, 3 iterations, tree at `0bcaa2f`,
+      `benchmark_outputs/ab-20261017-135307/tree_production-step_serial-direct_1.txt`):
+      cognition-tier rows 137, `scope_ai_stage_entities=1`,
+      `scope_stagger_skips=119`: the observer level's cognition lands on one
+      step in four. Failure scenario: a spawner with a period such as a
+      squad, a wave, or a per-level round-robin puts a whole group's
+      cognition on one phase, giving the per-step spike the stagger exists to
+      remove, and the `production-step` think counts that 75 and 88 cite
+      describe that step. Pass: phases spread within each group that thinks
+      together (level, cell), whatever the spawn order; a test with a
+      spawn order whose period shares a factor with
+      `cognition_stagger_n` that would fail with the index stripe
+      (`.claude/rules/tests-benchmarks.md` § Tests); serial == threaded; the
+      `production-step` bench samples whole stagger cycles (a sample of
+      fewer steps than one cycle, such as 3 iterations < 4, depends on which
+      steps it lands on) and reports per-step ai/steering max (or spread)
+      and thinking per step (`--details` prints only per-stage means today,
+      so a per-step spike cannot be read), so "max falls, mean unchanged" is
+      checkable. Phase is the think set's one membership test
+      (`cognitionJob`, `src/game/systems/simulation_scope.zig:858`, over the
+      phase the index stores, `src/game/systems/spatial_index.zig:394`), so
+      spreading the phases changes membership only; per-entity phases stay
+      (`src/game/simulation_scope.zig:153-158`).
       Neighbor-block sharing per step then falls to agents per cell ÷
       `cognition_stagger_n` (derived: about 2.3 per key at the `ai` density,
       whose benches think every agent; `production-step`'s census reports the
