@@ -68,9 +68,8 @@ pub const Signals = struct {
     memory_ring_y: [ai_memory_ring_capacity]f32 = @splat(0),
     memory_ring_age: [ai_memory_ring_capacity]f32 = @splat(0),
 
-    // Cohere neighbor mean, gathered by the caller via the shared spatial
-    // index (see ai.zig's separationNeighborVisit-style visitor) — this
-    // module never queries anything itself. 0 count = no neighbors found.
+    // Cohere neighbor mean, gathered by the caller from the shared spatial
+    // index; this module never queries. 0 count = no neighbors found.
     cohere_neighbor_mean_x: f32 = 0,
     cohere_neighbor_mean_y: f32 = 0,
     cohere_neighbor_count: u32 = 0,

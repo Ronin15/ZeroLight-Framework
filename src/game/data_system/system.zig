@@ -32,6 +32,7 @@ const ConstPrimitiveVisualSlice = types.ConstPrimitiveVisualSlice;
 const AssetReference = types.AssetReference;
 const ConstAssetReferenceSlice = types.ConstAssetReferenceSlice;
 const RenderEntityComponentIndices = types.RenderEntityComponentIndices;
+const BodyLevelFaction = types.BodyLevelFaction;
 const RenderCollectIndices = types.RenderCollectIndices;
 const MovementVisualDenseIndices = types.MovementVisualDenseIndices;
 const MovementSteeringDenseIndices = types.MovementSteeringDenseIndices;
@@ -461,6 +462,16 @@ pub const DataSystem = struct {
             .movement_body = @intCast(movement_body),
             .asset_ref = if (slot.asset_ref_index) |index| @intCast(index) else null,
             .facing = if (slot.facing_index) |index| @intCast(index) else null,
+        };
+    }
+
+    pub fn bodyLevelFaction(self: *const DataSystem, id: EntityId) ?BodyLevelFaction {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const movement_body = slot.movement_body_index orelse return null;
+        return .{
+            .movement_body = @intCast(movement_body),
+            .level = if (slot.world_level_index) |index| self.world_levels.get(@intCast(index)) else null,
+            .faction = if (slot.faction_index) |index| self.factions.factionAt(@intCast(index)) else null,
         };
     }
 
@@ -1510,6 +1521,37 @@ test "render entity component indices resolve movement asset and facing slots" {
     try std.testing.expectEqual(with_facing.movement_body, full.movement_body);
 
     try std.testing.expect(data.renderEntityComponentIndices(EntityId.invalid) == null);
+}
+
+test "bodyLevelFaction matches movementBodyDenseIndex, worldLevelConst, and factionConst" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const bare = try data.createEntity();
+    try data.setMovementBody(bare, testBody(1));
+    const tagged = try data.createEntity();
+    try data.setMovementBody(tagged, testBody(2));
+    try data.setWorldLevel(tagged, 3);
+    try data.setFaction(tagged, .hostile);
+    const bodiless = try data.createEntity();
+    try data.setWorldLevel(bodiless, 1);
+    try data.setFaction(bodiless, .ally);
+    const stale = try data.createEntity();
+    try data.setMovementBody(stale, testBody(3));
+    try std.testing.expect(data.destroyEntity(stale));
+
+    for ([_]EntityId{ bare, tagged }) |entity| {
+        const found = data.bodyLevelFaction(entity).?;
+        try std.testing.expectEqual(data.movementBodyDenseIndex(entity).?, found.movement_body);
+        try std.testing.expectEqual(data.worldLevelConst(entity), found.level);
+        try std.testing.expectEqual(data.factionConst(entity), found.faction);
+    }
+    try std.testing.expect(data.bodyLevelFaction(bare).?.level == null);
+    try std.testing.expect(data.bodyLevelFaction(bare).?.faction == null);
+    try std.testing.expectEqual(@as(?u16, 3), data.bodyLevelFaction(tagged).?.level);
+    try std.testing.expect(data.bodyLevelFaction(bodiless) == null);
+    try std.testing.expect(data.bodyLevelFaction(stale) == null);
+    try std.testing.expect(data.bodyLevelFaction(EntityId.invalid) == null);
 }
 
 test "movementVisualDenseIndices resolves both rows from one slot lookup" {

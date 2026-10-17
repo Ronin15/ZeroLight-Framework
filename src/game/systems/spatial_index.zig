@@ -4,30 +4,26 @@
 
 //! The shared neighbor index: one per pipeline, built each step from a handed population
 //! and read by every neighbor query that step. Slot k of the population is its row; a slot
-//! whose entity has no movement body holds no entry. Entries are sorted by
-//! (cell_y, cell_x, slot), so each populated cell's entries are contiguous, and carry the
-//! slot's previous position, entity, faction, and level in entry order.
+//! whose entity has no movement body holds no entry.
 //!
-//! A query scans the cells within its radius cell_y outer, cell_x inner, and visits each
-//! cell's entries in slot order; consumers that sum floats depend on that order. A band's
-//! cells in one cell row's aligned 64-cell span form a row segment with an occupancy mask,
-//! found by (cell_y, span) through a band directory and a per-band hash table: a query
-//! probes once per row piece, empty cells cost nothing, and no storage follows the
-//! populated extent.
+//! Cells tile the world's chunk grid, every cell in one chunk; positions outside the grid
+//! clamp to its edge cells. Entries are sorted by (level, chunk_y, chunk_x, faction,
+//! local_y, local_x, slot).
 //!
-//! Serial build (also when no stage can get a worker): one fill and one sort in a single
-//! band. Threaded, the main thread samples the band splitters, `index_bucket` resolves each
-//! range's slots and places their keys by band in its window, and `index_sort` sorts each
-//! band in its own slice and writes its cells, table, and entries; each stage runs inline or
-//! on workers as its own tuner selects. A cell lies in one band and the bands follow key
-//! order, so the entries, and every cell's entries, are identical for any splitters and
-//! partition.
+//! A query reads one level and a faction set and visits (cell row, chunk, faction, cell_x,
+//! slot). Each run, a (piece, faction)'s cells inside the box, is scanned in lane groups
+//! from its first entry, so an entry's lane is its position in the run mod 4; consumers
+//! that sum floats follow this order. Every structure the view exposes is identical for any
+//! partition of the build.
 //!
 //! Collision broadphase keeps its own sweep-and-prune order and does not use this index.
 
 const std = @import("std");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
+const pdqSort = @import("../../core/sort.zig").pdq;
+const shl = simd.shiftLeftUint4;
+const builtin = @import("builtin");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const Dispatch = @import("../../app/thread_system.zig").Dispatch;
@@ -45,7 +41,9 @@ const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySl
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const Faction = @import("../data_system.zig").Faction;
+const FactionSet = @import("../faction.zig").FactionSet;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
+const WorldSystem = @import("../world/system.zig").WorldSystem;
 
 pub const spatial_index_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -57,6 +55,10 @@ const band_count: usize = 64;
 const splitter_sample_count: usize = 4 * band_count;
 // The golden ratio's fractional part in 0.64 fixed point.
 const sample_fraction_step: u64 = 0x9E3779B97F4A7C15;
+
+// The most cells per chunk edge: a row part's cells are one 64-bit mask. A format width,
+// never a refusal: a finer configured cell gets a coarser effective one.
+const max_cells_per_chunk: u32 = 64;
 
 /// The rows one build indexes: slot k is `entities[rows[k]]`, or `entities[k]` without
 /// `rows`. Read during the build only.
@@ -73,9 +75,72 @@ pub const IndexPopulation = struct {
     }
 };
 
+/// The world chunk grid an index tiles: `chunks_x` x `chunks_y` chunks of
+/// `chunk_size_tiles` tiles of `tile_size` world units, on `level_count` levels.
+pub const IndexGeometry = struct {
+    /// Finite and positive.
+    tile_size: f32,
+    /// At least 1.
+    chunk_size_tiles: u16,
+    /// At least 1 each.
+    chunks_x: u32,
+    chunks_y: u32,
+    level_count: usize,
+
+    /// `world`'s chunk grid over its extent and its levels. A world before its first level
+    /// still has its extent: the index grows a directory for any level a body is on.
+    pub fn ofWorld(world: *const WorldSystem) IndexGeometry {
+        const chunk_tiles: u32 = @max(world.chunk_size_tiles, 1);
+        return .{
+            .tile_size = world.tile_size,
+            .chunk_size_tiles = @intCast(chunk_tiles),
+            // Ceiling divisions of u16 sides, so each is at most its side.
+            .chunks_x = @max((@as(u32, world.width) + chunk_tiles - 1) / chunk_tiles, 1),
+            .chunks_y = @max((@as(u32, world.height) + chunk_tiles - 1) / chunk_tiles, 1),
+            .level_count = world.levelCount(),
+        };
+    }
+};
+
+// An index's cell grid over its geometry's chunks: K = `cells_per_chunk` cells per chunk
+// edge, each `cell_size` wide.
+const Grid = struct {
+    cells_per_chunk: u32 = 1,
+    cell_size: f32 = 1,
+    chunks_x: u32 = 0,
+    chunks_y: u32 = 0,
+    cells_x: u32 = 0,
+    cells_y: u32 = 0,
+
+    // K is the configured cell's count per chunk width, rounded, in [1, 64] and at most
+    // maxInt(i32) cells per axis, so the lane cell math stays in i32; no geometry is refused.
+    fn of(geometry: IndexGeometry, configured_cell_size: f32) Grid {
+        std.debug.assert(std.math.isFinite(geometry.tile_size) and geometry.tile_size > 0);
+        std.debug.assert(geometry.chunk_size_tiles >= 1 and geometry.chunks_x >= 1 and geometry.chunks_y >= 1);
+        const chunk_world = geometry.tile_size * @as(f32, @floatFromInt(geometry.chunk_size_tiles));
+        const widest: u32 = @max(geometry.chunks_x, geometry.chunks_y);
+        const cells_cap: u32 = @intCast(@min(max_cells_per_chunk, std.math.maxInt(i32) / widest));
+        // `lossyCast` saturates a huge or non-finite ratio before the clamp.
+        const rounded: u32 = std.math.lossyCast(u32, @round(chunk_world / configured_cell_size));
+        const cells_per_chunk = std.math.clamp(rounded, 1, @max(cells_cap, 1));
+        return .{
+            .cells_per_chunk = cells_per_chunk,
+            .cell_size = chunk_world / @as(f32, @floatFromInt(cells_per_chunk)),
+            .chunks_x = geometry.chunks_x,
+            .chunks_y = geometry.chunks_y,
+            .cells_x = geometry.chunks_x * cells_per_chunk,
+            .cells_y = geometry.chunks_y * cells_per_chunk,
+        };
+    }
+
+    fn chunkCount(self: Grid) usize {
+        return @as(usize, self.chunks_x) * self.chunks_y;
+    }
+};
+
 pub const SpatialIndexConfig = struct {
-    /// World-unit side of one cell, finite and positive; a query's scan radius in cells
-    /// derives from it.
+    /// World-unit side of one cell, finite and positive; the effective cell is the nearest
+    /// whole fraction of a chunk's width. A query's scan radius in cells derives from it.
     cell_size: f32 = 32.0,
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
@@ -84,23 +149,53 @@ pub const SpatialIndexConfig = struct {
 
 const StageThreads = @import("../../app/thread_system.zig").StageThreads(SpatialIndexConfig);
 
-pub const NeighborVisitResult = enum { keep_going, stop };
+/// One four-entry batch of a query's scan: entry `first + lane` at each lane. Lanes set in
+/// `inside` are entries of the query's level and factions, strictly inside its radius, within
+/// its check budget, and never `self`; every other lane holds any value. `dx, dy` is the query
+/// point minus the entry's position and `dist2` is `dx * dx + dy * dy`, bit for bit.
+pub const NeighborLanes = struct {
+    first: u32,
+    x: simd.Float4,
+    y: simd.Float4,
+    dx: simd.Float4,
+    dy: simd.Float4,
+    dist2: simd.Float4,
+    inside: simd.MaskBits,
+};
+
+/// A lane visit's answer: null keeps scanning; a lane set in `inside` ends the query after
+/// that lane's entry, which counts as its last check.
+pub const LaneStop = ?simd.LaneIndex;
+
+/// `pass` cut to its lowest `room` set lanes, and the stop at the last kept lane when that
+/// fills `room`: every consumer's visit cap.
+pub const LaneCap = struct { pass: simd.MaskBits, stop: LaneStop };
+
+/// `room` is at least 1.
+pub fn capLanes(pass: simd.MaskBits, room: usize) LaneCap {
+    std.debug.assert(room >= 1);
+    const kept = simd.keepLowestSetBits(pass, room);
+    return .{ .pass = kept, .stop = if (@popCount(pass) >= room) std.math.log2_int(simd.MaskBits, kept) else null };
+}
 
 pub const NeighborQueryStats = struct {
     candidate_checks: u16 = 0,
 };
 
-/// One neighbor query: the entries strictly within `radius` of `(x, y)`, visited in scan
-/// order (see the module doc). Every scanned entry but `self` counts as a candidate check
-/// before its radius test; the scan stops before the check that would pass
-/// `max_candidate_checks`.
+/// One neighbor query: the entries on `level` of a faction in `factions` strictly within
+/// `radius` of `(x, y)`, visited in scan order (see the module doc). Every scanned entry of
+/// that level and those factions but `self` counts as a candidate check before its radius
+/// test; the scan stops before the check that would pass `max_candidate_checks`.
 pub const NeighborQuery = struct {
     x: f32,
     y: f32,
+    level: u16,
     /// Finite and at least 0.
     radius: f32,
     max_candidate_checks: u16,
-    /// Skipped without counting as a candidate.
+    factions: FactionSet = .full,
+    /// Skipped without counting as a candidate wherever the scan meets its entry in the piece
+    /// (cell row, chunk) holding `(x, y)` on `level`; indexed anywhere else it is a candidate.
     self: EntityId = EntityId.invalid,
 };
 
@@ -109,256 +204,307 @@ pub const SpatialIndexStats = struct {
     entity_count: usize = 0,
     bucket_batch: BatchStats = .{},
     sort_batch: BatchStats = .{},
+    link_batch: BatchStats = .{},
 };
 
-// The populated cells of one build's bands, found by key.
-const BandDirectory = struct {
-    splitters: [band_count - 1]CellKey = @splat(max_cell_key),
-    // 0 for the serial build's one band, else `band_count - 1`.
-    splitter_count: usize = 0,
-    bands: [band_count]BandExtent = @splat(.{}),
-
-    // A cell's band is the count of splitters at or below it; the splitters are
-    // nondecreasing, so the bands follow key order and every cell lies in exactly one.
-    fn bandOfCell(self: *const BandDirectory, cell: CellKey) usize {
-        return std.sort.partitionPoint(CellKey, self.splitters[0..self.splitter_count], cell, splitterAtOrBelow);
-    }
-
-    // One predicate call per probe, as `agent_grid`'s directory measured faster than
-    // `std.sort.upperBound`'s order wrapper.
-    fn splitterAtOrBelow(cell: CellKey, splitter: CellKey) bool {
-        return cellKeyOrder(cell, splitter) != .lt;
-    }
-};
-
-// Band b's entries, cells, and segments start at `start` in their lists; its table is
-// `segment_table[2 * start, 2 * (start + entry_count))`, at most half full.
-const BandExtent = struct {
-    start: u32 = 0,
-    entry_count: u32 = 0,
-    cell_count: u32 = 0,
-    segment_count: u32 = 0,
-};
+comptime {
+    // The key's faction field is two bits wide.
+    std.debug.assert(FactionSet.len <= 4);
+}
 
 /// One step's built index, read-only. Valid until the next build or reserve of its system.
 pub const SpatialIndexView = struct {
     /// Entry-order columns: a visit's entry index reads them.
     x: []const f32,
     y: []const f32,
-    entity: []const EntityId,
-    faction: []const Faction,
-    level: []const u16,
-    cells: []const SpatialCell,
-    segments: []const RowSegment,
-    segment_table: []const u32,
-    directory: *const BandDirectory,
+    entity_index: []const u32,
+    entity_generation: []const u32,
+    // Each populated cell's first entry in key order, then the entry count: cell c's entries
+    // are `[cells[c], cells[c + 1])`.
+    cells: []const u32,
+    rows: []const RowPart,
+    chunk_records: []const ChunkRecord,
+    level_slots: []const []ChunkSlot,
+    build_stamp: u64,
+    // The factions with an entry.
+    factions: FactionSet,
     cell_size: f32,
+    cells_per_chunk: u32,
+    chunks_x: u32,
+    cells_x: u32,
+    cells_y: u32,
 
-    /// Visits `query`'s neighbors in scan order through `visitor`, a pointer to a value
-    /// with `visit(entry: u32, dx: f32, dy: f32, dist2: f32) NeighborVisitResult`, where
-    /// `dx, dy` is the query point minus the entry's position. `.stop` ends the whole
-    /// query. Scans the `2r + 1` cell rows of its box, r = ceil(radius / cell_size), with one
-    /// probe per row piece: a row's run within one 64-cell span and one band.
+    /// The entity indexed at `entry`.
+    pub fn entityAt(self: SpatialIndexView, entry: u32) EntityId {
+        return .{ .index = self.entity_index[entry], .generation = self.entity_generation[entry] };
+    }
+
+    pub fn entryCount(self: SpatialIndexView) usize {
+        return self.x.len;
+    }
+
+    /// Visits `query`'s neighbors in scan order through `visitor`, a pointer to a value with
+    /// `visitLanes(*const NeighborLanes) LaneStop`, where `dx, dy` is the query point minus
+    /// the entry's position. A stop ends the whole query.
     pub fn queryNeighbors(self: SpatialIndexView, query: NeighborQuery, visitor: anytype) NeighborQueryStats {
         std.debug.assert(std.math.isFinite(query.radius) and query.radius >= 0);
-        var stats = NeighborQueryStats{};
-        if (self.entity.len == 0) return stats;
-        const scan = cellScanRadius(query.radius, self.cell_size);
-        const own = cellForPosition(query.x, query.y, self.cell_size);
-        const lanes = QueryLanes.init(query);
-        // Cell keys are i32: widen the box, then clamp it to the key range.
-        const key_min: i64 = std.math.minInt(i32);
-        const key_max: i64 = std.math.maxInt(i32);
-        // Clamped to the i32 range.
-        const min_x: i32 = @intCast(std.math.clamp(@as(i64, own.cell_x) - scan, key_min, key_max));
-        const max_x: i32 = @intCast(std.math.clamp(@as(i64, own.cell_x) + scan, key_min, key_max));
-        const min_y: i32 = @intCast(std.math.clamp(@as(i64, own.cell_y) - scan, key_min, key_max));
-        const max_y: i32 = @intCast(std.math.clamp(@as(i64, own.cell_y) + scan, key_min, key_max));
-        // Keys ascend through the box's rows and pieces, so the band only advances: one
-        // search, then at most `band_count - 1` steps per query.
-        var band = self.directory.bandOfCell(.{ .cell_y = min_y, .cell_x = min_x });
-        var cell_y: i64 = min_y;
+        const wanted = query.factions.bits.intersectWith(self.factions.bits);
+        if (wanted.mask == 0 or query.level >= self.level_slots.len) return .{};
+        const slots = self.level_slots[query.level];
+        const cells_per_chunk = self.cells_per_chunk;
+        const scan_radius: i64 = cellScanRadius(query.radius, self.cell_size);
+        const own_x = math.worldPosToCell(query.x, self.cell_size, self.cells_x);
+        const own_y = math.worldPosToCell(query.y, self.cell_size, self.cells_y);
+        // Widened, clamped to the grid, then narrowed.
+        const min_x: u32 = @intCast(@max(@as(i64, own_x) - scan_radius, 0));
+        const max_x: u32 = @intCast(@min(@as(i64, own_x) + scan_radius, @as(i64, self.cells_x) - 1));
+        const min_y: u32 = @intCast(@max(@as(i64, own_y) - scan_radius, 0));
+        const max_y: u32 = @intCast(@min(@as(i64, own_y) + scan_radius, @as(i64, self.cells_y) - 1));
+        const self_index = if (query.self.isValid()) query.self.index else no_entry;
+        var scan = Scan{
+            .x = self.x,
+            .y = self.y,
+            .entity_index = self.entity_index,
+            .entity_generation = self.entity_generation,
+            .query_x = query.x,
+            .query_y = query.y,
+            .lane_x = simd.splatFloat4(query.x),
+            .lane_y = simd.splatFloat4(query.y),
+            .lane_radius2 = simd.splatFloat4(query.radius * query.radius),
+            .cap = query.max_candidate_checks,
+            .self_index = self_index,
+            .self_generation = query.self.generation,
+            .lane_self = simd.splatUint4(self_index),
+        };
+        // Self is compared only in the piece holding the query point.
+        const self_chunk_x: u32 = if (query.self.isValid()) own_x / cells_per_chunk else std.math.maxInt(u32);
+        const first_chunk_x = min_x / cells_per_chunk;
+        const last_chunk_x = max_x / cells_per_chunk;
+        const first_lo: u32 = min_x % cells_per_chunk;
+        const last_hi: u32 = max_x % cells_per_chunk;
+        var chunk_y = min_y / cells_per_chunk;
+        var local_y = min_y % cells_per_chunk;
+        var cell_y = min_y;
+        // Scalar: per piece and per present faction, dependent directory, record, and row
+        // loads with popcounts, and no uniform float work; the runs go to `visitRun`.
         while (cell_y <= max_y) : (cell_y += 1) {
-            // In [min_y, max_y], both i32.
-            const row_y: i32 = @intCast(cell_y);
-            var piece_lo: i64 = min_x;
-            while (piece_lo <= max_x) {
-                // piece_lo is in [min_x, max_x], both i32.
-                const key = CellKey{ .cell_y = row_y, .cell_x = @intCast(piece_lo) };
-                // A row crosses the splitters in order as cell_x grows.
-                while (band < self.directory.splitter_count and cellKeyOrder(key, self.directory.splitters[band]) != .lt) band += 1;
-                // The piece ends at the box, its segment's last cell, or before the band's
-                // next splitter in this row; the splitter is above `key`, so past piece_lo.
-                // In i64: the last span's end is exactly `maxInt(i32)`.
-                var piece_hi: i64 = @min(max_x, segment_cells * @divFloor(piece_lo, segment_cells) + segment_cells - 1);
-                if (band < self.directory.splitter_count) {
-                    const splitter = self.directory.splitters[band];
-                    if (splitter.cell_y == row_y and splitter.cell_x <= piece_hi) piece_hi = @as(i64, splitter.cell_x) - 1;
+            const row_slots = slots[@as(usize, chunk_y) * self.chunks_x ..];
+            // local_y < cells_per_chunk <= 64.
+            const row_bit = @as(u64, 1) << @intCast(local_y);
+            var chunk_x = first_chunk_x;
+            while (chunk_x <= last_chunk_x) : (chunk_x += 1) {
+                const slot = &row_slots[chunk_x];
+                if (slot.build != self.build_stamp) continue;
+                const present = slot.factions.bits.intersectWith(wanted);
+                if (present.mask == 0) continue;
+                const record = &self.chunk_records[slot.record];
+                const lo: u32 = if (chunk_x == first_chunk_x) first_lo else 0;
+                const hi: u32 = if (chunk_x == last_chunk_x) last_hi else cells_per_chunk - 1;
+                const span = spanBits(lo, hi);
+                const own_piece = cell_y == own_y and chunk_x == self_chunk_x;
+                var factions = present.iterator(.{});
+                while (factions.next()) |faction| {
+                    const row_mask = record.row_masks[faction];
+                    if (row_mask & row_bit == 0) continue;
+                    const row = &self.rows[record.first_rows[faction] + @popCount(row_mask & (row_bit - 1))];
+                    const count = @popCount(row.cells & span);
+                    if (count == 0) continue;
+                    const first = row.first_cell + @popCount(row.cells & bitsBelow(lo));
+                    if (visitRun(&scan, self.cells[first], self.cells[first + count], own_piece, visitor)) return .{ .candidate_checks = scan.checks };
                 }
-                // Both in [min_x, max_x], i32.
-                const cells = self.pieceCells(band, row_y, @intCast(piece_lo), @intCast(piece_hi));
-                piece_lo = piece_hi + 1;
-                if (cells.len == 0) continue;
-                // The piece's cells are adjacent, so their entries are one run.
-                if (self.visitEntries(query, lanes, cells[0].start, cells[cells.len - 1].end, visitor, &stats)) return stats;
+            }
+            local_y += 1;
+            if (local_y == cells_per_chunk) {
+                local_y = 0;
+                chunk_y += 1;
             }
         }
-        return stats;
-    }
-
-    // Band `band`'s cells in row `cell_y` from `lo_x` to `hi_x`, a span inside one segment,
-    // in cell_x order. Scalar: a dependent, scattered probe chain and a bit rank.
-    fn pieceCells(self: SpatialIndexView, band: usize, cell_y: i32, lo_x: i32, hi_x: i32) []const SpatialCell {
-        std.debug.assert(lo_x <= hi_x and @divFloor(lo_x, segment_cells) == @divFloor(hi_x, segment_cells));
-        const segment = self.findSegment(band, cell_y, @divFloor(lo_x, segment_cells)) orelse return &.{};
-        // `@mod` by 64 is in [0, 63].
-        const lo_bit: u6 = @intCast(@mod(lo_x, segment_cells));
-        const hi_bit: u6 = @intCast(@mod(hi_x, segment_cells));
-        // The bits below lo_bit, and the bits lo_bit..hi_bit, as plain shifts: once per piece,
-        // where `setRangeValue`'s general range checks do not pay.
-        const below = (@as(u64, 1) << lo_bit) - 1;
-        const through_hi = ~@as(u64, 0) >> (63 - hi_bit);
-        const rank = @popCount(segment.occupied.mask & below);
-        const count = @popCount(segment.occupied.mask & through_hi & ~below);
-        return self.cells[segment.first_cell + rank ..][0..count];
-    }
-
-    // Scalar: a probe is a short chain of scattered, data-dependent loads.
-    fn findSegment(self: SpatialIndexView, band: usize, cell_y: i32, segment_x: i32) ?RowSegment {
-        const extent = self.directory.bands[band];
-        if (extent.segment_count == 0) return null;
-        const table_len = 2 * @as(usize, extent.entry_count);
-        const table = self.segment_table[2 * @as(usize, extent.start) ..][0..table_len];
-        var slot = tableSlot(cell_y, segment_x, table_len);
-        while (true) {
-            const stored = table[slot];
-            if (stored == 0) return null;
-            const segment = self.segments[stored - 1];
-            if (segment.cell_y == cell_y and segment.segment_x == segment_x) return segment;
-            slot += 1;
-            if (slot == table_len) slot = 0;
-        }
-    }
-
-    // The distance test runs in lanes over the contiguous entry columns, with the scalar
-    // tail; lanes are then taken in entry order for the self skip, the check, and the visit.
-    // Returns true when the query ends.
-    fn visitEntries(self: SpatialIndexView, query: NeighborQuery, lanes: QueryLanes, start: u32, end: u32, visitor: anytype, stats: *NeighborQueryStats) bool {
-        var entry: usize = start;
-        const vector_end = start + simd.vectorizedEnd(end - start);
-        while (entry < vector_end) : (entry += simd.lane_count) {
-            const dx = simd.subFloat4(lanes.x, simd.loadFloat4(self.x[entry..]));
-            const dy = simd.subFloat4(lanes.y, simd.loadFloat4(self.y[entry..]));
-            const dist2 = simd.lengthSquared2Float4(dx, dy);
-            const inside = simd.lessThanFloat4(dist2, lanes.radius2);
-            inline for (0..simd.lane_count) |lane| {
-                if (self.visitEntry(query, entry + lane, inside[lane], dx[lane], dy[lane], dist2[lane], visitor, stats)) return true;
-            }
-        }
-        return self.visitEntriesScalar(query, lanes.radius2[0], entry, end, visitor, stats);
-    }
-
-    // `visitEntries` one entry at a time: its tail, and its parity reference.
-    fn visitEntriesScalar(self: SpatialIndexView, query: NeighborQuery, radius2: f32, start: usize, end: usize, visitor: anytype, stats: *NeighborQueryStats) bool {
-        for (start..end) |entry| {
-            const dx = query.x - self.x[entry];
-            const dy = query.y - self.y[entry];
-            const dist2 = dx * dx + dy * dy;
-            if (self.visitEntry(query, entry, dist2 < radius2, dx, dy, dist2, visitor, stats)) return true;
-        }
-        return false;
-    }
-
-    fn visitEntry(self: SpatialIndexView, query: NeighborQuery, entry: usize, inside: bool, dx: f32, dy: f32, dist2: f32, visitor: anytype, stats: *NeighborQueryStats) bool {
-        // The index compare rejects every other entry with one u32 compare.
-        const candidate = self.entity[entry];
-        if (candidate.index == query.self.index and candidate.eql(query.self)) return false;
-        if (stats.candidate_checks >= query.max_candidate_checks) return true;
-        stats.candidate_checks += 1;
-        if (!inside) return false;
-        // Entries are below the slot count, at most maxInt(u32) (`SpatialIndexSystem.beginBuild`).
-        return visitor.visit(@as(u32, @intCast(entry)), dx, dy, dist2) == .stop;
+        return .{ .candidate_checks = scan.checks };
     }
 };
 
-// A query's point and squared radius in every lane, splatted once per query.
-const QueryLanes = struct {
-    x: simd.Float4,
-    y: simd.Float4,
-    radius2: simd.Float4,
+// No entry: never inside a run, since entries are below maxInt(u32), and never an indexed
+// entity's index.
+const no_entry: u32 = std.math.maxInt(u32);
 
-    fn init(query: NeighborQuery) QueryLanes {
-        return .{ .x = simd.splatFloat4(query.x), .y = simd.splatFloat4(query.y), .radius2 = simd.splatFloat4(query.radius * query.radius) };
-    }
+// A query's per-query constants and its running check count, shared by pointer with the
+// run visit.
+const Scan = struct {
+    x: []const f32,
+    y: []const f32,
+    entity_index: []const u32,
+    entity_generation: []const u32,
+    // A masked final batch's fill.
+    query_x: f32,
+    query_y: f32,
+    lane_x: simd.Float4,
+    lane_y: simd.Float4,
+    lane_radius2: simd.Float4,
+    cap: u16,
+    checks: u16 = 0,
+    // Self's entity index until the scan meets it, then `no_entry`.
+    self_index: u32,
+    self_generation: u32,
+    lane_self: simd.Uint4,
 };
 
-// Cells per row segment: one occupancy bit each.
-const segment_cells = 64;
-const SegmentMask = std.bit_set.Integer(segment_cells);
+// Entries `[start, end)` of one run in lane batches from `start`, each but self one candidate
+// check up to the budget; past the column's end the last batch is filled and masked. Self is
+// compared in `own_piece`'s runs only. Returns true on a stop, or with the budget spent before
+// the run's end, which ends the query.
+fn visitRun(scan: *Scan, start: u32, end: u32, own_piece: bool, visitor: anytype) bool {
+    std.debug.assert(start <= end and end <= scan.x.len);
+    var limit: usize = @min(end, @as(usize, start) + (scan.cap - scan.checks));
+    var entry: usize = start;
+    while (entry < limit) : (entry += simd.lane_count) {
+        const x = simd.loadFloat4OrFill(scan.x[entry..], scan.query_x);
+        const y = simd.loadFloat4OrFill(scan.y[entry..], scan.query_y);
+        var self_bits: simd.MaskBits = 0;
+        if (own_piece and scan.self_index != no_entry) {
+            // Lanes past the run belong to another run.
+            self_bits = simd.equalUint4Bits(simd.loadUint4OrFill(scan.entity_index[entry..], no_entry), scan.lane_self) & simd.lanesBelow(end - entry);
+            if (self_bits != 0) {
+                scan.self_index = no_entry;
+                const self_entry = entry + @ctz(self_bits);
+                if (scan.entity_generation[self_entry] != scan.self_generation) {
+                    self_bits = 0;
+                } else if (self_entry < limit) {
+                    // Self costs no check, so the budget reaches one entry further.
+                    limit = @min(end, limit + 1);
+                }
+            }
+        }
+        const counted = simd.lanesBelow(limit - entry) & ~self_bits;
+        const dx = simd.subFloat4(scan.lane_x, x);
+        const dy = simd.subFloat4(scan.lane_y, y);
+        const dist2 = simd.lengthSquared2Float4(dx, dy);
+        const inside = simd.lessThanFloat4Bits(dist2, scan.lane_radius2) & counted;
+        const before = scan.checks;
+        // At most the budget's remainder, a u16.
+        scan.checks += @popCount(counted);
+        if (inside == 0) continue;
+        // Entries are below maxInt(u32).
+        const lanes = NeighborLanes{ .first = @intCast(entry), .x = x, .y = y, .dx = dx, .dy = dy, .dist2 = dist2, .inside = inside };
+        if (visitor.visitLanes(&lanes)) |stop| {
+            std.debug.assert(inside >> stop & 1 != 0);
+            scan.checks = before + @popCount(counted & simd.lanesBelow(@as(usize, stop) + 1));
+            return true;
+        }
+    }
+    return limit < end;
+}
 
-// One band's populated cells in row `cell_y` within cells
-// `[segment_cells * segment_x, segment_cells * segment_x + segment_cells - 1]`: bit
-// `cell_x mod segment_cells` per cell, which are `cells[first_cell..]` in cell_x order,
-// one per set bit.
-const RowSegment = struct {
-    cell_y: i32,
-    segment_x: i32,
+// A row part's bits below local cell `lo`, a plain shift.
+fn bitsBelow(lo: u32) u64 {
+    std.debug.assert(lo < max_cells_per_chunk);
+    return (@as(u64, 1) << @intCast(lo)) - 1;
+}
+
+// A row part's bits of local cells `lo` to `hi`, as plain shifts: once per piece, where
+// `setRangeValue`'s general range checks do not pay.
+fn spanBits(lo: u32, hi: u32) u64 {
+    std.debug.assert(lo <= hi and hi < max_cells_per_chunk);
+    return (~@as(u64, 0) >> @intCast(63 - hi)) & ~bitsBelow(lo);
+}
+
+/// One chunk's entry in its level's directory. Valid only when `build` is the view's
+/// stamp; its record is `chunk_records[record]`, and `factions` the factions it holds.
+pub const ChunkSlot = struct {
+    build: u64 = 0,
+    record: u32 = 0,
+    factions: FactionSet = .empty,
+};
+
+/// Bytes of one directory slot: a level's directory is this times its world's chunks.
+pub const chunk_slot_bytes: usize = @sizeOf(ChunkSlot);
+
+comptime {
+    std.debug.assert(chunk_slot_bytes == 16);
+}
+
+// One populated chunk's row parts by faction index f: bit y of `row_masks[f]` is set when
+// faction f's row part at local row y exists, and that row part is
+// `rows[first_rows[f] + rank(row_masks[f], y)]`. A chunk's faction-f row parts are
+// contiguous and ascend by y.
+const ChunkRecord = struct {
+    row_masks: [FactionSet.len]u64,
+    first_rows: [FactionSet.len]u32,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(ChunkRecord) == 48);
+}
+
+// One (chunk, faction, local row)'s populated cells: bit `local_x` of `cells` per cell
+// holding an entry. Those cells are `cells[first_cell..][0..popCount(cells)]` of the view,
+// in local_x order, and their entries one contiguous run.
+const RowPart = struct {
+    cells: u64,
     first_cell: u32,
-    occupied: SegmentMask,
 };
 
-// A populated cell and its entries `[start, end)`.
-const SpatialCell = struct {
-    cell_y: i32,
-    cell_x: i32,
-    start: u32,
-    end: u32,
-};
-
-// A spatial cell, ordered by (cell_y, cell_x).
-const CellKey = struct {
-    cell_y: i32,
-    cell_x: i32,
-};
-
-// The largest cell key; splitters at it leave the bands after them empty.
-const max_cell_key = CellKey{ .cell_y = std.math.maxInt(i32), .cell_x = std.math.maxInt(i32) };
-
-// `cell` against `key` in (cell_y, cell_x) order. Plain comparisons: per-field
-// `std.math.order` calls measure slower on a per-query lookup (`agent_grid`).
-fn cellKeyOrder(cell: CellKey, key: CellKey) std.math.Order {
-    if (cell.cell_y != key.cell_y) return if (cell.cell_y < key.cell_y) .lt else .gt;
-    if (cell.cell_x != key.cell_x) return if (cell.cell_x < key.cell_x) .lt else .gt;
-    return .eq;
+comptime {
+    std.debug.assert(@sizeOf(RowPart) == 16);
 }
 
-fn cellKeyLessThan(_: void, lhs: CellKey, rhs: CellKey) bool {
-    return cellKeyOrder(lhs, rhs) == .lt;
+// An entry's sort key, packed high to low: level:16 | chunk_y:32 | chunk_x:32 | faction:2 |
+// local_y:6 | local_x:6 | slot:32. Total over a build, since slots are distinct; a cell, a
+// row part, a (chunk, faction), and a chunk are each a contiguous key range.
+const SortKey = u128;
+const key_cell_shift = 32;
+const key_row_shift = 38;
+const key_faction_shift = 44;
+const key_chunk_shift = 46;
+const key_chunk_y_shift = 78;
+const key_level_shift = 110;
+// The largest key; splitters at it leave the bands after them empty.
+const max_key: SortKey = std.math.maxInt(SortKey);
+
+fn packKey(level: u16, chunk_x: u32, chunk_y: u32, local_x: u32, local_y: u32, faction: usize, slot: u32) SortKey {
+    std.debug.assert(local_x < max_cells_per_chunk and local_y < max_cells_per_chunk and faction < 4);
+    return (@as(SortKey, level) << key_level_shift) |
+        (@as(SortKey, chunk_y) << key_chunk_y_shift) |
+        (@as(SortKey, chunk_x) << key_chunk_shift) |
+        (@as(SortKey, faction) << key_faction_shift) |
+        (@as(SortKey, local_y) << key_row_shift) |
+        (@as(SortKey, local_x) << key_cell_shift) |
+        slot;
 }
 
-// A segment's slot in a band's table of `table_len` slots: a 64-bit integer hash of
-// (cell_y, segment_x), scaled to the table without a division.
-fn tableSlot(cell_y: i32, segment_x: i32, table_len: usize) usize {
-    const packed_key = (@as(u64, @as(u32, @bitCast(cell_y))) << 32) | @as(u32, @bitCast(segment_x));
-    // The high word of hash * table_len is below table_len.
-    return @intCast(std.math.mulWide(u64, std.hash.int(packed_key), table_len) >> 64);
+// The key's fields by u32 word: word 1 holds local_x up to chunk_x's low bits, word 2
+// chunk_x's high bits and chunk_y's low bits, word 3 chunk_y's high bits and the level.
+comptime {
+    std.debug.assert(key_cell_shift == 32 and key_chunk_shift < 64);
+    std.debug.assert(key_chunk_y_shift == key_chunk_shift + 32 and key_chunk_y_shift >= 64 and key_chunk_y_shift < 96);
+    std.debug.assert(key_level_shift == key_chunk_y_shift + 32 and key_level_shift >= 96);
 }
 
-// An entry's sort key: total over a build, since slots are distinct.
-const SortKey = struct {
-    cell_y: i32,
-    cell_x: i32,
-    slot: u32,
+fn keySlot(key: SortKey) u32 {
+    return @truncate(key);
+}
 
-    fn cell(self: SortKey) CellKey {
-        return .{ .cell_y = self.cell_y, .cell_x = self.cell_x };
-    }
-};
+fn keyFaction(key: SortKey) usize {
+    return @as(u2, @truncate(key >> key_faction_shift));
+}
 
-fn sortKeyLessThan(_: void, lhs: SortKey, rhs: SortKey) bool {
-    if (lhs.cell_y != rhs.cell_y) return lhs.cell_y < rhs.cell_y;
-    if (lhs.cell_x != rhs.cell_x) return lhs.cell_x < rhs.cell_x;
-    return lhs.slot < rhs.slot;
+fn keyLocalX(key: SortKey) u32 {
+    return @as(u6, @truncate(key >> key_cell_shift));
+}
+
+fn keyLocalY(key: SortKey) u32 {
+    return @as(u6, @truncate(key >> key_row_shift));
+}
+
+fn keyChunkX(key: SortKey) u32 {
+    return @truncate(key >> key_chunk_shift);
+}
+
+fn keyChunkY(key: SortKey) u32 {
+    return @truncate(key >> key_chunk_y_shift);
+}
+
+fn keyLevel(key: SortKey) u16 {
+    return @truncate(key >> key_level_shift);
 }
 
 // One population slot as resolved this build; `entity` is invalid for a slot with no
@@ -374,9 +520,8 @@ const SlotRow = struct {
 const EntryRow = struct {
     x: f32,
     y: f32,
-    entity: EntityId,
-    faction: Faction,
-    level: u16,
+    entity_index: u32,
+    entity_generation: u32,
 };
 
 // With a 16-slot range alignment every bucket range's windows start on a cache line.
@@ -394,19 +539,25 @@ const BandOffsets = struct {
     offsets: [band_count + 1]u32 = @splat(0),
 };
 
+// One sorted band's cells, and its row-part and chunk starts after its first entry: the
+// main thread adds whether the first entry starts each.
 const BandTally = struct {
     cell_count: u32 = 0,
-    segment_count: u32 = 0,
+    row_starts: u32 = 0,
+    chunk_starts: u32 = 0,
+    factions: FactionSet = .empty,
+    max_level: u16 = 0,
 };
 
 comptime {
     for ([_]type{ BandOffsets, BandTally }) |T| std.debug.assert(@sizeOf(PaddedSlot(T)) % thread_shared_record_alignment == 0);
 }
 
-// The two stages of a threaded build, each under its own tuner.
+// The three stages of a threaded build, each under its own tuner.
 const BuildStages = struct {
     bucket: Dispatch,
     sort: Dispatch,
+    link: Dispatch,
 };
 
 pub const SpatialIndexSystem = struct {
@@ -418,32 +569,44 @@ pub const SpatialIndexSystem = struct {
     // A threaded build's band-ordered bucket windows.
     staging: SortKeyList = .empty,
     entries: std.MultiArrayList(EntryRow) = .{},
-    // Band b's cells sit in its own slice from its entry start; the rest of the slice is
-    // unused.
-    cells: std.ArrayList(SpatialCell) = .empty,
-    // Band b's row segments, laid out like its cells.
-    segments: std.ArrayList(RowSegment) = .empty,
-    // Per band, linear-probe slots holding 0 or a segment index + 1. Hand-rolled: a std
-    // hash map owns its storage, and each band's table is written by its sort range inside
-    // one seam-reserved buffer.
-    segment_table: std.ArrayList(u32) = .empty,
-    directory: BandDirectory = .{},
+    // Sort scratch: band b's cell starts sit in its own slice from its entry start; the rest
+    // of the slice is unused.
+    band_cells: std.ArrayList(u32) = .empty,
+    // Every populated cell's first entry in key order, then the entry count.
+    cells: std.ArrayList(u32) = .empty,
+    // Every (chunk, faction, local row)'s row part, contiguous in key order.
+    rows: std.ArrayList(RowPart) = .empty,
+    // Every populated chunk's record, in key order.
+    chunk_records: std.ArrayList(ChunkRecord) = .empty,
+    // One directory per level, `grid.chunkCount()` slots each.
+    level_slots: std.ArrayList([]ChunkSlot) = .empty,
+    // The current build's; never wraps.
+    build_stamp: u64 = 0,
+    grid: Grid = .{},
+    // The level count the last `reserveGeometry` covered: never released for an absence of
+    // bodies.
+    geometry_level_count: usize = 0,
+    // The factions with an entry this build.
+    factions: FactionSet = .empty,
     band_offsets: SlotList(BandOffsets) = .empty,
     band_tallies: SlotList(BandTally) = .empty,
     bucket_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    cell_size: f32 = (SpatialIndexConfig{}).cell_size,
+    link_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
     pub fn init(allocator: std.mem.Allocator) SpatialIndexSystem {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *SpatialIndexSystem) void {
+        self.freeLevels(0);
+        self.level_slots.deinit(self.allocator);
         self.band_tallies.deinit(self.allocator);
         self.band_offsets.deinit(self.allocator);
-        self.segment_table.deinit(self.allocator);
-        self.segments.deinit(self.allocator);
+        self.chunk_records.deinit(self.allocator);
+        self.rows.deinit(self.allocator);
         self.cells.deinit(self.allocator);
+        self.band_cells.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         self.staging.deinit(self.allocator);
         self.keys.deinit(self.allocator);
@@ -462,11 +625,51 @@ pub const SpatialIndexSystem = struct {
         try self.keys.ensureTotalCapacity(self.allocator, capacity);
         try self.staging.ensureTotalCapacity(self.allocator, capacity);
         try self.entries.ensureTotalCapacity(self.allocator, capacity);
-        try self.cells.ensureTotalCapacity(self.allocator, capacity);
-        try self.segments.ensureTotalCapacity(self.allocator, capacity);
-        try self.segment_table.ensureTotalCapacity(self.allocator, 2 * capacity);
+        try self.band_cells.ensureTotalCapacity(self.allocator, capacity);
+        // The cell starts and their end sentinel.
+        try self.cells.ensureTotalCapacity(self.allocator, capacity + 1);
+        try self.rows.ensureTotalCapacity(self.allocator, capacity);
+        try self.chunk_records.ensureTotalCapacity(self.allocator, capacity);
         try self.band_offsets.ensureTotalCapacity(self.allocator, maxRangeCount(capacity, spatial_index_range_alignment_items));
         try self.band_tallies.ensureTotalCapacity(self.allocator, band_count);
+    }
+
+    // Sizes the level directories for `geometry` at `config`'s cell, so a build of a
+    // population on its levels allocates none: no-op when unchanged, released and rebuilt on
+    // a grid change, grown to the level count otherwise. A build calls it first on the
+    // calling thread; a body on a level past the count gets its directory after the sort.
+    fn reserveGeometry(self: *SpatialIndexSystem, geometry: IndexGeometry, config: SpatialIndexConfig) error{OutOfMemory}!void {
+        const grid = Grid.of(geometry, config.cell_size);
+        if (!std.meta.eql(grid, self.grid)) {
+            self.freeLevels(0);
+            self.grid = grid;
+        }
+        self.geometry_level_count = geometry.level_count;
+        if (self.level_slots.items.len < geometry.level_count) try self.fitLevels(geometry.level_count);
+    }
+
+    /// Bytes the level directories hold.
+    pub fn directoryBytes(self: *const SpatialIndexSystem) usize {
+        var bytes: usize = 0;
+        for (self.level_slots.items) |slots| bytes += slots.len * chunk_slot_bytes;
+        return bytes;
+    }
+
+    // Grows or shrinks the directories to `level_count` levels, new ones all stale.
+    fn fitLevels(self: *SpatialIndexSystem, level_count: usize) error{OutOfMemory}!void {
+        self.freeLevels(level_count);
+        if (self.level_slots.items.len == level_count) return;
+        try self.level_slots.ensureTotalCapacity(self.allocator, level_count);
+        while (self.level_slots.items.len < level_count) {
+            const slots = try self.allocator.alloc(ChunkSlot, self.grid.chunkCount());
+            @memset(slots, .{});
+            self.level_slots.appendAssumeCapacity(slots);
+        }
+    }
+
+    // Frees every directory past the first `keep`.
+    fn freeLevels(self: *SpatialIndexSystem, keep: usize) void {
+        while (self.level_slots.items.len > keep) self.allocator.free(self.level_slots.pop().?);
     }
 
     /// The last build's index.
@@ -475,56 +678,71 @@ pub const SpatialIndexSystem = struct {
         return .{
             .x = entries.items(.x),
             .y = entries.items(.y),
-            .entity = entries.items(.entity),
-            .faction = entries.items(.faction),
-            .level = entries.items(.level),
+            .entity_index = entries.items(.entity_index),
+            .entity_generation = entries.items(.entity_generation),
             .cells = self.cells.items,
-            .segments = self.segments.items,
-            .segment_table = self.segment_table.items,
-            .directory = &self.directory,
-            .cell_size = self.cell_size,
+            .rows = self.rows.items,
+            .chunk_records = self.chunk_records.items,
+            .level_slots = self.level_slots.items,
+            .build_stamp = self.build_stamp,
+            .factions = self.factions,
+            .cell_size = self.grid.cell_size,
+            .cells_per_chunk = self.grid.cells_per_chunk,
+            .chunks_x = self.grid.chunks_x,
+            .cells_x = self.grid.cells_x,
+            .cells_y = self.grid.cells_y,
         };
     }
 
-    /// Builds the index of `population`'s slots from their previous positions. Both stages
-    /// run on workers under the index's tuners, or inline as they select; with no worker
-    /// available it builds serially. Allocates only past `reserve`'s capacity, on the
-    /// calling thread before any dispatch.
+    /// Builds the index of `population`'s slots from their previous positions over
+    /// `geometry`'s grid. Every stage runs on workers under the index's own tuners, or
+    /// inline as they select; with no worker available it builds serially. Allocates only
+    /// past `reserve`'s capacity or `reserveGeometry`'s directories, on the calling thread
+    /// before any dispatch that uses them.
     pub fn build(
         self: *SpatialIndexSystem,
         data: *const DataSystem,
         population: IndexPopulation,
+        geometry: IndexGeometry,
         thread_system: *ThreadSystem,
         config: SpatialIndexConfig,
     ) !SpatialIndexStats {
-        const slot_count = try self.beginBuild(population, config);
-        if (slot_count == 0) return .{};
+        const slot_count = try self.beginBuild(population, geometry, config);
+        if (slot_count == 0) return self.finishEmptyBuild(.{});
         const threads = StageThreads.withWorkers(.{ .thread_system = thread_system, .config = config }) orelse return self.buildDirect(data, population);
-        const stages = BuildStages{ .bucket = threads.stage(&self.bucket_tuner), .sort = threads.stage(&self.sort_tuner) };
-        return self.buildBanded(data, population, stages, chooseSplitters(data, population, self.cell_size));
+        const stages = BuildStages{ .bucket = threads.stage(&self.bucket_tuner), .sort = threads.stage(&self.sort_tuner), .link = threads.stage(&self.link_tuner) };
+        return self.buildBanded(data, population, stages, chooseSplitters(data, population, self.grid));
     }
 
     /// `build` on the calling thread alone.
-    pub fn buildSerial(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation, config: SpatialIndexConfig) !SpatialIndexStats {
-        const slot_count = try self.beginBuild(population, config);
-        if (slot_count == 0) return .{};
+    pub fn buildSerial(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation, geometry: IndexGeometry, config: SpatialIndexConfig) !SpatialIndexStats {
+        const slot_count = try self.beginBuild(population, geometry, config);
+        if (slot_count == 0) return self.finishEmptyBuild(.{});
         return self.buildDirect(data, population);
     }
 
-    // Clears the last build, so an empty one leaves no cells, and sizes every buffer for
-    // `population`. Returns its slot count.
-    fn beginBuild(self: *SpatialIndexSystem, population: IndexPopulation, config: SpatialIndexConfig) !usize {
+    // A build with no entries: the directories cut back to the geometry's levels, so levels
+    // grown for bodies that are gone are released.
+    fn finishEmptyBuild(self: *SpatialIndexSystem, stats: SpatialIndexStats) error{OutOfMemory}!SpatialIndexStats {
+        try self.fitLevels(self.geometry_level_count);
+        return stats;
+    }
+
+    // Starts a new build stamp, so every directory slot of the last build is stale, clears
+    // the last build, and sizes every buffer and directory for `population` and `geometry`.
+    // Returns its slot count.
+    fn beginBuild(self: *SpatialIndexSystem, population: IndexPopulation, geometry: IndexGeometry, config: SpatialIndexConfig) !usize {
         std.debug.assert(std.math.isFinite(config.cell_size) and config.cell_size > 0);
-        self.directory = .{};
-        self.cell_size = config.cell_size;
+        self.build_stamp += 1;
+        self.factions = .empty;
         self.entries.clearRetainingCapacity();
+        self.band_cells.clearRetainingCapacity();
         self.cells.clearRetainingCapacity();
-        self.segments.clearRetainingCapacity();
-        self.segment_table.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
+        self.chunk_records.clearRetainingCapacity();
+        try self.reserveGeometry(geometry, config);
         const slot_count = population.len();
-        // Slots, entries, cells, and segments are u32. The pipeline's population is its
-        // halo, at most the AI rows, at most the entity slots, which `createEntity` refuses
-        // past maxInt(u32).
+        // u32 slots, entries, cells, rows, and records: `createEntity` refuses past maxInt(u32).
         std.debug.assert(slot_count <= std.math.maxInt(u32));
         try self.reserve(slot_count);
         std.debug.assert(self.slot_rows.capacity >= slot_count and self.keys.capacity >= slot_count and self.staging.capacity >= slot_count);
@@ -533,36 +751,42 @@ pub const SpatialIndexSystem = struct {
         return slot_count;
     }
 
-    // The serial build: one fill straight into the keys and one band.
-    fn buildDirect(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation) SpatialIndexStats {
+    // The serial build: one fill straight into the keys, then one band's sort and link.
+    fn buildDirect(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation) !SpatialIndexStats {
         const slot_count = population.len();
         const fill = self.fillContext(data, population);
         // At most slot_count <= maxInt(u32) keys.
         const entry_count: u32 = @intCast(fillSlots(&fill, 0, slot_count, self.keys.items));
         self.setEntryCount(entry_count);
-        const counts = self.bandWriter().finishBand(0, entry_count);
-        self.directory.bands[0] = .{ .start = 0, .entry_count = entry_count, .cell_count = counts.cell_count, .segment_count = counts.segment_count };
+        var band_start: [band_count + 1]u32 = @splat(entry_count);
+        band_start[0] = 0;
+        var tallies: [band_count]BandTally = @splat(.{});
+        if (entry_count != 0) tallies[0] = self.bandWriter().finishBand(0, entry_count);
+        var link = try self.prepareLink(band_start, tallies, 1);
+        if (tallies[0].cell_count != 0) linkBand(&link, 0);
         return .{
             .entity_count = entry_count,
             .bucket_batch = inlineBatch(slot_count, spatial_index_range_alignment_items),
             .sort_batch = inlineBatch(entry_count, spatial_index_range_alignment_items),
+            .link_batch = inlineBatch(tallies[0].cell_count, spatial_index_range_alignment_items),
         };
     }
 
-    // `index_bucket` over the slots into the bands of `splitters` (nondecreasing), the band
-    // starts on the main thread, then `index_sort` over the keys and the band directory.
-    fn buildBanded(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation, stages: BuildStages, splitters: [band_count - 1]CellKey) SpatialIndexStats {
+    // `index_bucket` over the slots into the bands of `splitters` (nondecreasing cell
+    // starts), the band starts on the main thread, `index_sort` over the keys, the band
+    // prefixes and levels on the main thread, then `index_link` over the cells.
+    fn buildBanded(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation, stages: BuildStages, splitters: [band_count - 1]SortKey) !SpatialIndexStats {
         const slot_count = population.len();
         std.debug.assert(slot_count > 0 and self.slot_rows.items.len == slot_count and self.keys.items.len == slot_count);
-        for (splitters[0 .. band_count - 2], splitters[1..]) |lower, upper| std.debug.assert(cellKeyOrder(upper, lower) != .lt);
+        for (splitters[0 .. band_count - 2], splitters[1..]) |lower, upper| std.debug.assert(lower <= upper);
+        for (splitters) |splitter| std.debug.assert(splitter == max_key or splitter & cell_low_bits == 0);
         const bucket_selection = stages.bucket.select(slot_count, spatial_index_range_alignment_items);
         std.debug.assert(self.band_offsets.capacity >= bucket_selection.range_count and self.band_tallies.capacity >= band_count);
         self.staging.items.len = slot_count;
         setSlotCount(BandOffsets, &self.band_offsets, bucket_selection.range_count);
-        self.directory = .{ .splitters = splitters, .splitter_count = band_count - 1 };
         var bucket = BucketJob{
             .fill = self.fillContext(data, population),
-            .directory = &self.directory,
+            .splitters = splitters,
             .scratch = self.keys.items,
             .staging = self.staging.items,
             .items_per_range = bucket_selection.items_per_range,
@@ -580,24 +804,88 @@ pub const SpatialIndexSystem = struct {
         self.setEntryCount(entry_count);
         setSlotCount(BandTally, &self.band_tallies, band_count);
         stats.entity_count = entry_count;
-        if (entry_count != 0) {
-            const sort_selection = stages.sort.select(entry_count, spatial_index_range_alignment_items);
-            var sort = SortJob{
-                .staging = self.staging.items,
-                .band_offsets = self.band_offsets.items,
-                .bucket_items_per_range = bucket_selection.items_per_range,
-                .band_start = band_start,
-                .writer = self.bandWriter(),
-                .tallies = self.band_tallies.items,
-                .range_count = sort_selection.range_count,
-            };
-            stats.sort_batch = stages.sort.run(sort_selection, entry_count, spatial_index_range_alignment_items, &sort, sortJob);
-        }
+        if (entry_count == 0) return self.finishEmptyBuild(stats);
+        const sort_selection = stages.sort.select(entry_count, spatial_index_range_alignment_items);
+        var sort = SortJob{
+            .staging = self.staging.items,
+            .band_offsets = self.band_offsets.items,
+            .bucket_items_per_range = bucket_selection.items_per_range,
+            .band_start = band_start,
+            .writer = self.bandWriter(),
+            .tallies = self.band_tallies.items,
+            .range_count = sort_selection.range_count,
+        };
+        stats.sort_batch = stages.sort.run(sort_selection, entry_count, spatial_index_range_alignment_items, &sort, sortJob);
 
-        for (&self.directory.bands, self.band_tallies.items, band_start[0..band_count], band_start[1..]) |*band, tally, start, end| {
-            band.* = .{ .start = start, .entry_count = end - start, .cell_count = tally.value.cell_count, .segment_count = tally.value.segment_count };
-        }
+        var tallies: [band_count]BandTally = undefined;
+        for (&tallies, self.band_tallies.items) |*tally, slot| tally.* = slot.value;
+        const link_selection = stages.link.select(cellTotal(tallies), spatial_index_range_alignment_items);
+        var link = try self.prepareLink(band_start, tallies, link_selection.range_count);
+        stats.link_batch = stages.link.run(link_selection, link.cell_prefix[band_count], spatial_index_range_alignment_items, &link, linkJob);
         return stats;
+    }
+
+    // The link stage's job over `tallies`' bands at `band_start`, after the sort: the band
+    // cell, row-part, and chunk prefixes, the factions, and every level's directory, sized
+    // here on the calling thread. Sets the cell, row-part, and record counts and writes the
+    // cells' end sentinel. O(bands): two key reads per band.
+    fn prepareLink(self: *SpatialIndexSystem, band_start: [band_count + 1]u32, tallies: [band_count]BandTally, range_count: usize) error{OutOfMemory}!LinkJob {
+        const keys = self.keys.items;
+        var job = LinkJob{
+            .keys = keys,
+            .band_cells = self.band_cells.items,
+            .cells = undefined,
+            .rows = undefined,
+            .chunk_records = undefined,
+            .level_slots = undefined,
+            .chunks_x = self.grid.chunks_x,
+            .chunk_count = self.grid.chunkCount(),
+            .build_stamp = self.build_stamp,
+            .band_start = band_start,
+            .cell_counts = undefined,
+            .cell_prefix = undefined,
+            .row_prefix = undefined,
+            .chunk_prefix = undefined,
+            .range_count = range_count,
+        };
+        var max_level: u16 = 0;
+        job.cell_prefix[0] = 0;
+        job.row_prefix[0] = 0;
+        job.chunk_prefix[0] = 0;
+        for (tallies, 0..) |tally, band| {
+            job.cell_counts[band] = tally.cell_count;
+            var row_starts = tally.row_starts;
+            var chunk_starts = tally.chunk_starts;
+            if (tally.cell_count != 0) {
+                // The band's first entry starts a row part or chunk unless the entry before it,
+                // the last of an earlier band, shares it.
+                const first = band_start[band];
+                if (first == 0 or keys[first - 1] >> key_row_shift != keys[first] >> key_row_shift) row_starts += 1;
+                if (first == 0 or keys[first - 1] >> key_chunk_shift != keys[first] >> key_chunk_shift) chunk_starts += 1;
+                max_level = @max(max_level, tally.max_level);
+            }
+            job.cell_prefix[band + 1] = job.cell_prefix[band] + tally.cell_count;
+            job.row_prefix[band + 1] = job.row_prefix[band] + row_starts;
+            job.chunk_prefix[band + 1] = job.chunk_prefix[band] + chunk_starts;
+            self.factions.setUnion(tally.factions);
+        }
+        const cell_count = job.cell_prefix[band_count];
+        const row_count = job.row_prefix[band_count];
+        const chunk_count = job.chunk_prefix[band_count];
+        // A level the world lacks gets its directory here; levels past both the world's and
+        // the bodies' are released.
+        const body_levels: usize = if (cell_count == 0) 0 else @as(usize, max_level) + 1;
+        try self.fitLevels(@max(self.geometry_level_count, body_levels));
+        std.debug.assert(self.cells.capacity >= cell_count + 1 and self.rows.capacity >= row_count and self.chunk_records.capacity >= chunk_count);
+        self.cells.items.len = cell_count + 1;
+        self.cells.items[cell_count] = band_start[band_count];
+        self.rows.items.len = row_count;
+        self.chunk_records.items.len = chunk_count;
+        job.cells = self.cells.items;
+        job.rows = self.rows.items;
+        job.chunk_records = self.chunk_records.items;
+        job.level_slots = self.level_slots.items;
+        return job;
     }
 
     fn fillContext(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation) FillContext {
@@ -605,20 +893,17 @@ pub const SpatialIndexSystem = struct {
             .population = population,
             .data = data,
             .movement = data.movementBodySliceConst(),
-            .cell_size = self.cell_size,
+            .grid = self.grid,
             .slot_rows = self.slot_rows.items,
         };
     }
 
-    // Sizes the entry, cell, segment, and table lists for `entry_count` entries, within
+    // Sizes the entry list and the sort's cell scratch for `entry_count` entries, within
     // capacity.
     fn setEntryCount(self: *SpatialIndexSystem, entry_count: u32) void {
-        std.debug.assert(self.cells.capacity >= entry_count and self.segments.capacity >= entry_count);
-        std.debug.assert(self.segment_table.capacity >= 2 * @as(usize, entry_count));
+        std.debug.assert(self.band_cells.capacity >= entry_count);
         setRowCount(EntryRow, &self.entries, entry_count);
-        self.cells.items.len = entry_count;
-        self.segments.items.len = entry_count;
-        self.segment_table.items.len = 2 * @as(usize, entry_count);
+        self.band_cells.items.len = entry_count;
     }
 
     fn bandWriter(self: *SpatialIndexSystem) BandWriter {
@@ -628,44 +913,59 @@ pub const SpatialIndexSystem = struct {
             .slot_rows = self.slot_rows.items,
             .entry_x = entries.items(.x),
             .entry_y = entries.items(.y),
-            .entry_entity = entries.items(.entity),
-            .entry_faction = entries.items(.faction),
-            .entry_level = entries.items(.level),
-            .cells = self.cells.items,
-            .segments = self.segments.items,
-            .segment_table = self.segment_table.items,
+            .entry_entity_index = entries.items(.entity_index),
+            .entry_entity_generation = entries.items(.entity_generation),
+            .band_cells = self.band_cells.items,
         };
     }
 };
 
-// ---- Build stages -------------------------------------------------------------
-
-fn cellScanRadius(radius: f32, cell_size: f32) i32 {
-    // ceil(r / c) == -floor(-r / c), through the saturating `floorToI32`.
-    return -math.floorToI32(-(radius / cell_size));
+fn keyLessThan(_: void, lhs: SortKey, rhs: SortKey) bool {
+    return lhs < rhs;
 }
 
-fn cellForPosition(x: f32, y: f32, cell_size: f32) CellKey {
-    return .{ .cell_y = math.floorToI32(y / cell_size), .cell_x = math.floorToI32(x / cell_size) };
+fn cellTotal(tallies: [band_count]BandTally) usize {
+    var total: usize = 0;
+    for (tallies) |tally| total += tally.cell_count;
+    return total;
+}
+
+// ---- Build stages -------------------------------------------------------------
+
+// ceil(radius / cell_size) cells, saturated at maxInt(i32).
+fn cellScanRadius(radius: f32, cell_size: f32) i32 {
+    return std.math.lossyCast(i32, @ceil(radius / cell_size));
+}
+
+// A key's bits below its cell: the slot.
+const cell_low_bits: SortKey = (@as(SortKey, 1) << key_cell_shift) - 1;
+
+// The scalar key of a body on `level` at `(x, y)`, clamped to `grid`: bit for bit the lane
+// fill's.
+fn keyForPosition(grid: Grid, level: u16, x: f32, y: f32, faction: usize, slot: u32) SortKey {
+    const cell_x = math.worldPosToCell(x, grid.cell_size, grid.cells_x);
+    const cell_y = math.worldPosToCell(y, grid.cell_size, grid.cells_y);
+    const per_chunk = grid.cells_per_chunk;
+    return packKey(level, cell_x / per_chunk, cell_y / per_chunk, cell_x % per_chunk, cell_y % per_chunk, faction, slot);
 }
 
 const FillContext = struct {
     population: IndexPopulation,
     data: *const DataSystem,
     movement: ConstMovementBodySlice,
-    cell_size: f32,
+    grid: Grid,
     // Written at the filled slots only.
     slot_rows: []SlotRow,
 
-    // Scalar: a scattered dense-index lookup per component, with a skip.
+    // Scalar: one dense-index point lookup per slot, with a skip.
     fn resolveSlot(self: *const FillContext, slot: usize) SlotRow {
         const entity = self.population.entity(slot);
-        const row: SlotRow = if (self.data.movementBodyDenseIndex(entity)) |body| .{
+        const row: SlotRow = if (self.data.bodyLevelFaction(entity)) |found| .{
             .entity = entity,
-            .x = self.movement.previous_x[body],
-            .y = self.movement.previous_y[body],
-            .level = self.data.worldLevelConst(entity) orelse 0,
-            .faction = self.data.factionConst(entity) orelse .neutral,
+            .x = self.movement.previous_x[found.movement_body],
+            .y = self.movement.previous_y[found.movement_body],
+            .level = found.level orelse 0,
+            .faction = found.faction orelse .neutral,
         } else .{ .entity = EntityId.invalid, .x = 0, .y = 0, .level = 0, .faction = .neutral };
         self.slot_rows[slot] = row;
         return row;
@@ -673,30 +973,51 @@ const FillContext = struct {
 };
 
 // Resolves slots `[start, end)` into their rows and writes a key to `keys` for each with a
-// movement body, in slot order; returns the key count. Cells in lanes over the packed
-// positions with a scalar tail, bit for bit `cellForPosition`.
+// movement body, in slot order; returns the key count. Clamped cells, their chunk and local
+// coordinates, and the key's words in lanes over the packed rows with a scalar tail, bit
+// for bit `keyForPosition`.
 fn fillSlots(fill: *const FillContext, start: usize, end: usize, keys: []SortKey) usize {
     std.debug.assert(start <= end and end <= fill.slot_rows.len and keys.len >= end - start);
-    const cell_size_lanes = simd.splatFloat4(fill.cell_size);
+    const grid = fill.grid;
+    // At most 64.
+    const per_chunk_lanes = simd.splatInt4(@intCast(grid.cells_per_chunk));
     var count: usize = 0;
     var slot = start;
     const vector_end = start + simd.vectorizedEnd(end - start);
     while (slot < vector_end) : (slot += simd.lane_count) {
         var x: [simd.lane_count]f32 = undefined;
         var y: [simd.lane_count]f32 = undefined;
-        var has_body: [simd.lane_count]bool = undefined;
+        var level: [simd.lane_count]u32 = undefined;
+        var faction: [simd.lane_count]u32 = undefined;
+        var valid: [simd.lane_count]bool = undefined;
         inline for (0..simd.lane_count) |lane| {
             const row = fill.resolveSlot(slot + lane);
             x[lane] = row.x;
             y[lane] = row.y;
-            has_body[lane] = row.entity.isValid();
+            level[lane] = row.level;
+            // A faction index is below `FactionSet.len` (4).
+            faction[lane] = @intCast(FactionSet.Indexer.indexOf(row.faction));
+            valid[lane] = row.entity.isValid();
         }
-        const cell_x = simd.toIntArray(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&x), cell_size_lanes)));
-        const cell_y = simd.toIntArray(simd.floorToI4(simd.divFloat4(simd.loadFloat4(&y), cell_size_lanes)));
+        const cell_x = simd.worldPosToCell4(simd.loadFloat4(&x), grid.cell_size, grid.cells_x);
+        const cell_y = simd.worldPosToCell4(simd.loadFloat4(&y), grid.cell_size, grid.cells_y);
+        const chunk_x = simd.divInt4(cell_x, per_chunk_lanes);
+        const chunk_y = simd.divInt4(cell_y, per_chunk_lanes);
+        // Clamped cells are in [0, cells - 1], so every coordinate is non-negative.
+        const local_x: simd.Uint4 = @bitCast(simd.subInt4(cell_x, simd.mulInt4(chunk_x, per_chunk_lanes)));
+        const local_y: simd.Uint4 = @bitCast(simd.subInt4(cell_y, simd.mulInt4(chunk_y, per_chunk_lanes)));
+        const chunk_x_words: simd.Uint4 = @bitCast(chunk_x);
+        const chunk_y_words: simd.Uint4 = @bitCast(chunk_y);
+        const word1 = shl(local_x, key_cell_shift - 32) | shl(local_y, key_row_shift - 32) |
+            shl(simd.loadUint4(&faction), key_faction_shift - 32) | shl(chunk_x_words, key_chunk_shift - 32);
+        const word2 = simd.shiftRightUint4(chunk_x_words, 64 - key_chunk_shift) | shl(chunk_y_words, key_chunk_y_shift - 64);
+        const word3 = simd.shiftRightUint4(chunk_y_words, 96 - key_chunk_y_shift) | shl(simd.loadUint4(&level), key_level_shift - 96);
+        // The key's u32 words store low word first.
+        comptime std.debug.assert(builtin.cpu.arch.endian() == .little);
         inline for (0..simd.lane_count) |lane| {
-            if (has_body[lane]) {
+            if (valid[lane]) {
                 // A slot is below slot_count <= maxInt(u32).
-                keys[count] = .{ .cell_y = cell_y[lane], .cell_x = cell_x[lane], .slot = @intCast(slot + lane) };
+                keys[count] = @bitCast([4]u32{ @intCast(slot + lane), word1[lane], word2[lane], word3[lane] });
                 count += 1;
             }
         }
@@ -704,19 +1025,27 @@ fn fillSlots(fill: *const FillContext, start: usize, end: usize, keys: []SortKey
     while (slot < end) : (slot += 1) {
         const row = fill.resolveSlot(slot);
         if (!row.entity.isValid()) continue;
-        const cell = cellForPosition(row.x, row.y, fill.cell_size);
         // A slot is below slot_count <= maxInt(u32).
-        keys[count] = .{ .cell_y = cell.cell_y, .cell_x = cell.cell_x, .slot = @intCast(slot) };
+        keys[count] = keyForPosition(grid, row.level, row.x, row.y, FactionSet.Indexer.indexOf(row.faction), @intCast(slot));
         count += 1;
     }
     return count;
 }
 
+// A key's band among nondecreasing `splitters`: the count at or below it. Splitters sit at
+// cell starts, so a cell lies in exactly one band and the bands follow key order.
+fn bandOfKey(splitters: *const [band_count - 1]SortKey, key: SortKey) usize {
+    return std.sort.partitionPoint(SortKey, splitters, key, splitterAtOrBelow);
+}
+
+fn splitterAtOrBelow(key: SortKey, splitter: SortKey) bool {
+    return splitter <= key;
+}
+
 // `index_bucket`: one range of population slots.
 const BucketJob = struct {
     fill: FillContext,
-    // Its splitters, written before dispatch.
-    directory: *const BandDirectory,
+    splitters: [band_count - 1]SortKey,
     // Range r's windows start at `r * items_per_range`.
     scratch: []SortKey,
     staging: []SortKey,
@@ -733,15 +1062,14 @@ fn bucketJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start == range.index * job.items_per_range);
     std.debug.assert(range.start <= range.end and range.end <= job.fill.population.len());
     std.debug.assert(range.end <= job.scratch.len and range.end <= job.staging.len and range.end <= job.fill.slot_rows.len);
-    std.debug.assert(job.directory.splitter_count == band_count - 1);
     const filled = job.scratch[range.start..][0..fillSlots(&job.fill, range.start, range.end, job.scratch[range.start..range.end])];
     var offsets: [band_count + 1]u32 = @splat(0);
-    for (filled) |key| offsets[job.directory.bandOfCell(key.cell()) + 1] += 1;
+    for (filled) |key| offsets[bandOfKey(&job.splitters, key) + 1] += 1;
     for (1..band_count + 1) |band| offsets[band] += offsets[band - 1];
     job.band_offsets[range.index].value.offsets = offsets;
     var cursor = offsets;
     for (filled) |key| {
-        const band = job.directory.bandOfCell(key.cell());
+        const band = bandOfKey(&job.splitters, key);
         job.staging[range.start + cursor[band]] = key;
         cursor[band] += 1;
     }
@@ -753,7 +1081,7 @@ const SortJob = struct {
     staging: []const SortKey,
     band_offsets: []const PaddedSlot(BandOffsets),
     bucket_items_per_range: usize,
-    // Band b's keys, cells, and entries go to `[band_start[b], band_start[b + 1])`.
+    // Band b's keys, cell starts, and entries go to `[band_start[b], band_start[b + 1])`.
     band_start: [band_count + 1]u32,
     writer: BandWriter,
     tallies: []PaddedSlot(BandTally),
@@ -767,8 +1095,8 @@ fn sortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const entry_count = job.band_start[band_count];
     std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end and range.end <= entry_count);
-    std.debug.assert(entry_count <= job.writer.keys.len and entry_count <= job.writer.cells.len and entry_count <= job.writer.entry_x.len);
-    std.debug.assert(entry_count <= job.writer.segments.len and 2 * @as(usize, entry_count) <= job.writer.segment_table.len and job.tallies.len == band_count);
+    std.debug.assert(entry_count <= job.writer.keys.len and entry_count <= job.writer.band_cells.len and entry_count <= job.writer.entry_x.len);
+    std.debug.assert(job.tallies.len == band_count);
     var band = std.sort.partitionPoint(u32, job.band_start[0..band_count], range.start, startsBefore);
     while (band < band_count and job.band_start[band] < range.end) : (band += 1) {
         const start = job.band_start[band];
@@ -790,94 +1118,206 @@ fn startsBefore(range_start: usize, band_start: u32) bool {
     return band_start < range_start;
 }
 
-// Writes one band's slice of the sorted keys, cells, table, and entries.
+// Writes one band's slice of the sorted keys, cell starts, and entries.
 const BandWriter = struct {
     keys: []SortKey,
     slot_rows: []const SlotRow,
     entry_x: []f32,
     entry_y: []f32,
-    entry_entity: []EntityId,
-    entry_faction: []Faction,
-    entry_level: []u16,
-    cells: []SpatialCell,
-    segments: []RowSegment,
-    segment_table: []u32,
+    entry_entity_index: []u32,
+    entry_entity_generation: []u32,
+    band_cells: []u32,
 
-    // Sorts the band's keys `[start, end)`, writes one cell per run from `cells[start]` and
-    // one row segment per (cell_y, segment_x) run of cells from `segments[start]`, inserts
-    // the segments into the band's table, and gathers the entries' payload. pdqsort: the
-    // key is total, so an unstable sort is exact. Scalar: a comparison sort, run
-    // compaction, probe chains, and record copies.
+    // Sorts the band's keys `[start, end)`, writes each (level, cell, faction) run's first
+    // entry from `band_cells[start]`, counts the band's row-part and chunk starts after its
+    // first entry, and gathers the entries' payload. pdqsort: the key is total, so an
+    // unstable sort is exact. Scalar: a comparison sort, run compaction (one key compare per
+    // entry, two more per cell), and record copies.
     fn finishBand(self: BandWriter, start: u32, end: u32) BandTally {
-        std.sort.pdq(SortKey, self.keys[start..end], {}, sortKeyLessThan);
-        var cell_count: u32 = 0;
-        var segment_count: u32 = 0;
-        var entry: u32 = start;
-        while (entry < end) {
-            const cell_start = entry;
-            const key = self.keys[entry];
-            while (entry < end and self.keys[entry].cell_y == key.cell_y and self.keys[entry].cell_x == key.cell_x) entry += 1;
-            const cell_index = start + cell_count;
-            self.cells[cell_index] = .{ .cell_y = key.cell_y, .cell_x = key.cell_x, .start = cell_start, .end = entry };
-            cell_count += 1;
-            const segment_x: i32 = @divFloor(key.cell_x, segment_cells);
-            const open = segment_count != 0 and self.segments[start + segment_count - 1].cell_y == key.cell_y and self.segments[start + segment_count - 1].segment_x == segment_x;
-            if (!open) {
-                self.segments[start + segment_count] = .{ .cell_y = key.cell_y, .segment_x = segment_x, .first_cell = cell_index, .occupied = .empty };
-                segment_count += 1;
-            }
-            // `@mod` by 64 is in [0, 63].
-            self.segments[start + segment_count - 1].occupied.set(@intCast(@mod(key.cell_x, segment_cells)));
+        const keys = self.keys[start..end];
+        pdqSort(SortKey, keys, {}, keyLessThan);
+        var tally = BandTally{};
+        var previous_cell: SortKey = keys[0] >> key_cell_shift;
+        self.band_cells[start] = start;
+        tally.cell_count = 1;
+        tally.factions.bits.set(keyFaction(keys[0]));
+        for (keys[1..], start + 1..) |key, entry| {
+            const cell = key >> key_cell_shift;
+            if (cell == previous_cell) continue;
+            // entry < end <= maxInt(u32).
+            self.band_cells[start + tally.cell_count] = @intCast(entry);
+            tally.cell_count += 1;
+            tally.factions.bits.set(keyFaction(key));
+            // Row-part and chunk bits sit above the cell's local x.
+            if (cell >> (key_row_shift - key_cell_shift) != previous_cell >> (key_row_shift - key_cell_shift)) tally.row_starts += 1;
+            if (cell >> (key_chunk_shift - key_cell_shift) != previous_cell >> (key_chunk_shift - key_cell_shift)) tally.chunk_starts += 1;
+            previous_cell = cell;
         }
-
-        const table = self.segment_table[2 * @as(usize, start) .. 2 * @as(usize, end)];
-        @memset(table, 0);
-        for (start..start + segment_count) |segment_index| {
-            const segment = self.segments[segment_index];
-            var slot = tableSlot(segment.cell_y, segment.segment_x, table.len);
-            while (table[slot] != 0) {
-                slot += 1;
-                if (slot == table.len) slot = 0;
-            }
-            // segment_index + 1 <= entry count <= maxInt(u32).
-            table[slot] = @intCast(segment_index + 1);
-        }
+        // Keys ascend by level first.
+        tally.max_level = keyLevel(keys[keys.len - 1]);
 
         for (start..end) |index| {
-            const row = self.slot_rows[self.keys[index].slot];
+            const row = self.slot_rows[keySlot(self.keys[index])];
             self.entry_x[index] = row.x;
             self.entry_y[index] = row.y;
-            self.entry_entity[index] = row.entity;
-            self.entry_faction[index] = row.faction;
-            self.entry_level[index] = row.level;
+            self.entry_entity_index[index] = row.entity.index;
+            self.entry_entity_generation[index] = row.entity.generation;
         }
-        return .{ .cell_count = cell_count, .segment_count = segment_count };
+        return tally;
     }
 };
 
+// `index_link`: one range of cells, counted through the bands' cell prefixes. A range owns
+// every nonempty band whose cells start in it, and a band's owner writes every chunk whose
+// first cell lies in the band, reading on into later bands for a chunk that continues; a
+// chunk therefore has one writer, which writes its cells, row parts, and record at their
+// key-order indices and its directory slot.
+const LinkJob = struct {
+    keys: []const SortKey,
+    band_cells: []const u32,
+    cells: []u32,
+    rows: []RowPart,
+    chunk_records: []ChunkRecord,
+    level_slots: []const []ChunkSlot,
+    chunks_x: u32,
+    chunk_count: usize,
+    build_stamp: u64,
+    // Band b's cell starts are `band_cells[band_start[b]..][0..cell_counts[b]]`.
+    band_start: [band_count + 1]u32,
+    cell_counts: [band_count]u32,
+    // Band b's first cell, row part, and chunk starting in it are the `cell_prefix[b]`-th,
+    // `row_prefix[b]`-th, and `chunk_prefix[b]`-th in key order.
+    cell_prefix: [band_count + 1]u32,
+    row_prefix: [band_count + 1]u32,
+    chunk_prefix: [band_count + 1]u32,
+    range_count: usize,
+
+    fn cellKey(self: *const LinkJob, cell: u32) SortKey {
+        return self.keys[self.band_cells[cell]];
+    }
+};
+
+fn linkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *LinkJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end and range.end <= job.cell_prefix[band_count]);
+    std.debug.assert(job.cells.len == job.cell_prefix[band_count] + 1 and job.rows.len == job.row_prefix[band_count] and job.chunk_records.len == job.chunk_prefix[band_count]);
+    std.debug.assert(job.band_start[band_count] <= job.band_cells.len);
+    var band = std.sort.partitionPoint(u32, job.cell_prefix[0..band_count], range.start, startsBefore);
+    while (band < band_count and job.cell_prefix[band] < range.end) : (band += 1) {
+        if (job.cell_counts[band] != 0) linkBand(job, band);
+    }
+}
+
+// The cell after `cell` in key order across the bands from `band`, or null past the last:
+// its band and index.
+fn nextCell(job: *const LinkJob, band: usize, cell: u32) ?struct { band: usize, cell: u32 } {
+    if (cell + 1 < job.band_start[band] + job.cell_counts[band]) return .{ .band = band, .cell = cell + 1 };
+    var next = band + 1;
+    while (next < band_count) : (next += 1) {
+        if (job.cell_counts[next] != 0) return .{ .band = next, .cell = job.band_start[next] };
+    }
+    return null;
+}
+
+// Writes the cells, row parts, record, and directory slot of every chunk whose first cell
+// lies in `band`, skipping the leading cells of a chunk an earlier band started. Scalar:
+// bit-set compaction over scattered cell starts.
+fn linkBand(job: *LinkJob, band: usize) void {
+    const band_first = job.band_start[band];
+    const band_cells_end = band_first + job.cell_counts[band];
+    var cell = band_first;
+    var row = job.row_prefix[band];
+    var chunk_index = job.chunk_prefix[band];
+    // Entries are contiguous across bands: the band continues a chunk when its first entry's
+    // chunk is the entry before it's. That chunk's row parts starting here are its owner's.
+    if (band_first > 0 and job.keys[band_first] >> key_chunk_shift == job.keys[band_first - 1] >> key_chunk_shift) {
+        const continued = job.keys[band_first] >> key_chunk_shift;
+        var last_row_part = job.keys[band_first - 1] >> key_row_shift;
+        while (cell < band_cells_end and job.cellKey(cell) >> key_chunk_shift == continued) : (cell += 1) {
+            const row_part = job.cellKey(cell) >> key_row_shift;
+            if (row_part != last_row_part) {
+                row += 1;
+                last_row_part = row_part;
+            }
+        }
+    }
+    const cell_total = job.cells.len - 1;
+    while (cell < band_cells_end) {
+        const first_key = job.cellKey(cell);
+        const chunk = first_key >> key_chunk_shift;
+        var record = ChunkRecord{ .row_masks = @splat(0), .first_rows = @splat(0) };
+        var factions = FactionSet.empty;
+        // Never a real row part's: a chunk y is below maxInt(i32).
+        var last_row_part: SortKey = max_key >> key_row_shift;
+        var at_band = band;
+        var at_cell: ?u32 = cell;
+        while (at_cell) |current| {
+            const key = job.cellKey(current);
+            if (key >> key_chunk_shift != chunk) break;
+            const global = job.cell_prefix[at_band] + (current - job.band_start[at_band]);
+            std.debug.assert(global < cell_total);
+            job.cells[global] = job.band_cells[current];
+            const row_part = key >> key_row_shift;
+            if (row_part != last_row_part) {
+                const faction = keyFaction(key);
+                if (record.row_masks[faction] == 0) record.first_rows[faction] = row;
+                record.row_masks[faction] |= @as(u64, 1) << @intCast(keyLocalY(key));
+                factions.bits.set(faction);
+                std.debug.assert(row < job.rows.len);
+                job.rows[row] = .{ .cells = 0, .first_cell = global };
+                row += 1;
+                last_row_part = row_part;
+            }
+            job.rows[row - 1].cells |= @as(u64, 1) << @intCast(keyLocalX(key));
+            const next = nextCell(job, at_band, current) orelse {
+                at_cell = null;
+                break;
+            };
+            at_band = next.band;
+            at_cell = next.cell;
+        }
+        std.debug.assert(chunk_index < job.chunk_records.len);
+        job.chunk_records[chunk_index] = record;
+        const level = keyLevel(first_key);
+        std.debug.assert(level < job.level_slots.len);
+        const slots = job.level_slots[level];
+        std.debug.assert(slots.len == job.chunk_count);
+        const slot_index = @as(usize, keyChunkY(first_key)) * job.chunks_x + keyChunkX(first_key);
+        std.debug.assert(slot_index < slots.len);
+        slots[slot_index] = .{ .build = job.build_stamp, .record = chunk_index, .factions = factions };
+        chunk_index += 1;
+        // The chunk ended inside this band, or it ran on and this band holds no more.
+        cell = if (at_band == band) at_cell orelse band_cells_end else band_cells_end;
+    }
+}
+
 // The `band_count - 1` band splitters: the cells at the band quantiles of up to
-// `splitter_sample_count` slots (slots without a body skipped), sorted. Every slot when they
-// fit the sample, else slots at a golden-ratio sequence of fractions of the slot count,
-// which shares no period with a periodic slot order. Fixed work on the main thread; with no
-// sampled body every splitter is `max_cell_key`.
-fn chooseSplitters(data: *const DataSystem, population: IndexPopulation, cell_size: f32) [band_count - 1]CellKey {
+// `splitter_sample_count` slots (slots without a body skipped), sorted, as cell start keys.
+// Every slot when they fit the sample, else slots at a golden-ratio sequence of fractions of
+// the slot count, which shares no period with a periodic slot order. Fixed work on the main
+// thread; with no sampled body every splitter is `max_key`.
+fn chooseSplitters(data: *const DataSystem, population: IndexPopulation, grid: Grid) [band_count - 1]SortKey {
     const slot_count = population.len();
     const sample_count = @min(splitter_sample_count, slot_count);
     const movement = data.movementBodySliceConst();
-    var samples: [splitter_sample_count]CellKey = undefined;
+    var samples: [splitter_sample_count]SortKey = undefined;
     var valid: usize = 0;
     var fraction: u64 = 0;
     for (0..sample_count) |sample| {
         fraction +%= sample_fraction_step;
         // The high word of fraction * slot_count is below slot_count.
         const slot: usize = if (slot_count <= splitter_sample_count) sample else @intCast(std.math.mulWide(u64, fraction, slot_count) >> 64);
-        const body = data.movementBodyDenseIndex(population.entity(slot)) orelse continue;
-        samples[valid] = cellForPosition(movement.previous_x[body], movement.previous_y[body], cell_size);
+        const found = data.bodyLevelFaction(population.entity(slot)) orelse continue;
+        // The faction sits above the cell in the key, so a sample carries its body's.
+        const faction = FactionSet.Indexer.indexOf(found.faction orelse .neutral);
+        const key = keyForPosition(grid, found.level orelse 0, movement.previous_x[found.movement_body], movement.previous_y[found.movement_body], faction, 0);
+        samples[valid] = key & ~cell_low_bits;
         valid += 1;
     }
-    var splitters: [band_count - 1]CellKey = @splat(max_cell_key);
+    var splitters: [band_count - 1]SortKey = @splat(max_key);
     if (valid == 0) return splitters;
-    std.sort.pdq(CellKey, samples[0..valid], {}, cellKeyLessThan);
+    pdqSort(SortKey, samples[0..valid], {}, keyLessThan);
     for (&splitters, 1..) |*splitter, band| splitter.* = samples[band * valid / band_count];
     return splitters;
 }
@@ -885,24 +1325,39 @@ fn chooseSplitters(data: *const DataSystem, population: IndexPopulation, cell_si
 // ---- Tests --------------------------------------------------------------------
 
 const testing = std.testing;
-const builtin = @import("builtin");
 
-// A query visitor that records every visit, stopping after `stop_after` visits.
+// A query visitor that records every visit in lane order, stopping after `stop_after`
+// visits.
 const RecordingVisitor = struct {
-    entries: [256]u32 = undefined,
-    dx: [256]f32 = undefined,
-    dy: [256]f32 = undefined,
-    dist2: [256]f32 = undefined,
+    entries: [512]u32 = undefined,
+    dx: [512]f32 = undefined,
+    dy: [512]f32 = undefined,
+    dist2: [512]f32 = undefined,
     count: usize = 0,
     stop_after: usize = std.math.maxInt(usize),
 
-    fn visit(self: *RecordingVisitor, entry: u32, dx: f32, dy: f32, dist2: f32) NeighborVisitResult {
+    // Records one visit; true when it is the last.
+    fn record(self: *RecordingVisitor, entry: u32, dx: f32, dy: f32, dist2: f32) bool {
         self.entries[self.count] = entry;
         self.dx[self.count] = dx;
         self.dy[self.count] = dy;
         self.dist2[self.count] = dist2;
         self.count += 1;
-        return if (self.count >= self.stop_after) .stop else .keep_going;
+        return self.count >= self.stop_after;
+    }
+
+    fn visitLanes(self: *RecordingVisitor, lanes: *const NeighborLanes) LaneStop {
+        const dx = simd.toFloatArray(lanes.dx);
+        const dy = simd.toFloatArray(lanes.dy);
+        const dist2 = simd.toFloatArray(lanes.dist2);
+        const inside: std.bit_set.Integer(simd.lane_count) = .{ .mask = lanes.inside };
+        var bits = inside.iterator(.{});
+        while (bits.next()) |bit| {
+            // A set bit's index is below lane_count.
+            const lane: simd.LaneIndex = @intCast(bit);
+            if (self.record(lanes.first + lane, dx[lane], dy[lane], dist2[lane])) return lane;
+        }
+        return null;
     }
 
     fn visited(self: *const RecordingVisitor) []const u32 {
@@ -936,17 +1391,47 @@ fn aiPopulation(data: *const DataSystem) IndexPopulation {
     return .{ .entities = data.aiAgentSliceConst().entities };
 }
 
-// Index test layouts of `layout_slot_count` AI agents, every seventh from slot 3 without a
-// body: every body in one cell row across about 200 cells; spread over many cell rows; at
-// negative coordinates with a NaN y, a -inf x, a +inf y, and a -inf y; every body in one
-// cell; a 10x10-cell cluster with one body far outside it; and cells on both sides of
-// row-segment edges on both signs in four rows, with one body at each i32 cell extreme.
-// Factions and levels vary.
-const TestLayout = enum { one_row, spread, negative, one_cell, cluster_outlier, segment_edges };
-const segment_edge_cells = [_]i32{ -129, -128, -65, -64, -1, 0, 63, 64, 127, 128 };
+// A grid of `chunks` x `chunks` chunks of 16 cells of `cell_size`, on `levels` levels,
+// built at the default config: the effective cell is `cell_size` exactly.
+fn testGeometry(cell_size: f32, chunks: u32, levels: usize) IndexGeometry {
+    return .{ .tile_size = cell_size, .chunk_size_tiles = 16, .chunks_x = chunks, .chunks_y = chunks, .level_count = levels };
+}
+
+const test_cells_per_chunk: u32 = 16;
+
+// The default config at `cell_size`: with `testGeometry` it builds cells of exactly that size.
+fn testConfig(cell_size: f32) SpatialIndexConfig {
+    return .{ .cell_size = cell_size };
+}
+
+// Index test layouts of `layout_slot_count` AI agents, every seventh from slot 3 bodiless.
+// Factions vary, and levels too except in `one_cell` and `dense_row_part`.
+const TestLayout = enum {
+    // One cell row across about 200 cells.
+    one_row,
+    // Many cell rows.
+    spread,
+    // Outside the grid, with a NaN y, a -inf x, a +inf y, and a -inf y.
+    outside,
+    // One cell.
+    one_cell,
+    // A 10x10-cell cluster and one body far outside the grid.
+    cluster_outlier,
+    // Local x 0 and 15 on both sides of chunk edges in four rows, and one body past each
+    // grid extreme.
+    chunk_edges,
+    // Sites with a body on each of `stacked_level_count` levels at shared xy.
+    stacked_levels,
+    // One chunk's one cell row, all hostile on one level: a splitter carries its faction.
+    dense_row_part,
+};
+const stacked_level_count: u16 = 6;
+const chunk_edge_cells = [_]i32{ 0, 15, 16, 31, 32, 47, 48, 63, 64, 1023 };
 const layout_slot_count: usize = 1000;
 const layout_cell_size: f32 = 20;
+const layout_chunks: u32 = 64;
 const layout_outlier_slot: usize = layout_slot_count - 1;
+const layout_geometry = testGeometry(layout_cell_size, layout_chunks, 3);
 
 fn fillTestLayout(data: *DataSystem, layout: TestLayout) !void {
     var prng = std.Random.DefaultPrng.init(0x6e1d_b4d5);
@@ -967,7 +1452,7 @@ fn fillTestLayout(data: *DataSystem, layout: TestLayout) !void {
                 x = random.float(f32) * 120;
                 y = random.float(f32) * 640;
             },
-            .negative => {
+            .outside => {
                 x = random.float(f32) * 120 - 300;
                 y = -20 - random.float(f32) * 640;
             },
@@ -983,12 +1468,12 @@ fn fillTestLayout(data: *DataSystem, layout: TestLayout) !void {
                     y = 1e6;
                 }
             },
-            .segment_edges => {
-                const cell_x = segment_edge_cells[slot % segment_edge_cells.len];
-                const cell_y: i32 = @as(i32, @intCast(slot / segment_edge_cells.len % 4)) - 2;
+            .chunk_edges => {
+                const cell_x = chunk_edge_cells[slot % chunk_edge_cells.len];
+                const cell_y: i32 = @as(i32, @intCast(slot / chunk_edge_cells.len % 4)) + 14;
                 x = (@as(f32, @floatFromInt(cell_x)) + 0.1 + random.float(f32) * 0.8) * layout_cell_size;
                 y = (@as(f32, @floatFromInt(cell_y)) + 0.1 + random.float(f32) * 0.8) * layout_cell_size;
-                // Finite, and past the i32 cell range on each side.
+                // Finite, and past the grid on each side.
                 if (slot == layout_outlier_slot) {
                     x = 3e38;
                     y = 3e38;
@@ -998,12 +1483,25 @@ fn fillTestLayout(data: *DataSystem, layout: TestLayout) !void {
                     y = -3e38;
                 }
             },
+            .stacked_levels => {
+                const site = slot / stacked_level_count;
+                x = @as(f32, @floatFromInt(site % 12)) * 37 + 3;
+                y = @as(f32, @floatFromInt(site / 12)) * 41 + 5;
+            },
+            .dense_row_part => {
+                x = (@as(f32, @floatFromInt(slot % test_cells_per_chunk)) + 0.1 + random.float(f32) * 0.8) * layout_cell_size;
+                y = (0.1 + random.float(f32) * 0.8) * layout_cell_size;
+            },
         }
         const entity = try addTestBody(data, x, y);
-        try data.setFaction(entity, @fromBackingInt(@intCast(slot % 4)));
-        if (slot % 5 == 0) try data.setWorldLevel(entity, @intCast(slot % 3));
+        try data.setFaction(entity, if (layout == .dense_row_part) .hostile else @fromBackingInt(@intCast(slot % 4)));
+        if (layout == .stacked_levels) {
+            try data.setWorldLevel(entity, @intCast(slot % stacked_level_count));
+        } else if (layout != .one_cell and layout != .dense_row_part and slot % 5 == 0) {
+            try data.setWorldLevel(entity, @intCast(slot % 3));
+        }
     }
-    if (layout == .negative) {
+    if (layout == .outside) {
         // The store refuses non-finite positions; a column write is how one arrives.
         const entities = data.aiAgentSliceConst().entities;
         const movement = data.movementBodySlice();
@@ -1014,37 +1512,95 @@ fn fillTestLayout(data: *DataSystem, layout: TestLayout) !void {
     }
 }
 
-// Explicit band splitter sets, each nondecreasing: all past every cell; all one populated
-// cell; populated cells at a stride; the i32 extremes around populated cells; and
-// populated cells in equal pairs.
-const TestSplitters = enum { all_max, one_cell, stride, extremes, pairs };
+// Explicit nondecreasing band splitter sets over a build's cell start keys.
+const TestSplitters = enum {
+    // All past every key.
+    all_max,
+    // All one cell.
+    one_cell,
+    // Cells at a stride.
+    stride,
+    // The first key and past every key around cells.
+    extremes,
+    // Cells in equal pairs.
+    pairs,
+    // The second row part of the chunk with the most: the chunk straddles two bands.
+    straddle_chunk,
+    // The second cell of the row part with the most: the row part straddles two bands.
+    straddle_row,
+    // Every cell of the chunk with the most: it runs across that many bands.
+    every_cell,
+};
 
-fn testSplitters(set: TestSplitters, cells: []const SpatialCell) [band_count - 1]CellKey {
-    std.debug.assert(cells.len > 0);
-    const min_key = CellKey{ .cell_y = std.math.minInt(i32), .cell_x = std.math.minInt(i32) };
-    var splitters: [band_count - 1]CellKey = @splat(max_cell_key);
-    for (&splitters, 0..) |*splitter, index| {
-        const pick: usize = switch (set) {
-            .all_max => continue,
-            .one_cell => cells.len / 2,
-            .stride, .extremes => index * cells.len / (band_count - 1),
-            .pairs => (index / 2) * cells.len / (band_count / 2),
-        };
-        splitter.* = .{ .cell_y = cells[pick].cell_y, .cell_x = cells[pick].cell_x };
-        if (set == .extremes and index < 8) splitter.* = min_key;
-        if (set == .extremes and index >= band_count - 9) splitter.* = max_cell_key;
+// The first index and unit count of the group of `cell_keys` (keys equal above
+// `group_shift`) holding the most units (keys distinct above `unit_shift`), the first on a
+// tie.
+fn widestGroup(cell_keys: []const SortKey, group_shift: u7, unit_shift: u7) struct { start: usize, units: usize } {
+    var best_start: usize = 0;
+    var best_units: usize = 0;
+    var start: usize = 0;
+    var units: usize = 0;
+    for (cell_keys, 0..) |key, index| {
+        if (index == 0 or key >> group_shift != cell_keys[index - 1] >> group_shift) {
+            start = index;
+            units = 0;
+        }
+        if (index == start or key >> unit_shift != cell_keys[index - 1] >> unit_shift) units += 1;
+        if (units > best_units) {
+            best_units = units;
+            best_start = start;
+        }
+    }
+    return .{ .start = best_start, .units = best_units };
+}
+
+fn testSplitters(set: TestSplitters, cell_keys: []const SortKey) [band_count - 1]SortKey {
+    std.debug.assert(cell_keys.len > 0);
+    var splitters: [band_count - 1]SortKey = @splat(max_key);
+    switch (set) {
+        .all_max => {},
+        .one_cell => splitters = @splat(cell_keys[cell_keys.len / 2]),
+        .stride, .extremes => for (&splitters, 0..) |*splitter, index| {
+            splitter.* = cell_keys[index * cell_keys.len / (band_count - 1)];
+            if (set == .extremes and index < 8) splitter.* = 0;
+            if (set == .extremes and index >= band_count - 9) splitter.* = max_key;
+        },
+        .pairs => for (&splitters, 0..) |*splitter, index| {
+            splitter.* = cell_keys[(index / 2) * cell_keys.len / (band_count / 2)];
+        },
+        .straddle_chunk => {
+            const chunk = widestGroup(cell_keys, key_chunk_shift, key_row_shift);
+            if (chunk.units > 1) {
+                var cell = chunk.start + 1;
+                while (cell_keys[cell] >> key_row_shift == cell_keys[cell - 1] >> key_row_shift) cell += 1;
+                splitters[0] = cell_keys[cell];
+            }
+        },
+        .straddle_row => {
+            const row = widestGroup(cell_keys, key_row_shift, key_cell_shift);
+            if (row.units > 1) splitters[0] = cell_keys[row.start + 1];
+        },
+        .every_cell => {
+            const chunk = widestGroup(cell_keys, key_chunk_shift, key_cell_shift);
+            for (1..@min(chunk.units, band_count)) |cell| splitters[cell - 1] = cell_keys[chunk.start + cell];
+        },
     }
     return splitters;
 }
 
-// A copy of a build's entries and of every band's cells, in key order.
+// A build's entries, cells, row parts, records, valid directory slots, and cell start keys.
 const TestCapture = struct {
     x: std.ArrayList(f32) = .empty,
     y: std.ArrayList(f32) = .empty,
-    entity: std.ArrayList(EntityId) = .empty,
-    faction: std.ArrayList(Faction) = .empty,
-    level: std.ArrayList(u16) = .empty,
-    cells: std.ArrayList(SpatialCell) = .empty,
+    entity_index: std.ArrayList(u32) = .empty,
+    entity_generation: std.ArrayList(u32) = .empty,
+    cells: std.ArrayList(u32) = .empty,
+    rows: std.ArrayList(RowPart) = .empty,
+    chunk_records: std.ArrayList(ChunkRecord) = .empty,
+    // Each populated cell's first key with its slot cleared, in key order.
+    cell_keys: std.ArrayList(SortKey) = .empty,
+    // Every level's directory, valid slots only, by level and slot index.
+    slots: std.ArrayList(struct { level: usize, index: usize, slot: ChunkSlot }) = .empty,
 
     fn capture(system: *const SpatialIndexSystem) !TestCapture {
         var copy = TestCapture{};
@@ -1052,80 +1608,171 @@ const TestCapture = struct {
         const index = system.view();
         try copy.x.appendSlice(testing.allocator, index.x);
         try copy.y.appendSlice(testing.allocator, index.y);
-        try copy.entity.appendSlice(testing.allocator, index.entity);
-        try copy.faction.appendSlice(testing.allocator, index.faction);
-        try copy.level.appendSlice(testing.allocator, index.level);
-        for (index.directory.bands) |band| try copy.cells.appendSlice(testing.allocator, index.cells[band.start..][0..band.cell_count]);
+        try copy.entity_index.appendSlice(testing.allocator, index.entity_index);
+        try copy.entity_generation.appendSlice(testing.allocator, index.entity_generation);
+        try copy.cells.appendSlice(testing.allocator, index.cells);
+        try copy.rows.appendSlice(testing.allocator, index.rows);
+        try copy.chunk_records.appendSlice(testing.allocator, index.chunk_records);
+        if (index.cells.len > 0) {
+            for (index.cells[0 .. index.cells.len - 1]) |start| try copy.cell_keys.append(testing.allocator, system.keys.items[start] & ~cell_low_bits);
+        }
+        for (index.level_slots, 0..) |slots, level| {
+            for (slots, 0..) |slot, slot_index| {
+                if (slot.build != index.build_stamp) continue;
+                var stored = slot;
+                stored.build = 0;
+                try copy.slots.append(testing.allocator, .{ .level = level, .index = slot_index, .slot = stored });
+            }
+        }
         return copy;
     }
 
+    fn entityAt(self: *const TestCapture, entry: u32) EntityId {
+        return .{ .index = self.entity_index.items[entry], .generation = self.entity_generation.items[entry] };
+    }
+
     fn deinit(self: *TestCapture) void {
+        self.slots.deinit(testing.allocator);
+        self.cell_keys.deinit(testing.allocator);
+        self.chunk_records.deinit(testing.allocator);
+        self.rows.deinit(testing.allocator);
         self.cells.deinit(testing.allocator);
-        self.level.deinit(testing.allocator);
-        self.faction.deinit(testing.allocator);
-        self.entity.deinit(testing.allocator);
+        self.entity_generation.deinit(testing.allocator);
+        self.entity_index.deinit(testing.allocator);
         self.y.deinit(testing.allocator);
         self.x.deinit(testing.allocator);
     }
 };
 
 const parity_query_radii = [_]f32{ 0, 48, 96, 192 };
+// Every faction; one; two runs apart; and two adjacent.
+const parity_query_factions = [_]FactionSet{ .full, .initOne(.hostile), .initMany(&.{ .neutral, .ally }), .initMany(&.{ .player, .ally }) };
 const parity_query_checks: u16 = 64;
 // Cells sampled for the query battery, at a stride over the reference's cells.
 const parity_query_cells: usize = 48;
 
-// `system`'s index holds exactly the reference's entries, finds every reference cell
-// through its directory and tables with the same range, and answers the query battery
-// with the same visits and stats.
+fn factionIndex(faction: Faction) usize {
+    return FactionSet.Indexer.indexOf(faction);
+}
+
+// `system`'s index holds bit for bit the reference's entries, cells, row parts, records, and
+// directory, its records agree with its entries, and it answers the query battery with the
+// same visits and stats.
 fn expectIndexMatches(system: *const SpatialIndexSystem, reference: *const TestCapture, reference_system: *const SpatialIndexSystem) !void {
     const index = system.view();
+    var actual = try TestCapture.capture(system);
+    defer actual.deinit();
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.x.items), std.mem.sliceAsBytes(index.x));
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.y.items), std.mem.sliceAsBytes(index.y));
-    try testing.expectEqualSlices(EntityId, reference.entity.items, index.entity);
-    try testing.expectEqualSlices(Faction, reference.faction.items, index.faction);
-    try testing.expectEqualSlices(u16, reference.level.items, index.level);
-    var cell_count: usize = 0;
-    var segment_count: usize = 0;
-    for (index.directory.bands) |band| {
-        cell_count += band.cell_count;
-        segment_count += band.segment_count;
+    try testing.expectEqualSlices(u32, reference.entity_index.items, index.entity_index);
+    try testing.expectEqualSlices(u32, reference.entity_generation.items, index.entity_generation);
+    try testing.expectEqualSlices(u32, reference.cells.items, actual.cells.items);
+    try testing.expectEqualSlices(SortKey, reference.cell_keys.items, actual.cell_keys.items);
+    try testing.expectEqualSlices(RowPart, reference.rows.items, actual.rows.items);
+    try testing.expectEqualSlices(ChunkRecord, reference.chunk_records.items, actual.chunk_records.items);
+    try testing.expectEqual(reference.slots.items.len, actual.slots.items.len);
+    for (reference.slots.items, actual.slots.items) |want, got| {
+        try testing.expectEqual(want.level, got.level);
+        try testing.expectEqual(want.index, got.index);
+        try testing.expectEqual(want.slot.record, got.slot.record);
+        try testing.expect(want.slot.factions.eql(got.slot.factions));
     }
-    try testing.expectEqual(reference.cells.items.len, cell_count);
-    // One segment per (cell_y, segment_x) the cells hold, plus one per band boundary
-    // inside a segment, so at most one per cell.
-    var distinct_segments: usize = 0;
-    for (reference.cells.items, 0..) |cell, cell_index| {
-        if (cell_index == 0) {
-            distinct_segments += 1;
-            continue;
-        }
-        const previous = reference.cells.items[cell_index - 1];
-        if (previous.cell_y != cell.cell_y or @divFloor(previous.cell_x, segment_cells) != @divFloor(cell.cell_x, segment_cells)) distinct_segments += 1;
-    }
-    try testing.expect(segment_count >= distinct_segments and segment_count <= cell_count);
-    for (reference.cells.items) |cell| {
-        const key = CellKey{ .cell_y = cell.cell_y, .cell_x = cell.cell_x };
-        const found = index.pieceCells(index.directory.bandOfCell(key), cell.cell_y, cell.cell_x, cell.cell_x);
-        try testing.expectEqualSlices(SpatialCell, &.{cell}, found);
-    }
+    try expectRecordsAgree(system);
 
     const reference_index = reference_system.view();
-    const stride = @max(reference.cells.items.len / parity_query_cells, 1);
+    const stride = @max(reference.cell_keys.items.len / parity_query_cells, 1);
     var cell_index: usize = 0;
-    while (cell_index < reference.cells.items.len) : (cell_index += stride) {
-        const cell = reference.cells.items[cell_index];
-        const centre_x = (@as(f32, @floatFromInt(cell.cell_x)) + 0.5) * index.cell_size;
-        const centre_y = (@as(f32, @floatFromInt(cell.cell_y)) + 0.5) * index.cell_size;
+    while (cell_index < reference.cell_keys.items.len) : (cell_index += stride) {
+        const key = reference.cell_keys.items[cell_index];
+        const cell_x = keyChunkX(key) * index.cells_per_chunk + keyLocalX(key);
+        const cell_y = keyChunkY(key) * index.cells_per_chunk + keyLocalY(key);
+        const centre_x = (@as(f32, @floatFromInt(cell_x)) + 0.5) * index.cell_size;
+        const centre_y = (@as(f32, @floatFromInt(cell_y)) + 0.5) * index.cell_size;
         for (parity_query_radii) |radius| {
-            const query = NeighborQuery{ .x = centre_x, .y = centre_y, .radius = radius, .max_candidate_checks = parity_query_checks, .self = reference.entity.items[cell.start] };
-            var expected = RecordingVisitor{};
-            const expected_stats = reference_index.queryNeighbors(query, &expected);
-            var actual = RecordingVisitor{};
-            const actual_stats = index.queryNeighbors(query, &actual);
-            try testing.expectEqual(expected_stats, actual_stats);
-            try expected.expectEqual(&actual);
+            for (parity_query_factions) |factions| {
+                const query = NeighborQuery{ .x = centre_x, .y = centre_y, .level = keyLevel(key), .radius = radius, .max_candidate_checks = parity_query_checks, .factions = factions, .self = reference.entityAt(reference.cells.items[cell_index]) };
+                var expected = RecordingVisitor{};
+                const expected_stats = reference_index.queryNeighbors(query, &expected);
+                var got = RecordingVisitor{};
+                const got_stats = index.queryNeighbors(query, &got);
+                try testing.expectEqual(expected_stats, got_stats);
+                try expected.expectEqual(&got);
+            }
         }
     }
+}
+
+// Records, row parts, cells, and entries agree with the keys, gapless, in key order.
+fn expectRecordsAgree(system: *const SpatialIndexSystem) !void {
+    const index = system.view();
+    const keys = system.keys.items;
+    if (index.cells.len == 0) {
+        try testing.expectEqual(@as(usize, 0), index.entryCount());
+        return;
+    }
+    var records_seen: u32 = 0;
+    var rows_seen: u32 = 0;
+    var cells_seen: u32 = 0;
+    var entries_seen: u32 = 0;
+    var all_factions = FactionSet.empty;
+    for (index.level_slots, 0..) |slots, level| {
+        for (slots, 0..) |slot, slot_index| {
+            if (slot.build != index.build_stamp) continue;
+            // Key order is level, then chunk y and x: slot order.
+            try testing.expectEqual(records_seen, slot.record);
+            records_seen += 1;
+            const record = index.chunk_records[slot.record];
+            var chunk_factions = FactionSet.empty;
+            for (std.meta.tags(Faction)) |faction| {
+                var row_bits = record.row_masks[factionIndex(faction)];
+                if (row_bits == 0) continue;
+                chunk_factions.insert(faction);
+                try testing.expectEqual(rows_seen, record.first_rows[factionIndex(faction)]);
+                while (row_bits != 0) : (row_bits &= row_bits - 1) {
+                    const local_y: u32 = @ctz(row_bits);
+                    const row = index.rows[rows_seen];
+                    rows_seen += 1;
+                    try testing.expectEqual(cells_seen, row.first_cell);
+                    try testing.expect(row.cells != 0);
+                    var cell_bits = row.cells;
+                    while (cell_bits != 0) : (cell_bits &= cell_bits - 1) {
+                        const local_x: u32 = @ctz(cell_bits);
+                        const start = index.cells[cells_seen];
+                        const end = index.cells[cells_seen + 1];
+                        cells_seen += 1;
+                        try testing.expectEqual(entries_seen, start);
+                        try testing.expect(start < end);
+                        for (keys[start..end]) |key| {
+                            try testing.expectEqual(@as(u16, @intCast(level)), keyLevel(key));
+                            try testing.expectEqual(slot_index, @as(usize, keyChunkY(key)) * index.chunks_x + keyChunkX(key));
+                            try testing.expectEqual(factionIndex(faction), keyFaction(key));
+                            try testing.expectEqual(local_y, keyLocalY(key));
+                            try testing.expectEqual(local_x, keyLocalX(key));
+                        }
+                        entries_seen = end;
+                    }
+                }
+            }
+            try testing.expect(slot.factions.eql(chunk_factions));
+            all_factions.setUnion(chunk_factions);
+        }
+    }
+    try testing.expectEqual(index.chunk_records.len, records_seen);
+    try testing.expectEqual(index.rows.len, rows_seen);
+    try testing.expectEqual(index.cells.len, cells_seen + 1);
+    try testing.expectEqual(index.entryCount(), entries_seen);
+    try testing.expectEqual(index.entryCount(), index.cells[cells_seen]);
+    try testing.expect(index.factions.eql(all_factions));
+}
+
+// The three stages under fixed controls: `bucket_items`, `sort_items`, and `link_items`
+// per range, on up to `workers` workers.
+fn testStages(threads: *ThreadSystem, tuners: *[3]AdaptiveWorkTuner, workers: usize, bucket_items: usize, sort_items: usize, link_items: usize) BuildStages {
+    return .{
+        .bucket = Dispatch.init(threads, &tuners[0], .{ .items_per_range = bucket_items, .max_worker_threads = workers, .adaptive = false }),
+        .sort = Dispatch.init(threads, &tuners[1], .{ .items_per_range = sort_items, .max_worker_threads = workers, .adaptive = false }),
+        .link = Dispatch.init(threads, &tuners[2], .{ .items_per_range = link_items, .max_worker_threads = workers, .adaptive = false }),
+    };
 }
 
 test "serial and threaded index builds match across layouts, splitters, range sizes, and worker counts" {
@@ -1140,82 +1787,86 @@ test "serial and threaded index builds match across layouts, splitters, range si
         defer data.deinit();
         try fillTestLayout(&data, layout);
         const population = aiPopulation(&data);
-        const config = SpatialIndexConfig{ .cell_size = layout_cell_size };
+        const config = testConfig(layout_cell_size);
 
         var reference_system = SpatialIndexSystem.init(testing.allocator);
         defer reference_system.deinit();
-        _ = try reference_system.buildSerial(&data, population, config);
-        try testing.expectEqual(@as(usize, 0), reference_system.directory.splitter_count);
+        _ = try reference_system.buildSerial(&data, population, layout_geometry, config);
         var reference = try TestCapture.capture(&reference_system);
         defer reference.deinit();
-        try testing.expectEqual(layout == .one_cell, reference.cells.items.len == 1);
+        // The one cell holds every faction, each its own cell.
+        try testing.expectEqual(layout == .one_cell, reference.cell_keys.items.len == FactionSet.len);
+        try expectRecordsAgree(&reference_system);
 
         var system = SpatialIndexSystem.init(testing.allocator);
         defer system.deinit();
-        var tuners = [2]AdaptiveWorkTuner{ AdaptiveWorkTuner.init(.{}), AdaptiveWorkTuner.init(.{}) };
+        var tuners: [3]AdaptiveWorkTuner = @splat(AdaptiveWorkTuner.init(.{}));
 
-        // Bucket and sort range sizes and worker counts under the production splitters.
+        // Stage range sizes and worker counts under the production splitters.
         for ([_]usize{ 1, 3 }) |workers| {
             for ([_]usize{ 16, 64 }) |bucket_items| {
                 for ([_]usize{ 16, 1024 }) |sort_items| {
-                    const stages = BuildStages{
-                        .bucket = Dispatch.init(&threads, &tuners[0], .{ .items_per_range = bucket_items, .max_worker_threads = workers, .adaptive = false }),
-                        .sort = Dispatch.init(&threads, &tuners[1], .{ .items_per_range = sort_items, .max_worker_threads = workers, .adaptive = false }),
-                    };
-                    _ = try system.beginBuild(population, config);
-                    const stats = system.buildBanded(&data, population, stages, chooseSplitters(&data, population, system.cell_size));
-                    try testing.expect(!stats.bucket_batch.ran_inline);
-                    try expectIndexMatches(&system, &reference, &reference_system);
+                    for ([_]usize{ 16, 1024 }) |link_items| {
+                        _ = try system.beginBuild(population, layout_geometry, config);
+                        const stats = try system.buildBanded(&data, population, testStages(&threads, &tuners, workers, bucket_items, sort_items, link_items), chooseSplitters(&data, population, system.grid));
+                        try testing.expect(!stats.bucket_batch.ran_inline);
+                        try expectIndexMatches(&system, &reference, &reference_system);
+                    }
                 }
             }
         }
 
         // Explicit splitter sets over one partition.
-        const stages = BuildStages{
-            .bucket = Dispatch.init(&threads, &tuners[0], .{ .items_per_range = 64, .max_worker_threads = 3, .adaptive = false }),
-            .sort = Dispatch.init(&threads, &tuners[1], .{ .items_per_range = 64, .max_worker_threads = 3, .adaptive = false }),
-        };
+        const stages = testStages(&threads, &tuners, 3, 64, 64, 16);
         for (std.meta.tags(TestSplitters)) |set| {
-            _ = try system.beginBuild(population, config);
-            const stats = system.buildBanded(&data, population, stages, testSplitters(set, reference.cells.items));
+            _ = try system.beginBuild(population, layout_geometry, config);
+            const stats = try system.buildBanded(&data, population, stages, testSplitters(set, reference.cell_keys.items));
             try testing.expect(!stats.bucket_batch.ran_inline and !stats.sort_batch.ran_inline);
             try expectIndexMatches(&system, &reference, &reference_system);
         }
 
         // The production build, and a config that allows no worker builds serially.
-        const threaded = try system.build(&data, population, &threads, .{ .cell_size = layout_cell_size, .items_per_range = 64, .max_worker_threads = 3, .adaptive = false });
+        const threaded = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .items_per_range = 16, .max_worker_threads = 3, .adaptive = false });
         try testing.expect(!threaded.bucket_batch.ran_inline and !threaded.sort_batch.ran_inline);
-        try testing.expectEqual(band_count - 1, system.directory.splitter_count);
+        // The link stage partitions the cells: one range of them may run inline.
+        try testing.expect(reference.cell_keys.items.len <= 16 or !threaded.link_batch.ran_inline);
         try expectIndexMatches(&system, &reference, &reference_system);
-        _ = try system.build(&data, population, &threads, .{ .cell_size = layout_cell_size, .max_worker_threads = 0 });
-        try testing.expectEqual(@as(usize, 0), system.directory.splitter_count);
+        const serial = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .max_worker_threads = 0 });
+        try testing.expect(serial.bucket_batch.ran_inline and serial.sort_batch.ran_inline and serial.link_batch.ran_inline);
         try expectIndexMatches(&system, &reference, &reference_system);
     }
 }
 
-// The most entries any band of `system`'s index holds.
-fn largestBandEntries(system: *const SpatialIndexSystem) usize {
-    var largest: usize = 0;
-    for (system.directory.bands) |band| largest = @max(largest, band.entry_count);
-    return largest;
-}
-
-test "the threaded index splits a one-row corridor and a cluster with a far outlier across bands" {
+test "the threaded index splits a one-row corridor, a cluster with a far outlier, and a one-row-part crowd across bands" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3 });
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
-    for ([_]TestLayout{ .one_row, .cluster_outlier }) |layout| {
+    for ([_]TestLayout{ .one_row, .cluster_outlier, .dense_row_part }) |layout| {
         var data = DataSystem.init(testing.allocator);
         defer data.deinit();
         try fillTestLayout(&data, layout);
         var system = SpatialIndexSystem.init(testing.allocator);
         defer system.deinit();
-        const stats = try system.build(&data, aiPopulation(&data), &threads, .{ .cell_size = layout_cell_size, .items_per_range = 64, .max_worker_threads = 3, .adaptive = false });
+        const population = aiPopulation(&data);
+        _ = try system.beginBuild(population, layout_geometry, testConfig(layout_cell_size));
+        const splitters = chooseSplitters(&data, population, system.grid);
+        var tuners: [3]AdaptiveWorkTuner = @splat(AdaptiveWorkTuner.init(.{}));
+        const stats = try system.buildBanded(&data, population, testStages(&threads, &tuners, 3, 64, 64, 64), splitters);
         try testing.expect(stats.entity_count > 0);
-        try testing.expect(largestBandEntries(&system) <= stats.entity_count / 8);
+        // The largest band's entries, counted from the splitters over the sorted keys.
+        var largest: usize = 0;
+        var band_start: usize = 0;
+        for (0..band_count) |band| {
+            var band_end: usize = band_start;
+            while (band_end < stats.entity_count and bandOfKey(&splitters, system.keys.items[band_end]) == band) band_end += 1;
+            largest = @max(largest, band_end - band_start);
+            band_start = band_end;
+        }
+        try testing.expectEqual(stats.entity_count, band_start);
+        try testing.expect(largest <= stats.entity_count / 8);
     }
 }
 
@@ -1230,11 +1881,11 @@ test "queryNeighbors visits a cell's entries in slot order, skipping self withou
     _ = try addTestBody(&data, 1, 0);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), .{ .cell_size = 10 });
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
 
     var visitor = RecordingVisitor{};
-    const stats = index.queryNeighbors(.{ .x = 0, .y = 0, .radius = 5, .max_candidate_checks = 128, .self = self_entity }, &visitor);
+    const stats = index.queryNeighbors(.{ .x = 0, .y = 0, .level = 0, .radius = 5, .max_candidate_checks = 128, .self = self_entity }, &visitor);
     // Slot 2 (dist2 == 25) is checked but not visited; self is neither.
     try testing.expectEqualSlices(u32, &.{ 1, 3, 4 }, visitor.visited());
     try testing.expectEqual(@as(u16, 4), stats.candidate_checks);
@@ -1243,7 +1894,7 @@ test "queryNeighbors visits a cell's entries in slot order, skipping self withou
 
     // Without a self, slot 0 is a candidate at distance 0.
     var all = RecordingVisitor{};
-    _ = index.queryNeighbors(.{ .x = 0, .y = 0, .radius = 5, .max_candidate_checks = 128 }, &all);
+    _ = index.queryNeighbors(.{ .x = 0, .y = 0, .level = 0, .radius = 5, .max_candidate_checks = 128 }, &all);
     try testing.expectEqualSlices(u32, &.{ 0, 1, 3, 4 }, all.visited());
 }
 
@@ -1259,29 +1910,29 @@ test "queryNeighbors stops at its check budget before the tipping entry, and on 
     _ = try addTestBody(&data, 5, 15);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), .{ .cell_size = 10 });
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
 
     var capped = RecordingVisitor{};
-    const capped_stats = index.queryNeighbors(.{ .x = 0, .y = 0, .radius = 100, .max_candidate_checks = 1, .self = self_entity }, &capped);
+    const capped_stats = index.queryNeighbors(.{ .x = 0, .y = 0, .level = 0, .radius = 100, .max_candidate_checks = 1, .self = self_entity }, &capped);
     try testing.expectEqualSlices(u32, &.{1}, capped.visited());
     try testing.expectEqual(@as(u16, 1), capped_stats.candidate_checks);
 
     // A stop in the first cell ends the row and the scan.
     var stopped = RecordingVisitor{ .stop_after = 2 };
-    const stopped_stats = index.queryNeighbors(.{ .x = 0, .y = 0, .radius = 100, .max_candidate_checks = 64 }, &stopped);
+    const stopped_stats = index.queryNeighbors(.{ .x = 0, .y = 0, .level = 0, .radius = 100, .max_candidate_checks = 64 }, &stopped);
     try testing.expectEqualSlices(u32, &.{ 0, 1 }, stopped.visited());
     try testing.expectEqual(@as(u16, 2), stopped_stats.candidate_checks);
 
     // Unbounded, the scan runs cell_y outer, cell_x inner: (0, 0), (0, 1), then (1, 0).
     var full = RecordingVisitor{};
-    _ = index.queryNeighbors(.{ .x = 0, .y = 0, .radius = 100, .max_candidate_checks = 64 }, &full);
+    _ = index.queryNeighbors(.{ .x = 0, .y = 0, .level = 0, .radius = 100, .max_candidate_checks = 64 }, &full);
     try testing.expectEqual(@as(usize, 6), full.count);
     try testing.expectEqual(@as(f32, 15), index.x[full.entries[4]]);
     try testing.expectEqual(@as(f32, 15), index.y[full.entries[5]]);
 }
 
-test "an index over population rows maps each slot to its row's entity and skips bodiless slots" {
+test "an index over population rows maps each slot to its row's entity, skips bodiless slots, and links each chunk's rows" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     const near = try addTestBody(&data, 4, 4);
@@ -1295,173 +1946,499 @@ test "an index over population rows maps each slot to its row's entity and skips
     const rows = [_]u32{ 3, 2, 0 };
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    const stats = try system.buildSerial(&data, .{ .entities = data.aiAgentSliceConst().entities, .rows = &rows }, .{ .cell_size = 10 });
+    const stats = try system.buildSerial(&data, .{ .entities = data.aiAgentSliceConst().entities, .rows = &rows }, testGeometry(10, 4, 1), testConfig(10));
     try testing.expectEqual(@as(usize, 2), stats.entity_count);
     const index = system.view();
-    // Cell (0, 0) holds slot 2 (`near`), cell (0, 1) slot 0 (`far`).
-    try testing.expectEqualSlices(EntityId, &.{ near, far }, index.entity);
-    try testing.expectEqual(Faction.hostile, index.faction[1]);
-    try testing.expectEqual(@as(u16, 2), index.level[1]);
-    try testing.expectEqual(Faction.neutral, index.faction[0]);
-    try testing.expectEqual(@as(u16, 0), index.level[0]);
+    // Level 0's cell (0, 0) holds slot 2 (`near`), level 2's cell (1, 0) slot 0 (`far`),
+    // each its chunk's one neutral or hostile row part; level 2 has a directory though the
+    // geometry has one level.
+    var entities: [2]EntityId = undefined;
+    try testing.expectEqualSlices(EntityId, &.{ near, far }, viewEntities(index, &entities));
+    try testing.expectEqual(@as(usize, 3), index.level_slots.len);
+    try testing.expectEqual(@as(usize, 2), index.rows.len);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, index.cells);
+    const level_0 = index.level_slots[0][0];
+    try testing.expectEqual(index.build_stamp, level_0.build);
+    try testing.expectEqual(@as(u32, 0), level_0.record);
+    try testing.expect(level_0.factions.eql(.initOne(.neutral)));
+    const level_2 = index.level_slots[2][0];
+    try testing.expectEqual(index.build_stamp, level_2.build);
+    try testing.expectEqual(@as(u32, 1), level_2.record);
+    try testing.expect(level_2.factions.eql(.initOne(.hostile)));
+    try testing.expect(index.level_slots[1][0].build != index.build_stamp);
+    try testing.expectEqualSlices(ChunkRecord, &.{
+        .{ .row_masks = .{ 1, 0, 0, 0 }, .first_rows = .{ 0, 0, 0, 0 } },
+        .{ .row_masks = .{ 0, 0, 0, 1 }, .first_rows = .{ 0, 0, 0, 1 } },
+    }, index.chunk_records);
+    try testing.expectEqualSlices(RowPart, &.{ .{ .cells = 1, .first_cell = 0 }, .{ .cells = 1 << 1, .first_cell = 1 } }, index.rows);
+    try testing.expect(index.factions.eql(.initMany(&.{ .neutral, .hostile })));
+    try expectRecordsAgree(&system);
+
+    var visitor = RecordingVisitor{};
+    _ = index.queryNeighbors(.{ .x = 12, .y = 4, .level = 2, .radius = 5, .max_candidate_checks = 8 }, &visitor);
+    try testing.expectEqualSlices(u32, &.{1}, visitor.visited());
 }
 
-// A query's visits by brute force: every entry whose cell lies in the query's box, in
-// ascending entry order (the box scan's (cell_y, cell_x, slot) order), self skipped,
-// counted against the budget, then visited inside the strict radius.
-fn bruteForceVisits(index: SpatialIndexView, query: NeighborQuery, expected: *RecordingVisitor) NeighborQueryStats {
-    var stats = NeighborQueryStats{};
+// An AI agent with a movement body at `(x, y)` on `level`, of `faction`.
+fn addTaggedBody(data: *DataSystem, x: f32, y: f32, level: u16, faction: Faction) !EntityId {
+    const entity = try addTestBody(data, x, y);
+    try data.setWorldLevel(entity, level);
+    try data.setFaction(entity, faction);
+    return entity;
+}
+
+// The entities `visitor` visited, in visit order.
+fn visitedEntities(index: SpatialIndexView, visitor: *const RecordingVisitor, out: []EntityId) []const EntityId {
+    for (visitor.visited(), 0..) |entry, visit| out[visit] = index.entityAt(entry);
+    return out[0..visitor.count];
+}
+
+// The view's entities in entry order.
+fn viewEntities(index: SpatialIndexView, out: []EntityId) []const EntityId {
+    for (out[0..index.entryCount()], 0..) |*entity, entry| entity.* = index.entityAt(@intCast(entry));
+    return out[0..index.entryCount()];
+}
+
+test "a query visits only its own level: rows at the same xy on other levels are neither visited nor checked" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const self_entity = try addTaggedBody(&data, 5, 5, 0, .neutral);
+    const same_level = try addTaggedBody(&data, 8, 5, 0, .neutral);
+    var stacked: [3]EntityId = undefined;
+    for (&stacked, 1..) |*entity, level| entity.* = try addTaggedBody(&data, 8, 5, @intCast(level), .neutral);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    const index = system.view();
+
+    var visitor = RecordingVisitor{};
+    const stats = index.queryNeighbors(.{ .x = 5, .y = 5, .level = 0, .radius = 10, .max_candidate_checks = 64, .self = self_entity }, &visitor);
+    var visited: [8]EntityId = undefined;
+    try testing.expectEqualSlices(EntityId, &.{same_level}, visitedEntities(index, &visitor, &visited));
+    try testing.expectEqual(@as(u16, 1), stats.candidate_checks);
+
+    for (stacked, 1..) |entity, level| {
+        var level_visitor = RecordingVisitor{};
+        const level_stats = index.queryNeighbors(.{ .x = 5, .y = 5, .level = @intCast(level), .radius = 10, .max_candidate_checks = 64, .self = self_entity }, &level_visitor);
+        try testing.expectEqualSlices(EntityId, &.{entity}, visitedEntities(index, &level_visitor, &visited));
+        try testing.expectEqual(@as(u16, 1), level_stats.candidate_checks);
+    }
+
+    var empty_visitor = RecordingVisitor{};
+    const empty_stats = index.queryNeighbors(.{ .x = 5, .y = 5, .level = 9, .radius = 10, .max_candidate_checks = 64 }, &empty_visitor);
+    try testing.expectEqual(@as(usize, 0), empty_visitor.count);
+    try testing.expectEqual(@as(u16, 0), empty_stats.candidate_checks);
+}
+
+test "a hostile-masked query checks only hostile rows on its level: an ally crowd and stacked hostiles spend no budget" {
+    // 200 allies over 4x4 cells around the query point, 3 hostiles among them, and a
+    // hostile on each of 8 other levels at the query point.
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    for (0..200) |ally| _ = try addTaggedBody(&data, @floatFromInt(ally % 20 * 2), @floatFromInt(ally / 20 * 4), 0, .player);
+    var hostiles: [3]EntityId = undefined;
+    for (&hostiles, 0..) |*entity, hostile| entity.* = try addTaggedBody(&data, 6 + @as(f32, @floatFromInt(hostile)) * 11, 21, 0, .hostile);
+    for (1..9) |level| _ = try addTaggedBody(&data, 20, 20, @intCast(level), .hostile);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    const index = system.view();
+
+    var visitor = RecordingVisitor{};
+    const stats = index.queryNeighbors(.{ .x = 20, .y = 20, .level = 0, .radius = 40, .max_candidate_checks = 64, .factions = .initOne(.hostile) }, &visitor);
+    var visited: [8]EntityId = undefined;
+    try testing.expectEqualSlices(EntityId, &hostiles, visitedEntities(index, &visitor, &visited));
+    try testing.expectEqual(@as(u16, hostiles.len), stats.candidate_checks);
+
+    // Every faction: the allies spend the budget.
+    var all = RecordingVisitor{};
+    const all_stats = index.queryNeighbors(.{ .x = 20, .y = 20, .level = 0, .radius = 40, .max_candidate_checks = 64 }, &all);
+    try testing.expectEqual(@as(u16, 64), all_stats.candidate_checks);
+}
+
+test "a query visits each piece's faction runs in (cell row, chunk, faction, cell, slot) order, under its budget" {
+    // Cells (0, 0) and (0, 1) at cell size 10, factions mixed out of slot order.
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const cell_a_hostile = try addTaggedBody(&data, 1, 1, 0, .hostile);
+    const cell_a_neutral = try addTaggedBody(&data, 2, 2, 0, .neutral);
+    const cell_a_ally = try addTaggedBody(&data, 3, 3, 0, .ally);
+    const cell_b_neutral = try addTaggedBody(&data, 12, 1, 0, .neutral);
+    const cell_b_hostile = try addTaggedBody(&data, 13, 2, 0, .hostile);
+    const cell_a_neutral_late = try addTaggedBody(&data, 4, 4, 0, .neutral);
+    const cell_b_player = try addTaggedBody(&data, 14, 4, 0, .player);
+    const cell_b_hostile_late = try addTaggedBody(&data, 15, 5, 0, .hostile);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    const index = system.view();
+
+    const cases = [_]struct { factions: FactionSet, checks: u16, expected: []const EntityId }{
+        .{ .factions = .full, .checks = 64, .expected = &.{ cell_a_neutral, cell_a_neutral_late, cell_b_neutral, cell_b_player, cell_a_ally, cell_a_hostile, cell_b_hostile, cell_b_hostile_late } },
+        .{ .factions = .initMany(&.{ .neutral, .hostile }), .checks = 64, .expected = &.{ cell_a_neutral, cell_a_neutral_late, cell_b_neutral, cell_a_hostile, cell_b_hostile, cell_b_hostile_late } },
+        .{ .factions = .initMany(&.{ .neutral, .hostile }), .checks = 4, .expected = &.{ cell_a_neutral, cell_a_neutral_late, cell_b_neutral, cell_a_hostile } },
+        .{ .factions = .initMany(&.{ .player, .ally }), .checks = 64, .expected = &.{ cell_b_player, cell_a_ally } },
+        .{ .factions = .initOne(.hostile), .checks = 64, .expected = &.{ cell_a_hostile, cell_b_hostile, cell_b_hostile_late } },
+        .{ .factions = .empty, .checks = 64, .expected = &.{} },
+    };
+    for (cases) |case| {
+        var visitor = RecordingVisitor{};
+        const stats = index.queryNeighbors(.{ .x = 5, .y = 5, .level = 0, .radius = 30, .max_candidate_checks = case.checks, .factions = case.factions }, &visitor);
+        var visited: [8]EntityId = undefined;
+        try testing.expectEqualSlices(EntityId, case.expected, visitedEntities(index, &visitor, &visited));
+        try testing.expectEqual(@as(u16, @intCast(case.expected.len)), stats.candidate_checks);
+    }
+
+    // A visitor stop ends the query: a prefix, each visit one check.
+    const masked_order = [_]EntityId{ cell_a_neutral, cell_a_neutral_late, cell_b_neutral, cell_a_hostile, cell_b_hostile, cell_b_hostile_late };
+    for ([_]usize{ 2, 4 }) |stop_after| {
+        var visitor = RecordingVisitor{ .stop_after = stop_after };
+        const stats = index.queryNeighbors(.{ .x = 5, .y = 5, .level = 0, .radius = 30, .max_candidate_checks = 64, .factions = .initMany(&.{ .neutral, .hostile }) }, &visitor);
+        var visited: [8]EntityId = undefined;
+        try testing.expectEqualSlices(EntityId, masked_order[0..stop_after], visitedEntities(index, &visitor, &visited));
+        try testing.expectEqual(@as(u16, @intCast(stop_after)), stats.candidate_checks);
+    }
+}
+
+test "self is skipped without a check at its cell's first, middle, and last entry, and only where it is indexed" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    // One cell of neutrals, a hostile in it, and a neutral at the same xy on level 1.
+    var cell: [5]EntityId = undefined;
+    for (&cell, 0..) |*entity, slot| entity.* = try addTaggedBody(&data, 2 + @as(f32, @floatFromInt(slot)), 3, 0, .neutral);
+    const hostile = try addTaggedBody(&data, 4, 4, 0, .hostile);
+    const upstairs = try addTaggedBody(&data, 2, 3, 1, .neutral);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 2), testConfig(10));
+    const index = system.view();
+    const movement = data.movementBodySliceConst();
+
+    for ([_]usize{ 0, 2, 4 }) |position| {
+        const self_entity = cell[position];
+        const body = data.movementBodyDenseIndex(self_entity).?;
+        var visitor = RecordingVisitor{};
+        const stats = index.queryNeighbors(.{ .x = movement.previous_x[body], .y = movement.previous_y[body], .level = 0, .radius = 20, .max_candidate_checks = 64, .factions = .initOne(.neutral), .self = self_entity }, &visitor);
+        try testing.expectEqual(@as(u16, cell.len - 1), stats.candidate_checks);
+        var visited: [8]EntityId = undefined;
+        for (visitedEntities(index, &visitor, &visited)) |entity| try testing.expect(!entity.eql(self_entity));
+    }
+
+    // Every faction: self in the first faction's run, and in the last's.
+    for ([_]EntityId{ cell[2], hostile }) |self_entity| {
+        const body = data.movementBodyDenseIndex(self_entity).?;
+        var visitor = RecordingVisitor{};
+        const stats = index.queryNeighbors(.{ .x = movement.previous_x[body], .y = movement.previous_y[body], .level = 0, .radius = 20, .max_candidate_checks = 64, .self = self_entity }, &visitor);
+        try testing.expectEqual(@as(u16, cell.len), stats.candidate_checks);
+        var visited: [8]EntityId = undefined;
+        for (visitedEntities(index, &visitor, &visited)) |entity| try testing.expect(!entity.eql(self_entity));
+    }
+
+    // Self's faction not wanted: no effect.
+    var hostile_visitor = RecordingVisitor{};
+    const hostile_stats = index.queryNeighbors(.{ .x = 2, .y = 3, .level = 0, .radius = 20, .max_candidate_checks = 64, .factions = .initOne(.hostile), .self = cell[0] }, &hostile_visitor);
+    try testing.expectEqual(@as(u16, 1), hostile_stats.candidate_checks);
+    var visited: [8]EntityId = undefined;
+    try testing.expectEqualSlices(EntityId, &.{hostile}, visitedEntities(index, &hostile_visitor, &visited));
+
+    // A self indexed on another level is not resolved: level 1's entry is a candidate.
+    var other_level = RecordingVisitor{};
+    const other_stats = index.queryNeighbors(.{ .x = 2, .y = 3, .level = 1, .radius = 20, .max_candidate_checks = 64, .self = cell[0] }, &other_level);
+    try testing.expectEqual(@as(u16, 1), other_stats.candidate_checks);
+    try testing.expectEqualSlices(EntityId, &.{upstairs}, visitedEntities(index, &other_level, &visited));
+
+    // An invalid self resolves nothing.
+    var no_self = RecordingVisitor{};
+    const no_self_stats = index.queryNeighbors(.{ .x = 2, .y = 3, .level = 0, .radius = 20, .max_candidate_checks = 64, .self = EntityId.invalid }, &no_self);
+    try testing.expectEqual(@as(u16, cell.len + 1), no_self_stats.candidate_checks);
+}
+
+// Each entry's level and faction as `data` holds them, read independently of the index.
+const EntryTags = struct {
+    level: [512]u16 = undefined,
+    faction: [512]Faction = undefined,
+
+    fn read(data: *const DataSystem, index: SpatialIndexView) EntryTags {
+        std.debug.assert(index.entryCount() <= 512);
+        var tags = EntryTags{};
+        for (0..index.entryCount()) |entry| {
+            const entity = index.entityAt(@intCast(entry));
+            tags.level[entry] = data.worldLevelConst(entity) orelse 0;
+            tags.faction[entry] = data.factionConst(entity) orelse .neutral;
+        }
+        return tags;
+    }
+};
+
+// One brute-force candidate, ordered by the scan's (cell_y, chunk_x, faction, cell_x,
+// entry).
+const BruteCandidate = struct {
+    cell_y: u32,
+    chunk_x: u32,
+    faction: usize,
+    cell_x: u32,
+    entry: u32,
+
+    fn lessThan(_: void, lhs: BruteCandidate, rhs: BruteCandidate) bool {
+        if (lhs.cell_y != rhs.cell_y) return lhs.cell_y < rhs.cell_y;
+        if (lhs.chunk_x != rhs.chunk_x) return lhs.chunk_x < rhs.chunk_x;
+        if (lhs.faction != rhs.faction) return lhs.faction < rhs.faction;
+        if (lhs.cell_x != rhs.cell_x) return lhs.cell_x < rhs.cell_x;
+        return lhs.entry < rhs.entry;
+    }
+};
+
+// A query's visits by brute force: every entry on the query's level, of a faction in its
+// set, whose clamped cell lies in its box, in the scan's (cell_y, chunk_x, faction, cell_x,
+// slot) order (slots ascend with entries inside a cell), self skipped, counted against the
+// budget, then visited inside the strict radius.
+fn bruteForceVisits(index: SpatialIndexView, tags: *const EntryTags, query: NeighborQuery, expected: *RecordingVisitor) NeighborQueryStats {
+    var candidates: [512]BruteCandidate = undefined;
+    var candidate_count: usize = 0;
     const scan = cellScanRadius(query.radius, index.cell_size);
-    const own = cellForPosition(query.x, query.y, index.cell_size);
+    const own_x = math.worldPosToCell(query.x, index.cell_size, index.cells_x);
+    const own_y = math.worldPosToCell(query.y, index.cell_size, index.cells_y);
     for (0..index.x.len) |entry| {
-        if (index.entity[entry].eql(query.self)) continue;
-        const cell = cellForPosition(index.x[entry], index.y[entry], index.cell_size);
-        if (@abs(@as(i64, cell.cell_x) - own.cell_x) > scan or @abs(@as(i64, cell.cell_y) - own.cell_y) > scan) continue;
+        if (index.entityAt(@intCast(entry)).eql(query.self)) continue;
+        if (tags.level[entry] != query.level or !query.factions.contains(tags.faction[entry])) continue;
+        const cell_x = math.worldPosToCell(index.x[entry], index.cell_size, index.cells_x);
+        const cell_y = math.worldPosToCell(index.y[entry], index.cell_size, index.cells_y);
+        if (@abs(@as(i64, cell_x) - own_x) > scan or @abs(@as(i64, cell_y) - own_y) > scan) continue;
+        candidates[candidate_count] = .{ .cell_y = cell_y, .chunk_x = cell_x / index.cells_per_chunk, .faction = factionIndex(tags.faction[entry]), .cell_x = cell_x, .entry = @intCast(entry) };
+        candidate_count += 1;
+    }
+    std.sort.pdq(BruteCandidate, candidates[0..candidate_count], {}, BruteCandidate.lessThan);
+    var stats = NeighborQueryStats{};
+    for (candidates[0..candidate_count]) |candidate| {
         if (stats.candidate_checks >= query.max_candidate_checks) break;
         stats.candidate_checks += 1;
-        const dx = query.x - index.x[entry];
-        const dy = query.y - index.y[entry];
+        const dx = query.x - index.x[candidate.entry];
+        const dy = query.y - index.y[candidate.entry];
         const dist2 = dx * dx + dy * dy;
-        if (dist2 < query.radius * query.radius) _ = expected.visit(@intCast(entry), dx, dy, dist2);
+        if (dist2 < query.radius * query.radius) _ = expected.record(candidate.entry, dx, dy, dist2);
     }
     return stats;
 }
 
-test "queryNeighbors visits exactly a brute-force scan's in-box entries in ascending entry order, up to its check budget" {
-    // Bodies over cells -75..74 at cell size 4, in 20 cell rows: radius 300 spans several
-    // row segments and bands per row.
-    var data = DataSystem.init(testing.allocator);
-    defer data.deinit();
+// Bodies over cells 25..174 at cell size 4 in a 16 x 4 chunk grid, in 20 cell rows on 3
+// levels, of every faction: radius 300 crosses five chunks per row. A dense block of one
+// cell per level gives masked runs of a lane block and more, and ten bodies past each grid
+// side clamp to its edge cells.
+fn fillBruteForceLayout(data: *DataSystem) !void {
     var prng = std.Random.DefaultPrng.init(0x0b5e_55ed);
     const random = prng.random();
-    for (0..200) |_| _ = try addTestBody(&data, random.float(f32) * 600 - 300, random.float(f32) * 80 - 40);
+    for (0..200) |_| {
+        const entity = try addTestBody(data, 100 + random.float(f32) * 600, 60 + random.float(f32) * 80);
+        try data.setWorldLevel(entity, random.uintLessThan(u16, 3));
+        try data.setFaction(entity, @fromBackingInt(random.int(u2)));
+    }
+    for (0..90) |_| {
+        const entity = try addTestBody(data, 401 + random.float(f32) * 2, 101 + random.float(f32) * 2);
+        try data.setWorldLevel(entity, random.uintLessThan(u16, 3));
+        try data.setFaction(entity, @fromBackingInt(random.int(u2)));
+    }
+    const sides = [_][2]f32{ .{ -1, 0 }, .{ 1, 0 }, .{ 0, -1 }, .{ 0, 1 } };
+    for (sides) |side| {
+        for (0..10) |_| {
+            const along_x = 100 + random.float(f32) * 600;
+            const along_y = 60 + random.float(f32) * 80;
+            const x = if (side[0] < 0) -random.float(f32) * 50 else if (side[0] > 0) 1024 + random.float(f32) * 50 else along_x;
+            const y = if (side[1] < 0) -random.float(f32) * 50 else if (side[1] > 0) 256 + random.float(f32) * 50 else along_y;
+            const entity = try addTestBody(data, x, y);
+            try data.setWorldLevel(entity, random.uintLessThan(u16, 3));
+            try data.setFaction(entity, @fromBackingInt(random.int(u2)));
+        }
+    }
+}
+
+const brute_force_geometry = IndexGeometry{ .tile_size = 4, .chunk_size_tiles = 16, .chunks_x = 16, .chunks_y = 4, .level_count = 3 };
+
+test "queryNeighbors visits exactly a brute-force scan's in-box entries of its level and factions in scan order, up to its check budget" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    try fillBruteForceLayout(&data);
     const population = aiPopulation(&data);
-    const config = SpatialIndexConfig{ .cell_size = 4 };
+    const config = testConfig(4);
 
     var serial = SpatialIndexSystem.init(testing.allocator);
     defer serial.deinit();
-    _ = try serial.buildSerial(&data, population, config);
+    _ = try serial.buildSerial(&data, population, brute_force_geometry, config);
     var reference = try TestCapture.capture(&serial);
     defer reference.deinit();
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = if (builtin.single_threaded) 0 else 3 });
     defer threads.deinit();
-    var tuners = [2]AdaptiveWorkTuner{ AdaptiveWorkTuner.init(.{}), AdaptiveWorkTuner.init(.{}) };
+    var tuners: [3]AdaptiveWorkTuner = @splat(AdaptiveWorkTuner.init(.{}));
     var banded = SpatialIndexSystem.init(testing.allocator);
     defer banded.deinit();
-    _ = try banded.beginBuild(population, config);
-    _ = banded.buildBanded(&data, population, .{
-        .bucket = Dispatch.init(&threads, &tuners[0], .{ .items_per_range = 16, .max_worker_threads = 3, .adaptive = false }),
-        .sort = Dispatch.init(&threads, &tuners[1], .{ .items_per_range = 16, .max_worker_threads = 3, .adaptive = false }),
-    }, testSplitters(.pairs, reference.cells.items));
+    _ = try banded.beginBuild(population, brute_force_geometry, config);
+    _ = try banded.buildBanded(&data, population, testStages(&threads, &tuners, 3, 16, 16, 16), testSplitters(.pairs, reference.cell_keys.items));
 
+    const query_factions = [_]FactionSet{ .full, .initOne(.hostile), .initMany(&.{ .neutral, .ally }), .initMany(&.{ .player, .ally }) };
     for ([_]*const SpatialIndexSystem{ &serial, &banded }) |system| {
         const index = system.view();
+        const tags = EntryTags.read(&data, index);
         for (0..index.x.len) |origin| {
-            for ([_]f32{ 0, 20, 100, 300 }) |radius| {
-                for ([_]u16{ 64, 1000 }) |checks| {
-                    const query = NeighborQuery{ .x = index.x[origin], .y = index.y[origin], .radius = radius, .max_candidate_checks = checks, .self = index.entity[origin] };
-                    var expected = RecordingVisitor{};
-                    const expected_stats = bruteForceVisits(index, query, &expected);
-                    var actual = RecordingVisitor{};
-                    const actual_stats = index.queryNeighbors(query, &actual);
-                    try testing.expectEqual(expected_stats, actual_stats);
-                    try expected.expectEqual(&actual);
+            // The origin's own level and one other.
+            for ([_]u16{ tags.level[origin], (tags.level[origin] + 1) % 3 }) |level| {
+                for ([_]f32{ 0, 20, 100, 300 }) |radius| {
+                    for ([_]u16{ 16, 1000 }) |checks| {
+                        for (query_factions) |factions| {
+                            const query = NeighborQuery{ .x = index.x[origin], .y = index.y[origin], .level = level, .radius = radius, .max_candidate_checks = checks, .factions = factions, .self = index.entityAt(@intCast(origin)) };
+                            var expected = RecordingVisitor{};
+                            const expected_stats = bruteForceVisits(index, &tags, query, &expected);
+                            var actual = RecordingVisitor{};
+                            const actual_stats = index.queryNeighbors(query, &actual);
+                            try testing.expectEqual(expected_stats, actual_stats);
+                            try expected.expectEqual(&actual);
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-test "row segments hold each 64-cell span's cells, split where a splitter falls inside one" {
-    // One cell row at cell size 10: cells -65 | -64, -1 | 0, 63 | 64 lie in spans -2..1.
+test "queries from inside and outside the grid visit exactly the entries within the strict radius" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
-    for ([_]i32{ -65, -64, -1, 0, 63, 64 }) |cell_x| _ = try addTestBody(&data, @as(f32, @floatFromInt(cell_x)) * 10 + 5, 5);
+    try fillBruteForceLayout(&data);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), brute_force_geometry, testConfig(4));
+    const index = system.view();
+    const tags = EntryTags.read(&data, index);
+    const points = [_][2]f32{ .{ 400, 100 }, .{ 2, 2 }, .{ -30, 120 }, .{ 1050, 20 }, .{ 500, 280 }, .{ -40, -40 } };
+    for (points) |point| {
+        for ([_]f32{ 20, 100, 300 }) |radius| {
+            for (0..3) |level| {
+                const query = NeighborQuery{ .x = point[0], .y = point[1], .level = @intCast(level), .radius = radius, .max_candidate_checks = std.math.maxInt(u16) };
+                var expected = RecordingVisitor{};
+                const expected_stats = bruteForceVisits(index, &tags, query, &expected);
+                var actual = RecordingVisitor{};
+                const actual_stats = index.queryNeighbors(query, &actual);
+                try testing.expectEqual(expected_stats, actual_stats);
+                try expected.expectEqual(&actual);
+                // Exactly the entries within the radius by true distance.
+                var within: usize = 0;
+                for (0..index.x.len) |entry| {
+                    const dx = point[0] - index.x[entry];
+                    const dy = point[1] - index.y[entry];
+                    if (tags.level[entry] == level and dx * dx + dy * dy < radius * radius) within += 1;
+                }
+                try testing.expectEqual(within, actual.count);
+            }
+        }
+    }
+}
+
+test "row parts hold each chunk row's cells at their local x, and a chunk or row part straddling bands keeps one slot and one row record" {
+    // Cell size 10: cells 15 | 16, 31 | 32, 47 lie at local x 15 | 0, 15 | 0, 15 of chunks
+    // 0..2 in row 0, and cell (20, 3) in chunk 1's row 3; one body per cell.
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    for ([_]u32{ 15, 16, 31, 32, 47 }) |cell_x| _ = try addTestBody(&data, @as(f32, @floatFromInt(cell_x)) * 10 + 5, 5);
+    _ = try addTestBody(&data, 205, 35);
     const population = aiPopulation(&data);
-    const config = SpatialIndexConfig{ .cell_size = 10 };
+    const geometry = testGeometry(10, 4, 1);
+    const config = testConfig(10);
 
     var serial = SpatialIndexSystem.init(testing.allocator);
     defer serial.deinit();
-    _ = try serial.buildSerial(&data, population, config);
+    _ = try serial.buildSerial(&data, population, geometry, config);
     const one_band = serial.view();
-    try testing.expectEqual(@as(u32, 4), one_band.directory.bands[0].segment_count);
-    const expected = [_]struct { segment_x: i32, first_cell: u32, mask: u64 }{
-        .{ .segment_x = -2, .first_cell = 0, .mask = 1 << 63 },
-        .{ .segment_x = -1, .first_cell = 1, .mask = 1 | 1 << 63 },
-        .{ .segment_x = 0, .first_cell = 3, .mask = 1 | 1 << 63 },
-        .{ .segment_x = 1, .first_cell = 5, .mask = 1 },
-    };
-    for (expected, one_band.segments[0..expected.len]) |want, segment| {
-        try testing.expectEqual(@as(i32, 0), segment.cell_y);
-        try testing.expectEqual(want.segment_x, segment.segment_x);
-        try testing.expectEqual(want.first_cell, segment.first_cell);
-        try testing.expectEqual(want.mask, segment.occupied.mask);
+    // Chunk-major: chunk 0's row 0, chunk 1's rows 0 and 3, chunk 2's row 0.
+    try testing.expectEqualSlices(RowPart, &.{
+        .{ .cells = 1 << 15, .first_cell = 0 },
+        .{ .cells = 1 | 1 << 15, .first_cell = 1 },
+        .{ .cells = 1 << 4, .first_cell = 3 },
+        .{ .cells = 1 | 1 << 15, .first_cell = 4 },
+    }, one_band.rows);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5, 6 }, one_band.cells);
+    const neutral = factionIndex(.neutral);
+    const expected_records = [_]struct { row_mask: u64, first_row: u32 }{ .{ .row_mask = 1, .first_row = 0 }, .{ .row_mask = 1 | 1 << 3, .first_row = 1 }, .{ .row_mask = 1, .first_row = 3 } };
+    try testing.expectEqual(expected_records.len, one_band.chunk_records.len);
+    for (expected_records, one_band.chunk_records, one_band.level_slots[0][0..3], 0..) |want, record, slot, chunk| {
+        try testing.expectEqual(one_band.build_stamp, slot.build);
+        try testing.expectEqual(@as(u32, @intCast(chunk)), slot.record);
+        try testing.expectEqual(want.row_mask, record.row_masks[neutral]);
+        try testing.expectEqual(want.first_row, record.first_rows[neutral]);
     }
+    try testing.expect(one_band.level_slots[0][3].build != one_band.build_stamp);
 
-    // A splitter at cell 32 gives span 0 one record in each band.
+    // A splitter at chunk 1's row 3 puts its row parts in two bands; one at its row 0's
+    // second cell puts that row part's cells in two bands.
+    var reference = try TestCapture.capture(&serial);
+    defer reference.deinit();
+    try testing.expectEqual(reference.cell_keys.items[3], testSplitters(.straddle_chunk, reference.cell_keys.items)[0]);
+    try testing.expectEqual(reference.cell_keys.items[2], testSplitters(.straddle_row, reference.cell_keys.items)[0]);
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = if (builtin.single_threaded) 0 else 2 });
     defer threads.deinit();
-    var tuners = [2]AdaptiveWorkTuner{ AdaptiveWorkTuner.init(.{}), AdaptiveWorkTuner.init(.{}) };
-    var splitters: [band_count - 1]CellKey = @splat(max_cell_key);
-    splitters[0] = .{ .cell_y = 0, .cell_x = 32 };
+    var tuners: [3]AdaptiveWorkTuner = @splat(AdaptiveWorkTuner.init(.{}));
     var banded = SpatialIndexSystem.init(testing.allocator);
     defer banded.deinit();
-    _ = try banded.beginBuild(population, config);
-    _ = banded.buildBanded(&data, population, .{
-        .bucket = Dispatch.init(&threads, &tuners[0], .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false }),
-        .sort = Dispatch.init(&threads, &tuners[1], .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false }),
-    }, splitters);
-    const two_bands = banded.view();
-    const lower = two_bands.directory.bands[0];
-    const upper = two_bands.directory.bands[1];
-    try testing.expectEqual(@as(u32, 3), lower.segment_count);
-    try testing.expectEqual(@as(u32, 2), upper.segment_count);
-    const lower_span = two_bands.segments[lower.start + 2];
-    const upper_span = two_bands.segments[upper.start];
-    try testing.expectEqual(@as(i32, 0), lower_span.segment_x);
-    try testing.expectEqual(@as(u64, 1), lower_span.occupied.mask);
-    try testing.expectEqual(@as(i32, 0), upper_span.segment_x);
-    try testing.expectEqual(@as(u64, 1 << 63), upper_span.occupied.mask);
-    try testing.expectEqual(upper.start, upper_span.first_cell);
-
-    // Both indexes visit every entry, in order, across the split span.
-    const query = NeighborQuery{ .x = 325, .y = 5, .radius = 1000, .max_candidate_checks = 64 };
+    const query = NeighborQuery{ .x = 325, .y = 5, .level = 0, .radius = 1000, .max_candidate_checks = 64 };
     var one_band_visits = RecordingVisitor{};
     _ = one_band.queryNeighbors(query, &one_band_visits);
-    var two_band_visits = RecordingVisitor{};
-    _ = two_bands.queryNeighbors(query, &two_band_visits);
-    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5 }, one_band_visits.visited());
-    try one_band_visits.expectEqual(&two_band_visits);
+    try testing.expectEqual(@as(usize, 6), one_band_visits.count);
+    for ([_]TestSplitters{ .straddle_chunk, .straddle_row }) |set| {
+        _ = try banded.beginBuild(population, geometry, config);
+        _ = try banded.buildBanded(&data, population, testStages(&threads, &tuners, 2, 16, 16, 16), testSplitters(set, reference.cell_keys.items));
+        try expectIndexMatches(&banded, &reference, &serial);
+        // Both indexes visit every entry, in order, across the chunk edges.
+        var two_band_visits = RecordingVisitor{};
+        _ = banded.view().queryNeighbors(query, &two_band_visits);
+        try one_band_visits.expectEqual(&two_band_visits);
+    }
 }
 
-test "index cells in lanes match cellForPosition, including the scalar tail" {
-    // 25 slots: six lane blocks and a one-slot tail. Cell size 30 is not a power of two,
-    // so a reciprocal multiply in place of the division would diverge.
+test "index keys in lanes match keyForPosition, including the scalar tail, at 12 and 16 cells per chunk" {
+    // 25 slots: six lane blocks and a one-slot tail, some outside the grid, on levels 0..5,
+    // of every faction. Cell size 32 gives 12 cells per 384-unit chunk and 16 per 512-unit
+    // chunk.
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     for (0..25) |slot| {
-        _ = try addTestBody(&data, @as(f32, @floatFromInt(slot % 23)) * 7.0 - 40.0, @as(f32, @floatFromInt(slot / 23)) * 5.0 - 20.0);
+        _ = try addTaggedBody(&data, @as(f32, @floatFromInt(slot % 23)) * 47.0 - 40.0, @as(f32, @floatFromInt(slot / 23)) * 405.0 - 20.0, @intCast(slot % 6), @fromBackingInt(@intCast(slot % 4)));
     }
-    var system = SpatialIndexSystem.init(testing.allocator);
-    defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), .{ .cell_size = 30 });
-
-    const index = system.view();
-    var keys_checked: usize = 0;
-    for (index.cells[0..index.directory.bands[0].cell_count]) |cell| {
-        for (cell.start..cell.end) |entry| {
+    for ([_]f32{ 24, 32 }) |tile_size| {
+        const geometry = IndexGeometry{ .tile_size = tile_size, .chunk_size_tiles = 16, .chunks_x = 2, .chunks_y = 2, .level_count = 1 };
+        var system = SpatialIndexSystem.init(testing.allocator);
+        defer system.deinit();
+        const stats = try system.buildSerial(&data, aiPopulation(&data), geometry, .{});
+        try testing.expectEqual(@as(usize, 25), stats.entity_count);
+        try testing.expectEqual(@as(u32, if (tile_size == 24) 12 else 16), system.grid.cells_per_chunk);
+        try testing.expectEqual(@as(f32, 32), system.grid.cell_size);
+        for (system.keys.items[0..system.view().entryCount()]) |key| {
             // Recomputed from the fixture's own formula, not read back from the index.
-            const slot = system.keys.items[entry].slot;
-            const expected = cellForPosition(@as(f32, @floatFromInt(slot % 23)) * 7.0 - 40.0, @as(f32, @floatFromInt(slot / 23)) * 5.0 - 20.0, 30);
-            try testing.expectEqual(expected, CellKey{ .cell_y = cell.cell_y, .cell_x = cell.cell_x });
-            keys_checked += 1;
+            const slot = keySlot(key);
+            const faction: Faction = @fromBackingInt(@intCast(slot % 4));
+            const expected = keyForPosition(system.grid, @intCast(slot % 6), @as(f32, @floatFromInt(slot % 23)) * 47.0 - 40.0, @as(f32, @floatFromInt(slot / 23)) * 405.0 - 20.0, factionIndex(faction), slot);
+            try testing.expectEqual(expected, key);
         }
     }
-    try testing.expectEqual(@as(usize, 25), keys_checked);
 }
 
-test "the entry visit in lanes matches the scalar visit, including NaN and the tail" {
+// Entries `[start, end)` but `skip` visited one at a time with the query's semantics: the
+// scalar reference of the lane visit. Returns true when the query ends; `met_skip` is set
+// when the walk reaches `skip` inside the budget.
+fn visitScalar(index: SpatialIndexView, query: NeighborQuery, start: u32, end: u32, skip: u32, visitor: *RecordingVisitor, stats: *NeighborQueryStats, met_skip: *bool) bool {
+    for (start..end) |entry| {
+        if (entry == skip) {
+            met_skip.* = stats.candidate_checks < query.max_candidate_checks;
+            continue;
+        }
+        if (stats.candidate_checks >= query.max_candidate_checks) return true;
+        stats.candidate_checks += 1;
+        const dx = query.x - index.x[entry];
+        const dy = query.y - index.y[entry];
+        const dist2 = dx * dx + dy * dy;
+        if (dist2 < query.radius * query.radius and visitor.record(@intCast(entry), dx, dy, dist2)) return true;
+    }
+    return false;
+}
+
+test "the run visit in lanes matches the scalar visit over run offsets, the column end, self anywhere, every budget, and a stop" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     // Nine bodies in cell (0, 0): one NaN position, one exactly at the radius.
@@ -1470,27 +2447,134 @@ test "the entry visit in lanes matches the scalar visit, including NaN and the t
     data.movementBodySlice().previous_x[4] = std.math.nan(f32);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), .{ .cell_size = 10 });
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 1, 1), testConfig(10));
     const index = system.view();
-    try testing.expectEqual(@as(u32, 1), index.directory.bands[0].cell_count);
+    try testing.expectEqual(@as(usize, 1), index.rows.len);
+    const column_end: u32 = positions.len;
 
-    for (1..positions.len + 1) |length| {
-        for ([_]u16{ 2, 64 }) |checks| {
-            const query = NeighborQuery{ .x = 2, .y = 1, .radius = 3, .max_candidate_checks = checks, .self = index.entity[1] };
-            var lanes = RecordingVisitor{};
-            var lane_stats = NeighborQueryStats{};
-            const lane_stop = index.visitEntries(query, QueryLanes.init(query), 0, @intCast(length), &lanes, &lane_stats);
-            var scalar = RecordingVisitor{};
-            var scalar_stats = NeighborQueryStats{};
-            const scalar_stop = index.visitEntriesScalar(query, query.radius * query.radius, 0, length, &scalar, &scalar_stats);
-            try testing.expectEqual(scalar_stop, lane_stop);
-            try testing.expectEqual(scalar_stats, lane_stats);
-            try scalar.expectEqual(&lanes);
+    // Runs from offsets 0..3, over-reading the entries past them, to every end up to the
+    // column's, where the last batch fills.
+    for (0..simd.lane_count) |start| {
+        for (start + 1..column_end + 1) |end| {
+            // Self at every entry of the column, inside the run or not, then none.
+            for (0..column_end + 1) |self_at| {
+                const self: EntityId = if (self_at == column_end) EntityId.invalid else index.entityAt(@intCast(self_at));
+                const skip: u32 = if (self_at >= start and self_at < end) @intCast(self_at) else no_entry;
+                for (0..end - start + 2) |checks| {
+                    for ([_]usize{ std.math.maxInt(usize), 1, 2 }) |stop_after| {
+                        const query = NeighborQuery{ .x = 2, .y = 1, .level = 0, .radius = 3, .max_candidate_checks = @intCast(checks), .self = self };
+                        const self_index = if (self.isValid()) self.index else no_entry;
+                        var scan = Scan{
+                            .x = index.x,
+                            .y = index.y,
+                            .entity_index = index.entity_index,
+                            .entity_generation = index.entity_generation,
+                            .query_x = query.x,
+                            .query_y = query.y,
+                            .lane_x = simd.splatFloat4(query.x),
+                            .lane_y = simd.splatFloat4(query.y),
+                            .lane_radius2 = simd.splatFloat4(query.radius * query.radius),
+                            .cap = query.max_candidate_checks,
+                            .self_index = self_index,
+                            .self_generation = self.generation,
+                            .lane_self = simd.splatUint4(self_index),
+                        };
+                        var lanes = RecordingVisitor{ .stop_after = stop_after };
+                        const lane_stop = visitRun(&scan, @intCast(start), @intCast(end), true, &lanes);
+                        var scalar = RecordingVisitor{ .stop_after = stop_after };
+                        var scalar_stats = NeighborQueryStats{};
+                        var met_self = false;
+                        const scalar_stop = visitScalar(index, query, @intCast(start), @intCast(end), skip, &scalar, &scalar_stats, &met_self);
+                        // The lane scan may also end with the budget spent and only self left.
+                        try testing.expect(scalar_stop == lane_stop or (lane_stop and scan.checks == query.max_candidate_checks));
+                        try testing.expectEqual(scalar_stats.candidate_checks, scan.checks);
+                        try scalar.expectEqual(&lanes);
+                        // A self the budget reaches before any stop is met in its batch.
+                        if (met_self and scalar.count < stop_after and self_at - start < checks) try testing.expectEqual(no_entry, scan.self_index);
+                    }
+                }
+            }
         }
     }
 }
 
-test "a build after a populated one leaves no stale cells, serial and threaded" {
+test "self in a dense cell is skipped where the budget reaches it and costs no check past it" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    var prng = std.Random.DefaultPrng.init(0xde45_e5e1);
+    const random = prng.random();
+    for (0..512) |_| _ = try addTestBody(&data, 1 + random.float(f32) * 8, 1 + random.float(f32) * 8);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    const index = system.view();
+    try testing.expectEqual(@as(usize, 1), index.rows.len);
+
+    var expected: [16]u32 = undefined;
+    for ([_]u32{ 5, 511 }) |self_at| {
+        const self = index.entityAt(self_at);
+        var visitor = RecordingVisitor{};
+        const stats = index.queryNeighbors(.{ .x = index.x[self_at], .y = index.y[self_at], .level = 0, .radius = 100, .max_candidate_checks = 16, .self = self }, &visitor);
+        try testing.expectEqual(@as(u16, 16), stats.candidate_checks);
+        var next: u32 = 0;
+        for (&expected) |*entry| {
+            if (next == self_at) next += 1;
+            entry.* = next;
+            next += 1;
+        }
+        try testing.expectEqualSlices(u32, &expected, visitor.visited());
+    }
+}
+
+test "a self indexed in another piece than the query point's is a candidate" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const self = try addTestBody(&data, 5, 5);
+    const other = try addTestBody(&data, 6, 25);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    const index = system.view();
+
+    // Two cell rows below self's: self is in the box but not in the query point's piece.
+    var visitor = RecordingVisitor{};
+    const stats = index.queryNeighbors(.{ .x = 5, .y = 25, .level = 0, .radius = 30, .max_candidate_checks = 64, .self = self }, &visitor);
+    var visited: [2]EntityId = undefined;
+    try testing.expectEqualSlices(EntityId, &.{ self, other }, visitedEntities(index, &visitor, &visited));
+    try testing.expectEqual(@as(u16, 2), stats.candidate_checks);
+
+    // From self's own position it is skipped.
+    var own = RecordingVisitor{};
+    const own_stats = index.queryNeighbors(.{ .x = 5, .y = 5, .level = 0, .radius = 30, .max_candidate_checks = 64, .self = self }, &own);
+    try testing.expectEqualSlices(EntityId, &.{other}, visitedEntities(index, &own, &visited));
+    try testing.expectEqual(@as(u16, 1), own_stats.candidate_checks);
+}
+
+test "a radius of 1e30 scans the whole level without overflow" {
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), cellScanRadius(1e30, 32));
+    for ([_]f32{ 0, 16, 32, 48 }, [_]i32{ 0, 1, 1, 2 }) |radius, cells| try testing.expectEqual(cells, cellScanRadius(radius, 32));
+
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    try fillBruteForceLayout(&data);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), brute_force_geometry, testConfig(4));
+    const index = system.view();
+    const tags = EntryTags.read(&data, index);
+    for (0..3) |level| {
+        const query = NeighborQuery{ .x = index.x[0], .y = index.y[0], .level = @intCast(level), .radius = 1e30, .max_candidate_checks = std.math.maxInt(u16), .self = index.entityAt(0) };
+        var expected = RecordingVisitor{};
+        const expected_stats = bruteForceVisits(index, &tags, query, &expected);
+        var actual = RecordingVisitor{};
+        const actual_stats = index.queryNeighbors(query, &actual);
+        try testing.expectEqual(expected_stats, actual_stats);
+        try expected.expectEqual(&actual);
+        try testing.expect(actual.count > 0);
+    }
+}
+
+test "a build after a populated one leaves no stale cells or slots, serial and threaded" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     for (0..40) |slot| _ = try addTestBody(&data, @floatFromInt(slot * 3), 0);
@@ -1498,34 +2582,134 @@ test "a build after a populated one leaves no stale cells, serial and threaded" 
     defer empty_data.deinit();
     // Slots, none with a body.
     for (0..20) |_| _ = try addTestBodiless(&empty_data);
+    // A body in chunk (1, 1) only.
+    var moved_data = DataSystem.init(testing.allocator);
+    defer moved_data.deinit();
+    _ = try addTestBody(&moved_data, 600, 600);
 
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = if (builtin.single_threaded) 0 else 2 });
     defer threads.deinit();
+    const geometry = testGeometry(32, 4, 1);
 
     const empties = [_]IndexPopulation{ aiPopulation(&empty_data), .{ .entities = &.{} } };
     for (empties) |empty| {
         for ([_]bool{ false, true }) |threaded| {
-            _ = try system.buildSerial(&data, aiPopulation(&data), .{});
-            try testing.expect(system.view().entity.len == 40);
+            _ = try system.buildSerial(&data, aiPopulation(&data), geometry, .{});
+            try testing.expect(system.view().entryCount() == 40);
             const stats = if (threaded)
-                try system.build(&empty_data, empty, &threads, .{ .items_per_range = 16, .adaptive = false })
+                try system.build(&empty_data, empty, geometry, &threads, .{ .items_per_range = 16, .adaptive = false })
             else
-                try system.buildSerial(&empty_data, empty, .{});
+                try system.buildSerial(&empty_data, empty, geometry, .{});
             try testing.expectEqual(@as(usize, 0), stats.entity_count);
             const index = system.view();
-            try testing.expectEqual(@as(usize, 0), index.entity.len);
-            for (index.directory.bands) |band| {
-                try testing.expectEqual(@as(u32, 0), band.cell_count);
-                try testing.expectEqual(@as(u32, 0), band.segment_count);
+            try testing.expectEqual(@as(usize, 0), index.entryCount());
+            try testing.expectEqual(@as(usize, 0), index.rows.len);
+            try testing.expect(index.factions.eql(.empty));
+            for (index.level_slots) |slots| {
+                for (slots) |slot| try testing.expect(slot.build != index.build_stamp);
             }
             var visitor = RecordingVisitor{};
-            const query_stats = index.queryNeighbors(.{ .x = 3, .y = 0, .radius = 64, .max_candidate_checks = 64 }, &visitor);
+            const query_stats = index.queryNeighbors(.{ .x = 3, .y = 0, .level = 0, .radius = 64, .max_candidate_checks = 64 }, &visitor);
             try testing.expectEqual(@as(usize, 0), visitor.count);
             try testing.expectEqual(@as(u16, 0), query_stats.candidate_checks);
         }
     }
+
+    // Chunk (0, 0) populated in one build and empty in the next is rejected by its stamp.
+    _ = try system.buildSerial(&data, aiPopulation(&data), geometry, .{});
+    _ = try system.buildSerial(&moved_data, aiPopulation(&moved_data), geometry, .{});
+    const moved = system.view();
+    try testing.expect(moved.level_slots[0][0].build != moved.build_stamp);
+    try testing.expectEqual(moved.build_stamp, moved.level_slots[0][4 + 1].build);
+    var near_origin = RecordingVisitor{};
+    _ = moved.queryNeighbors(.{ .x = 3, .y = 0, .level = 0, .radius = 64, .max_candidate_checks = 64 }, &near_origin);
+    try testing.expectEqual(@as(usize, 0), near_origin.count);
+    try expectRecordsAgree(&system);
+}
+
+test "the level directories follow the geometry: reset on a grid change, grown for a body's level, and the tail released" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const body = try addTestBody(&data, 10, 10);
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
+    try testing.expectEqual(@as(usize, 2), system.level_slots.items.len);
+    try testing.expectEqual(2 * 16 * chunk_slot_bytes, system.directoryBytes());
+
+    // A body on a level past the geometry's gets its directory, and the next build without
+    // it releases the tail.
+    try data.setWorldLevel(body, 4);
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
+    try testing.expectEqual(@as(usize, 5), system.level_slots.items.len);
+    var visitor = RecordingVisitor{};
+    _ = system.view().queryNeighbors(.{ .x = 10, .y = 10, .level = 4, .radius = 8, .max_candidate_checks = 8 }, &visitor);
+    try testing.expectEqual(@as(usize, 1), visitor.count);
+    try data.setWorldLevel(body, 1);
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
+    try testing.expectEqual(@as(usize, 2), system.level_slots.items.len);
+
+    // An empty build, with no slots or with only bodiless ones, serial and threaded,
+    // releases the tail too.
+    var bodiless_data = DataSystem.init(testing.allocator);
+    defer bodiless_data.deinit();
+    for (0..20) |_| _ = try addTestBodiless(&bodiless_data);
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = if (builtin.single_threaded) 0 else 2 });
+    defer threads.deinit();
+    const empties = [_]struct { data: *const DataSystem, population: IndexPopulation }{
+        .{ .data = &data, .population = .{ .entities = &.{} } },
+        .{ .data = &bodiless_data, .population = aiPopulation(&bodiless_data) },
+    };
+    for (empties) |empty| {
+        for ([_]bool{ false, true }) |threaded| {
+            try data.setWorldLevel(body, 4);
+            _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
+            try testing.expectEqual(@as(usize, 5), system.level_slots.items.len);
+            const stats = if (threaded)
+                try system.build(empty.data, empty.population, testGeometry(32, 4, 2), &threads, .{ .items_per_range = 16, .adaptive = false })
+            else
+                try system.buildSerial(empty.data, empty.population, testGeometry(32, 4, 2), .{});
+            try testing.expectEqual(@as(usize, 0), stats.entity_count);
+            try testing.expectEqual(@as(usize, 2), system.level_slots.items.len);
+            try testing.expectEqual(2 * 16 * chunk_slot_bytes, system.directoryBytes());
+        }
+    }
+    try data.setWorldLevel(body, 1);
+
+    // A grid change rebuilds every directory at the new chunk count.
+    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 8, 3), .{});
+    try testing.expectEqual(@as(usize, 3), system.level_slots.items.len);
+    try testing.expectEqual(3 * 64 * chunk_slot_bytes, system.directoryBytes());
+    for (system.level_slots.items) |slots| try testing.expectEqual(@as(usize, 64), slots.len);
+    try expectRecordsAgree(&system);
+}
+
+test "the index cell is the configured cell rounded to a whole fraction of the chunk, never refusing a geometry" {
+    const default_world = IndexGeometry{ .tile_size = 32, .chunk_size_tiles = 16, .chunks_x = 8, .chunks_y = 8, .level_count = 1 };
+    const default_grid = Grid.of(default_world, (SpatialIndexConfig{}).cell_size);
+    try testing.expectEqual(@as(u32, 16), default_grid.cells_per_chunk);
+    try testing.expectEqual(@as(f32, 32), default_grid.cell_size);
+    try testing.expectEqual(@as(u32, 128), default_grid.cells_x);
+
+    var tile_30 = default_world;
+    tile_30.tile_size = 30;
+    try testing.expectEqual(@as(u32, 15), Grid.of(tile_30, 32).cells_per_chunk);
+
+    const tiny = IndexGeometry{ .tile_size = 2, .chunk_size_tiles = 1, .chunks_x = 3, .chunks_y = 2, .level_count = 1 };
+    const tiny_grid = Grid.of(tiny, 32);
+    try testing.expectEqual(@as(u32, 1), tiny_grid.cells_per_chunk);
+    try testing.expectEqual(@as(f32, 2), tiny_grid.cell_size);
+
+    var huge = default_world;
+    huge.tile_size = 1e6;
+    try testing.expectEqual(max_cells_per_chunk, Grid.of(huge, 32).cells_per_chunk);
+
+    const wide = IndexGeometry{ .tile_size = 32, .chunk_size_tiles = 64, .chunks_x = 1 << 26, .chunks_y = 1, .level_count = 1 };
+    const wide_grid = Grid.of(wide, 32);
+    try testing.expectEqual(@as(u32, std.math.maxInt(i32) / (1 << 26)), wide_grid.cells_per_chunk);
+    try testing.expect(wide_grid.cells_x <= std.math.maxInt(i32));
 }
 
 test "the index builds correctly above a small reserved capacity" {
@@ -1535,23 +2719,26 @@ test "the index builds correctly above a small reserved capacity" {
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
     try system.reserve(4);
-    const stats = try system.buildSerial(&data, aiPopulation(&data), .{});
+    const stats = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 4, 1), .{});
     try testing.expectEqual(@as(usize, 40), stats.entity_count);
-    try testing.expectEqual(@as(usize, 40), system.view().entity.len);
-    try testing.expect(system.directory.bands[0].cell_count > 0);
+    try testing.expectEqual(@as(usize, 40), system.view().entryCount());
+    try testing.expect(system.view().rows.len > 0);
 }
 
-test "after reserve, threaded builds at 2 and 4 partitions per stage, a serial build, and a query allocate nothing" {
-    // No warm build: the reserve alone covers every partition the tuners can pick.
+test "after reserve and reserveGeometry, threaded builds at 2 and 4 partitions per stage, a serial build, and queries allocate nothing" {
+    // No warm build: the reserves alone cover every partition the tuners can pick.
     if (builtin.single_threaded) return error.SkipZigTest;
 
+    // One body per cell, so the link stage partitions like the others.
     const population_count: usize = 64;
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     for (0..population_count) |slot| {
-        _ = try addTestBody(&data, @as(f32, @floatFromInt(slot % 23)) * 7.0 - 40.0, @as(f32, @floatFromInt(slot / 23)) * 5.0 - 20.0);
+        const entity = try addTestBody(&data, @as(f32, @floatFromInt(slot % 16)) * 40.0 + 5, @as(f32, @floatFromInt(slot / 16)) * 40.0 + 5);
+        try data.setFaction(entity, @fromBackingInt(@intCast(slot % 4)));
     }
     const population = aiPopulation(&data);
+    const geometry = testGeometry(32, 4, 1);
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
@@ -1560,28 +2747,38 @@ test "after reserve, threaded builds at 2 and 4 partitions per stage, a serial b
 
     var reference = SpatialIndexSystem.init(testing.allocator);
     defer reference.deinit();
-    _ = try reference.buildSerial(&data, population, .{});
+    _ = try reference.buildSerial(&data, population, geometry, .{});
 
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
     try system.reserve(population_count);
+    try system.reserveGeometry(geometry, .{});
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const original_allocator = system.allocator;
     system.allocator = failing.allocator();
     defer system.allocator = original_allocator;
 
     for ([_]usize{ 32, 16 }) |items_per_range| {
-        const stats = try system.build(&data, population, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
+        const stats = try system.build(&data, population, geometry, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
         try testing.expectEqual(population_count, stats.entity_count);
-        try testing.expect(!stats.bucket_batch.ran_inline and !stats.sort_batch.ran_inline);
-        try testing.expectEqual(population_count / items_per_range, stats.bucket_batch.range_count);
-        try testing.expectEqual(population_count / items_per_range, stats.sort_batch.range_count);
-        try testing.expectEqualSlices(EntityId, reference.view().entity, system.view().entity);
+        try testing.expect(!stats.bucket_batch.ran_inline and !stats.sort_batch.ran_inline and !stats.link_batch.ran_inline);
+        for ([_]BatchStats{ stats.bucket_batch, stats.sort_batch, stats.link_batch }) |batch| {
+            try testing.expectEqual(population_count / items_per_range, batch.range_count);
+        }
+        try testing.expectEqualSlices(u32, reference.view().entity_index, system.view().entity_index);
+        try testing.expectEqualSlices(u32, reference.view().entity_generation, system.view().entity_generation);
     }
-    const serial_stats = try system.buildSerial(&data, population, .{});
+    const serial_stats = try system.buildSerial(&data, population, geometry, .{});
     try testing.expectEqual(population_count, serial_stats.entity_count);
     var visitor = RecordingVisitor{};
-    _ = system.view().queryNeighbors(.{ .x = 0, .y = 0, .radius = 128, .max_candidate_checks = 16 }, &visitor);
-    try testing.expectEqual(@as(usize, 16), visitor.count);
+    const full_stats = system.view().queryNeighbors(.{ .x = 0, .y = 0, .level = 0, .radius = 400, .max_candidate_checks = 16 }, &visitor);
+    try testing.expectEqual(@as(u16, 16), full_stats.candidate_checks);
+    try testing.expect(visitor.count > 0);
+    for ([_]FactionSet{ .initMany(&.{ .neutral, .hostile }), .initMany(&.{ .player, .ally }) }) |factions| {
+        var masked = RecordingVisitor{};
+        const masked_stats = system.view().queryNeighbors(.{ .x = 0, .y = 0, .level = 0, .radius = 400, .max_candidate_checks = 16, .factions = factions }, &masked);
+        try testing.expectEqual(@as(u16, 16), masked_stats.candidate_checks);
+        try testing.expect(masked.count > 0);
+    }
     try testing.expectEqual(@as(usize, 0), failing.allocations);
 }

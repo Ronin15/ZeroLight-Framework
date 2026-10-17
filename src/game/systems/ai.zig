@@ -2,34 +2,23 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! AI decision processor: gathers per-row perception/memory/affect/personality
-//! signals, runs `arbitration.zig`'s utility scoring + sticky selection +
-//! goal resolution to pick one of 5 behaviors and a concrete goal,
-//! then blends that goal with wander noise and local separation into a
-//! `NavigationIntent`. Arbitration output is per-agent: perception's
-//! `nearest_threat` is already faction-generic (any hostile can become a
-//! pursue/flee target), and `AiConfig.focus_target`/`focus_entity` is an
-//! explicit, opt-in, last-resort fallback gated on `gain_pursue > 0` — never
-//! the primary signal.
-//! Stateless (except work memory + per-system tuner); reads typed const slices for ai + movement prior positions,
-//! pre-sizes NavigationIntent output ranges and uses staged parallelForWithOptions work.
-//! Deterministic via explicit seed in config. Gather uses DataSystem dense-index lookup, so cost is bounded by live AI rows.
-//! Separation and arbitration's cohere neighbor-mean query the caller's shared
-//! `SpatialIndexView` (a second, friendly-stance-filtered query in the same
-//! separation-stage job); each think row skips itself by entity. Their float sums
-//! follow the index's scan order (see `spatial_index.zig`).
-//! decideDir pure base; applySeparationAndNormalize shared (no logic dup). Serial fallback + threaded identical.
-//! Arbitration itself (scoreBehaviors -> selectSticky -> resolveGoal per row) runs
-//! inside the already-threaded `writeAiIntentsJob`/`writeAiSeparationJob` range jobs —
-//! `updateSerial` calls the same job functions with a single full-range dispatch
-//! (mirrors `computeAiSeparationsSerial`), so serial and threaded paths share one
-//! code path by construction rather than two hand-duplicated ones.
-//! Serial/main-only clamp for AI squares (math.clamp consistent with player, vel zero for AI decision rate).
-//! Serial fallback, read-only workers, range aligned to ai_range_alignment_items, no hot alloc after init, direct SoA.
+//! AI decision processor: gathers each think row's perception, memory, affect, and
+//! personality signals, runs `arbitration.zig`'s utility scoring, sticky selection, and goal
+//! resolution to pick a behavior and goal, then blends the goal with wander noise and local
+//! separation into a `NavigationIntent`. Goals are per-agent; `AiConfig.focus_target` is an
+//! opt-in last-resort pursue fallback.
+//!
+//! Separation (every faction) and cohere (the row's friendly factions) query the shared
+//! `SpatialIndexView` on the row's level, skipping the row itself; their float sums follow
+//! the index's lane order (`spatial_index.zig`).
+//!
+//! Serial and threaded paths run the same `writeAiSeparationJob`/`writeAiIntentsJob`; the
+//! serial path calls them on one full range.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
+const simd = @import("../../core/simd.zig");
 const rng = @import("../../core/rng.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
@@ -58,8 +47,10 @@ const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const spatial_index = @import("spatial_index.zig");
 const SpatialIndexView = spatial_index.SpatialIndexView;
-const NeighborVisitResult = spatial_index.NeighborVisitResult;
-const stance = @import("../faction.zig").stance;
+const NeighborLanes = spatial_index.NeighborLanes;
+const LaneStop = spatial_index.LaneStop;
+const capLanes = spatial_index.capLanes;
+const factionsWithStance = @import("../faction.zig").factionsWithStance;
 const arbitration = @import("arbitration.zig");
 const InterestMarkerStore = @import("../world/interest.zig").InterestMarkerStore;
 
@@ -147,8 +138,6 @@ const RowInterest = struct {
     present: bool = false,
     x: f32 = 0,
     y: f32 = 0,
-    /// World level sampled at gather. The separation job reads it when it scans markers.
-    level: u16 = 0,
     /// Whether the agent carries a real faction component. The gathered
     /// `faction` column falls back to `.neutral` for stance math, but the
     /// marker scan must pass `null` for a factionless agent so a
@@ -166,10 +155,8 @@ const RowFocus = struct {
     y: f32,
 };
 
-/// Cohere neighbor-mean gather, written by `writeAiSeparationJob`'s
-/// friendly-stance-filtered `queryNeighbors` pass (same job, same spatial
-/// index as local separation). 0 count = no friendly neighbors found within
-/// `cohere_radius`.
+/// Cohere neighbor mean from `writeAiSeparationJob`'s friendly query; count 0 when no
+/// friendly neighbor lies within `cohere_radius`.
 const RowCohere = struct {
     mean_x: f32 = 0,
     mean_y: f32 = 0,
@@ -190,21 +177,17 @@ const RowResolved = struct {
     goal_entity: ?EntityId = null,
 };
 
-/// One gathered AI row. Columnar (MultiArrayList), never boxed into an
-/// `arbitration.Signals` for storage — `Signals` is built transiently, once
-/// per row, right before the `scoreBehaviors`/`resolveGoal` calls in
-/// `resolveRowArbitration`, then discarded (mirrors this file's existing
-/// `AiDir` helper struct). Fields are grouped into small per-domain structs
-/// (gains, sticky state, threat, stimulus, memory, drives, focus, cohere,
-/// resolved output) rather than ~50 flat scalars: `std.MultiArrayList`'s
-/// comptime field-layout sort exceeds Zig's default eval-branch quota well
-/// before that many fields (verified empirically), and grouping keeps each
-/// signal domain readable as a unit besides.
+/// One gathered AI row, columnar; `arbitration.Signals` is built transiently per row. Fields
+/// are grouped by domain because MAL's comptime layout exceeds the eval quota near 50 flat
+/// fields.
 const AiGatherRow = struct {
     entity: EntityId,
     pos_x: f32,
     pos_y: f32,
     faction: Faction,
+    /// World level sampled at gather: the level the row's neighbor queries and marker
+    /// scan read.
+    level: u16,
     wander_amplitude: f32,
     gains: RowGains,
     sticky: RowSticky,
@@ -235,18 +218,18 @@ fn appendAiGatherRow(
 
 const separation_radius: f32 = 48.0;
 const max_separation_neighbors: u8 = 32;
-const max_separation_candidate_checks: u16 = 128;
+pub const max_separation_candidate_checks: u16 = 128;
+// Neighbors at or nearer than this squared distance add no separation.
+const separation_min_dist2: f32 = 0.1;
 
-// Cohere's neighbor-mean gather: a second, wider-radius, friendly-stance-filtered
-// query of the shared index in the same job. Fixed constants, not derived from
-// world/population size.
+// Cohere's neighbor-mean gather: a second, wider-radius query of the shared index over the
+// agent's friendly factions, in the same job. Fixed, not derived from world or population size.
 const cohere_radius: f32 = 96.0;
 const max_cohere_neighbors: u32 = 12;
 const max_cohere_candidate_checks: u16 = 64;
 
-/// Fixed cognition query radius for world interest markers (independent of
-/// world/map size). Sized near typical hearing range so curious agents can
-/// discover demo POIs without dig stimuli.
+/// Fixed cognition query radius for world interest markers, independent of world size; near
+/// hearing range so curious agents find markers without dig stimuli.
 const interest_marker_query_radius: f32 = 400.0;
 
 /// Fixed sticky-selection epsilon (see `arbitration.selectSticky`'s
@@ -300,8 +283,7 @@ pub const AiConfig = struct {
     focus_entity: ?EntityId = null,
     /// Fixed distance (world units) the live `focus_target` must move from
     /// the last reported goal before that goal snaps to the new position. 0
-    /// (default) snaps every step — exact instant tracking, preserving
-    /// pre-hysteresis behavior. Nonzero throttles how often a shared
+    /// (default) snaps every step. Nonzero throttles how often a shared
     /// `.group` path goal re-keys (see
     /// `default_goal_requantization_hysteresis_distance`), since local
     /// separation/steering closes the small gap between path updates. Only
@@ -321,15 +303,8 @@ pub const AiConfig = struct {
     /// consulted to build `arbitration.Signals`' drive fields. Null = every
     /// drive scores as 0 (pure personality-gain + perception/memory scoring).
     affect_slice: ?ConstAiAffectSlice = null,
-    /// Solver-mode ceiling honored only when a row's `kind_hint` is not
-    /// `.individual`. Per `arbitration.resolveGoal`, every
-    /// behavior (including the `focus_target` pursue fallback) currently
-    /// resolves `kind_hint = .individual` — goals are agent-specific by
-    /// construction now, not a single broadcast target — so this field has
-    /// no observable effect yet. Detecting when many agents genuinely share
-    /// one quantized goal cell (the case where `.group` remains a real
-    /// amortization win) is deferred; this field is kept as the documented
-    /// future opt-in ceiling for that upgrade, not removed.
+    /// Solver mode for a row whose `kind_hint` is not `.individual`. Every behavior resolves
+    /// `.individual` (`arbitration.resolveGoal`), so it has no effect.
     nav_request_kind: PathRequestKind = .individual,
     navigation_intents: ?*RangeOutputStream(NavigationIntent) = null,
     /// When non-null, only these dense ai-store indices think this step (the
@@ -496,14 +471,9 @@ pub const AiSystem = struct {
         };
     }
 
-    // Walks the think set (`scope_dense_indices`, or every agent), skipping rows
-    // with no movement body. Populates every INPUT column arbitration needs (personality gains, hot
-    // commitment state, perception/memory/affect signals, the gated
-    // opt-in focus_target) as flat scalar/fixed-array columns — never an
-    // `arbitration.Signals` array. `Signals` values are built transiently,
-    // one at a time, inside `resolveRowArbitration` (called from the
-    // threaded `writeAiIntentsJob`/`writeAiSeparationJob` jobs below, not
-    // from this serial gather pass).
+    // One row per think-set agent with a movement body: every column arbitration reads.
+    // Scalar: a dense-index lookup per row into the movement, faction, level, perception,
+    // memory, and affect stores, with skips; the threaded stages read the packed rows.
     fn gatherAiData(
         self: *AiSystem,
         ai_slice: ConstAiAgentSlice,
@@ -544,6 +514,7 @@ pub const AiSystem = struct {
                 .pos_x = movement.previous_x[mi],
                 .pos_y = movement.previous_y[mi],
                 .faction = ent_faction,
+                .level = data.worldLevelConst(ent) orelse 0,
                 .wander_amplitude = ai_slice.wander_amplitudes[i],
                 .gains = .{
                     .wander = ai_slice.gain_wanders[i],
@@ -640,10 +611,7 @@ pub const AiSystem = struct {
                 }
             }
 
-            row.interest = .{
-                .level = data.worldLevelConst(ent) orelse 0,
-                .has_faction = maybe_faction != null,
-            };
+            row.interest = .{ .has_faction = maybe_faction != null };
 
             appendAiGatherRow(&self.rows, &row_slice, row);
         }
@@ -667,9 +635,7 @@ pub const AiSystem = struct {
         return result.goal;
     }
 
-    /// Zeroes this step's separation/cohere accumulator columns. No longer
-    /// builds a grid (the caller-supplied `SpatialIndexView` replaces it), so
-    /// this is infallible unlike the `buildSeparationGrid` it replaces.
+    /// Zeroes this step's separation and cohere columns.
     fn resetSeparationScratch(self: *AiSystem) void {
         if (self.rows.len == 0) return;
         const gathered = self.rows.slice();
@@ -698,6 +664,7 @@ fn buildAiSeparationContext(
         .pos_x = gathered.items(.pos_x),
         .pos_y = gathered.items(.pos_y),
         .faction = gathered.items(.faction),
+        .level = gathered.items(.level),
         .gains = gathered.items(.gains),
         .sep_x = gathered.items(.sep_x),
         .sep_y = gathered.items(.sep_y),
@@ -856,18 +823,14 @@ const AiSeparationContext = struct {
     pos_x: []const f32,
     pos_y: []const f32,
     faction: []const Faction,
-    /// Only `.cohere` is read here (gates the neighbor query below) — kept as
-    /// the full row rather than a single `[]const f32` column so this struct
-    /// doesn't grow a second near-duplicate gains slice alongside
-    /// `AiJobContext.gains`.
+    level: []const u16,
+    /// Only `.cohere` is read: it gates the cohere neighbor query.
     gains: []const RowGains,
     sep_x: []f32,
     sep_y: []f32,
     neighbor_counts: []u8,
     candidate_counts: []u16,
-    /// Cohere neighbor-mean output (see `RowCohere`'s doc comment) — written
-    /// by the same job, same shared spatial index, as local separation. Not
-    /// a second grid.
+    /// Cohere neighbor-mean output, written by the same job as separation.
     cohere: []RowCohere,
     interest: []RowInterest,
     markers: ?*const InterestMarkerStore,
@@ -889,12 +852,8 @@ fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
         job.neighbor_counts[index] = result.neighbor_count;
         job.candidate_counts[index] = result.candidate_count;
 
-        // A row with no cohere gain can never win `.cohere` in
-        // `scoreBehaviors` (its score is `gain_cohere * (...)` = 0, and a
-        // zero tie always loses to `.wander`'s lower enum index) — the
-        // neighbor-mean this query would produce is provably unused, so
-        // skip the second shared-spatial-index traversal entirely for the
-        // common case (most demo archetypes have `gain_cohere == 0`).
+        // A zero cohere gain never wins `.cohere` (its score is 0 and a tie loses to
+        // `.wander`), so its query is skipped.
         job.cohere[index] = if (job.gains[index].cohere > 0)
             computeCohereNeighbors(job, index)
         else
@@ -904,7 +863,7 @@ fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
             if (job.gains[index].investigate > 0) {
                 const interest = &job.interest[index];
                 const agent_faction: ?Faction = if (interest.has_faction) job.faction[index] else null;
-                if (markers.findBestInvestigateMarker(interest.level, job.pos_x[index], job.pos_y[index], interest_marker_query_radius, agent_faction)) |hit| {
+                if (markers.findBestInvestigateMarker(job.level[index], job.pos_x[index], job.pos_y[index], interest_marker_query_radius, agent_faction)) |hit| {
                     interest.present = true;
                     interest.x = hit.x;
                     interest.y = hit.y;
@@ -921,84 +880,77 @@ const SeparationResult = struct {
     candidate_count: u16 = 0,
 };
 
-/// Accumulates the bounded local-separation contribution for one row from the
-/// shared index's visits. The near-zero `dist2 > 0.1` guard stays here (an
-/// AI-specific "avoid degenerate normalize" concern); the radius prefilter and
-/// candidate-check bookkeeping are `SpatialIndexView.queryNeighbors`'s (see the
-/// brute-force parity test).
+// The bounded separation sum of one row's query in lane partials: each lane sums the unit
+// directions away from the neighbors at its lane, past `separation_min_dist2`.
 const SeparationAccumulator = struct {
-    x: f32 = 0,
-    y: f32 = 0,
+    x: simd.Float4 = @splat(0),
+    y: simd.Float4 = @splat(0),
     neighbor_count: u8 = 0,
 
-    pub fn visit(self: *SeparationAccumulator, _: u32, dx: f32, dy: f32, dist2: f32) NeighborVisitResult {
-        if (dist2 > 0.1) {
-            const dir = math.normalizeOrZeroFinite(dx, dy, 0);
-            self.x += dir.x;
-            self.y += dir.y;
-            self.neighbor_count += 1;
-            if (self.neighbor_count >= max_separation_neighbors) return .stop;
-        }
-        return .keep_going;
+    pub fn visitLanes(self: *SeparationAccumulator, lanes: *const NeighborLanes) LaneStop {
+        const near = lanes.inside & simd.greaterThanFloat4Bits(lanes.dist2, simd.splatFloat4(separation_min_dist2));
+        if (near == 0) return null;
+        const cap = capLanes(near, max_separation_neighbors - self.neighbor_count);
+        // Inside lanes are finite (NaN and inf fail the radius test), and `near` is above 0.
+        const dir = simd.normalizeKnownFinite2Float4(lanes.dx, lanes.dy, lanes.dist2, cap.pass);
+        self.x = simd.addFloat4(self.x, dir.x);
+        self.y = simd.addFloat4(self.y, dir.y);
+        self.neighbor_count += @popCount(cap.pass);
+        return cap.stop;
     }
 };
 
 fn computeBoundedSeparation(job: *const AiSeparationContext, index: usize) SeparationResult {
     var acc = SeparationAccumulator{};
+    // Every faction on the row's level.
     const stats = job.spatial_index.queryNeighbors(.{
         .x = job.pos_x[index],
         .y = job.pos_y[index],
+        .level = job.level[index],
         .radius = separation_radius,
         .max_candidate_checks = max_separation_candidate_checks,
         .self = job.entities[index],
     }, &acc);
     return .{
-        .x = acc.x,
-        .y = acc.y,
+        .x = simd.sumLanesFloat4(acc.x),
+        .y = simd.sumLanesFloat4(acc.y),
         .neighbor_count = acc.neighbor_count,
         .candidate_count = stats.candidate_checks,
     };
 }
 
-const CohereAccumulator = struct {
-    sum_x: f32 = 0,
-    sum_y: f32 = 0,
-    count: u32 = 0,
-};
-
-/// Scalar (a branchy stance lookup per visited entry, not dense uniform work).
-/// Filters to friendly stance only: cohere flocks with allies, never hostiles or
-/// neutrals.
+// The friendly positions one row's cohere query visits, summed in lane partials.
 const CohereVisitor = struct {
-    self_faction: Faction,
-    spatial_index: *const SpatialIndexView,
-    acc: CohereAccumulator = .{},
+    sum_x: simd.Float4 = @splat(0),
+    sum_y: simd.Float4 = @splat(0),
+    count: u32 = 0,
 
-    pub fn visit(self: *CohereVisitor, entry: u32, _: f32, _: f32, _: f32) NeighborVisitResult {
-        if (stance(self.self_faction, self.spatial_index.faction[entry]) != .friendly) return .keep_going;
-        self.acc.sum_x += self.spatial_index.x[entry];
-        self.acc.sum_y += self.spatial_index.y[entry];
-        self.acc.count += 1;
-        if (self.acc.count >= max_cohere_neighbors) return .stop;
-        return .keep_going;
+    pub fn visitLanes(self: *CohereVisitor, lanes: *const NeighborLanes) LaneStop {
+        const cap = capLanes(lanes.inside, max_cohere_neighbors - self.count);
+        self.sum_x = simd.addFloat4(self.sum_x, simd.selectOrZeroFloat4(cap.pass, lanes.x));
+        self.sum_y = simd.addFloat4(self.sum_y, simd.selectOrZeroFloat4(cap.pass, lanes.y));
+        self.count += @popCount(cap.pass);
+        return cap.stop;
     }
 };
 
 /// Cohere's neighbor-mean gather: a second query of the shared index used for
-/// separation.
+/// separation, over the factions friendly to the row on its level, so cohere flocks with
+/// allies, never hostiles or neutrals.
 fn computeCohereNeighbors(job: *const AiSeparationContext, index: usize) RowCohere {
-    var visitor = CohereVisitor{ .self_faction = job.faction[index], .spatial_index = &job.spatial_index };
+    var visitor = CohereVisitor{};
     _ = job.spatial_index.queryNeighbors(.{
         .x = job.pos_x[index],
         .y = job.pos_y[index],
+        .level = job.level[index],
         .radius = cohere_radius,
         .max_candidate_checks = max_cohere_candidate_checks,
+        .factions = factionsWithStance(job.faction[index], .friendly),
         .self = job.entities[index],
     }, &visitor);
-    const acc = visitor.acc;
-    if (acc.count == 0) return .{};
-    const inv = 1.0 / @as(f32, @floatFromInt(acc.count));
-    return .{ .mean_x = acc.sum_x * inv, .mean_y = acc.sum_y * inv, .count = acc.count };
+    if (visitor.count == 0) return .{};
+    const inv = 1.0 / @as(f32, @floatFromInt(visitor.count));
+    return .{ .mean_x = simd.sumLanesFloat4(visitor.sum_x) * inv, .mean_y = simd.sumLanesFloat4(visitor.sum_y) * inv, .count = visitor.count };
 }
 
 /// Per-row job context for `writeAiIntentsJob`: every input column
@@ -1040,17 +992,9 @@ const AiJobContext = struct {
     range_count: usize,
 };
 
-/// Runs arbitration for one row: builds a transient `arbitration.Signals`
-/// from this row's gathered columns (never stored — discarded immediately
-/// after the three calls below), scores behaviors, sticky-selects one, then
-/// resolves a concrete goal. Writes the row's steering-facing output column
-/// and persists the *locomotion* behavior to `ai_agent_hot`: a selected
-/// behavior with no resolvable goal this step (e.g. a one-frame perception
-/// gap) degrades to pure wander (zero gain) for both steering and the hot
-/// `active_behavior` column so affect fatigue does not treat an unresolvable
-/// pursue/flee as exertion. Sticky commitment still records the selection's
-/// countdown when the goal is valid; on invalid goals commitment is cleared
-/// so sticky does not hold an unresolvable pursue/flee across steps.
+/// Runs arbitration for one row and writes its resolved output and locomotion behavior. A
+/// selection with no resolvable goal degrades to wander with zero gain, in the hot
+/// `active_behavior` column too, and clears its commitment.
 fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
     const threat = job.threat[i];
     const stimulus = job.stimulus[i];
@@ -2472,7 +2416,10 @@ test "ai serial and real threaded workers produce identical navigation intents" 
                 .active_behavior = if (i % 2 == 0) .pursue else .wander,
                 .wander_amplitude = @floatFromInt(i % 13),
                 .gain_pursue = if (i % 2 == 0) 0.7 else 0.2,
+                .gain_cohere = if (i % 3 == 0) 0.5 else 0,
             });
+            // Friendly to one another, so cohere finds neighbors.
+            try data.setFaction(entity, .ally);
         }
     }
 
@@ -2513,7 +2460,21 @@ test "ai serial and real threaded workers produce identical navigation intents" 
     threaded_frame.beginStep();
     const stats = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, cfg);
     try std.testing.expect(!stats.intent_batch.ran_inline);
+    try std.testing.expect(!stats.separation_batch.ran_inline);
     const threaded = threaded_frame.navigation_intents.mergedItems();
+    // Separation and cohere rows on workers equal the serial ones bit for bit.
+    const serial_rows = serial_ai.rows.slice();
+    const threaded_rows = threaded_ai.rows.slice();
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial_rows.items(.sep_x)), std.mem.sliceAsBytes(threaded_rows.items(.sep_x)));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial_rows.items(.sep_y)), std.mem.sliceAsBytes(threaded_rows.items(.sep_y)));
+    var cohere_rows: usize = 0;
+    for (serial_rows.items(.cohere), threaded_rows.items(.cohere)) |serial_cohere, threaded_cohere| {
+        try std.testing.expectEqual(serial_cohere.count, threaded_cohere.count);
+        try std.testing.expectEqual(@as(u32, @bitCast(serial_cohere.mean_x)), @as(u32, @bitCast(threaded_cohere.mean_x)));
+        try std.testing.expectEqual(@as(u32, @bitCast(serial_cohere.mean_y)), @as(u32, @bitCast(threaded_cohere.mean_y)));
+        if (serial_cohere.count > 1) cohere_rows += 1;
+    }
+    try std.testing.expect(cohere_rows > 0);
 
     try std.testing.expectEqual(serial.len, threaded.len);
     for (serial, threaded) |a, b| {
@@ -2569,7 +2530,7 @@ test "ai spatial separation caps dense neighbor samples" {
     try std.testing.expect(stats.separation_neighbor_samples > 0);
 }
 
-test "ai spatial separation handles negative grid coordinates" {
+test "ai spatial separation finds neighbors past the grid edge at negative coordinates" {
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
@@ -2673,46 +2634,97 @@ test "think rows skip themselves and find halo neighbors" {
     try std.testing.expectApproxEqAbs(@as(f32, 20), gathered.items(.cohere)[1].mean_x, 1e-4);
 }
 
-/// O(n^2) reference reproducing `computeBoundedSeparation`'s documented
-/// semantics directly (no spatial partitioning): ascending-index scan, self
-/// skipped without counting, candidate-stop checked before increment, radius
-/// prefilter strict `<`, near-zero guard `dist2 > 0.1`, neighbor cap checked
-/// after accumulating. See the parity test below for why an ascending-index
-/// scan matches the real spatially-partitioned traversal bit-for-bit here.
-fn bruteForceSeparation(pos_x: []const f32, pos_y: []const f32, index: usize) SeparationResult {
-    var result = SeparationResult{};
-    for (0..pos_x.len) |j| {
-        if (j == index) continue;
-        if (result.candidate_count >= max_separation_candidate_checks) break;
-        result.candidate_count += 1;
+test "separation and cohere read only the row's level, and cohere only friendly rows" {
+    // A thinker on level 2, a friendly and a hostile 20 units away on its level, and a
+    // friendly on each of levels 0, 1, and 3 at the thinker's xy offset by 10.
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const Body = struct {
+        fn add(store: *DataSystem, x: f32, level: u16, faction: Faction, gain_cohere: f32) !EntityId {
+            const entity = try store.createEntity();
+            try store.setMovementBody(entity, .{ .position = .{ .x = x, .y = 0 }, .previous_position = .{ .x = x, .y = 0 }, .velocity = .{}, .speed = 20 });
+            try store.setAiAgent(entity, .{ .active_behavior = .wander, .gain_cohere = gain_cohere });
+            try store.setFaction(entity, faction);
+            try store.setWorldLevel(entity, level);
+            return entity;
+        }
+    };
+    _ = try Body.add(&data, 0, 2, .player, 1.0);
+    _ = try Body.add(&data, 20, 2, .ally, 0);
+    _ = try Body.add(&data, -20, 2, .hostile, 0);
+    for ([_]u16{ 0, 1, 3 }) |level| _ = try Body.add(&data, 10, level, .ally, 0);
 
+    var spatial_sys = try testSpatialIndex(&data);
+    defer spatial_sys.deinit();
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    try ai_sys.gatherAiData(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, null, null, null, null, null, null, null);
+    const context = buildAiSeparationContext(ai_sys.rows.slice(), spatial_sys.view(), 1, null);
+
+    const separation = computeBoundedSeparation(&context, 0);
+    try std.testing.expectEqual(@as(u16, 2), separation.candidate_count);
+    try std.testing.expectEqual(@as(u8, 2), separation.neighbor_count);
+    const cohere = computeCohereNeighbors(&context, 0);
+    try std.testing.expectEqual(@as(u32, 1), cohere.count);
+    try std.testing.expectEqual(@as(f32, 20), cohere.mean_x);
+}
+
+// A row's separation from its neighbors visited in `order`, each at its lane, summed in
+// lane partials as the index's lane scan does: the reference both oracles below feed.
+const LaneSeparation = struct {
+    acc_x: [simd.lane_count]f32 = @splat(0),
+    acc_y: [simd.lane_count]f32 = @splat(0),
+    lane_terms: [simd.lane_count]u8 = @splat(0),
+    result: SeparationResult = .{},
+    done: bool = false,
+
+    // Visits neighbor `j` at `lane`, or nothing once the query has ended.
+    fn visit(self: *LaneSeparation, pos_x: []const f32, pos_y: []const f32, index: usize, j: usize, lane: usize) void {
+        if (self.done) return;
+        if (self.result.candidate_count >= max_separation_candidate_checks) {
+            self.done = true;
+            return;
+        }
+        self.result.candidate_count += 1;
         const dx = pos_x[index] - pos_x[j];
         const dy = pos_y[index] - pos_y[j];
         const dist2 = dx * dx + dy * dy;
-        if (dist2 > 0.1 and dist2 < separation_radius * separation_radius) {
+        if (dist2 > separation_min_dist2 and dist2 < separation_radius * separation_radius) {
             const dir = math.normalizeOrZeroFinite(dx, dy, 0);
-            result.x += dir.x;
-            result.y += dir.y;
-            result.neighbor_count += 1;
-            if (result.neighbor_count >= max_separation_neighbors) break;
+            self.acc_x[lane] += dir.x;
+            self.acc_y[lane] += dir.y;
+            self.lane_terms[lane] += 1;
+            self.result.neighbor_count += 1;
+            if (self.result.neighbor_count >= max_separation_neighbors) self.done = true;
         }
     }
-    return result;
+
+    fn finish(self: *LaneSeparation) SeparationResult {
+        self.result.x = simd.sumLanesScalar(self.acc_x);
+        self.result.y = simd.sumLanesScalar(self.acc_y);
+        return self.result;
+    }
+};
+
+// Reference for a single populated cell: one run in index order, so neighbor `j`'s lane is
+// its position in the run, self included, mod 4.
+fn bruteForceSeparation(pos_x: []const f32, pos_y: []const f32, index: usize) SeparationResult {
+    var lanes = LaneSeparation{};
+    for (0..pos_x.len) |j| {
+        if (j == index) continue;
+        lanes.visit(pos_x, pos_y, index, j, j % simd.lane_count);
+    }
+    return lanes.finish();
 }
 
-test "ai computeBoundedSeparation matches an O(n^2) brute-force reference bit-for-bit" {
+test "ai computeBoundedSeparation matches a one-cell lane-order reference bit-for-bit" {
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
     var prng = std.Random.DefaultPrng.init(0x51ab_dead);
     const rand = prng.random();
-    const count = 32;
-    // Every agent lands inside the single grid cell (0,0) (well under the
-    // 32-unit cell size), so the shared index's cell-scan visits exactly one
-    // range in ascending stored (== population) order — identical to the
-    // brute-force reference's plain ascending-index loop above. That equality
-    // of traversal order is what makes this a bit-exact proof of parity
-    // instead of an approximate one; see the module doc's determinism note.
+    // One cell (well under the 32-unit cell), and past the 32-neighbor stop mid-batch.
+    const count = 40;
     for (0..count) |_| {
         const entity = try data.createEntity();
         const position = math.Vec2{ .x = rand.float(f32) * 20.0, .y = rand.float(f32) * 20.0 };
@@ -2725,6 +2737,7 @@ test "ai computeBoundedSeparation matches an O(n^2) brute-force reference bit-fo
 
     var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
+    try std.testing.expectEqual(@as(usize, 1), spatial_sys.view().rows.len);
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
@@ -2737,6 +2750,7 @@ test "ai computeBoundedSeparation matches an O(n^2) brute-force reference bit-fo
 
     const context = buildAiSeparationContext(gathered, spatial_sys.view(), 1, null);
 
+    var capped: usize = 0;
     for (0..count) |i| {
         const ported = computeBoundedSeparation(&context, i);
         const reference = bruteForceSeparation(pos_x, pos_y, i);
@@ -2744,21 +2758,19 @@ test "ai computeBoundedSeparation matches an O(n^2) brute-force reference bit-fo
         try std.testing.expectEqual(reference.neighbor_count, ported.neighbor_count);
         try std.testing.expectEqual(reference.x, ported.x);
         try std.testing.expectEqual(reference.y, ported.y);
+        if (ported.neighbor_count == max_separation_neighbors) capped += 1;
     }
+    try std.testing.expect(capped > 0);
 }
 
-/// Cell-scan-ordered reference: unlike `bruteForceSeparation` above (a plain
-/// ascending-index scan), this independently reconstructs the cell_y-outer,
-/// cell_x-inner, ascending-stored-index-within-cell traversal spec from raw
-/// positions (no call into `spatial_index.zig`/`cellForPosition`), so it can
-/// validate cross-cell floating-point summation order rather than just a
-/// single populated cell where any loop nesting degenerates to the same
-/// ascending-index walk.
 // The index's default cell size, which `testSpatialIndex` builds at.
 const test_cell_size: f32 = (spatial_index.SpatialIndexConfig{}).cell_size;
 const test_separation_scan_radius: i32 = @intFromFloat(@ceil(separation_radius / test_cell_size));
 
-fn cellScanOrderedSeparation(pos_x: []const f32, pos_y: []const f32, index: usize) SeparationResult {
+// Reconstructs the index's order from raw positions: with one faction, one level, and one
+// chunk it is (cell_y, cell_x, index), and each in-box cell row is one run whose lanes count
+// every entry of the row, self included. `max_lane_terms` is the most terms one lane summed.
+fn cellScanOrderedSeparation(pos_x: []const f32, pos_y: []const f32, index: usize, max_lane_terms: *u8) SeparationResult {
     const cellOf = struct {
         fn compute(x: f32, y: f32) [2]i32 {
             return .{
@@ -2768,42 +2780,29 @@ fn cellScanOrderedSeparation(pos_x: []const f32, pos_y: []const f32, index: usiz
         }
     }.compute;
     const own_cell = cellOf(pos_x[index], pos_y[index]);
-    var result = SeparationResult{};
+    var lanes = LaneSeparation{};
     var cell_y = own_cell[1] - test_separation_scan_radius;
     while (cell_y <= own_cell[1] + test_separation_scan_radius) : (cell_y += 1) {
+        var rank: usize = 0;
         var cell_x = own_cell[0] - test_separation_scan_radius;
         while (cell_x <= own_cell[0] + test_separation_scan_radius) : (cell_x += 1) {
-            // A plain forward scan filtered to exactly this (cell_x, cell_y)
-            // already visits matching agents in ascending index order.
             for (0..pos_x.len) |j| {
-                if (j == index) continue;
                 const j_cell = cellOf(pos_x[j], pos_y[j]);
                 if (j_cell[0] != cell_x or j_cell[1] != cell_y) continue;
-                if (result.candidate_count >= max_separation_candidate_checks) return result;
-                result.candidate_count += 1;
-
-                const dx = pos_x[index] - pos_x[j];
-                const dy = pos_y[index] - pos_y[j];
-                const dist2 = dx * dx + dy * dy;
-                if (dist2 > 0.1 and dist2 < separation_radius * separation_radius) {
-                    const dir = math.normalizeOrZeroFinite(dx, dy, 0);
-                    result.x += dir.x;
-                    result.y += dir.y;
-                    result.neighbor_count += 1;
-                    if (result.neighbor_count >= max_separation_neighbors) return result;
-                }
+                const lane = rank % simd.lane_count;
+                rank += 1;
+                if (j == index) continue;
+                lanes.visit(pos_x, pos_y, index, j, lane);
             }
         }
     }
-    return result;
+    for (lanes.lane_terms) |terms| max_lane_terms.* = @max(max_lane_terms.*, terms);
+    return lanes.finish();
 }
 
-test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across multiple cells" {
-    // The brute-force test above proves parity only where it's vacuous for
-    // traversal order (one populated cell). This spreads agents across many
-    // cells so a silently flipped scan order (e.g. x-outer instead of
-    // y-outer) or a non-ascending within-cell walk would actually break
-    // bit-exact float-summation parity and fail this test.
+test "ai computeBoundedSeparation matches a cell-scan-ordered lane oracle across multiple cells" {
+    // Agents across many cells, so a flipped scan order, a within-cell walk out of index
+    // order, or a lane off its run position breaks bit-exact parity.
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
@@ -2832,8 +2831,8 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across mult
     const pos_x = gathered.items(.pos_x);
     const pos_y = gathered.items(.pos_y);
 
-    // Fail loud if the fixture regresses to a near-single-cell spread, which
-    // would silently make this test as weak as the one above.
+    // Fail loud if the fixture regresses to a near-single-cell spread, or leaves its one
+    // chunk.
     var min_cell_x: i32 = std.math.maxInt(i32);
     var max_cell_x: i32 = std.math.minInt(i32);
     var min_cell_y: i32 = std.math.maxInt(i32);
@@ -2848,23 +2847,81 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across mult
     }
     try std.testing.expect(max_cell_x - min_cell_x >= 3);
     try std.testing.expect(max_cell_y - min_cell_y >= 3);
+    try std.testing.expect(min_cell_x >= 0 and min_cell_y >= 0 and max_cell_x < spatial_sys.view().cells_per_chunk and max_cell_y < spatial_sys.view().cells_per_chunk);
 
     const context = buildAiSeparationContext(gathered, spatial_sys.view(), 1, null);
 
-    // Fail loud if no agent ever accumulates >= 2 neighbors: with fewer than
-    // two summed `dir` terms, float-summation order can't actually differ,
-    // making the bit-exact assertions below vacuous.
-    var max_neighbor_count: u8 = 0;
+    // Fail loud if no lane ever sums two terms: the lane order would be untested.
+    var max_lane_terms: u8 = 0;
     for (0..count) |i| {
         const ported = computeBoundedSeparation(&context, i);
-        const reference = cellScanOrderedSeparation(pos_x, pos_y, i);
+        const reference = cellScanOrderedSeparation(pos_x, pos_y, i, &max_lane_terms);
         try std.testing.expectEqual(reference.candidate_count, ported.candidate_count);
         try std.testing.expectEqual(reference.neighbor_count, ported.neighbor_count);
         try std.testing.expectEqual(reference.x, ported.x);
         try std.testing.expectEqual(reference.y, ported.y);
-        max_neighbor_count = @max(max_neighbor_count, reference.neighbor_count);
     }
-    try std.testing.expect(max_neighbor_count >= 2);
+    try std.testing.expect(max_lane_terms >= 2);
+}
+
+// An agent with cohere gain, of `faction`, at `(x, y)`.
+fn addCohereBody(data: *DataSystem, x: f32, y: f32, faction: Faction) !void {
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = x, .y = y }, .previous_position = .{ .x = x, .y = y }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(entity, .{ .active_behavior = .wander, .gain_cohere = 1.0 });
+    try data.setFaction(entity, faction);
+}
+
+test "cohere finds its ally past more hostiles than its check budget" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // The thinker in cell row 3, 65 hostiles in row 2 within reach and scanned first, and
+    // one ally in row 4.
+    try addCohereBody(&data, 100, 100, .player);
+    for (0..max_cohere_candidate_checks + 1) |hostile| try addCohereBody(&data, 60 + 1.2 * @as(f32, @floatFromInt(hostile)), 70, .hostile);
+    try addCohereBody(&data, 100, 150, .ally);
+
+    var spatial_sys = try testSpatialIndex(&data);
+    defer spatial_sys.deinit();
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    try ai_sys.gatherAiData(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, null, null, null, null, null, null, null);
+    const context = buildAiSeparationContext(ai_sys.rows.slice(), spatial_sys.view(), 1, null);
+    const cohere = computeCohereNeighbors(&context, 0);
+    try std.testing.expectEqual(@as(u32, 1), cohere.count);
+    try std.testing.expectEqual(@as(f32, 100), cohere.mean_x);
+    try std.testing.expectEqual(@as(f32, 150), cohere.mean_y);
+}
+
+test "cohere caps at its neighbor count, summing the first in scan order in lane partials" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // One cell: the thinker, then 14 allies.
+    try addCohereBody(&data, 16, 16, .player);
+    var prng = std.Random.DefaultPrng.init(0xc0e4_e12a);
+    const rand = prng.random();
+    for (0..14) |_| try addCohereBody(&data, 1 + rand.float(f32) * 30, 1 + rand.float(f32) * 30, .ally);
+
+    var spatial_sys = try testSpatialIndex(&data);
+    defer spatial_sys.deinit();
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    try ai_sys.gatherAiData(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, null, null, null, null, null, null, null);
+    const gathered = ai_sys.rows.slice();
+    const context = buildAiSeparationContext(gathered, spatial_sys.view(), 1, null);
+    const cohere = computeCohereNeighbors(&context, 0);
+    try std.testing.expectEqual(max_cohere_neighbors, cohere.count);
+
+    // The ally run, after self's player run, in index order: ally k at lane k mod 4.
+    var acc_x: [simd.lane_count]f32 = @splat(0);
+    var acc_y: [simd.lane_count]f32 = @splat(0);
+    for (0..max_cohere_neighbors) |ally| {
+        acc_x[ally % simd.lane_count] += gathered.items(.pos_x)[ally + 1];
+        acc_y[ally % simd.lane_count] += gathered.items(.pos_y)[ally + 1];
+    }
+    const inv = 1.0 / @as(f32, @floatFromInt(max_cohere_neighbors));
+    try std.testing.expectEqual(simd.sumLanesScalar(acc_x) * inv, cohere.mean_x);
+    try std.testing.expectEqual(simd.sumLanesScalar(acc_y) * inv, cohere.mean_y);
 }
 
 test "ai seek retargets toward fresh AiMemory last-known position when perception target is cold" {
@@ -2991,7 +3048,7 @@ test "ai seek keeps the default seek target when memory can't override it" {
     // Memory present but last_known_target invalid: override must not apply.
     // Same start position as `no_memory`; agents at exact-equal positions get
     // zero separation contribution (the `dist2 > 0.1` near-zero guard in
-    // `separationNeighborVisit`), so this stays a pure seek-direction check.
+    // `SeparationAccumulator.visitLanes`), so this stays a pure seek-direction check.
     const invalid_target = try data.createEntity();
     try data.setMovementBody(invalid_target, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
     try data.setAiAgent(invalid_target, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 });

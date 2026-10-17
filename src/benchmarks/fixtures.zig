@@ -14,6 +14,7 @@ const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const CollisionResponseMobility = @import("../game/data_system.zig").CollisionResponseMobility;
@@ -102,6 +103,19 @@ pub fn buildBandedWorld(allocator: std.mem.Allocator, io: std.Io, side: u16, lev
     world.adoptTilesetMeta(meta);
     meta_owned = false;
     return world;
+}
+
+/// The index grid of a default-chunk world covering `[0, width) x [0, height)` on `levels`
+/// levels, for a bench with no `WorldSystem`.
+pub fn indexGeometryCovering(width: f32, height: f32, levels: usize) IndexGeometry {
+    const chunk_world = world_tileset_meta.required_tile_size * @as(f32, @floatFromInt(default_chunk_size_tiles));
+    return .{
+        .tile_size = world_tileset_meta.required_tile_size,
+        .chunk_size_tiles = default_chunk_size_tiles,
+        .chunks_x = @max(1, @as(u32, @intFromFloat(@ceil(width / chunk_world)))),
+        .chunks_y = @max(1, @as(u32, @intFromFloat(@ceil(height / chunk_world)))),
+        .level_count = levels,
+    };
 }
 
 /// The cells a `flood4` reached, and whether it stopped at a cell its context stops on.

@@ -2,33 +2,12 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Scoped simulation-processing throughput:
-//! it runs the real per-step processing stages — AI cognition, collision, movement,
-//! and chunk maintenance — but gated by the scope system, so the measured cost
-//! reflects the ACTIVE work, not the full entity count.
-//!
-//! The fixture spreads N entities across the chunk grid and assigns each its
-//! simulation-LOD tier via the cube `lodDistance` (`tierForChunkDistance`). The x/y
-//! spread stays inside the cognition halo, so the bands here come from the per-level
-//! depth penalty (`level = index % 5`): levels 0-1 cognition, 2 locomotion, 3
-//! kinematic, 4 dormant. So this measures a realistic MIXED-TIER population, not
-//! all-cognition:
-//!   - movement integrates the full contiguous range every step; dormant rows
-//!     carry zero velocity and integrate as no-ops (no tier gather).
-//!   - collision runs on locomotion+cognition (drops dormant+kinematic).
-//!   - AI thinks on the stagger-filtered cognition subset; the spatial index is
-//!     built from the unstaggered halo.
-//!   - chunk maintenance (deriveChunks) runs as its own pass over the settled
-//!     positions, recomputing every body's chunk before tier policy reads it.
-//!
-//! `output_count` reports how many entities actually ran cognition this step, so the
-//! gap between that and N is the scope reduction. Note the timed window covers the
-//! whole scoped step (AI + collision + movement + chunk derive + gathers + tier
-//! policy), so it is
-//! not directly comparable to the AI-only `ai` group. The shared spatial index build
-//! also runs every step here (AI separation queries it) but its own
-//! wall-clock cost is excluded from this reported window, same as the `ai` group —
-//! it has its own dedicated `spatial_index` bench group.
+//! `scope`: the scoped step (AI cognition, collision, movement, chunk derive, gathers, and
+//! tier policy) over N entities whose levels (`index % 5`) give a mixed-tier population:
+//! cognition, locomotion, kinematic, and dormant. The index build runs every step but is
+//! excluded from the window (its own group times it). `output_count` is the rows that ran
+//! cognition. Pass shape: time linear in the active (cognition + locomotion) rows, never
+//! in N; asserts check fewer than N rows ran cognition.
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -42,6 +21,7 @@ const movement = @import("../game/systems/movement.zig");
 const MovementSystem = @import("../game/systems/movement.zig").MovementSystem;
 const AiSystem = @import("../game/systems/ai.zig").AiSystem;
 const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
+const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
 const IndexPopulation = @import("../game/systems/spatial_index.zig").IndexPopulation;
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
@@ -70,6 +50,8 @@ const chunk_size_tiles: u16 = 8;
 const grid_chunks: u16 = 16;
 const grid_tiles: u16 = grid_chunks * chunk_size_tiles;
 const chunk_px: f32 = tile_size * @as(f32, @floatFromInt(chunk_size_tiles));
+// The grid's five populated levels (`level = index % 5`).
+const index_geometry = IndexGeometry{ .tile_size = tile_size, .chunk_size_tiles = chunk_size_tiles, .chunks_x = grid_chunks, .chunks_y = grid_chunks, .level_count = 5 };
 
 // Camera-visible chunk window: left two x-chunks, full height. The LOD bands fan
 // out from here, so over the 16 x-chunks the population lands roughly: cognition
@@ -226,19 +208,15 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const result = try runOnce(&ctx, io, if (threads) |*thread_system| thread_system else null);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        // The spatial-index build is excluded from this group's reported
-        // timing, same as the `ai` bench group: it has its own dedicated
-        // `spatial_index` bench group, so this stays comparable to the
-        // "AI + collision + movement + gathers + tier policy" baseline
-        // instead of conflating it with a new build cost.
+        // The index build is excluded from the window.
         const net_ns = if (elapsed_ns > result.excluded_ns) elapsed_ns - result.excluded_ns else 0;
         accumulator.record(net_ns, result.batch);
         active_cognition = result.active_cognition;
     }
 
     var stats = accumulator.finish();
-    // output_count = entities that actually ran cognition this step; the gap to
-    // item_count is the scope reduction.
+    // The mixed-tier fixture keeps some rows out of cognition.
+    std.debug.assert(active_cognition < item_count);
     stats.output_count = active_cognition;
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(move.adaptive_tuner.report(), settled_before_measurement);
@@ -258,7 +236,7 @@ fn allTunersSettled(ai: *const AiSystem, collision: *const CollisionSystem, move
         collision.broadphase_tuner.isSettled() and collision.narrowphase_tuner.isSettled() and
         scope.chunk_derive_tuner.isSettled() and scope.collision_gather_tuner.isSettled() and
         scope.ai_gather_tuner.isSettled() and scope.tier_policy_tuner.isSettled() and
-        spatial_index.bucket_tuner.isSettled() and spatial_index.sort_tuner.isSettled();
+        spatial_index.bucket_tuner.isSettled() and spatial_index.sort_tuner.isSettled() and spatial_index.link_tuner.isSettled();
 }
 
 const RunContext = struct {
@@ -316,9 +294,9 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
     const spatial_start_ns = suite.nowNs(io);
     const halo_population = IndexPopulation{ .entities = ai_slice.entities, .rows = ai_halo_indices };
     const spatial_stats = if (thread_system) |ts|
-        try ctx.spatial_index.build(&fixture.data, halo_population, ts, .{})
+        try ctx.spatial_index.build(&fixture.data, halo_population, index_geometry, ts, .{})
     else
-        try ctx.spatial_index.buildSerial(&fixture.data, halo_population, .{});
+        try ctx.spatial_index.buildSerial(&fixture.data, halo_population, index_geometry, .{});
     _ = spatial_stats;
     const spatial_end_ns = suite.nowNs(io);
     const excluded_ns = suite.elapsedNs(spatial_start_ns, spatial_end_ns);

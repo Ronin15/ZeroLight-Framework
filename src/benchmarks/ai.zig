@@ -2,6 +2,11 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! `ai`: the per-step AI decision (separation, cohere, arbitration, intents) over a
+//! fixed-density grid, with the shared index built untimed. Pass shape: time linear in
+//! agents; separation checks per agent at most `max_separation_candidate_checks`; the tuned
+//! case within spread of the best control. Asserts check the check bound.
+
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
@@ -12,6 +17,8 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const AiStats = @import("../game/systems/ai.zig").AiStats;
 const AiSystem = @import("../game/systems/ai.zig").AiSystem;
 const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
+const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
+const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
@@ -22,15 +29,14 @@ const suite = @import("suite.zig");
 const delta_seconds: f32 = 1.0 / 60.0;
 const intent_seed: u64 = 0x0a17_b0a7;
 
-// Fixed 5-slot archetype cycle (one slot per `AiBehavior`), so the
-// arbitration selection histogram exercises every bucket instead of
-// collapsing to a wander/pursue split. Mirrors `game_demo_state.zig`'s
-// `demoArchetypeForIndex` at bench scale, but sets hot perception columns
-// directly (no `PerceptionSystem`/`AffectSystem` run) the same way
-// `affect.zig`'s bench sets `AiPerception` hot fields straight into the
-// fixture -- this bench isolates arbitration + intent-emission cost, not the
-// upstream cognition stages.
+// One archetype per `AiBehavior`, so every selection bucket runs; perception columns are set
+// directly, so the bench times decision and intents, not the upstream cognition stages.
 const behavior_archetype_cycle_len: usize = 5;
+
+// The fixture's body grid: columns per row and the world-unit pitch.
+const grid_columns: usize = 128;
+const grid_pitch_x: f32 = 11.0;
+const grid_pitch_y: f32 = 9.0;
 
 pub const group = suite.BenchmarkGroup{
     .name = "ai",
@@ -79,8 +85,8 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     for (0..count) |index| {
         const entity = try data.createEntity();
         const position = math.Vec2{
-            .x = @as(f32, @floatFromInt(index % 128)) * 11.0,
-            .y = @as(f32, @floatFromInt(index / 128)) * 9.0,
+            .x = @as(f32, @floatFromInt(index % grid_columns)) * grid_pitch_x,
+            .y = @as(f32, @floatFromInt(index / grid_columns)) * grid_pitch_y,
         };
         try data.setMovementBody(entity, .{
             .position = position,
@@ -132,6 +138,12 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     return .{ .data = data, .frame = frame, .focus_entity = focus_entity, .markers = markers };
 }
 
+// The grid covering the fixture's `count` bodies, laid out `grid_columns` per row.
+fn fixtureIndexGeometry(count: usize) IndexGeometry {
+    const rows = (count + grid_columns - 1) / grid_columns;
+    return fixtures.indexGeometryCovering(@as(f32, @floatFromInt(grid_columns)) * grid_pitch_x, @as(f32, @floatFromInt(rows)) * grid_pitch_y, 1);
+}
+
 fn behaviorHistogram(behaviors: []const AiBehavior) suite.AiBehaviorHistogramSummary {
     var histogram = suite.AiBehaviorHistogramSummary{};
     for (behaviors) |behavior| {
@@ -161,18 +173,10 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
-    // This bench never runs movement, so the fixture's positions never change
-    // across iterations. Build the shared spatial index once, outside every
-    // timed/warmup/settle call, so the group's timed window measures only
-    // `system.update`/`updateSerial` (query + intent emission), not the index
-    // build — that cost has its own dedicated `spatial_index` bench group.
-    // Built with a worker, so queries run on the banded directory production builds.
+    // Positions never change, so the index is built once, untimed (its own group times it).
     var spatial_sys = SpatialIndexSystem.init(allocator);
     defer spatial_sys.deinit();
-    var index_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 1 });
-    defer index_threads.deinit();
-    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, &index_threads, .{});
-    std.debug.assert(spatial_sys.directory.splitter_count != 0);
+    _ = try spatial_sys.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, fixtureIndexGeometry(item_count), .{});
     const spatial_view = spatial_sys.view();
 
     for (0..options.warmup_iterations) |_| {
@@ -198,6 +202,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     }
 
     var stats = accumulator.finish();
+    std.debug.assert(last_ai_stats.separation_candidate_checks <= last_ai_stats.entity_count * max_separation_candidate_checks);
     stats.candidate_pairs = last_ai_stats.separation_candidate_checks;
     stats.output_count = last_ai_stats.intent_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(last_ai_stats.intent_batch);

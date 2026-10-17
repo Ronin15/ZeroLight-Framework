@@ -279,6 +279,13 @@ pub const RenderEntityComponentIndices = struct {
     facing: ?usize = null,
 };
 
+/// A movement body's row, world level, and faction resolved in one entity-slot lookup.
+pub const BodyLevelFaction = struct {
+    movement_body: usize,
+    level: ?u16 = null,
+    faction: ?Faction = null,
+};
+
 /// Primitive-visual and optional facing/asset indices for one movement-body row.
 /// Returned only when the entity carries a drawable primitive visual.
 pub const RenderCollectIndices = struct {

@@ -2,21 +2,9 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Backbone simulation system that determines which entities enter each
-//! fixed-step stage.
+//! Decides which entities enter each fixed-step stage.
 //!
-//! Per-step ownership split (chunk columns vs gathers):
-//!   - **Early gathers** (AI / collision dense-index lists) run at the **start**
-//!     of the step and read chunk columns left by the **prior** step's late
-//!     `deriveChunks`. That one-step lag for the cognition halo is intentional
-//!     (same contract as pathfinding's frame delay): this step's halo uses the
-//!     body's pre-move cell, not mid-step pose thrash.
-//!   - **`deriveChunks`** runs **late**, after movement integrate, collision
-//!     response, bounds/tile gate, and plane traversal have settled poses, so
-//!     tier_policy (same step) and next-step gathers see final world positions.
-//!     Movement/collision gate on tier only — no chunk filter.
-//!
-//! Stage participation rules:
+//! Stage participation:
 //!   movement   — tier.allowsMovement()  — no chunk filter
 //!   collision  — tier.allowsCollision() — no chunk filter
 //!   spatial index / perception candidates — cognition halo, no stagger
@@ -25,16 +13,12 @@
 //!                 (always_active entities bypass halo and stagger;
 //!                 `cognition_region == null` applies neither halo nor stagger)
 //!
-//! Each O(N)-per-step pass threads like the other processors. Every pass emits at
-//! most one record per input row, so each range writes into its own
-//! `[range.start, range.end)` window of one item-count-sized output buffer and
-//! stores its count in a cache-line-padded tally; the main thread then compacts the
-//! windows in range order (the gathers) or streams them into the frame's
-//! structural-command stream (the tier policy). No per-range buffers exist, so the
-//! population seam's `reserve` covers every partition the tuner can pick. Each pass
-//! owns an `AdaptiveWorkTuner` and exposes a `*Serial` variant for the serial
-//! bench/test path. Threaded and serial produce identical results (range-ordered
-//! compaction preserves scan order).
+//! The gathers run early and read the chunk columns the prior step's late `deriveChunks`
+//! wrote; `deriveChunks` runs after every position writer, so the same step's tier policy
+//! sees settled positions.
+//!
+//! Each pass threads: a range writes its window of one item-sized buffer and its padded
+//! tally, and the main thread compacts or streams the windows in range order.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -675,14 +659,9 @@ fn deriveChunkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     }
 }
 
-/// Vectorized tier-policy scan over a contiguous entity range: computes each
-/// entity's cube LOD distance and target tier four lanes at a time (chebyshev
-/// chunk distance floored by the per-level penalty, then the `tierForChunkDistance`
-/// band ladder via masked selects), then writes a set_simulation_tier command for
-/// every non-pinned entity whose current tier differs into `out` (at most one per
-/// scanned row, so `out.len >= end - start`) and returns the count. Shared by the
-/// serial core and the threaded job so both stay SIMD; the scalar tail mirrors the
-/// scalar `lodDistance`/`tierForChunkDistance` exactly.
+/// Writes a set_simulation_tier command into `out` for each non-pinned entity of
+/// `[start, end)` whose cube-LOD tier differs from its current one, in lanes with a scalar
+/// tail equal to `lodDistance`/`tierForChunkDistance`; returns the count.
 fn scanTierPolicy(
     scope: ConstScopeColumnsSlice,
     region: ActiveRegion,
@@ -1324,7 +1303,7 @@ test "scoped AI emits navigation intents only for in-halo, on-phase agents" {
     defer spatial_sys.deinit();
     const ai_slice = data.aiAgentSliceConst();
     const movement_slice = data.movementBodySliceConst();
-    _ = try spatial_sys.buildSerial(&data, .{ .entities = ai_slice.entities, .rows = pops.halo }, .{});
+    _ = try spatial_sys.buildSerial(&data, .{ .entities = ai_slice.entities, .rows = pops.halo }, @import("spatial_index_test_support.zig").test_index_geometry, .{});
 
     var ai_sys = ai.AiSystem.init(allocator);
     defer ai_sys.deinit();

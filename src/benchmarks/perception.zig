@@ -2,27 +2,17 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! AI perception substrate throughput bench: gather -> shared
-//! spatial-index neighbor query -> squared-form FOV filter -> bounded
-//! line-of-sight raycast -> transition emit, at the same population scale
-//! `ai.zig`/`spatial_index.zig` already use (`suite.eventScaleCounts`).
-//!
-//! Groups, each isolating one variable over the same population:
-//! - `perception`: `WorldSystem.initDemoFromMeta`'s ordinary sparse-tile
-//!   density (two deco props).
-//! - `perception-los-dense`: the identical population and per-pair
-//!   blocked-candidate pattern, plus `los_dense_extra_sparse_tiles` sparse
-//!   tiles far outside the populated region. They never coincide with a ray
-//!   cell, so `sensed_count`/`los_checks`/`los_blocked`/
-//!   `nearest_threat_found_count` match `perception` exactly and only
-//!   wall-clock differs: a per-cell LOS test that scales with sparse-tile
-//!   count shows here. `hasLineOfSight` reads `levelBlocksMovement` (chunk
-//!   bits, O(1)), so the two should match within run-to-run spread.
-//! - `perception-scattered-dense-index`: the identical population with
-//!   `perception_dense_index` assigned in a shuffled order
-//!   (`createDecorrelatedFixture`), so worker ranges write interleaved
-//!   (same-cache-line) `PerceptionStore` slots; `perception` keeps that index
-//!   near-monotonic in row order and would hide any such contention.
+//! Perception throughput: gather, shared index query, FOV filter, bounded LOS raycast, and
+//! transition emit, over one population per group.
+//! - `perception`: observer/hostile pairs on ordinary sparse-tile density. Pass shape: time
+//!   linear in observers.
+//! - `perception-los-dense`: the same pairs plus `los_dense_extra_sparse_tiles` sparse
+//!   tiles no ray crosses, so only a per-cell LOS cost that scales with tile count can move
+//!   it. Pass shape: within spread of `perception`; asserts check its sensed, LOS, and found
+//!   counts equal `perception`'s.
+//! - `perception-scattered-dense-index`: the same pairs with `perception_dense_index` in a
+//!   shuffled order, so worker ranges write interleaved `PerceptionStore` slots. Pass shape:
+//!   within spread of `perception`.
 //! - `perception-crowd`: separated clusters of one observer (default
 //!   `AiPerception`) and one hostile on its level ahead of it. Variant `allies`
 //!   puts the hostile at half the vision range and adds allies inside the range;
@@ -30,7 +20,8 @@
 //!   range and puts the same-level hostile farther out, past the stack. Pass shape:
 //!   every observer finds its hostile in both variants, nothing is sensed across
 //!   levels, and candidate checks per observer stay flat in allies and in levels.
-//!   Asserts check only the observer count.
+//!   Asserts check it per config: every observer finds a threat, exactly one candidate
+//!   per observer survives FOV, and checks stay within `crowd_max_checks_per_observer`.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -40,6 +31,7 @@ const Faction = @import("../game/data_system.zig").Faction;
 const AiPerception = @import("../game/data_system.zig").AiPerception;
 const SimulationEvents = @import("../game/simulation.zig").SimulationEvents;
 const spatial_index_mod = @import("../game/systems/spatial_index.zig");
+const IndexGeometry = spatial_index_mod.IndexGeometry;
 const SpatialIndexSystem = spatial_index_mod.SpatialIndexSystem;
 const SpatialIndexView = spatial_index_mod.SpatialIndexView;
 const perception_mod = @import("../game/systems/perception.zig");
@@ -111,57 +103,33 @@ const crowd_cluster_pitch: f32 = 384;
 // Allies fill a square of this half-extent around their observer, inside its range.
 const crowd_ally_half_extent: f32 = 84;
 const crowd_observer_velocity_x: f32 = 10;
+// Per-observer check bound, flat in allies and levels; the box meets only adjacent clusters
+// (asserted in `createCrowdFixture`).
+const crowd_max_checks_per_observer: usize = 9;
+// The `levels` variant's same-level hostile, as a fraction of the vision range ahead.
+const crowd_same_level_hostile_fraction: f32 = 0.75;
 
-// Grid spacing for observer/candidate pairs is tile-aligned (see
-// `createFixture`): each pair's candidate lands in its own distinct tile
-// cell, one column/row apart from its neighbors, so a per-pair blocking tile
-// (`blocked_pair_period` below) never collaterally blocks a neighboring
-// pair's candidate cell too -- world tiles are typically much larger than a
-// tight world-space grid step, so an unaligned spacing would let several
-// pairs share one cell and turn "block every 4th pair" into "block nearly
-// every pair in the shared cell's cluster".
+// Pairs are one tile apart, so a pair's blocking tile blocks no other pair's candidate.
 const pair_grid_columns: usize = 128;
 // Pairs sit on their row's center line, off the horizontal grid lines, so each
 // pair's LOS stays the single same-cell check (a ray along a grid line also
 // tests the row across it).
 const pair_row_center: f32 = 0.5;
-// Fraction of one tile the observer sits ahead of its own candidate (so
-// facing derived from its velocity points straight at it, well inside the
-// default 60-degree half-angle FOV) without leaving the candidate's tile
-// cell -- keeps the pair's own LOS geometry simple (single-sample raycast).
+// The observer sits this fraction of a tile ahead of its candidate, in the candidate's tile,
+// facing it.
 const observer_offset_tile_fraction: f32 = 0.3;
 const observer_facing_velocity_x: f32 = -10.0;
 
-// Deliberately short vision_range (2 tiles at the default spatial-index
-// cell_size 32, vs. `AiPerception`'s 240/7.5-tile default). This fixture
-// places one pair per tile cell -- much denser than a real scene -- so a
-// full-range scan window can fill `max_perception_candidates` (16) purely
-// from rows *above* an observer before `queryNeighbors`'s cell_y-then-cell_x
-// traversal ever reaches its own row (order is not nearest-first). A short
-// range keeps the scan window small enough that every observer's own row is
-// always reached, so `los_blocked` reflects real obstacle blocking, not
-// candidate-cap starvation. Verified stable (100% found with no obstacles)
-// from a single populated row through this bench's largest multi-row count.
+// Two tiles: short enough that the candidate cap never fills before an observer's own row
+// is scanned, so `los_blocked` counts real occlusion.
 const observer_vision_range: f32 = 64.0;
 
-// Every 4th pair's own candidate sits on a blocking tile, so a realistic
-// fraction of observers pay for a blocked nearest candidate before falling
-// through to a farther clear one (or finding none) -- exercising
-// `los_blocked` at both densities identically, the same way the module's own
-// "LOS gating skips a blocked nearer candidate" test does at unit scale.
+// Every 4th pair's candidate sits on a blocking tile.
 const blocked_pair_period: usize = 4;
 
-// Sparse tiles added far outside the populated grid, purely to inflate
-// `WorldSystem`'s total sparse tile count (see module doc). This is well
-// beyond this project's other benchmark fixtures' sparse-tile density
-// (`render_game_prep.zig` caps at 12_288 even at its largest population) --
-// deliberately so, since this fixture exists to stress exactly the scan cost
-// those fixtures never approach.
+// Sparse tiles far outside the populated grid, only to inflate the world's tile count.
 const los_dense_extra_sparse_tiles: usize = 20_000;
-// Reserved rows/columns comfortably clear of the largest populated grid this
-// bench ever builds (the `stress` profile's 50_000-item count needs at most
-// 196 pair rows at `pair_grid_columns` columns), so the extra bulk tiles
-// never coincide with a real agent's tile.
+// Rows clear of the largest populated grid, so the extra tiles meet no agent's tile.
 const los_dense_region_row_start: u16 = 210;
 const los_dense_region_width: u16 = 200;
 const world_tiles_side: u16 = 340;
@@ -196,11 +164,7 @@ fn addObserver(data: *DataSystem, pos_x: f32, pos_y: f32, velocity_x: f32, veloc
     return entity;
 }
 
-// `meta` is only needed to resolve tile ids and build the catalog/dense
-// ground layer; once `WorldSystem.initDemoFromMeta` returns, this bench never
-// calls anything that reads `WorldSystem.tilesetMeta()` back (no rendering),
-// so `meta` is freed at the end of this function -- same shape as
-// `nav_update.zig`'s `buildSharedFixture`.
+// `meta` resolves tile ids only; nothing reads it after the world is built.
 fn createFixture(allocator: std.mem.Allocator, io: std.Io, count: usize, extra_sparse_tiles: usize) !Fixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
@@ -240,22 +204,11 @@ fn createFixture(allocator: std.mem.Allocator, io: std.Io, count: usize, extra_s
     return .{ .data = data, .world = world };
 }
 
-// Preferred stride for `createDecorrelatedFixture`'s observer-creation-order
-// shuffle. Prime, odd, and not a multiple of 5, so it stays coprime with
-// every pair count this bench's default `eventScaleCounts` tiers produce
-// (each is `2^a * 5^b`). `shuffleStrideFor` below falls back to searching
-// upward from this value for a pair count supplied via `--items`, so the
-// shuffle stays a bijection (visits every observer exactly once) regardless
-// of item count.
+// The observer shuffle's preferred stride.
 const dense_index_shuffle_stride: usize = 97;
 
-// Smallest stride >= `dense_index_shuffle_stride` that is coprime with
-// `pair_count`, so `(step * stride) % pair_count` is a bijection over
-// `0..pair_count` for any positive `pair_count` (not just ones coprime with
-// the preferred stride). Search is bounded: `pair_count` consecutive integers
-// always contain one coprime with `pair_count` (residue 1 alone guarantees
-// this), so the loop below always terminates within `pair_count` steps. Runs
-// once at fixture-build time, not on a measured path.
+// The smallest stride at or past the preferred one coprime with `pair_count`, so
+// `(step * stride) % pair_count` visits every observer once.
 fn shuffleStrideFor(pair_count: usize) usize {
     if (pair_count <= 1) return 1;
     var stride = dense_index_shuffle_stride;
@@ -263,22 +216,8 @@ fn shuffleStrideFor(pair_count: usize) usize {
     return stride;
 }
 
-// Same population, geometry, and blocked-tile pattern as `createFixture`
-// (isolating one variable, same as `perception-los-dense`'s own module-doc
-// convention), but built in two phases so `perception_dense_index` (the
-// `PerceptionStore` row an observer lands in, assigned in `setAiPerception`
-// call order -- see `data_system/system.zig`'s `setAiPerception`) is
-// decorrelated from the gather row order `i` (which follows entity/pair
-// creation order -- see `gatherPerceptionData`'s doc comment). Phase 1
-// creates every pair exactly as `createFixture` does but withholds
-// `setAiPerception`; phase 2 calls it for every observer in a fixed
-// reversible permutation (`(step * shuffleStrideFor(pair_count)) %
-// pair_count`) instead of creation order. This lets two entities whose gather
-// rows fall in *different* worker ranges land in numerically close (same-cache-line)
-// `perception_dense_index` slots, so `computeOneAgent`'s unconditional
-// scatter into `job.perception_slice` (see that function) can be compared
-// threaded-vs-serial against `createFixture`'s today-correlated order. See
-// this module's doc comment for the measured result.
+// `createFixture`'s pairs with `setAiPerception` called in a shuffled observer order, so
+// `perception_dense_index` is decorrelated from the gather row order.
 fn createDecorrelatedFixture(allocator: std.mem.Allocator, io: std.Io, count: usize) !Fixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
@@ -306,8 +245,7 @@ fn createDecorrelatedFixture(allocator: std.mem.Allocator, io: std.Io, count: us
         const gx = @as(f32, @floatFromInt(pair_index % pair_grid_columns)) * tile_size;
         const gy = (@as(f32, @floatFromInt(pair_index / pair_grid_columns)) + pair_row_center) * tile_size;
         _ = try addAgent(&data, gx, gy, 0, 0, .hostile);
-        // Same shape as `addObserver` but withholds `setAiPerception` until
-        // phase 2's shuffled pass below.
+        // `setAiPerception` waits for the shuffled pass.
         const observer = try addAgent(&data, gx + observer_offset_x, gy, observer_facing_velocity_x, 0, .player);
         observers.appendAssumeCapacity(observer);
 
@@ -331,7 +269,27 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 }
 
 pub fn runLosDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseImpl(allocator, io, options, case, item_count, buildLosDenseFixture);
+    const stats = try runCaseImpl(allocator, io, options, case, item_count, buildLosDenseFixture);
+    if (stats.status == .skipped) return stats;
+    // The extra tiles change no count.
+    const plain = try untimedCounts(allocator, io, item_count);
+    std.debug.assert(stats.sample_count == plain.sensed_count and stats.candidate_pairs == plain.los_checks);
+    std.debug.assert(stats.deferred_count == plain.los_blocked and stats.output_count == plain.nearest_threat_found_count);
+    return stats;
+}
+
+// One untimed serial step over the default fixture.
+fn untimedCounts(allocator: std.mem.Allocator, io: std.Io, item_count: usize) !PerceptionStats {
+    var fixture = try buildDefaultFixture(allocator, io, item_count);
+    defer fixture.deinit();
+    var system = PerceptionSystem.init(allocator);
+    defer system.deinit();
+    var events = SimulationEvents.init(allocator);
+    defer events.deinit();
+    var spatial_sys = SpatialIndexSystem.init(allocator);
+    defer spatial_sys.deinit();
+    _ = try spatial_sys.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&fixture.world), .{});
+    return runOnce(&system, &fixture, spatial_sys.view(), &events, null, suite.serial_cases[0]);
 }
 
 pub fn runScatteredDenseIndexCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -375,17 +333,10 @@ fn runCaseImpl(
     var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
-    // Positions never change across iterations (this bench measures the
-    // steady-state gather/FOV/LOS cost, not movement), so the shared spatial
-    // index is built once, outside every timed/warmup/settle call -- mirrors
-    // `ai.zig`'s own bench, which times only `system.update`/`updateSerial`.
-    // Built with a worker, so queries run on the banded directory production builds.
+    // Positions never change, so the shared index is built once, untimed.
     var spatial_sys = SpatialIndexSystem.init(allocator);
     defer spatial_sys.deinit();
-    var index_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 1 });
-    defer index_threads.deinit();
-    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, &index_threads, .{});
-    std.debug.assert(spatial_sys.directory.splitter_count != 0);
+    _ = try spatial_sys.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&fixture.world), .{});
     const spatial_view = spatial_sys.view();
 
     for (0..options.warmup_iterations) |_| {
@@ -401,12 +352,7 @@ fn runCaseImpl(
     const settled_before_measurement = if (case.adaptive) system.compute_tuner.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
-    // Only the first measured call ever produces invalid->valid transitions
-    // (nothing moves between iterations after that, so later calls settle to
-    // zero perceived/lost -- see the module doc); `last_stats` is still the
-    // right per-iteration steady-state snapshot for `sensed_count`/
-    // `los_checks`/`los_blocked`/`nearest_threat_found_count`, which are
-    // recomputed identically every step regardless of transition state.
+    // Sensed, LOS, and found counts are the same every step; transitions occur once.
     var last_stats = PerceptionStats{};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
@@ -468,9 +414,17 @@ const CrowdFixture = struct {
 fn createCrowdFixture(allocator: std.mem.Allocator, io: std.Io, variant: CrowdVariant, axis: u32) !CrowdFixture {
     const vision_range = (AiPerception{}).vision_range;
     const side_px = @as(f32, @floatFromInt(crowd_grid_side)) * crowd_cluster_pitch;
-    // Every member sits inside its observer's range, and every other cluster's past it.
-    const member_reach = @max(crowd_ally_half_extent * std.math.sqrt2, vision_range * 0.5);
-    std.debug.assert(member_reach < vision_range and crowd_cluster_pitch - member_reach > vision_range);
+    // Every member sits inside its observer's range. Another cluster's allies sit past it;
+    // its hostiles sit ahead of their own observer, so one in range lies behind this one,
+    // outside its cone.
+    const hostile_reach = vision_range * crowd_same_level_hostile_fraction;
+    std.debug.assert(@max(crowd_ally_half_extent * std.math.sqrt2, hostile_reach) < vision_range);
+    std.debug.assert(crowd_cluster_pitch - crowd_ally_half_extent > vision_range and hostile_reach < crowd_cluster_pitch);
+    // The query box, the vision range rounded up to whole cells plus the observer's own
+    // cell on each axis, misses every cluster past the adjacent ones.
+    const cell_size = (spatial_index_mod.SpatialIndexConfig{}).cell_size;
+    const box_reach = (@ceil(vision_range / cell_size) + 1) * cell_size;
+    std.debug.assert(2 * crowd_cluster_pitch - hostile_reach > box_reach);
     const levels: u16 = switch (variant) {
         .allies => 1,
         .levels => @intCast(axis),
@@ -493,7 +447,7 @@ fn createCrowdFixture(allocator: std.mem.Allocator, io: std.Io, variant: CrowdVa
         try data.setAiPerception(observer, .{});
         const hostile_x = center_x + vision_range * 0.5;
         // Past the stacked hostiles, still inside the range.
-        const same_level_hostile_x = center_x + vision_range * 0.75;
+        const same_level_hostile_x = center_x + vision_range * crowd_same_level_hostile_fraction;
         switch (variant) {
             .allies => {
                 _ = try addAgent(&data, hostile_x, center_y, 0, 0, .hostile);
@@ -538,13 +492,9 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     defer if (threads) |*thread_system| thread_system.deinit();
 
     // Positions never change, so the shared index is built once, untimed.
-    // Built with a worker, so queries run on the banded directory production builds.
     var spatial_sys = SpatialIndexSystem.init(allocator);
     defer spatial_sys.deinit();
-    var index_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 1 });
-    defer index_threads.deinit();
-    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, &index_threads, .{});
-    std.debug.assert(spatial_sys.directory.splitter_count != 0);
+    _ = try spatial_sys.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&fixture.world), .{});
     const spatial_view = spatial_sys.view();
     const thread_ptr = if (threads) |*thread_system| thread_system else null;
 
@@ -569,6 +519,9 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.batch);
     }
     std.debug.assert(last_stats.observer_count == crowd_observers);
+    std.debug.assert(last_stats.nearest_threat_found_count == crowd_observers);
+    std.debug.assert(last_stats.sensed_count == crowd_observers);
+    std.debug.assert(last_stats.candidate_checks <= crowd_observers * crowd_max_checks_per_observer);
 
     var stats = accumulator.finish();
     stats.items_per_second = suite.itemsPerSecond(last_stats.observer_count, stats.mean_ns);

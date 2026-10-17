@@ -89,6 +89,7 @@ const SimulationScope = @import("simulation_scope.zig").SimulationScope;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const cognition_halo_chunks = @import("simulation_scope.zig").cognition_halo_chunks;
 const SimulationScopeSystem = @import("systems/simulation_scope.zig").SimulationScopeSystem;
+const IndexGeometry = @import("systems/spatial_index.zig").IndexGeometry;
 const SpatialIndexStats = @import("systems/spatial_index.zig").SpatialIndexStats;
 const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSystem;
 const CellCoord = @import("world/system.zig").CellCoord;
@@ -203,7 +204,12 @@ fn stageContract(stage: StageId) StageContract {
         // transition events. Reads world_tiles for line-of-sight /
         // occlusion against the dig-authored floor state from dig_world_edit.
         // Reads `stimuli` authored at dig_world_edit (live bus + hearing scratch).
-        .perception_update => .{ .reads = resources(&.{ .ai_cognition_indices, .spatial_index, .world_tiles, .stimuli }), .writes = resources(&.{ .perception_sensed, .perception_events }) },
+        // Carries the previous step's positions and levels the observer rows gather.
+        .perception_update => .{
+            .reads = resources(&.{ .ai_cognition_indices, .spatial_index, .world_tiles, .stimuli }),
+            .writes = resources(&.{ .perception_sensed, .perception_events }),
+            .carried = resources(&.{ .movement_positions, .world_level }),
+        },
         // Refreshes from this step's perception transition events,
         // reading the acquired target's last-seen position from perception_sensed.
         .ai_memory_update => .{ .reads = resources(&.{ .ai_cognition_indices, .perception_events, .perception_sensed }), .writes = resources(&.{.ai_memory}) },
@@ -218,7 +224,7 @@ fn stageContract(stage: StageId) StageContract {
         .ai_decide => .{
             .reads = resources(&.{ .ai_cognition_indices, .spatial_index, .perception_sensed, .ai_memory, .affect_drives }),
             .writes = resources(&.{ .navigation_intents, .ai_behavior }),
-            .carried = resources(&.{.interest_markers}),
+            .carried = resources(&.{ .interest_markers, .movement_positions, .world_level }),
         },
         // One projection per distinct blocked goal of this step's intents, before every
         // reader of a live goal.
@@ -279,16 +285,9 @@ fn stageDerivations(stage: StageId) []const Derivation {
     };
 }
 
-/// The pipeline's concrete fixed-step stage order. Reads-before-writes ordering
-/// and derived-resource freshness (see `stageDerivations`) are enforced at
-/// comptime below; ordering the contract cannot see (e.g. two stages that share
-/// no `PipelineResource`) is proven by causal-effect tests further down in this
-/// file, the same technique the other stage-order tests use.
-///
-/// Tile gate runs AFTER collision response so a contact correction that pushes a
-/// body into solid underground dirt is re-gated before plane_traversal and
-/// chunk_derive observe the pose. Dig still runs first so this step's carves are
-/// walkable for movement + gate. Bounds clamp shares the gate stage.
+/// The fixed-step stage order, comptime-enforced against the contracts; ordering the
+/// contracts cannot see is proven by causal-effect tests. Tile gate runs after collision
+/// response, so a pushed body is re-gated.
 const stage_order = [_]StageId{
     .dig_world_edit,
     .scope_advance_and_ai_gather,
@@ -414,16 +413,10 @@ pub const SimulationPipelineConfig = struct {
     /// When set, the one-time static nav build fans mask/abstract work across levels.
     nav_build_thread_system: ?*ThreadSystem = null,
     dig: DigConfig = .{},
-    /// The caller's part of the per-step `.structural_commit` event share, in events:
-    /// size it with `structuralEventHeadroom(creates, destroys + component sets)` from
-    /// the caller's own fixed per-step producer budgets (a create costs up to
-    /// `max_structural_events_per_create`; tier changes cost none). Covers only
-    /// commands the caller queues: the pipeline adds its own `action_react`
-    /// destructible share (`pipeline_structural_event_share`) on top. The total is
-    /// enforced on its own at the commit (`structuralCommitBudget`), never borrowed
-    /// from other producers, and sizes the structural-command stream beyond one tier
-    /// command per body (`structuralCommandHeadroom`) and its range count beyond the
-    /// pipeline's own ranges, one range per event.
+    /// The caller's part of the per-step `.structural_commit` event share, in events, sized
+    /// with `structuralEventHeadroom(creates, destroys + component sets)` from the caller's
+    /// fixed per-step budgets; the pipeline adds its own share on top. It also sizes the
+    /// structural-command stream and its ranges past the pipeline's own.
     structural_headroom: usize = 0,
     stimuli: StimulusConfig = .{},
 };
@@ -543,7 +536,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.scope_stagger_skips, metric(scope_stats.stagger_skips));
         perf.recordMetric(.scope_chunk_filtered_entities, metric(scope_stats.chunk_filtered_entities));
 
-        perf.recordBatch(.spatial_index_build, spatial_index_stats.bucket_batch);
+        // The sort is the build's cost driver; the bucket and link stages stay bench-only.
         perf.recordBatch(.spatial_index_build, spatial_index_stats.sort_batch);
 
         perf.recordMetric(.perception_observers, metric(perception_stats.observer_count));
@@ -929,14 +922,10 @@ pub const SimulationPipeline = struct {
         };
     }
 
-    /// Population growth seam. Main thread, `merge_outputs`, right after
-    /// the structural commit and before the post-commit reactions. O(1) fast path; on
-    /// growth, re-reserves every population-sized pipeline capacity, the frame streams
-    /// and event bound, and the pathfinding elastic pools. The only population growth
-    /// point: the fixed-step stages stay allocation-free between seams. Grow-only; the
-    /// trigger and the grown sizes are pure functions of committed row counts, so
-    /// capacity never changes behavior. After an error the tracked values are restored
-    /// and the next seam retries (every reserve is idempotent).
+    /// Population growth seam, on main after the structural commit: O(1) unless the
+    /// population grew, then re-reserves every population-sized capacity. The only growth
+    /// point; grow-only, sized from committed row counts, so capacity never changes
+    /// behavior. After an error the tracked values are restored and the next seam retries.
     pub fn syncPopulationCapacity(
         self: *SimulationPipeline,
         frame: *SimulationFrame,
@@ -1363,7 +1352,7 @@ pub const SimulationPipeline = struct {
     }
 
     /// Shared neighbor index: built once from the unstaggered halo, at the
-    /// previous positions perception and AI read.
+    /// previous positions perception and AI read, over the world's chunk grid.
     fn stageSpatialIndexBuild(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         const data = context.data;
@@ -1371,6 +1360,7 @@ pub const SimulationPipeline = struct {
         step.spatial_index = try self.spatial_index.build(
             data,
             .{ .entities = data.aiAgentSliceConst().entities, .rows = step.ai_halo_indices },
+            IndexGeometry.ofWorld(context.world),
             context.thread_system,
             .{},
         );
@@ -1666,6 +1656,11 @@ test "stage contracts split event families and carry out-of-graph inputs" {
     try std.testing.expect(decide.writes.contains(.ai_behavior));
     try std.testing.expect(decide.writes.contains(.navigation_intents));
     try std.testing.expect(decide.carried.contains(.interest_markers));
+    try std.testing.expect(decide.carried.contains(.movement_positions));
+    try std.testing.expect(decide.carried.contains(.world_level));
+    const perception = stageContract(.perception_update);
+    try std.testing.expect(perception.carried.contains(.movement_positions));
+    try std.testing.expect(perception.carried.contains(.world_level));
 
     const react = stageContract(.action_react);
     try std.testing.expect(react.carried.contains(.action_intents));
@@ -5017,17 +5012,10 @@ const GrowthScenarioResult = struct {
     world_tile_changed: usize = 0,
 };
 
-/// Builds a minimal 3-level world at population 4, grows it to 37 rows through
-/// structural creates and the population seam, runs one stationary step, then one
-/// step where all 24 NPCs fall through dug holes. The 3 initial NPCs and the first 2
-/// created ones carry `AiPerception` + `AiAffect`, so the perception and affect
-/// stages run (and their derived event shares grow at the seam) on every step. `max_worker_threads > 0` pins a
-/// multi-range partition (2 workers, 16-item ranges; 32-item ranges when `retune` is
-/// set). With `prove_zero_alloc`, the first step counts allocations per owner (none,
-/// serial or multi-worker: the seam reserved every partition) and the falling step
-/// runs with every allocator, the world's included, failing. A non-null `retune`
-/// re-pins that partition after the first step and runs one more stationary step
-/// under the failing allocators: a partition change never allocates in-stage.
+/// A 3-level world grown from 4 to 37 rows through the population seam, one stationary
+/// step, then one where 24 NPCs fall through dug holes; perception and affect run every
+/// step. `max_worker_threads > 0` pins a multi-range partition; `prove_zero_alloc` runs the
+/// steps with failing allocators; a non-null `retune` re-pins the partition mid-run.
 fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool, retune: ?AdaptiveWorkProfile) !GrowthScenarioResult {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
@@ -5394,6 +5382,10 @@ test "production steps on workers record nothing into the thread system's shared
         try data.setCollisionBounds(agent, npc.collision_bounds.?);
         try data.setCollisionResponse(agent, npc.collision_response.?);
     }
+    // One agent per index cell past the crowd, so the index's link stage spans ranges too.
+    const spread_count: usize = 32;
+    for (0..spread_count) |index| _ = try addShareTestAgent(&data, 400 + @as(f32, @floatFromInt(index)) * 40, .player, false);
+    const body_count = agent_count + spread_count;
     try markAllAlwaysActive(&data);
 
     var world = try shareTestWorld();
@@ -5404,13 +5396,13 @@ test "production steps on workers record nothing into the thread system's shared
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{
-        .contact_capacity = agent_count * 8,
+        .contact_capacity = body_count * 8,
         .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
     });
     defer pipeline.deinit();
-    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, agent_count, agent_count * 8, 4, 4);
-    try frame.reservePathRequests(1, agent_count);
-    try pipeline.reserve(&frame, agent_count);
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, body_count, body_count * 8, 4, 4);
+    try frame.reservePathRequests(1, body_count);
+    try pipeline.reserve(&frame, body_count);
 
     const context: SimulationPipelineUpdateContext = .{
         .data = &data,
@@ -5434,6 +5426,7 @@ test "production steps on workers record nothing into the thread system's shared
     const stage_batches = [_]BatchStats{
         stats.spatial_index.bucket_batch,
         stats.spatial_index.sort_batch,
+        stats.spatial_index.link_batch,
         stats.perception.batch,
         stats.ai_memory.batch,
         stats.affect.batch,
