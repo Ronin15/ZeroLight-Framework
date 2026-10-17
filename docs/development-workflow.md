@@ -347,9 +347,8 @@ build reconfigures on every invocation. No suppressions ship
 (`.claude/rules/threading.md`).
 
 The full suite takes about 3 minutes under TSan (x86_64 Linux, Debug), and
-the option is not part of `verify`. A landing that touches threaded code runs
-the `thread_system` tests under TSan; the full suite runs under TSan at a
-slice's or branch's final commit.
+the option is not part of `verify`. When it runs:
+`.claude/rules/build-validation.md`.
 
 ## Profiling
 
