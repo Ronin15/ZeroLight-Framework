@@ -60,6 +60,8 @@ orchestrates, verifies every agent claim against live code, and reports.
   not fixed in its landing becomes a checklist item in the owning slice
   with its `file:line` and failure scenario, never only a memory note.
 - `zig-debug-specialist` for failures.
+- `docs-specialist` (Sonnet, owner's choice) writes a slice's docs commit
+  and routes findings into roadmap slices; it edits docs only.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
 - Terse reports and docs, never by dropping findings. Make engineering calls
@@ -77,8 +79,9 @@ orchestrates, verifies every agent claim against live code, and reports.
   per-finding commits, worktrees, or merge commits. Never commit known-broken
   or unfinished code; the owner pushes.
 - Docs wait until a slice's programming is done: each landing's doc changes
-  are notes in its commit message, and the slice's docs commit writes them
-  once from the code as landed (checklist check-offs, durable docs, tables).
+  are notes in its commit message, and the slice's docs commit
+  (`docs-specialist`) writes them once from the code as landed (checklist
+  check-offs, durable docs, tables).
 
 ## Commands
 
