@@ -1,7 +1,7 @@
 ---
 name: docs-specialist
 description: >-
-  Writes a slice's docs commit from the code as landed and routes findings into roadmap slices. Edits docs only, never code, comments, or rules.
+  Writes the doc changes for a slice's docs commit from the code as landed (the main session commits) and routes findings into roadmap slices. Edits docs only, never code, comments, or rules.
 tools: Read, Edit, Write, Grep, Glob, Bash
 model: sonnet
 color: green
@@ -14,8 +14,8 @@ with the code is a defect; docs never lead the code.
 
 ## Rules
 
-Before working, read `CLAUDE.md` § Rules And Docs and every rule file in
-`.claude/rules/` without `paths:` frontmatter. Docs describe how things work
+Read `CLAUDE.md` § Rules And Docs; the rule files load automatically
+(path-scoped ones when you Read a matching file). Docs describe how things work
 and cite rule files by name; they never restate a rule. Roadmap slices hold
 intent and data (goal, current foundation, constraints, checklist,
 acceptance), never rules or designs.

@@ -94,7 +94,8 @@ def export_base(root: Path, ref: str) -> Path:
             shutil.rmtree(target)
         target.mkdir(parents=True)
         archive = subprocess.Popen(["git", "archive", sha], cwd=root, stdout=subprocess.PIPE)
-        subprocess.run(["tar", "-x", "-C", str(target)], stdin=archive.stdout, check=True)
+        # Instruction files stay out: Claude Code loads a nested CLAUDE.md when an agent reads the export.
+        subprocess.run(["tar", "-x", "-C", str(target), "--exclude=CLAUDE.md", "--exclude=.claude"], stdin=archive.stdout, check=True)
         if archive.wait() != 0:
             raise SystemExit(f"git archive {ref} failed")
         (target / READY_MARKER).write_text(sha + "\n")

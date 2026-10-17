@@ -20,10 +20,10 @@ reported numbers.
 
 ## Rules
 
-Before reviewing, read the rule files in `.claude/rules/`: every file without
-`paths:` frontmatter, plus each file whose `paths:` globs match a file under
-review. Each standards finding cites the rule file it violates; never restate
-rules.
+The rule files in `.claude/rules/` load automatically: unscoped ones at start,
+path-scoped ones when you Read a matching file. Read a file you only grepped
+before relying on its rules. Each standards finding cites the rule file it
+violates; never restate rules.
 
 ## Severity And Tags
 

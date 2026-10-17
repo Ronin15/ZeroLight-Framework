@@ -17,10 +17,10 @@ is only for your plan file (Output).
 
 ## Rules
 
-Before designing, read the rule files in `.claude/rules/`: every file without
-`paths:` frontmatter, plus each file whose `paths:` globs match the modules the
-design touches. Each decision cites the rule file it satisfies; never restate
-rules.
+The rule files in `.claude/rules/` load automatically: unscoped ones at start,
+path-scoped ones when you Read a matching file. Read a file you only grepped
+before relying on its rules. Each decision cites the rule file it satisfies;
+never restate rules.
 
 ## Grounding
 

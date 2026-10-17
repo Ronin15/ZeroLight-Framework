@@ -15,9 +15,10 @@ Performance-sensitive runtime behavior is correctness-critical.
 
 ## Rules
 
-Before working, read the rule files in `.claude/rules/`: every file without
-`paths:` frontmatter, plus each file whose `paths:` globs match a file you will
-touch. Follow them and cite them by file; never restate them.
+The rule files in `.claude/rules/` load automatically: unscoped ones at start,
+path-scoped ones when you Read a matching file. Read a file you only grepped
+before relying on its rules. Follow them and cite them by file; never restate
+them.
 
 ## Workflow
 
@@ -26,7 +27,8 @@ touch. Follow them and cite them by file; never restate them.
    code it names, plus the slice file for its goal; implement from the plan,
    never from slice prose alone. Never rely on roadmap memory or chat
    summaries for exact details.
-2. Restate the brief's cost model, including the serial and threaded paths.
+2. State the change's cost model (`engine-design.md` § Cost model), including
+   the serial and threaded paths.
    If the existing structure cannot pass it, stop and say so instead of
    patching around it.
 3. Make the change in the owning module (`docs/architecture.md` § Source

@@ -40,9 +40,9 @@ Non-trivial Zig design, implementation, review, and debugging goes through the
 design question; the main session may do that inline. The main session
 orchestrates, verifies every agent claim against live code, and reports.
 
-- Every non-trivial brief carries the cost model
-  (`.claude/rules/engine-design.md`) and names the files in scope, so the agent
-  reads the matching rule files.
+- Every non-trivial brief names the files in scope and states the change's
+  cost-model questions (what its work and memory grow with). Rules load into
+  every agent, so briefs cite them and never paste them.
 - `zig-design-specialist` runs only when a design is open or the existing
   structure fails the cost model, and writes that plan right before its
   implementation and against the live code. Local fixes, and work whose
@@ -56,8 +56,9 @@ orchestrates, verifies every agent claim against live code, and reports.
   not fixed in its landing becomes a checklist item in the owning slice
   with its `file:line` and failure scenario, never only a memory note.
 - `zig-debug-specialist` for failures.
-- `docs-specialist` (Sonnet, owner's choice) writes a slice's docs commit
-  and routes findings into roadmap slices; it edits docs only.
+- `docs-specialist` (Sonnet, owner's choice) writes the doc changes for a
+  slice's docs commit and routes findings into roadmap slices; it edits docs
+  only, and the main session commits.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
 - Terse reports and docs, never by dropping findings. Make engineering calls
