@@ -36,10 +36,10 @@ in its owning slice.
 
 ### Checklist
 
-- [ ] Owner decision needed: DataSystem row-order redesign of the persistent
-      layout (contiguity audit H5; a major redesign, `CLAUDE.md` § Agent
-      Pipeline). Failure: every component store appends and swap-removes
-      (`data_system/movement.zig:168`, `agents.zig:159`,
+- [ ] DataSystem hot-pass contiguity (contiguity audit H5): the stores stay
+      dense SoA; the stagger assignment and the cross-store joins are fixed
+      within that layout. Failure: every component store appends and
+      swap-removes (`data_system/movement.zig:168`, `agents.zig:159`,
       `faction_level.zig:61`, `:122`), so no store is ordered by the keys
       tiered passes filter on. Tier, stagger phase, chunk, and level sit in
       the movement scope columns; faction and `world_level` are separate
@@ -59,7 +59,8 @@ in its owning slice.
       uses a quarter of each, plus random slot-table, faction, and
       `world_level` probes per row; swap-remove churn scrambles phase and
       chunk order further, and the scope index lists inherit the scatter.
-      Pass, once the owner decides: the design states the row order, how
+      Pass: each stagger phase is a contiguous row run; columns read
+      together are co-located or gathered once per stage; the design states how
       the structural applier and determinism depend on it, and its
       coordination with 75 (tier and cadence), 73 (think interval), 68A
       (gathers off main), 86 (collision gather), and 35 (`world_gate`); the

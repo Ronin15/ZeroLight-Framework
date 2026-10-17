@@ -315,7 +315,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
      verdict (docs M9); intent order (contiguity M3).
    - 87: visible-chunk source (contiguity H4); sparse tile lists (contiguity
      M1); submit gathers (contiguity M2); bench review tags (code L9).
-   - 88: DataSystem row order (contiguity H5, owner decision);
+   - 88: DataSystem hot-pass contiguity (contiguity H5);
      structural-share deferral (docs M7); index and AI scratch sized by AI
      rows (code M2); perf-log policy (code L1); `production-step` fixes (code
      L3, L5); `hotStoreCapacity` copies (code L8).
@@ -430,9 +430,6 @@ writes the findings into slice checklists or new slice files.
   orders level, chunk, faction, then in-chunk position: the chunk, the
   directory's lookup unit, sits above faction, with the same run count as
   faction above chunk and no per-faction directories. Confirm that reading.
-- **DataSystem row order** (contiguity audit H5): ordering the persistent
-  stores by the keys tiered passes filter on is a major redesign of the
-  persistent layout; 88's item waits on the call.
 - **SIMD scope** (code audit M4, docs audit M9): 84 and 85 restructure the AI
   separation and steering avoidance accumulates that 35 vectorizes, and a
   per-neighbor float loop is SIMD-shaped (`memory-performance.md` § SIMD and
