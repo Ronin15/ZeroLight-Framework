@@ -131,7 +131,9 @@ fn appendMalRow(
   parity tests. A one-system kernel built from `core` primitives may stay
   local; promote it once reused.
 - Use `simd.zig` helpers with a scalar tail for dense uniform float math over
-  SoA columns; prefer scalar for tiny batches or simple logic.
+  SoA columns; a loop whose results feed a lane consumer ends in one masked
+  lane batch instead, so the consumer has one lane path. Prefer scalar for
+  tiny batches or simple logic.
 - Prefer scalar-to-`@Vector` loads unless an aligned load is measured and
   owned.
 - Judge per-agent and per-neighbor loops at target scale, never as "low count".
