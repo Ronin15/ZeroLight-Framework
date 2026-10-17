@@ -37,15 +37,8 @@ density.
 | movers (per step) | ~2000–2050 |
 
 Known costs inside the band: the full agent snapshot each cognition step
-(~0.33 ms), the avoidance batch (~0.40 ms; [Slice 85](slices/slice-85.md)),
-and the collision gather (~0.09 ms).
+(~0.33 ms) and the avoidance batch (~0.40 ms; [Slice 85](slices/slice-85.md)).
 
-- [ ] **Collision full-sort under melee density.** Mid-pack soaks saw
-      `full_sorts` jump (1 → 24) while the stage held ~0.21 ms and the
-      broadphase batch ~0.09 ms. A melee-density `collision` case with
-      `collision_setup` gather/sort timings and `full_sort_disorder_percent`
-      decides whether that is expected disorder or a retune; SAP order never
-      changes without measured parity. (`collision.zig`)
 - [ ] **AI separation density.** Separation samples rise 2–3× running through
       the pack and scale with cognition density. The `ai_separation` batch
       line separates gather from math; Slice 55 removes queries for coasting

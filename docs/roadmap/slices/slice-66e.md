@@ -20,9 +20,9 @@ tags pass it before Steam `staging` is promoted to `default`.
   `RunStats` (mean/min/max/iterations), human-readable tables only
   (`printGroupReport`); filtering a non-baseline case auto-adds
   `serial-direct`.
-- `tools/bench_run.py` saves header-stamped runs to `benchmark_outputs/`
-  (gitignored); 52C adds optimize and CPU-baseline options.
-- Size profiles: `eventScaleCounts` quick is `{1024, 4096, 10000}`;
+- `tools/bench_ab.py` runs targeted before/after comparisons; 52C adds
+  optimize and CPU-baseline options.
+- Size lists: `suite.event_scale_counts` is `{1024, 4096, 10000}`;
   `steering` and the pathfinding fallback group use their own smaller
   ladders; 52C's `frame-battle` runs one fixed size.
 - Reference machine: AMD Ryzen 9 7900X3D, 12 cores / 24 threads, two CCDs

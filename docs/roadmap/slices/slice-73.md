@@ -62,7 +62,7 @@ sized to today's four drives and five behaviors:
   tag, its columns, one appraisal path, and one weight-table row") and the
   Emergent AI track's former add-a-feeling procedure encode the one-at-a-time
   shape.
-- Benches: `ai`, `ai-affect`, `scope`, `perception`.
+- Benches: `ai`, `ai-affect`, `production-step`, `perception`.
 
 ### Architecture notes
 
@@ -158,6 +158,6 @@ sized to today's four drives and five behaviors:
       archetype set size, three points each) shows per-agent cost flat in
       catalog size and linear in agent count and used set size
       (`.claude/rules/tests-benchmarks.md`).
-- [ ] `ai`, `ai-affect`, and `scope` show no regression against a baseline
+- [ ] `ai`, `ai-affect`, and `production-step` show no regression against a baseline
       taken before the first change.
 - [ ] `zig build verify` passes.

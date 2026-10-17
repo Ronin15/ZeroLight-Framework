@@ -156,7 +156,7 @@ Scope comes from one camera and puts far entities to sleep.
 - [ ] No entity stops advancing because of distance from the observer
       (tests over every band).
 - [ ] `far-sim` matches the cost model (linear in population ÷ cadence);
-      `scope`, `ai`, and `steering` show no near-observer regression beyond
+      `production-step`, `ai`, and `steering` show no near-observer regression beyond
       run-to-run spread.
 - [ ] `production-step` meets its pass shape on the level-count and
       level-side axes with every row advancing at its tier.

@@ -39,8 +39,8 @@ Slice 75's distance bands are another.
   from a threat, fresh memory, focus, stimulus, marker, or ring contact.
 - Slice 47 guards: the dual-list perception test and the sticky dig-linger
   test in `simulation_pipeline.zig`.
-- Benches: `ai` (every row thinks, no scope) and `scope` (halo / think
-  gathers, then AI).
+- Benches: `ai` (every row thinks, no scope) and `production-step` (the production
+  fixed step).
 
 ### Architecture notes
 
@@ -92,7 +92,7 @@ Slice 75's distance bands are another.
       set independent of the render window; existing per-agent tests
       audited for the longer cadence.
 - [ ] Benches `ai-idle-stagger` (control) and `ai-idle-coast` on one
-      fixture; the `scope` bench inserts the decide gather.
+      fixture; the `production-step` bench inserts the decide gather.
 - [ ] Docs: `docs/architecture.md` scope paragraph,
       `docs/simulation-tiers-and-pipeline.md`, bench examples in
       `docs/development-workflow.md`.

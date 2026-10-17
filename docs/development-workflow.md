@@ -414,12 +414,9 @@ of the best-control pick. Groups that time an edit and its revert (terrain edits
 batch, nav dig and update toggles, connectivity toggles) run each half on its
 own tuner set, so each tuner takes one sample per step as production does
 (`.claude/rules/threading.md`); reported shapes and settle checks follow each
-set's own half. Some groups take their sizes from the
-profile: the processor and render-prep groups share a count ladder
-(quick 1,024, 4,096, and 10,000; standard adds 25,000 and 50,000; stress 10,000,
-25,000, and 50,000), and most pathfinding request-load groups keep their own lists
-per profile. Every other group runs one fixed config list, so `--profile` does not
-change it; `--items N` runs one config of any group.
+set's own half. A group runs its own `item_counts` list; the processor and
+render-prep groups share `suite.event_scale_counts` (1,024, 4,096, and 10,000).
+`--items N` runs one config of any group.
 
 Each group's doc comment, beside its `BenchmarkGroup` in `src/benchmarks/`, is
 the full statement of its fixture, what one sample times, its item code, its pass
@@ -470,7 +467,7 @@ Reading results:
   secondary stays `inline`. Pathfinding's request preparation can use SIMD lane
   batches while the A* solve stage owns its own tuner and row.
 - `--details` adds scheduler ranges, wait time, items-per-range, tuning phase,
-  and workload counters. `--items N` overrides the profile counts for the
+  and workload counters. `--items N` overrides the item counts for the
   selected group; `--group-prefix P` runs every group whose name starts with
   `P` (a family such as `chunk-scale-`); `--fallback-budget N` compares
   hard-fallback caps against the runtime default in ReleaseFast tuning.
@@ -481,16 +478,17 @@ Group index (files under `src/benchmarks/`):
 - `movement.zig`: `movement`, `movement-apply-intents`, `-sorted`; movement
   bodies and applying AI intents.
 - `collision.zig`: `collision`, `collision-sparse`, `collision-tall`,
-  `collision-stacked`; the broadphase and its worst-case shapes.
-- `collision_response.zig`: `collision-response-stage`, `-solid`, `-bounce`,
-  `-trigger`, `-mixed`; the response step.
+  `collision-stacked`, `collision-thin`, `collision-static-heavy-sap`,
+  `collision-static-heavy`, `collision-static-index-change`; the broadphase and
+  its worst-case shapes.
+- `collision_response.zig`: `collision-response-stage`; the response step.
 - `plane_traversal.zig`: `plane-traversal`, `-falls`, `-dense-falls`,
   `-dense-falls-banded`.
 - `steering.zig`: `steering`, `-shuffled`, `-corridor`, `-cluster-outlier`,
   `steering-static-change`, `steering-static-dense`.
 - `spatial_index.zig`: `spatial_index`, `-shape`, `-query`; the shared neighbor
   index.
-- `scope.zig`: `scope`, `scope-cognition`; the scoped step and the think set.
+- `scope.zig`: `scope-cognition`; the think set.
 - `ai.zig`: `ai`, `ai-cell-ordered`. `ai_memory.zig`: `ai-memory`, `-shuffled`,
   `-sparse`. `affect.zig`: `ai-affect`, `ai-affect-shuffled`.
   `perception.zig`: `perception`, `-los-dense`, `-scattered-dense-index`,
@@ -498,14 +496,14 @@ Group index (files under `src/benchmarks/`):
 - `production_step.zig`: `production-step`, the production fixed step.
   `world_create.zig`: `world-create`. `world_gate.zig`: `world-gate`.
 - `render_prep.zig`: `render-prep`. `render_game_prep.zig`: `render-game-prep`,
-  `-dense-surface`, `-dense-deep`, `-offview`. `sparse_window.zig`:
+  `-dense-deep`, `-offview`. `sparse_window.zig`:
   `render-sparse-window-frame`, `-pan`, `-add`. `particles.zig`: `particles`.
 - `chunk_scale.zig`: `chunk-scale-dig`, `-ramp`, `-cave-in`, `-explosion-fill`,
   `chunk-scale-gpu-sync-dig`, `-level-enter`, `-pan`, and the
   `chunk-scale-nav-*` groups (`-dig`, `-ramp`, `-cave-in`, `-explosion-fill`,
   `-enclose`, `-level-add`); terrain change and its nav reaction against level
   side and depth.
-- `nav_update.zig`: `nav-update-scattered`, `-multichunk`, `-entity-obstacles`,
+- `nav_update.zig`: `nav-update-scattered`, `-entity-obstacles`,
   `-static-population`, `-static-dense`, `-static-dense-tail`.
 - `pathfinding/requests.zig`: the request-load groups (`pathfinding`,
   `-shared-goal`, `-drain`, `-cache-open`, `-cache-detour`, `-hard-fallback`,
@@ -524,19 +522,22 @@ Group index (files under `src/benchmarks/`):
 Shared harness pieces live once, each in its owning file; a group declares its
 label and formatter in its definition (`.claude/rules/tests-benchmarks.md`).
 `suite.zig` owns options, cases, item codes, labels, stage shapes, and
-reporting; `fixtures.zig` owns worlds, bodies, thread systems, and tuners;
+reporting, including `suite.Warmup` (a case's warmup and adaptive settle loop)
+and `suite.DetailLines` (a case's extra report lines, printed under its row by
+`--details`); `fixtures.zig` owns worlds, bodies, thread systems, and tuners,
+including `fixtures.CommitSeam` (the structural-commit seam a bench drives, since
+it holds no `SimulationPipeline`);
 `nav_size.zig` owns the nav memory estimate. `src/tests.zig` imports only
 `suite.zig` and `nav_size.zig`, so only their tests of their own pure utilities
 run under `zig build test`; no group file is called from a test, and fixture
 correctness rests on the asserts that fire in a real bench run.
 
 Optional arguments narrow or scale the run. Day-to-day runs target a group
-(`.claude/rules/tests-benchmarks.md`); the full-suite forms (`--profile`, bare
-`--details`) are for requested sweeps:
+(`.claude/rules/tests-benchmarks.md`); the full-suite forms (bare `zig build bench`,
+bare `--details`) are for requested sweeps:
 
 ```sh
-zig build bench -- --profile quick
-zig build bench -- --profile standard --iterations 100
+zig build bench -- --iterations 100
 zig build bench -- --case thread-adaptive-tuned-range
 zig build bench -- --group movement --items 65536 --details
 zig build bench -- --group ai --details
@@ -546,8 +547,8 @@ zig build bench -- --group render-game-prep --details
 zig build bench -- --group pathfinding-hard-fallback --details
 zig build bench -- --group pathfinding-hard-fallback-budget --items 256 --details
 zig build bench -- --group nav-update-scattered --details
-zig build bench -- --group nav-update-multichunk --details
-zig build bench -- --group scope --details
+zig build bench -- --group nav-update-entity-obstacles --details
+zig build bench -- --group scope-cognition --details
 zig build bench -- --group production-step --case thread-adaptive-tuned-range --details
 zig build bench -- --group-prefix chunk-scale- --case serial-direct
 zig build bench -- --group-prefix render-sparse-window- --case serial-direct

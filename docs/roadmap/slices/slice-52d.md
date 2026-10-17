@@ -141,7 +141,7 @@ groups measure it.
       core, interleaved repetitions, medians, at `ship` and `compat`): the
       floor, chunk-division, clamp, and sin/cos kernels improve beyond
       run-to-run spread across the ladder; normalize and gather-scatter stay
-      within spread; system groups (spatial index, scope, perception,
+      within spread; system groups (spatial index, scope-cognition, perception,
       steering, collision, affect, particles, movement, AI, render prep) show
       no regression beyond spread unless the hot function's disassembly is
       identical or a strict subset (layout noise). Tables in Status.

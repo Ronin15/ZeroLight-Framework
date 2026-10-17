@@ -105,7 +105,7 @@ Goal:
       metrics.
 - [ ] `FailingAllocator` proofs: warmed overlays, log push + draw, cue flush,
       drawable label draw.
-- [ ] Bench group `ui-event-log-feed` at the `eventScaleCounts` sizes,
+- [ ] Bench group `ui-event-log-feed` at the `suite.event_scale_counts` sizes,
       showing cost linear in step events.
 - [ ] Docs: `docs/rendering-assets-shaders.md` Text Rendering and Debug
       Overlay; `docs/architecture.md` text ownership, event-log boundary, UI

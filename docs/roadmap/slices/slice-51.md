@@ -102,6 +102,6 @@ with tests, and its consumers land with their slices.
       gameplay code (grep).
 - [ ] `background-lane` and `movement` numbers recorded in the landing
       commit; 65A's lowered-priority gate closes the interference question.
-      `zig build bench -Dsanitize-thread=true -- --profile quick --group
+      `zig build bench -Dsanitize-thread=true -- --group
       background-lane` is clean.
 - [ ] `zig build verify` passes.

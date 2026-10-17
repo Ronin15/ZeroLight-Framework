@@ -25,9 +25,8 @@ digests at every size.
   run `test` / `bench` / `run` / `gpu-smoke` with the PATH prepend.
 - `gpu-smoke` needs a display.
 - Benches: groups register in `src/benchmarks/runner.zig`; the suite accepts
-  `--group`, `--case`, `--items`, `--profile`, `--iterations`, `--details`;
-  outputs are gitignored. `tools/bench_run.py` always runs Debug and calls
-  `os.uname()`, which Windows lacks.
+  `--group`, `--case`, `--items`, `--iterations`, `--details`; outputs are
+  gitignored. `tools/bench_ab.py` runs Debug by default.
 - No bench drives the full fixed step; groups are per system, and
   `render-game-prep` covers CPU render prep on synthetic fixtures. The only
   full-frame reference is manual ReleaseSafe perf-log dumps at one demo
@@ -70,11 +69,11 @@ digests at every size.
 - Soak fails only on test, assert, safety panic, digest mismatch, or nonzero
   NaN count, never on timing; hosted-runner numbers are trend data, and
   authoritative release numbers come from the reference machine. The soak's
-  full `--profile stress` sweep is the one full-suite run this slice names.
+  full `zig build bench` sweep is the one full-suite run this slice names.
 - Pinning: Zig from zon in one step; GitHub-owned actions by major tag;
   third-party actions and container images by full SHA or digest.
 - Owners: `.github/workflows/`, a `-Dpython` build option routing every Python
-  step, `tools/bench_run.py`, and `src/benchmarks/frame.zig`; no production
+  step, `tools/bench_ab.py`, and `src/benchmarks/frame.zig`; no production
   API change.
 - VoidLight: no CI to port; its manual ReleaseSafe soak model becomes this
   reproducible soak, which supplements DW's multi-hour soak gate; do not port
@@ -84,8 +83,8 @@ digests at every size.
 
 - [ ] `-Dpython=<exe>` with a host-dependent default, used by every Python
       build step.
-- [ ] `tools/bench_run.py` `--optimize` and `--cpu-baseline` recorded in the
-      header, `platform.node()`; `tools/README.md`.
+- [ ] The soak and release bench runs record optimize mode and CPU baseline
+      in their archived output; `tools/README.md`.
 - [ ] `frame-battle` bench (`src/benchmarks/frame.zig`): direct-built fixture
       ladder over population and world extent, fixed settle, split sim and
       render-prep timers, serial and threaded cases, `state_digest`, and
