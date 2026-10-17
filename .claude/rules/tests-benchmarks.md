@@ -54,7 +54,9 @@ paths:
   scales. Compare before/after on adjacent commits in Debug (ReleaseFast only
   per `build-validation.md`) with one run per side (`tools/bench_ab.py`); a
   case more than 10% slower is rerun alone with 3 reps, and a regression is a
-  change beyond their run-to-run spread. Act on one only when it shows a worse growth
+  change beyond their run-to-run spread. When the change alters a bench's
+  fixture or input order, the base code also runs on the new fixture; the
+  like-for-like gap is the code's. Act on one only when it shows a worse growth
   order or a material total; a nanosecond-per-item constant is reported, not
   redesigned. A constant is material when it moves the stage's total beyond
   the run-to-run spread at the bench's sizes; a few ns per item on a stage

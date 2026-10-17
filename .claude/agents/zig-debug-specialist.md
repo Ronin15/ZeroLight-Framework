@@ -69,7 +69,9 @@ hypothesis until a measurement tests it; say which.
    `.claude/rules/build-validation.md`.
 
 Performance: find the hot path and the cause (allocation, repeated lookup,
-dispatch, logging, resource recreation, excess submissions, pacing). For
+dispatch, logging, resource recreation, excess submissions, pacing). Check
+data shape before kernel overhead: work requesters repeat identically, run
+lengths, and a fixture or input order that changed between the sides. For
 multi-stage processors, isolate stage timing and tuner state first. Check the
 two MAL regression signatures early: `rows.items(.field)` in a loop and per-row
 `appendAssumeCapacity` in a hot gather. Measure with a targeted bench group.
