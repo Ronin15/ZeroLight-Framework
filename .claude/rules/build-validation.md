@@ -37,8 +37,7 @@ Commands and options: `docs/development-workflow.md`.
 - Before a ReleaseFast release candidate, a multi-hour ReleaseSafe soak across
   realistic to extreme entity counts and spawn/despawn churn must pass;
   ReleaseFast corrupts memory silently where ReleaseSafe reports.
-- ReleaseSafe soaks are diagnostics, not an every-edit step
-  (`tests-benchmarks.md`).
+- ReleaseSafe soaks are diagnostics, not an every-edit step.
 - Never hand-edit `zig-out/` or `.zig-cache/`. Never commit generated binaries
   or local machine paths.
 - When adding `build.zig.zon` dependencies, keep hashes accurate and review the

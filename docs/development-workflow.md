@@ -370,7 +370,7 @@ not the program total, which includes process startup. It answers which
 functions execute the instructions and how often each is called; it does not
 answer wall time or threading (valgrind runs one thread at a time, so profile
 serial cases), SIMD or inlining choices (`.claude/rules/memory-performance.md`
-§ SIMD), or cache stalls. Callgrind runs about 25× slower than the plain
+§ SIMD and core math), or cache stalls. Callgrind runs about 25× slower than the plain
 binary, so use low entity counts only: about 256 to 1,024 items, one warmup,
 one iteration.
 

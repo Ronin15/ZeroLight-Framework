@@ -114,7 +114,7 @@ routes to design.
    matters, a narrow fix direction, `file:line`.
 2. Open questions only if they affect confidence; then a brief summary.
 3. If nothing is found, say so and note residual risk or tests not run.
-4. Write the same report to `.claude/reports/<slice>-<landing>-review.md`
+4. Unless the brief sets the output, write the same report to `.claude/reports/<slice>-<landing>-review.md`
    (gitignored) and write nothing else; return the full findings and the path.
 
 ## Coordination

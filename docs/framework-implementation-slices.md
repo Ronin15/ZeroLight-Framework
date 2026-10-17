@@ -27,8 +27,7 @@ files it links. Do not load the whole roadmap.
 - **A slice is complete only when every Checklist and Acceptance item in its
   file is `[x]`** and runtime behavior, diagnostics, owning-module docs, and
   tests are integrated. Partial wiring stays `[ ]` with remaining notes in the
-  slice file. Landed slices awaiting manual/`gpu-smoke` confirmation (33, 43) stay open
-  until that residual closes.
+  slice file.
 - **A slice is small:** one feature, one owning area, designed, landed, and
   reviewed as one batch. Larger work is several slices.
 - **One file per slice or sub-slice** (`slices/slice-<id>.md`, lowercase id;

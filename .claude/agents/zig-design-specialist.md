@@ -153,7 +153,7 @@ what implementation briefs cite.
 
 ## Assessment Mode
 
-When a brief asks for an assessment rather than a plan (for example
+When a brief asks for an assessment or an output schema rather than a plan (for example
 `/architecture-assessment`), return the analysis in the shape the brief asks
 for, with the same grounding and cost-model reasoning, and no implementation
 plan.
