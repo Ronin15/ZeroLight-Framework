@@ -6,8 +6,9 @@
 `world_gate` items land first, on the core branch (Engine-Core Overhaul
 order), independent of 55 and 52D; the `world-gate` bench landed there.
 
-Goal: the scalar per-agent and per-neighbor loops in AI separation, AI
-decision math, and steering avoidance become packed-scratch SIMD kernels, so
+Goal: the scalar per-agent loops in AI decision math become SIMD kernels
+across agents (AI separation moved to [84](slice-84.md) and steering
+avoidance to [85](slice-85.md), which restructure those loops), so
 per-agent cognition and steering cost stays low at large populations in every
 world, bit-identical across scalar/SIMD and serial/threaded paths. It also
 lands `world_gate.apply` as a threaded SIMD range job with its serial path,
@@ -43,9 +44,6 @@ and the `world-gate` bench that measures it.
 - Restructures existing loops only; the utility/sticky arbitration contract
   stays (`.claude/rules/simulation.md` § AI and affect). It measures against
   the cognition structure 55 lands on (re-based on 73).
-- The per-query budgets above stay unchanged, and the packed scratch is
-  sized from them, so per-range scratch needs no reserve
-  (`.claude/rules/budgets-capacities.md`).
 - Vector math goes through `core`; branches become masks; only irreducible
   loops stay scalar, each with its reason at the site
   (`.claude/rules/memory-performance.md` § SIMD and core math).
@@ -60,15 +58,8 @@ and the `world-gate` bench that measures it.
 
 ### Checklist
 
-- [ ] AI separation: in-range neighbors gathered once into packed scratch,
-      vectorized accumulate, a bounded mask instead of the per-neighbor early
-      exit.
 - [ ] AI decision math (`decideDir`, wander/seek blend, normalize) vectorized
       across agents with masked branches.
-- [ ] Steering neighbor/obstacle avoidance: sampled neighbors and obstacle
-      boxes packed into scratch, vectorized force math, the sampling bound as
-      a mask.
-- [ ] Gather scratch sized from the fixed per-query budgets.
 - [x] `world-gate` bench group: serial baseline at three body counts
       (`5d5a089`); its threaded cases join the threaded gate below.
 - [ ] `world_gate.apply` NPC clamp and tile gate as a threaded SIMD range
@@ -83,20 +74,14 @@ and the `world-gate` bench that measures it.
 - [ ] The whole of `systems/world_gate.zig` checked against the cost model and
       the rules (owner 2026-10-16), not only the items above. Each finding
       becomes an item here.
-- [ ] Tests: scalar/SIMD and serial/threaded parity per restructured path; a
-      `FailingAllocator` proof over a real multi-worker AI + steering step
-      with agents at the full neighbor and candidate caps.
-- [ ] This slice's refs (docs audit M3): the foundation's
-      `simulation_pipeline.zig:1566` is `:1562` at HEAD (`d51e8ae`) and
-      `:1564` in the uncommitted 84 tree. Pass: labelled or re-pointed by the
-      refs convention the owner picks (index, owner questions).
+- [ ] Tests: scalar/SIMD and serial/threaded parity per restructured path.
 
 ### Acceptance checks
 
 - [ ] Every parity test passes, bit-stable across layouts.
-- [ ] `ai` and `steering` benches at three or more agent counts show the
+- [ ] The `ai` bench at three or more agent counts shows the
       restructured paths winning at the large end and no regression at the
       small end (`.claude/rules/tests-benchmarks.md`); `world-gate` covers
       serial and threaded at the same body counts.
-- [ ] Per-query budgets are unchanged and the warmed proofs allocate nothing.
+- [ ] The warmed proofs allocate nothing.
 - [ ] `zig build verify` passes.

@@ -4,9 +4,8 @@
 
 **Status: not started.** Routed by the 64G combined review (area C). The
 render backend pass closes the core branch and comes after the collect moves,
-so the same files are touched once. Owner question (index, docs audit M5):
-88 depends on 87 and runs before the branch's last items, so 87 cannot be
-complete before 88 starts while its backend pass closes the branch.
+so the same files are touched once; 88 follows the collect items, before
+the backend pass (index, merged order).
 
 Goal: render collect work and its record and command capacity follow the
 rows in the visible chunks, never the world's population. The GPU tile sync's
@@ -75,16 +74,19 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
       idle while the camera is still. Pass: the window walk reads each
       chunk's sparse rows as one contiguous run; a churned
       `render-sparse-window-pan` case matches the unchurned one.
-- [ ] Render submit reads records in sort order (contiguity audit M2).
-      Failure: `DynamicScenePrep` sorts `sort_indices` by (depth, sequence)
-      (`render_prep.zig:278`, a comparator loading two records per compare at
-      `:739-740`), and submit gathers `records[record_index]` (`:527-530`);
-      the sparse window sorts row ids over three pool columns
-      (`world/render.zig:230`), and `emitSparseRange` gathers per id
-      (`:626`). Failure scenario: every frame reads the visible records out
-      of order. Medium: the count is the visible records, each feeding one
-      renderer call. Pass: submit walks its records (or a packed key array
-      carrying the payload) in memory order; `render-game-prep` within
+- [ ] Render submit reads its records in sort order (contiguity audit M2).
+      Failure: `DynamicScenePrep` sorts an index array, `sort_indices`, by
+      (depth, sequence) (`render_prep.zig:278`), its comparator loading two
+      records per compare (`:738-741`), and submit reads
+      `records[record_index]` through it (`:527-530`); the sparse window
+      sorts row ids over three pool columns (`world/render.zig:230`), and
+      `emitSparseRange` reads each row by id (`:626`). Render submission is
+      a hot path, so its reads follow the sort order in memory
+      (`.claude/rules/memory-performance.md` § Hot paths, § Dense SoA
+      storage). Failure scenario: every frame reads the visible records out
+      of order, and the sort chases two records per compare. Pass: the sort
+      orders the records themselves, or packed keys carrying their payload,
+      and submit walks them in memory order; `render-game-prep` within
       spread or faster.
 - [ ] Render backend pass, last on the core branch: the renderer, sprite
       batch, text, and GPU buffers, plus `src/render/camera.zig`,

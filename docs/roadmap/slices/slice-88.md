@@ -1,12 +1,12 @@
 ## Slice 88: DataSystem, Step Contracts, Pipeline, And Core Kernels Pass
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md) (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: not started.** Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
-covers the shared layers no other core slice owns. It runs after 87 and
-before the inert-row items and 75's tier mechanics, both of which build on
-the storage it settles.
+covers the shared layers no other core slice owns. It runs after 87's
+collect items and before the inert-row items and 75's tier mechanics, both
+of which build on the storage it settles.
 
 Goal: the persistent storage, the per-step stream contracts, the pipeline
 scheduler, and the shared math and SIMD kernels every processor runs on pass
@@ -59,9 +59,13 @@ in its owning slice.
       uses a quarter of each, plus random slot-table, faction, and
       `world_level` probes per row; swap-remove churn scrambles phase and
       chunk order further, and the scope index lists inherit the scatter.
-      Pass: each stagger phase is a contiguous row run; columns read
-      together are co-located or gathered once per stage; the design states how
-      the structural applier and determinism depend on it, and its
+      Pass: each stagger phase is a contiguous row run; columns that grow,
+      shrink, and swap-remove together as one row share one
+      `MultiArrayList` store, so one row index reaches each column
+      (`.claude/rules/memory-performance.md` § Dense SoA storage), and a
+      pass needing another store's columns gathers them once per stage;
+      the design states how the structural applier and determinism depend
+      on it, and its
       coordination with 75 (tier and cadence), 73 (think interval), 68A
       (gathers off main), 86 (collision gather), and 35 (`world_gate`); the
       hot consumers read contiguous runs.
@@ -118,13 +122,6 @@ in its owning slice.
       bench OOM or leak sweep reports the fixture's leak. Pass: the state is
       created first, or a guarded errdefer covers `world` until
       `initWithWorld` takes ownership.
-- [ ] `production-step`'s tuned case checks that its tuners settled (code
-      audit L5). Failure: it warms a fixed `adaptiveSettleIterationLimit`
-      steps (`production_step.zig:430-432`) and reports no per-stage settle
-      state. Failure scenario: the measured window includes probes or
-      retunes, skewing the main share that 84, 86, and 88 gate on. Pass: the
-      case reports each stage's settle state, or settles by walking the
-      pipeline's tuners.
 - [ ] One `hotStoreCapacity` (code audit L8). Failure: eight private copies
       wrap `std.mem.alignForwardAnyAlign` (`systems/ai.zig:81`,
       `perception.zig:106`, `affect.zig:92`, `ai_memory.zig:71`,

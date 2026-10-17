@@ -299,31 +299,35 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    - Render backend pass: 87, last.
 
    Items the 2026-10-16 audits routed here (`.claude/reports/audit-*.md`),
-   with the 84 chunk-index review's; their refs are live at `d51e8ae` plus the
-   uncommitted 84 tree:
+   with the 84 chunk-index review's. Slice refs are as of the commit their
+   block names and are re-checked right before implementation
+   (`.claude/rules/engine-design.md` § Cost model).
    - 84: index order and its fragment paths (code H1, review 1 and 8);
-     cohere's check budget (code H1); carried stage inputs (code M1); SIMD
-     verdicts (code M4, L7, review 6); bench base and off-main asserts
-     (review 2 and 3, code L2); comments and module doc (code L9, review 4
-     and 9); cell-radius overflow (review 5); empty-build tail (review 7);
-     the docs commit's refs, 83 archive, changelog, 68A cross-edit, and DW
-     (docs M3, M4, M12, L3, L4, L12, L13, code L10); done in the tree (code
-     L1, L6).
+     cohere's check budget (code H1); carried stage inputs (code M1); the
+     vectorized separation accumulate, moved from 35 (code M4); scalar
+     reasons (code L7, review 6); bench base and off-main asserts (review 2
+     and 3, code L2); comments and module doc (code L9, review 4 and 9);
+     cell-radius overflow (review 5); empty-build tail (review 7); the docs
+     commit's foundation, 83 archive, changelog, 68A cross-edit, and DW
+     (docs M4, M12, L3, L4, L12, L13, code L10); done in the tree (code L1,
+     L6).
    - 86: sweep order and proxy gather (contiguity H2); static-collider lists
-     (contiguity H3); path registry lists (contiguity L1); refs (docs M3).
-   - 85: steering grid level key (contiguity H1, code H2); avoidance SIMD
-     verdict (docs M9); intent order (contiguity M3).
+     (contiguity H3).
+   - 85: steering grid level key (contiguity H1, code H2); the vectorized
+     avoidance accumulate, moved from 35 (docs M9); intent order
+     (contiguity M3).
    - 87: visible-chunk source (contiguity H4); sparse tile lists (contiguity
-     M1); submit gathers (contiguity M2); bench review tags (code L9).
-   - 88: DataSystem hot-pass contiguity (contiguity H5);
-     structural-share deferral (docs M7); index and AI scratch sized by AI
-     rows (code M2); perf-log policy (code L1); `production-step` fixes (code
-     L3, L5); `hotStoreCapacity` copies (code L8).
+     M1); submit reads in sort order (contiguity M2); bench review tags
+     (code L9).
+   - 88: DataSystem hot-pass contiguity (contiguity H5); structural-share
+     deferral (docs M7); index and AI scratch sized by AI rows (code M2);
+     perf-log policy (code L1); `production-step` OOM leak (code L3);
+     `hotStoreCapacity` copies (code L8).
    - 74: the steering seam copy (code M3); `production-step` spawn path (code
      L4).
    - 68A: think-set compact on main (contiguity audit, noticed in passing).
    - 52A: `build.zig` doc pointer (code L9, docs L14).
-   - 35 and 75: refs (docs M3); 75's census timers (docs L18).
+   - 75: census timers (docs L18).
 
    Coverage (owner 2026-10-16: every system gets a whole-subsystem pass
    against the cost model and the rules, not only its measured findings):
@@ -396,45 +400,6 @@ writes the findings into slice checklists or new slice files.
 - **Open question:** whether crowds converging on one goal share path work
   through the goal-keyed cache or need the group field (73).
 
-**Owner questions** (2026-10-16 audits):
-- **Branch order** (docs audit M5): 88 depends on 87 and runs before the
-  inert rows and 75's tier mechanics, but 87's backend pass closes the
-  branch, so 87 cannot be complete before 88 starts. Split the backend pass
-  into its own slice at the branch end, or make 88 depend on 87's collect
-  items only?
-- **Merged order** (docs audit M6): the merged order's invariant (every
-  prerequisite on an earlier line) breaks twice. 87 (line 9) depends on 35's
-  `world_gate` items, but 35 is line 22, after 55 and 52D; and 75's inert-row
-  and tier-mechanics items run on the core branch while 75 depends on 73.
-  Split those items into sub-slices (for example 35A and 75A) that carry only
-  their real dependencies, ordered before 87 and 88?
-- **Foundation refs** (docs audit open question 1): pinned at `5d5a089` with
-  a label per block, as the core-branch paragraph says, or kept live? The
-  answer settles docs audit M3's items in 84, 86, 35, and 75, and the refs in
-  [79](roadmap/slices/slice-79.md) and [80](roadmap/slices/slice-80.md)
-  (`simulation_pipeline.zig:1159` is `:1160`, and `:1389` is `:1387`, at
-  `d51e8ae`).
-- **Rule edit, overhead gaps** (docs audit M1): `engine-design.md` § Cost
-  model says a gap from overhead is tuned out, while § Cost model's
-  nanosecond line and `tests-benchmarks.md` § Benchmarks report an immaterial
-  constant, so an immaterial overhead gap gets two verdicts. Proposed: "a
-  material gap from overhead (`tests-benchmarks.md` § Benchmarks) is tuned
-  out".
-- **Rule edit, competing hot queries** (docs audit M2):
-  `memory-performance.md` § Dense SoA storage has no tiebreak when one index
-  serves queries that filter on different keys (84: perception and cohere
-  filter on faction; separation and steering read every faction), and its
-  "never with a separate short-run or fragment path" can read as banning the
-  scalar tail § SIMD and core math requires. Needed before 84's faction
-  layout lands. 84's layout plan (`.claude/reports/slice-84-faction-layout-plan.md`)
-  orders level, chunk, faction, then in-chunk position: the chunk, the
-  directory's lookup unit, sits above faction, with the same run count as
-  faction above chunk and no per-faction directories. Confirm that reading.
-- **SIMD scope** (code audit M4, docs audit M9): 84 and 85 restructure the AI
-  separation and steering avoidance accumulates that 35 vectorizes, and a
-  per-neighbor float loop is SIMD-shaped (`memory-performance.md` § SIMD and
-  core math). Do 84 and 85 land the vectorized accumulates, moved from 35?
-
 ## Deferred By Owner
 
 Product work the owner explicitly deferred: not slices, no design. When an
@@ -482,8 +447,11 @@ order.
 6. **84** Level-Aware Shared Neighbor Index — after 83 (core-systems branch).
 7. **86** Collision Subsystem Pass — after 83, 84 (core-systems branch).
 8. **85** Steering On The Shared Neighbor Index — after 84, 86 (core-systems branch).
+8a. **35's `world_gate` items** — after 85 (core-systems branch; the rest of 35 is line 22).
 9. **87** Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items (core-systems branch).
-9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 (core-systems branch).
+9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87's collect items (core-systems branch).
+9b. **Inert rows** (86's and 75's items), then **75's tier mechanics** — after 88 (core-systems branch; the rest of 75 is line 14).
+9c. **87's render backend pass** — after 9b; closes the core-systems branch.
 10. **76** Cave-Ins — after 64G.
 11. **77** Explosions — after 64G, 76.
 12. **49** Session Seed And Determinism Checksum Harness — after 64G.

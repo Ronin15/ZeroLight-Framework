@@ -137,10 +137,6 @@ Scope comes from one camera and puts far entities to sleep.
       sizes with most agents far from the observer.
 - [ ] Docs: `docs/architecture.md` tier model; `docs/simulation-tiers-and-pipeline.md`
       scope, bands, and cadences.
-- [ ] This slice's refs (docs audit M3): `movement.zig:47` (foundation and
-      checklist) is `update` at `:49`, and `simulation_scope.zig:689`
-      (`scanTierPolicy`) is `:686`. Pass: labelled or re-pointed by the refs
-      convention the owner picks (index, owner questions).
 
 ### Acceptance checks
 

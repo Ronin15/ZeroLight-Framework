@@ -3,8 +3,7 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 84](slice-84.md), [Slice 86](slice-86.md) (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: not started.** Routed by the 64G combined review (area D M1, M4,
-L10) and the movement intent measurement. [Slice 35](slice-35.md) owns
-vectorizing steering's per-neighbor math.
+L10) and the movement intent measurement.
 
 Goal: steering queries 84's shared index instead of building and sorting a
 private grid; an entity create or destroy invalidates only what it changed in
@@ -74,15 +73,17 @@ keeps the apply local.
       row, threaded. Pass: a test that unrelated rows keep their cached
       index; a spawn-churn `steering` case flat in population for a fixed
       churn.
-- [ ] A SIMD verdict at `accumulateAgentAvoidanceBounded`
-      (`avoidance.zig:360`). The loop is per-neighbor float math, so a
-      scalar verdict needs a shape reason
-      (`.claude/rules/memory-performance.md` § SIMD), never a slice reference
-      at the site (`.claude/rules/zig-style.md` § Comments) (docs audit M9).
-      Whether 85, which rewrites this loop onto 84's index, lands the
-      vectorized accumulate (moved from 35's steering avoidance item) is an
-      owner question (index). Pass: the site states its verdict; a vectorized
-      loop ships its scalar/SIMD parity test.
+- [ ] The agent avoidance accumulate is vectorized (moved from 35; docs
+      audit M9). Failure: `accumulateAgentAvoidanceBounded`
+      (`avoidance.zig:360`), which this slice rewrites onto 84's index, is
+      per-neighbor float math run scalar; a per-neighbor float loop is
+      SIMD-shaped, so the rewritten loop ships SIMD
+      (`.claude/rules/memory-performance.md` § SIMD and core math). Pass:
+      sampled neighbors gathered once into packed scratch sized from the
+      fixed per-query budgets, the force math through `simd.zig` helpers
+      with a scalar tail and the sampling bound as a mask; scalar/SIMD and
+      serial/threaded parity tests; a `FailingAllocator` proof over a
+      multi-worker step with agents at the full candidate cap.
 - [ ] Movement intents in movement-row order if the ordering costs less than
       the apply gain. Failure scenario: `frame.intents` is written in
       steering's selected order (`avoidance.zig:216`), so the apply resolves

@@ -69,10 +69,10 @@ that does not grow with them.
       sorts on that many workers, one in a single row part on one. Failure
       scenario (derived): an observer in an ally crowd walks one fragment per
       cell and fills no lane block, at population scale. Design:
-      `.claude/reports/slice-84-faction-layout-plan.md` (in progress); the
-      tiebreak for the all-faction queries is the owner's rule question
-      (index, docs audit M2). Pass: a masked query reads one contiguous run
-      per requested faction and row piece; the three paths are gone; the
+      `.claude/reports/slice-84-faction-layout-plan.md` (level, chunk,
+      faction, then in-chunk position); the all-faction queries (separation,
+      steering) read one run per faction per row piece. Pass: a masked query
+      reads one contiguous run per requested faction and row piece; the three paths are gone; the
       tests and the `spatial_index-query` masked variant that encode the old
       order change with it; the sort order in the cost model carries its
       row-part qualifier, and `spatial_index-shape dense_chunk` stays off
@@ -124,15 +124,18 @@ that does not grow with them.
       the previous step's, so it senses across levels or misses a hostile.
       Pass: both arms carry `movement_positions` and `world_level`, so the
       reorder fails the comptime contract check.
-- [ ] A SIMD verdict at `SeparationAccumulator.visit` (`ai.zig:931-946`;
-      code audit M4). Failure: the restructured per-neighbor normalize, up to
-      32 per agent, states no reason, unlike its sibling visitors. The loop
-      is per-neighbor float math, so a scalar verdict needs a shape reason
-      (`.claude/rules/memory-performance.md` § SIMD), never a slice
-      reference at the site (`.claude/rules/zig-style.md` § Comments).
-      Whether 84 lands the packed-scratch accumulate, moved from 35's AI
-      separation item, is an owner question (index). Pass: the site states
-      its verdict; a vectorized loop ships its scalar/SIMD parity test.
+- [ ] The separation accumulate is vectorized (moved from 35; code audit
+      M4). Failure: `SeparationAccumulator.visit` (`ai.zig:931-946`), which
+      this slice restructures, normalizes up to 32 neighbors per agent one
+      at a time with no verdict at the site; a per-neighbor float loop is
+      SIMD-shaped, so the restructured loop ships SIMD
+      (`.claude/rules/memory-performance.md` § SIMD and core math). Pass:
+      in-range neighbors gathered once into packed scratch sized from the
+      fixed per-query budgets, the accumulate through `simd.zig` helpers
+      with a scalar tail and a bounded mask in place of the per-neighbor
+      early exit; scalar/SIMD and serial/threaded parity tests; a
+      `FailingAllocator` proof over a multi-worker step with agents at the
+      full neighbor and candidate caps.
 - [ ] The new `spatial_index-shape` and `spatial_index-query` groups get a
       base (chunk-index review 2). Failure: they land in the same diff as
       the fix (`src/benchmarks/runner.zig:115-116`), so the per-query cost
@@ -206,12 +209,9 @@ that does not grow with them.
       hostiles found; serial == threaded; allocation-free warmed step.
 - [ ] Docs: `docs/architecture.md` spatial index;
       `docs/simulation-tiers-and-pipeline.md` stage list.
-- [ ] Docs commit: this slice's refs (docs audit M3). The foundation and
-      checklist cite `ai.zig:1100`, `:1149`, `perception.zig:124`, `:134`,
-      `:846`, `:1114`, and `spatial_index.zig:141`, `:434`, `:740`, stale
-      since `13e88ad` and `c52a5ff` (the last three name code that is gone).
-      Pass: labelled or re-pointed by the refs convention the owner picks
-      (index, owner questions), one convention in the slice.
+- [ ] Docs commit: the foundation and checklist describe the code as
+      landed (docs audit M3: `spatial_index.zig:141`, `:434`, `:740` name
+      code that is gone).
 - [ ] Docs commit: archive Slice 83 (docs audit M4): `git mv` its file to
       `roadmap/archive/`, move its row
       (`framework-implementation-slices.md`, Open Frontier index) to the

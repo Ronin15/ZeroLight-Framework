@@ -139,30 +139,12 @@ order stay deterministic for the order-sensitive consumers.
       `collision_response.zig`, `static_colliders.zig`, `contact_query.zig`,
       `destructible_controller.zig`, `data_system/collision.zig`,
       `data_system/destructible.zig`). Each finding becomes an item here.
-- [ ] Path registry lists, decided with the static-collider item's design
-      (contiguity audit L1). Failure: the `path_index` shards are
-      `ChunkListMap`s keyed by (level, chunk)
-      (`pathfinding/system.zig:150`), walked per changed key by the threaded
-      `nav_evict` jobs (`pathfinding/eviction.zig:250`, `:303`) and the cold
-      `evictLevel` (`:60`). Failure scenario: after publish churn, each
-      eviction walk chases scattered entries. Low: the walk runs per change,
-      not per step, and the registry churns at every publish, where O(1)
-      relinking pays. Pass: if the static-collider design changes
-      `ChunkListMap` itself, it states the registry's layout too; if not, the
-      registry goes to the owner (no open slice owns pathfinding storage;
-      64G is sealed).
 - [ ] Benches at the worst-case shapes (thin, tall, deep, dense), with the
       shape asserts landing with each fix (`.claude/rules/tests-benchmarks.md`).
 - [ ] Tests: identical contacts and order across worker counts; cross-level,
       tall, and inert fixtures; allocation-free warmed step.
 - [ ] Docs: `docs/architecture.md` collision;
       `docs/simulation-tiers-and-pipeline.md` stage list.
-- [ ] Docs commit: this slice's refs (docs audit M3). The foundation and
-      checklist cite `collision.zig` `:327`, `:336`, `:473`, `:684`, `:778`,
-      `:790`, `:903`, `:915`, which moved in `13e88ad` (now `:326`, `:335`,
-      `:455`, `:666`, `:760`, `:772`, `:885`, `:897`). Pass: labelled or
-      re-pointed by the refs convention the owner picks (index, owner
-      questions), one convention in the slice.
 
 ### Acceptance checks
 
