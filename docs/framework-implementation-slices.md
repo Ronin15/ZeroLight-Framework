@@ -93,7 +93,9 @@ files it links. Do not load the whole roadmap.
 7. **Docs commit, once the slice's programming is done:** check off Checklist
    items, update durable docs (`architecture.md`, rendering/sim docs) and
    Tables T1–T6 from the landings' commit notes (`CLAUDE.md` § Agent
-   Pipeline).
+   Pipeline), and bring every open slice the landed code affects up to
+   date: its Current foundation and `file:line` refs, items the landing
+   closed or made obsolete, and the interfaces or orders it builds on.
 8. **Set Status**, run `zig build verify` before the slice's final commit, and
    when complete archive the file (Ground Rules). Follow-ups go into a slice
    Checklist or a new slice file.

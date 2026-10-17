@@ -41,7 +41,10 @@ acceptance), never rules or designs.
    an unmet item stays open with its reason. A routed finding becomes a
    checklist item in its owning slice with its `file:line`, failure
    scenario, and pass condition.
-5. Edit only docs (`docs/`, `README.md` per `engine-design.md` § Changes and
+5. In a slice's docs commit, update every open slice the landed code
+   affects (roadmap index § Agent Workflow step 7); find them by searching
+   the open slices for the changed modules and symbols.
+6. Edit only docs (`docs/`, `README.md` per `engine-design.md` § Changes and
    docs). A needed code, comment, or rule change is reported, never made.
    Rule edits go to the owner.
 
