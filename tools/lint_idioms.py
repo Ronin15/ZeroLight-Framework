@@ -23,6 +23,11 @@ reviewer diligence:
 7. No camelCase enum tags (Zig enum members are snake_case).
 8. No unused file-scope `const` (a dead import or alias): Zig compiles only
    what is referenced, so an unused declaration builds clean and goes stale.
+9. No test- or bench-only `pub` API in production code: every `pub` decl in a
+   production file is referenced by production code (outside `test` blocks,
+   `*test_support.zig`, `src/benchmarks/`, and the test/bench/smoke roots). A decl only tests or
+   benches reach is deleted or made private, or carries
+   `// lint:allow bench-api: <reason>` on its line or the line above.
 
 Scans every `src/**/*.zig` file plus `build.zig`. Rules in SRC_ONLY_PATTERNS
 apply to `src/` only. All rules match code with string/char-literal contents
@@ -337,6 +342,75 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
     return issues
 
 
+# Rule 9: production files and the roots that are not production (tests, benches,
+# GPU smoke). Lines inside `test` blocks never count as production references.
+NON_PRODUCTION_ROOTS = {"src/tests.zig", "src/benchmark_runner.zig", "src/gpu_smoke.zig", "src/platform/gpu_smoke_impl.zig"}
+PUB_DECL = re.compile(r"^\s*pub\s+(?:inline\s+|extern\s+|export\s+)?(?:fn|const|var)\s+([A-Za-z_][A-Za-z0-9_]*)")
+BENCH_API_ALLOW = re.compile(r"lint:allow bench-api:\s*\S+")
+# Entry hooks the compiler or std looks up by name.
+PUB_ENTRY_NAMES = {"main", "std_options", "panic", "root"}
+WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def is_production(path: Path) -> bool:
+    rel = path.relative_to(REPO_ROOT).as_posix()
+    # `*test_support.zig` files are test code: only `test` blocks import them, so they never
+    # compile into the game, and their references never count as production use.
+    return (
+        rel.startswith("src/")
+        and not rel.startswith("src/benchmarks/")
+        and rel not in NON_PRODUCTION_ROOTS
+        and not rel.endswith("test_support.zig")
+    )
+
+
+def production_lines(path: Path) -> list[str]:
+    """Code lines outside `test` blocks, literals blanked and comments removed."""
+    out: list[str] = []
+    in_test = False
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if TEST_DECL.match(raw):
+            in_test = True
+        elif raw.startswith("}") and in_test:
+            in_test = False
+            out.append("")
+            continue
+        code = strip_line_comment(blank_literals(raw))
+        quoted = " ".join(a or b for a, b in QUOTED_DECL_REF.findall(raw))
+        out.append("" if in_test else f"{code} {quoted}")
+    return out
+
+
+def lint_test_only_api(files: list[Path]) -> list[tuple[str, int, str, str]]:
+    prod = [path for path in files if is_production(path)]
+    lines = {path: production_lines(path) for path in prod}
+    counts: dict[str, int] = {}
+    for code_lines in lines.values():
+        for code in code_lines:
+            for word in WORD.findall(code):
+                counts[word] = counts.get(word, 0) + 1
+    issues: list[tuple[str, int, str, str]] = []
+    for path in prod:
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        raw_lines = path.read_text(encoding="utf-8").splitlines()
+        for index, code in enumerate(lines[path]):
+            decl = PUB_DECL.match(code)
+            if not decl or decl.group(1) in PUB_ENTRY_NAMES:
+                continue
+            name = decl.group(1)
+            # The declaration line itself spells the name once.
+            if counts.get(name, 0) > len(WORD.findall(code)) - len([w for w in WORD.findall(code) if w != name]):
+                continue
+            here = raw_lines[index]
+            above = raw_lines[index - 1] if index > 0 else ""
+            if BENCH_API_ALLOW.search(here) or BENCH_API_ALLOW.search(above):
+                continue
+            issues.append(
+                (rel, index + 1, f"`pub {name}` has no production reference (only tests or benches reach it); delete it or make it private", here.strip())
+            )
+    return issues
+
+
 def main() -> None:
     if not SRC_DIR.is_dir():
         print(f"idiom-lint: source directory not found: {SRC_DIR}", file=sys.stderr)
@@ -346,6 +420,13 @@ def main() -> None:
     issues: list[tuple[str, int, str, str]] = []
     for path in files:
         issues.extend(lint_file(path))
+    # Rule 9 reports without failing until the cleanup clears its last hits; then it joins
+    # `issues` so it fails the build.
+    test_only_api = lint_test_only_api(files)
+    for rel, lineno, message, snippet in test_only_api:
+        print(f"{rel}:{lineno}: {message}\n    {snippet}", file=sys.stderr)
+    if test_only_api:
+        print(f"idiom-lint: {len(test_only_api)} rule-9 warning(s) (pub API with no production use)", file=sys.stderr)
 
     if issues:
         for rel, lineno, message, snippet in issues:
