@@ -89,6 +89,19 @@ every existing agent is byte-identical.
       own-level `goal_level` on post goals.
 - [ ] Slice 55 hooks: posts non-coastable, post alert input.
 - [ ] `alarm` stimulus with sticky linger and deferred enqueue.
+- [ ] Stimulus storage grows, and over-budget stimuli defer instead of
+      dropping (`budgets-capacities.md`). Failure: every `SensoryBus` pool
+      is a fixed array that drops when full: the live bus
+      (`stimulus_live_capacity` 32, `sensory_bus.zig:84`), the deferred
+      impacts (`stimulus_deferred_capacity` 16 and
+      `stimulus_max_impacts_per_step` 8, `:179-186`), and the sticky linger
+      (`:154`), all in `simulation.zig:634-652`. Perception reads them, so a
+      drop changes what AI hears. Measured: `stimuli_deferred_dropped=325`
+      in 60 s of the Debug demo (owner run, 2026-10-17). The alarm stimulus
+      above lands in the same buffers. Pass: stimulus storage starts at a
+      content-derived size and grows at the step seam; an over-budget
+      impact or alarm defers to the next step in canonical order; the drop
+      counters go away, replaced by a deferral test.
 - [ ] Help-call stage with its contract, `.guard_alarm` impulse producer,
       deferral of over-budget alarms, and the spatial index entity column.
 - [ ] Archetype content: post gains for `guard` and `merchant`, an `escort`
