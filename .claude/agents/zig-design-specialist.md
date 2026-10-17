@@ -63,13 +63,17 @@ section with nothing new is omitted.
   fails, the design replaces the parts that fail
   (`.claude/rules/engine-design.md`).
 - **Shared results** (`.claude/rules/engine-design.md` § Cost model): name
-  the unit each computed result is stored at and every requester it serves.
+  the unit each computed result is stored at and every requester it serves,
+  intermediates included (walks, gathers, candidate lists): work two
+  requesters repeat identically is a shared result.
 - **One chosen design**, justified against the target in a few lines; one line
   per rejected alternative.
 - **Goal, success criteria, scope**, and the owning module of every new piece.
 - **Call flow** through `main.zig → Engine → StateStack → states`, and
   pipeline/controller placement.
-- **Data layout and lifetime** for every persistent and transient set.
+- **Data layout and lifetime** for every persistent and transient set,
+  settled before any kernel (`memory-performance.md` § Data-oriented design);
+  each SIMD verdict follows from the loop shape that layout produces.
 - **Ordered processor list**: reads, writes, output buffers, position; a new or
   reordered stage names its `PipelineResource` tags and `stage_order` position.
 - **Budgets, capacities, thresholds**: class, sizing, growth point, degradation

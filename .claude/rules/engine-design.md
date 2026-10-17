@@ -68,6 +68,8 @@ Every design, and every fix touching storage or per-change work, states:
 - A computed result (a proof, region, path, or summary) is stored at the unit
   it covers and shared by every requester it answers, never recomputed per
   requester; a result keyed finer than what it proves fails the cost model.
+  Intermediate work counts: a walk, gather, or candidate list that requesters
+  repeat identically is a shared result.
 - If part of the existing structure cannot pass, redesign that part to the
   rules; never patch around it. Code, tests, and benches built on a failing
   part go with it and are never design references or correctness baselines.
