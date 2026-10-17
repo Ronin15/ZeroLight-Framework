@@ -243,6 +243,24 @@ const same_shape_notes = blk: {
     break :blk notes;
 };
 
+/// A case's report lines past its workload (a group's stage or memory report), written when
+/// the case ends and printed under its row by `--details`. Text past the buffer is cut.
+pub const DetailLines = struct {
+    buffer: [2048]u8 = undefined,
+    len: usize = 0,
+
+    pub fn print(self: *DetailLines, comptime format: []const u8, args: anytype) void {
+        var writer: std.Io.Writer = .fixed(self.buffer[self.len..]);
+        // A full buffer cuts the report; it is diagnostic text only.
+        writer.print(format, args) catch {};
+        self.len += writer.buffered().len;
+    }
+
+    pub fn text(self: *const DetailLines) []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
+
 pub const RunStats = struct {
     // Plain scalar result surface shared by every benchmark group; each group's
     // `write_workload` names what its counters hold.
@@ -299,6 +317,7 @@ pub const RunStats = struct {
     render_capacities: ?RenderCapacitySummary = null,
     production_step: ?ProductionStepSummary = null,
     world_create: ?WorldCreateSummary = null,
+    details: DetailLines = .{},
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -1001,7 +1020,14 @@ fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
         printCell(formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning), 72);
         const workload = formatWorkloadInto(&workload_buffer, group, result.stats, .details);
         std.debug.print("{s}\n", .{if (workload.len == 0) "-" else workload});
+        printDetailLines(result.stats.details.text());
     }
+}
+
+// A case's report lines, each indented under its row.
+fn printDetailLines(text: []const u8) void {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| std.debug.print("    {s}\n", .{line});
 }
 
 // `group`'s workload text for `stats`; empty when it writes none.

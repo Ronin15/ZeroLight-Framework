@@ -133,16 +133,13 @@ pub const StageReport = struct {
         self.shapes.add(updateBatches(stats));
     }
 
-    pub fn print(self: StageReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
-        if (!options.details or self.timed_ns == 0) return;
+    pub fn write(self: StageReport, details: *suite.DetailLines) void {
+        if (self.timed_ns == 0) return;
         var buffers: [update_stage_count][48]u8 = undefined;
         var labels: [update_stage_count][]const u8 = undefined;
         for (&buffers, &labels, 0..) |*buffer, *label, index| label.* = self.shapes.label(index, buffer);
         const samples: u128 = self.samples * std.time.ns_per_us;
-        std.debug.print("  {s} {} {s}: intake={s} group_field={s}/{s} solve={s} publish_copy={s} registry_flush={s} resize_copy={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us", .{
-            group_name,
-            item_count,
-            case.name,
+        details.print("intake={s} group_field={s}/{s} solve={s} publish_copy={s} registry_flush={s} resize_copy={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us", .{
             labels[0],
             labels[1],
             labels[2],
@@ -157,15 +154,15 @@ pub const StageReport = struct {
             @as(u64, @intCast(self.solve_main_ns / samples)),
             @as(u64, @intCast(self.publish_ns / samples)),
         });
-        if (self.routes) |routes| std.debug.print(" routes solved={} unsolved={}", .{ routes.solved, routes.unsolved });
-        std.debug.print(" registrations +{}/-{} per update", .{ self.registrations_added / self.samples, self.registrations_removed / self.samples });
+        if (self.routes) |routes| details.print(" routes solved={} unsolved={}", .{ routes.solved, routes.unsolved });
+        details.print(" registrations +{}/-{} per update", .{ self.registrations_added / self.samples, self.registrations_removed / self.samples });
         if (self.unavailable + self.goal_fallbacks != 0) {
-            std.debug.print(" unavailable={} goal_fallbacks={} per update", .{
+            details.print(" unavailable={} goal_fallbacks={} per update", .{
                 self.unavailable / self.samples,
                 self.goal_fallbacks / self.samples,
             });
         }
-        std.debug.print("\n", .{});
+        details.print("\n", .{});
     }
 };
 
@@ -398,15 +395,12 @@ pub const EvictReport = struct {
         self.evicted = reaction.stats.evicted_results;
     }
 
-    pub fn print(self: EvictReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
-        if (!options.details or self.stages.timed_ns == 0) return;
+    pub fn write(self: EvictReport, details: *suite.DetailLines) void {
+        if (self.stages.timed_ns == 0) return;
         var shapes: [3][48]u8 = undefined;
         const labels = self.stages.labels(&shapes);
         var main_buffer: [320]u8 = undefined;
-        std.debug.print("  {s} {} {s}: evict_count={s} evict={s} evict_flush={s} main={}us ({}%) visited={} evicted={}{s}\n", .{
-            group_name,
-            item_count,
-            case.name,
+        details.print("evict_count={s} evict={s} evict_flush={s} main={}us ({}%) visited={} evicted={}{s}\n", .{
             labels[0],
             labels[1],
             labels[2],

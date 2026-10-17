@@ -249,11 +249,11 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         try fixture.fillCache(case, thread_ptr);
         if (churn) |*registry_churn| try registry_churn.run(io, &fixture, case, thread_ptr);
     }
-    report.print(options, evict_group.name, item_count, case);
     // The size config charges no long block.
     if (fixture.system.long_block_growth.count != 0) return error.ShortRouteTookLongBlock;
     try nav_size.checkNavBytes(evict_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
+    report.write(&stats.details);
     stats.output_count = evicted;
     stats.cache_evictions = evicted;
     stats.candidate_pairs = result_count;
@@ -442,15 +442,12 @@ const ShrinkReport = struct {
         self.last = shrink;
     }
 
-    fn print(self: ShrinkReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
-        if (!options.details or self.samples == 0 or self.step_ns == 0) return;
+    fn write(self: ShrinkReport, details: *suite.DetailLines) void {
+        if (self.samples == 0 or self.step_ns == 0) return;
         const resize_ns = self.step_ns -| self.hold_ns;
         const resize_main_ns = resize_ns -| self.copy_ns;
         const samples: u128 = self.samples * std.time.ns_per_us;
-        std.debug.print("  {s} {} {s}: agents {}->{} cache {}->{} kept={} evicted={} moved={} step={}us hold={}us resize={}us ({}% of step) copy={}us resize_main={}us\n", .{
-            group_name,
-            item_count,
-            case.name,
+        details.print("agents {}->{} cache {}->{} kept={} evicted={} moved={} step={}us hold={}us resize={}us ({}% of step) copy={}us resize_main={}us\n", .{
             self.last.agent_capacity_before,
             self.last.agent_capacity_after,
             self.last.cache_capacity_before,
@@ -517,13 +514,13 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
         stage_report.add(shrink.step_ns, shrink.step_stats);
         shrink_report.add(shrink);
     }
-    stage_report.print(options, elastic_shrink_group.name, item_count, case);
-    shrink_report.print(options, elastic_shrink_group.name, item_count, case);
     // The size config charges no long block.
     if (system.long_block_growth.count != 0) return error.ShortRouteTookLongBlock;
 
     try nav_size.checkNavBytes(elastic_shrink_group.name, item_count, size_config, &system);
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
+    shrink_report.write(&stats.details);
     stats.output_count = shrink_report.last.kept;
     stats.candidate_pairs = shrink_report.last.moved;
     stats.cache_evictions = shrink_report.last.evicted;

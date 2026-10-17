@@ -308,14 +308,11 @@ const ToggleReport = struct {
         stats.nav_conn = conn;
     }
 
-    fn print(self: ToggleReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
-        if (!options.details or self.samples == 0) return;
+    fn write(self: ToggleReport, details: *suite.DetailLines) void {
+        if (self.samples == 0) return;
         const samples: u128 = self.samples * std.time.ns_per_us;
         const timed_ns = self.change_ns + self.revert_ns;
-        std.debug.print("  {s} {} {s}: block={}us reopen={}us main={}us ({}%)\n", .{
-            group_name,
-            item_count,
-            case.name,
+        details.print("block={}us reopen={}us main={}us ({}%)\n", .{
             @as(u64, @intCast(self.change_ns / samples)),
             @as(u64, @intCast(self.revert_ns / samples)),
             @as(u64, @intCast(self.main_ns / samples)),
@@ -329,7 +326,7 @@ const ToggleReport = struct {
 // cells flipped per second. The revert runs on its own stage tuner set, copied from the
 // fixture's, so each set learns one workload; the retire's reactions keep the tuners as
 // they were (`OnewayBallast.untimedReaction`).
-fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *ReactFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks, ballast: ?*OnewayBallast) !suite.RunStats {
+fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *ReactFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks, ballast: ?*OnewayBallast) !suite.RunStats {
     var revert_tuners = fixture.system.tuners;
     for (0..options.warmup_iterations) |_| {
         if (ballast) |chain| try chain.retire(io, fixture, thread_system);
@@ -344,8 +341,8 @@ fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCas
         report.add(sample);
         if (ballast) |chain| chain.addSample(sample);
     }
-    report.print(options, group_name, item_count, case);
     var stats = accumulator.finish();
+    report.write(&stats.details);
     report.summarize(&stats, fixtures.floodTunerWorkers(&fixture.system, case));
     stats.items_per_second = suite.itemsPerSecond(2 * cells.len, stats.mean_ns);
     return stats;
@@ -539,7 +536,7 @@ fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: s
     try fixture.changed.ensureTotalCapacity(allocator, gap.len);
     fixtures.setNavTuners(&fixture.system, case);
 
-    var stats = try runToggleSamples(io, options, case, connectivity_split_group.name, item_count, &fixture, gap, thread_ptr, .{}, null);
+    var stats = try runToggleSamples(io, options, case, item_count, &fixture, gap, thread_ptr, .{}, null);
     try nav_size.checkNavBytes(connectivity_split_group.name, item_count, size_config, &fixture.system);
     stats.output_count = gap.len;
     stats.candidate_pairs = config.structureChunks();
@@ -822,18 +819,15 @@ const OnewayBallast = struct {
     // and use, and the close's main-thread closure time (it holds the free) and the words it
     // freed; then the timed block reactions' split (the rest is everything outside the
     // reserve, closure, and landing). Printed under --details.
-    fn print(self: OnewayBallast, options: suite.Options, case: suite.BenchmarkCase) void {
-        if (!options.details or self.retires == 0) return;
+    fn write(self: OnewayBallast, details: *suite.DetailLines) void {
+        if (self.retires == 0) return;
         const reopen = self.reopen.stats;
         const close = self.close.stats;
         var land_shape = suite.StageShapes(1){};
         land_shape.add(.{reopen.conn_closure_land_batch});
         var land_buffer: [48]u8 = undefined;
         const land = reopen.conn_closure_land_batch;
-        std.debug.print("  {s} {} {s}: ballast rooms={} block_words={} retires={} reopen={}us reopen_land={s} reopen_land_ns={} landed_words={} tail_bound={} tail_used={} tail_ratio={d:.2} close={}us close_closure_main={}ns freed_words={} left_live_words={}\n", .{
-            connectivity_oneway_group.name,
-            self.item_count,
-            case.name,
+        details.print("ballast rooms={} block_words={} retires={} reopen={}us reopen_land={s} reopen_land_ns={} landed_words={} tail_bound={} tail_used={} tail_ratio={d:.2} close={}us close_closure_main={}ns freed_words={} left_live_words={}\n", .{
             self.cells.len,
             self.block_words,
             self.retires,
@@ -852,10 +846,7 @@ const OnewayBallast = struct {
         if (self.samples == 0) return;
         const samples: u128 = self.samples;
         const parts = self.reserve_ns + self.closure_stages_ns + self.land_ns;
-        std.debug.print("  {s} {} {s}: timed block split total={}ns reserve={}ns closure_stages={}ns land={}ns rest={}ns\n", .{
-            connectivity_oneway_group.name,
-            self.item_count,
-            case.name,
+        details.print("timed block split total={}ns reserve={}ns closure_stages={}ns land={}ns rest={}ns\n", .{
             @as(u64, @intCast(self.close_ns / samples)),
             @as(u64, @intCast(self.reserve_ns / samples)),
             @as(u64, @intCast(self.closure_stages_ns / samples)),
@@ -1044,8 +1035,8 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
         .ballast => .{ .isolated = true },
         else => .{},
     };
-    var stats = try runToggleSamples(io, options, case, connectivity_oneway_group.name, item_count, &fixture, cells, thread_ptr, checks, if (config.variant == .ballast) &ballast else null);
-    ballast.print(options, case);
+    var stats = try runToggleSamples(io, options, case, item_count, &fixture, cells, thread_ptr, checks, if (config.variant == .ballast) &ballast else null);
+    ballast.write(&stats.details);
     try nav_size.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
     stats.output_count = config.links();
     stats.candidate_pairs = config.rooms();

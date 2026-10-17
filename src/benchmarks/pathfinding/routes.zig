@@ -341,7 +341,7 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     var fixture = try initRouteFixture(allocator, open, &requests, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
     try nav_size.checkNavBytes(level_size_group.name, item_count, size_config, &fixture.system);
-    const stats = try runColdRouteSteps(io, options, case, level_size_group.name, item_count, &fixture, thread_ptr, .fail);
+    const stats = try runColdRouteSteps(io, options, case, item_count, &fixture, thread_ptr, .fail);
     try nav_size.checkNavBytes(level_size_group.name, item_count, size_config, &fixture.system);
     return stats;
 }
@@ -474,7 +474,7 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     var fixture = try initRouteFixture(allocator, open, &requests, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
     try nav_size.checkNavBytes(group_name, item_count, size_config, &fixture.system);
-    const stats = try runColdRouteSteps(io, options, case, group_name, item_count, &fixture, thread_ptr, if (teleport) .count else .fail);
+    const stats = try runColdRouteSteps(io, options, case, item_count, &fixture, thread_ptr, if (teleport) .count else .fail);
     try nav_size.checkNavBytes(group_name, item_count, size_config, &fixture.system);
     return stats;
 }
@@ -549,7 +549,7 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     var fixture = try initRouteFixture(allocator, open, &requests, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit();
     try nav_size.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
-    const stats = try runColdRouteSteps(io, options, case, cross_level_shaft_group.name, item_count, &fixture, thread_ptr, .count);
+    const stats = try runColdRouteSteps(io, options, case, item_count, &fixture, thread_ptr, .count);
     try nav_size.checkNavBytes(cross_level_shaft_group.name, item_count, size_config, &fixture.system);
     return stats;
 }
@@ -1171,7 +1171,7 @@ fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
     return walk;
 }
 
-fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest, blocked: usize) !suite.RunStats {
+fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest, blocked: usize) !suite.RunStats {
     var stream = RangeOutputStream(PathRequest).init(allocator);
     defer stream.deinit();
     const step_limit = 4 * config.routeCells() + 64;
@@ -1187,11 +1187,8 @@ fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     }
     var stats = accumulator.finish();
     const walk = reference orelse return stats;
-    if (options.details) {
-        std.debug.print("  {s} {} {s}: {s} walk parameter={} route~{} cells | steps={} held={} solves={} partial={} full={} escalations={} claims={} solve={}us | blocked={}\n", .{
-            long_path_group.name,
-            item_count,
-            case.name,
+    {
+        stats.details.print("{s} walk parameter={} route~{} cells | steps={} held={} solves={} partial={} full={} escalations={} claims={} solve={}us | blocked={}\n", .{
             @tagName(config.layout),
             config.parameter,
             config.routeCells(),
@@ -1287,7 +1284,7 @@ fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
     }
 }
 
-fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest) !suite.RunStats {
+fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest) !suite.RunStats {
     var stream = RangeOutputStream(PathRequest).init(allocator);
     defer stream.deinit();
     // Every published hop advances at least one cell.
@@ -1304,11 +1301,8 @@ fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     }
     var stats = accumulator.finish();
     const chain = reference orelse return stats;
-    if (options.details) {
-        std.debug.print("  {s} {} {s}: {s} hops parameter={} route~{} cells | stop=L{}:{} hops={} least_hops={} solves={} escalations={} claims={} solve={}us\n", .{
-            long_path_group.name,
-            item_count,
-            case.name,
+    {
+        stats.details.print("{s} hops parameter={} route~{} cells | stop=L{}:{} hops={} least_hops={} solves={} escalations={} claims={} solve={}us\n", .{
             @tagName(config.layout),
             config.parameter,
             config.routeCells(),
@@ -1328,8 +1322,8 @@ fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     return stats;
 }
 
-fn printLongPathAttempt(label: []const u8, attempt: LongPathAttempt, mean_ns: u64) void {
-    std.debug.print(" | {s}: nodes={} corridor={} cells={} segments={} settles={} frozen={} outcome={s} {}us", .{
+fn writeLongPathAttempt(details: *suite.DetailLines, label: []const u8, attempt: LongPathAttempt, mean_ns: u64) void {
+    details.print(" | {s}: nodes={} corridor={} cells={} segments={} settles={} frozen={} outcome={s} {}us", .{
         label,
         attempt.nodes,
         attempt.corridor,
@@ -1379,9 +1373,9 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // Every variant checks the nav's bytes again once its paths are cached and registered.
     if (config.variant == .walk or config.variant == .hops) {
         const stats = if (config.variant == .walk)
-            try runLongPathWalkCase(allocator, io, options, case, item_count, config, &fixture, agents[0], built.blocked)
+            try runLongPathWalkCase(allocator, io, options, item_count, config, &fixture, agents[0], built.blocked)
         else
-            try runLongPathHopsCase(allocator, io, options, case, item_count, config, &fixture, agents[0]);
+            try runLongPathHopsCase(allocator, io, options, item_count, config, &fixture, agents[0]);
         try nav_size.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
         return stats;
     }
@@ -1409,21 +1403,18 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     try nav_size.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     const cycle = reference orelse return stats;
-    if (options.details) {
+    {
         const samples: u64 = stats.iterations;
-        std.debug.print("  {s} {} {s}: {s} {s} parameter={} route~{} cells agents={}", .{
-            long_path_group.name,
-            item_count,
-            case.name,
+        stats.details.print("{s} {s} parameter={} route~{} cells agents={}", .{
             @tagName(config.layout),
             @tagName(config.variant),
             config.parameter,
             config.routeCells(),
             agent_count,
         });
-        printLongPathAttempt("first", cycle.first, first_ns / samples);
-        if (cycle.escalated) |escalated| printLongPathAttempt("escalated", escalated, escalated_ns / samples);
-        std.debug.print(" | blocked={} status available={} partial={} missing={}\n", .{ built.blocked, cycle.available, cycle.partial, cycle.missing });
+        writeLongPathAttempt(&stats.details, "first", cycle.first, first_ns / samples);
+        if (cycle.escalated) |escalated| writeLongPathAttempt(&stats.details, "escalated", escalated, escalated_ns / samples);
+        stats.details.print(" | blocked={} status available={} partial={} missing={}\n", .{ built.blocked, cycle.available, cycle.partial, cycle.missing });
     }
     stats.candidate_pairs = (cycle.escalated orelse cycle.first).nodes;
     stats.output_count = cycle.available;
@@ -1579,7 +1570,7 @@ fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_syste
 
 // Times one cold pathfinding step of the fixture's requests per iteration (runtime
 // state cleared, untimed, before each).
-fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, fixture: *RouteFixture, thread_system: ?*ThreadSystem, unsolved_routes: UnsolvedRoutes) !suite.RunStats {
+fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *RouteFixture, thread_system: ?*ThreadSystem, unsolved_routes: UnsolvedRoutes) !suite.RunStats {
     const system = &fixture.system;
     setPathStageTuners(system, case);
     for (0..options.warmup_iterations) |_| {
@@ -1610,8 +1601,8 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
         abstract_nodes = lastAbstractNodesUsed(system);
     }
     if (unsolved_routes == .count) stage_report.routes = .{ .solved = last_stats.available_results, .unsolved = route_request_count - last_stats.available_results };
-    stage_report.print(options, group_name, item_count, case);
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
     stats.output_count = last_stats.available_results;
     stats.candidate_pairs = abstract_nodes;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
@@ -1692,9 +1683,9 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     }
     const pads_held = fixture.open.world.levelLinks().len;
     if (pads_held != peak_pads) return error.LinkFoldDrift;
-    report.print(options, link_fold_group.name, item_count, case);
     try nav_size.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
+    report.write(&stats.details);
     stats.output_count = pads_held;
     stats.candidate_pairs = report.chunks_patched;
     stats.nav_main = report.stages.nav_main;
@@ -1817,18 +1808,15 @@ const LinkFoldReport = struct {
         self.pads_held += pads_held;
     }
 
-    fn print(self: LinkFoldReport, options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase) void {
+    fn write(self: LinkFoldReport, details: *suite.DetailLines) void {
         const stages = self.stages;
-        if (!options.details or stages.timed_ns == 0) return;
+        if (stages.timed_ns == 0) return;
         var shapes: [3][48]u8 = undefined;
         const labels = stages.labels(&shapes);
         var main_buffer: [320]u8 = undefined;
         const endpoints_x10 = self.touched_endpoints * 10 / self.touched_chunks;
         const pad_samples = stages.samples * link_fold_batch;
-        std.debug.print("  {s} {} {s}: plan={s} patch={s} conn_gather={s} per_pad={}ns commit_per_pad={}ns endpoints_per_touched_chunk={}.{} pads_held_mean={} main={}us ({}%) patched={}{s}\n", .{
-            group_name,
-            item_count,
-            case.name,
+        details.print("plan={s} patch={s} conn_gather={s} per_pad={}ns commit_per_pad={}ns endpoints_per_touched_chunk={}.{} pads_held_mean={} main={}us ({}%) patched={}{s}\n", .{
             labels[0],
             labels[1],
             labels[2],

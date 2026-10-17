@@ -268,10 +268,10 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
         accumulator.record(step.elapsed_ns, last_stats.intake_batch);
         stage_report.add(step.elapsed_ns, last_stats);
     }
-    stage_report.print(options, negative_steady_group.name, item_count, case);
 
     try nav_size.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
     stats.output_count = last_stats.unavailable_results;
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
     return stats;
@@ -293,14 +293,11 @@ const NegativeDigReport = struct {
         self.remask.add(.{reaction.stats.remask_batch});
     }
 
-    fn print(self: NegativeDigReport, options: suite.Options, item_count: usize, case: suite.BenchmarkCase) void {
-        if (!options.details or self.samples == 0) return;
+    fn write(self: NegativeDigReport, details: *suite.DetailLines) void {
+        if (self.samples == 0) return;
         const samples: u128 = self.samples * std.time.ns_per_us;
         var remask_buffer: [48]u8 = undefined;
-        std.debug.print("  {s} {} {s}: react={}us update={}us remask={s}\n", .{
-            negative_dig_group.name,
-            item_count,
-            case.name,
+        details.print("react={}us update={}us remask={s}\n", .{
             @as(u64, @intCast(self.react_ns / samples)),
             @as(u64, @intCast(self.update_ns / samples)),
             self.remask.label(0, &remask_buffer),
@@ -371,12 +368,12 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         reaction_report.add(timed.reaction);
         report.add(timed.reaction, timed.update);
     }
-    stage_report.print(options, negative_dig_group.name, item_count, case);
-    reaction_report.print(options, negative_dig_group.name, item_count, case);
-    report.print(options, item_count, case);
 
     try nav_size.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
+    reaction_report.write(&stats.details);
+    report.write(&stats.details);
     stats.output_count = requester_count;
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(requester_count, stats.mean_ns);
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.intake.report(), settled_before_measurement);
@@ -553,14 +550,11 @@ const ResolveReport = struct {
         self.off_main_ns += offMainNs(resolve.scan_batch) + offMainNs(resolve.project_batch);
     }
 
-    fn print(self: ResolveReport, options: suite.Options, item_count: usize, case: suite.BenchmarkCase) void {
-        if (!options.details or self.samples == 0) return;
+    fn write(self: ResolveReport, details: *suite.DetailLines) void {
+        if (self.samples == 0) return;
         var scan_buffer: [48]u8 = undefined;
         var project_buffer: [48]u8 = undefined;
-        std.debug.print("  {s} {} {s}: goal_scan={s} goal_project={s} goal_off_main={}us\n", .{
-            negative_burst_group.name,
-            item_count,
-            case.name,
+        details.print("goal_scan={s} goal_project={s} goal_off_main={}us\n", .{
             self.shapes.label(0, &scan_buffer),
             self.shapes.label(1, &project_buffer),
             @as(u64, @intCast(self.off_main_ns / self.samples / std.time.ns_per_us)),
@@ -643,11 +637,11 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
         accumulator.record(burst.elapsed_ns, burst.stats.intake_batch);
         last = burst;
     }
-    stage_report.print(options, negative_burst_group.name, item_count, case);
-    resolve_report.print(options, item_count, case);
 
     try nav_size.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
+    resolve_report.write(&stats.details);
     if (last) |burst| {
         stats.output_count = burst.unavailable;
         stats.candidate_pairs = burst.projections;

@@ -377,7 +377,7 @@ const MeasurementMode = enum {
 };
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, group.name, item_count, .unique_open, .cold_solve, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .unique_open, .cold_solve, item_count, item_count);
 }
 
 // Every request shares one goal: all but the first fold into its pending entry, so a cold
@@ -429,27 +429,27 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 }
 
 fn runFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, fallback_group.name, item_count, .unique_open, .hot_cache, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .unique_open, .hot_cache, item_count, item_count);
 }
 
 fn runFallbackDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, fallback_detour_group.name, item_count, .blocked_detour, .hot_cache, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .blocked_detour, .hot_cache, item_count, item_count);
 }
 
 fn runHardFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runWorkloadCase(allocator, io, options, case, hard_fallback_group.name, item_count, .hard_fallback, .cold_fallback, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_fallback, item_count, item_count);
 }
 
 fn runHardFallbackBudgetCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     const fallback_budget = @min(options.fallback_budget orelse hard_fallback_admissions, item_count);
-    return runWorkloadCase(allocator, io, options, case, hard_fallback_budget_group.name, item_count, .hard_fallback, .cold_fallback, item_count, fallback_budget);
+    return runWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_fallback, item_count, fallback_budget);
 }
 
 // Admissions per step of the hard-fallback-budget case: a window narrower than its solve
 // window, so the admission limit defers the rest.
 const hard_fallback_admissions: usize = 128;
 
-fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, group_name: []const u8, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
+fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var threads = try fixtures.initCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
@@ -490,11 +490,11 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
         stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
     }
-    stage_report.print(options, group_name, item_count, case);
     // Every route exists and starts open.
     if (last_stats.unavailable_results != 0) return error.RouteUnavailable;
 
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
     stats.output_count = last_stats.available_results;
     stats.deferred_count = last_stats.pending_requests;
     stats.fallback_deferred_count = last_stats.admission_deferred_requests;
@@ -567,9 +567,9 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
             if (system.pending.len >= before) return error.DrainStalled;
         }
     }
-    stage_report.print(options, drain_group.name, item_count, case);
 
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
     stats.output_count = last_stats.available_results + last_stats.unavailable_results;
     stats.candidate_pairs = last_stats.solved_requests;
     stats.deferred_count = last_stats.pending_requests;
@@ -902,9 +902,9 @@ fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: su
         // A ready field answers every member: no build, no per-agent solve.
         if (last_stats.group_fields_built != 0 or last_stats.group_field_samples != item_count) return error.GroupFieldNotSampled;
     }
-    stage_report.print(options, group_field_detour_group.name, item_count, case);
 
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
     stats.output_count = last_stats.duplicate_requests;
     stats.candidate_pairs = last_stats.group_field_samples;
     stats.items_per_second = suite.itemsPerSecond(item_count, stats.mean_ns);
@@ -937,7 +937,7 @@ const MovingTotals = struct {
 // no earlier cycle targeted (a strict march, so no cycle rides an earlier cached result), then
 // steps the rekey period. The first request for a new goal is always one bounded solve (the
 // field cannot be ready for it yet); the throttle must let the field serve the rest.
-fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     // Fixed cycle counts: --warmup and --iterations do not apply.
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var threads = try fixtures.initCaseThreads(allocator, io, case);
@@ -964,12 +964,12 @@ fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, optio
             totals.add(stats);
         }
     }
-    stage_report.print(options, group_field_detour_moving_group.name, item_count, case);
     // The throttle lets the field reach ready and serve part of the run; escalated solves stay
     // at one per rekey.
     if (totals.samples == 0) return error.GroupFieldNeverSampled;
     if (totals.escalated > group_field_detour_moving_cycles) return error.GroupFieldEscalationsPastRekeys;
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
     totals.into(&stats);
     return stats;
 }
@@ -1059,7 +1059,7 @@ fn writeGroupFieldPackRequests(allocator: std.mem.Allocator, stream: *RangeOutpu
     try fixtures.writeRequests(stream, scratch.items);
 }
 
-fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const packs = item_count;
     if (packs == 0 or group_field_pack_side / packs < group_field_pack_band_min) return error.GroupFieldPacksTooMany;
@@ -1105,12 +1105,12 @@ fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, options: sui
             samples_total += stats.group_field_samples;
         }
     }
-    stage_report.print(options, group_field_packs_group.name, item_count, case);
-    printFieldMemory(options, group_field_packs_group.name, item_count, case, &system);
     // Every pack's field builds each rekey and is sampled.
     if (built_total < packs * group_field_detour_moving_cycles or samples_total == 0) return error.GroupFieldPacksNotEngaged;
 
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
+    writeFieldMemory(&stats.details, &system);
     stats.output_count = built_total;
     stats.candidate_pairs = samples_total;
     stats.items_per_second = suite.itemsPerSecond(built_total, stats.mean_ns *| stats.iterations);
@@ -1118,8 +1118,7 @@ fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, options: sui
 }
 
 // Per-field coverage and memory of a system's fields, averaged over the built fields.
-fn printFieldMemory(options: suite.Options, group_name: []const u8, item_count: usize, case: suite.BenchmarkCase, system: *const PathfindingSystem) void {
-    if (!options.details) return;
+fn writeFieldMemory(details: *suite.DetailLines, system: *const PathfindingSystem) void {
     var fields: usize = 0;
     var covered: usize = 0;
     var blocks: usize = 0;
@@ -1132,10 +1131,7 @@ fn printFieldMemory(options: suite.Options, group_name: []const u8, item_count: 
         resident += field.residentBytes();
     }
     if (fields == 0) return;
-    std.debug.print("  {s} {} {s}: fields={} per_field covered={} blocks={} resident={}B bytes_per_cell={} pool_grows={} pool_failures={}\n", .{
-        group_name,
-        item_count,
-        case.name,
+    details.print("fields={} per_field covered={} blocks={} resident={}B bytes_per_cell={} pool_grows={} pool_failures={}\n", .{
         fields,
         covered / fields,
         blocks / fields,
@@ -1237,9 +1233,9 @@ fn runGroupFieldTunnelCase(allocator: std.mem.Allocator, io: std.Io, options: su
     for (system.group_fields.items) |field| covered += field.pushed_count;
     // Every field covers its cap: the lattice's corridor cells reach past the largest cap.
     if (covered != group_field_tunnel_fields * item_count) return error.GroupFieldTunnelShortOfCap;
-    printFieldMemory(options, group_field_tunnel_group.name, item_count, case, system);
 
     var stats = accumulator.finish();
+    writeFieldMemory(&stats.details, system);
     stats.output_count = covered;
     stats.items_per_second = suite.itemsPerSecond(covered, stats.mean_ns);
     return stats;
