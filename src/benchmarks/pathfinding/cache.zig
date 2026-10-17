@@ -49,7 +49,11 @@ const chunkCells = @import("nav_fixtures.zig").chunkCells;
 // re-solves the evicted results. The region configs (4, 16, or 64 chunks at 10,000 results)
 // instead fill a chunk-aligned square of that many chunks in one step, crossing the routes of
 // its rows: the dense-change reaction, which passes when linear in the region's chunks and
-// the registrations its eviction visits. Items/s is the path-registry
+// the registrations its eviction visits. The churned config (64 chunks at 10,000 results)
+// times the same region fill over a registry rebuilt through publish/evict churn before
+// every timed reaction (untimed: rounds of seeded random digs inside the region's route
+// rows, each reacted to, reopened, and re-solved); it passes when its eviction stages are
+// within spread of the fresh registry's at the same config. Items/s is the path-registry
 // entries the eviction visited per second. `--details` prints the eviction stages' shapes,
 // the reaction's main-thread time, and the entries visited.
 pub const evict_group = suite.BenchmarkGroup{
@@ -91,16 +95,21 @@ pub const elastic_shrink_group = suite.BenchmarkGroup{
     .write_workload = writeElasticShrinkWorkload,
 };
 
-const EvictCode = suite.ItemCode(struct { region_chunks: usize, cached_results: usize }, &.{7});
+// How the path registry was built before each timed reaction: by the cache fill alone, or
+// through publish/evict churn after it.
+const EvictRegistry = enum(u8) { fresh, churned };
+const EvictCode = suite.ItemCode(struct { registry: EvictRegistry, region_chunks: usize, cached_results: usize }, &.{ 3, 7 });
 
-// The dig at each result count, then the region axis at a fixed result count.
+// The dig at each result count, then the region axis at a fixed result count, then the
+// churned registry at the largest region.
 const evict_item_counts = [_]usize{
-    EvictCode.of(.{ .region_chunks = 0, .cached_results = 1_000 }),
-    EvictCode.of(.{ .region_chunks = 0, .cached_results = 10_000 }),
-    EvictCode.of(.{ .region_chunks = 0, .cached_results = 50_000 }),
-    EvictCode.of(.{ .region_chunks = 4, .cached_results = 10_000 }),
-    EvictCode.of(.{ .region_chunks = 16, .cached_results = 10_000 }),
-    EvictCode.of(.{ .region_chunks = 64, .cached_results = 10_000 }),
+    EvictCode.of(.{ .registry = .fresh, .region_chunks = 0, .cached_results = 1_000 }),
+    EvictCode.of(.{ .registry = .fresh, .region_chunks = 0, .cached_results = 10_000 }),
+    EvictCode.of(.{ .registry = .fresh, .region_chunks = 0, .cached_results = 50_000 }),
+    EvictCode.of(.{ .registry = .fresh, .region_chunks = 4, .cached_results = 10_000 }),
+    EvictCode.of(.{ .registry = .fresh, .region_chunks = 16, .cached_results = 10_000 }),
+    EvictCode.of(.{ .registry = .fresh, .region_chunks = 64, .cached_results = 10_000 }),
+    EvictCode.of(.{ .registry = .churned, .region_chunks = 64, .cached_results = 10_000 }),
 };
 const elastic_ramp_item_counts = [_]usize{ 1_000, 4_000, 16_000 };
 
@@ -182,6 +191,7 @@ fn evictRegionChunks(allocator: std.mem.Allocator, edge: u16) ![]ChunkCoord {
 fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const code = try EvictCode.decode(item_count);
+    if (code.registry == .churned and code.region_chunks == 0) return error.EvictChurnNeedsRegion;
     const region_chunks = code.region_chunks;
     const result_count = code.cached_results;
     const region_edge = std.math.cast(u16, std.math.sqrt(region_chunks)) orelse return error.EvictRegionTooLarge;
@@ -219,13 +229,17 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     defer if (region_cells) |cells| allocator.free(cells);
     const cells: []const CellCoord = region_cells orelse &.{evict_dig_cell};
     try fixture.changed.ensureTotalCapacity(allocator, cells.len);
+    var churn: ?RegistryChurn = if (code.registry == .churned) try RegistryChurn.init(allocator, cells, result_count) else null;
+    defer if (churn) |*registry_churn| registry_churn.deinit(allocator);
     fixtures.setNavTuners(&fixture.system, case);
     try fixture.fillCache(case, thread_ptr);
+    if (churn) |*registry_churn| try registry_churn.run(io, &fixture, case, thread_ptr);
 
     for (0..options.warmup_iterations) |_| {
         _ = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_ptr);
         _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
+        if (churn) |*registry_churn| try registry_churn.run(io, &fixture, case, thread_ptr);
     }
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = EvictReport{};
@@ -241,6 +255,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         report.add(reaction);
         _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
+        if (churn) |*registry_churn| try registry_churn.run(io, &fixture, case, thread_ptr);
     }
     report.print(options, evict_group.name, item_count, case);
     // The size config charges no long block.
@@ -256,6 +271,56 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.patch_batch);
     return stats;
 }
+
+// Churn rounds before each timed reaction, and the cells each round digs.
+const churn_rounds: usize = 4;
+const churn_cells_per_round: usize = 256;
+const churn_seed: u64 = 0x63_68_75_72;
+
+// Publish/evict churn over the region's route rows: each round digs a seeded random set of
+// those cells in one step (evicting the results routed through them), reopens them, and
+// re-solves every evicted result, so the registry's runs are rebuilt from released entries.
+const RegistryChurn = struct {
+    // The region's cells on some result's route, shuffled per round.
+    candidates: []CellCoord,
+    prng: std.Random.DefaultPrng,
+
+    fn init(allocator: std.mem.Allocator, region_cells: []const CellCoord, result_count: usize) !RegistryChurn {
+        // Route rows: goals from row 8, each start one row below its goal.
+        const last_route_row = 8 + @divCeil(result_count, short_route_columns);
+        var count: usize = 0;
+        for (region_cells) |cell| {
+            if (cell.y >= 8 and cell.y <= last_route_row) count += 1;
+        }
+        if (count < churn_cells_per_round) return error.EvictChurnTooFewRouteCells;
+        const candidates = try allocator.alloc(CellCoord, count);
+        count = 0;
+        for (region_cells) |cell| {
+            if (cell.y < 8 or cell.y > last_route_row) continue;
+            candidates[count] = cell;
+            count += 1;
+        }
+        return .{ .candidates = candidates, .prng = std.Random.DefaultPrng.init(churn_seed) };
+    }
+
+    fn deinit(self: *RegistryChurn, allocator: std.mem.Allocator) void {
+        allocator.free(self.candidates);
+        self.* = undefined;
+    }
+
+    // Untimed churn rounds; `fixture.changed` was reserved for the region, which holds every
+    // candidate.
+    fn run(self: *RegistryChurn, io: std.Io, fixture: *ReactFixture, case: suite.BenchmarkCase, thread_system: ?*ThreadSystem) !void {
+        std.debug.assert(fixture.changed.capacity >= churn_cells_per_round);
+        for (0..churn_rounds) |_| {
+            self.prng.random().shuffle(CellCoord, self.candidates);
+            const cells = self.candidates[0..churn_cells_per_round];
+            _ = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
+            _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
+            try fixture.fillCache(case, thread_system);
+        }
+    }
+};
 
 const elastic_ramp_steps: usize = 64;
 

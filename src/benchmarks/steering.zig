@@ -10,14 +10,21 @@
 //! capture, and sync), the steering post-commit reaction, and one steering step for a fixed
 //! agent population, with the static count as its item count; the cost model expects it flat
 //! in the static count. `steering-static-dense` times one steering step for a fixed agent
-//! population among chunks holding the item count of statics each. Each reports the main
-//! thread's share: the iteration minus its off-main stage time.
+//! population among chunks holding a count of statics each; its item code names the
+//! statics' layout and that count. The `chunk_ordered` layout creates the statics chunk by
+//! chunk; `interleaved` creates the same statics in a seeded shuffled order, so consecutive
+//! statics land in different chunks; `churned` builds the chunk-ordered statics, then
+//! destroys a seeded random half and recreates them at the same places through the commit
+//! seam (collider capture and sync). Each reports the main thread's share: the iteration
+//! minus its off-main stage time.
 //!
 //! Pass shape: `steering` and the three layout groups linear in agents, the tuned case
 //! judged against its controls; `steering-static-change` flat in statics;
-//! `steering-static-dense` linear in statics per chunk. Asserts check that every agent
-//! writes a movement intent, that the static groups sample statics, and that
-//! `steering-static-dense` repeats its first step's obstacle visits and samples.
+//! `steering-static-dense` linear in statics per chunk, and the `interleaved` and `churned`
+//! layouts' time per agent within spread of `chunk_ordered` at the same count. Asserts
+//! check that every agent writes a movement intent, that the static groups sample statics,
+//! and that `steering-static-dense` repeats its first step's obstacle visits and samples
+//! and, when churned, that every destroy and recreate commits and syncs.
 //!
 //! The agent groups print `avoidance_checks=`, `samples=`, and `intents=`;
 //! `steering-static-change` prints `obstacle_checks=` and `obstacle_samples=`;
@@ -35,6 +42,7 @@ const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
+const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const NavigationIntent = @import("../game/simulation.zig").NavigationIntent;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
@@ -89,7 +97,7 @@ pub const static_change_group = suite.BenchmarkGroup{
 
 pub const static_dense_group = suite.BenchmarkGroup{
     .name = "steering-static-dense",
-    .item_label = "statics per chunk",
+    .item_label = StaticDenseCode.label,
     .defaultItemCounts = staticDenseItemCounts,
     .runCase = runStaticDenseCase,
     .write_workload = writeStaticDenseWorkload,
@@ -610,21 +618,12 @@ fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thre
     const frame = &fixture.steering.frame;
     const colliders = &fixture.steering.colliders;
     const target = if (fixture.at_second) fixture.mover_positions[0] else fixture.mover_positions[1];
-    try frame.structural_commands.prepareRangeCounts(1);
-    frame.structural_commands.addCount(0, 1);
-    try frame.structural_commands.prefix();
-    var writer = frame.structural_commands.rangeWriter(0);
-    writer.write(.{ .set_movement_body = .{
+    const move = [_]StructuralCommand{.{ .set_movement_body = .{
         .entity = fixture.mover,
         .body = .{ .position = target, .previous_position = target, .velocity = .{}, .speed = 0 },
-    } });
-    writer.finish();
-    frame.structural_commands.finishWrite();
-    try colliders.reserveForCommit(&fixture.steering.data, 1);
-    const commit = try frame.applyStructuralCommandsBudgeted(&fixture.steering.data, .{});
+    } }};
+    const commit = try fixtures.commitThroughColliderSeam(frame, &fixture.steering.data, colliders, &move, if (case.usesThreadSystem()) thread_system else null);
     if (commit.components_set != 1) return error.StaticMoveNotApplied;
-    colliders.capture(frame);
-    try colliders.sync(&fixture.steering.data, if (case.usesThreadSystem()) thread_system else null);
     if (colliders.changesThisStep().len != 1) return error.StaticChangeNotSynced;
     fixture.at_second = !fixture.at_second;
     system.reactToPostCommitSteeringEvents(frame);
@@ -639,9 +638,20 @@ fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thre
 // Static dense: a fixed agent population among chunks dense with statics.
 // ----------------------------------------------------------------------------
 
-const static_dense_counts = [_]usize{ 4, 16, 64 };
+const StaticDenseLayout = enum(u8) { chunk_ordered, interleaved, churned };
+const StaticDenseCode = suite.ItemCode(struct { layout: StaticDenseLayout, statics_per_chunk: usize }, &.{3});
+
+// The chunk-ordered layout at each count, then the other layouts at the largest.
+const static_dense_counts = [_]usize{
+    StaticDenseCode.of(.{ .layout = .chunk_ordered, .statics_per_chunk = 4 }),
+    StaticDenseCode.of(.{ .layout = .chunk_ordered, .statics_per_chunk = 16 }),
+    StaticDenseCode.of(.{ .layout = .chunk_ordered, .statics_per_chunk = 64 }),
+    StaticDenseCode.of(.{ .layout = .interleaved, .statics_per_chunk = 64 }),
+    StaticDenseCode.of(.{ .layout = .churned, .statics_per_chunk = 64 }),
+};
 // Fixed agent population; the threaded case dispatches the steering stage to workers at it.
 const static_dense_agent_count: usize = 4096;
+const static_dense_shuffle_seed: u64 = 0x73_74_61_74;
 
 const StaticDenseFixture = struct {
     steering: Fixture,
@@ -661,8 +671,9 @@ fn staticDenseItemCounts(_: suite.Profile) []const usize {
 
 // `statics_per_chunk` statics in every chunk the agent grid overlaps, each centered in its slot
 // of a square slot grid spanning the chunk, so every chunk the agents query holds exactly
-// `statics_per_chunk` statics and no static crosses a chunk edge.
-fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usize) !StaticDenseFixture {
+// `statics_per_chunk` statics and no static crosses a chunk edge. `layout` sets the order the
+// statics are created in and whether half are churned through the commit seam.
+fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usize, layout: StaticDenseLayout) !StaticDenseFixture {
     if (statics_per_chunk == 0) return error.NoStatics;
     const slot_side = std.math.sqrt(statics_per_chunk - 1) + 1;
     std.debug.assert(slot_side * slot_side >= statics_per_chunk);
@@ -700,6 +711,9 @@ fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usi
     defer allocator.free(per_chunk_tally);
     @memset(per_chunk_tally, 0);
 
+    // Every static's position, chunk by chunk.
+    const positions = try allocator.alloc(math.Vec2, chunk_count * statics_per_chunk);
+    defer allocator.free(positions);
     const slot_inset = (slot_pitch - static_size) * 0.5;
     for (0..chunk_count) |chunk_index| {
         const chunk_x = @as(f32, @floatFromInt(chunk_index % chunks_per_axis)) * chunk_px;
@@ -717,18 +731,24 @@ fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usi
             if (min_chunk_x != max_chunk_x or min_chunk_y != max_chunk_y) return error.StaticCrossesChunk;
             if (min_chunk_x >= chunks_per_axis or min_chunk_y >= chunks_per_axis) return error.StaticOutsideAgentChunks;
             per_chunk_tally[min_chunk_y * chunks_per_axis + min_chunk_x] += 1;
-            _ = try addStatic(&data, position);
+            positions[chunk_index * statics_per_chunk + slot] = position;
         }
     }
     for (per_chunk_tally) |tally| {
         if (tally != statics_per_chunk) return error.WrongStaticsPerChunk;
     }
+    var prng = std.Random.DefaultPrng.init(static_dense_shuffle_seed);
+    if (layout == .interleaved) prng.random().shuffle(math.Vec2, positions);
+    const statics = try allocator.alloc(EntityId, positions.len);
+    defer allocator.free(statics);
+    for (statics, positions) |*entity, position| entity.* = try addStatic(&data, position);
 
     const nav_extent = @as(f32, @floatFromInt(chunks_per_axis)) * chunk_px;
-    try pathfinding.rebuildStaticNavGrid(&data, nav_extent, nav_extent, nav_cell_size);
     var colliders = try buildColliders(allocator, &data, &pathfinding, nav_extent, nav_extent);
     errdefer colliders.deinit();
+    if (layout == .churned) try churnStatics(allocator, &data, &colliders, statics, positions, prng.random());
     if (colliders.rowCount() != chunk_count * statics_per_chunk) return error.WrongStaticCount;
+    try pathfinding.rebuildStaticNavGrid(&data, nav_extent, nav_extent, nav_cell_size);
 
     return .{ .steering = .{
         .data = data,
@@ -739,15 +759,70 @@ fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usi
     } };
 }
 
+// Destroys a `random` half of `statics` (at `positions`) in one commit, then recreates them
+// at the same places in another, each through the commit seam with the collider capture and
+// sync, as play does; `statics` is left holding the live ids.
+fn churnStatics(
+    allocator: std.mem.Allocator,
+    data: *DataSystem,
+    colliders: *StaticColliderSystem,
+    statics: []EntityId,
+    positions: []const math.Vec2,
+    random: std.Random,
+) !void {
+    const order = try allocator.alloc(usize, statics.len);
+    defer allocator.free(order);
+    for (order, 0..) |*slot, index| slot.* = index;
+    random.shuffle(usize, order);
+    const churned = order[0 .. statics.len / 2];
+    const commands = try allocator.alloc(StructuralCommand, churned.len);
+    defer allocator.free(commands);
+    var frame = SimulationFrame.init(allocator);
+    defer frame.deinit();
+    // A create emits its entity event and one per component (body, bounds, response).
+    try frame.reserveStreams(1, churned.len * 4, 0, 0, 0, churned.len);
+
+    for (commands, churned) |*command, index| command.* = .{ .destroy_entity = statics[index] };
+    try churnCommit(&frame, data, colliders, commands);
+    if (colliders.rowCount() != statics.len - churned.len) return error.StaticDestroysMissing;
+
+    for (commands, churned) |*command, index| command.* = .{ .create_entity = .{
+        .movement_body = .{ .position = positions[index], .previous_position = positions[index], .velocity = .{}, .speed = 0 },
+        .collision_bounds = .{ .size = .{ .x = static_size, .y = static_size } },
+        .collision_response = .{ .mode = .solid, .mobility = .static, .restitution = 0 },
+    } };
+    try churnCommit(&frame, data, colliders, commands);
+    var created: usize = 0;
+    for (frame.structural_changes_scratch.items) |change| switch (change) {
+        .entity_created => |entity| {
+            statics[churned[created]] = entity;
+            created += 1;
+        },
+        else => {},
+    };
+    if (created != churned.len) return error.StaticRecreatesMissing;
+}
+
+// `commands` as one step's commit through the seam; fails unless every command changed a
+// static.
+fn churnCommit(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, commands: []const StructuralCommand) !void {
+    frame.beginStep();
+    _ = try fixtures.commitThroughColliderSeam(frame, data, colliders, commands, null);
+    if (colliders.changesThisStep().len != commands.len) return error.StaticChurnNotSynced;
+}
+
 fn runStaticDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const code = try StaticDenseCode.decode(item_count);
 
-    var fixture = try createStaticDenseFixture(allocator, item_count);
+    var fixture = try createStaticDenseFixture(allocator, code.statics_per_chunk, code.layout);
     defer fixture.deinit(allocator);
-    const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, prepareStaticDense, staticDenseOnce);
+    const measured = try measureCase(allocator, io, options, case, code.statics_per_chunk, &fixture.steering, &fixture, prepareStaticDense, staticDenseOnce);
     var stats = measured.stats;
     stats.candidate_pairs = measured.last.obstacle_candidate_checks;
     stats.sample_count = measured.last.obstacle_samples;
+    // The header names the config; throughput stays per static per chunk.
+    stats.item_count = item_count;
     return stats;
 }
 

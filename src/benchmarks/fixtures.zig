@@ -3,8 +3,8 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Fixture builders shared by the bench groups: a case's thread system, bodies, request
-//! streams, the world tileset and banded worlds, a 4-connected flood, a stride shuffle, and
-//! the nav reaction's tuner setup.
+//! streams, a commit through the static-collider seam, the world tileset and banded worlds,
+//! a 4-connected flood, a stride shuffle, and the nav reaction's tuner setup.
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -18,8 +18,12 @@ const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const CollisionResponseMobility = @import("../game/data_system.zig").CollisionResponseMobility;
+const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
+const StructuralCommitStats = @import("../game/data_system.zig").StructuralCommitStats;
 const PathRequest = @import("../game/simulation.zig").PathRequest;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
+const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const level_z_step = @import("../game/world/system.zig").level_z_step;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
@@ -55,6 +59,32 @@ pub fn addBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, mobility
     try data.setCollisionBounds(entity, .{ .size = size });
     try data.setCollisionResponse(entity, .{ .mobility = mobility });
     return entity;
+}
+
+/// One structural commit through the static-collider seam, in the pipeline's order:
+/// `commands` written as one range of `frame`'s structural commands, the collider reserve,
+/// the commit, then the collider capture and sync (its splice stages on `thread_system`
+/// when set). Runs in `frame`'s current step, whose structural commands are empty; the
+/// step's changes stay in the frame for the caller.
+pub fn commitThroughColliderSeam(
+    frame: *SimulationFrame,
+    data: *DataSystem,
+    colliders: *StaticColliderSystem,
+    commands: []const StructuralCommand,
+    thread_system: ?*ThreadSystem,
+) !StructuralCommitStats {
+    try frame.structural_commands.prepareRangeCounts(1);
+    frame.structural_commands.addCount(0, commands.len);
+    try frame.structural_commands.prefix();
+    var writer = frame.structural_commands.rangeWriter(0);
+    for (commands) |command| writer.write(command);
+    writer.finish();
+    frame.structural_commands.finishWrite();
+    try colliders.reserveForCommit(data, commands.len);
+    const stats = try frame.applyStructuralCommands(data);
+    colliders.capture(frame);
+    try colliders.sync(data, thread_system);
+    return stats;
 }
 
 /// Writes `requests` as one range, replacing the stream's contents.
