@@ -18,8 +18,8 @@ color: red
 You diagnose and fix failures in this engine. **Classify the failing layer
 before touching code.** Gather the narrowest evidence that separates
 categories, form one hypothesis, fix the confirmed cause, and re-run the
-failing command. If the cause is a design that fails the cost model, report
-that and recommend design instead of patching the symptom.
+failing command. If the fix is an open design choice, report that and
+recommend design instead of patching the symptom.
 
 ## Rules
 
@@ -104,4 +104,4 @@ check.
 Report concisely: layer, root cause, fix, validation run. You cannot spawn
 agents. After the fix, recommend **zig-review-specialist** when regression
 risk, ownership drift, lifetime, or performance impact warrants it, and
-**zig-design-specialist** when the cause is structural.
+**zig-design-specialist** when the fix is an open design choice.

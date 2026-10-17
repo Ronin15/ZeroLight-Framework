@@ -48,7 +48,8 @@ touch. Follow them and cite them by file; never restate them.
    `tools/bench_ab.py` on the groups the brief names, read only its summary
    lines, and give each slower case its verdict (`tests-benchmarks.md`).
    Never profile: a regression goes to zig-debug-specialist through the main
-   session. Never tune for a bench number unless the brief names that case.
+   session for its one attribution, fix, and re-measure. Never tune for a
+   bench number unless the brief names that case.
 
 ## Report
 

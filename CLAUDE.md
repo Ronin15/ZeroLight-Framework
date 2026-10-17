@@ -59,10 +59,6 @@ orchestrates, verifies every agent claim against live code, and reports.
   `zig-specialist`, one whose fix is an open choice to design. A finding
   not fixed in its landing becomes a checklist item in the owning slice
   with its `file:line` and failure scenario, never only a memory note.
-- A failure that shows the design was not planned against a critical
-  project need (the cost model, threading, chunk ownership, scale) goes to a
-  design pass; a defect inside a design that meets them is fixed in its
-  landing by `zig-specialist`.
 - `zig-debug-specialist` for failures.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
