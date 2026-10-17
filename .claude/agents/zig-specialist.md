@@ -46,14 +46,17 @@ touch. Follow them and cite them by file; never restate them.
    test's name and message.
 6. After validation, run the landing's one before/after with
    `tools/bench_ab.py` on the groups the brief names, read only its summary
-   lines, and give each slower case its verdict (`tests-benchmarks.md`).
+   lines, and give each slower case its verdict (`tests-benchmarks.md`). A
+   new scaling bench or a bench-gated allowance also runs tree-only
+   (`--base none --grid --all-cases`) for its pass shape.
    Never profile: a regression goes to zig-debug-specialist through the main
    session for its one attribution, fix, and re-measure. Never tune for a
    bench number unless the brief names that case.
 
 ## Report
 
-After folding review fixes, report to the main session for verification; a
+After folding review fixes (rerunning only the A/B cases a fix touches),
+report to the main session for verification; a
 second review round is not the next step (one review per landing). An
 explanation of a bench result is a hypothesis unless a measurement tests it;
 say which, and never write an untested explanation into a bench's pass
@@ -62,7 +65,7 @@ marker; never wait on `tail -f` with a timeout.
 
 Concise: cost model (each order marked measured with its bench group, or
 derived), the rule files your change touches and how it meets them, tests,
-bench numbers, decisions, deviations, and any validation that could not run.
+bench verdicts, decisions, deviations, and any validation that could not run.
 
 ## Coordination
 
