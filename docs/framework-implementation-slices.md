@@ -308,8 +308,8 @@ roadmap flow (Suggested Order) resumes after the AI branch.
      query group doc and off-main asserts (review 2 and 3, code L2); comments
      and module doc (code L9, review 4 and 9); cell-radius overflow (review
      5); empty-build tail (review 7); the docs commit's foundation,
-     changelog, 68A cross-edit, and DW fields (docs M3, M12, L12, L13, code
-     L10); done in the tree (code L1, L6).
+     changelog, 68A cross-edit, one place per explanation, and DW fields
+     (docs M3, M12, L3, L4, L12, L13, code L10); done in the tree (code L1, L6).
    - 86: sweep order and proxy gather (contiguity H2); static-collider lists
      (contiguity H3); path registry lists (contiguity L1).
    - 85: steering grid level key (contiguity H1, code H2); the vectorized

@@ -231,6 +231,18 @@ that does not grow with them.
       removed the tables and added the carry
       (`simulation_pipeline.zig:200`). Pass: 68A's foundation matches the
       landed index, and its carry item records that 84 landed it.
+- [ ] Docs commit: one place per explanation (docs audit L3, L4; owner
+      2026-10-16: "you just are sloping the docs up otherwise"). Failure:
+      bench_ab's behavior is explained in DW:733-745, `tools/README.md:47-70`,
+      the `tools/bench_ab.py` docstring, and `CLAUDE.md:98`; configure-cache
+      poisoning in `docs/setup.md:66-71`, DW:165-172, and DW:345; the CPU
+      floor mapping in DW:73-79 and the bench_ab docstring (`:33`); and
+      DW:519-560 restates each bench group doc (for example
+      `src/benchmarks/production_step.zig:5-12`). Failure scenario: one copy
+      changes and the others drift. Pass: `tools/README.md` holds bench_ab's
+      behavior, DW the CPU floor and the configure cache, and each group doc
+      its pass shape; the others cite them. `CLAUDE.md` is the owner's to
+      edit.
 - [ ] Docs commit: DW's callgrind refusal list (docs audit L12). Failure:
       DW:366 says the build refuses "a non-Linux target", but `build.zig:801`
       also refuses a non-Linux host and a foreign-arch target. Pass: "a
