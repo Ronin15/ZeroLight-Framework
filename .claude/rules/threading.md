@@ -22,8 +22,11 @@ How the thread system works: `docs/architecture.md` § Thread System.
   commit seam.
 - Every threaded stage ships a serial path with identical results and parity
   tests in its first implementation, under a named owner with immutable inputs
-  and owned outputs. Running inline below the tuner's gate is a measured
-  choice, not a violation, as long as the threaded path exists.
+  and owned outputs. The serial path is the stage's own function run inline
+  (no workers), the path production takes below the tuner's gate, never a
+  separate entry only tests or benches call. Running inline below the
+  tuner's gate is a measured choice, not a violation, as long as the threaded
+  path exists.
 
 ## Building a stage
 

@@ -26,9 +26,13 @@ paths:
 - Full procedural world-building paths run only when under test, at
   most 16x16 tiles and 1 underground level. A growth or scale test may use a
   larger populated world, or more levels, built directly.
-- Production APIs carry no test-only tags, payloads, fields, stages, hooks,
-  shortcuts, or paths; tests use private helpers, fixtures, mocks, or real
-  payloads.
+- Tests and benches never shape production code. Production modules carry no
+  test- or bench-only entry points, tags, payloads, fields, stages, hooks,
+  shortcuts, or paths, and production never does work only so it can be
+  measured or checked. Tests and benches drive the production functions and
+  use private helpers, fixtures, mocks, or real payloads; diagnostic
+  counters production keeps for measurement compile to nothing in shipping
+  builds (`zig-style.md` § Logging).
 - Tests never time anything and never call `src/benchmarks/` (except the
   shared harness's tests of its own pure utilities); bench-fixture
   correctness relies on internal asserts firing during a real bench run.
@@ -59,8 +63,9 @@ paths:
   alters a bench's fixture or input order, the base code also runs on the
   new fixture; the like-for-like gap is the code's. A constant is material
   when it moves the stage's total beyond the run-to-run spread at the
-  bench's sizes. A threaded stage is judged on its
-  `thread-adaptive-tuned-range` case (the production tuner) against its base;
+  bench's sizes. A bench's serial case runs the production function inline
+  (no workers), never a separate serial entry. A threaded stage is judged on
+  its `thread-adaptive-tuned-range` case (the production tuner) against its base;
   the other cases are controls, and the tuned case matches or beats the best
   of them within spread. The tuned case's report says which path is
   production at a size: where it runs inline, the serial path is production
