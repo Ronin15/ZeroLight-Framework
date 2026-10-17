@@ -1005,14 +1005,24 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, i
         break :blk e;
     };
 
-    const body = data.movementBodyPtr(entity).?;
-    body.snapZ(world.levelBaseZ(spec.world_level));
+    try placeSpawnedMover(data, world, entity, false);
+    return entity;
+}
+
+/// Places a just-created movement row on its `world_level` (the surface without one): its
+/// render z at that level's base and its scope metadata (cognition tier, the chunk under its
+/// position, that level, `always_active` as given). Returns `error.InvalidEntity` for a row
+/// with no movement body.
+pub fn placeSpawnedMover(data: *DataSystem, world: *const WorldSystem, entity: EntityId, always_active: bool) !void {
+    const body = data.movementBodyPtr(entity) orelse return error.InvalidEntity;
+    const level = data.worldLevelConst(entity) orelse 0;
+    body.snapZ(world.levelBaseZ(level));
     try data.setSimulationMetadata(entity, .{
         .tier = .cognition,
-        .chunk = world.chunkCoordForWorldPos(spec.position.x, spec.position.y),
-        .level = spec.world_level,
+        .chunk = world.chunkCoordForWorldPos(body.position_x.*, body.position_y.*),
+        .level = level,
+        .always_active = always_active,
     });
-    return entity;
 }
 
 fn demoVelocityForIndex(index: usize) math.Vec2 {

@@ -59,6 +59,7 @@ const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const SteeringAgent = @import("../game/data_system.zig").SteeringAgent;
 const DigConfig = @import("../game/dig_controller.zig").DigConfig;
 const GameDemoState = @import("../game/game_demo_state.zig").GameDemoState;
+const placeSpawnedMover = @import("../game/game_demo_state.zig").placeSpawnedMover;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
@@ -259,9 +260,9 @@ fn crowdPosition(slot: usize, slots: usize, level_px: f32) math.Vec2 {
     };
 }
 
-// Commits the population as one batch through the production applier, then sets each new
-// row's render z and simulation metadata as the demo spawn does, and grows the pipeline
-// at the population seam.
+// Commits the population as one batch through the production applier, then places each new
+// row on its level through the demo spawn's `placeSpawnedMover`, and grows the pipeline at
+// the population seam.
 fn spawnPopulation(allocator: std.mem.Allocator, state: *GameDemoState, fields: StepFields) !void {
     const level_px = state.world.worldWidthPixels();
     const rows_per_agent = @as(usize, fields.inert_per_agent) + 1;
@@ -303,19 +304,9 @@ fn spawnPopulation(allocator: std.mem.Allocator, state: *GameDemoState, fields: 
     _ = try state.data.applyStructuralCommands(commands.items);
     const movement = state.data.movementBodySliceConst();
     std.debug.assert(movement.entities.len == rows_before + row_count);
-    for (movement.entities[rows_before..]) |entity| {
-        const body = state.data.movementBodyConst(entity).?;
-        const level = state.data.worldLevelConst(entity) orelse 0;
-        state.data.movementBodyPtr(entity).?.snapZ(state.world.levelBaseZ(level));
-        // `stacked` rows are `always_active`, so every level's crowd is indexed and its AI rows
-        // think.
-        try state.data.setSimulationMetadata(entity, .{
-            .tier = .cognition,
-            .chunk = state.world.chunkCoordForWorldPos(body.position.x, body.position.y),
-            .level = level,
-            .always_active = fields.shape == .stacked,
-        });
-    }
+    // `stacked` rows are `always_active`, so every level's crowd is indexed and its AI rows
+    // think.
+    for (movement.entities[rows_before..]) |entity| try placeSpawnedMover(&state.data, &state.world, entity, fields.shape == .stacked);
 
     // The observer stands at the footprint's centre.
     const player = state.data.movementBodyPtr(state.player.entity).?;
