@@ -11,9 +11,10 @@ paths:
 - Design data-first: name the data each hot loop reads and writes and the
   order it reads it, store it as dense SoA columns in that order (§ Dense
   SoA storage), and stream it in batches (§ SIMD and core math). Data is
-  grouped by its storage unit (the chunk `(level, cx, cy)`); within it,
-  keys a loop filters on (faction, kind) order the data ahead of position,
-  so a filtered loop reads contiguous runs it streams whole in SIMD lanes.
+  grouped by its storage unit where it has one (the chunk `(level, cx, cy)`
+  for terrain, nav, and spatial data); within it, keys a loop filters on
+  (level, faction, kind) order the data ahead of position, so a filtered
+  loop reads contiguous runs it streams whole in SIMD lanes.
 - A hot loop pays no per-item indirection: no pointer or linked-list walk,
   no read through an index permutation, no per-row lookup into another
   store. A stage that needs another store's columns gathers them once into
@@ -133,7 +134,8 @@ fn appendMalRow(
 - Use `simd.zig` helpers with a scalar tail for dense uniform float math over
   SoA columns; a loop whose results feed a lane consumer ends in one masked
   lane batch instead, so the consumer has one lane path. Prefer scalar for
-  tiny batches or simple logic.
+  tiny fixed-size batches or simple logic; short runs inside a population
+  loop are a layout problem, fixed in the layout (§ Data-oriented design).
 - Prefer scalar-to-`@Vector` loads unless an aligned load is measured and
   owned.
 - Judge per-agent and per-neighbor loops at target scale, never as "low count".
