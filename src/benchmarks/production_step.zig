@@ -5,31 +5,41 @@
 //! `production-step`: the production fixed step (`GameDemoState.update`: the pipeline, then
 //! the structural-commit seam) at one population, one axis moved at a time from a base of a
 //! spread population on a banded walkable world. Shapes: `spread` (a uniform grid over every
-//! level, the population split across levels) and `crowd` (a square at a fixed pitch around
-//! the observer, on the surface). The state is built through `initWithWorld` with no demo
-//! spawn and the production pathfinding defaults; the population is committed through the
-//! production structural applier and grown through the population seam.
+//! level, the population split across levels), `crowd` (a square at a fixed pitch around
+//! the observer, on the surface), and `stacked` (the same `crowd` square, archetype for
+//! archetype, on every level at the observer's x/y, every row `always_active` so every
+//! level is indexed and every AI row thinks every step). The state is built through
+//! `initWithWorld` with no demo spawn and the production pathfinding defaults; the population
+//! is committed through the production structural applier and grown through the population
+//! seam.
 //!
 //! Item code: `shape * 10^14 + inert per agent * 10^13 + level side * 10^9 + levels * 10^6 +
-//! population` (shape 0 `spread`, 1 `crowd`). The base is 4,096 `spread` agents at 1024² x 8
-//! levels; the axes are population 1,024 and 16,384 for each shape, levels 1 and 32, side 512
-//! and 2048, and 1 or 4 inert rows per agent.
+//! population` (shape 0 `spread`, 1 `crowd`, 2 `stacked`). The base is 4,096 `spread` agents
+//! at 1024² x 8 levels; the axes are population 1,024 and 16,384 for `spread` and `crowd`,
+//! levels 1 and 32, side 512 and 2048, 1 or 4 inert rows per agent, and `stacked` at 256
+//! agents per level on 1, 4, and 8 levels.
 //!
 //! Each sample binds a fresh runtime perf log: `main` is the step's wall time minus the
 //! off-main time of the logged batches that ran on workers (an upper bound: unlogged batches
 //! count as main), and `untimed` is the wall time no top-level stage timer holds. `tiers=`
 //! splits the rows by scope tier (cognition/locomotion/kinematic/dormant), `thinking=` counts
-//! the rows the AI stage ran, and `top_main=` names the three top-level stages with the most
-//! main time. `--details` adds `shared_tuner=` (the thread system's shared tuner after the
-//! run: phase, samples, settled windows), each top-level stage's `wall=`, `off_main=`, and
-//! `main=` with its batches' `threaded=` steps over the measured steps, the nested stage
-//! timers, and the census counters as means per step. ReleaseFast compiles the log out, so
-//! only the step total prints there.
+//! the rows the AI stage ran, `separation_per_thinking=` the AI separation candidate checks
+//! and neighbor samples per thinking row, and `top_main=` names the three top-level stages
+//! with the most main time. `--details` adds `shared_tuner=` (the thread system's shared
+//! tuner after the run: phase, samples, settled windows), each top-level stage's `wall=`,
+//! `off_main=`, and `main=` with its batches' `threaded=` steps over the measured steps, the
+//! nested stage timers, and the census counters as means per step. ReleaseFast compiles the
+//! log out, so only the step total prints there.
 //!
-//! Pass shape: step and main time linear in population for both shapes; in level side and in
-//! level count at a fixed population, every row advances at its tier and the cost per
-//! advancing row stays flat; flat in inert rows. Asserts check only the committed population
-//! and that every step finishes.
+//! Pass shape: step and main time linear in population for `spread` and `crowd`; in level
+//! side and in level count at a fixed population, every row advances at its tier and the cost
+//! per advancing row stays flat; flat in inert rows; `stacked` separation checks and samples
+//! per thinking row flat in levels, since a query reads only its own level. Asserts check
+//! the committed population and that every step finishes; on `stacked`, separation checks
+//! per thinking row within `check_bound=`, the most rows of one level any query's scan box
+//! holds at the measured steps' index input (the pre-measure snapshot, each row widened by
+//! the cells it crossed since; `drift=` is the most cells any row crossed per axis), and that
+//! bound below the query's check budget, so a query that also reads other levels fails it.
 
 const std = @import("std");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
@@ -49,6 +59,13 @@ const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const SteeringAgent = @import("../game/data_system.zig").SteeringAgent;
 const DigConfig = @import("../game/dig_controller.zig").DigConfig;
 const GameDemoState = @import("../game/game_demo_state.zig").GameDemoState;
+const DataSystem = @import("../game/data_system.zig").DataSystem;
+const EntityId = @import("../game/data_system.zig").EntityId;
+const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
+const separation_radius = @import("../game/systems/ai.zig").separation_radius;
+const boxAxisCells = @import("../game/systems/spatial_index.zig").boxAxisCells;
+const cellScanRadius = @import("../game/systems/spatial_index.zig").cellScanRadius;
+const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
@@ -67,7 +84,7 @@ pub const group = suite.BenchmarkGroup{
     .cases = &suite.serial_and_tuned_cases,
 };
 
-const StepShape = enum(u8) { spread, crowd };
+const StepShape = enum(u8) { spread, crowd, stacked };
 const StepFields = struct { shape: StepShape, inert_per_agent: u8, level_side: u16, levels: u16, population: u32 };
 const StepCode = suite.ItemCode(StepFields, &.{ 1, 4, 3, 6 });
 
@@ -93,6 +110,9 @@ const item_counts = [_]usize{
     baseWith(.{ .level_side = 2048 }),
     baseWith(.{ .inert_per_agent = 1 }),
     baseWith(.{ .inert_per_agent = 4 }),
+    baseWith(.{ .shape = .stacked, .levels = 1, .population = 256 }),
+    baseWith(.{ .shape = .stacked, .levels = 4, .population = 1_024 }),
+    baseWith(.{ .shape = .stacked, .levels = 8, .population = 2_048 }),
 };
 
 fn defaultItemCounts(_: suite.Profile) []const usize {
@@ -197,6 +217,7 @@ fn spreadPosition(slot: usize, slots_per_level: usize, level_px: f32) math.Vec2 
 // Placement of agent `agent` (`inert == null`) or its `inert`-th inert row. Spread: agents
 // round-robin over levels, each level a uniform grid holding its agents and their inert
 // rows interleaved. Crowd: a square at `crowd_pitch` centred on the level, all on level 0.
+// Stacked: agents fill level 0, then level 1, and on, each level the same centred square.
 fn placement(fields: StepFields, level_px: f32, agent: usize, inert: ?usize) Placement {
     const rows_per_agent = @as(usize, fields.inert_per_agent) + 1;
     const slot_in_agent: usize = if (inert) |index| index + 1 else 0;
@@ -209,17 +230,38 @@ fn placement(fields: StepFields, level_px: f32, agent: usize, inert: ?usize) Pla
                 .position = spreadPosition(slot, agents_per_level * rows_per_agent, level_px),
             };
         },
-        .crowd => {
-            const slots = @as(usize, fields.population) * rows_per_agent;
-            const side = suite.ceilSqrt(slots);
-            const slot = agent * rows_per_agent + slot_in_agent;
-            const origin = level_px * 0.5 - @as(f32, @floatFromInt(side)) * crowd_pitch * 0.5;
-            return .{ .level = 0, .position = .{
-                .x = origin + @as(f32, @floatFromInt(slot % side)) * crowd_pitch,
-                .y = origin + @as(f32, @floatFromInt(slot / side)) * crowd_pitch,
-            } };
+        .crowd => return .{
+            .level = 0,
+            .position = crowdPosition(agent * rows_per_agent + slot_in_agent, @as(usize, fields.population) * rows_per_agent, level_px),
+        },
+        .stacked => {
+            const agents_per_level = stackedAgentsPerLevel(fields);
+            return .{
+                .level = @intCast(agent / agents_per_level),
+                .position = crowdPosition((agent % agents_per_level) * rows_per_agent + slot_in_agent, agents_per_level * rows_per_agent, level_px),
+            };
         },
     }
+}
+
+// The index that picks agent `agent`'s archetype: its slot on its level for `stacked`, so
+// every level holds the same archetype at the same position; else the agent itself.
+fn archetypeSlot(fields: StepFields, agent: usize) usize {
+    return if (fields.shape == .stacked) agent % stackedAgentsPerLevel(fields) else agent;
+}
+
+fn stackedAgentsPerLevel(fields: StepFields) usize {
+    return (@as(usize, fields.population) + fields.levels - 1) / fields.levels;
+}
+
+// Row `slot` of `slots` in a square at `crowd_pitch` centred on a `level_px` square level.
+fn crowdPosition(slot: usize, slots: usize, level_px: f32) math.Vec2 {
+    const side = suite.ceilSqrt(slots);
+    const origin = level_px * 0.5 - @as(f32, @floatFromInt(side)) * crowd_pitch * 0.5;
+    return .{
+        .x = origin + @as(f32, @floatFromInt(slot % side)) * crowd_pitch,
+        .y = origin + @as(f32, @floatFromInt(slot / side)) * crowd_pitch,
+    };
 }
 
 // Commits the population as one batch through the production applier, then sets each new
@@ -233,7 +275,7 @@ fn spawnPopulation(allocator: std.mem.Allocator, state: *GameDemoState, fields: 
     defer commands.deinit(allocator);
     try commands.ensureTotalCapacity(allocator, row_count);
     for (0..fields.population) |agent| {
-        const bundle = state.archetype_catalog.bundleForId(archetype_ids[agent % archetype_ids.len]);
+        const bundle = state.archetype_catalog.bundleForId(archetype_ids[archetypeSlot(fields, agent) % archetype_ids.len]);
         const agent_place = placement(fields, level_px, agent, null);
         commands.appendAssumeCapacity(.{ .create_entity = .{
             .movement_body = .{ .position = agent_place.position, .previous_position = agent_place.position, .speed = agent_speed },
@@ -270,10 +312,13 @@ fn spawnPopulation(allocator: std.mem.Allocator, state: *GameDemoState, fields: 
         const body = state.data.movementBodyConst(entity).?;
         const level = state.data.worldLevelConst(entity) orelse 0;
         state.data.movementBodyPtr(entity).?.snapZ(state.world.levelBaseZ(level));
+        // `stacked` rows are `always_active`, so every level's crowd is indexed and its AI rows
+        // think.
         try state.data.setSimulationMetadata(entity, .{
             .tier = .cognition,
             .chunk = state.world.chunkCoordForWorldPos(body.position.x, body.position.y),
             .level = level,
+            .always_active = fields.shape == .stacked,
         });
     }
 
@@ -285,6 +330,175 @@ fn spawnPopulation(allocator: std.mem.Allocator, state: *GameDemoState, fields: 
     player.previous_y.* = level_px * 0.5;
 
     _ = try state.pipeline.syncPopulationCapacity(&state.simulation_frame, &state.data);
+}
+
+// Every movement row's level and the cells the index filed it under per axis, from the
+// pre-measure snapshot through the last measured step's build, for the `stacked` separation
+// check bound.
+const CellSpanRecord = struct {
+    const Span = struct { level: u16, min_x: u32, max_x: u32, min_y: u32, max_y: u32 };
+
+    // The movement rows at the snapshot, in row order; no row despawns here.
+    entities: []EntityId,
+    spans: std.MultiArrayList(Span),
+    cell_size: f32,
+    cells_x: u32,
+    cells_y: u32,
+
+    // Snapshots every row at the positions the next step's index build reads.
+    fn init(allocator: std.mem.Allocator, data: *const DataSystem, view: SpatialIndexView) !CellSpanRecord {
+        const movement = data.movementBodySliceConst();
+        const entities = try allocator.dupe(EntityId, movement.entities);
+        errdefer allocator.free(entities);
+        var spans: std.MultiArrayList(Span) = .empty;
+        errdefer spans.deinit(allocator);
+        try spans.resize(allocator, entities.len);
+        const columns = spans.slice();
+        for (entities, columns.items(.level)) |entity, *level| {
+            // The level the index files the row under.
+            level.* = (data.bodyLevelFaction(entity) orelse return error.PopulationRowLost).level orelse 0;
+        }
+        var record = CellSpanRecord{ .entities = entities, .spans = spans, .cell_size = view.cell_size, .cells_x = view.cells_x, .cells_y = view.cells_y };
+        @memset(columns.items(.min_x), std.math.maxInt(u32));
+        @memset(columns.items(.max_x), 0);
+        @memset(columns.items(.min_y), std.math.maxInt(u32));
+        @memset(columns.items(.max_y), 0);
+        record.widen(data);
+        return record;
+    }
+
+    fn deinit(self: *CellSpanRecord, allocator: std.mem.Allocator) void {
+        self.spans.deinit(allocator);
+        allocator.free(self.entities);
+        self.* = undefined;
+    }
+
+    // Widens each row's spans to the cells the next step's index build files it under, read
+    // from the dense previous-position columns (`SpatialIndexSystem`'s fill reads them) in
+    // row order.
+    fn widen(self: *CellSpanRecord, data: *const DataSystem) void {
+        const movement = data.movementBodySliceConst();
+        std.debug.assert(movement.entities.len == self.entities.len);
+        const columns = self.spans.slice();
+        for (movement.previous_x, movement.previous_y, columns.items(.min_x), columns.items(.max_x), columns.items(.min_y), columns.items(.max_y)) |x, y, *min_x, *max_x, *min_y, *max_y| {
+            const cell_x = math.worldPosToCell(x, self.cell_size, self.cells_x);
+            const cell_y = math.worldPosToCell(y, self.cell_size, self.cells_y);
+            min_x.* = @min(min_x.*, cell_x);
+            max_x.* = @max(max_x.*, cell_x);
+            min_y.* = @min(min_y.*, cell_y);
+            max_y.* = @max(max_y.*, cell_y);
+        }
+    }
+
+    fn expectRowsUnchanged(self: *const CellSpanRecord, data: *const DataSystem) !void {
+        const entities = data.movementBodySliceConst().entities;
+        if (entities.len != self.entities.len) return error.PopulationRowsChanged;
+        for (self.entities, entities) |snapshot, live| if (!snapshot.eql(live)) return error.PopulationRowsChanged;
+    }
+
+    // The most cells any row crossed on one axis since the snapshot.
+    fn maxDrift(self: *const CellSpanRecord) u32 {
+        const columns = self.spans.slice();
+        var most: u32 = 0;
+        for (columns.items(.min_x), columns.items(.max_x), columns.items(.min_y), columns.items(.max_y)) |min_x, max_x, min_y, max_y| most = @max(most, max_x - min_x, max_y - min_y);
+        return most;
+    }
+
+    // The most rows of one level whose spans reach one query's scan box of `scan_radius`
+    // cells. A row reaches the boxes of the query cells its spans' own boxes cover; per level,
+    // each row adds one over that rectangle of a difference table, whose summed-area pass
+    // gives every query cell its count.
+    fn oneLevelBoxBound(self: *const CellSpanRecord, allocator: std.mem.Allocator, levels: u16, scan_radius: u32) !usize {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const columns = self.spans.slice();
+        const row_levels = columns.items(.level);
+
+        // Rows bucketed by level: level l's rows are `by_level[level_starts[l]..level_starts[l + 1]]`.
+        const level_starts = try arena.alloc(usize, @as(usize, levels) + 1);
+        @memset(level_starts, 0);
+        for (row_levels) |level| {
+            if (level >= levels) return error.RowLevelPastWorld;
+            level_starts[level + 1] += 1;
+        }
+        for (1..level_starts.len) |level| level_starts[level] += level_starts[level - 1];
+        const cursors = try arena.dupe(usize, level_starts[0..levels]);
+        const by_level = try arena.alloc(u32, row_levels.len);
+        for (row_levels, 0..) |level, row| {
+            // Movement rows fit u32, as the index's population rows do.
+            by_level[cursors[level]] = @intCast(row);
+            cursors[level] += 1;
+        }
+
+        var most: usize = 0;
+        for (0..levels) |level| {
+            const rows = by_level[level_starts[level]..level_starts[level + 1]];
+            if (rows.len == 0) continue;
+            // The query cells any of the level's rows reaches, so the table covers only them.
+            var window = Reach{ .min_x = std.math.maxInt(u32), .max_x = 0, .min_y = std.math.maxInt(u32), .max_y = 0 };
+            for (rows) |row| {
+                const reach = self.reachOf(columns, row, scan_radius);
+                window = .{ .min_x = @min(window.min_x, reach.min_x), .max_x = @max(window.max_x, reach.max_x), .min_y = @min(window.min_y, reach.min_y), .max_y = @max(window.max_y, reach.max_y) };
+            }
+            const width: usize = window.max_x - window.min_x + 1;
+            const height: usize = window.max_y - window.min_y + 1;
+            const stride = width + 1;
+            const table = try arena.alloc(i32, stride * (height + 1));
+            @memset(table, 0);
+            for (rows) |row| {
+                const reach = self.reachOf(columns, row, scan_radius);
+                const x0: usize = reach.min_x - window.min_x;
+                const x1: usize = reach.max_x - window.min_x + 1;
+                const y0: usize = reach.min_y - window.min_y;
+                const y1: usize = reach.max_y - window.min_y + 1;
+                table[y0 * stride + x0] += 1;
+                table[y0 * stride + x1] -= 1;
+                table[y1 * stride + x0] -= 1;
+                table[y1 * stride + x1] += 1;
+            }
+            for (0..height) |y| {
+                for (0..width) |x| {
+                    var count = table[y * stride + x];
+                    if (x > 0) count += table[y * stride + x - 1];
+                    if (y > 0) count += table[(y - 1) * stride + x];
+                    if (x > 0 and y > 0) count -= table[(y - 1) * stride + x - 1];
+                    table[y * stride + x] = count;
+                    // A count of rows: non-negative.
+                    most = @max(most, @as(usize, @intCast(count)));
+                }
+            }
+        }
+        return most;
+    }
+
+    // Query cells `[min, max]` per axis whose scan box reaches a row's spans.
+    const Reach = struct { min_x: u32, max_x: u32, min_y: u32, max_y: u32 };
+
+    fn reachOf(self: *const CellSpanRecord, columns: std.MultiArrayList(Span).Slice, row: u32, scan_radius: u32) Reach {
+        return .{
+            .min_x = boxAxisCells(columns.items(.min_x)[row], scan_radius, self.cells_x).min,
+            .max_x = boxAxisCells(columns.items(.max_x)[row], scan_radius, self.cells_x).max,
+            .min_y = boxAxisCells(columns.items(.min_y)[row], scan_radius, self.cells_y).min,
+            .max_y = boxAxisCells(columns.items(.max_y)[row], scan_radius, self.cells_y).max,
+        };
+    }
+};
+
+// The `stacked` pass shape per config: separation checks per thinking row within the most
+// rows of one level any query's scan box holds, and that bound below the query's check
+// budget, so a query that also reads other levels fails it.
+fn checkStackedSeparation(allocator: std.mem.Allocator, summary: *suite.ProductionStepSummary, fields: StepFields, record: *const CellSpanRecord) !void {
+    const scan_radius: u32 = @intCast(cellScanRadius(separation_radius, record.cell_size));
+    const bound = try record.oneLevelBoxBound(allocator, fields.levels, scan_radius);
+    summary.separation_check_bound = bound;
+    summary.max_cell_drift = record.maxDrift();
+    if (bound >= max_separation_candidate_checks) return error.SeparationBoundAtCheckBudget;
+    // Census counters are floored per-step means of the same steps: a mean under the bound
+    // per thinking row stays under it with one more row.
+    const thinking = summary.metrics.get(.scope_ai_stage_entities);
+    if (thinking == 0) return error.NoThinkingRows;
+    if (summary.metrics.get(.ai_separation_candidate_checks) > (thinking + 1) * bound) return error.SeparationChecksPastOneLevel;
 }
 
 fn bodyVisual() PrimitiveVisual {
@@ -442,16 +656,30 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     for (0..warmup_steps) |_| _ = try step.run();
     var accumulator = suite.StatsAccumulator.init(item_count);
     var census = Census{};
-    for (0..options.iterations) |_| {
+    // Each measured step's queries read the index its build files from the positions the step
+    // before it left.
+    var span_record: ?CellSpanRecord = if (runtime_perf_log.enabled and fields.shape == .stacked)
+        try CellSpanRecord.init(allocator, &state.data, state.pipeline.spatial_index.view())
+    else
+        null;
+    defer if (span_record) |*record| record.deinit(allocator);
+    for (0..options.iterations) |iteration| {
         const step_ns = try step.run();
         accumulator.record(step_ns, .{});
         if (comptime runtime_perf_log.enabled) census.add(&step.perf_log, step_ns);
+        if (span_record) |*record| if (iteration + 1 < options.iterations) record.widen(&state.data);
     }
     var stats = accumulator.finish();
     stats.items_per_second = suite.itemsPerSecond(population, stats.mean_ns);
     stats.batch_carried = false;
     stats.output_count = population;
-    if (comptime runtime_perf_log.enabled) stats.production_step = census.finish(population, threads.adaptive_tuner.report());
+    if (comptime runtime_perf_log.enabled) {
+        stats.production_step = census.finish(population, threads.adaptive_tuner.report());
+        if (span_record) |*record| {
+            try record.expectRowsUnchanged(&state.data);
+            try checkStackedSeparation(allocator, &stats.production_step.?, fields, record);
+        }
+    }
     return stats;
 }
 
@@ -496,6 +724,12 @@ fn writeStepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.
         summary.metrics.get(.scope_dormant_entities),
         summary.metrics.get(.scope_ai_stage_entities),
     });
+    const thinking: f64 = @floatFromInt(@max(summary.metrics.get(.scope_ai_stage_entities), 1));
+    try writer.print(" separation_per_thinking={d:.2}/{d:.2}", .{
+        @as(f64, @floatFromInt(summary.metrics.get(.ai_separation_candidate_checks))) / thinking,
+        @as(f64, @floatFromInt(summary.metrics.get(.ai_separation_neighbor_samples))) / thinking,
+    });
+    if (summary.separation_check_bound) |bound| try writer.print(" check_bound={} drift={}", .{ bound, summary.max_cell_drift });
     var stage_buffer: [timing_count]Timing = undefined;
     const stages = stagesByMain(summary, &stage_buffer);
     try writer.writeAll(" top_main=");

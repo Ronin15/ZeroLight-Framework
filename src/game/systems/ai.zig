@@ -223,7 +223,7 @@ const AiRangeTally = struct {
     cohere_block_fills: usize = 0,
 };
 
-const separation_radius: f32 = 48.0;
+pub const separation_radius: f32 = 48.0;
 const max_separation_neighbors: u8 = 32;
 pub const max_separation_candidate_checks: u16 = 128;
 // Neighbors at or nearer than this squared distance add no separation.

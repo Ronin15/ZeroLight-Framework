@@ -228,7 +228,7 @@ pub const SpatialIndexView = struct {
     /// The population row each entry was indexed from.
     population_row: []const u32,
     /// Each entry's body's cognition phase at the build: `every_cognition_phase` for an
-    /// `always_active` body, else its stagger phase, at most `every_cognition_phase - 1`.
+    /// `always_active` body, else its stagger phase, below `cognition_stagger_n`.
     cognition_phase: []const u8,
     // Each populated cell's first entry in key order, then the entry count: cell c's entries
     // are `[cells[c], cells[c + 1])`.
@@ -389,15 +389,17 @@ const FactionBits = @FieldType(FactionSet, "bits");
 /// An entry's `cognition_phase` when its body thinks every step.
 pub const every_cognition_phase: u8 = std.math.maxInt(u8);
 
-// A body's cognition phase as the index stores it: a stagger phase is kept below
-// `every_cognition_phase`, where it still matches no stagger step.
+// A body's cognition phase as the index stores it. A stored stagger phase is below
+// `cognition_stagger_n` (`setSimulationMetadata` validates every write).
 fn cognitionPhase(always_active: bool, stagger_phase: u8) u8 {
-    return if (always_active) every_cognition_phase else @min(stagger_phase, every_cognition_phase - 1);
+    if (always_active) return every_cognition_phase;
+    std.debug.assert(stagger_phase < cognition_stagger_n);
+    return stagger_phase;
 }
 
 comptime {
-    // Every stagger step is below the clamp's ceiling, so a clamped phase matches none.
-    std.debug.assert(cognition_stagger_n <= every_cognition_phase - 1);
+    // No stagger phase reads as `every_cognition_phase`.
+    std.debug.assert(cognition_stagger_n < every_cognition_phase);
 }
 
 // Local rows 0 to 63: the domain `cellMajorSpan`'s row search bisects.
@@ -557,21 +559,35 @@ const QueryBox = struct {
         if (key == empty_key) return .{ .empty = true };
         const own_x: u32 = @truncate(key >> block_key_own_x_shift);
         const own_y: u32 = @truncate(key >> block_key_own_y_shift);
-        const scan_radius: i64 = @as(u32, @truncate(key >> block_key_box_shift));
+        const scan_radius: u32 = @truncate(key >> block_key_box_shift);
+        const box_x = boxAxisCells(own_x, scan_radius, view.cells_x);
+        const box_y = boxAxisCells(own_y, scan_radius, view.cells_y);
         return .{
             .empty = false,
             .level = @truncate(key >> block_key_level_shift),
             .wanted = .{ .mask = @truncate(key) },
             .own_x = own_x,
             .own_y = own_y,
-            // Widened, clamped to the grid, then narrowed.
-            .min_x = @intCast(@max(@as(i64, own_x) - scan_radius, 0)),
-            .max_x = @intCast(@min(@as(i64, own_x) + scan_radius, @as(i64, view.cells_x) - 1)),
-            .min_y = @intCast(@max(@as(i64, own_y) - scan_radius, 0)),
-            .max_y = @intCast(@min(@as(i64, own_y) + scan_radius, @as(i64, view.cells_y) - 1)),
+            .min_x = box_x.min,
+            .max_x = box_x.max,
+            .min_y = box_y.min,
+            .max_y = box_y.max,
         };
     }
 };
+
+/// Cells `[min, max]` of one grid axis.
+pub const AxisCells = struct { min: u32, max: u32 };
+
+/// The cells a query's scan box covers on one axis of `cells` grid cells: `scan_radius`
+/// cells either side of the query's own cell `own`, clamped to the grid.
+pub fn boxAxisCells(own: u32, scan_radius: u32, cells: u32) AxisCells {
+    // Widened, clamped to the grid, then narrowed.
+    return .{
+        .min = @intCast(@max(@as(i64, own) - scan_radius, 0)),
+        .max = @intCast(@min(@as(i64, own) + scan_radius, @as(i64, cells) - 1)),
+    };
+}
 
 // One (piece, faction)'s cells inside a box: entries `[start, end)`, in the own piece (the
 // cell row and chunk holding the query point) or not.
@@ -3213,6 +3229,14 @@ test "a self indexed in another piece than the query point's is a candidate" {
     const own_stats = testQuery(index, .{ .x = 5, .y = 5, .level = 0, .radius = 30, .max_candidate_checks = 64, .self = self }, &own);
     try testing.expectEqualSlices(EntityId, &.{other}, visitedEntities(index, &own, &visited));
     try testing.expectEqual(@as(u16, 1), own_stats.candidate_checks);
+}
+
+test "a scan box axis spans its radius either side of its cell, clamped to the grid" {
+    try testing.expectEqual(AxisCells{ .min = 3, .max = 7 }, boxAxisCells(5, 2, 32));
+    try testing.expectEqual(AxisCells{ .min = 0, .max = 3 }, boxAxisCells(1, 2, 32));
+    try testing.expectEqual(AxisCells{ .min = 29, .max = 31 }, boxAxisCells(31, 2, 32));
+    try testing.expectEqual(AxisCells{ .min = 4, .max = 4 }, boxAxisCells(4, 0, 32));
+    try testing.expectEqual(AxisCells{ .min = 0, .max = 3 }, boxAxisCells(2, std.math.maxInt(i32), 4));
 }
 
 test "a radius of 1e30 scans the whole level without overflow" {

@@ -544,6 +544,10 @@ pub const ProductionStepSummary = struct {
     batch_recorded_steps: std.enums.EnumArray(PerfBatchStage, usize) = .initFill(0),
     metrics: std.enums.EnumArray(PerfMetric, u64) = .initFill(0),
     shared_tuner: AdaptiveWorkReport = .{},
+    // A per-level shape's separation check bound per query and the most cells any row
+    // crossed on one axis over the steps it covers.
+    separation_check_bound: ?usize = null,
+    max_cell_drift: u32 = 0,
 };
 
 /// One world's create and destroy: each phase's mean time, the live bytes after each
