@@ -1,6 +1,6 @@
 ## Slice 61: Harvesting And World Resource Nodes
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 73](slice-73.md), [Slice 56](slice-56.md), [Slice 57](slice-57.md), [Slice 49](slice-49.md), [Slice 41](../archive/slice-41.md), [Slice 45](../archive/slice-45.md) · Before: [Slice 58](slice-58.md), [Slice 63](slice-63.md) · Track: [VoidLight port](../tracks/voidlight-port.md) · [Emergent AI](../tracks/emergent-ai.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](slice-88.md) (structural-share deferral), [Slice 73](slice-73.md), [Slice 56](slice-56.md), [Slice 57](slice-57.md), [Slice 49](slice-49.md), [Slice 41](../archive/slice-41.md), [Slice 45](../archive/slice-45.md) · Before: [Slice 58](slice-58.md), [Slice 63](slice-63.md) · Track: [VoidLight port](../tracks/voidlight-port.md) · [Emergent AI](../tracks/emergent-ai.md)
 
 **Status: not started.**
 
@@ -98,8 +98,10 @@ step's commit seam. No sessions, timers, or per-harvester state.
       visual refill under a fixed per-step budget.
 - [ ] `action_react` structural share re-derived for the largest claimant;
       capacity-limit test re-pinned.
-- [ ] Harvest commands (depletion, removal) past the structural share
-      use [Slice 88](slice-88.md)'s deferral (docs audit M7).
+- [ ] Harvest commands (depletion, removal) past the structural share defer
+      through [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an
+      over-share harvest burst defers and the step succeeds
+      (`.claude/rules/budgets-capacities.md`).
 - [ ] Affect-impulse substrate with per-producer budgets and the
       commit-seam drain; `FailingAllocator` proof.
 - [ ] `need` drive and `forage` behavior as Slice 73 content; forage

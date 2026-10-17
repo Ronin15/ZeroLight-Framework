@@ -1,4 +1,4 @@
-## Slice 35: AI And Steering Hot-Loop SIMD Restructure
+## Slice 35: AI Decision Math And World-Gate SIMD Restructure
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 55](slice-55.md), [Slice 52D](slice-52d.md) (archive [34](../archive/slice-34.md), [24](../archive/slice-24.md), [32](../archive/slice-32.md) landed) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
@@ -6,25 +6,17 @@
 `world_gate` items land first, on the core branch (Engine-Core Overhaul
 order), independent of 55 and 52D; the `world-gate` bench landed there.
 
-Goal: the scalar per-agent loops in AI decision math become SIMD kernels
-across agents (AI separation moved to [84](slice-84.md) and steering
-avoidance to [85](slice-85.md), which restructure those loops), so
-per-agent cognition and steering cost stays low at large populations in every
-world, bit-identical across scalar/SIMD and serial/threaded paths. It also
-lands `world_gate.apply` as a threaded SIMD range job with its serial path,
-and the `world-gate` bench that measures it.
+Goal: AI decision math (`decideDir`, wander/seek blend, normalize) runs as
+SIMD kernels across agents, so per-agent cognition cost stays low at large
+populations in every world, bit-identical across scalar/SIMD and
+serial/threaded paths. It also lands `world_gate.apply` as a threaded SIMD
+range job with its serial path, and the `world-gate` bench that measures it.
+AI separation's accumulate is [84](slice-84.md)'s and steering's agent
+avoidance [85](slice-85.md)'s.
 
 ### Current foundation
 
-- AI separation accumulation and `decideDir` (`src/game/systems/ai.zig`) and
-  steering agent avoidance (`accumulateAgentAvoidanceBounded`,
-  `src/game/systems/steering/avoidance.zig:360`) are scalar: sparse-index
-  gathers and per-element early exits. The obstacle push (`pushObstacles`,
-  `avoidance.zig:295`) is SIMD.
-- Fixed per-query budgets: `max_separation_neighbors` = 32 and
-  `max_separation_candidate_checks` = 128 (`ai.zig`);
-  `max_agent_candidate_checks` = 64, `max_obstacle_hits` = 64, and
-  `max_obstacle_work` = 512 (`steering/avoidance.zig:44-50`).
+- `decideDir` (`src/game/systems/ai.zig:788` at HEAD) is scalar.
 - Gather, rsqrt, normalize, sincos, and the packed-SoA-scratch idiom exist in
   `src/core/simd.zig` and `src/core/math.zig` (archive Slice 34).
 - `world_gate.apply` (`src/game/systems/world_gate.zig`, staged at
@@ -36,8 +28,6 @@ and the `world-gate` bench that measures it.
     bodies (linear).
   - `production-step` tuned, spread P 16,384: `clamp_bounds` 1.92 ms, all on
     main, about a fifth of a 9.8 ms step.
-- ReleaseSafe trend data at 2048 movers puts the avoidance batch near 0.40 ms
-  ([Scaling Gaps](../scaling-gaps.md); diagnostic, not a perf claim).
 
 ### Architecture notes
 
@@ -53,7 +43,7 @@ and the `world-gate` bench that measures it.
   implementation (`.claude/rules/threading.md`): the NPC bounds clamp and
   tile gate become one threaded SIMD range job over AI movement rows; the
   player gate stays scalar.
-- Composes with 55: 55 cuts the rows reaching decide and steering; 35 cuts
+- Composes with 55: 55 cuts the rows reaching decide; 35 cuts
   the per-row math.
 
 ### Checklist
@@ -79,9 +69,10 @@ and the `world-gate` bench that measures it.
 ### Acceptance checks
 
 - [ ] Every parity test passes, bit-stable across layouts.
-- [ ] The `ai` bench at three or more agent counts shows the
-      restructured paths winning at the large end and no regression at the
-      small end (`.claude/rules/tests-benchmarks.md`); `world-gate` covers
-      serial and threaded at the same body counts.
+- [ ] The `ai` bench at three or more agent counts shows no regression beyond
+      run-to-run spread (`.claude/rules/tests-benchmarks.md`); a SIMD gain
+      claim comes only from the targeted ReleaseFast run
+      (`.claude/rules/build-validation.md`); `world-gate` covers serial and
+      threaded at the same body counts.
 - [ ] The warmed proofs allocate nothing.
 - [ ] `zig build verify` passes.

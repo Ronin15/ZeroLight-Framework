@@ -1,6 +1,6 @@
 ## Slice 77: Explosions
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md), [Slice 76](slice-76.md) · Track: [Gameplay direction](../tracks/gameplay-direction.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](slice-88.md) (structural-share deferral), [Slice 64G](slice-64g.md), [Slice 76](slice-76.md) · Track: [Gameplay direction](../tracks/gameplay-direction.md)
 
 **Status: not started.** Owner direction 2026-10-09: explosions belong to
 the destructible controller.
@@ -49,8 +49,10 @@ up the same step.
       stage.
 - [ ] Entities in the region hit through deferred commands; required events
       reserved before the step.
-- [ ] Explosion entity commands past the structural share
-      use [Slice 88](slice-88.md)'s deferral (docs audit M7).
+- [ ] Explosion entity commands past the structural share defer through
+      [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an over-share
+      explosion defers its entity commands and the step succeeds
+      (`.claude/rules/budgets-capacities.md`).
 - [ ] Downstream reactions take an explosion without a per-cell event cap.
 - [ ] The explosion writer reserves its nav record before its write and records
       every applied write on every exit path, as the dig stage does.

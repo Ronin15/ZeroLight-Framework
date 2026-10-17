@@ -32,8 +32,11 @@ Steam Deck readiness; a build without it is unchanged.
 - Steam calls stay off workers (`.claude/rules/threading.md`).
 - No Steam state feeds simulation (`.claude/rules/simulation.md`
   § Determinism); simulation emits, Steam receives.
-- The callback pump and the service log nothing per frame in shipping
-  builds (`.claude/rules/zig-style.md` § Logging).
+- The callback pump and the service follow `.claude/rules/zig-style.md`
+  § Logging.
+- Controllers stay on SDL3's gamepad layer, never the Steam Input
+  action-set API (`.claude/rules/engine-design.md` § Ownership boundaries);
+  the service integrates only this checklist's features.
 
 ### Checklist
 
@@ -64,13 +67,6 @@ Steam Deck readiness; a build without it is unchanged.
 - [ ] Docs: `docs/development-workflow.md` (the build option, SDK setup,
       dev `steam_appid.txt` kept out of git); `docs/architecture.md` (the
       service).
-
-### Out of scope
-
-Not planned, with no owning slice: workshop and mods (no mod loading exists),
-Steam networking and lobbies, leaderboards, DLC and in-game purchases, and the
-Steam Input action-set API (SDL3's gamepad layer covers controllers). A slice
-is written for one only when the owner confirms it.
 
 ### Acceptance checks
 

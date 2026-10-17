@@ -1,6 +1,6 @@
 ## Slice 56: Health, Damage, And Combat Domain Controller
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 49](slice-49.md), [Slice 73](slice-73.md), [Slice 40](../archive/slice-40.md), [Slice 45](../archive/slice-45.md) · Track: [VoidLight port](../tracks/voidlight-port.md) · [Emergent AI](../tracks/emergent-ai.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](slice-88.md) (structural-share deferral), [Slice 49](slice-49.md), [Slice 73](slice-73.md), [Slice 40](../archive/slice-40.md), [Slice 45](../archive/slice-45.md) · Track: [VoidLight port](../tracks/voidlight-port.md) · [Emergent AI](../tracks/emergent-ai.md)
 
 **Status: not started.**
 
@@ -116,8 +116,10 @@ projectiles (56B), equipment modifiers (57), knockback and retaliation
       and kill caps with deterministic deferral of excess hits.
 - [ ] Combat events, stats, metrics, and event budget; pipeline-owned
       structural share for kills.
-- [ ] Kill commands past the structural share
-      use [Slice 88](slice-88.md)'s deferral (docs audit M7).
+- [ ] Kill commands past the structural share defer through
+      [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an over-share
+      kill burst defers and the step succeeds
+      (`.claude/rules/budgets-capacities.md`).
 - [ ] Affect damage signal through the watermark; undamaged rows
       bit-identical.
 - [ ] `Action.attack` bindings, routing tests, and capture latch (classified in 64B and saved in 46's `pipeline_history`).

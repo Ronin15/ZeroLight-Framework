@@ -85,7 +85,7 @@ sensing (Slice 55 rejects it).
       fields that described the pairing are deleted; pairing asserts added.
 - [ ] The think-set compact leaves main (contiguity audit, noticed in
       passing). Failure: `compactCognitionFromHalo`
-      (`src/game/systems/simulation_scope.zig:418-445`) resolves each halo
+      (`src/game/systems/simulation_scope.zig:418-444`) resolves each halo
       row's movement slot and tests its stagger phase on main, per-row work
       beyond an ordered merge (`.claude/rules/threading.md`). Failure
       scenario: once 75 indexes the whole population, main pays a slot

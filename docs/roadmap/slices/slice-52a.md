@@ -128,7 +128,7 @@ Linux and macOS; no shader compilers are needed for a normal build.
       excludes `.coff`; windows-gnu ReleaseFast `check` passes.
 - [ ] (added by Slice 66) "windows-gnu LTO links" on the upgrade re-check list.
 - [ ] The `addCallgrindBenchRun` doc comment points to
-      `docs/development-workflow.md § Profiling` (`build.zig:788`) (code
+      `docs/development-workflow.md § Profiling` (`build.zig:789`) (code
       audit L9, docs audit L14; `.claude/rules/zig-style.md` § Comments).
       Failure scenario: the section moves or is renamed, and the comment
       sends readers to nothing. Pass: the comment states the step's contract

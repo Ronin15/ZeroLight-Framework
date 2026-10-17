@@ -4,8 +4,10 @@
 
 **Status: not started.** Needs 52A's `-Dcpu-baseline` (until then the same
 commands work with `-Dcpu=x86_64_v2` / `-Dcpu=x86_64`). Land before Slice 35
-(its kernels are mask/select-heavy). If 49 lands first, re-baseline
-49's checksum goldens in the sin/cos commit.
+(its kernels are mask/select-heavy). 84's separation and 85's avoidance
+accumulates land earlier through `simd.zig`, bit-identical by their parity
+tests; this slice's codegen covers them when it lands. If 49 lands first,
+re-baseline 49's checksum goldens in the sin/cos commit.
 
 Goal: every `src/core/simd.zig` primitive lowers to the shortest libcall-free
 sequence the `ship` baseline offers and stays libcall-free on `compat`;

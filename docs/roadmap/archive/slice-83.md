@@ -1,6 +1,6 @@
 ## Slice 83: Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 50](slice-50.md) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 50](../slices/slice-50.md) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: landed on `core_systems` (`3c42b4f`, `176ed03`, `13e88ad`);
 `zig build verify` passes.** First on the core branch (owner 2026-10-16), so
@@ -53,5 +53,6 @@ no stage falls back to `ThreadSystem`'s shared tuner.
 ### Acceptance checks
 
 - [x] The splits change no test count or result (`3c42b4f`, `176ed03`).
-- [x] Touched stage groups within run-to-run spread (Debug A/B, `13e88ad`).
+- [x] Touched stage groups within run-to-run spread (Debug A/B of `13e88ad`
+      against `176ed03`).
 - [x] `zig build verify` passes at `13e88ad`.

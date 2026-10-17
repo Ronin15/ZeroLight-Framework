@@ -37,7 +37,7 @@ density.
 | movers (per step) | ~2000–2050 |
 
 Known costs inside the band: the full agent snapshot each cognition step
-(~0.33 ms), the avoidance batch (~0.40 ms; [Slice 35](slices/slice-35.md)),
+(~0.33 ms), the avoidance batch (~0.40 ms; [Slice 85](slices/slice-85.md)),
 and the collision gather (~0.09 ms).
 
 - [ ] **Collision full-sort under melee density.** Mid-pack soaks saw

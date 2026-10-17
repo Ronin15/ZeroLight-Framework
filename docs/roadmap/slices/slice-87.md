@@ -1,6 +1,6 @@
 ## Slice 87: Render Collect By Visible Chunks
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](slice-83.md) (sprite-prep tuner), [Slice 85](slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (sprite-prep tuner), [Slice 85](slice-85.md) and [Slice 35](slice-35.md)'s `world_gate` items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: not started.** Routed by the 64G combined review (area C). The
 render backend pass closes the core branch and comes after the collect moves,
@@ -51,11 +51,10 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
       more drawn. The visible rows are scattered over the movement store
       (append and swap-remove order, `data_system/movement.zig:168`), and
       collect resolves each row's level by slot (`render_prep.zig:400`)
-      before its chunk test (`:406`). Constraint (contiguity audit H4): the
-      per-visible-chunk source reads each (level, chunk)'s rows as one
-      contiguous run, from 84's index if 75 indexes the whole population or
-      from a chunk-owned row block; an intrusive per-chunk list fails the
-      same rule (`.claude/rules/memory-performance.md` § Dense SoA storage).
+      before its chunk test (`:407`). Constraint: the per-visible-chunk
+      source reads each (level, chunk)'s rows as one contiguous run
+      (contiguity audit H4; `.claude/rules/memory-performance.md`
+      § Data-oriented design); the source is this slice's design.
       Measured: `render-game-prep-offview` above. Pass: collect time and the
       record and command capacities flat in off-view rows (group doc); the
       shape asserts land with the fix.
@@ -68,26 +67,27 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
       rows newest-first per (level, chunk) through `chunk_next` and
       `chunk_prev` (`:191-192`) over one world-wide pool, and
       `walkWindowSparseTiles` (`world/render.zig:177`) walks each window
-      chunk's list, reading `cell_index` from scattered pool rows. Failure
-      scenario: while panning, every tile-edge crossing walks fragments, more
-      scattered after dig and build churn. Medium: bounded by the window, and
-      idle while the camera is still. Pass: the window walk reads each
-      chunk's sparse rows as one contiguous run; a churned
-      `render-sparse-window-pan` case matches the unchurned one.
+      chunk's list, reading `cell_index` from scattered pool rows;
+      `addSparseTile` appends in call order (`world/edit.zig:757-768`), so
+      worldgen order already interleaves chunks
+      (`.claude/rules/memory-performance.md` § Data-oriented design). Failure
+      scenario: the walk reruns whenever the window crosses a tile edge
+      (`world/system.zig:284-285`), walking fragments, more scattered after
+      dig and build churn. Pass: the window walk reads each chunk's sparse
+      rows as one contiguous run; churned and interleaved-creation
+      `render-sparse-window-pan` cases match a chunk-ordered one.
 - [ ] Render submit reads its records in sort order (contiguity audit M2).
       Failure: `DynamicScenePrep` sorts an index array, `sort_indices`, by
       (depth, sequence) (`render_prep.zig:278`), its comparator loading two
-      records per compare (`:738-741`), and submit reads
-      `records[record_index]` through it (`:527-530`); the sparse window
-      sorts row ids over three pool columns (`world/render.zig:230`), and
-      `emitSparseRange` reads each row by id (`:626`). Render submission is
-      a hot path, so its reads follow the sort order in memory
-      (`.claude/rules/memory-performance.md` § Hot paths, § Dense SoA
-      storage). Failure scenario: every frame reads the visible records out
-      of order, and the sort chases two records per compare. Pass: the sort
-      orders the records themselves, or packed keys carrying their payload,
-      and submit walks them in memory order; `render-game-prep` within
-      spread or faster.
+      records per compare (`:738-742`), and submit reads
+      `records[record_index]` through it (`:527-530`); the sparse window sorts
+      row ids over three pool columns (`world/render.zig:230`), and
+      `emitSparseRange` reads each row by id (`:631-635`)
+      (`.claude/rules/memory-performance.md` § Data-oriented design, § Hot
+      paths). Failure scenario: every frame reads the visible records out of
+      order, and the sort chases two records per compare. Pass: the dynamic
+      submit and the sparse emit each read their sorted rows in memory order;
+      `render-game-prep` within spread or faster.
 - [ ] Render backend pass, last on the core branch: the renderer, sprite
       batch, text, and GPU buffers, plus `src/render/camera.zig`,
       `debug_overlay.zig`, `fps_counter.zig`, and `resources.zig`, which no

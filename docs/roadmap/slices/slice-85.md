@@ -56,42 +56,45 @@ keeps the apply local.
       sorted by `(cell_y, cell_x, row)` (`:263`, `:339`), and
       `accumulateAgentAvoidanceBounded` counts each entry against
       `max_agent_candidate_checks` (64, `avoidance.zig:44`) at `:395`, before
-      its level gate at `:400`, then gathers 5 snapshot columns per
-      candidate through the row index (contiguity audit H1, code audit H2;
-      `.claude/rules/memory-performance.md` § Dense SoA storage). Failure
+      its level gate at `:400`, then reads 5 snapshot columns per candidate
+      through the row index (contiguity audit H1, code audit H2;
+      `.claude/rules/memory-performance.md` § Data-oriented design,
+      `.claude/rules/simulation.md` § Controllers and processors). Failure
       scenario (derived): a shaft of L levels with k agents per cell at the
-      same xy; with L·k > 64 the budget runs out on other-level rows, a
-      same-level neighbor gives no push, and bodies overlap; avoidance cost
-      per agent grows with L. Measured: `steering_grid` 0.59 ms above. Pass:
-      one sort per step in the `production-step` census; `steering` within
-      spread or faster; a levels axis on the `steering` bench with avoidance
-      samples and checks per agent flat in L; the fix is 84's index order,
-      never a level check added to this grid.
+      same xy; checks per agent grow with L up to the 64 cap, and with L·k >
+      64 the cap is spent on other-level rows, so a same-level neighbor gives
+      no avoidance push. Measured: `steering_grid` 0.59 ms above. Pass: one
+      sort per step in the `production-step` census; `steering` within spread
+      or faster; a levels axis on the `steering` bench with avoidance samples
+      and checks per agent flat in L.
 - [ ] A create or destroy invalidates only the cache entries it affects
       (`system.zig:747`). Failure scenario (derived): a spawn burst makes every
       steering row re-resolve its movement index that step, nanoseconds per
       row, threaded. Pass: a test that unrelated rows keep their cached
       index; a spawn-churn `steering` case flat in population for a fixed
       churn.
-- [ ] The agent avoidance accumulate is vectorized (moved from 35; docs
-      audit M9). Failure: `accumulateAgentAvoidanceBounded`
-      (`avoidance.zig:360`), which this slice rewrites onto 84's index, is
-      per-neighbor float math run scalar; a per-neighbor float loop is
-      SIMD-shaped, so the rewritten loop ships SIMD
-      (`.claude/rules/memory-performance.md` § SIMD and core math). Pass:
-      sampled neighbors gathered once into packed scratch sized from the
-      fixed per-query budgets, the force math through `simd.zig` helpers
-      with a scalar tail and the sampling bound as a mask; scalar/SIMD and
-      serial/threaded parity tests; a `FailingAllocator` proof over a
-      multi-worker step with agents at the full candidate cap.
-- [ ] Movement intents in movement-row order if the ordering costs less than
-      the apply gain. Failure scenario: `frame.intents` is written in
-      steering's selected order (`avoidance.zig:216`), so the apply resolves
-      each intent's movement row (`movement.zig:133`) and writes the rows
-      scattered (contiguity audit M3). Measured gain above (ReleaseFast
-      only; Debug numbers come first, `.claude/rules/build-validation.md`).
-      Pass: `movement-apply-intents` within spread of `-sorted`, with the
-      ordering cost counted in steering.
+- [ ] The agent avoidance accumulate is vectorized (moved from 35; docs audit
+      M9). Failure: `accumulateAgentAvoidanceBounded` (`avoidance.zig:360`),
+      which this slice rewrites onto 84's index, runs its per-neighbor float
+      math scalar with no verdict at the site; the rewritten loop is a
+      gather-bound per-agent loop, so it ships SIMD
+      (`.claude/rules/memory-performance.md` § Data-oriented design, § SIMD
+      and core math). Failure scenario: avoidance's per-neighbor math stays
+      scalar at population scale. Pass: the accumulate runs through `simd.zig`
+      with a scalar tail, bit-identical to its scalar form; scalar/SIMD and
+      serial/threaded parity tests; any scratch it reserves has a
+      `FailingAllocator` proof over the real multi-worker `ThreadSystem`
+      (`.claude/rules/memory-performance.md` § Allocator discipline).
+- [ ] Movement intents reach the apply in movement-row order. Failure
+      scenario: `frame.intents` is written in steering's selected order
+      (`avoidance.zig:216`), so the apply resolves each intent's movement row
+      (`movement.zig:133`) and writes the rows scattered (contiguity audit M3;
+      `.claude/rules/memory-performance.md` § Data-oriented design,
+      `.claude/rules/threading.md`). Measured gain above (ReleaseFast only;
+      Debug numbers come first, `.claude/rules/build-validation.md`). Pass:
+      the apply walks its intents in row order with no per-intent row lookup;
+      `movement-apply-intents` within spread of `-sorted`, with the ordering
+      cost counted in steering.
 - [ ] The whole subsystem checked against the cost model and the rules
       (owner 2026-10-16), not only the items above: every file in
       `src/game/systems/steering/` (selection, directions, avoidance, the

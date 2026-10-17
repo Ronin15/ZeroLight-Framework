@@ -1,8 +1,13 @@
 ## Slice 75: Far Simulation
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md), [Slice 73](slice-73.md) · Track: [Emergent AI](../tracks/emergent-ai.md)
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 64G](slice-64g.md); [Slice 73](slice-73.md) for its think-interval item; its core-branch items after [Slice 88](slice-88.md) (branch order) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: not started.**
+**Status: not started.** Its core-branch items (owner 2026-10-16; index,
+merged order 9b) are the inert-rows item and the tier mechanics: fidelity
+bands, every agent thinking at its band's cadence, whole-population index
+coverage, movement near full rate, and `dormant` for inert rows only. They
+need nothing from 73; 73's per-agent interval later takes the band as one
+input (Architecture notes).
 
 Goal: fidelity falls with distance from the observer (the camera focus, or
 a player when a game has one), and nothing that exists stops advancing.
@@ -44,9 +49,9 @@ Scope comes from one camera and puts far entities to sleep.
 - Full-active fallback: a world with no chunks yields no region, so no halo,
   stagger, or demotion applies and everything runs at full cost.
 - One observer, one view, one world (74).
-- Movement integrates every row (`src/game/systems/movement.zig:47`) and the
+- Movement integrates every row (`src/game/systems/movement.zig:49`) and the
   tier policy scans every row (`scanTierPolicy`,
-  `src/game/systems/simulation_scope.zig:689`), rows at rest included.
+  `src/game/systems/simulation_scope.zig:686`), rows at rest included.
 - Measured, `production-step` tuned (Debug, `5d5a089`):
   - At the base config (spread P 4,096, 1024², 8 levels), half the rows are
     dormant and 101 think per step. At L 32, 87% are dormant; at side
@@ -103,24 +108,22 @@ Scope comes from one camera and puts far entities to sleep.
 - [ ] Fidelity bands from the observer, including a lowest band for 74; the
       § Scope and tiers rule in `.claude/rules/simulation.md` updated in the
       same change.
-- [ ] Every agent thinks, at a tick 73's interval derives
-      with the band as an input; no agent is excluded from cognition by
-      distance.
+- [ ] Every agent thinks at its band's cadence; no agent is excluded from
+      cognition by distance.
+- [ ] 73's per-agent think interval takes the band as one input (after 73).
 - [ ] The spatial index covers the whole population in every band.
 - [ ] Movement and terrain gating near full rate in every band; collision
       fidelity per band set by the design pass.
 - [ ] `dormant` reserved for inert rows, which still advance (57 schedules
       item decay); agents are never dormant.
 - [ ] Rows at rest cost no per-step movement or tier-scan work
-      (`movement.zig:47`, `simulation_scope.zig:689`). Failure scenario: items
+      (`movement.zig:49`, `simulation_scope.zig:686`). Failure scenario: items
       and resource nodes at rest raise every step's cost (measured above).
       Pass: `production-step` flat in inert rows. Collision's share is
       [86](slice-86.md); render collect's is [87](slice-87.md).
-- [ ] Timers for the untimed stages, so the `production-step` census
-      attributes the 2–20% `untimed` share before a policy change: bench-only
-      (`--details`) timers, with a `runtime_perf_log` `BatchStage` only for a
-      stage its design names as a change path's cost driver
-      (`.claude/rules/threading.md`; docs audit L18).
+- [ ] Bench-only (`--details`) timers for the untimed stages, so the
+      `production-step` census attributes the 2–20% `untimed` share before
+      this slice's policy change (`.claude/rules/threading.md`).
 - [ ] A deterministic far-from-observer signal for 62's ambient
       recycling.
 - [ ] Far path requests over the whole-world nav within the fixed request

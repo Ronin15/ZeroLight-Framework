@@ -131,7 +131,7 @@ the [archive](framework-implementation-slices-archive.md).
 | Slice | Status | Open work (see the slice file for the full Checklist) |
 | --- | --- | --- |
 | [**33**](roadmap/slices/slice-33.md) | Landed (visual verification pending) | Data-Driven AI Archetypes And Debug Introspection |
-| [**35**](roadmap/slices/slice-35.md) | Not started | AI And Steering Hot-Loop SIMD Restructure — after 55, 52D |
+| [**35**](roadmap/slices/slice-35.md) | Not started | AI Decision Math And World-Gate SIMD Restructure — after 55, 52D |
 | [**38**](roadmap/slices/slice-38.md) | Not started | Elevation Above The Surface — after 64G |
 | [**42**](roadmap/slices/slice-42.md) | Not started | Affect Expansion — More Feelings, Coupling, And Mood — after 73, 56, 61, 59 |
 | [**43**](roadmap/slices/slice-43.md) | Landed (hardware verification pending) | SDL3 Gamepad/Controller Support |
@@ -149,15 +149,15 @@ the [archive](framework-implementation-slices-archive.md).
 | [**53B**](roadmap/slices/slice-53b.md) | Not started | UI Widget Toolkit, Menu Migration, And HUD Primitives — after 53A |
 | [**54**](roadmap/slices/slice-54.md) | Not started | Persistent Settings — after 53B, 52B |
 | [**55**](roadmap/slices/slice-55.md) | Not started | Cognition Think-Interval Coasting (Decision LOD) — after 73 |
-| [**56**](roadmap/slices/slice-56.md) | Not started | Health, Damage, And Combat Domain Controller — after 49, 73 |
+| [**56**](roadmap/slices/slice-56.md) | Not started | Health, Damage, And Combat Domain Controller — after 88, 49, 73 |
 | [**56B**](roadmap/slices/slice-56b.md) | Not started | Projectiles And Ranged Combat — after 56 |
-| [**57**](roadmap/slices/slice-57.md) | Not started | Items, Inventory, And Equipment — after 56, 49, 59 |
+| [**57**](roadmap/slices/slice-57.md) | Not started | Items, Inventory, And Equipment — after 88, 56, 49, 59 |
 | [**57B**](roadmap/slices/slice-57b.md) | Not started | Inventory And Equipment UI — after 53A, 53B, 57, 49 |
 | [**58**](roadmap/slices/slice-58.md) | Not started | Seeded Procedural World Generation — after 49, 57, 61, 64G |
 | [**59**](roadmap/slices/slice-59.md) | Not started | Game Time, Day/Night Cycle, Seasons, And Weather — after 49, 60 |
 | [**60**](roadmap/slices/slice-60.md) | Not started | Camera Behavior And Scene Composite Pass — after 49, 54, 70A |
-| [**61**](roadmap/slices/slice-61.md) | Not started | Harvesting And World Resource Nodes — after 73, 56, 57, 49 |
-| [**62**](roadmap/slices/slice-62.md) | Not started | NPC Population, Spawning, And Spawn Tables — after 49, 57, 58, 59, 63, 64G, 75 |
+| [**61**](roadmap/slices/slice-61.md) | Not started | Harvesting And World Resource Nodes — after 88, 73, 56, 57, 49 |
+| [**62**](roadmap/slices/slice-62.md) | Not started | NPC Population, Spawning, And Spawn Tables — after 88, 49, 57, 58, 59, 63, 64G, 75 |
 | [**63**](roadmap/slices/slice-63.md) | Not started | Social Relationships And Trade — after 73, 53B, 56, 57, 57B, 61 |
 | [**64A**](roadmap/slices/slice-64a.md) | Not started | Simulation-Invisible Pause, Float Min/Max Policy, And FP Environment Assertion — after 49, 52D |
 | [**64B**](roadmap/slices/slice-64b.md) | Not started | Simulation Checksum v2 — NaN-Canonical, Sectioned, Threaded, Pipeline-History Coverage — after 49, 50, 64A, 64G, 74 |
@@ -202,12 +202,11 @@ the [archive](framework-implementation-slices-archive.md).
 | [**73**](roadmap/slices/slice-73.md) | Not started | Data-Driven Cognition — after 49 |
 | [**74**](roadmap/slices/slice-74.md) | Not started | World Instances — after 64G, 49, 50, 75 |
 | [**75**](roadmap/slices/slice-75.md) | Not started | Far Simulation — after 64G, 73 |
-| [**76**](roadmap/slices/slice-76.md) | Not started | Cave-Ins — after 64G |
-| [**77**](roadmap/slices/slice-77.md) | Not started | Explosions — after 64G, 76 |
+| [**76**](roadmap/slices/slice-76.md) | Not started | Cave-Ins — after 64G, 88 |
+| [**77**](roadmap/slices/slice-77.md) | Not started | Explosions — after 64G, 76, 88 |
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
-| [**83**](roadmap/slices/slice-83.md) | Landed | Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners |
 | [**84**](roadmap/slices/slice-84.md) | Not started | Level-Aware Shared Neighbor Index — after 83 |
 | [**85**](roadmap/slices/slice-85.md) | Not started | Steering On The Shared Neighbor Index — after 84, 86 |
 | [**86**](roadmap/slices/slice-86.md) | Not started | Collision Subsystem Pass — after 83, 84 |
@@ -276,7 +275,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    finding, with its `file:line` re-checked there, its measured number, and
    its pass shape, lives in its slice. 83 landed (`3c42b4f`, `176ed03`,
    `13e88ad`; `verify` passes). Order:
-   [83](roadmap/slices/slice-83.md) prep →
+   [83](roadmap/archive/slice-83.md) prep →
    [84](roadmap/slices/slice-84.md) spatial index →
    [86](roadmap/slices/slice-86.md) collision →
    [85](roadmap/slices/slice-85.md) steering → tile gate
@@ -298,28 +297,29 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    - Collision, whole subsystem: 86.
    - Render backend pass: 87, last.
 
-   Items the 2026-10-16 audits routed here (`.claude/reports/audit-*.md`),
-   with the 84 chunk-index review's. Slice refs are as of the commit their
-   block names and are re-checked right before implementation
-   (`.claude/rules/engine-design.md` § Cost model).
+   Items the 2026-10-16 audits and the 84 chunk-index review routed here
+   (tags name findings in the local `.claude/reports/` audit files). Refs in
+   84's items describe its uncommitted landing; every ref is re-checked right
+   before implementation (`.claude/rules/engine-design.md` § Cost model).
    - 84: index order and its fragment paths (code H1, review 1 and 8);
-     cohere's check budget (code H1); carried stage inputs (code M1); the
-     vectorized separation accumulate, moved from 35 (code M4); scalar
-     reasons (code L7, review 6); bench base and off-main asserts (review 2
-     and 3, code L2); comments and module doc (code L9, review 4 and 9);
-     cell-radius overflow (review 5); empty-build tail (review 7); the docs
-     commit's foundation, 83 archive, changelog, 68A cross-edit, and DW
-     (docs M4, M12, L3, L4, L12, L13, code L10); done in the tree (code L1,
-     L6).
+     cohere's check budget (code H1); TSan before merge (review open
+     question); carried stage inputs (code M1); the vectorized separation
+     accumulate, moved from 35 (code M4); scalar reasons (code L7, review 6);
+     query group doc and off-main asserts (review 2 and 3, code L2); comments
+     and module doc (code L9, review 4 and 9); cell-radius overflow (review
+     5); empty-build tail (review 7); the docs commit's foundation,
+     changelog, 68A cross-edit, and DW fields (docs M3, M12, L12, L13, code
+     L10); done in the tree (code L1, L6).
    - 86: sweep order and proxy gather (contiguity H2); static-collider lists
-     (contiguity H3).
+     (contiguity H3); path registry lists (contiguity L1).
    - 85: steering grid level key (contiguity H1, code H2); the vectorized
      avoidance accumulate, moved from 35 (docs M9); intent order
      (contiguity M3).
    - 87: visible-chunk source (contiguity H4); sparse tile lists (contiguity
      M1); submit reads in sort order (contiguity M2); bench review tags
      (code L9).
-   - 88: DataSystem hot-pass contiguity (contiguity H5); structural-share
+   - 88: stagger phase overwritten at spawn (roadmap verify); DataSystem
+     hot-pass data layout (contiguity H5); structural-share
      deferral (docs M7); index and AI scratch sized by AI rows (code M2);
      perf-log policy (code L1); `production-step` OOM leak (code L3);
      `hotStoreCapacity` copies (code L8).
@@ -352,10 +352,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
 
    Coverage gaps (docs audit L5): `src/render/camera.zig`,
    `debug_overlay.zig`, `fps_counter.zig`, and `resources.zig` go to 87's
-   backend pass, and `src/core/logging.zig` to 88's kernels item. The file
-   lists above repeat each slice's whole-subsystem item, and "Item 4" repeats
-   branch item 4 below; the slices own the lists, so this map keeps slice
-   numbers only, trimmed when 84's docs commit edits this index.
+   backend pass, and `src/core/logging.zig` to 88's kernels item.
 3. **AI:** cognition, perception, memory, affect, sensory bus and interest
    markers, built on the core branch's final form.
 4. **Remaining layers, when normal roadmap flow resumes after the AI branch:**
@@ -443,7 +440,7 @@ order.
 2. **82** Split The World Module — landed (archived).
 3. **81** Split The Pathfinding Module — landed (archived).
 4. **50** Thread System Hardening (opens the core-systems branch) — landed on `core_systems`.
-5. **83** Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners — landed on `core_systems`.
+5. **83** Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners — landed on `core_systems` (archived).
 6. **84** Level-Aware Shared Neighbor Index — after 83 (core-systems branch).
 7. **86** Collision Subsystem Pass — after 83, 84 (core-systems branch).
 8. **85** Steering On The Shared Neighbor Index — after 84, 86 (core-systems branch).
@@ -452,11 +449,11 @@ order.
 9a. **88** DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87's collect items (core-systems branch).
 9b. **Inert rows** (86's and 75's items), then **75's tier mechanics** — after 88 (core-systems branch; the rest of 75 is line 14).
 9c. **87's render backend pass** — after 9b; closes the core-systems branch.
-10. **76** Cave-Ins — after 64G.
-11. **77** Explosions — after 64G, 76.
+10. **76** Cave-Ins — after 64G, 88.
+11. **77** Explosions — after 64G, 76, 88.
 12. **49** Session Seed And Determinism Checksum Harness — after 64G.
 13. **73** Data-Driven Cognition — after 49.
-14. **75** Far Simulation — after 64G, 73.
+14. **75** Far Simulation — after 64G, 73 (its core-branch items are line 9b).
 15. **74** World Instances — after 64G, 49, 50, 75.
 16. **52A** Release CPU Baseline, Toolchain Pins, Pinned SDL, Committed Shaders.
 17. **52B** Platform Packaging Layouts — after 52A.
@@ -464,7 +461,7 @@ order.
 19. **52D** SIMD Layer Codegen For The v2 Release Baseline — after 52A.
 20. **64A** Simulation-Invisible Pause, Float Min/Max Policy, And FP Environment Assertion — after 49, 52D.
 21. **55** Cognition Think-Interval Coasting (Decision LOD) — after 73.
-22. **35** AI And Steering Hot-Loop SIMD Restructure — after 55, 52D.
+22. **35** AI Decision Math And World-Gate SIMD Restructure — after 55, 52D.
 23. **51** Background Job Lane With Deterministic Step Handoff — after 49, 50, 64A.
 24. **65A** Thread-Shared Layout Consolidation And Background-Lane OS Priority — after 50, 51.
 25. **64B** Simulation Checksum v2 — NaN-Canonical, Sectioned, Threaded, Pipeline-History Coverage — after 49, 50, 64A, 64G, 74.
@@ -483,19 +480,19 @@ order.
 38. **67C** Save Slot Presentation — Thumbnails, Named Saves, And The Text-Input Widget — after 46, 60, 67A.
 39. **67E** Localization Roots — after 53B.
 40. **70B** Presentation Polish (Runtime Scene Resolution, Pad Zoom, Fade-Out, Sharp-Bilinear, Zoom Tween) — after 60, 54, 44.
-41. **56** Health, Damage, And Combat Domain Controller — after 49, 73.
+41. **56** Health, Damage, And Combat Domain Controller — after 88, 49, 73.
 42. **56B** Projectiles And Ranged Combat — after 56.
 43. **59** Game Time, Day/Night Cycle, Seasons, And Weather — after 49, 60.
-44. **57** Items, Inventory, And Equipment — after 56, 49, 59.
+44. **57** Items, Inventory, And Equipment — after 88, 56, 49, 59.
 45. **57B** Inventory And Equipment UI — after 53A, 53B, 57, 49.
 46. **69C** Time Skip — after 59, 49, 75, 64B, 67B, 67E, 57B.
 47. **38** Elevation Above The Surface — after 64G.
-48. **61** Harvesting And World Resource Nodes — after 73, 56, 57, 49.
+48. **61** Harvesting And World Resource Nodes — after 88, 73, 56, 57, 49.
 49. **58** Seeded Procedural World Generation — after 49, 57, 61, 64G.
 50. **65C** Streaming Worldgen On The Background Lane — after 58, 53B, 51, 74.
 51. **69B** Regional (Biome) Weather — after 58, 59, 60.
 52. **63** Social Relationships And Trade — after 73, 53B, 56, 57, 57B, 61.
-53. **62** NPC Population, Spawning, And Spawn Tables — after 49, 57, 58, 59, 63, 64G, 75.
+53. **62** NPC Population, Spawning, And Spawn Tables — after 88, 49, 57, 58, 59, 63, 64G, 75.
 54. **71A** AI Behavior Parity — Patrol, Follow, Guard — after 73, 55, 56, 61, 62, 63.
 55. **71B** Static Collider Index And Group-Field Prewarm — after 64G, 62, 71A.
 56. **71C** Cover-Aware Flee And Ranged Pursue (`cover` Interest Markers) — after 73, 56B.
