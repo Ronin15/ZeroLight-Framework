@@ -93,7 +93,7 @@ const StructuralCapacityNeeds = struct {
         if (self.world_levels > std.math.maxInt(u32)) return error.TooManyWorldLevelRows;
         if (self.factions > std.math.maxInt(u32)) return error.TooManyFactionRows;
         if (self.ai_perceptions > std.math.maxInt(u32)) return error.TooManyAiPerceptionRows;
-        if (self.ai_memories > std.math.maxInt(u32)) return error.TooManyAiMemoryRows;
+        if (self.ai_memories > std.math.maxInt(u32)) return error.OutOfMemory;
         if (self.ai_affects > std.math.maxInt(u32)) return error.TooManyAiAffectRows;
         if (self.destructibles > std.math.maxInt(u32)) return error.TooManyDestructibleRows;
     }
@@ -783,7 +783,7 @@ test "StructuralCapacityNeeds.validateLimits rejects an ai_perceptions count bey
     try std.testing.expectError(error.TooManyAiPerceptionRows, needs.validateLimits());
 }
 
-test "StructuralCapacityNeeds.validateLimits rejects an ai_memories count beyond u32" {
+test "StructuralCapacityNeeds.validateLimits fails an ai_memories count beyond u32 as OutOfMemory" {
     // Growing AiMemoryStore to u32-max rows is impractical to exercise for
     // real, so this proves the guard directly against the private capacity
     // struct rather than via an actual oversized store.
@@ -791,7 +791,7 @@ test "StructuralCapacityNeeds.validateLimits rejects an ai_memories count beyond
     try needs.validateLimits();
 
     needs.ai_memories = @as(usize, std.math.maxInt(u32)) + 1;
-    try std.testing.expectError(error.TooManyAiMemoryRows, needs.validateLimits());
+    try std.testing.expectError(error.OutOfMemory, needs.validateLimits());
 }
 
 test "StructuralCapacityNeeds.validateLimits rejects an ai_affects count beyond u32" {

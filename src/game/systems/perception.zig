@@ -9,17 +9,21 @@
 //! `PerceptionStore` row; `entity_perceived`/`entity_lost` events derive from the changes.
 //!
 //! Sign convention: the index hands `dx, dy = observer - candidate`;
-//! `PerceptionVisitor.visitLanes` buffers `to = candidate - observer`, which every later
-//! step reads.
+//! `PerceptionVisitor.visitLanes` keeps `to = candidate - observer`, which every later step
+//! reads.
 //!
-//! The FOV test needs `cos_half_fov >= 0` (`AiPerception` caps the half angle at pi/2).
+//! The FOV test needs `cos_half_fov >= 0` (`AiPerception` caps the half angle at pi/2). It
+//! runs in the query's lanes after the candidate cap, so only survivors leave the lanes.
 //!
-//! Scalar exceptions: the candidate compaction, the at most 17-survivor sort, and the LOS
+//! Scalar exceptions: the survivor compaction, the at most 17-survivor sort, and the LOS
 //! grid walk, each stated at its site.
 //!
-//! Threading: each range writes only its rows' `PerceptionStore` and `final_*` columns and
-//! its own padded stats slot; the main thread emits the events after the join in row order.
-//! Serial and threaded paths run the same `computePerceptionRange`.
+//! Threading: the gather writes each range's window of rows and main moves them together
+//! in range order; each compute range derives its rows' facing, then writes only its rows'
+//! `PerceptionStore` and `final_*` columns and its own padded stats slot; the main thread
+//! emits the events after the join in row order. Serial and threaded paths run the same
+//! jobs. A compute range keeps one neighbor block, walking each run of rows that share a
+//! cell, level, and faction once per distinct scan box.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -36,9 +40,11 @@ const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
-const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
-const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
+const SlotList = @import("../../app/thread_system.zig").SlotList;
+const compactRowWindows = @import("../../app/thread_system.zig").compactRowWindows;
+const setRowCount = @import("../../app/thread_system.zig").setRowCount;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
@@ -56,6 +62,8 @@ const SpatialIndexView = spatial_index_mod.SpatialIndexView;
 const NeighborLanes = spatial_index_mod.NeighborLanes;
 const LaneStop = spatial_index_mod.LaneStop;
 const capLanes = spatial_index_mod.capLanes;
+const cellScanRadius = spatial_index_mod.cellScanRadius;
+const FactionSet = @import("../faction.zig").FactionSet;
 
 pub const perception_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -76,13 +84,16 @@ const max_perception_candidates: u8 = 16;
 // (mirrors ai.zig's max_cohere_candidate_checks).
 const max_perception_candidate_checks: u16 = 64;
 const max_perception_scratch: usize = max_perception_candidates + 1; // + player
+// The budget's stream and self.
+const PerceptionBlock = spatial_index_mod.NeighborBlock(max_perception_candidate_checks + 1);
 
 // "Moving" gate for facing derivation: 1.0 units/sec, compared against
 // speed-squared so the dense pass never needs a sqrt to decide.
 const facing_speed_squared_threshold: f32 = 1.0;
 const facing_normalize_epsilon: f32 = 1.0e-6;
 
-const player_candidate_sentinel: usize = std.math.maxInt(usize);
+// Never an entry: entries are below maxInt(u32).
+const player_candidate_sentinel: u32 = std.math.maxInt(u32);
 
 const default_max_events_per_step: usize = 512;
 
@@ -142,9 +153,12 @@ pub const PerceptionStats = struct {
     // `ai_separation_candidate_checks`), the query's own traversal cost before the
     // radius and FOV tests that `sensed_count` follows.
     candidate_checks: usize = 0,
+    /// Neighbor-block fills, one per (row group, scan box) a range walks.
+    block_fills: usize = 0,
     perceived_events: usize = 0,
     lost_events: usize = 0,
     dropped_events: usize = 0,
+    gather_batch: BatchStats = .{},
     batch: BatchStats = .{},
 };
 
@@ -156,6 +170,9 @@ const PerceptionRangeStats = struct {
     los_blocked: usize = 0,
     // `PerceptionStats.candidate_checks` over this range's observers.
     candidate_checks: usize = 0,
+    block_fills: usize = 0,
+    // The gather's kept rows in this range's window.
+    kept: usize = 0,
     // Uncapped `entity_lost` + `entity_perceived` events this range's rows
     // will produce (`transitionEventCount`), counted by the worker on the row
     // it just wrote so the main-thread emit (`emitTransitionEvents`) knows the
@@ -174,6 +191,8 @@ const PerceptionGatherRow = struct {
     hearing_range: f32,
     faction: Faction,
     level: u16,
+    // The vision range's scan box half-width in index cells.
+    scan_box: u32,
     // This entity's own row in `PerceptionStore`, used only to write results back.
     perception_dense_index: usize,
     facing_x: f32,
@@ -184,41 +203,26 @@ const PerceptionGatherRow = struct {
     final_nearest_threat_generation: i32,
 };
 
-fn appendPerceptionGatherRow(
-    rows: *std.MultiArrayList(PerceptionGatherRow),
-    row_slice: *std.MultiArrayList(PerceptionGatherRow).Slice,
-    row: PerceptionGatherRow,
-) void {
-    _ = rows.addOneAssumeCapacity();
-    row_slice.len = rows.len;
-    row_slice.set(rows.len - 1, row);
-}
-
-const PerceptionRangeStatsSlot = struct {
-    // Each worker writes only its assigned slot, once, at the end of its
-    // range (see `PerceptionRangeStats`'s doc comment). Padding keeps that
-    // write off shared cache lines across concurrently running ranges.
-    stats: PerceptionRangeStats = .{},
-    padding: [paddingForCacheLine(PerceptionRangeStats)]u8 = @splat(0),
-};
-
-const PerceptionRangeStatsSlotList = std.array_list.Aligned(PerceptionRangeStatsSlot, .fromByteUnits(thread_shared_record_alignment));
+// Each range writes only its own padded slot, once, at the end of its range.
+const PerceptionRangeStatsSlot = PaddedSlot(PerceptionRangeStats);
 
 pub const PerceptionSystem = struct {
     allocator: std.mem.Allocator,
-    // Gathered work memory (main-thread only; workers read only copies in
-    // job context, except their own rows' `final_nearest_threat_*` columns
-    // and their own padded `range_stats` slot).
+    // Gathered work memory: the gather's ranges write their windows and main compacts them;
+    // compute ranges write only their own rows' facing and `final_nearest_threat_*` columns
+    // and their own padded `range_stats` slot.
     rows: std.MultiArrayList(PerceptionGatherRow) = .{},
-    range_stats: PerceptionRangeStatsSlotList = .empty,
+    range_stats: SlotList(PerceptionRangeStats) = .empty,
     /// Once-only flag for the emit-cap drop warn. The pipeline's derived share makes a
     /// drop impossible by construction; the cap and `dropped_events` stay as the
     /// shared-frame safety net.
     dropped_events_warned: bool = false,
+    gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
     compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
     pub fn init(allocator: std.mem.Allocator) PerceptionSystem {
         return .{
             .allocator = allocator,
+            .gather_tuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
             .compute_tuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
         };
     }
@@ -253,11 +257,9 @@ pub const PerceptionSystem = struct {
         config: PerceptionConfig,
     ) !PerceptionStats {
         const perception_slice = data.perceptionSlice();
-        try self.gatherPerceptionData(ai_agents, movement, data, perception_slice, config.scope_dense_indices);
+        const gather_batch = try self.gatherPerceptionData(.{ .ai_agents = ai_agents, .movement = movement, .data = data, .perception_slice = perception_slice, .scope_dense_indices = config.scope_dense_indices, .cell_size = spatial.cell_size }, thread_system, config);
         const observer_count = self.rows.len;
-        if (observer_count == 0) return .{ .candidate_population_count = spatial.entryCount() };
-
-        self.computeFacingDense(perception_slice);
+        if (observer_count == 0) return .{ .candidate_population_count = spatial.entryCount(), .gather_batch = gather_batch };
 
         const compute = Dispatch.init(thread_system, &self.compute_tuner, .{
             .items_per_range = config.items_per_range,
@@ -282,9 +284,11 @@ pub const PerceptionSystem = struct {
             .los_checks = totals.los_checks,
             .los_blocked = totals.los_blocked,
             .candidate_checks = totals.candidate_checks,
+            .block_fills = totals.block_fills,
             .perceived_events = merge.perceived,
             .lost_events = merge.lost,
             .dropped_events = merge.dropped,
+            .gather_batch = gather_batch,
             .batch = batch,
         };
     }
@@ -300,11 +304,9 @@ pub const PerceptionSystem = struct {
         config: PerceptionConfig,
     ) !PerceptionStats {
         const perception_slice = data.perceptionSlice();
-        try self.gatherPerceptionData(ai_agents, movement, data, perception_slice, config.scope_dense_indices);
+        try self.gatherPerceptionDataSerial(.{ .ai_agents = ai_agents, .movement = movement, .data = data, .perception_slice = perception_slice, .scope_dense_indices = config.scope_dense_indices, .cell_size = spatial.cell_size });
         const observer_count = self.rows.len;
         if (observer_count == 0) return .{ .candidate_population_count = spatial.entryCount() };
-
-        self.computeFacingDense(perception_slice);
 
         const range_count: usize = 1;
         try self.prepareRangeStats(range_count);
@@ -322,9 +324,11 @@ pub const PerceptionSystem = struct {
             .los_checks = totals.los_checks,
             .los_blocked = totals.los_blocked,
             .candidate_checks = totals.candidate_checks,
+            .block_fills = totals.block_fills,
             .perceived_events = merge.perceived,
             .lost_events = merge.lost,
             .dropped_events = merge.dropped,
+            .gather_batch = inlineBatch(observer_count, perception_range_alignment_items),
             .batch = inlineBatch(observer_count, perception_range_alignment_items),
         };
     }
@@ -343,12 +347,15 @@ pub const PerceptionSystem = struct {
             .entities = rows.items(.entity),
             .pos_x = rows.items(.pos_x),
             .pos_y = rows.items(.pos_y),
+            .velocity_x = rows.items(.velocity_x),
+            .velocity_y = rows.items(.velocity_y),
             .vision_range = rows.items(.vision_range),
             .cos_half_fov = rows.items(.cos_half_fov),
             .hearing_range = rows.items(.hearing_range),
             .stimuli = stimuli,
             .faction = rows.items(.faction),
             .level = rows.items(.level),
+            .scan_box = rows.items(.scan_box),
             .perception_dense_index = rows.items(.perception_dense_index),
             .facing_x = rows.items(.facing_x),
             .facing_y = rows.items(.facing_y),
@@ -364,93 +371,46 @@ pub const PerceptionSystem = struct {
         };
     }
 
-    // An observer row per think-set agent with a movement body and `AiPerception`. Scalar:
-    // dense-index lookups per row into the movement, perception, faction, and level stores,
-    // with skips.
-    fn gatherPerceptionData(
-        self: *PerceptionSystem,
-        ai_agents: ConstAiAgentSlice,
-        movement: ConstMovementBodySlice,
-        data: *const DataSystem,
-        perception_slice: PerceptionSlice,
-        scope_dense_indices: ?[]const u32,
-    ) !void {
-        self.clearWork();
-        const n = if (scope_dense_indices) |idx| idx.len else ai_agents.entities.len;
-        if (n == 0) return;
-        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
+    // The gather over the think rows on workers under `gather_tuner`: each range writes its
+    // observer rows' window, then main moves the windows together in range order.
+    fn gatherPerceptionData(self: *PerceptionSystem, inputs: PerceptionGatherInputs, thread_system: *ThreadSystem, config: PerceptionConfig) !BatchStats {
+        const n = try self.prepareGather(inputs);
+        if (n == 0) return .{};
+        const gather = Dispatch.init(thread_system, &self.gather_tuner, .{
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .adaptive = config.adaptive,
+        });
+        const selection = gather.select(n, perception_range_alignment_items);
+        try self.prepareRangeStats(selection.range_count);
+        var context = PerceptionGatherContext{ .inputs = inputs, .rows = self.rows.slice(), .items_per_range = selection.items_per_range, .range_stats = self.range_stats.items[0..selection.range_count] };
+        const batch = gather.run(selection, n, perception_range_alignment_items, &context, gatherPerceptionJob);
+        compactRowWindows(PerceptionGatherRow, PerceptionRangeStats, &self.rows, context.range_stats, selection.items_per_range);
+        return batch;
+    }
 
-        var row_slice = self.rows.slice();
-        for (0..n) |k| {
-            const i: usize = if (scope_dense_indices) |idx| idx[k] else k;
-            const ent = ai_agents.entities[i];
-            const mi = data.movementBodyDenseIndex(ent) orelse continue;
-            const perception_index = data.aiPerceptionDenseIndex(ent) orelse continue;
-            const prev_nearest = perception_slice.nearest_threat[perception_index];
-            appendPerceptionGatherRow(&self.rows, &row_slice, .{
-                .entity = ent,
-                .pos_x = movement.previous_x[mi],
-                .pos_y = movement.previous_y[mi],
-                .velocity_x = movement.velocity_x[mi],
-                .velocity_y = movement.velocity_y[mi],
-                .vision_range = perception_slice.vision_range[perception_index],
-                .cos_half_fov = perception_slice.cos_half_fov[perception_index],
-                .hearing_range = perception_slice.hearing_range[perception_index],
-                .faction = data.factionConst(ent) orelse .neutral,
-                .level = data.worldLevelConst(ent) orelse 0,
-                .perception_dense_index = perception_index,
-                .facing_x = perception_slice.facing_x[perception_index],
-                .facing_y = perception_slice.facing_y[perception_index],
-                .prev_nearest_threat_index = @bitCast(prev_nearest.index),
-                .prev_nearest_threat_generation = @bitCast(prev_nearest.generation),
-                .final_nearest_threat_index = invalid_index_bits,
-                .final_nearest_threat_generation = invalid_generation_bits,
-            });
-        }
+    // `gatherPerceptionData` as one range on the calling thread.
+    fn gatherPerceptionDataSerial(self: *PerceptionSystem, inputs: PerceptionGatherInputs) !void {
+        const n = try self.prepareGather(inputs);
+        if (n == 0) return;
+        try self.prepareRangeStats(1);
+        var context = PerceptionGatherContext{ .inputs = inputs, .rows = self.rows.slice(), .items_per_range = n, .range_stats = self.range_stats.items[0..1] };
+        gatherPerceptionJob(&context, .{ .index = 0, .start = 0, .end = n }, WorkerId.main);
+        compactRowWindows(PerceptionGatherRow, PerceptionRangeStats, &self.rows, context.range_stats, n);
+    }
+
+    // Sizes the rows to one window slot per think row before dispatch; returns the count.
+    fn prepareGather(self: *PerceptionSystem, inputs: PerceptionGatherInputs) !usize {
+        self.clearWork();
+        const n = inputs.rowCount();
+        if (n == 0) return 0;
+        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
+        setRowCount(PerceptionGatherRow, &self.rows, n);
+        return n;
     }
 
     fn clearWork(self: *PerceptionSystem) void {
         self.rows.clearRetainingCapacity();
-    }
-
-    /// Unit facing from each row's previous velocity, once on main before dispatch;
-    /// near-stationary rows keep their facing. Scalar scatter back into `PerceptionStore`.
-    fn computeFacingDense(self: *PerceptionSystem, perception_slice: PerceptionSlice) void {
-        const rows = self.rows.slice();
-        const n = rows.len;
-        const velocity_x = rows.items(.velocity_x);
-        const velocity_y = rows.items(.velocity_y);
-        const facing_x = rows.items(.facing_x);
-        const facing_y = rows.items(.facing_y);
-        const perception_dense_index = rows.items(.perception_dense_index);
-
-        var i: usize = 0;
-        const vend = simd.vectorizedEnd(n);
-        const threshold = simd.splatFloat4(facing_speed_squared_threshold);
-        while (i < vend) : (i += simd.lane_count) {
-            const vx = simd.loadFloat4(velocity_x[i..]);
-            const vy = simd.loadFloat4(velocity_y[i..]);
-            const prev_fx = simd.loadFloat4(facing_x[i..]);
-            const prev_fy = simd.loadFloat4(facing_y[i..]);
-            const speed2 = simd.lengthSquared2Float4(vx, vy);
-            const moving = simd.greaterThanFloat4(speed2, threshold);
-            const normalized = simd.normalizeOrZero2Float4(vx, vy, facing_normalize_epsilon);
-            const result_x = simd.selectFloat4(moving, normalized.x, prev_fx);
-            const result_y = simd.selectFloat4(moving, normalized.y, prev_fy);
-            simd.storeFloat4Slice(facing_x[i..], result_x);
-            simd.storeFloat4Slice(facing_y[i..], result_y);
-        }
-        while (i < n) : (i += 1) {
-            const result = computeFacingScalar(velocity_x[i], velocity_y[i], .{ .x = facing_x[i], .y = facing_y[i] });
-            facing_x[i] = result.x;
-            facing_y[i] = result.y;
-        }
-
-        for (0..n) |row_index| {
-            const dense = perception_dense_index[row_index];
-            perception_slice.facing_x[dense] = facing_x[row_index];
-            perception_slice.facing_y[dense] = facing_y[row_index];
-        }
     }
 
     // Sizes/resets `range_stats` to `range_count` slots before dispatch
@@ -459,18 +419,19 @@ pub const PerceptionSystem = struct {
     fn prepareRangeStats(self: *PerceptionSystem, range_count: usize) !void {
         try self.range_stats.ensureTotalCapacity(self.allocator, range_count);
         while (self.range_stats.items.len < range_count) self.range_stats.appendAssumeCapacity(.{});
-        for (self.range_stats.items[0..range_count]) |*slot| slot.stats = .{};
+        for (self.range_stats.items[0..range_count]) |*slot| slot.value = .{};
     }
 
     fn sumRangeStats(self: *const PerceptionSystem, range_count: usize) PerceptionRangeStats {
         var totals = PerceptionRangeStats{};
         for (self.range_stats.items[0..range_count]) |slot| {
-            totals.sensed_count += slot.stats.sensed_count;
-            totals.nearest_threat_found += slot.stats.nearest_threat_found;
-            totals.los_checks += slot.stats.los_checks;
-            totals.los_blocked += slot.stats.los_blocked;
-            totals.candidate_checks += slot.stats.candidate_checks;
-            totals.transition_events += slot.stats.transition_events;
+            totals.sensed_count += slot.value.sensed_count;
+            totals.nearest_threat_found += slot.value.nearest_threat_found;
+            totals.los_checks += slot.value.los_checks;
+            totals.los_blocked += slot.value.los_blocked;
+            totals.candidate_checks += slot.value.candidate_checks;
+            totals.block_fills += slot.value.block_fills;
+            totals.transition_events += slot.value.transition_events;
         }
         return totals;
     }
@@ -549,6 +510,78 @@ const PerceptionEventMergeResult = struct {
     dropped: usize,
 };
 
+// One step's perception gather inputs, read-only on every range.
+const PerceptionGatherInputs = struct {
+    ai_agents: ConstAiAgentSlice,
+    movement: ConstMovementBodySlice,
+    data: *const DataSystem,
+    perception_slice: PerceptionSlice,
+    scope_dense_indices: ?[]const u32,
+    // The index's cell, for each row's scan box.
+    cell_size: f32,
+
+    fn rowCount(self: *const PerceptionGatherInputs) usize {
+        return if (self.scope_dense_indices) |indices| indices.len else self.ai_agents.entities.len;
+    }
+
+    // Think row `k`'s observer row, or null without a movement body or `AiPerception`.
+    // Scalar per row: dense-index lookups into the movement, perception, faction, and level
+    // stores, with skips; threaded in windows.
+    fn gatherRow(self: *const PerceptionGatherInputs, k: usize) ?PerceptionGatherRow {
+        const i: usize = if (self.scope_dense_indices) |indices| indices[k] else k;
+        const ent = self.ai_agents.entities[i];
+        const mi = self.data.movementBodyDenseIndex(ent) orelse return null;
+        const perception_index = self.data.aiPerceptionDenseIndex(ent) orelse return null;
+        const perception = self.perception_slice;
+        const prev_nearest = perception.nearest_threat[perception_index];
+        const vision_range = perception.vision_range[perception_index];
+        return .{
+            .entity = ent,
+            .pos_x = self.movement.previous_x[mi],
+            .pos_y = self.movement.previous_y[mi],
+            .velocity_x = self.movement.velocity_x[mi],
+            .velocity_y = self.movement.velocity_y[mi],
+            .vision_range = vision_range,
+            .cos_half_fov = perception.cos_half_fov[perception_index],
+            .hearing_range = perception.hearing_range[perception_index],
+            .faction = self.data.factionConst(ent) orelse .neutral,
+            .level = self.data.worldLevelConst(ent) orelse 0,
+            // Non-negative: the vision range is at least 0.
+            .scan_box = @intCast(cellScanRadius(vision_range, self.cell_size)),
+            .perception_dense_index = perception_index,
+            .facing_x = perception.facing_x[perception_index],
+            .facing_y = perception.facing_y[perception_index],
+            .prev_nearest_threat_index = @bitCast(prev_nearest.index),
+            .prev_nearest_threat_generation = @bitCast(prev_nearest.generation),
+            .final_nearest_threat_index = invalid_index_bits,
+            .final_nearest_threat_generation = invalid_generation_bits,
+        };
+    }
+};
+
+const PerceptionGatherContext = struct {
+    inputs: PerceptionGatherInputs,
+    // `inputs.rowCount()` window slots: range r's kept rows from `r * items_per_range`.
+    rows: std.MultiArrayList(PerceptionGatherRow).Slice,
+    items_per_range: usize,
+    range_stats: []PerceptionRangeStatsSlot,
+};
+
+fn gatherPerceptionJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *PerceptionGatherContext = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.range_stats.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.rows.len and range.end <= job.inputs.rowCount());
+    var rows = job.rows;
+    var kept: usize = 0;
+    for (range.start..range.end) |k| {
+        const row = job.inputs.gatherRow(k) orelse continue;
+        rows.set(range.start + kept, row);
+        kept += 1;
+    }
+    job.range_stats[range.index].value = .{ .kept = kept };
+}
+
 fn computeFacingScalar(vx: f32, vy: f32, prev_facing: math.Vec2) math.Vec2 {
     const speed2 = vx * vx + vy * vy;
     if (speed2 <= facing_speed_squared_threshold) return prev_facing;
@@ -559,15 +592,19 @@ const PerceptionJobContext = struct {
     entities: []const EntityId,
     pos_x: []const f32,
     pos_y: []const f32,
+    velocity_x: []const f32,
+    velocity_y: []const f32,
     vision_range: []const f32,
     cos_half_fov: []const f32,
     hearing_range: []const f32,
     stimuli: []const WorldStimulus,
     faction: []const Faction,
     level: []const u16,
+    scan_box: []const u32,
     perception_dense_index: []const usize,
-    facing_x: []const f32,
-    facing_y: []const f32,
+    // Written by each compute range for its rows before their queries.
+    facing_x: []f32,
+    facing_y: []f32,
     prev_nearest_threat_index: []const i32,
     prev_nearest_threat_generation: []const i32,
     final_nearest_threat_index: []i32,
@@ -592,102 +629,150 @@ fn writePerceptionRangeJob(context: *anyopaque, range: ParallelRange, _: WorkerI
     computePerceptionRange(job, range);
 }
 
-/// One range's observers (`computeOneAgent`) and their transition-event tally, for the
-/// threaded dispatch and the serial single range alike.
+/// One range's observers and their transition-event tally, for the threaded dispatch and the
+/// serial single range alike: the rows' facing, then each run of rows sharing a cell, level,
+/// and faction, one pass per distinct scan box, so each (run, box) fills the range's
+/// block once.
 fn computePerceptionRange(job: *PerceptionJobContext, range: ParallelRange) void {
+    computeFacingRange(job, range.start, range.end);
     // Local accumulator, not a pointer into job.range_stats: only one write
     // (below) ever lands per range, so concurrently running ranges never
     // touch each other's slot mid-accumulation.
     var range_stats = PerceptionRangeStats{};
+    var block = PerceptionBlock{};
+    var group_start = range.start;
+    var group_key = if (range.start < range.end) observerCell(job, range.start) else undefined;
+    while (group_start < range.end) {
+        // The group's end, and the next group's key: one cell compute per row.
+        var group_end = group_start + 1;
+        var next_key = group_key;
+        while (group_end < range.end) : (group_end += 1) {
+            next_key = observerCell(job, group_end);
+            if (!std.mem.eql(u32, &next_key, &group_key)) break;
+        }
+        // Scalar: group control, u32 compares over the group's boxes.
+        var done: ?u32 = null;
+        while (true) {
+            var box: ?u32 = null;
+            for (job.scan_box[group_start..group_end]) |row_box| {
+                if (done != null and row_box <= done.?) continue;
+                if (box == null or row_box < box.?) box = row_box;
+            }
+            const next_box = box orelse break;
+            for (group_start..group_end) |row| {
+                if (job.scan_box[row] == next_box) computeOneAgent(job, row, &block, &range_stats);
+            }
+            done = next_box;
+        }
+        group_start = group_end;
+        group_key = next_key;
+    }
+    range_stats.block_fills = block.fills;
     for (range.start..range.end) |i| {
-        computeOneAgent(job, i, &range_stats);
         range_stats.transition_events += transitionEventCount(
             reconstructEntityId(job.prev_nearest_threat_index[i], job.prev_nearest_threat_generation[i]),
             reconstructEntityId(job.final_nearest_threat_index[i], job.final_nearest_threat_generation[i]),
         );
     }
-    job.range_stats[range.index].stats = range_stats;
+    job.range_stats[range.index].value = range_stats;
 }
 
-const CandidateScratch = struct {
-    candidate_index: [max_perception_scratch]usize = undefined,
+// A row's (level, index cell, faction): rows equal in it query one neighborhood's hostiles.
+fn observerCell(job: *const PerceptionJobContext, row: usize) [4]u32 {
+    const spatial = job.spatial;
+    return .{
+        job.level[row],
+        math.worldPosToCell(job.pos_x[row], spatial.cell_size, spatial.cells_x),
+        math.worldPosToCell(job.pos_y[row], spatial.cell_size, spatial.cells_y),
+        @intCast(FactionSet.Indexer.indexOf(job.faction[row])),
+    };
+}
+
+/// Unit facing from each row of `[start, end)`'s previous velocity, written to the row and
+/// scattered into `PerceptionStore`; near-stationary rows keep their facing. Ranges start on
+/// `perception_range_alignment_items`, so the lane batches and the tail match a whole pass.
+fn computeFacingRange(job: *PerceptionJobContext, start: usize, end: usize) void {
+    std.debug.assert(start <= end and end <= job.facing_x.len);
+    var i = start;
+    const vend = start + simd.vectorizedEnd(end - start);
+    const threshold = simd.splatFloat4(facing_speed_squared_threshold);
+    while (i < vend) : (i += simd.lane_count) {
+        const vx = simd.loadFloat4(job.velocity_x[i..]);
+        const vy = simd.loadFloat4(job.velocity_y[i..]);
+        const prev_fx = simd.loadFloat4(job.facing_x[i..]);
+        const prev_fy = simd.loadFloat4(job.facing_y[i..]);
+        const speed2 = simd.lengthSquared2Float4(vx, vy);
+        const moving = simd.greaterThanFloat4(speed2, threshold);
+        const normalized = simd.normalizeOrZero2Float4(vx, vy, facing_normalize_epsilon);
+        simd.storeFloat4Slice(job.facing_x[i..], simd.selectFloat4(moving, normalized.x, prev_fx));
+        simd.storeFloat4Slice(job.facing_y[i..], simd.selectFloat4(moving, normalized.y, prev_fy));
+    }
+    while (i < end) : (i += 1) {
+        const result = computeFacingScalar(job.velocity_x[i], job.velocity_y[i], .{ .x = job.facing_x[i], .y = job.facing_y[i] });
+        job.facing_x[i] = result.x;
+        job.facing_y[i] = result.y;
+    }
+    // Scalar scatter: one store per row into its own `PerceptionStore` slot.
+    for (start..end) |row| {
+        const dense = job.perception_dense_index[row];
+        job.perception_slice.facing_x[dense] = job.facing_x[row];
+        job.perception_slice.facing_y[dense] = job.facing_y[row];
+    }
+}
+
+// One observer's FOV survivors in scan order, then the player, as `candidate - observer`.
+const SurvivorScratch = struct {
+    // An index entry, or `player_candidate_sentinel`.
+    candidate: [max_perception_scratch]u32 = undefined,
     to_x: [max_perception_scratch]f32 = undefined,
     to_y: [max_perception_scratch]f32 = undefined,
     dist2: [max_perception_scratch]f32 = undefined,
     count: usize = 0,
 
-    fn append(self: *CandidateScratch, index: usize, to_x: f32, to_y: f32, dist2: f32) void {
-        self.candidate_index[self.count] = index;
+    fn append(self: *SurvivorScratch, candidate: u32, to_x: f32, to_y: f32, dist2: f32) void {
+        self.candidate[self.count] = candidate;
         self.to_x[self.count] = to_x;
         self.to_y[self.count] = to_y;
         self.dist2[self.count] = dist2;
         self.count += 1;
     }
 
-    // Appends each lane of `lanes` set in `pass`, in lane order, with `to = -(dx, dy)`.
-    // Scalar: compaction into the packed scratch `filterFovSurvivors` reads in lanes.
-    fn appendLanes(self: *CandidateScratch, lanes: *const NeighborLanes, pass: simd.MaskBits) void {
-        const to_x = -lanes.dx;
-        const to_y = -lanes.dy;
+    // Appends each lane set in `survivors`, in lane order. Scalar: compaction, since the
+    // survivor sort and the LOS walk that read it are scalar.
+    fn appendLanes(self: *SurvivorScratch, lanes: *const NeighborLanes, to_x: simd.Float4, to_y: simd.Float4, survivors: simd.MaskBits) void {
         inline for (0..simd.lane_count) |lane| {
-            if (pass & (1 << lane) != 0) self.append(lanes.first + lane, to_x[lane], to_y[lane], lanes.dist2[lane]);
+            if (survivors & (1 << lane) != 0) self.append(lanes.entry[lane], to_x[lane], to_y[lane], lanes.dist2[lane]);
         }
     }
 };
 
-/// Buffers the first `max_perception_candidates` hostile rows the query visits, as
-/// `candidate - observer` (see the module doc's sign convention).
+/// Caps an observer's hostile candidates at the first `max_perception_candidates` the query
+/// visits, then keeps those in its FOV cone, in lanes: with unit facing,
+/// `dot(facing, to) > 0 and dot^2 > cos_half_fov^2 * dist2`.
 const PerceptionVisitor = struct {
-    scratch: *CandidateScratch,
+    facing_x: simd.Float4,
+    facing_y: simd.Float4,
+    // cos_half_fov^2.
+    cos2: simd.Float4,
+    seen: u8 = 0,
+    scratch: *SurvivorScratch,
+
+    fn init(facing_x: f32, facing_y: f32, cos_half_fov: f32, scratch: *SurvivorScratch) PerceptionVisitor {
+        return .{ .facing_x = simd.splatFloat4(facing_x), .facing_y = simd.splatFloat4(facing_y), .cos2 = simd.splatFloat4(cos_half_fov * cos_half_fov), .scratch = scratch };
+    }
 
     pub fn visitLanes(self: *PerceptionVisitor, lanes: *const NeighborLanes) LaneStop {
-        const cap = capLanes(lanes.inside, max_perception_candidates - self.scratch.count);
-        self.scratch.appendLanes(lanes, cap.pass);
+        const cap = capLanes(lanes.inside, max_perception_candidates - self.seen);
+        self.seen += @popCount(cap.pass);
+        const to_x = -lanes.dx;
+        const to_y = -lanes.dy;
+        const dot = simd.dotFloat4(self.facing_x, self.facing_y, to_x, to_y);
+        const ahead = simd.greaterThanFloat4Bits(dot, simd.splatFloat4(0));
+        const within_cone = simd.greaterThanFloat4Bits(simd.mulFloat4(dot, dot), simd.mulFloat4(self.cos2, lanes.dist2));
+        self.scratch.appendLanes(lanes, to_x, to_y, cap.pass & ahead & within_cone);
         return cap.stop;
     }
 };
-
-/// FOV filter in lanes over the packed scratch, with a scalar tail: with unit `facing`,
-/// `dot(facing, to) > 0 and dot^2 > cos_half_fov^2 * dist2` is the angle compare.
-fn filterFovSurvivors(
-    scratch: *const CandidateScratch,
-    facing_x: f32,
-    facing_y: f32,
-    cos_half_fov: f32,
-    survivors: *[max_perception_scratch]usize,
-) usize {
-    var survivor_count: usize = 0;
-    const facing_x_vec = simd.splatFloat4(facing_x);
-    const facing_y_vec = simd.splatFloat4(facing_y);
-    const cos2_vec = simd.splatFloat4(cos_half_fov * cos_half_fov);
-    const zero = simd.splatFloat4(0);
-
-    var i: usize = 0;
-    const n = scratch.count;
-    const vend = simd.vectorizedEnd(n);
-    while (i < vend) : (i += simd.lane_count) {
-        const to_x = simd.loadFloat4(scratch.to_x[i..]);
-        const to_y = simd.loadFloat4(scratch.to_y[i..]);
-        const dist2 = simd.loadFloat4(scratch.dist2[i..]);
-        const dot = simd.dotFloat4(facing_x_vec, facing_y_vec, to_x, to_y);
-        const positive = simd.greaterThanFloat4(dot, zero);
-        const within_cone = simd.greaterThanFloat4(simd.mulFloat4(dot, dot), simd.mulFloat4(cos2_vec, dist2));
-        const passed = positive & within_cone;
-        inline for (0..simd.lane_count) |lane| {
-            if (passed[lane]) {
-                survivors[survivor_count] = i + lane;
-                survivor_count += 1;
-            }
-        }
-    }
-    while (i < n) : (i += 1) {
-        if (fovTestScalar(facing_x, facing_y, scratch.to_x[i], scratch.to_y[i], scratch.dist2[i], cos_half_fov)) {
-            survivors[survivor_count] = i;
-            survivor_count += 1;
-        }
-    }
-    return survivor_count;
-}
 
 fn fovTestScalar(facing_x: f32, facing_y: f32, to_x: f32, to_y: f32, dist2: f32, cos_half_fov: f32) bool {
     const dot = facing_x * to_x + facing_y * to_y;
@@ -696,16 +781,15 @@ fn fovTestScalar(facing_x: f32, facing_y: f32, to_x: f32, to_y: f32, dist2: f32,
 }
 
 const SurvivorSortContext = struct {
-    scratch: *const CandidateScratch,
+    scratch: *const SurvivorScratch,
     spatial: *const SpatialIndexView,
     player_candidate: ?PlayerPerceptionCandidate,
 };
 
 fn resolveCandidate(ctx: SurvivorSortContext, slot: usize) EntityId {
-    const candidate_index = ctx.scratch.candidate_index[slot];
-    if (candidate_index == player_candidate_sentinel) return ctx.player_candidate.?.entity;
-    // A candidate index is an entry, below maxInt(u32).
-    return ctx.spatial.entityAt(@intCast(candidate_index));
+    const candidate = ctx.scratch.candidate[slot];
+    if (candidate == player_candidate_sentinel) return ctx.player_candidate.?.entity;
+    return ctx.spatial.entityAt(candidate);
 }
 
 // Branchy comparator resolving an entity per compare. Scalar: each observer
@@ -827,7 +911,7 @@ fn hasLineOfSight(world: *const WorldSystem, level: u16, ox: f32, oy: f32, tx: f
     return false;
 }
 
-fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *PerceptionRangeStats) void {
+fn computeOneAgent(job: *PerceptionJobContext, i: usize, block: *PerceptionBlock, range_stats: *PerceptionRangeStats) void {
     const ox = job.pos_x[i];
     const oy = job.pos_y[i];
     const vision_range = job.vision_range[i];
@@ -839,9 +923,9 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
 
     const hostile = factionsWithStance(observer_faction, .hostile);
 
-    var scratch = CandidateScratch{};
-    var visitor = PerceptionVisitor{ .scratch = &scratch };
-    const query_stats = job.spatial.queryNeighbors(.{
+    var scratch = SurvivorScratch{};
+    var visitor = PerceptionVisitor.init(facing_x, facing_y, cos_half_fov, &scratch);
+    const query_stats = job.spatial.queryNeighbors(block, .{
         .x = ox,
         .y = oy,
         .level = observer_level,
@@ -857,14 +941,16 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
             const to_x = player.pos_x - ox;
             const to_y = player.pos_y - oy;
             const dist2 = to_x * to_x + to_y * to_y;
-            if (dist2 < vision_range * vision_range) {
+            // One item: the scalar pair of the lane FOV test.
+            if (dist2 < vision_range * vision_range and fovTestScalar(facing_x, facing_y, to_x, to_y, dist2, cos_half_fov)) {
                 scratch.append(player_candidate_sentinel, to_x, to_y, dist2);
             }
         }
     }
 
     var survivors: [max_perception_scratch]usize = undefined;
-    const survivor_count = filterFovSurvivors(&scratch, facing_x, facing_y, cos_half_fov, &survivors);
+    const survivor_count = scratch.count;
+    for (survivors[0..survivor_count], 0..) |*survivor, slot| survivor.* = slot;
 
     const sort_ctx = SurvivorSortContext{
         .scratch = &scratch,
@@ -1070,32 +1156,66 @@ test "fovTestScalar accepts squarely ahead, boundary, and rejects squarely behin
     try testing.expect(!fovTestScalar(1, 0, outside.x, outside.y, outside.x * outside.x + outside.y * outside.y, cos_half_fov));
 }
 
-test "filterFovSurvivors matches fovTestScalar lane-for-lane across a packed scratch, including the scalar tail" {
-    var scratch = CandidateScratch{};
-    // 6 candidates (not a multiple of lane_count 4): exercises the vectorized
-    // block (4) and the scalar tail (2) in the same run.
-    const facing_x: f32 = 0.6;
-    const facing_y: f32 = 0.8;
-    const cos_half_fov: f32 = 0.5;
-    const cases = [_][2]f32{ .{ 10, 10 }, .{ -5, -5 }, .{ 20, 1 }, .{ 1, 20 }, .{ -8, 3 }, .{ 6, -1 } };
-    for (cases, 0..) |c, idx| {
-        scratch.append(idx, c[0], c[1], c[0] * c[0] + c[1] * c[1]);
-    }
+// Every in-radius candidate a query visits, in visit order, as `candidate - observer`.
+const CandidateRecorder = struct {
+    scratch: [64]struct { entry: u32, to_x: f32, to_y: f32, dist2: f32 } = undefined,
+    count: usize = 0,
 
-    var survivors: [max_perception_scratch]usize = undefined;
-    const survivor_count = filterFovSurvivors(&scratch, facing_x, facing_y, cos_half_fov, &survivors);
-
-    var expected_count: usize = 0;
-    for (0..scratch.count) |i| {
-        const expect = fovTestScalar(facing_x, facing_y, scratch.to_x[i], scratch.to_y[i], scratch.dist2[i], cos_half_fov);
-        const found = std.mem.indexOfScalar(usize, survivors[0..survivor_count], i) != null;
-        try testing.expectEqual(expect, found);
-        if (expect) expected_count += 1;
+    pub fn visitLanes(self: *CandidateRecorder, lanes: *const NeighborLanes) LaneStop {
+        const entries: [simd.lane_count]u32 = lanes.entry;
+        inline for (0..simd.lane_count) |lane| {
+            if (lanes.inside & (1 << lane) != 0) {
+                self.scratch[self.count] = .{ .entry = entries[lane], .to_x = -lanes.dx[lane], .to_y = -lanes.dy[lane], .dist2 = lanes.dist2[lane] };
+                self.count += 1;
+            }
+        }
+        return null;
     }
-    try testing.expectEqual(expected_count, survivor_count);
+};
+
+test "the in-lane FOV keeps exactly the capped candidates fovTestScalar passes, in scan order" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    // The observer, then 21 hostiles around it in one cell: the 16-candidate cap lands
+    // mid-batch, and both sides of the cone hold candidates before and after it.
+    const observer = try addObserver(&data, 16, 16, 0, 0, .player, .{});
+    for (0..21) |hostile| {
+        const angle = @as(f32, @floatFromInt(hostile)) * 0.61;
+        _ = try addAgent(&data, 16 + @cos(angle) * 9, 16 + @sin(angle) * 9, 0, 0, .hostile);
+    }
+    var spatial_sys = try testSpatialIndex(&data);
+    defer spatial_sys.deinit();
+    const index = spatial_sys.view();
+    const query = spatial_index_mod.NeighborQuery{ .x = 16, .y = 16, .level = 0, .radius = 200, .max_candidate_checks = max_perception_candidate_checks, .factions = factionsWithStance(.player, .hostile), .self = observer };
+    var recorder = CandidateRecorder{};
+    var recorder_block = PerceptionBlock{};
+    _ = index.queryNeighbors(&recorder_block, query, &recorder);
+    try testing.expectEqual(@as(usize, 21), recorder.count);
+
+    const facings = [_][2]f32{ .{ 0.6, 0.8 }, .{ 1, 0 }, .{ -1, 0 }, .{ 0, -1 } };
+    for (facings) |facing| {
+        for ([_]f32{ 0, 0.5, 0.9 }) |cos_half_fov| {
+            var scratch = SurvivorScratch{};
+            var visitor = PerceptionVisitor.init(facing[0], facing[1], cos_half_fov, &scratch);
+            var block = PerceptionBlock{};
+            const stats = index.queryNeighbors(&block, query, &visitor);
+            try testing.expectEqual(max_perception_candidates, visitor.seen);
+            try testing.expectEqual(@as(u16, max_perception_candidates), stats.candidate_checks);
+            var expected: usize = 0;
+            for (recorder.scratch[0..max_perception_candidates]) |candidate| {
+                if (!fovTestScalar(facing[0], facing[1], candidate.to_x, candidate.to_y, candidate.dist2, cos_half_fov)) continue;
+                try testing.expectEqual(candidate.entry, scratch.candidate[expected]);
+                try testing.expectEqual(@as(u32, @bitCast(candidate.to_x)), @as(u32, @bitCast(scratch.to_x[expected])));
+                try testing.expectEqual(@as(u32, @bitCast(candidate.to_y)), @as(u32, @bitCast(scratch.to_y[expected])));
+                try testing.expectEqual(@as(u32, @bitCast(candidate.dist2)), @as(u32, @bitCast(scratch.dist2[expected])));
+                expected += 1;
+            }
+            try testing.expectEqual(expected, scratch.count);
+        }
+    }
 }
 
-test "computeFacingDense matches computeFacingScalar lane-for-lane, including the scalar tail" {
+test "the compute range's facing matches computeFacingScalar lane-for-lane, including the scalar tail" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
 
@@ -1153,7 +1273,7 @@ test "an observer skips itself by entity, not by its filtered observer row" {
 
     const x = try addObserver(&data, 0, 0, 0, 0, .player, .{});
     const y = try addAgent(&data, 1000, 1000, 0, 0, .hostile);
-    // Z moves toward Y (-x direction) so computeFacingDense derives a facing
+    // Z moves toward Y (-x direction) so the compute range derives a facing
     // pointed at Y without needing to poke internal fields directly.
     const z = try addObserver(&data, 1010, 1000, -100, 0, .player, .{});
 
@@ -1427,8 +1547,8 @@ test "same-level gating skips cross-level candidates even when closest" {
     try testing.expectEqual(far_same_level.index, perception.nearest_threat.index);
 }
 
-test "an observer past 16 hostiles in range buffers the first 16 in scan order and counts checks through the 16th" {
-    // One cell: the player observer (entry 0), then 20 hostiles (entries 1..20).
+test "an observer past 16 hostiles caps its candidates before its FOV: the first 16 in scan order, checks through the 16th" {
+    // One cell: the player observer (entry 0), then 20 hostiles (entries 1..20) at x 1..20.
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     const observer = try addObserver(&data, 16, 16, 10, 0, .player, .{});
@@ -1437,20 +1557,56 @@ test "an observer past 16 hostiles in range buffers the first 16 in scan order a
     defer spatial_sys.deinit();
     const index = spatial_sys.view();
     try testing.expect(index.entityAt(0).eql(observer));
+    const query = spatial_index_mod.NeighborQuery{ .x = 16, .y = 16, .level = 0, .radius = 200, .max_candidate_checks = max_perception_candidate_checks, .factions = factionsWithStance(.player, .hostile), .self = observer };
 
-    var scratch = CandidateScratch{};
-    var visitor = PerceptionVisitor{ .scratch = &scratch };
-    const stats = index.queryNeighbors(.{ .x = 16, .y = 16, .level = 0, .radius = 200, .max_candidate_checks = max_perception_candidate_checks, .factions = factionsWithStance(.player, .hostile), .self = observer }, &visitor);
-    try testing.expectEqual(@as(usize, max_perception_candidates), scratch.count);
-    try testing.expectEqual(@as(u16, max_perception_candidates), stats.candidate_checks);
-    for (0..max_perception_candidates) |slot| {
-        const entry: u32 = @intCast(slot + 1);
-        try testing.expectEqual(@as(usize, entry), scratch.candidate_index[slot]);
-        const to_x = index.x[entry] - 16;
-        const to_y = index.y[entry] - 16;
-        try testing.expectEqual(to_x, scratch.to_x[slot]);
-        try testing.expectEqual(to_y, scratch.to_y[slot]);
-        try testing.expectEqual((16 - index.x[entry]) * (16 - index.x[entry]) + (16 - index.y[entry]) * (16 - index.y[entry]), scratch.dist2[slot]);
+    // 90-degree half angles: facing +y keeps entries 1..16; facing +x keeps only hostiles
+    // ahead (x > 16), all past the cap, so none.
+    for ([_][2]f32{ .{ 0, 1 }, .{ 1, 0 } }, [_]usize{ max_perception_candidates, 0 }) |facing, survivors| {
+        var scratch = SurvivorScratch{};
+        var visitor = PerceptionVisitor.init(facing[0], facing[1], 0, &scratch);
+        var block = PerceptionBlock{};
+        const stats = index.queryNeighbors(&block, query, &visitor);
+        try testing.expectEqual(max_perception_candidates, visitor.seen);
+        try testing.expectEqual(@as(u16, max_perception_candidates), stats.candidate_checks);
+        try testing.expectEqual(survivors, scratch.count);
+        for (0..scratch.count) |slot| {
+            const entry: u32 = @intCast(slot + 1);
+            try testing.expectEqual(entry, scratch.candidate[slot]);
+            try testing.expectEqual(index.x[entry] - 16, scratch.to_x[slot]);
+            try testing.expectEqual(index.y[entry] - 16, scratch.to_y[slot]);
+            try testing.expectEqual((16 - index.x[entry]) * (16 - index.x[entry]) + (16 - index.y[entry]) * (16 - index.y[entry]), scratch.dist2[slot]);
+        }
+    }
+}
+
+test "observers with interleaved vision boxes in one cell each read their own box" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    // Six observers in one cell facing +x, vision ranges by slot: three scan boxes
+    // interleaved. One hostile 150 ahead: only the 200-range observers see it.
+    const ranges = [_]f32{ 30, 100, 200, 30, 100, 200 };
+    var observers: [ranges.len]EntityId = undefined;
+    for (&observers, ranges, 0..) |*observer, range, slot| {
+        observer.* = try addObserver(&data, 10 + @as(f32, @floatFromInt(slot)), 10, 10, 0, .player, .{ .vision_range = range, .fov_half_angle_radians = std.math.pi / 3.0 });
+    }
+    const far = try addAgent(&data, 162, 10, 0, 0, .hostile);
+    var spatial_sys = try testSpatialIndex(&data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 16, 16, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    try testing.expectEqual(ranges.len, stats.observer_count);
+    // One block fill per distinct box of the one row group.
+    try testing.expectEqual(@as(usize, 3), stats.block_fills);
+    for (observers, ranges) |observer, range| {
+        const perception = data.aiPerceptionConst(observer).?;
+        try testing.expectEqual(range == 200, perception.target_visible);
+        try testing.expect(perception.nearest_threat.eql(if (range == 200) far else EntityId.invalid));
     }
 }
 
@@ -2514,12 +2670,17 @@ test "serial and threaded PerceptionSystem updates route through identical math"
     defer threaded_sys.deinit();
     var threaded_events = SimulationEvents.init(testing.allocator);
     defer threaded_events.deinit();
-    _ = try threaded_sys.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &world, &threaded_data, &threaded_events, &threads, .{
+    const threaded_stats = try threaded_sys.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &world, &threaded_data, &threaded_events, &threads, .{
         .items_per_range = perception_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
         .stimuli = &stimuli,
     });
+    try testing.expect(!threaded_stats.gather_batch.ran_inline and !threaded_stats.batch.ran_inline);
+    // The windowed gather keeps the serial gather's rows, hostiles skipped, in row order.
+    try testing.expectEqual(@as(usize, 40), threaded_sys.rows.len);
+    try testing.expectEqual(serial_sys.rows.len, threaded_sys.rows.len);
+    for (0..serial_sys.rows.len) |row| try testing.expectEqualDeep(serial_sys.rows.get(row), threaded_sys.rows.get(row));
 
     const serial_ai = serial_data.aiAgentSliceConst();
     const threaded_ai = threaded_data.aiAgentSliceConst();
@@ -2724,6 +2885,8 @@ test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item
         try testing.expectEqual(observer_total, stats.observer_count);
         try testing.expectEqual(rangeCount(observer_total, items), stats.batch.range_count);
         try testing.expect(!stats.batch.ran_inline);
+        // The gather over every agent (hostiles skipped) ran on workers too.
+        try testing.expect(!stats.gather_batch.ran_inline);
         try testing.expect(stats.batch.active_worker_threads > 0);
         if (step == 0) try testing.expectEqual(observer_total, stats.perceived_events);
     }

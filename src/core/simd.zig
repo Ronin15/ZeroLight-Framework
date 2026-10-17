@@ -53,22 +53,6 @@ pub inline fn loadUint4(values: []const u32) Uint4 {
     return values[0..lane_count].*;
 }
 
-/// The first four values, or every value then `fill` in the lanes past them.
-pub inline fn loadFloat4OrFill(values: []const f32, fill: f32) Float4 {
-    if (values.len >= lane_count) return values[0..lane_count].*;
-    var lanes: [lane_count]f32 = @splat(fill);
-    @memcpy(lanes[0..values.len], values);
-    return lanes;
-}
-
-/// The first four values, or every value then `fill` in the lanes past them.
-pub inline fn loadUint4OrFill(values: []const u32, fill: u32) Uint4 {
-    if (values.len >= lane_count) return values[0..lane_count].*;
-    var lanes: [lane_count]u32 = @splat(fill);
-    @memcpy(lanes[0..values.len], values);
-    return lanes;
-}
-
 pub inline fn storeFloat4(values: *[lane_count]f32, vector: Float4) void {
     values.* = toFloatArray(vector);
 }
@@ -1091,20 +1075,6 @@ test "lanesBelow and keepLowestSetBits match a reference loop for every mask and
                 }
             }
             try std.testing.expectEqual(kept, keepLowestSetBits(bits, count));
-        }
-    }
-}
-
-test "loadFloat4OrFill and loadUint4OrFill load every length 0..5 and fill the rest" {
-    const floats = [_]f32{ 1, -2, 3.5, std.math.nan(f32), 9 };
-    const words = [_]u32{ 7, 0, std.math.maxInt(u32), 3, 11 };
-    for (0..floats.len + 1) |len| {
-        const float_lanes = toFloatArray(loadFloat4OrFill(floats[0..len], -0.0));
-        const word_lanes: [lane_count]u32 = loadUint4OrFill(words[0..len], 42);
-        for (0..lane_count) |lane| {
-            const want_float: f32 = if (lane < len) floats[lane] else -0.0;
-            try std.testing.expectEqual(@as(u32, @bitCast(want_float)), @as(u32, @bitCast(float_lanes[lane])));
-            try std.testing.expectEqual(if (lane < len) words[lane] else 42, word_lanes[lane]);
         }
     }
 }

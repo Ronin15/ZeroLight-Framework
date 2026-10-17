@@ -3,9 +3,10 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Perception throughput: gather, shared index query, FOV filter, bounded LOS raycast, and
-//! transition emit, over one population per group.
+//! transition emit, over one population per group, with the index and the think set (every
+//! agent, in the index's cell-major order, as production orders it) built untimed.
 //! - `perception`: observer/hostile pairs on ordinary sparse-tile density. Pass shape: time
-//!   linear in observers.
+//!   linear in observers, the main thread's time (the gather's window merge) flat per agent.
 //! - `perception-los-dense`: the same pairs plus `los_dense_extra_sparse_tiles` sparse
 //!   tiles no ray crosses, so only a per-cell LOS cost that scales with tile count can move
 //!   it. Pass shape: within spread of `perception`; asserts check its sensed, LOS, and found
@@ -13,6 +14,12 @@
 //! - `perception-scattered-dense-index`: the same pairs with `perception_dense_index` in a
 //!   shuffled order, so worker ranges write interleaved `PerceptionStore` slots. Pass shape:
 //!   within spread of `perception`.
+//! - `perception-cell-ordered`: the same pairs created in the think set's observer order, so
+//!   every `PerceptionStore` read and write ascends with the rows. Pass shape: `perception`
+//!   within spread of it, the scattered-write control; asserts check the rows' store slots
+//!   ascend.
+//! Every group but the crowd asserts at most one neighbor-block fill per run of observer
+//! rows sharing a cell, level, and faction, plus one per range (one vision range: one box).
 //! - `perception-crowd`: separated clusters of one observer (default
 //!   `AiPerception`) and one hostile on its level ahead of it. Variant `allies`
 //!   puts the hostile at half the vision range and adds allies inside the range;
@@ -25,6 +32,8 @@
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
+const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const Faction = @import("../game/data_system.zig").Faction;
@@ -39,6 +48,7 @@ const PerceptionStats = perception_mod.PerceptionStats;
 const PerceptionSystem = perception_mod.PerceptionSystem;
 const perception_range_alignment_items = perception_mod.perception_range_alignment_items;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
+const SimulationScopeSystem = @import("../game/systems/simulation_scope.zig").SimulationScopeSystem;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
@@ -63,6 +73,14 @@ pub const scattered_dense_index_group = suite.BenchmarkGroup{
     .item_label = "perception agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runScatteredDenseIndexCase,
+    .write_workload = writePerceptionWorkload,
+};
+
+pub const cell_ordered_group = suite.BenchmarkGroup{
+    .name = "perception-cell-ordered",
+    .item_label = "perception agents",
+    .defaultItemCounts = defaultItemCounts,
+    .runCase = runCellOrderedCase,
     .write_workload = writePerceptionWorkload,
 };
 
@@ -166,6 +184,11 @@ fn addObserver(data: *DataSystem, pos_x: f32, pos_y: f32, velocity_x: f32, veloc
 
 // `meta` resolves tile ids only; nothing reads it after the world is built.
 fn createFixture(allocator: std.mem.Allocator, io: std.Io, count: usize, extra_sparse_tiles: usize) !Fixture {
+    return createFixtureInOrder(allocator, io, count, extra_sparse_tiles, null);
+}
+
+// `createFixture`'s pairs created in `order` (pair `order[k]` k-th), or in pair order.
+fn createFixtureInOrder(allocator: std.mem.Allocator, io: std.Io, count: usize, extra_sparse_tiles: usize, order: ?[]const u32) !Fixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
@@ -181,8 +204,10 @@ fn createFixture(allocator: std.mem.Allocator, io: std.Io, count: usize, extra_s
 
     const observer_offset_x = tile_size * observer_offset_tile_fraction;
     const pair_count = count / 2;
-    var pair_index: usize = 0;
-    while (pair_index < pair_count) : (pair_index += 1) {
+    std.debug.assert(order == null or order.?.len == pair_count);
+    var step: usize = 0;
+    while (step < pair_count) : (step += 1) {
+        const pair_index: usize = if (order) |pairs| pairs[step] else step;
         const gx = @as(f32, @floatFromInt(pair_index % pair_grid_columns)) * tile_size;
         const gy = (@as(f32, @floatFromInt(pair_index / pair_grid_columns)) + pair_row_center) * tile_size;
         _ = try addAgent(&data, gx, gy, 0, 0, .hostile);
@@ -204,18 +229,6 @@ fn createFixture(allocator: std.mem.Allocator, io: std.Io, count: usize, extra_s
     return .{ .data = data, .world = world };
 }
 
-// The observer shuffle's preferred stride.
-const dense_index_shuffle_stride: usize = 97;
-
-// The smallest stride at or past the preferred one coprime with `pair_count`, so
-// `(step * stride) % pair_count` visits every observer once.
-fn shuffleStrideFor(pair_count: usize) usize {
-    if (pair_count <= 1) return 1;
-    var stride = dense_index_shuffle_stride;
-    while (std.math.gcd(stride, pair_count) != 1) : (stride += 1) {}
-    return stride;
-}
-
 // `createFixture`'s pairs with `setAiPerception` called in a shuffled observer order, so
 // `perception_dense_index` is decorrelated from the gather row order.
 fn createDecorrelatedFixture(allocator: std.mem.Allocator, io: std.Io, count: usize) !Fixture {
@@ -233,7 +246,7 @@ fn createDecorrelatedFixture(allocator: std.mem.Allocator, io: std.Io, count: us
 
     const observer_offset_x = tile_size * observer_offset_tile_fraction;
     const pair_count = count / 2;
-    const shuffle_stride = shuffleStrideFor(pair_count);
+    const shuffle_stride = fixtures.shuffleStrideFor(pair_count);
     std.debug.assert(pair_count == 0 or std.math.gcd(shuffle_stride, pair_count) == 1);
 
     var observers = std.ArrayList(EntityId).empty;
@@ -289,11 +302,61 @@ fn untimedCounts(allocator: std.mem.Allocator, io: std.Io, item_count: usize) !P
     var spatial_sys = SpatialIndexSystem.init(allocator);
     defer spatial_sys.deinit();
     _ = try spatial_sys.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&fixture.world), .{});
-    return runOnce(&system, &fixture, spatial_sys.view(), &events, null, suite.serial_cases[0]);
+    const spatial_view = spatial_sys.view();
+    var scope = SimulationScopeSystem.init(allocator);
+    defer scope.deinit();
+    const think_set = (try scope.compactCognitionSerial(&spatial_view, 0, false)).cognition;
+    return runOnce(&system, &fixture, spatial_view, think_set, &events, null, suite.serial_cases[0]);
 }
 
 pub fn runScatteredDenseIndexCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runCaseImpl(allocator, io, options, case, item_count, buildScatteredDenseIndexFixture);
+}
+
+pub fn runCellOrderedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    const stats = try runCaseImpl(allocator, io, options, case, item_count, buildCellOrderedFixture);
+    if (stats.status == .skipped) return stats;
+    // The same pairs: the same counts as the default order.
+    const plain = try untimedCounts(allocator, io, item_count);
+    std.debug.assert(stats.sample_count == plain.sensed_count and stats.output_count == plain.nearest_threat_found_count);
+    return stats;
+}
+
+// The default fixture's pairs in its think set's observer order: an observer's AI row is its
+// pair's second (`addAgent` hostile, then observer).
+fn buildCellOrderedFixture(allocator: std.mem.Allocator, io: std.Io, item_count: usize) !Fixture {
+    var plain = try buildDefaultFixture(allocator, io, item_count);
+    defer plain.deinit();
+    var spatial_sys = SpatialIndexSystem.init(allocator);
+    defer spatial_sys.deinit();
+    _ = try spatial_sys.buildSerial(&plain.data, .{ .entities = plain.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&plain.world), .{});
+    const view = spatial_sys.view();
+    var scope = SimulationScopeSystem.init(allocator);
+    defer scope.deinit();
+    const think_set = (try scope.compactCognitionSerial(&view, 0, false)).cognition;
+    const order = try allocator.alloc(u32, item_count / 2);
+    defer allocator.free(order);
+    var observers: usize = 0;
+    for (think_set) |row| {
+        if (row % 2 == 0) continue;
+        order[observers] = row / 2;
+        observers += 1;
+    }
+    std.debug.assert(observers == order.len);
+    var fixture = try createFixtureInOrder(allocator, io, item_count, 0, order);
+    errdefer fixture.deinit();
+    // The new think set walks the observers, so their store slots, in creation order.
+    var ordered_index = SpatialIndexSystem.init(allocator);
+    defer ordered_index.deinit();
+    _ = try ordered_index.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&fixture.world), .{});
+    const ordered_view = ordered_index.view();
+    var next_observer: u32 = 1;
+    for ((try scope.compactCognitionSerial(&ordered_view, 0, false)).cognition) |row| {
+        if (row % 2 == 0) continue;
+        std.debug.assert(row == next_observer);
+        next_observer += 2;
+    }
+    return fixture;
 }
 
 fn buildDefaultFixture(allocator: std.mem.Allocator, io: std.Io, item_count: usize) !Fixture {
@@ -324,7 +387,8 @@ fn runCaseImpl(
     var system = PerceptionSystem.init(allocator);
     defer system.deinit();
     if (suite.adaptiveTunerForCase(case, perception_range_alignment_items)) |tuner| {
-        system.compute_tuner = tuner;
+        system.gather_tuner = tuner;
+        system.compute_tuner = suite.adaptiveTunerForCase(case, perception_range_alignment_items).?;
     }
 
     var events = SimulationEvents.init(allocator);
@@ -338,15 +402,18 @@ fn runCaseImpl(
     defer spatial_sys.deinit();
     _ = try spatial_sys.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&fixture.world), .{});
     const spatial_view = spatial_sys.view();
+    var scope = SimulationScopeSystem.init(allocator);
+    defer scope.deinit();
+    const think_set = (try scope.compactCognitionSerial(&spatial_view, 0, false)).cognition;
 
     for (0..options.warmup_iterations) |_| {
-        _ = try runOnce(&system, &fixture, spatial_view, &events, if (threads) |*thread_system| thread_system else null, case);
+        _ = try runOnce(&system, &fixture, spatial_view, think_set, &events, if (threads) |*thread_system| thread_system else null, case);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!system.compute_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runOnce(&system, &fixture, spatial_view, &events, if (threads) |*thread_system| thread_system else null, case);
+        while ((!system.gather_tuner.isSettled() or !system.compute_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runOnce(&system, &fixture, spatial_view, think_set, &events, if (threads) |*thread_system| thread_system else null, case);
         }
     }
     const settled_before_measurement = if (case.adaptive) system.compute_tuner.isSettled() else false;
@@ -354,30 +421,52 @@ fn runCaseImpl(
     var accumulator = suite.StatsAccumulator.init(item_count);
     // Sensed, LOS, and found counts are the same every step; transitions occur once.
     var last_stats = PerceptionStats{};
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        last_stats = try runOnce(&system, &fixture, spatial_view, &events, if (threads) |*thread_system| thread_system else null, case);
+        last_stats = try runOnce(&system, &fixture, spatial_view, think_set, &events, if (threads) |*thread_system| thread_system else null, case);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.batch);
+        const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
+        accumulator.record(elapsed_ns, last_stats.batch);
+        main_total += elapsed_ns -| (offMainNs(last_stats.gather_batch) + offMainNs(last_stats.batch));
     }
 
+    std.debug.assert(last_stats.block_fills <= observerCellRuns(&fixture.data, &system, spatial_view) + last_stats.batch.range_count);
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.output_count = last_stats.nearest_threat_found_count;
     stats.candidate_pairs = last_stats.los_checks;
     stats.sample_count = last_stats.sensed_count;
     stats.deferred_count = last_stats.los_blocked;
     stats.fallback_deferred_count = last_stats.perceived_events + last_stats.lost_events;
     stats.cache_evictions = last_stats.dropped_events;
+    stats.neighbor_block_fills = last_stats.block_fills;
+    stats.splice_batch = suite.batchSummaryFromBatch(last_stats.gather_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(system.compute_tuner.report(), settled_before_measurement);
     }
     return stats;
 }
 
+// The runs of consecutive observer rows sharing a level, index cell, and faction: the
+// fixture's keys, with one vision range.
+fn observerCellRuns(data: *const DataSystem, system: *const PerceptionSystem, view: SpatialIndexView) usize {
+    const rows = system.rows.slice();
+    var runs: usize = 0;
+    var previous: ?[4]u32 = null;
+    for (rows.items(.entity), rows.items(.pos_x), rows.items(.pos_y)) |entity, x, y| {
+        const key = [4]u32{ data.worldLevelConst(entity) orelse 0, math.worldPosToCell(x, view.cell_size, view.cells_x), math.worldPosToCell(y, view.cell_size, view.cells_y), @backingInt(data.factionConst(entity) orelse .neutral) };
+        if (previous == null or !std.mem.eql(u32, &previous.?, &key)) runs += 1;
+        previous = key;
+    }
+    return runs;
+}
+
 fn runOnce(
     system: *PerceptionSystem,
     fixture: *Fixture,
     spatial_view: SpatialIndexView,
+    think_set: []const u32,
     events: *SimulationEvents,
     thread_system: ?*ThreadSystem,
     case: suite.BenchmarkCase,
@@ -386,18 +475,27 @@ fn runOnce(
     const ai_slice = fixture.data.aiAgentSliceConst();
     const movement_slice = fixture.data.movementBodySliceConst();
     if (!case.usesThreadSystem()) {
-        return try system.updateSerial(ai_slice, movement_slice, spatial_view, &fixture.world, &fixture.data, events, .{});
+        return try system.updateSerial(ai_slice, movement_slice, spatial_view, &fixture.world, &fixture.data, events, .{ .scope_dense_indices = think_set });
     }
 
     return try system.update(ai_slice, movement_slice, spatial_view, &fixture.world, &fixture.data, events, thread_system.?, .{
         .items_per_range = case.stageItemsPerRange(perception_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .scope_dense_indices = think_set,
     });
 }
 
-fn writePerceptionWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
-    try writer.print("sensed={} los_checks={} los_blocked={} found={} events={} dropped_events={}", .{ stats.sample_count, stats.candidate_pairs, stats.deferred_count, stats.output_count, stats.fallback_deferred_count, stats.cache_evictions });
+// `neighbor_block_fills` holds the block fills, `splice_batch` the gather, and `main` the
+// time outside the gather's and compute's worker dispatches, also per agent.
+fn writePerceptionWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("sensed={} los_checks={} los_blocked={} found={} events={} dropped_events={} block_fills={}", .{ stats.sample_count, stats.candidate_pairs, stats.deferred_count, stats.output_count, stats.fallback_deferred_count, stats.cache_evictions, stats.neighbor_block_fills });
+    if (view == .summary) return;
+    try suite.writeMainShare(writer, stats, stats.item_count);
+    if (stats.splice_batch) |gather| {
+        try writer.writeAll(" gather=");
+        try suite.writeStageShape(writer, gather);
+    }
 }
 
 const CrowdFixture = struct {
@@ -484,7 +582,8 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var system = PerceptionSystem.init(allocator);
     defer system.deinit();
     if (suite.adaptiveTunerForCase(case, perception_range_alignment_items)) |tuner| {
-        system.compute_tuner = tuner;
+        system.gather_tuner = tuner;
+        system.compute_tuner = suite.adaptiveTunerForCase(case, perception_range_alignment_items).?;
     }
     var events = SimulationEvents.init(allocator);
     defer events.deinit();
@@ -497,15 +596,18 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     _ = try spatial_sys.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, IndexGeometry.ofWorld(&fixture.world), .{});
     const spatial_view = spatial_sys.view();
     const thread_ptr = if (threads) |*thread_system| thread_system else null;
+    var scope = SimulationScopeSystem.init(allocator);
+    defer scope.deinit();
+    const think_set = (try scope.compactCognitionSerial(&spatial_view, 0, false)).cognition;
 
     for (0..options.warmup_iterations) |_| {
-        _ = try runCrowdOnce(&system, &fixture, spatial_view, &events, thread_ptr, case);
+        _ = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!system.compute_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runCrowdOnce(&system, &fixture, spatial_view, &events, thread_ptr, case);
+        while ((!system.gather_tuner.isSettled() or !system.compute_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
         }
     }
     const settled_before_measurement = if (case.adaptive) system.compute_tuner.isSettled() else false;
@@ -514,7 +616,7 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var last_stats = PerceptionStats{};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        last_stats = try runCrowdOnce(&system, &fixture, spatial_view, &events, thread_ptr, case);
+        last_stats = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.batch);
     }
@@ -529,6 +631,7 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.output_count = last_stats.nearest_threat_found_count;
     stats.sample_count = last_stats.sensed_count;
     stats.candidate_pairs = last_stats.candidate_checks;
+    stats.neighbor_block_fills = last_stats.block_fills;
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(system.compute_tuner.report(), settled_before_measurement);
     }
@@ -539,6 +642,7 @@ fn runCrowdOnce(
     system: *PerceptionSystem,
     fixture: *CrowdFixture,
     spatial_view: SpatialIndexView,
+    think_set: []const u32,
     events: *SimulationEvents,
     thread_system: ?*ThreadSystem,
     case: suite.BenchmarkCase,
@@ -547,23 +651,26 @@ fn runCrowdOnce(
     const ai_slice = fixture.data.aiAgentSliceConst();
     const movement_slice = fixture.data.movementBodySliceConst();
     if (!case.usesThreadSystem()) {
-        return try system.updateSerial(ai_slice, movement_slice, spatial_view, &fixture.world, &fixture.data, events, .{});
+        return try system.updateSerial(ai_slice, movement_slice, spatial_view, &fixture.world, &fixture.data, events, .{ .scope_dense_indices = think_set });
     }
     return try system.update(ai_slice, movement_slice, spatial_view, &fixture.world, &fixture.data, events, thread_system.?, .{
         .items_per_range = case.stageItemsPerRange(perception_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .scope_dense_indices = think_set,
     });
 }
 
 // `deferred_count` holds the observers, `output_count` those that found a threat,
-// `sample_count` the sensed candidates, and `candidate_pairs` the index candidate checks.
+// `sample_count` the sensed candidates, `candidate_pairs` the index candidate checks, and
+// `neighbor_block_fills` the block fills.
 fn writeCrowdWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     const observers = @max(stats.deferred_count, 1);
-    try writer.print("threat_found={}/{} sensed={} checks_per_observer={d:.2}", .{
+    try writer.print("threat_found={}/{} sensed={} block_fills={} checks_per_observer={d:.2}", .{
         stats.output_count,
         stats.deferred_count,
         stats.sample_count,
+        stats.neighbor_block_fills,
         @as(f64, @floatFromInt(stats.candidate_pairs)) / @as(f64, @floatFromInt(observers)),
     });
 }

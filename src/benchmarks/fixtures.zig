@@ -3,8 +3,8 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Fixture builders shared by the bench groups: a case's thread system, bodies, request
-//! streams, the world tileset and banded worlds, a 4-connected flood, and the nav reaction's
-//! tuner setup.
+//! streams, the world tileset and banded worlds, a 4-connected flood, a stride shuffle, and
+//! the nav reaction's tuner setup.
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -198,4 +198,25 @@ pub fn floodTunerWorkersOf(tuners: *const NavTuners, case: suite.BenchmarkCase) 
     if (!case.adaptive or !case.usesThreadSystem()) return null;
     const tuner = tuners.nav.getPtrConst(.conn_flood).report();
     return if (tuner.has_threaded_profile) tuner.current_profile.worker_threads else 0;
+}
+
+// The stride shuffle's preferred stride.
+const shuffle_stride: usize = 97;
+
+/// The smallest stride at or past 97 coprime with `count`, so `(step * stride) % count` visits
+/// every index of `0..count` once: a fixed scattered order.
+pub fn shuffleStrideFor(count: usize) usize {
+    if (count <= 1) return 1;
+    var stride = shuffle_stride;
+    while (std.math.gcd(stride, count) != 1) : (stride += 1) {}
+    return stride;
+}
+
+/// `0..count` in the stride-shuffled order. The caller frees it.
+pub fn strideShuffledRows(allocator: std.mem.Allocator, count: usize) ![]u32 {
+    const rows = try allocator.alloc(u32, count);
+    const stride = shuffleStrideFor(count);
+    // Below `count`, a population size.
+    for (rows, 0..) |*row, step| row.* = @intCast(step * stride % count);
+    return rows;
 }

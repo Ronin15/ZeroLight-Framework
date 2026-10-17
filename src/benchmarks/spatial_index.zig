@@ -13,14 +13,16 @@
 //!   tuned case at the largest H; `deep_levels` flat in levels, its storage linear in
 //!   levels. Asserts check every body indexed, the sort on workers, and the directories'
 //!   bytes whole against `chunk_slot_bytes` x chunks x levels.
-//! - `spatial_index-query`: one query per body from its own position. `field` is a uniform
-//!   four-faction field at the `ai` density, radius a quarter, one, or four chunks, over
-//!   `full`, `friendly`, or `hostile` factions: per-query time linear in the box's pieces
-//!   plus its checks, hostile <= friendly <= full. `dense_cell` puts N neutral bodies in one
-//!   cell with a one-cell radius: per-query time flat in N. Asserts check each query's
-//!   checks equal its budget or its box's entries of its factions but itself, every visit
-//!   of the query's factions and never self, each field radius's chunk count, and every
-//!   `dense_cell` body in one cell.
+//! - `spatial_index-query`: one query per body from its own position, in the index's
+//!   cell-major order as the think set orders requesters, through one neighbor block.
+//!   `field` is a uniform four-faction field at the `ai` density, radius a quarter, one, or
+//!   four chunks, over `full`, `friendly`, or `hostile` factions: one block fill per key
+//!   (own cell), each walking the box's pieces once, and per-query time linear in its
+//!   checks, hostile <= friendly <= full. `dense_cell` puts N neutral bodies in one cell
+//!   with a one-cell radius: one fill for the run, and per-query time flat in N, judged from
+//!   timing. Asserts check each query's checks equal its budget or its box's entries of its
+//!   factions but itself, every visit of the query's factions and never self, one fill per
+//!   key, each field radius's chunk count, and every `dense_cell` body in one cell.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -37,6 +39,7 @@ const IndexPopulation = @import("../game/systems/spatial_index.zig").IndexPopula
 const chunk_slot_bytes = @import("../game/systems/spatial_index.zig").chunk_slot_bytes;
 const NeighborQuery = @import("../game/systems/spatial_index.zig").NeighborQuery;
 const NeighborLanes = @import("../game/systems/spatial_index.zig").NeighborLanes;
+const NeighborBlock = @import("../game/systems/spatial_index.zig").NeighborBlock;
 const LaneStop = @import("../game/systems/spatial_index.zig").LaneStop;
 const SpatialIndexConfig = @import("../game/systems/spatial_index.zig").SpatialIndexConfig;
 const SpatialIndexStats = @import("../game/systems/spatial_index.zig").SpatialIndexStats;
@@ -379,6 +382,8 @@ const query_field_bodies: usize = query_field_columns * query_field_rows;
 // player, and ally by slot.
 const query_hostile_stride: usize = 8;
 const query_check_budget: u16 = 64;
+// The budget's stream and self.
+const QueryBlock = NeighborBlock(query_check_budget + 1);
 
 // The chunk columns a box of `radius` spans, from the default index cell: a quarter chunk's
 // box fits in one chunk width, one chunk's spans three, four chunks' nine. Null for a radius
@@ -453,7 +458,8 @@ const CheckingVisitor = struct {
         while (bits.next()) |bit| {
             // A set bit's index is below lane_count.
             const lane: simd.LaneIndex = @intCast(bit);
-            const entity = self.index.entityAt(lanes.first + lane);
+            const entries: [simd.lane_count]u32 = lanes.entry;
+            const entity = self.index.entityAt(entries[lane]);
             std.debug.assert(self.factions.contains(self.data.factionConst(entity) orelse .neutral));
             std.debug.assert(!entity.eql(self.self));
         }
@@ -465,6 +471,7 @@ const QueryTotals = struct {
     checks: usize = 0,
     visits: usize = 0,
     dist2_sum: f32 = 0,
+    block_fills: usize = 0,
 };
 
 fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -513,17 +520,24 @@ fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         const cell_y = math.worldPosToCell(index.y[0], index.cell_size, index.cells_y);
         std.debug.assert(counts.inBox(cell_x, cell_y, 0) == query_count);
     }
-    checkQueries(&system, &fixture, radius, factions, &counts);
-    for (0..options.warmup_iterations) |_| _ = runQueries(&system, &fixture, radius, factions);
+    const order = try queryOrder(allocator, system.view());
+    defer allocator.free(order);
+    std.debug.assert(order.len == query_count);
+    checkQueries(&system, &fixture, order, radius, factions, &counts);
+    for (0..options.warmup_iterations) |_| _ = runQueries(&system, &fixture, order, radius, factions);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var totals = QueryTotals{};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        totals = runQueries(&system, &fixture, radius, factions);
+        totals = runQueries(&system, &fixture, order, radius, factions);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), .{});
     }
     std.debug.assert(std.math.isFinite(totals.dist2_sum));
+
+    // One fill per key, as the untimed check counted.
+    std.debug.assert(totals.block_fills == ownCellRuns(&system, &fixture, order));
+    if (fields.shape == .dense_cell) std.debug.assert(totals.block_fills == 1);
 
     var stats = accumulator.finish();
     stats.items_per_second = suite.itemsPerSecond(query_count, stats.mean_ns);
@@ -532,7 +546,23 @@ fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.candidate_pairs = totals.checks;
     stats.output_count = totals.visits;
     stats.sample_count = box_cells;
+    stats.neighbor_block_fills = totals.block_fills;
     return stats;
+}
+
+// The runs of consecutive queries in `order` sharing an own cell: the field's keys, since its
+// box and factions are fixed.
+fn ownCellRuns(system: *const SpatialIndexSystem, fixture: *const Fixture, order: []const u32) usize {
+    const index = system.view();
+    var runs: usize = 0;
+    var previous: ?[2]u32 = null;
+    for (order) |slot| {
+        const query = slotQuery(fixture, slot, 0, .full);
+        const cell = [2]u32{ math.worldPosToCell(query.x, index.cell_size, index.cells_x), math.worldPosToCell(query.y, index.cell_size, index.cells_y) };
+        if (previous == null or !std.mem.eql(u32, &previous.?, &cell)) runs += 1;
+        previous = cell;
+    }
+    return runs;
 }
 
 // The query from slot `slot`'s own position with its entity as `self`, under the fixture's
@@ -594,43 +624,62 @@ const FactionCellCounts = struct {
     }
 };
 
+// The population slots in the index's cell-major order: records in key order, each record's
+// (cell, faction) runs. The caller frees it.
+fn queryOrder(allocator: std.mem.Allocator, index: SpatialIndexView) ![]u32 {
+    const order = try allocator.alloc(u32, index.entryCount());
+    var count: usize = 0;
+    var span = index.cellMajorSpan(0, index.entryCount());
+    while (span.next(&index)) |run| {
+        @memcpy(order[count..][0 .. run.end - run.start], index.population_row[run.start..run.end]);
+        count += run.end - run.start;
+    }
+    std.debug.assert(count == order.len);
+    return order;
+}
+
 // Every query once, untimed: its checks the budget or its box's bodies of its factions but
 // itself, and its visits of its factions.
-fn checkQueries(system: *const SpatialIndexSystem, fixture: *const Fixture, radius: f32, factions: FactionSet, counts: *const FactionCellCounts) void {
+fn checkQueries(system: *const SpatialIndexSystem, fixture: *const Fixture, order: []const u32, radius: f32, factions: FactionSet, counts: *const FactionCellCounts) void {
     const index = system.view();
     const scan_radius: u32 = @intFromFloat(@ceil(radius / index.cell_size));
-    for (0..fixture.data.aiAgentSliceConst().entities.len) |slot| {
+    var block = QueryBlock{};
+    for (order) |slot| {
         const query = slotQuery(fixture, slot, radius, factions);
         var visitor = CheckingVisitor{ .data = &fixture.data, .index = index, .factions = factions, .self = query.self };
-        const query_stats = index.queryNeighbors(query, &visitor);
+        const query_stats = index.queryNeighbors(&block, query, &visitor);
         const own_x = math.worldPosToCell(query.x, index.cell_size, index.cells_x);
         const own_y = math.worldPosToCell(query.y, index.cell_size, index.cells_y);
         const self_counted: u32 = @intFromBool(factions.contains(fixture.data.factionConst(query.self) orelse .neutral));
         const wanted = counts.inBox(own_x, own_y, scan_radius) - self_counted;
         std.debug.assert(query_stats.candidate_checks == @min(wanted, query_check_budget));
     }
+    std.debug.assert(block.fills == ownCellRuns(system, fixture, order));
 }
 
-fn runQueries(system: *const SpatialIndexSystem, fixture: *const Fixture, radius: f32, factions: FactionSet) QueryTotals {
+fn runQueries(system: *const SpatialIndexSystem, fixture: *const Fixture, order: []const u32, radius: f32, factions: FactionSet) QueryTotals {
     const index = system.view();
     var totals = QueryTotals{};
-    for (0..fixture.data.aiAgentSliceConst().entities.len) |slot| {
+    var block = QueryBlock{};
+    for (order) |slot| {
         var visitor = QueryVisitor{};
-        const query_stats = index.queryNeighbors(slotQuery(fixture, slot, radius, factions), &visitor);
+        const query_stats = index.queryNeighbors(&block, slotQuery(fixture, slot, radius, factions), &visitor);
         totals.checks += query_stats.candidate_checks;
         totals.visits += visitor.visits;
         totals.dist2_sum += visitor.dist2_sum;
     }
+    totals.block_fills = block.fills;
     return totals;
 }
 
 // `deferred_count` holds the queries, `candidate_pairs` their checks, `output_count` their
-// visits, and `sample_count` the box side in cells.
+// visits, `sample_count` the box side in cells, and `neighbor_block_fills` the block fills.
 fn writeQueryWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     const queries = @max(stats.deferred_count, 1);
-    try writer.print("queries={} box_cells={} checks_per_query={d:.2} visits_per_query={d:.2}", .{
+    try writer.print("queries={} box_cells={} block_fills={} checks_per_query={d:.2} visits_per_query={d:.2}", .{
         stats.deferred_count,
         stats.sample_count,
+        stats.neighbor_block_fills,
         @as(f64, @floatFromInt(stats.candidate_pairs)) / @as(f64, @floatFromInt(queries)),
         @as(f64, @floatFromInt(stats.output_count)) / @as(f64, @floatFromInt(queries)),
     });

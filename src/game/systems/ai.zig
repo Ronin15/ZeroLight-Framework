@@ -10,7 +10,9 @@
 //!
 //! Separation (every faction) and cohere (the row's friendly factions) query the shared
 //! `SpatialIndexView` on the row's level, skipping the row itself; their float sums follow
-//! the index's lane order (`spatial_index.zig`).
+//! the index's lane order (`spatial_index.zig`). Each separation range keeps one neighbor
+//! block per query kind, so consecutive rows of one cell (the think set is cell-major)
+//! share one walk.
 //!
 //! Serial and threaded paths run the same `writeAiSeparationJob`/`writeAiIntentsJob`; the
 //! serial path calls them on one full range.
@@ -27,7 +29,13 @@ const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
+const SlotList = @import("../../app/thread_system.zig").SlotList;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
+const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const compactRowWindows = @import("../../app/thread_system.zig").compactRowWindows;
+const setRowCount = @import("../../app/thread_system.zig").setRowCount;
+const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const AiAgentSlice = @import("../data_system.zig").AiAgentSlice;
 const ConstAiMemorySlice = @import("../data_system.zig").ConstAiMemorySlice;
@@ -50,6 +58,7 @@ const SpatialIndexView = spatial_index.SpatialIndexView;
 const NeighborLanes = spatial_index.NeighborLanes;
 const LaneStop = spatial_index.LaneStop;
 const capLanes = spatial_index.capLanes;
+const NeighborBlock = spatial_index.NeighborBlock;
 const factionsWithStance = @import("../faction.zig").factionsWithStance;
 const arbitration = @import("arbitration.zig");
 const InterestMarkerStore = @import("../world/interest.zig").InterestMarkerStore;
@@ -206,15 +215,13 @@ const AiGatherRow = struct {
     resolved: RowResolved,
 };
 
-fn appendAiGatherRow(
-    rows: *std.MultiArrayList(AiGatherRow),
-    row_slice: *std.MultiArrayList(AiGatherRow).Slice,
-    row: AiGatherRow,
-) void {
-    _ = rows.addOneAssumeCapacity();
-    row_slice.len = rows.len;
-    row_slice.set(rows.len - 1, row);
-}
+// One range's counts, written once by its job: the gather's kept rows, then the separation
+// job's block fills.
+const AiRangeTally = struct {
+    kept: usize = 0,
+    separation_block_fills: usize = 0,
+    cohere_block_fills: usize = 0,
+};
 
 const separation_radius: f32 = 48.0;
 const max_separation_neighbors: u8 = 32;
@@ -227,6 +234,10 @@ const separation_min_dist2: f32 = 0.1;
 const cohere_radius: f32 = 96.0;
 const max_cohere_neighbors: u32 = 12;
 const max_cohere_candidate_checks: u16 = 64;
+
+// Each query kind's block holds its budget's stream and self.
+const SeparationBlock = NeighborBlock(max_separation_candidate_checks + 1);
+const CohereBlock = NeighborBlock(max_cohere_candidate_checks + 1);
 
 /// Fixed cognition query radius for world interest markers, independent of world size; near
 /// hearing range so curious agents find markers without dig stimuli.
@@ -321,6 +332,10 @@ pub const AiStats = struct {
     navigation_intent_count: usize = 0,
     separation_candidate_checks: usize = 0,
     separation_neighbor_samples: usize = 0,
+    /// Separation and cohere neighbor-block fills, one per key a range's rows change to.
+    separation_block_fills: usize = 0,
+    cohere_block_fills: usize = 0,
+    gather_batch: BatchStats = .{},
     separation_batch: BatchStats = .{},
     intent_batch: BatchStats = .{},
     batch: BatchStats = .{},
@@ -328,8 +343,12 @@ pub const AiStats = struct {
 
 pub const AiSystem = struct {
     allocator: std.mem.Allocator,
-    // Gathered work memory (main-thread only; workers read only copies in ctx). Sized to ai ents.
+    // Gathered work memory, one row per think row with a body: the gather's ranges write
+    // their windows, then main compacts them in range order.
     rows: std.MultiArrayList(AiGatherRow) = .{},
+    // Per-range tallies of the gather and separation dispatches, which run in turn.
+    range_tallies: SlotList(AiRangeTally) = .empty,
+    gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
     separation_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
     intent_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
     // Broadcast goal-requantization state (see `requantizeGoal`); one scalar
@@ -337,20 +356,25 @@ pub const AiSystem = struct {
     snapped_goal: AiDir = .{ .x = 0, .y = 0 },
     snapped_goal_initialized: bool = false,
 
+    /// Sizes the gather rows and the range tallies for `pop` think rows under every partition
+    /// the tuners can pick. Grow-only; the pipeline calls it at its population seam.
     pub fn reserve(self: *AiSystem, pop: usize) !void {
         if (pop == 0) return;
         try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(pop));
+        try self.range_tallies.ensureTotalCapacity(self.allocator, maxRangeCount(hotStoreCapacity(pop), ai_range_alignment_items));
     }
 
     pub fn init(allocator: std.mem.Allocator) AiSystem {
         return .{
             .allocator = allocator,
+            .gather_tuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
             .separation_tuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
             .intent_tuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
         };
     }
 
     pub fn deinit(self: *AiSystem) void {
+        self.range_tallies.deinit(self.allocator);
         self.rows.deinit(self.allocator);
         self.* = undefined;
     }
@@ -368,11 +392,11 @@ pub const AiSystem = struct {
     ) !AiStats {
         _ = delta_seconds; // decisions are instantaneous; integration in movement
         const held_focus_target = self.resolveFocusTarget(config);
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, held_focus_target, config.focus_entity, config.perception_slice, config.memory_slice, config.affect_slice, config.interest_markers);
+        const gather_batch = try self.gatherAiData(gatherInputs(ai_agents, movement, data, config, held_focus_target), thread_system, config);
         const entity_count = self.rows.len;
         if (entity_count == 0) {
             // No ai this step; do not touch caller's stream (other emitters may use intents).
-            return .{};
+            return .{ .gather_batch = gather_batch };
         }
 
         self.resetSeparationScratch();
@@ -383,8 +407,10 @@ pub const AiSystem = struct {
             .adaptive = config.adaptive,
         });
         const separation_selection = separation.select(entity_count, ai_range_alignment_items);
-        var separation_context = buildAiSeparationContext(gathered, spatial, separation_selection.range_count, config.interest_markers);
+        try self.prepareRangeTallies(separation_selection.range_count);
+        var separation_context = buildAiSeparationContext(gathered, spatial, self.range_tallies.items, config.interest_markers);
         const separation_batch = separation.run(separation_selection, entity_count, ai_range_alignment_items, &separation_context, writeAiSeparationJob);
+        const fills = self.sumBlockFills();
 
         const intent = Dispatch.init(thread_system, &self.intent_tuner, .{
             .items_per_range = config.intent_items_per_range orelse config.items_per_range,
@@ -417,6 +443,9 @@ pub const AiSystem = struct {
             .navigation_intent_count = entity_count,
             .separation_candidate_checks = sumU16(gathered.items(.separation_candidate_count)),
             .separation_neighbor_samples = sumU8(gathered.items(.separation_neighbor_count)),
+            .separation_block_fills = fills.separation_block_fills,
+            .cohere_block_fills = fills.cohere_block_fills,
+            .gather_batch = gather_batch,
             .separation_batch = separation_batch,
             .intent_batch = intent_batch,
             .batch = separation_batch,
@@ -441,11 +470,12 @@ pub const AiSystem = struct {
     ) !AiStats {
         _ = delta_seconds;
         const held_focus_target = self.resolveFocusTarget(config);
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, held_focus_target, config.focus_entity, config.perception_slice, config.memory_slice, config.affect_slice, config.interest_markers);
+        try self.gatherAiDataSerial(gatherInputs(ai_agents, movement, data, config, held_focus_target));
         const entity_count = self.rows.len;
         if (entity_count == 0) return .{};
         self.resetSeparationScratch();
-        self.computeAiSeparationsSerial(spatial, config.interest_markers);
+        try self.computeAiSeparationsSerial(spatial, config.interest_markers);
+        const fills = self.sumBlockFills();
         const gathered = self.rows.slice();
         const rcount: usize = 1;
         const navigation_stream = config.navigation_intents orelse &frame.navigation_intents;
@@ -465,156 +495,66 @@ pub const AiSystem = struct {
             .navigation_intent_count = entity_count,
             .separation_candidate_checks = sumU16(gathered.items(.separation_candidate_count)),
             .separation_neighbor_samples = sumU8(gathered.items(.separation_neighbor_count)),
+            .separation_block_fills = fills.separation_block_fills,
+            .cohere_block_fills = fills.cohere_block_fills,
+            .gather_batch = inlineBatch(entity_count, ai_range_alignment_items),
             .separation_batch = separation_batch,
             .intent_batch = intent_batch,
             .batch = separation_batch,
         };
     }
 
-    // One row per think-set agent with a movement body: every column arbitration reads.
-    // Scalar: a dense-index lookup per row into the movement, faction, level, perception,
-    // memory, and affect stores, with skips; the threaded stages read the packed rows.
-    fn gatherAiData(
-        self: *AiSystem,
-        ai_slice: ConstAiAgentSlice,
-        movement: ConstMovementBodySlice,
-        data: *const DataSystem,
-        scope_dense_indices: ?[]const u32,
-        focus_target: ?AiDir,
-        focus_entity: ?EntityId,
-        perception_slice: ?ConstPerceptionSlice,
-        memory_slice: ?ConstAiMemorySlice,
-        affect_slice: ?ConstAiAffectSlice,
-        _: ?*const InterestMarkerStore,
-    ) !void {
-        self.clearWork();
-        const n = if (scope_dense_indices) |idx| idx.len else ai_slice.entities.len;
+    // The gather over the think rows on workers under `gather_tuner`: each range writes its
+    // rows' window, then main moves the windows together in range order.
+    fn gatherAiData(self: *AiSystem, inputs: AiGatherInputs, thread_system: *ThreadSystem, config: AiConfig) !BatchStats {
+        const n = try self.prepareGather(inputs);
+        if (n == 0) return .{};
+        const gather = Dispatch.init(thread_system, &self.gather_tuner, .{
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
+            .adaptive = config.adaptive,
+        });
+        const selection = gather.select(n, ai_range_alignment_items);
+        try self.prepareRangeTallies(selection.range_count);
+        var context = AiGatherContext{ .inputs = inputs, .rows = self.rows.slice(), .items_per_range = selection.items_per_range, .tallies = self.range_tallies.items };
+        const batch = gather.run(selection, n, ai_range_alignment_items, &context, gatherAiJob);
+        compactRowWindows(AiGatherRow, AiRangeTally, &self.rows, self.range_tallies.items, selection.items_per_range);
+        return batch;
+    }
+
+    // `gatherAiData` as one range on the calling thread.
+    fn gatherAiDataSerial(self: *AiSystem, inputs: AiGatherInputs) !void {
+        const n = try self.prepareGather(inputs);
         if (n == 0) return;
+        try self.prepareRangeTallies(1);
+        var context = AiGatherContext{ .inputs = inputs, .rows = self.rows.slice(), .items_per_range = n, .tallies = self.range_tallies.items };
+        gatherAiJob(&context, .{ .index = 0, .start = 0, .end = n }, WorkerId.main);
+        compactRowWindows(AiGatherRow, AiRangeTally, &self.rows, self.range_tallies.items, n);
+    }
+
+    // Sizes the rows to one window slot per think row before dispatch; returns the count.
+    fn prepareGather(self: *AiSystem, inputs: AiGatherInputs) !usize {
+        self.clearWork();
+        const n = inputs.rowCount();
+        if (n == 0) return 0;
         try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
+        setRowCount(AiGatherRow, &self.rows, n);
+        return n;
+    }
 
-        // Preserve ai order for deterministic output. DataSystem rejects stale generations
-        // and returns direct dense movement rows without transient high-water index tables.
-        // The scoped path walks only the selected ai indices; both paths gather the
-        // same per-row columns, so all downstream stages operate on the gathered set.
-        var row_slice = self.rows.slice();
-        for (0..n) |k| {
-            const i: usize = if (scope_dense_indices) |idx| idx[k] else k;
-            const ent = ai_slice.entities[i];
-            const mi = data.movementBodyDenseIndex(ent) orelse continue;
-            const maybe_faction = data.factionConst(ent);
-            const ent_faction = maybe_faction orelse .neutral;
+    // `range_count` zeroed tallies, before dispatch; grow-only past `reserve`.
+    fn prepareRangeTallies(self: *AiSystem, range_count: usize) !void {
+        try self.range_tallies.ensureTotalCapacity(self.allocator, range_count);
+        setSlotCount(AiRangeTally, &self.range_tallies, range_count);
+    }
 
-            // See AiConfig.focus_target's doc comment: only an explicit opt-in,
-            // never populated for a row with no pursue gain at all.
-            const gain_pursue = ai_slice.gain_pursues[i];
-            const has_focus = focus_target != null and gain_pursue > 0;
-
-            var row = AiGatherRow{
-                .entity = ent,
-                .pos_x = movement.previous_x[mi],
-                .pos_y = movement.previous_y[mi],
-                .faction = ent_faction,
-                .level = data.worldLevelConst(ent) orelse 0,
-                .wander_amplitude = ai_slice.wander_amplitudes[i],
-                .gains = .{
-                    .wander = ai_slice.gain_wanders[i],
-                    .pursue = gain_pursue,
-                    .flee = ai_slice.gain_flees[i],
-                    .investigate = ai_slice.gain_investigates[i],
-                    .cohere = ai_slice.gain_coheres[i],
-                },
-                .sticky = .{
-                    .commitment_max_steps = ai_slice.commitment_max_steps[i],
-                    .sticky_bonus = ai_slice.sticky_bonus[i],
-                    .prev_behavior = ai_slice.behaviors[i],
-                    .prev_commitment_remaining = ai_slice.commitment_remaining[i],
-                    .agent_dense_index = @intCast(i),
-                },
-                .threat = .{
-                    .target_visible = false,
-                    .nearest_threat = EntityId.invalid,
-                    .nearest_threat_x = 0,
-                    .nearest_threat_y = 0,
-                },
-                .stimulus = .{ .heard_stimulus = false, .heard_stimulus_x = 0, .heard_stimulus_y = 0 },
-                .memory = .{
-                    .last_known_target = EntityId.invalid,
-                    .last_known_x = 0,
-                    .last_known_y = 0,
-                    .staleness = 0,
-                    .max_staleness = 0,
-                },
-                .memory_ring = @splat(.{}),
-                .drives = .{ .fear = 0, .curiosity = 0, .aggression = 0, .fatigue = 0 },
-                .focus = .{
-                    .entity = if (has_focus) focus_entity else null,
-                    .x = if (has_focus) focus_target.?.x else 0,
-                    .y = if (has_focus) focus_target.?.y else 0,
-                },
-                .interest = .{},
-                .sep_x = 0,
-                .sep_y = 0,
-                .separation_neighbor_count = 0,
-                .separation_candidate_count = 0,
-                .cohere = .{},
-                .resolved = .{ .goal_x = movement.previous_x[mi], .goal_y = movement.previous_y[mi] },
-            };
-
-            if (perception_slice) |perception| {
-                if (data.aiPerceptionDenseIndex(ent)) |pidx| {
-                    row.threat = .{
-                        .target_visible = perception.target_visible[pidx],
-                        .nearest_threat = perception.nearest_threat[pidx],
-                        .nearest_threat_x = perception.last_seen_x[pidx],
-                        .nearest_threat_y = perception.last_seen_y[pidx],
-                    };
-                    row.stimulus = .{
-                        .heard_stimulus = perception.heard_stimulus[pidx],
-                        .heard_stimulus_x = perception.heard_stimulus_x[pidx],
-                        .heard_stimulus_y = perception.heard_stimulus_y[pidx],
-                    };
-                }
-            }
-
-            if (memory_slice) |memory| {
-                if (data.aiMemoryDenseIndex(ent)) |midx| {
-                    row.memory = .{
-                        .last_known_target = memory.last_known_target[midx],
-                        .last_known_x = memory.last_known_x[midx],
-                        .last_known_y = memory.last_known_y[midx],
-                        .staleness = memory.staleness[midx],
-                        .max_staleness = max_ai_memory_staleness,
-                    };
-                    const ring_entity = memory.ring_entity[midx];
-                    const ring_x = memory.ring_x[midx];
-                    const ring_y = memory.ring_y[midx];
-                    const ring_age = memory.ring_age[midx];
-                    for (0..ai_memory_ring_capacity) |slot| {
-                        row.memory_ring[slot] = .{
-                            .entity = ring_entity[slot],
-                            .x = ring_x[slot],
-                            .y = ring_y[slot],
-                            .age = ring_age[slot],
-                        };
-                    }
-                }
-            }
-
-            if (affect_slice) |affect| {
-                if (data.aiAffectDenseIndex(ent)) |aidx| {
-                    row.drives = .{
-                        .fear = affect.fear[aidx],
-                        .curiosity = affect.curiosity[aidx],
-                        .aggression = affect.aggression[aidx],
-                        .fatigue = affect.fatigue[aidx],
-                    };
-                }
-            }
-
-            row.interest = .{ .has_faction = maybe_faction != null };
-
-            appendAiGatherRow(&self.rows, &row_slice, row);
+    fn sumBlockFills(self: *const AiSystem) AiRangeTally {
+        var total = AiRangeTally{};
+        for (self.range_tallies.items) |slot| {
+            total.separation_block_fills += slot.value.separation_block_fills;
+            total.cohere_block_fills += slot.value.cohere_block_fills;
         }
+        return total;
     }
 
     fn clearWork(self: *AiSystem) void {
@@ -646,17 +586,192 @@ pub const AiSystem = struct {
         @memset(gathered.items(.cohere), RowCohere{});
     }
 
-    fn computeAiSeparationsSerial(self: *AiSystem, spatial: SpatialIndexView, markers: ?*const InterestMarkerStore) void {
-        const gathered = self.rows.slice();
-        var context = buildAiSeparationContext(gathered, spatial, 1, markers);
+    fn computeAiSeparationsSerial(self: *AiSystem, spatial: SpatialIndexView, markers: ?*const InterestMarkerStore) !void {
+        try self.prepareRangeTallies(1);
+        var context = buildAiSeparationContext(self.rows.slice(), spatial, self.range_tallies.items, markers);
         writeAiSeparationJob(&context, .{ .index = 0, .start = 0, .end = self.rows.len }, WorkerId.main);
     }
 };
 
+// One step's AI gather inputs, read-only on every range.
+const AiGatherInputs = struct {
+    ai_slice: ConstAiAgentSlice,
+    movement: ConstMovementBodySlice,
+    data: *const DataSystem,
+    scope_dense_indices: ?[]const u32 = null,
+    focus_target: ?AiDir = null,
+    focus_entity: ?EntityId = null,
+    perception_slice: ?ConstPerceptionSlice = null,
+    memory_slice: ?ConstAiMemorySlice = null,
+    affect_slice: ?ConstAiAffectSlice = null,
+
+    fn rowCount(self: *const AiGatherInputs) usize {
+        return if (self.scope_dense_indices) |indices| indices.len else self.ai_slice.entities.len;
+    }
+
+    // Think row `k`'s gather row, every column arbitration reads, or null without a movement
+    // body. Scalar per row: dense-index lookups into the movement, faction, level,
+    // perception, memory, and affect stores, with skips; threaded in windows.
+    fn gatherRow(self: *const AiGatherInputs, k: usize) ?AiGatherRow {
+        const i: usize = if (self.scope_dense_indices) |indices| indices[k] else k;
+        const ent = self.ai_slice.entities[i];
+        const mi = self.data.movementBodyDenseIndex(ent) orelse return null;
+        const maybe_faction = self.data.factionConst(ent);
+        const ent_faction = maybe_faction orelse .neutral;
+
+        // See AiConfig.focus_target's doc comment: only an explicit opt-in,
+        // never populated for a row with no pursue gain at all.
+        const gain_pursue = self.ai_slice.gain_pursues[i];
+        const has_focus = self.focus_target != null and gain_pursue > 0;
+
+        var row = AiGatherRow{
+            .entity = ent,
+            .pos_x = self.movement.previous_x[mi],
+            .pos_y = self.movement.previous_y[mi],
+            .faction = ent_faction,
+            .level = self.data.worldLevelConst(ent) orelse 0,
+            .wander_amplitude = self.ai_slice.wander_amplitudes[i],
+            .gains = .{
+                .wander = self.ai_slice.gain_wanders[i],
+                .pursue = gain_pursue,
+                .flee = self.ai_slice.gain_flees[i],
+                .investigate = self.ai_slice.gain_investigates[i],
+                .cohere = self.ai_slice.gain_coheres[i],
+            },
+            .sticky = .{
+                .commitment_max_steps = self.ai_slice.commitment_max_steps[i],
+                .sticky_bonus = self.ai_slice.sticky_bonus[i],
+                .prev_behavior = self.ai_slice.behaviors[i],
+                .prev_commitment_remaining = self.ai_slice.commitment_remaining[i],
+                .agent_dense_index = @intCast(i),
+            },
+            .threat = .{
+                .target_visible = false,
+                .nearest_threat = EntityId.invalid,
+                .nearest_threat_x = 0,
+                .nearest_threat_y = 0,
+            },
+            .stimulus = .{ .heard_stimulus = false, .heard_stimulus_x = 0, .heard_stimulus_y = 0 },
+            .memory = .{
+                .last_known_target = EntityId.invalid,
+                .last_known_x = 0,
+                .last_known_y = 0,
+                .staleness = 0,
+                .max_staleness = 0,
+            },
+            .memory_ring = @splat(.{}),
+            .drives = .{ .fear = 0, .curiosity = 0, .aggression = 0, .fatigue = 0 },
+            .focus = .{
+                .entity = if (has_focus) self.focus_entity else null,
+                .x = if (has_focus) self.focus_target.?.x else 0,
+                .y = if (has_focus) self.focus_target.?.y else 0,
+            },
+            .interest = .{},
+            .sep_x = 0,
+            .sep_y = 0,
+            .separation_neighbor_count = 0,
+            .separation_candidate_count = 0,
+            .cohere = .{},
+            .resolved = .{ .goal_x = self.movement.previous_x[mi], .goal_y = self.movement.previous_y[mi] },
+        };
+
+        if (self.perception_slice) |perception| {
+            if (self.data.aiPerceptionDenseIndex(ent)) |pidx| {
+                row.threat = .{
+                    .target_visible = perception.target_visible[pidx],
+                    .nearest_threat = perception.nearest_threat[pidx],
+                    .nearest_threat_x = perception.last_seen_x[pidx],
+                    .nearest_threat_y = perception.last_seen_y[pidx],
+                };
+                row.stimulus = .{
+                    .heard_stimulus = perception.heard_stimulus[pidx],
+                    .heard_stimulus_x = perception.heard_stimulus_x[pidx],
+                    .heard_stimulus_y = perception.heard_stimulus_y[pidx],
+                };
+            }
+        }
+
+        if (self.memory_slice) |memory| {
+            if (self.data.aiMemoryDenseIndex(ent)) |midx| {
+                row.memory = .{
+                    .last_known_target = memory.last_known_target[midx],
+                    .last_known_x = memory.last_known_x[midx],
+                    .last_known_y = memory.last_known_y[midx],
+                    .staleness = memory.staleness[midx],
+                    .max_staleness = max_ai_memory_staleness,
+                };
+                const ring_entity = memory.ring_entity[midx];
+                const ring_x = memory.ring_x[midx];
+                const ring_y = memory.ring_y[midx];
+                const ring_age = memory.ring_age[midx];
+                for (0..ai_memory_ring_capacity) |slot| {
+                    row.memory_ring[slot] = .{
+                        .entity = ring_entity[slot],
+                        .x = ring_x[slot],
+                        .y = ring_y[slot],
+                        .age = ring_age[slot],
+                    };
+                }
+            }
+        }
+
+        if (self.affect_slice) |affect| {
+            if (self.data.aiAffectDenseIndex(ent)) |aidx| {
+                row.drives = .{
+                    .fear = affect.fear[aidx],
+                    .curiosity = affect.curiosity[aidx],
+                    .aggression = affect.aggression[aidx],
+                    .fatigue = affect.fatigue[aidx],
+                };
+            }
+        }
+
+        row.interest = .{ .has_faction = maybe_faction != null };
+        return row;
+    }
+};
+
+fn gatherInputs(ai_slice: ConstAiAgentSlice, movement: ConstMovementBodySlice, data: *const DataSystem, config: AiConfig, focus_target: ?AiDir) AiGatherInputs {
+    return .{
+        .ai_slice = ai_slice,
+        .movement = movement,
+        .data = data,
+        .scope_dense_indices = config.scope_dense_indices,
+        .focus_target = focus_target,
+        .focus_entity = config.focus_entity,
+        .perception_slice = config.perception_slice,
+        .memory_slice = config.memory_slice,
+        .affect_slice = config.affect_slice,
+    };
+}
+
+const AiGatherContext = struct {
+    inputs: AiGatherInputs,
+    // `inputs.rowCount()` window slots: range r's kept rows from `r * items_per_range`.
+    rows: std.MultiArrayList(AiGatherRow).Slice,
+    items_per_range: usize,
+    tallies: []PaddedSlot(AiRangeTally),
+};
+
+fn gatherAiJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *AiGatherContext = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.tallies.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.rows.len and range.end <= job.inputs.rowCount());
+    var rows = job.rows;
+    var kept: usize = 0;
+    for (range.start..range.end) |k| {
+        const row = job.inputs.gatherRow(k) orelse continue;
+        rows.set(range.start + kept, row);
+        kept += 1;
+    }
+    job.tallies[range.index].value.kept = kept;
+}
+
 fn buildAiSeparationContext(
     gathered: std.MultiArrayList(AiGatherRow).Slice,
     spatial: SpatialIndexView,
-    range_count: usize,
+    range_tallies: []PaddedSlot(AiRangeTally),
     markers: ?*const InterestMarkerStore,
 ) AiSeparationContext {
     return .{
@@ -674,7 +789,7 @@ fn buildAiSeparationContext(
         .interest = gathered.items(.interest),
         .markers = markers,
         .spatial_index = spatial,
-        .range_count = range_count,
+        .range_tallies = range_tallies,
     };
 }
 
@@ -835,18 +950,20 @@ const AiSeparationContext = struct {
     interest: []RowInterest,
     markers: ?*const InterestMarkerStore,
     spatial_index: SpatialIndexView,
-    /// Dispatched range count; dual-asserted against `range.index` at job entry.
-    range_count: usize,
+    /// One slot per dispatched range; range r writes only its own, once.
+    range_tallies: []PaddedSlot(AiRangeTally),
 };
 
 fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *AiSeparationContext = @ptrCast(@alignCast(context));
     // Dual worker asserts (mirror affect.zig / collision.zig).
-    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.index < job.range_tallies.len);
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.pos_x.len);
+    var separation_block = SeparationBlock{};
+    var cohere_block = CohereBlock{};
     for (range.start..range.end) |index| {
-        const result = computeBoundedSeparation(job, index);
+        const result = computeBoundedSeparation(job, index, &separation_block);
         job.sep_x[index] = result.x;
         job.sep_y[index] = result.y;
         job.neighbor_counts[index] = result.neighbor_count;
@@ -855,7 +972,7 @@ fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
         // A zero cohere gain never wins `.cohere` (its score is 0 and a tie loses to
         // `.wander`), so its query is skipped.
         job.cohere[index] = if (job.gains[index].cohere > 0)
-            computeCohereNeighbors(job, index)
+            computeCohereNeighbors(job, index, &cohere_block)
         else
             .{};
 
@@ -871,6 +988,7 @@ fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
             }
         }
     }
+    job.range_tallies[range.index].value = .{ .separation_block_fills = separation_block.fills, .cohere_block_fills = cohere_block.fills };
 }
 
 const SeparationResult = struct {
@@ -900,10 +1018,10 @@ const SeparationAccumulator = struct {
     }
 };
 
-fn computeBoundedSeparation(job: *const AiSeparationContext, index: usize) SeparationResult {
+fn computeBoundedSeparation(job: *const AiSeparationContext, index: usize, block: *SeparationBlock) SeparationResult {
     var acc = SeparationAccumulator{};
     // Every faction on the row's level.
-    const stats = job.spatial_index.queryNeighbors(.{
+    const stats = job.spatial_index.queryNeighbors(block, .{
         .x = job.pos_x[index],
         .y = job.pos_y[index],
         .level = job.level[index],
@@ -937,9 +1055,9 @@ const CohereVisitor = struct {
 /// Cohere's neighbor-mean gather: a second query of the shared index used for
 /// separation, over the factions friendly to the row on its level, so cohere flocks with
 /// allies, never hostiles or neutrals.
-fn computeCohereNeighbors(job: *const AiSeparationContext, index: usize) RowCohere {
+fn computeCohereNeighbors(job: *const AiSeparationContext, index: usize, block: *CohereBlock) RowCohere {
     var visitor = CohereVisitor{};
-    _ = job.spatial_index.queryNeighbors(.{
+    _ = job.spatial_index.queryNeighbors(block, .{
         .x = job.pos_x[index],
         .y = job.pos_y[index],
         .level = job.level[index],
@@ -1610,7 +1728,7 @@ test "ai update records one sample into each stage tuner and none into the share
 
     const stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, .{ .intent_seed = 3 });
     try std.testing.expectEqual(@as(usize, 128), stats.intent_count);
-    for ([_]*const AdaptiveWorkTuner{ &ai_sys.separation_tuner, &ai_sys.intent_tuner }) |tuner| {
+    for ([_]*const AdaptiveWorkTuner{ &ai_sys.gather_tuner, &ai_sys.separation_tuner, &ai_sys.intent_tuner }) |tuner| {
         try std.testing.expectEqual(@as(usize, 1), tuner.report().sample_count);
         try std.testing.expect(tuner.last_request != null);
     }
@@ -1825,7 +1943,7 @@ test "ai threaded multi-worker update has no steady-state allocation after warmu
 
     try ai_sys.reserve(64);
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const original_ai = ai_sys.allocator;
     const original_frame = frame.allocator;
     const original_nav = frame.navigation_intents.allocator;
@@ -1840,6 +1958,8 @@ test "ai threaded multi-worker update has no steady-state allocation after warmu
 
     frame.beginStep();
     const stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, cfg);
+    try std.testing.expect(!stats.gather_batch.ran_inline);
+    try std.testing.expect(!stats.separation_batch.ran_inline);
     try std.testing.expect(!stats.intent_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 64), frame.navigation_intents.mergedItems().len);
     frame.phase = .finished;
@@ -2101,8 +2221,8 @@ test "ai interest gate skips the marker scan for a zero-investigate-gain row" {
     defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, move_slice, &data, null, null, null, null, null, null, &markers);
-    ai_sys.computeAiSeparationsSerial(spatial_sys.view(), &markers);
+    try ai_sys.gatherAiDataSerial(.{ .ai_slice = ai_slice, .movement = move_slice, .data = &data });
+    try ai_sys.computeAiSeparationsSerial(spatial_sys.view(), &markers);
 
     const rows = ai_sys.rows.slice();
     const entities = rows.items(.entity);
@@ -2147,8 +2267,8 @@ test "ai factionless agent never discovers a faction-restricted marker" {
     defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, move_slice, &data, null, null, null, null, null, null, &markers);
-    ai_sys.computeAiSeparationsSerial(spatial_sys.view(), &markers);
+    try ai_sys.gatherAiDataSerial(.{ .ai_slice = ai_slice, .movement = move_slice, .data = &data });
+    try ai_sys.computeAiSeparationsSerial(spatial_sys.view(), &markers);
 
     const rows = ai_sys.rows.slice();
     const entities = rows.items(.entity);
@@ -2392,97 +2512,180 @@ test "ai serial and threaded (0 workers) produce identical intents with separati
     try std.testing.expectEqual(serial[1].direct_direction_y, thr[1].direct_direction_y);
 }
 
-test "ai serial and real threaded workers produce identical navigation intents" {
+// 128 allies at a 9 x 7 pitch: about four per index cell, every third with cohere gain, and
+// every eleventh AI agent without a movement body, so the gather skips rows.
+fn fillParityAgents(data: *DataSystem) !void {
+    for (0..140) |i| {
+        const entity = try data.createEntity();
+        try data.setAiAgent(entity, .{
+            .active_behavior = if (i % 2 == 0) .pursue else .wander,
+            .wander_amplitude = @floatFromInt(i % 13),
+            .gain_pursue = if (i % 2 == 0) 0.7 else 0.2,
+            .gain_cohere = if (i % 3 == 0) 0.5 else 0,
+        });
+        // Friendly to one another, so cohere finds neighbors.
+        try data.setFaction(entity, .ally);
+        if (i % 11 == 10) continue;
+        const x: f32 = @floatFromInt(i % 16);
+        const y: f32 = @floatFromInt(i / 16);
+        try data.setMovementBody(entity, .{
+            .position = .{ .x = x * 9.0, .y = y * 7.0 },
+            .previous_position = .{ .x = x * 9.0, .y = y * 7.0 },
+            .velocity = .{},
+            .speed = 20,
+        });
+    }
+}
+
+const SimulationScopeSystem = @import("simulation_scope.zig").SimulationScopeSystem;
+
+test "ai serial and real threaded workers produce identical rows and intents on cell-major rows at every range size" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    // Two DataSystems: arbitration write-back mutates sticky columns, so serial
-    // and threaded must start from identical unmutated state.
-    var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    var serial_data = DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
-    var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
-    defer threaded_data.deinit();
-    inline for (.{ &serial_data, &threaded_data }) |data| {
-        for (0..128) |i| {
-            const x: f32 = @floatFromInt(i % 16);
-            const y: f32 = @floatFromInt(i / 16);
-            const entity = try data.createEntity();
-            try data.setMovementBody(entity, .{
-                .position = .{ .x = x * 9.0, .y = y * 7.0 },
-                .previous_position = .{ .x = x * 9.0, .y = y * 7.0 },
-                .velocity = .{},
-                .speed = 20,
-            });
-            try data.setAiAgent(entity, .{
-                .active_behavior = if (i % 2 == 0) .pursue else .wander,
-                .wander_amplitude = @floatFromInt(i % 13),
-                .gain_pursue = if (i % 2 == 0) 0.7 else 0.2,
-                .gain_cohere = if (i % 3 == 0) 0.5 else 0,
-            });
-            // Friendly to one another, so cohere finds neighbors.
-            try data.setFaction(entity, .ally);
-        }
-    }
-
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
-        .max_worker_threads = 2,
-        .items_per_range = 16,
-    });
-    defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-
-    const cfg: AiConfig = .{
-        .items_per_range = 16,
-        .max_worker_threads = 2,
-        .adaptive = false,
-        .intent_seed = 0x1234abcd,
-        .focus_target = .{ .x = 300, .y = 200 },
-    };
-
+    try fillParityAgents(&serial_data);
     var serial_spatial = try testSpatialIndex(&serial_data);
     defer serial_spatial.deinit();
-    var threaded_spatial = try testSpatialIndex(&threaded_data);
-    defer threaded_spatial.deinit();
+    const serial_view = serial_spatial.view();
+    var scope = SimulationScopeSystem.init(std.testing.allocator);
+    defer scope.deinit();
+    // The think set in the index's cell-major order, as the pipeline orders it.
+    const think_set = (try scope.compactCognitionSerial(&serial_view, 0, false)).cognition;
+    try std.testing.expect(think_set.len > 100);
 
+    const base_cfg: AiConfig = .{ .intent_seed = 0x1234abcd, .focus_target = .{ .x = 300, .y = 200 }, .scope_dense_indices = think_set };
     var serial_ai = AiSystem.init(std.testing.allocator);
     defer serial_ai.deinit();
     var serial_frame = SimulationFrame.init(std.testing.allocator);
     defer serial_frame.deinit();
-    try serial_frame.reserveStreams(8, 0, 128, 0, 0, 0);
+    try serial_frame.reserveStreams(16, 0, 140, 0, 0, 0);
     serial_frame.beginStep();
-    _ = try serial_ai.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, cfg);
+    const serial_stats = try serial_ai.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_view, &serial_data, &serial_frame, 0.016, base_cfg);
     const serial = serial_frame.navigation_intents.mergedItems();
-
-    var threaded_ai = AiSystem.init(std.testing.allocator);
-    defer threaded_ai.deinit();
-    var threaded_frame = SimulationFrame.init(std.testing.allocator);
-    defer threaded_frame.deinit();
-    try threaded_frame.reserveStreams(8, 0, 128, 0, 0, 0);
-    threaded_frame.beginStep();
-    const stats = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, cfg);
-    try std.testing.expect(!stats.intent_batch.ran_inline);
-    try std.testing.expect(!stats.separation_batch.ran_inline);
-    const threaded = threaded_frame.navigation_intents.mergedItems();
-    // Separation and cohere rows on workers equal the serial ones bit for bit.
     const serial_rows = serial_ai.rows.slice();
-    const threaded_rows = threaded_ai.rows.slice();
-    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial_rows.items(.sep_x)), std.mem.sliceAsBytes(threaded_rows.items(.sep_x)));
-    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial_rows.items(.sep_y)), std.mem.sliceAsBytes(threaded_rows.items(.sep_y)));
     var cohere_rows: usize = 0;
-    for (serial_rows.items(.cohere), threaded_rows.items(.cohere)) |serial_cohere, threaded_cohere| {
-        try std.testing.expectEqual(serial_cohere.count, threaded_cohere.count);
-        try std.testing.expectEqual(@as(u32, @bitCast(serial_cohere.mean_x)), @as(u32, @bitCast(threaded_cohere.mean_x)));
-        try std.testing.expectEqual(@as(u32, @bitCast(serial_cohere.mean_y)), @as(u32, @bitCast(threaded_cohere.mean_y)));
-        if (serial_cohere.count > 1) cohere_rows += 1;
+    for (serial_rows.items(.cohere)) |cohere| {
+        if (cohere.count > 1) cohere_rows += 1;
     }
     try std.testing.expect(cohere_rows > 0);
 
-    try std.testing.expectEqual(serial.len, threaded.len);
-    for (serial, threaded) |a, b| {
-        try std.testing.expectEqual(a.entity.index, b.entity.index);
-        try std.testing.expectEqual(a.entity.generation, b.entity.generation);
-        try std.testing.expectEqual(a.direct_direction_x, b.direct_direction_x);
-        try std.testing.expectEqual(a.direct_direction_y, b.direct_direction_y);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    for ([_]usize{ 1, 4, 16 }) |items_per_range| {
+        // Arbitration writes sticky columns back, so each run starts from fresh state.
+        var threaded_data = DataSystem.init(std.testing.allocator);
+        defer threaded_data.deinit();
+        try fillParityAgents(&threaded_data);
+        var threaded_spatial = try testSpatialIndex(&threaded_data);
+        defer threaded_spatial.deinit();
+        var cfg = base_cfg;
+        cfg.items_per_range = items_per_range;
+        cfg.max_worker_threads = 2;
+        cfg.adaptive = false;
+        var threaded_ai = AiSystem.init(std.testing.allocator);
+        defer threaded_ai.deinit();
+        var threaded_frame = SimulationFrame.init(std.testing.allocator);
+        defer threaded_frame.deinit();
+        try threaded_frame.reserveStreams(16, 0, 140, 0, 0, 0);
+        threaded_frame.beginStep();
+        const stats = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, cfg);
+        try std.testing.expect(!stats.gather_batch.ran_inline);
+        try std.testing.expect(!stats.separation_batch.ran_inline);
+        try std.testing.expect(!stats.intent_batch.ran_inline);
+        // Range boundaries split cells, each refilling: never fewer fills than serial.
+        try std.testing.expect(stats.separation_block_fills >= serial_stats.separation_block_fills);
+
+        // Every gathered row, and the separation and cohere sums, bit for bit.
+        const threaded_rows = threaded_ai.rows.slice();
+        try std.testing.expectEqual(serial_rows.len, threaded_rows.len);
+        for (0..serial_rows.len) |row| {
+            const want = serial_rows.get(row);
+            const got = threaded_rows.get(row);
+            try std.testing.expect(want.entity.eql(got.entity));
+            try std.testing.expectEqual(want.sticky.agent_dense_index, got.sticky.agent_dense_index);
+            try std.testing.expectEqual(@as(u32, @bitCast(want.pos_x)), @as(u32, @bitCast(got.pos_x)));
+            try std.testing.expectEqual(@as(u32, @bitCast(want.sep_x)), @as(u32, @bitCast(got.sep_x)));
+            try std.testing.expectEqual(@as(u32, @bitCast(want.sep_y)), @as(u32, @bitCast(got.sep_y)));
+            try std.testing.expectEqual(want.cohere.count, got.cohere.count);
+            try std.testing.expectEqual(@as(u32, @bitCast(want.cohere.mean_x)), @as(u32, @bitCast(got.cohere.mean_x)));
+            try std.testing.expectEqual(@as(u32, @bitCast(want.cohere.mean_y)), @as(u32, @bitCast(got.cohere.mean_y)));
+            try std.testing.expectEqualDeep(want.resolved, got.resolved);
+        }
+        const threaded = threaded_frame.navigation_intents.mergedItems();
+        try std.testing.expectEqual(serial.len, threaded.len);
+        for (serial, threaded) |a, b| {
+            try std.testing.expect(a.entity.eql(b.entity));
+            try std.testing.expectEqual(@as(u32, @bitCast(a.direct_direction_x)), @as(u32, @bitCast(b.direct_direction_x)));
+            try std.testing.expectEqual(@as(u32, @bitCast(a.direct_direction_y)), @as(u32, @bitCast(b.direct_direction_y)));
+        }
     }
+}
+
+test "the threaded gather writes every row the serial gather does, skipping bodiless rows" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try fillParityAgents(&data);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    const inputs = AiGatherInputs{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data, .focus_target = .{ .x = 1, .y = 2 }, .focus_entity = EntityId.invalid };
+
+    var serial_ai = AiSystem.init(std.testing.allocator);
+    defer serial_ai.deinit();
+    try serial_ai.gatherAiDataSerial(inputs);
+    // Every eleventh agent has no body.
+    try std.testing.expectEqual(@as(usize, 140 - 12), serial_ai.rows.len);
+    for ([_]usize{ 16, 48 }) |items_per_range| {
+        var threaded_ai = AiSystem.init(std.testing.allocator);
+        defer threaded_ai.deinit();
+        const batch = try threaded_ai.gatherAiData(inputs, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 3, .adaptive = false });
+        try std.testing.expect(!batch.ran_inline);
+        try std.testing.expectEqual(serial_ai.rows.len, threaded_ai.rows.len);
+        for (0..serial_ai.rows.len) |row| try std.testing.expectEqualDeep(serial_ai.rows.get(row), threaded_ai.rows.get(row));
+    }
+}
+
+test "rows of one cell fill one separation block, and cohere rows of one cell one cohere block" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // Three cells (32-unit cells) of four, three, and five agents, all with cohere gain.
+    const cells = [_][2]f32{ .{ 40, 40 }, .{ 200, 40 }, .{ 40, 200 } };
+    const counts = [_]usize{ 4, 3, 5 };
+    for (cells, counts) |cell, count| {
+        for (0..count) |k| {
+            const entity = try data.createEntity();
+            const offset = @as(f32, @floatFromInt(k)) * 2;
+            try data.setMovementBody(entity, .{ .position = .{ .x = cell[0] + offset, .y = cell[1] }, .previous_position = .{ .x = cell[0] + offset, .y = cell[1] }, .velocity = .{}, .speed = 20 });
+            try data.setAiAgent(entity, .{ .active_behavior = .wander, .gain_cohere = 1 });
+            try data.setFaction(entity, .ally);
+        }
+    }
+    var spatial_sys = try testSpatialIndex(&data);
+    defer spatial_sys.deinit();
+    const view = spatial_sys.view();
+    var scope = SimulationScopeSystem.init(std.testing.allocator);
+    defer scope.deinit();
+    const think_set = (try scope.compactCognitionSerial(&view, 0, false)).cognition;
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 16, 0, 0, 0);
+    frame.beginStep();
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), view, &data, &frame, 0.016, .{ .scope_dense_indices = think_set });
+    try std.testing.expectEqual(@as(usize, 12), stats.entity_count);
+    try std.testing.expectEqual(cells.len, stats.separation_block_fills);
+    try std.testing.expectEqual(cells.len, stats.cohere_block_fills);
+
+    // Rows interleaving the cells refill at every key change: A B C A B C A B C A C C.
+    const shuffled = [_]u32{ 0, 4, 7, 1, 5, 8, 2, 6, 9, 3, 10, 11 };
+    frame.beginStep();
+    const shuffled_stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), view, &data, &frame, 0.016, .{ .scope_dense_indices = &shuffled });
+    try std.testing.expectEqual(@as(usize, 11), shuffled_stats.separation_block_fills);
 }
 
 test "ai spatial separation caps dense neighbor samples" {
@@ -2658,13 +2861,15 @@ test "separation and cohere read only the row's level, and cohere only friendly 
     defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, null, null, null, null, null, null, null);
-    const context = buildAiSeparationContext(ai_sys.rows.slice(), spatial_sys.view(), 1, null);
+    try ai_sys.gatherAiDataSerial(.{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data });
+    const context = buildAiSeparationContext(ai_sys.rows.slice(), spatial_sys.view(), ai_sys.range_tallies.items, null);
+    var separation_block = SeparationBlock{};
+    var cohere_block = CohereBlock{};
 
-    const separation = computeBoundedSeparation(&context, 0);
+    const separation = computeBoundedSeparation(&context, 0, &separation_block);
     try std.testing.expectEqual(@as(u16, 2), separation.candidate_count);
     try std.testing.expectEqual(@as(u8, 2), separation.neighbor_count);
-    const cohere = computeCohereNeighbors(&context, 0);
+    const cohere = computeCohereNeighbors(&context, 0, &cohere_block);
     try std.testing.expectEqual(@as(u32, 1), cohere.count);
     try std.testing.expectEqual(@as(f32, 20), cohere.mean_x);
 }
@@ -2706,8 +2911,8 @@ const LaneSeparation = struct {
     }
 };
 
-// Reference for a single populated cell: one run in index order, so neighbor `j`'s lane is
-// its position in the run, self included, mod 4.
+// Reference for a single populated cell: one stream in index order, so neighbor `j`'s lane
+// is its rank in it, self included, mod 4.
 fn bruteForceSeparation(pos_x: []const f32, pos_y: []const f32, index: usize) SeparationResult {
     var lanes = LaneSeparation{};
     for (0..pos_x.len) |j| {
@@ -2741,18 +2946,20 @@ test "ai computeBoundedSeparation matches a one-cell lane-order reference bit-fo
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null, null);
+    try ai_sys.gatherAiDataSerial(.{ .ai_slice = ai_slice, .movement = movement_slice, .data = &data });
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
     const pos_x = gathered.items(.pos_x);
     const pos_y = gathered.items(.pos_y);
 
-    const context = buildAiSeparationContext(gathered, spatial_sys.view(), 1, null);
+    const context = buildAiSeparationContext(gathered, spatial_sys.view(), ai_sys.range_tallies.items, null);
+
+    var separation_block = SeparationBlock{};
 
     var capped: usize = 0;
     for (0..count) |i| {
-        const ported = computeBoundedSeparation(&context, i);
+        const ported = computeBoundedSeparation(&context, i, &separation_block);
         const reference = bruteForceSeparation(pos_x, pos_y, i);
         try std.testing.expectEqual(reference.candidate_count, ported.candidate_count);
         try std.testing.expectEqual(reference.neighbor_count, ported.neighbor_count);
@@ -2768,8 +2975,8 @@ const test_cell_size: f32 = (spatial_index.SpatialIndexConfig{}).cell_size;
 const test_separation_scan_radius: i32 = @intFromFloat(@ceil(separation_radius / test_cell_size));
 
 // Reconstructs the index's order from raw positions: with one faction, one level, and one
-// chunk it is (cell_y, cell_x, index), and each in-box cell row is one run whose lanes count
-// every entry of the row, self included. `max_lane_terms` is the most terms one lane summed.
+// chunk it is (cell_y, cell_x, index), one stream whose lanes count every in-box entry, self
+// included. `max_lane_terms` is the most terms one lane summed.
 fn cellScanOrderedSeparation(pos_x: []const f32, pos_y: []const f32, index: usize, max_lane_terms: *u8) SeparationResult {
     const cellOf = struct {
         fn compute(x: f32, y: f32) [2]i32 {
@@ -2781,9 +2988,9 @@ fn cellScanOrderedSeparation(pos_x: []const f32, pos_y: []const f32, index: usiz
     }.compute;
     const own_cell = cellOf(pos_x[index], pos_y[index]);
     var lanes = LaneSeparation{};
+    var rank: usize = 0;
     var cell_y = own_cell[1] - test_separation_scan_radius;
     while (cell_y <= own_cell[1] + test_separation_scan_radius) : (cell_y += 1) {
-        var rank: usize = 0;
         var cell_x = own_cell[0] - test_separation_scan_radius;
         while (cell_x <= own_cell[0] + test_separation_scan_radius) : (cell_x += 1) {
             for (0..pos_x.len) |j| {
@@ -2824,7 +3031,7 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered lane oracle across
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null, null);
+    try ai_sys.gatherAiDataSerial(.{ .ai_slice = ai_slice, .movement = movement_slice, .data = &data });
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
@@ -2849,12 +3056,14 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered lane oracle across
     try std.testing.expect(max_cell_y - min_cell_y >= 3);
     try std.testing.expect(min_cell_x >= 0 and min_cell_y >= 0 and max_cell_x < spatial_sys.view().cells_per_chunk and max_cell_y < spatial_sys.view().cells_per_chunk);
 
-    const context = buildAiSeparationContext(gathered, spatial_sys.view(), 1, null);
+    const context = buildAiSeparationContext(gathered, spatial_sys.view(), ai_sys.range_tallies.items, null);
+
+    var separation_block = SeparationBlock{};
 
     // Fail loud if no lane ever sums two terms: the lane order would be untested.
     var max_lane_terms: u8 = 0;
     for (0..count) |i| {
-        const ported = computeBoundedSeparation(&context, i);
+        const ported = computeBoundedSeparation(&context, i, &separation_block);
         const reference = cellScanOrderedSeparation(pos_x, pos_y, i, &max_lane_terms);
         try std.testing.expectEqual(reference.candidate_count, ported.candidate_count);
         try std.testing.expectEqual(reference.neighbor_count, ported.neighbor_count);
@@ -2885,9 +3094,10 @@ test "cohere finds its ally past more hostiles than its check budget" {
     defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, null, null, null, null, null, null, null);
-    const context = buildAiSeparationContext(ai_sys.rows.slice(), spatial_sys.view(), 1, null);
-    const cohere = computeCohereNeighbors(&context, 0);
+    try ai_sys.gatherAiDataSerial(.{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data });
+    const context = buildAiSeparationContext(ai_sys.rows.slice(), spatial_sys.view(), ai_sys.range_tallies.items, null);
+    var cohere_block = CohereBlock{};
+    const cohere = computeCohereNeighbors(&context, 0, &cohere_block);
     try std.testing.expectEqual(@as(u32, 1), cohere.count);
     try std.testing.expectEqual(@as(f32, 100), cohere.mean_x);
     try std.testing.expectEqual(@as(f32, 150), cohere.mean_y);
@@ -2906,18 +3116,19 @@ test "cohere caps at its neighbor count, summing the first in scan order in lane
     defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, null, null, null, null, null, null, null);
+    try ai_sys.gatherAiDataSerial(.{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data });
     const gathered = ai_sys.rows.slice();
-    const context = buildAiSeparationContext(gathered, spatial_sys.view(), 1, null);
-    const cohere = computeCohereNeighbors(&context, 0);
+    const context = buildAiSeparationContext(gathered, spatial_sys.view(), ai_sys.range_tallies.items, null);
+    var cohere_block = CohereBlock{};
+    const cohere = computeCohereNeighbors(&context, 0, &cohere_block);
     try std.testing.expectEqual(max_cohere_neighbors, cohere.count);
 
-    // The ally run, after self's player run, in index order: ally k at lane k mod 4.
+    // The ally run follows self's one-entry player run in the stream: ally k at rank k + 1.
     var acc_x: [simd.lane_count]f32 = @splat(0);
     var acc_y: [simd.lane_count]f32 = @splat(0);
     for (0..max_cohere_neighbors) |ally| {
-        acc_x[ally % simd.lane_count] += gathered.items(.pos_x)[ally + 1];
-        acc_y[ally % simd.lane_count] += gathered.items(.pos_y)[ally + 1];
+        acc_x[(ally + 1) % simd.lane_count] += gathered.items(.pos_x)[ally + 1];
+        acc_y[(ally + 1) % simd.lane_count] += gathered.items(.pos_y)[ally + 1];
     }
     const inv = 1.0 / @as(f32, @floatFromInt(max_cohere_neighbors));
     try std.testing.expectEqual(simd.sumLanesScalar(acc_x) * inv, cohere.mean_x);

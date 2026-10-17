@@ -2,12 +2,21 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! `scope`: the scoped step (AI cognition, collision, movement, chunk derive, gathers, and
-//! tier policy) over N entities whose levels (`index % 5`) give a mixed-tier population:
-//! cognition, locomotion, kinematic, and dormant. The index build runs every step but is
-//! excluded from the window (its own group times it). `output_count` is the rows that ran
-//! cognition. Pass shape: time linear in the active (cognition + locomotion) rows, never
-//! in N; asserts check fewer than N rows ran cognition.
+//! - `scope`: the scoped step (AI cognition, collision, movement, chunk derive, gathers, the
+//!   think set, and tier policy) over N entities whose levels (`index % 5`) give a
+//!   mixed-tier population: cognition, locomotion, kinematic, and dormant. The index build
+//!   runs every step but is excluded from the window (its own group times it).
+//!   `output_count` is the rows that ran cognition. Pass shape: time linear in the active
+//!   (cognition + locomotion) rows, never in N; asserts check fewer than N rows ran
+//!   cognition.
+//! - `scope-cognition`: the think set alone (`compactCognition`) over a halo index built once
+//!   untimed: `spread` over the `scope` fixture, `dense_chunk` with every agent in one chunk
+//!   (one index record), whose ranges split the one chunk. Pass shape: linear in the H
+//!   indexed rows in both layouts, `spread` on workers at the largest size on the tuned case;
+//!   the main thread's share (the window merges) flat per row. Asserts check `spread`'s
+//!   tuned case off main at the largest size, one record for `dense_chunk`, every case's
+//!   think set equal to the serial pass's, and every indexed row counted once, thinking or
+//!   skipped.
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -22,8 +31,10 @@ const MovementSystem = @import("../game/systems/movement.zig").MovementSystem;
 const AiSystem = @import("../game/systems/ai.zig").AiSystem;
 const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
 const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
+const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
 const IndexPopulation = @import("../game/systems/spatial_index.zig").IndexPopulation;
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
+const CognitionResult = @import("../game/systems/simulation_scope.zig").CognitionResult;
 const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
 const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
 const SimulationScopeSystem = @import("../game/systems/simulation_scope.zig").SimulationScopeSystem;
@@ -38,6 +49,8 @@ const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
+
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 
 const delta_seconds: f32 = 1.0 / 60.0;
 const intent_seed: u64 = 0x5c0_9ed5;
@@ -79,6 +92,14 @@ pub const group = suite.BenchmarkGroup{
     .write_workload = writeScopeWorkload,
 };
 
+pub const cognition_group = suite.BenchmarkGroup{
+    .name = "scope-cognition",
+    .item_label = CognitionCode.label,
+    .defaultItemCounts = cognitionItemCounts,
+    .runCase = runCognitionCase,
+    .write_workload = writeCognitionWorkload,
+};
+
 const Fixture = struct {
     data: DataSystem,
     frame: SimulationFrame,
@@ -94,6 +115,29 @@ const Fixture = struct {
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
     return suite.eventScaleCounts(profile);
+}
+
+// `spread` is the `scope` fixture; `dense_chunk` puts every agent in chunk (0, 0).
+const CognitionLayout = enum(u8) { spread, dense_chunk };
+const CognitionCode = suite.ItemCode(struct { layout: CognitionLayout, agents: u32 }, &.{6});
+
+// Each layout at the `scope` sizes.
+fn cognitionCodes(comptime counts: []const usize) [2 * counts.len]usize {
+    var codes: [2 * counts.len]usize = undefined;
+    for (counts, 0..) |count, index| {
+        codes[index] = CognitionCode.of(.{ .layout = .spread, .agents = count });
+        codes[counts.len + index] = CognitionCode.of(.{ .layout = .dense_chunk, .agents = count });
+    }
+    return codes;
+}
+
+fn cognitionItemCounts(profile: suite.Profile) []const usize {
+    return switch (profile) {
+        inline else => |comptime_profile| blk: {
+            const codes = comptime cognitionCodes(suite.eventScaleCounts(comptime_profile));
+            break :blk &codes;
+        },
+    };
 }
 
 pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
@@ -168,7 +212,8 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     // Each stage trains its own adaptive tuner(s) from the case, exactly as that
     // stage's own benchmark does (one tuner per independently-timed threaded stage).
     if (suite.adaptiveTunerForCase(case, ai_range_alignment_items)) |tuner| {
-        ai.separation_tuner = tuner;
+        ai.gather_tuner = tuner;
+        ai.separation_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
         ai.intent_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
     }
     if (suite.adaptiveTunerForCase(case, collision_range_alignment_items)) |tuner| {
@@ -232,10 +277,10 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 /// measured iterations will use.
 fn allTunersSettled(ai: *const AiSystem, collision: *const CollisionSystem, move: *const MovementSystem, scope: *const SimulationScopeSystem, spatial_index: *const SpatialIndexSystem) bool {
     return move.adaptive_tuner.isSettled() and
-        ai.separation_tuner.isSettled() and ai.intent_tuner.isSettled() and
+        ai.gather_tuner.isSettled() and ai.separation_tuner.isSettled() and ai.intent_tuner.isSettled() and
         collision.broadphase_tuner.isSettled() and collision.narrowphase_tuner.isSettled() and
         scope.chunk_derive_tuner.isSettled() and scope.collision_gather_tuner.isSettled() and
-        scope.ai_gather_tuner.isSettled() and scope.tier_policy_tuner.isSettled() and
+        scope.ai_gather_tuner.isSettled() and scope.cognition_tuner.isSettled() and scope.tier_policy_tuner.isSettled() and
         spatial_index.bucket_tuner.isSettled() and spatial_index.sort_tuner.isSettled() and spatial_index.link_tuner.isSettled();
 }
 
@@ -272,17 +317,12 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
     // scope stage's own tuners train inside the measured window.
     var collision_indices: ?[]const u32 = undefined;
     var ai_halo_indices: []const u32 = undefined;
-    var ai_cognition_indices: []const u32 = undefined;
     if (thread_system) |ts| {
         collision_indices = (try ctx.scope.gatherCollisionBoundsIndices(&fixture.data, ts, scope_config)).indices;
-        const pops = try ctx.scope.gatherAiPopulations(&fixture.data, region, ctx.scope.staggerStep(), ts, scope_config);
-        ai_halo_indices = pops.halo;
-        ai_cognition_indices = pops.cognition;
+        ai_halo_indices = (try ctx.scope.gatherAiPopulations(&fixture.data, region, ts, scope_config)).halo;
     } else {
         collision_indices = try ctx.scope.gatherCollisionBoundsIndicesSerial(&fixture.data);
-        const pops = try ctx.scope.gatherAiPopulationsSerial(&fixture.data, region, ctx.scope.staggerStep());
-        ai_halo_indices = pops.halo;
-        ai_cognition_indices = pops.cognition;
+        ai_halo_indices = (try ctx.scope.gatherAiPopulationsSerial(&fixture.data, region)).halo;
     }
 
     const ai_slice = fixture.data.aiAgentSliceConst();
@@ -301,6 +341,10 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
     const spatial_end_ns = suite.nowNs(io);
     const excluded_ns = suite.elapsedNs(spatial_start_ns, spatial_end_ns);
     const spatial_view = ctx.spatial_index.view();
+    const ai_cognition_indices = if (thread_system) |ts|
+        (try ctx.scope.compactCognition(&spatial_view, ctx.scope.staggerStep(), true, ts, scope_config)).cognition
+    else
+        (try ctx.scope.compactCognitionSerial(&spatial_view, ctx.scope.staggerStep(), true)).cognition;
 
     const chunk_grid = SimulationScopeSystem.ChunkGrid{
         .tile_size = tile_size,
@@ -365,4 +409,111 @@ fn scopeConfig(case: suite.BenchmarkCase) ScopeConfig {
 
 fn writeScopeWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("cognition_active={}", .{stats.output_count});
+}
+
+// Every agent a cognition-tier body in chunk (0, 0) on level 0, over its 8x8 index cells.
+fn createDenseChunkFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    var frame = SimulationFrame.init(allocator);
+    errdefer frame.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(allocator);
+    errdefer contacts.deinit();
+    const side: usize = @intFromFloat(chunk_px - 16);
+    for (0..count) |index| {
+        const entity = try data.createEntity();
+        const position = math.Vec2{
+            .x = 8.0 + @as(f32, @floatFromInt(index % side)),
+            .y = 8.0 + @as(f32, @floatFromInt(index / side % side)),
+        };
+        try data.setMovementBody(entity, .{ .position = position, .previous_position = position });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+        try data.setSimulationMetadata(entity, .{ .tier = .cognition, .stagger_phase = @intCast(index % cognition_stagger_n) });
+    }
+    return .{ .data = data, .frame = frame, .contacts = contacts };
+}
+
+pub fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+
+    const fields = try CognitionCode.decode(item_count);
+    var fixture = switch (fields.layout) {
+        .spread => try createFixture(allocator, fields.agents),
+        .dense_chunk => try createDenseChunkFixture(allocator, fields.agents),
+    };
+    defer fixture.deinit();
+    var scope = SimulationScopeSystem.init(allocator);
+    defer scope.deinit();
+    try scope.reserve(fields.agents);
+    if (suite.adaptiveTunerForCase(case, scope_range_alignment_items)) |tuner| scope.cognition_tuner = tuner;
+    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const thread_ptr = if (threads) |*thread_system| thread_system else null;
+
+    // Positions never change, so the halo's index is built once, untimed.
+    var spatial_index = SpatialIndexSystem.init(allocator);
+    defer spatial_index.deinit();
+    const halo = (try scope.gatherAiPopulationsSerial(&fixture.data, cognitionHaloRegion())).halo;
+    _ = try spatial_index.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities, .rows = halo }, index_geometry, .{});
+    const view = spatial_index.view();
+    const indexed = view.entryCount();
+    if (fields.layout == .dense_chunk) std.debug.assert(view.recordCount() == 1 and indexed == fields.agents);
+    // The serial pass's think set, untimed: every case must match it.
+    const serial_think = blk: {
+        var reference = SimulationScopeSystem.init(allocator);
+        defer reference.deinit();
+        break :blk try allocator.dupe(u32, (try reference.compactCognitionSerial(&view, 0, true)).cognition);
+    };
+    defer allocator.free(serial_think);
+
+    for (0..options.warmup_iterations) |_| _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while (!scope.cognition_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
+        }
+    }
+    const settled_before_measurement = if (case.adaptive) scope.cognition_tuner.isSettled() else false;
+
+    const counts = defaultItemCounts(options.profile);
+    // `dense_chunk` runs inline where its tuner measures that cheaper.
+    const expect_off_main = fields.layout == .spread and case.adaptive and case.adaptive_range_mode == .tuned and fields.agents == counts[counts.len - 1];
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var think_rows: usize = 0;
+    var main_total: u128 = 0;
+    for (0..options.iterations) |_| {
+        const start_ns = suite.nowNs(io);
+        const result = try runCognitionOnce(&scope, &view, thread_ptr, case);
+        const end_ns = suite.nowNs(io);
+        if (expect_off_main and result.batch.ran_inline) return error.CognitionRanInline;
+        const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
+        accumulator.record(elapsed_ns, result.batch);
+        main_total += elapsed_ns -| offMainNs(result.batch);
+        std.debug.assert(std.mem.eql(u32, serial_think, result.cognition));
+        think_rows = result.cognition.len;
+        // Every indexed row thinks or is skipped, once.
+        std.debug.assert(think_rows + scope.stagger_skips == indexed);
+    }
+
+    var stats = accumulator.finish();
+    stats.items_per_second = suite.itemsPerSecond(fields.agents, stats.mean_ns);
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    stats.candidate_pairs = indexed;
+    stats.output_count = think_rows;
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(scope.cognition_tuner.report(), settled_before_measurement);
+    return stats;
+}
+
+fn runCognitionOnce(scope: *SimulationScopeSystem, view: *const SpatialIndexView, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !CognitionResult {
+    if (thread_system) |ts| return scope.compactCognition(view, 0, true, ts, scopeConfig(case));
+    return scope.compactCognitionSerial(view, 0, true);
+}
+
+// `candidate_pairs` holds the indexed rows and `output_count` the rows that think; `main` is
+// the time outside the pass's worker dispatch.
+fn writeCognitionWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("indexed={} thinking={}", .{ stats.candidate_pairs, stats.output_count });
+    if (view == .summary) return;
+    try suite.writeMainShare(writer, stats, stats.candidate_pairs);
 }

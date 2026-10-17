@@ -280,6 +280,10 @@ pub const RunStats = struct {
     deferred_count: usize = 0,
     fallback_deferred_count: usize = 0,
     cache_evictions: usize = 0,
+    // Neighbor-block fills of a group whose queries share `NeighborBlock`s, and of its second
+    // query kind when it has two.
+    neighbor_block_fills: usize = 0,
+    secondary_neighbor_block_fills: usize = 0,
     iterations: usize = 0,
     mean_ns: u64 = 0,
     min_ns: u64 = 0,
@@ -1248,6 +1252,13 @@ fn writeWorkTuning(writer: *std.Io.Writer, summary: WorkTuningSummary) std.Io.Wr
 pub fn writeShare(writer: *std.Io.Writer, label: []const u8, part_ns: u64, mean_ns: u64) std.Io.Writer.Error!void {
     const percent = if (mean_ns == 0) 0 else part_ns * 100 / mean_ns;
     try writer.print(" {s}={f} ({}%)", .{ label, formatDuration(part_ns), percent });
+}
+
+/// The main thread's share of the mean (`main_ns`, when set) and its time per one of `items`.
+pub fn writeMainShare(writer: *std.Io.Writer, stats: RunStats, items: usize) std.Io.Writer.Error!void {
+    const main_ns = stats.main_ns orelse return;
+    try writeShare(writer, "main", main_ns, stats.mean_ns);
+    try writer.print(" main_per_item={f}", .{formatDuration(main_ns / @max(items, 1))});
 }
 
 /// A stage's batch shape: `inline`, or active workers and ranges.

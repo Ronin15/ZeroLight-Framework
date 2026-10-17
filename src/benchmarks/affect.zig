@@ -10,6 +10,10 @@
 //! affect's inputs are hot component state, not per-step events, so there is
 //! no per-iteration injection loop here (and so no risk of the O(n^2)
 //! per-event `appendRequired` pitfall that file's bench comment warns about).
+//!
+//! `ai-affect-shuffled`: the same step over a stride shuffle of every agent as the think
+//! set, so ranges write scattered affect rows, as a cell-major think set does. Pass shape:
+//! within spread of `ai-affect`.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -26,6 +30,14 @@ pub const group = suite.BenchmarkGroup{
     .item_label = "AI agents",
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
+    .write_workload = writeAffectWorkload,
+};
+
+pub const shuffled_group = suite.BenchmarkGroup{
+    .name = "ai-affect-shuffled",
+    .item_label = "AI agents",
+    .defaultItemCounts = defaultItemCounts,
+    .runCase = runShuffledCase,
     .write_workload = writeAffectWorkload,
 };
 
@@ -71,6 +83,17 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
 }
 
 pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCaseImpl(allocator, io, options, case, item_count, null);
+}
+
+pub fn runShuffledCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    const think_set = try fixtures.strideShuffledRows(allocator, item_count);
+    defer allocator.free(think_set);
+    return runCaseImpl(allocator, io, options, case, item_count, think_set);
+}
+
+// `think_set` null: every agent in store order.
+fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, think_set: ?[]const u32) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     var fixture = try createFixture(allocator, item_count);
@@ -85,13 +108,13 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer if (threads) |*thread_system| thread_system.deinit();
 
     for (0..options.warmup_iterations) |_| {
-        _ = try runOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+        _ = try runOnce(&system, &fixture, think_set, if (threads) |*thread_system| thread_system else null, case);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while (!system.compute_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+            _ = try runOnce(&system, &fixture, think_set, if (threads) |*thread_system| thread_system else null, case);
         }
     }
     const settled_before_measurement = if (case.adaptive) system.compute_tuner.isSettled() else false;
@@ -100,7 +123,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var last_stats = AffectStats{};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        last_stats = try runOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+        last_stats = try runOnce(&system, &fixture, think_set, if (threads) |*thread_system| thread_system else null, case);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.batch);
     }
@@ -114,18 +137,19 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     return stats;
 }
 
-fn runOnce(system: *AffectSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !AffectStats {
+fn runOnce(system: *AffectSystem, fixture: *Fixture, think_set: ?[]const u32, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !AffectStats {
     fixture.events.clearRetainingCapacity();
     const ai_slice = fixture.data.aiAgentSliceConst();
 
     if (!case.usesThreadSystem()) {
-        return try system.updateSerial(ai_slice, &fixture.data, &fixture.events, .{});
+        return try system.updateSerial(ai_slice, &fixture.data, &fixture.events, .{ .scope_dense_indices = think_set });
     }
 
     return try system.update(ai_slice, &fixture.data, &fixture.events, thread_system.?, .{
         .items_per_range = case.stageItemsPerRange(affect_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .scope_dense_indices = think_set,
     });
 }
 

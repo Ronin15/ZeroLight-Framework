@@ -150,6 +150,7 @@ const StageId = enum {
     dig_world_edit,
     scope_advance_and_ai_gather,
     spatial_index_build,
+    ai_cognition_order,
     perception_update,
     ai_memory_update,
     affect_update,
@@ -191,7 +192,7 @@ fn stageContract(stage: StageId) StageContract {
         // Stimulus writes (promote, dig append, footstep) run inside this stage,
         // before perception reads the live bus.
         .dig_world_edit => .{ .reads = .empty, .writes = resources(&.{ .world_tiles, .world_events, .stimuli }) },
-        .scope_advance_and_ai_gather => .{ .reads = .empty, .writes = resources(&.{ .ai_halo_indices, .ai_cognition_indices }) },
+        .scope_advance_and_ai_gather => .{ .reads = .empty, .writes = resources(&.{.ai_halo_indices}) },
         // Indexes the halo at the previous step's positions and levels, which this
         // step's movement and plane traversal write later.
         .spatial_index_build => .{
@@ -199,6 +200,9 @@ fn stageContract(stage: StageId) StageContract {
             .writes = resources(&.{.spatial_index}),
             .carried = resources(&.{ .movement_positions, .world_level }),
         },
+        // The think set in the index's cell-major order, so rows sharing a neighborhood
+        // are adjacent in every think-set stage.
+        .ai_cognition_order => .{ .reads = resources(&.{.spatial_index}), .writes = resources(&.{.ai_cognition_indices}) },
         // Queries the spatial index for hostile candidates and writes sensed
         // state for this step's observers (think set); also emits acquisition/loss
         // transition events. Reads world_tiles for line-of-sight /
@@ -292,6 +296,7 @@ const stage_order = [_]StageId{
     .dig_world_edit,
     .scope_advance_and_ai_gather,
     .spatial_index_build,
+    .ai_cognition_order,
     .perception_update,
     .ai_memory_update,
     .affect_update,
@@ -472,6 +477,8 @@ fn simViewRegion(context: SimulationPipelineUpdateContext) ?ActiveRegion {
 pub const SimulationPipelineStats = struct {
     scope: SimulationScope = .{},
     spatial_index: SpatialIndexStats = .{},
+    /// The think-set compaction (`ai_cognition_order`).
+    cognition: BatchStats = .{},
     perception: PerceptionStats = .{},
     ai_memory: AiMemoryStats = .{},
     affect: AffectStats = .{},
@@ -1197,10 +1204,12 @@ pub const SimulationPipeline = struct {
         dig_plane_scratch_grown: usize = 0,
         plane_entry_windows_grown: usize = 0,
         cognition_region: ?ActiveRegion = null,
+        stagger_step: u8 = 0,
         ai_halo_indices: []const u32 = &[_]u32{},
         ai_cognition_indices: []const u32 = &[_]u32{},
         collision_scope_indices: ?[]const u32 = null,
         spatial_index: SpatialIndexStats = .{},
+        cognition: BatchStats = .{},
         perception: PerceptionStats = .{},
         ai_memory: AiMemoryStats = .{},
         affect: AffectStats = .{},
@@ -1238,6 +1247,7 @@ pub const SimulationPipeline = struct {
             return .{
                 .scope = scope,
                 .spatial_index = self.spatial_index,
+                .cognition = self.cognition,
                 .perception = self.perception,
                 .ai_memory = self.ai_memory,
                 .affect = self.affect,
@@ -1281,6 +1291,7 @@ pub const SimulationPipeline = struct {
             .dig_world_edit => try self.stageDigWorldEdit(step),
             .scope_advance_and_ai_gather => try self.stageScopeAdvanceAndAiGather(step),
             .spatial_index_build => try self.stageSpatialIndexBuild(step),
+            .ai_cognition_order => try self.stageAiCognitionOrder(step),
             .perception_update => try self.stagePerceptionUpdate(step),
             .ai_memory_update => try self.stageAiMemoryUpdate(step),
             .affect_update => try self.stageAffectUpdate(step),
@@ -1336,19 +1347,17 @@ pub const SimulationPipeline = struct {
     }
 
     /// Advance the stagger clock, derive the cognition halo from the fixed-step
-    /// `sim_view` (never the render window), and select the
-    /// two cognition populations for this step: unstaggered halo (spatial index +
-    /// perception candidates) and the stagger-filtered think set. Chunk columns are
-    /// derived later in `chunk_derive`. The AI gather reads the chunk written last
-    /// step. Movement/collision gate on tier only, so they keep running off-screen.
+    /// `sim_view` (never the render window), and gather this step's unstaggered halo
+    /// (spatial index + perception candidates); `ai_cognition_order` selects the think set
+    /// from its index. Chunk columns are derived later in `chunk_derive`. The AI gather
+    /// reads the chunk written last step. Movement/collision gate on tier only, so they
+    /// keep running off-screen.
     fn stageScopeAdvanceAndAiGather(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         self.scope.advanceStep();
         step.cognition_region = context.world.cognitionRegionForWorldRect(context.sim_view, sim_view_overscan_chunks, cognition_halo_chunks);
-        const stagger_step = self.scope.staggerStep();
-        const ai_pops = try self.scope.gatherAiPopulations(context.data, step.cognition_region, stagger_step, context.thread_system, .{});
-        step.ai_halo_indices = ai_pops.halo;
-        step.ai_cognition_indices = ai_pops.cognition;
+        step.stagger_step = self.scope.staggerStep();
+        step.ai_halo_indices = (try self.scope.gatherAiPopulations(context.data, step.cognition_region, context.thread_system, .{})).halo;
     }
 
     /// Shared neighbor index: built once from the unstaggered halo, at the
@@ -1365,6 +1374,16 @@ pub const SimulationPipeline = struct {
             .{},
         );
         spatial_index_timer.stop(context.perf, .pipeline_spatial_index);
+    }
+
+    /// The think set: the indexed halo rows on this step's stagger phase (every row with no
+    /// cognition region), in the index's cell-major order.
+    fn stageAiCognitionOrder(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        const index = self.spatial_index.view();
+        const result = try self.scope.compactCognition(&index, step.stagger_step, step.cognition_region != null, context.thread_system, .{});
+        step.ai_cognition_indices = result.cognition;
+        step.cognition = result.batch;
     }
 
     /// Perception: hostile candidates within vision/FOV/line-of-sight
@@ -5427,9 +5446,16 @@ test "production steps on workers record nothing into the thread system's shared
         stats.spatial_index.bucket_batch,
         stats.spatial_index.sort_batch,
         stats.spatial_index.link_batch,
+        stats.cognition,
+        stats.perception.gather_batch,
         stats.perception.batch,
+        stats.ai_memory.gather_batch,
+        // The order stage's items are touched row words: one range at this population,
+        // inline by construction. `ai_memory.zig` proves it on workers.
         stats.ai_memory.batch,
+        stats.ai_memory.visible_batch,
         stats.affect.batch,
+        stats.ai.gather_batch,
         stats.ai.separation_batch,
         stats.ai.intent_batch,
         stats.steering.agents_batch,
@@ -6296,6 +6322,66 @@ test "a full-template create costs max_structural_events_per_create events" {
     try std.testing.expectError(error.EventCapacityExceeded, frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = share - 1 }));
     _ = try frame.applyStructuralCommandsBudgeted(&data, .{ .structural_event_share = share });
     try std.testing.expectEqual(share, frame.events.mergedItems().len);
+}
+
+test "the think-set stage reads the built index and writes the think set every cognition stage reads" {
+    const order = stageContract(.ai_cognition_order);
+    try std.testing.expect(order.reads.contains(.spatial_index));
+    try std.testing.expect(order.writes.contains(.ai_cognition_indices));
+    try std.testing.expect(!stageContract(.scope_advance_and_ai_gather).writes.contains(.ai_cognition_indices));
+    const order_at = std.mem.indexOfScalar(StageId, &stage_order, .ai_cognition_order).?;
+    try std.testing.expect(std.mem.indexOfScalar(StageId, &stage_order, .spatial_index_build).? < order_at);
+    for ([_]StageId{ .perception_update, .ai_memory_update, .affect_update, .ai_decide }) |reader| {
+        try std.testing.expect(stageContract(reader).reads.contains(.ai_cognition_indices));
+        try std.testing.expect(order_at < std.mem.indexOfScalar(StageId, &stage_order, reader).?);
+    }
+}
+
+test "the think set reaches AI in the index's cell-major order, not AI index order" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    // AI agent 0 nine cell rows below agents 1 and 2, which share a cell.
+    const positions = [_]math.Vec2{ .{ .x = 40, .y = 300 }, .{ .x = 40, .y = 10 }, .{ .x = 45, .y = 12 } };
+    var agents: [positions.len]EntityId = undefined;
+    for (&agents, positions) |*agent, position| {
+        agent.* = try data.createEntity();
+        try data.setMovementBody(agent.*, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 });
+        try data.setAiAgent(agent.*, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    }
+
+    // A struct-literal world: no cognition region, so every agent thinks.
+    var world = WorldSystem{ .allocator = std.testing.allocator, .width = 64, .height = 64, .tile_size = 32, .chunk_size_tiles = 16 };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 4, 4, 4, 4, 4);
+    try frame.reservePathRequests(4, 4);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 2048, .{
+        .contact_capacity = 4,
+        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = 1 },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 2048,
+        .bounds_height = 2048,
+        .sim_view = fullWorldSimView(&world),
+    });
+    try std.testing.expectEqual(@as(usize, 3), stats.ai.entity_count);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 0 }, pipeline.scope.ai_cognition_indices.items);
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 3), intents.len);
+    for (intents, [_]usize{ 1, 2, 0 }) |intent, agent| try std.testing.expect(intent.entity.eql(agents[agent]));
 }
 
 test "the goal resolve stage writes path_goals, read by steering's status queries and the pathfinding update after it" {

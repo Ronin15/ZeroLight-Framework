@@ -1515,6 +1515,44 @@ pub fn setRowCount(comptime Row: type, rows: *std.MultiArrayList(Row), count: us
     rows.len = count;
 }
 
+/// The main thread's merge after a windowed MAL gather: moves each range's `kept` rows from its
+/// window at `range * items_per_range` to the running total in range order, column by column,
+/// then cuts `rows` to the total. `Tally` has a `kept: usize` field. Windows ascend with the
+/// range index, so each starts at or past the total; when no range skipped nothing moves.
+pub fn compactRowWindows(comptime Row: type, comptime Tally: type, rows: *std.MultiArrayList(Row), tallies: []const PaddedSlot(Tally), items_per_range: usize) void {
+    const columns = rows.slice();
+    var total: usize = 0;
+    for (tallies, 0..) |slot, range_index| {
+        const kept = slot.value.kept;
+        const window = range_index * items_per_range;
+        std.debug.assert(total <= window and window + kept <= rows.len);
+        if (total != window and kept != 0) {
+            inline for (comptime std.meta.tags(std.MultiArrayList(Row).Field)) |field| {
+                const column = columns.items(field);
+                @memmove(column[total..][0..kept], column[window..][0..kept]);
+            }
+        }
+        total += kept;
+    }
+    rows.shrinkRetainingCapacity(total);
+}
+
+/// `compactRowWindows` over one slice: moves each range's `kept` items from its window at
+/// `range * items_per_range` to the running total in range order and returns the total; the
+/// caller cuts its list to it. `Tally` has a `kept: usize` field. Hand-written: std has no
+/// window compaction.
+pub fn compactSliceWindows(comptime T: type, comptime Tally: type, items: []T, tallies: []const PaddedSlot(Tally), items_per_range: usize) usize {
+    var total: usize = 0;
+    for (tallies, 0..) |slot, range_index| {
+        const kept = slot.value.kept;
+        const window = range_index * items_per_range;
+        std.debug.assert(total <= window and window + kept <= items.len);
+        if (total != window and kept != 0) @memmove(items[total..][0..kept], items[window..][0..kept]);
+        total += kept;
+    }
+    return total;
+}
+
 /// The partition of `row_count` rows into `band_count` bands of whole `block_rows` blocks:
 /// band `b` owns blocks `[ceil(b * blocks / bands), ceil((b + 1) * blocks / bands))`. The
 /// band count is `max_bands`, or one band per block when fewer, independent of any stage's
@@ -4981,4 +5019,43 @@ fn tunerTestBatchWithProfileEx(
         .main_thread_wait_ns = main_thread_wait_ns,
         .ran_inline = profile.worker_threads == 0,
     };
+}
+
+test "compactRowWindows moves each range's kept rows together in range order, column by column" {
+    const Row = struct { id: u32, weight: f32, flag: bool };
+    const Tally = struct { kept: usize = 0 };
+    var rows: std.MultiArrayList(Row) = .{};
+    defer rows.deinit(std.testing.allocator);
+    // Three windows of four: ranges keep 2, 0, and 3 rows; the rest of each window is stale.
+    try rows.ensureTotalCapacity(std.testing.allocator, 12);
+    setRowCount(Row, &rows, 11);
+    for (0..11) |slot| rows.set(slot, .{ .id = @intCast(100 + slot), .weight = @floatFromInt(slot), .flag = slot % 2 == 0 });
+    const tallies = [_]PaddedSlot(Tally){ .{ .value = .{ .kept = 2 } }, .{ .value = .{ .kept = 0 } }, .{ .value = .{ .kept = 3 } } };
+    compactRowWindows(Row, Tally, &rows, &tallies, 4);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+    try std.testing.expectEqualSlices(u32, &.{ 100, 101, 108, 109, 110 }, rows.items(.id));
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 8, 9, 10 }, rows.items(.weight));
+    try std.testing.expectEqualSlices(bool, &.{ true, false, true, false, true }, rows.items(.flag));
+    // Full windows move nothing.
+    const full = [_]PaddedSlot(Tally){ .{ .value = .{ .kept = 4 } }, .{ .value = .{ .kept = 1 } } };
+    compactRowWindows(Row, Tally, &rows, &full, 4);
+    try std.testing.expectEqualSlices(u32, &.{ 100, 101, 108, 109, 110 }, rows.items(.id));
+}
+
+test "compactSliceWindows moves each range's kept items together in range order" {
+    const Tally = struct { kept: usize = 0 };
+    // Three windows of four: ranges keep 2, 0, and 3 items; the rest of each window is stale.
+    var items: [11]u32 = undefined;
+    for (&items, 0..) |*item, slot| item.* = @intCast(100 + slot);
+    const tallies = [_]PaddedSlot(Tally){ .{ .value = .{ .kept = 2 } }, .{ .value = .{ .kept = 0 } }, .{ .value = .{ .kept = 3 } } };
+    const total = compactSliceWindows(u32, Tally, &items, &tallies, 4);
+    try std.testing.expectEqual(@as(usize, 5), total);
+    try std.testing.expectEqualSlices(u32, &.{ 100, 101, 108, 109, 110 }, items[0..total]);
+    // Full windows move nothing.
+    const full = [_]PaddedSlot(Tally){ .{ .value = .{ .kept = 4 } }, .{ .value = .{ .kept = 1 } } };
+    try std.testing.expectEqual(@as(usize, 5), compactSliceWindows(u32, Tally, &items, &full, 4));
+    try std.testing.expectEqualSlices(u32, &.{ 100, 101, 108, 109, 110 }, items[0..5]);
+    // Empty windows keep nothing.
+    const empty = [_]PaddedSlot(Tally){ .{}, .{} };
+    try std.testing.expectEqual(@as(usize, 0), compactSliceWindows(u32, Tally, &items, &empty, 4));
 }
