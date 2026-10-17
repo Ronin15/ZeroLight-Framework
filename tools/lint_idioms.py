@@ -25,9 +25,8 @@ reviewer diligence:
    what is referenced, so an unused declaration builds clean and goes stale.
 9. No test- or bench-only `pub` API in production code: every `pub` decl in a
    production file is referenced by production code (outside `test` blocks,
-   `*test_support.zig`, `src/benchmarks/`, and the test/bench/smoke roots). A decl only tests or
-   benches reach is deleted or made private, or carries
-   `// lint:allow bench-api: <reason>` on its line or the line above.
+   `*test_support.zig`, `src/benchmarks/`, and the test/bench/smoke roots).
+   Every hit is removed from production; no annotation exempts one.
 
 Scans every `src/**/*.zig` file plus `build.zig`. Rules in SRC_ONLY_PATTERNS
 apply to `src/` only. All rules match code with string/char-literal contents
@@ -346,7 +345,6 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
 # GPU smoke). Lines inside `test` blocks never count as production references.
 NON_PRODUCTION_ROOTS = {"src/tests.zig", "src/benchmark_runner.zig", "src/gpu_smoke.zig", "src/platform/gpu_smoke_impl.zig"}
 PUB_DECL = re.compile(r"^\s*pub\s+(?:inline\s+|extern\s+|export\s+)?(?:fn|const|var)\s+([A-Za-z_][A-Za-z0-9_]*)")
-BENCH_API_ALLOW = re.compile(r"lint:allow bench-api:\s*\S+")
 # Entry hooks the compiler or std looks up by name.
 PUB_ENTRY_NAMES = {"main", "std_options", "panic", "root"}
 WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -402,11 +400,8 @@ def lint_test_only_api(files: list[Path]) -> list[tuple[str, int, str, str]]:
             if counts.get(name, 0) > len(WORD.findall(code)) - len([w for w in WORD.findall(code) if w != name]):
                 continue
             here = raw_lines[index]
-            above = raw_lines[index - 1] if index > 0 else ""
-            if BENCH_API_ALLOW.search(here) or BENCH_API_ALLOW.search(above):
-                continue
             issues.append(
-                (rel, index + 1, f"`pub {name}` has no production reference (only tests or benches reach it); delete it or make it private", here.strip())
+                (rel, index + 1, f"`pub {name}` has no production use (only tests or benches reach it); remove it from production", here.strip())
             )
     return issues
 
