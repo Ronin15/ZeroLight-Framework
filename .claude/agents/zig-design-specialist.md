@@ -65,7 +65,9 @@ section with nothing new is omitted.
 - **Shared results** (`.claude/rules/engine-design.md` § Cost model): name
   the unit each computed result is stored at and every requester it serves,
   intermediates included (walks, gathers, candidate lists): work two
-  requesters repeat identically is a shared result.
+  requesters repeat identically is a shared result. Give each requester
+  kind's measured sharing factor (requesters per stored result); where it
+  is near one, the sharing form must earn its cost another measured way.
 - **One chosen design**, justified against the target in a few lines; one line
   per rejected alternative.
 - **Goal, success criteria, scope**, and the owning module of every new piece.
