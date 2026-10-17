@@ -67,8 +67,6 @@ pub const BenchmarkGroup = struct {
     /// Writes a case's workload: its counters in the group's own terms, and under
     /// `--details` its stage shapes too. Writing nothing prints no workload.
     write_workload: WorkloadWriter,
-    /// The case the summary leads with.
-    summary_focus: SummaryFocus = .fastest,
     /// Set only when every fixed-control stage of the group resolves its range from this
     /// one shape. A fixed case that resolves to an earlier case's configuration is then
     /// reported as that case's duplicate and not timed again; null keeps every case timed.
@@ -91,13 +89,6 @@ pub const FixedRangeShape = struct {
 pub const WorkloadView = enum { summary, details };
 
 pub const WorkloadWriter = *const fn (*std.Io.Writer, RunStats, WorkloadView) std.Io.Writer.Error!void;
-
-pub const SummaryFocus = enum {
-    // The fastest measured case.
-    fastest,
-    // The production tuner's case, beside the fastest control.
-    production_adaptive,
-};
 
 /// A group with no workload counters.
 pub fn writeNoWorkload(_: *std.Io.Writer, _: RunStats, _: WorkloadView) std.Io.Writer.Error!void {}
@@ -1060,11 +1051,10 @@ fn printValidationSummary(
     // Keep the summary terse and action-oriented: it should call out unusual
     // scheduler behavior or workload counters without pretending to choose
     // runtime tuning policy from one benchmark run.
-    const focus = switch (group.summary_focus) {
-        .fastest => best,
-        .production_adaptive => adaptive orelse best,
-    };
-    const focus_label = if (group.summary_focus == .production_adaptive and adaptive != null) "production_adaptive" else "best";
+    // The summary leads with the production tuner's case, beside the fastest control; a
+    // group with no adaptive case leads with its fastest.
+    const focus = adaptive orelse best;
+    const focus_label = if (adaptive != null) "production_adaptive" else "best";
     const focus_speedup = speedupBasisPoints(baseline.stats, focus.stats);
     std.debug.print(
         "summary: {s} {s} at {f} ({d}.{d:0>2}x serial). ",

@@ -4,7 +4,6 @@
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const CollisionResponse = @import("../game/data_system.zig").CollisionResponse;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
@@ -12,200 +11,10 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const movement_range_alignment_items = @import("../game/data_system.zig").movement_range_alignment_items;
 const CollisionResponseStats = @import("../game/systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("../game/systems/collision_response.zig").CollisionResponseSystem;
+const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
-
-// `collision-response-solid`, `-bounce`, `-trigger`, and `-mixed`: one serial response step
-// (`updateSerial`) over N contacts, each between its own pair: a dynamic solid against a
-// static solid, a dynamic bounce against a static solid, a static trigger against a dynamic
-// solid, or those three plus a dynamic solid against a dynamic bounce in turn. Serial case
-// only. Prints `triggers=` and `intents=`. No pass shape asserted.
-pub const solid_group = suite.BenchmarkGroup{
-    .name = "collision-response-solid",
-    .item_label = "contacts",
-    .defaultItemCounts = defaultItemCounts,
-    .runCase = runSolidCase,
-    .write_workload = writeResponseWorkload,
-    .cases = &suite.serial_cases,
-};
-
-pub const bounce_group = suite.BenchmarkGroup{
-    .name = "collision-response-bounce",
-    .item_label = "contacts",
-    .defaultItemCounts = defaultItemCounts,
-    .runCase = runBounceCase,
-    .write_workload = writeResponseWorkload,
-    .cases = &suite.serial_cases,
-};
-
-pub const trigger_group = suite.BenchmarkGroup{
-    .name = "collision-response-trigger",
-    .item_label = "contacts",
-    .defaultItemCounts = defaultItemCounts,
-    .runCase = runTriggerCase,
-    .write_workload = writeResponseWorkload,
-    .cases = &suite.serial_cases,
-};
-
-pub const mixed_group = suite.BenchmarkGroup{
-    .name = "collision-response-mixed",
-    .item_label = "contacts",
-    .defaultItemCounts = defaultItemCounts,
-    .runCase = runMixedCase,
-    .write_workload = writeResponseWorkload,
-    .cases = &suite.serial_cases,
-};
-
-const FixtureMode = enum {
-    solid_static,
-    bounce_static,
-    trigger_only,
-    mixed,
-};
-
-const Fixture = struct {
-    data: DataSystem,
-    frame: SimulationFrame,
-
-    fn deinit(self: *Fixture) void {
-        self.frame.deinit();
-        self.data.deinit();
-        self.* = undefined;
-    }
-};
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return suite.eventScaleCounts(profile);
-}
-
-fn runSolidCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseWithMode(allocator, io, options, case, item_count, .solid_static);
-}
-
-fn runBounceCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseWithMode(allocator, io, options, case, item_count, .bounce_static);
-}
-
-fn runTriggerCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseWithMode(allocator, io, options, case, item_count, .trigger_only);
-}
-
-fn runMixedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseWithMode(allocator, io, options, case, item_count, .mixed);
-}
-
-fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, mode: FixtureMode) !suite.RunStats {
-    std.debug.assert(!case.usesThreadSystem());
-
-    var fixture = try createFixture(allocator, item_count, mode);
-    defer fixture.deinit();
-    var system = CollisionResponseSystem.init(allocator);
-    defer system.deinit();
-
-    for (0..options.warmup_iterations) |_| {
-        _ = try runOnce(&system, &fixture, mode);
-    }
-
-    var accumulator = suite.StatsAccumulator.init(item_count);
-    var last_stats = CollisionResponseStats{};
-    for (0..options.iterations) |_| {
-        prepareFrameForRun(&fixture, mode);
-        const start_ns = suite.nowNs(io);
-        last_stats = try system.updateSerial(&fixture.data, &fixture.frame, EntityId.invalid);
-        const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), inlineBatch(item_count, movement_range_alignment_items));
-    }
-
-    var stats = accumulator.finish();
-    stats.candidate_pairs = last_stats.trigger_count;
-    stats.output_count = last_stats.intent_count;
-    return stats;
-}
-
-fn runOnce(system: *CollisionResponseSystem, fixture: *Fixture, mode: FixtureMode) !CollisionResponseStats {
-    prepareFrameForRun(fixture, mode);
-    return try system.updateSerial(&fixture.data, &fixture.frame, EntityId.invalid);
-}
-
-fn prepareFrameForRun(fixture: *Fixture, mode: FixtureMode) void {
-    if (mode == .trigger_only or mode == .mixed) {
-        fixture.frame.collision_triggers.clearRetainingCapacity();
-    }
-}
-
-fn createFixture(allocator: std.mem.Allocator, contact_count: usize, mode: FixtureMode) !Fixture {
-    var data = DataSystem.init(allocator);
-    errdefer data.deinit();
-    var frame = SimulationFrame.init(allocator);
-    errdefer frame.deinit();
-    try frame.reserveStreams(1, 0, 0, contact_count, contact_count, 0);
-
-    try frame.contacts.prepareRangeCounts(1);
-    frame.contacts.addCount(0, contact_count);
-    try frame.contacts.prefix();
-    var writer = frame.contacts.rangeWriter(0);
-    for (0..contact_count) |index| {
-        const pair = try addContactPair(&data, index, mode);
-        writer.write(.{
-            .a = pair.a,
-            .b = pair.b,
-            .a_movement_index = data.movementBodyDenseIndex(pair.a).?,
-            .b_movement_index = data.movementBodyDenseIndex(pair.b).?,
-            .normal_x = if (index % 2 == 0) @as(f32, -1) else @as(f32, 0),
-            .normal_y = if (index % 2 == 0) @as(f32, 0) else @as(f32, -1),
-            .penetration = @as(f32, @floatFromInt((index % 5) + 1)),
-        });
-    }
-    writer.finish();
-    frame.contacts.finishWrite();
-
-    return .{ .data = data, .frame = frame };
-}
-
-const ContactPair = struct {
-    a: EntityId,
-    b: EntityId,
-};
-
-fn addContactPair(data: *DataSystem, index: usize, mode: FixtureMode) !ContactPair {
-    return switch (mode) {
-        .solid_static => addPhysicalPair(data, index, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 }, .{ .mode = .solid, .mobility = .static, .restitution = 0 }),
-        .bounce_static => addPhysicalPair(data, index, .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 }, .{ .mode = .solid, .mobility = .static, .restitution = 0 }),
-        .trigger_only => addPhysicalPair(data, index, .{ .mode = .trigger, .mobility = .static, .restitution = 0 }, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 }),
-        .mixed => switch (index % 4) {
-            0 => addPhysicalPair(data, index, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 }, .{ .mode = .solid, .mobility = .static, .restitution = 0 }),
-            1 => addPhysicalPair(data, index, .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 }, .{ .mode = .solid, .mobility = .static, .restitution = 0 }),
-            2 => addPhysicalPair(data, index, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 }, .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 }),
-            else => addPhysicalPair(data, index, .{ .mode = .trigger, .mobility = .static, .restitution = 0 }, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 }),
-        },
-    };
-}
-
-fn addPhysicalPair(
-    data: *DataSystem,
-    index: usize,
-    a_response: CollisionResponse,
-    b_response: CollisionResponse,
-) !ContactPair {
-    const base_x: f32 = @floatFromInt((index % 512) * 4);
-    const base_y: f32 = @floatFromInt((index / 512) * 4);
-    const a = try addEntity(data, base_x, base_y, 20, -12, a_response);
-    const b = try addEntity(data, base_x + 2, base_y + 2, -18, 10, b_response);
-    return .{ .a = a, .b = b };
-}
-
-fn addEntity(data: *DataSystem, position_x: f32, position_y: f32, velocity_x: f32, velocity_y: f32, response: CollisionResponse) !EntityId {
-    const entity = try data.createEntity();
-    try data.setMovementBody(entity, .{
-        .position = .{ .x = position_x, .y = position_y },
-        .previous_position = .{ .x = position_x, .y = position_y },
-        .velocity = .{ .x = velocity_x, .y = velocity_y },
-        .speed = 0,
-    });
-    try data.setCollisionResponse(entity, response);
-    return entity;
-}
 
 // `collision-response-stage`: one response step over a contact stream where every body
 // sits in several contacts as `a` and as `b`, written once in a scattered order. Timed:
@@ -221,8 +30,8 @@ pub const stage_group = suite.BenchmarkGroup{
 };
 
 const stage_item_counts = [_]usize{ 1_024, 4_096, 16_384 };
-// First stride tried for the scattered contact order; stepped by 2 until coprime with
-// the contact count so the order visits every contact once.
+// First stride tried for the scattered contact order; stepped until coprime with the
+// contact count so the order visits every contact once.
 const stage_scatter_stride_seed: usize = 7_919;
 const stage_bounce_restitution: f32 = 0.5;
 
@@ -295,13 +104,6 @@ fn stageExpectedIntents(a: CollisionResponse, b: CollisionResponse) usize {
     return 2;
 }
 
-fn stageScatterStride(count: usize) usize {
-    if (count <= 1) return 1;
-    var stride = stage_scatter_stride_seed;
-    while (std.math.gcd(stride, count) != 1) stride += 2;
-    return stride;
-}
-
 // `contact_count / 2 + 2` bodies, body `j` on movement row `j`, with nonzero velocities of
 // mixed sign; the contacts carry correct movement hints and are written in
 // `order * stride mod contact_count` order. The observer is body 0.
@@ -335,11 +137,8 @@ fn buildStageFixture(allocator: std.mem.Allocator, contact_count: usize) !StageF
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
     try frame.reserveStreams(1, 0, 0, contact_count, contact_count, 0);
-    try frame.contacts.prepareRangeCounts(1);
-    frame.contacts.addCount(0, contact_count);
-    try frame.contacts.prefix();
-    var writer = frame.contacts.rangeWriter(0);
-    const stride = stageScatterStride(contact_count);
+    var writer = try fixtures.beginOneRange(CollisionContact, &frame.contacts, contact_count);
+    const stride = fixtures.coprimeStride(stage_scatter_stride_seed, contact_count);
     var expected_intents: usize = 0;
     var expected_triggers: usize = 0;
     var expected_observer_contacts: usize = 0;
@@ -479,18 +278,12 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.candidate_pairs = last_stats.trigger_count;
     stats.output_count = last_stats.intent_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.apply_batch);
-    if (stats.iterations > 0) {
-        stats.terrain_edit_phases = .{ .main_ns = @intCast(main_total / stats.iterations) };
-    }
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(system.gather_tuner.report(), settled_before_measurement);
         stats.secondary_work_tuning = suite.workTuningSummary(system.apply_tuner.report(), settled_before_measurement);
     }
     return stats;
-}
-
-fn writeResponseWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
-    try writer.print("triggers={} intents={}", .{ stats.candidate_pairs, stats.output_count });
 }
 
 fn writeResponseStageWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
@@ -500,5 +293,5 @@ fn writeResponseStageWorkload(writer: *std.Io.Writer, stats: suite.RunStats, vie
     try suite.writeStageShape(writer, stats.batch);
     try writer.writeAll(" apply=");
     try suite.writeStageShape(writer, stats.secondary_batch orelse .{});
-    try suite.writeShare(writer, "main_outside_stage_batches", (stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{}).main_ns, stats.mean_ns);
+    try suite.writeShare(writer, "main_outside_stage_batches", stats.main_ns orelse 0, stats.mean_ns);
 }

@@ -246,7 +246,7 @@ fn createDecorrelatedFixture(allocator: std.mem.Allocator, io: std.Io, count: us
 
     const observer_offset_x = tile_size * observer_offset_tile_fraction;
     const pair_count = count / 2;
-    const shuffle_stride = fixtures.shuffleStrideFor(pair_count);
+    const shuffle_stride = fixtures.coprimeStride(fixtures.shuffle_stride, pair_count);
     std.debug.assert(pair_count == 0 or std.math.gcd(shuffle_stride, pair_count) == 1);
 
     var observers = std.ArrayList(EntityId).empty;

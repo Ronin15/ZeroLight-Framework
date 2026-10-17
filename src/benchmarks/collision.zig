@@ -56,7 +56,6 @@ const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const ColliderGeometry = @import("../game/systems/static_colliders.zig").ColliderGeometry;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
-const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const tile_size = @import("../assets/world_tileset_meta.zig").required_tile_size;
 const fixtures = @import("fixtures.zig");
@@ -232,19 +231,24 @@ fn denseVisitsPerEntryBound() usize {
     return rows_per_strip * columns_reached - 1;
 }
 
+// A dense-sized body at `position`, with no collision response.
+fn addDenseBody(data: *DataSystem, position: math.Vec2) !EntityId {
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = position, .previous_position = position });
+    try data.setCollisionBounds(entity, .{ .size = .{ .x = dense_body_size, .y = dense_body_size } });
+    return entity;
+}
+
 fn createGridFixture(allocator: std.mem.Allocator, shape: GridShape) !DataSystem {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
     for (0..shape.levels) |level| {
         for (0..shape.rows) |row| {
             for (0..shape.columns) |column| {
-                const entity = try data.createEntity();
-                const position = math.Vec2{
+                const entity = try addDenseBody(&data, .{
                     .x = @as(f32, @floatFromInt(column)) * dense_pitch,
                     .y = @as(f32, @floatFromInt(row)) * dense_pitch,
-                };
-                try data.setMovementBody(entity, .{ .position = position, .previous_position = position });
-                try data.setCollisionBounds(entity, .{ .size = .{ .x = dense_body_size, .y = dense_body_size } });
+                });
                 if (shape.stamp_levels) try data.setWorldLevel(entity, @intCast(level));
             }
         }
@@ -261,19 +265,7 @@ fn createFixtureWithMode(allocator: std.mem.Allocator, count: usize, mode: Fixtu
     errdefer data.deinit();
 
     const columns: usize = 512;
-    for (0..count) |index| {
-        const entity = try data.createEntity();
-        const position = benchmarkPosition(index, columns, mode);
-        try data.setMovementBody(entity, .{
-            .position = position,
-            .previous_position = position,
-            .velocity = .{},
-            .speed = 0,
-        });
-        try data.setCollisionBounds(entity, .{
-            .size = .{ .x = dense_body_size, .y = dense_body_size },
-        });
-    }
+    for (0..count) |index| _ = try addDenseBody(&data, benchmarkPosition(index, columns, mode));
 
     return data;
 }
@@ -411,9 +403,7 @@ fn runStaticCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Option
 const StaticMover = struct {
     frame: SimulationFrame,
     colliders: StaticColliderSystem,
-    entity: EntityId,
-    positions: [2]math.Vec2,
-    at_second: bool = false,
+    move: fixtures.StaticMove,
 
     fn init(allocator: std.mem.Allocator, fixture: *const StaticHeavyFixture, case: suite.BenchmarkCase) !StaticMover {
         var frame = SimulationFrame.init(allocator);
@@ -426,11 +416,7 @@ const StaticMover = struct {
         const cells: u32 = @intCast(2 * fixture.side);
         try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles));
         if (colliders.rowCount() != fixture.side * fixture.side) return error.WrongStaticCount;
-        if (suite.adaptiveTunerForCase(case, splice_range_alignment_items)) |tuner| {
-            colliders.splice_tuner = tuner;
-            colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
-        }
-        colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
+        fixtures.setSpliceTuners(&colliders, case);
         const home = pitchCellOrigin(fixture.side - 1, fixture.side - 1);
         // Statics sit on even tiles, so an odd tile offset lands on a free tile.
         const away_tiles = default_chunk_size_tiles + 1;
@@ -439,8 +425,7 @@ const StaticMover = struct {
         return .{
             .frame = frame,
             .colliders = colliders,
-            .entity = fixture.last_static,
-            .positions = .{ home, .{ .x = home.x - away, .y = home.y - away } },
+            .move = .{ .entity = fixture.last_static, .positions = .{ home, .{ .x = home.x - away, .y = home.y - away } } },
         };
     }
 
@@ -454,11 +439,7 @@ const StaticMover = struct {
     // `thread_system` when set).
     fn moveAndSync(self: *StaticMover, data: *DataSystem, thread_system: ?*ThreadSystem) !void {
         self.frame.beginStep();
-        const target = if (self.at_second) self.positions[0] else self.positions[1];
-        const move = [_]StructuralCommand{.{ .set_movement_body = .{
-            .entity = self.entity,
-            .body = .{ .position = target, .previous_position = target },
-        } }};
+        const move = [_]StructuralCommand{self.move.command()};
         const commit = try fixtures.commitThroughColliderSeam(&self.frame, data, &self.colliders, &move, thread_system);
         if (commit.components_set != 1) return error.StaticMoveNotApplied;
         const changes = self.colliders.changesThisStep();
@@ -467,7 +448,7 @@ const StaticMover = struct {
         const old_cells = (changes[0].old orelse return error.StaticMoverUnplaced).cells;
         const new_cells = (changes[0].new orelse return error.StaticMoverUnplaced).cells;
         if (old_cells.min_x / chunk_tiles == new_cells.min_x / chunk_tiles or old_cells.min_y / chunk_tiles == new_cells.min_y / chunk_tiles) return error.StaticMoverStayedInChunk;
-        self.at_second = !self.at_second;
+        self.move.advance();
     }
 
     fn spliceOffMainNs(self: *const StaticMover) u64 {

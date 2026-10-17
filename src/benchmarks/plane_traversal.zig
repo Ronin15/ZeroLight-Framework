@@ -379,9 +379,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     std.debug.assert(entries == fixture.fallers.items.len);
     var stats = accumulator.finish();
     stats.output_count = entries;
-    if (stats.iterations > 0) {
-        stats.terrain_edit_phases = .{ .main_ns = @intCast(main_total / stats.iterations) };
-    }
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(plane_entry.tuner.report(), settled_before_measurement);
     }
@@ -399,7 +397,7 @@ fn writePlaneBandsWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: 
 fn writePlaneWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView, unit: []const u8) std.Io.Writer.Error!void {
     try writer.print("{s}={} entries={}", .{ unit, stats.item_count, stats.output_count });
     if (view == .summary) return;
-    const main_ns = (stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{}).main_ns;
+    const main_ns = stats.main_ns orelse 0;
     try writer.writeAll(" gather=");
     try suite.writeStageShape(writer, stats.batch);
     try suite.writeShare(writer, "main", main_ns, stats.mean_ns);

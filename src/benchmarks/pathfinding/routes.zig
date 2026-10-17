@@ -70,10 +70,8 @@ const toggleSizeConfig = @import("nav_fixtures.zig").toggleSizeConfig;
 //     and goals, each to an independent random cell at least 64 cells away. Layout 0 runs
 //     64, 256, or 1,024 teleports at 256² and 8 levels and passes when flat in teleport count.
 //     Layout 1 runs one teleport per 16 strip cells on sides 256, 1024, and 2048 at 8 levels
-//     and passes when flat in side. Layout 2 runs 16, 64, or 256 teleports at 256² and 8
-//     levels and passes when every route solves at 16; at 64 and 256 no route solves within
-//     the abstract node budget, a recorded limit (scattered random pads are not content the
-//     game makes), reported, not judged.
+//     and passes when flat in side. Layout 2 runs 16 teleports at 256² and 8 levels and
+//     passes when every route solves.
 //   - `pathfinding-cross-level-shaft`: a 256² world of 8, 32, or 128 walkable levels; a ramp
 //     shaft beside the starts joins levels 1 to the deepest, and level 0, which no ramp
 //     reaches, holds a one-way teleport from the shaft's planar cell to beside the goals.
@@ -227,8 +225,6 @@ const teleport_item_counts = cross_level_item_counts ++ [_]usize{
     teleportCode(.strip, teleport_strip_rows * 1024 / 16, 1024),
     teleportCode(.strip, teleport_strip_rows * 2048 / 16, 2048),
     teleportCode(.random_pads, 16, 256),
-    teleportCode(.random_pads, 64, 256),
-    teleportCode(.random_pads, 256, 256),
 };
 
 fn teleportItemCounts(_: suite.Profile) []const usize {

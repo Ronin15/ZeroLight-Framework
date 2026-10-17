@@ -211,7 +211,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.group and not args.group_prefix:
-        parser.error("name at least one --group or --group-prefix; full-suite sweeps use tools/bench_run.py")
+        parser.error("name at least one --group or --group-prefix; full-suite sweeps run zig build bench")
     names_items = any(a.startswith("--items") for a in args.bench_args)
     if not names_items and not args.grid:
         parser.error("name the config that answers the question (-- --items N), or pass --grid for every config")

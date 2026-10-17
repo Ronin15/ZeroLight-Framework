@@ -11,6 +11,7 @@ const movement_range_alignment_items = @import("../game/data_system.zig").moveme
 const movement = @import("../game/systems/movement.zig");
 const MovementSystem = @import("../game/systems/movement.zig").MovementSystem;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const SimulationIntent = @import("../game/simulation.zig").SimulationIntent;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
@@ -147,8 +148,8 @@ const IntentOrder = enum { scattered, sorted };
 const apply_intents_item_counts = [_]usize{ 1_024, 4_096, 16_384 };
 // Every this-many agents has speed 0, so the apply takes its default-speed path.
 const zero_speed_every: usize = 5;
-// First stride tried for the scattered intent order; stepped by 2 until coprime with
-// the agent count so the order visits every row once.
+// First stride tried for the scattered intent order; stepped until coprime with the agent
+// count so the order visits every row once.
 const scatter_stride_seed: usize = 7_919;
 // The apply's speed for a row whose speed is not positive.
 const default_intent_speed: f32 = 40.0;
@@ -179,12 +180,6 @@ fn agentDirection(index: usize) [2]f32 {
     };
 }
 
-fn scatterStride(count: usize) usize {
-    var stride = scatter_stride_seed;
-    while (std.math.gcd(stride, count) != 1) stride += 2;
-    return stride;
-}
-
 // `count` agents with a movement body (zero velocity) and an AI agent, entity `index`
 // on movement row `index`; one movement intent each, in `index * stride mod count` order
 // when scattered, else in row order.
@@ -201,12 +196,9 @@ fn buildApplyIntentsFixture(allocator: std.mem.Allocator, count: usize, order_ki
 
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
-    try frame.intents.prepareRangeCounts(1);
-    frame.intents.addCount(0, count);
-    try frame.intents.prefix();
-    var writer = frame.intents.rangeWriter(0);
+    var writer = try fixtures.beginOneRange(SimulationIntent, &frame.intents, count);
     const stride: usize = switch (order_kind) {
-        .scattered => scatterStride(count),
+        .scattered => fixtures.coprimeStride(scatter_stride_seed, count),
         .sorted => 1,
     };
     for (0..count) |order| {
@@ -307,9 +299,7 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     std.debug.assert(applied == item_count);
     var stats = accumulator.finish();
     stats.output_count = applied;
-    if (stats.iterations > 0) {
-        stats.terrain_edit_phases = .{ .main_ns = @intCast(main_total / stats.iterations) };
-    }
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(system.apply_intents_tuner.report(), settled_before_measurement);
     }
@@ -321,5 +311,5 @@ fn writeApplyWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite
     if (view == .summary) return;
     try writer.writeAll(" apply=");
     try suite.writeStageShape(writer, stats.batch);
-    try suite.writeShare(writer, "main", (stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{}).main_ns, stats.mean_ns);
+    try suite.writeShare(writer, "main", stats.main_ns orelse 0, stats.mean_ns);
 }

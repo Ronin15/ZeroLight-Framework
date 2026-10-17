@@ -47,7 +47,6 @@ const NavigationIntent = @import("../game/simulation.zig").NavigationIntent;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
-const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const SteeringStats = @import("../game/systems/steering/system.zig").SteeringStats;
 const SteeringSystem = @import("../game/systems/steering/system.zig").SteeringSystem;
 const steering_range_alignment_items = @import("../game/systems/steering/system.zig").steering_range_alignment_items;
@@ -340,7 +339,7 @@ fn measureCase(
     }
 
     var stats = accumulator.finish();
-    if (stats.iterations > 0) stats.terrain_edit_phases = .{ .main_ns = @intCast(main_total / stats.iterations) };
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.output_count = last_stats.movement_intent_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(BatchStats{});
     stats.steering_stages = .{
@@ -384,10 +383,7 @@ fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*Thr
 }
 
 fn appendNavigationIntents(frame: *SimulationFrame, agents: []const EntityId) !void {
-    try frame.navigation_intents.prepareRangeCounts(1);
-    frame.navigation_intents.addCount(0, agents.len);
-    try frame.navigation_intents.prefix();
-    var writer = frame.navigation_intents.rangeWriter(0);
+    var writer = try fixtures.beginOneRange(NavigationIntent, &frame.navigation_intents, agents.len);
     for (agents, 0..) |entity, index| {
         writer.write(NavigationIntent{
             .entity = entity,
@@ -446,16 +442,7 @@ fn addAgent(data: *DataSystem, position: math.Vec2) !EntityId {
 
 // A solid static collision body with its minimum corner at `position`.
 fn addStatic(data: *DataSystem, position: math.Vec2) !EntityId {
-    const obstacle = try data.createEntity();
-    try data.setMovementBody(obstacle, .{
-        .position = position,
-        .previous_position = position,
-        .velocity = .{},
-        .speed = 0,
-    });
-    try data.setCollisionBounds(obstacle, .{ .size = .{ .x = static_size, .y = static_size } });
-    try data.setCollisionResponse(obstacle, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
-    return obstacle;
+    return fixtures.addBody(data, position, .{ .x = static_size, .y = static_size }, .static);
 }
 
 // Static `index` of the row placed among the agents.
@@ -492,10 +479,8 @@ const static_move_event_count: usize = 1;
 
 const StaticChangeFixture = struct {
     steering: Fixture,
-    mover: EntityId,
-    // The mover alternates between these two filler-block chunks.
-    mover_positions: [2]math.Vec2,
-    at_second: bool = false,
+    // The mover alternates between two filler-block chunks.
+    mover: fixtures.StaticMove,
 
     fn deinit(self: *StaticChangeFixture, allocator: std.mem.Allocator) void {
         self.steering.deinit(allocator);
@@ -564,7 +549,7 @@ fn createStaticChangeFixture(allocator: std.mem.Allocator, static_count: usize) 
         .{ .x = first_chunk.x + mover_offset.x, .y = first_chunk.y + mover_offset.y },
         .{ .x = second_chunk.x + mover_offset.x, .y = second_chunk.y + mover_offset.y },
     };
-    const mover = try addStatic(&data, mover_positions[0]);
+    const mover = fixtures.StaticMove{ .entity = try addStatic(&data, mover_positions[0]), .positions = mover_positions };
 
     // Nav covers the agents and the whole filler block, so no static clamps onto an edge cell.
     const nav_width = @as(f32, @floatFromInt(filler_origin_chunk_x + block_side)) * chunk_px;
@@ -577,7 +562,6 @@ fn createStaticChangeFixture(allocator: std.mem.Allocator, static_count: usize) 
     return .{
         .steering = .{ .data = data, .frame = frame, .pathfinding = pathfinding, .colliders = colliders, .agents = agents },
         .mover = mover,
-        .mover_positions = mover_positions,
     };
 }
 
@@ -594,12 +578,7 @@ fn runStaticChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
 
     var fixture = try createStaticChangeFixture(allocator, item_count);
     defer fixture.deinit(allocator);
-    const colliders = &fixture.steering.colliders;
-    if (suite.adaptiveTunerForCase(case, splice_range_alignment_items)) |tuner| {
-        colliders.splice_tuner = tuner;
-        colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items).?;
-    }
-    colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
+    fixtures.setSpliceTuners(&fixture.steering.colliders, case);
     const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, prepareStaticChange, staticChangeOnce);
     var stats = measured.stats;
     stats.candidate_pairs = measured.last.obstacle_candidate_checks;
@@ -617,15 +596,11 @@ fn prepareStaticChange(fixture: *StaticChangeFixture) !void {
 fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     const frame = &fixture.steering.frame;
     const colliders = &fixture.steering.colliders;
-    const target = if (fixture.at_second) fixture.mover_positions[0] else fixture.mover_positions[1];
-    const move = [_]StructuralCommand{.{ .set_movement_body = .{
-        .entity = fixture.mover,
-        .body = .{ .position = target, .previous_position = target, .velocity = .{}, .speed = 0 },
-    } }};
+    const move = [_]StructuralCommand{fixture.mover.command()};
     const commit = try fixtures.commitThroughColliderSeam(frame, &fixture.steering.data, colliders, &move, if (case.usesThreadSystem()) thread_system else null);
     if (commit.components_set != 1) return error.StaticMoveNotApplied;
     if (colliders.changesThisStep().len != 1) return error.StaticChangeNotSynced;
-    fixture.at_second = !fixture.at_second;
+    fixture.mover.advance();
     system.reactToPostCommitSteeringEvents(frame);
 
     const stats = try steeringStep(system, &fixture.steering, thread_system, case);
@@ -877,5 +852,5 @@ fn writeStaticDenseWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view:
 fn writeSteerShape(writer: *std.Io.Writer, stats: suite.RunStats) std.Io.Writer.Error!void {
     try writer.writeAll(" steer=");
     try suite.writeStageShape(writer, stats.batch);
-    try suite.writeShare(writer, "main", (stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{}).main_ns, stats.mean_ns);
+    try suite.writeShare(writer, "main", stats.main_ns orelse 0, stats.mean_ns);
 }

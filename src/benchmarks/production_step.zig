@@ -79,7 +79,6 @@ pub const group = suite.BenchmarkGroup{
     .defaultItemCounts = defaultItemCounts,
     .runCase = runCase,
     .write_workload = writeStepWorkload,
-    .summary_focus = .production_adaptive,
     // The step runs its own stage tuners; the fixed controls live in the stage groups.
     .cases = &suite.serial_and_tuned_cases,
 };

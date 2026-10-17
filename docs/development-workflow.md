@@ -556,9 +556,8 @@ zig build bench -- --details
 ```
 
 Before/after comparisons use `tools/bench_ab.py` (targeted groups, a base ref
-against the working tree, Debug); full-suite capture with timestamped output
-under `benchmark_outputs/` uses `tools/bench_run.py`. Both:
-[tools/README.md](../tools/README.md).
+against the working tree, Debug): [tools/README.md](../tools/README.md).
+Requested full sweeps run `zig build bench` directly.
 
 ## GPU Smoke
 

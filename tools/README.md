@@ -22,7 +22,6 @@ they are **not** part of the game binary.
 | Script | What it does |
 | --- | --- |
 | `bench_ab.py` | Targeted Debug before/after: named bench groups only, a base ref vs the working tree, one run per side (`--reps 3` confirms a slower case), runs cached by build inputs. |
-| `bench_run.py` | Run `zig build bench` (full suite unless args narrow it), save a timestamped copy to `benchmark_outputs/`, and rotate to the newest N runs. |
 | `gen_atlas_orders.py` | Generate atlas **order manifests** (`atlas_orders/*.json`) from the procedural sprite registries. |
 | `generate_grim_sprites.py` | Generate the grim-dark fantasy character and item sprite atlases. |
 | `generate_world_tileset.py` | Generate the grim-dark 32×32 world tileset atlas. |
@@ -77,21 +76,6 @@ tools/bench_ab.py --group chunk-scale-cave-in -- --items 2561024032
 tools/bench_ab.py --group chunk-scale-gpu-sync-dig --case serial-direct --base 5439e36 -- --items 1024032
 tools/bench_ab.py --base none --grid --group chunk-scale-dig  # shape: tree only, every config
 tools/bench_ab.py --group pathfinding -- --items 2000          # forward bench args
-```
-
-## Benchmark runner — `bench_run.py`
-
-For owner- or slice-requested sweeps. Wraps `zig build bench`: streams output live, saves a header-stamped copy
-(date, commit, branch, host, cpu count, args) to `benchmark_outputs/`
-(gitignored), and prunes to the newest runs. `latest.txt` symlinks the most
-recent run for quick `diff`-ing. The repetitive `ThreadSystem initialized`
-debug lines are stripped from the saved copy by default.
-
-```sh
-tools/bench_run.py                 # run, save, rotate (keep 20)
-tools/bench_run.py --keep 50       # deeper history window
-tools/bench_run.py --no-strip      # keep the ThreadSystem debug lines
-tools/bench_run.py -- --details    # forward args to the bench binary
 ```
 
 ## Asset pipeline at a glance

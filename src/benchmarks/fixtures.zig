@@ -2,9 +2,10 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Fixture builders shared by the bench groups: a case's thread system, bodies, request
-//! streams, a commit through the static-collider seam, the world tileset and banded worlds,
-//! a 4-connected flood, a stride shuffle, and the nav reaction's tuner setup.
+//! Fixture builders shared by the bench groups: a case's thread system, bodies, one-range
+//! stream writes, a static moved through the static-collider seam, the world tileset and
+//! banded worlds, a 4-connected flood, a coprime-stride shuffle, the nav reaction's and the
+//! static colliders' tuner setup, and the render benches' texture table and phase timers.
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -12,6 +13,9 @@ const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
+const Color = @import("../config.zig").Color;
+const resources = @import("../render/resources.zig");
+const sprite_batch = @import("../render/sprite_batch.zig");
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
@@ -24,6 +28,7 @@ const PathRequest = @import("../game/simulation.zig").PathRequest;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
+const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const level_z_step = @import("../game/world/system.zig").level_z_step;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
@@ -73,13 +78,7 @@ pub fn commitThroughColliderSeam(
     commands: []const StructuralCommand,
     thread_system: ?*ThreadSystem,
 ) !StructuralCommitStats {
-    try frame.structural_commands.prepareRangeCounts(1);
-    frame.structural_commands.addCount(0, commands.len);
-    try frame.structural_commands.prefix();
-    var writer = frame.structural_commands.rangeWriter(0);
-    for (commands) |command| writer.write(command);
-    writer.finish();
-    frame.structural_commands.finishWrite();
+    try writeOneRange(StructuralCommand, &frame.structural_commands, commands);
     try colliders.reserveForCommit(data, commands.len);
     const stats = try frame.applyStructuralCommands(data);
     colliders.capture(frame);
@@ -87,17 +86,54 @@ pub fn commitThroughColliderSeam(
     return stats;
 }
 
-/// Writes `requests` as one range, replacing the stream's contents.
-pub fn writeRequests(stream: *RangeOutputStream(PathRequest), requests: []const PathRequest) !void {
-    stream.clearRetainingCapacity();
-    if (requests.len == 0) return;
-    const range_base = try stream.appendRangeCounts(1);
-    stream.addCount(range_base, requests.len);
-    try stream.prefixAppendedRanges(range_base);
-    var writer = stream.rangeWriter(range_base);
-    for (requests) |request| writer.write(request);
+/// Replaces `stream`'s contents with one range of `count` items and returns its writer; the
+/// caller writes exactly `count` items, then calls the writer's `finish` and the stream's
+/// `finishWrite`.
+pub fn beginOneRange(comptime T: type, stream: *RangeOutputStream(T), count: usize) !RangeOutputStream(T).RangeWriter {
+    try stream.prepareRangeCounts(1);
+    stream.addCount(0, count);
+    try stream.prefix();
+    return stream.rangeWriter(0);
+}
+
+/// Replaces `stream`'s contents with `items` as one range.
+pub fn writeOneRange(comptime T: type, stream: *RangeOutputStream(T), items: []const T) !void {
+    var writer = try beginOneRange(T, stream, items.len);
+    for (items) |item| writer.write(item);
     writer.finish();
     stream.finishWrite();
+}
+
+/// Writes `requests` as one range, replacing the stream's contents; no range when empty.
+pub fn writeRequests(stream: *RangeOutputStream(PathRequest), requests: []const PathRequest) !void {
+    if (requests.len == 0) return stream.clearRetainingCapacity();
+    try writeOneRange(PathRequest, stream, requests);
+}
+
+/// One static body moved back and forth between two positions, one structural command per
+/// step: the next move's `set_movement_body`, then `advance` once it committed.
+pub const StaticMove = struct {
+    entity: EntityId,
+    // The body starts at the first.
+    positions: [2]math.Vec2,
+    at_second: bool = false,
+
+    pub fn command(self: *const StaticMove) StructuralCommand {
+        const target = if (self.at_second) self.positions[0] else self.positions[1];
+        return .{ .set_movement_body = .{ .entity = self.entity, .body = .{ .position = target, .previous_position = target } } };
+    }
+
+    pub fn advance(self: *StaticMove) void {
+        self.at_second = !self.at_second;
+    }
+};
+
+/// Gives the static colliders' chunk-list and query-list splice stages fresh tuners and the
+/// range controls for `case`.
+pub fn setSpliceTuners(colliders: *StaticColliderSystem, case: suite.BenchmarkCase) void {
+    colliders.splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
 }
 
 /// The world tileset's metadata; the caller deinits it.
@@ -230,14 +266,14 @@ pub fn floodTunerWorkersOf(tuners: *const NavTuners, case: suite.BenchmarkCase) 
     return if (tuner.has_threaded_profile) tuner.current_profile.worker_threads else 0;
 }
 
-// The stride shuffle's preferred stride.
-const shuffle_stride: usize = 97;
+/// The stride shuffle's preferred stride.
+pub const shuffle_stride: usize = 97;
 
-/// The smallest stride at or past 97 coprime with `count`, so `(step * stride) % count` visits
-/// every index of `0..count` once: a fixed scattered order.
-pub fn shuffleStrideFor(count: usize) usize {
+/// The smallest stride at or past `first` coprime with `count`, so `(step * stride) % count`
+/// visits every index of `0..count` once: a fixed scattered order.
+pub fn coprimeStride(first: usize, count: usize) usize {
     if (count <= 1) return 1;
-    var stride = shuffle_stride;
+    var stride = first;
     while (std.math.gcd(stride, count) != 1) : (stride += 1) {}
     return stride;
 }
@@ -245,8 +281,76 @@ pub fn shuffleStrideFor(count: usize) usize {
 /// `0..count` in the stride-shuffled order. The caller frees it.
 pub fn strideShuffledRows(allocator: std.mem.Allocator, count: usize) ![]u32 {
     const rows = try allocator.alloc(u32, count);
-    const stride = shuffleStrideFor(count);
+    const stride = coprimeStride(shuffle_stride, count);
     // Below `count`, a population size.
     for (rows, 0..) |*row, step| row.* = @intCast(step * stride % count);
     return rows;
+}
+
+/// A sprite texture slot of the render benches' table.
+pub const TextureSlot = struct {
+    id: sprite_batch.TextureId,
+    desc: resources.TextureDesc,
+    alive: bool = true,
+};
+
+/// The render benches' texture table: four live textures and a dead one (slot 4), which a
+/// sprite's texture resolves against.
+pub const TextureTable = struct {
+    slots: []const TextureSlot,
+
+    pub const bench = TextureTable{ .slots = &.{
+        .{ .id = textureId(0, 1), .desc = .{ .width = 64, .height = 64 } },
+        .{ .id = textureId(1, 1), .desc = .{ .width = 128, .height = 32 } },
+        .{ .id = textureId(2, 1), .desc = .{ .width = 32, .height = 128 } },
+        .{ .id = textureId(3, 1), .desc = .{ .width = 16, .height = 16 } },
+        .{ .id = textureId(4, 1), .desc = .{ .width = 8, .height = 8 }, .alive = false },
+    } };
+
+    pub fn resolver(self: *const TextureTable) sprite_batch.TextureResolver {
+        return .{ .context = self, .resolve = resolve };
+    }
+
+    fn resolve(context: *const anyopaque, id: sprite_batch.TextureId) ?resources.TextureDesc {
+        const self: *const TextureTable = @ptrCast(@alignCast(context));
+        if (!id.isValid()) return null;
+        for (self.slots) |slot| {
+            if (slot.alive and slot.id.matches(id.index, id.generation)) return slot.desc;
+        }
+        return null;
+    }
+};
+
+pub fn textureId(index: u32, generation: u32) sprite_batch.TextureId {
+    return sprite_batch.TextureId.init(index, generation) catch unreachable;
+}
+
+/// A render bench's tint for item `index`.
+pub fn tintFor(index: usize) Color {
+    return .{
+        .r = 0.45 + @as(f32, @floatFromInt(index % 5)) * 0.08,
+        .g = 0.55 + @as(f32, @floatFromInt(index % 7)) * 0.05,
+        .b = 0.65 + @as(f32, @floatFromInt(index % 3)) * 0.09,
+        .a = 1,
+    };
+}
+
+/// Sums a render bench's per-iteration phase times (`Phases`: every field a `u64` time) and
+/// gives their means.
+pub fn PhaseAccumulator(comptime Phases: type) type {
+    return struct {
+        const names = @typeInfo(Phases).@"struct".field_names;
+        totals: [names.len]u128 = @splat(0),
+
+        pub fn record(self: *@This(), phases: Phases) void {
+            inline for (names, &self.totals) |name, *total| total.* += @field(phases, name);
+        }
+
+        pub fn finish(self: @This(), iterations: usize) Phases {
+            var means: Phases = .{};
+            if (iterations == 0) return means;
+            inline for (names, self.totals) |name, total| @field(means, name) = std.math.lossyCast(u64, total / iterations);
+            return means;
+        }
+    };
 }
