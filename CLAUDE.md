@@ -2,16 +2,12 @@
 
 ## Project Snapshot
 
-A 2D game framework on **Zig 0.17** and **SDL3 / SDL_GPU**: a fixed-step
-**60Hz** simulation, a state stack with policy-driven input routing, and
-atlas-backed assets addressed by stable IDs. Gameplay is data-oriented: dense
-**SoA** stores (`DataSystem`, `WorldSystem`), a state-owned
-`SimulationPipeline`, scoped simulation tiers, and multithreaded/SIMD
-processors. The game built on it is a colony simulator (dig/build with
-cave-ins and explosions); a player entity is optional. This is engine core for
-a fully simulated, multi-world game: everything that exists keeps advancing,
-with fidelity falling off with distance from the observer; the demo is a test
-harness (`.claude/rules/engine-design.md`).
+A 2D game framework on **Zig 0.17** and **SDL3 / SDL_GPU** with a fixed-step
+**60Hz** data-oriented simulation. It is engine core for a fully simulated,
+multi-world colony simulator (dig/build with cave-ins and explosions; a player
+entity is optional): everything keeps advancing, with fidelity falling off
+with distance from the observer. The demo is a test harness
+(`.claude/rules/engine-design.md`).
 
 ## Rules And Docs
 

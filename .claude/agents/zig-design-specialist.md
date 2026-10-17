@@ -1,14 +1,7 @@
 ---
 name: zig-design-specialist
 description: >-
-  Data-oriented (DOD) game-systems design specialist for this Zig 0.17 + SDL3/SDL_GPU
-  engine. Use before implementing a change whose design is open, or whose existing
-  structure fails the cost model (local fixes go straight to zig-specialist): gameplay
-  systems, ECS/DataSystem changes, processor ordering, deferred structural changes,
-  save/load boundaries, emergent gameplay (AI, collision, steering, pathfinding,
-  particles), parallel render-prep, simulation pipeline/controller placement,
-  threading/SIMD policy, or a roadmap slice. Produces a decision-complete plan; it does
-  NOT edit code.
+  Writes a decision-complete plan, right before implementation, for a change whose design is open or whose structure fails the cost model. Never edits code.
 tools: Read, Grep, Glob, Bash, Write
 model: opus
 effort: high

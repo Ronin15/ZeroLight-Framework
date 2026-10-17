@@ -1,11 +1,7 @@
 ---
 name: docs-specialist
 description: >-
-  Documentation specialist for this Zig 0.17 + SDL3/SDL_GPU game engine. Use for a
-  slice's docs commit (doc notes from its landings' commit messages written once from
-  the code as landed: checklist check-offs, durable docs, tables, changelog) and for
-  roadmap edits (a finding routed to its owning slice as a checklist item, forward
-  lines into later slices). Edits docs only, never code, comments, or rule files.
+  Writes a slice's docs commit from the code as landed and routes findings into roadmap slices. Edits docs only, never code, comments, or rules.
 tools: Read, Edit, Write, Grep, Glob, Bash
 model: sonnet
 color: green

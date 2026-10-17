@@ -1,3 +1,10 @@
+---
+paths:
+  - "src/**/*.zig"
+  - "docs/roadmap/**"
+  - "docs/framework-implementation-slices.md"
+---
+
 # Budgets, Capacities, And Thresholds
 
 - The unit of change owns its storage and work: for terrain and nav, the chunk.
