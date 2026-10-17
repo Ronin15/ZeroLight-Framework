@@ -5,9 +5,10 @@
 //! `steering` times one steering step over its agent count on a row-major grid;
 //! `steering-shuffled`, `steering-corridor`, and `steering-cluster-outlier` time the same step
 //! with the agents created in a shuffled order, in one cell-row corridor, and in a cluster
-//! with one agent far outside it. `steering-static-change` times
-//! one static collision body moved and committed through the seam (collider reserve, commit,
-//! capture, and sync), the steering post-commit reaction, and one steering step for a fixed
+//! with one agent far outside it. `steering-static-change` times one static collision body
+//! moved and committed through the seam (`fixtures.CommitSeam`: collider reserve, budgeted
+//! commit, capture, and sync, then the steering post-commit reaction) and one steering step
+//! for a fixed
 //! agent population, with the static count as its item count; the cost model expects it flat
 //! in the static count. `steering-static-dense` times one steering step for a fixed agent
 //! population among chunks holding a count of statics each; its item code names the
@@ -45,6 +46,7 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const NavigationIntent = @import("../game/simulation.zig").NavigationIntent;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const structuralEventHeadroom = @import("../game/simulation.zig").structuralEventHeadroom;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const SteeringStats = @import("../game/systems/steering/system.zig").SteeringStats;
@@ -590,18 +592,17 @@ fn prepareStaticChange(fixture: *StaticChangeFixture) !void {
     try prepareOnce(&fixture.steering);
 }
 
-// One step: the mover's set_movement_body through the commit seam (collider reserve, commit,
-// capture, and sync with its splice stages on the case's threads), the steering post-commit
-// reaction, then the steering update.
+// One step: the mover's set_movement_body through the commit seam (collider reserve, budgeted
+// commit, capture, and sync with its splice stages on the case's threads, then the steering
+// post-commit reaction), then the steering update.
 fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     const frame = &fixture.steering.frame;
     const colliders = &fixture.steering.colliders;
-    const move = [_]StructuralCommand{fixture.mover.command()};
-    const commit = try fixtures.commitThroughColliderSeam(frame, &fixture.steering.data, colliders, &move, if (case.usesThreadSystem()) thread_system else null);
-    if (commit.components_set != 1) return error.StaticMoveNotApplied;
+    const seam = fixtures.CommitSeam{ .colliders = colliders, .steering = system, .structural_headroom = fixtures.StaticMove.structural_headroom };
+    const commit = try seam.commit(frame, &fixture.steering.data, &.{fixture.mover.command()}, if (case.usesThreadSystem()) thread_system else null);
+    if (commit.structural.components_set != 1) return error.StaticMoveNotApplied;
     if (colliders.changesThisStep().len != 1) return error.StaticChangeNotSynced;
     fixture.mover.advance();
-    system.reactToPostCommitSteeringEvents(frame);
 
     const stats = try steeringStep(system, &fixture.steering, thread_system, case);
     if (stats.movement_intent_count != fixture.steering.agents.items.len) return error.AgentIntentMissing;
@@ -778,11 +779,12 @@ fn churnStatics(
     if (created != churned.len) return error.StaticRecreatesMissing;
 }
 
-// `commands` as one step's commit through the seam; fails unless every command changed a
-// static.
+// `commands` as one step's commit through the seam, its share one destroy or create per
+// command; fails unless every command changed a static.
 fn churnCommit(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, commands: []const StructuralCommand) !void {
     frame.beginStep();
-    _ = try fixtures.commitThroughColliderSeam(frame, data, colliders, commands, null);
+    const seam = fixtures.CommitSeam{ .colliders = colliders, .structural_headroom = structuralEventHeadroom(commands.len, 0) };
+    _ = try seam.commit(frame, data, commands, null);
     if (colliders.changesThisStep().len != commands.len) return error.StaticChurnNotSynced;
 }
 

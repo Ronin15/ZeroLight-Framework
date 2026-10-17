@@ -146,8 +146,7 @@ fn emitVertices(
 }
 
 fn submitOrderedCommandsOnce(batch: *sprite_batch.SpriteBatch, count: usize) !void {
-    batch.commands.clearRetainingCapacity();
-    batch.last_order = null;
+    batch.beginFrame();
     for (0..count) |index| {
         try batch.drawSprite(benchmarkSprite(index, orderedBenchmarkOrder(index, count)));
     }

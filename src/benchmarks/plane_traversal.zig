@@ -16,12 +16,13 @@
 //!     rest walkable overlays) and as many walkable sparse tiles per chunk; main time per
 //!     entry against the band count shows whether a landing costs its level's bands and
 //!     sparse tiles.
-//! Timed: the plane stage's NPC cell-entry gather (`PlaneEntrySystem`, serial or threaded),
-//! then the dig reserve and commit over its entries, with the carve batch on the same
-//! threads. The untimed reset puts the fallers back on level 0, refills their landing cells,
-//! and begins the next frame step. `--details` reports the gather's shape and the stage's
-//! main-thread time (all but a dispatched gather or carve batch), its share, and its time per
-//! entry.
+//! Timed: the production plane stage (`simulation_pipeline.runPlaneTraversal`): the NPC
+//! cell-entry gather, the dig reserve and commit over its entries with the carve batch, and
+//! the carves' nav record, on the case's threads (none for the serial case). The untimed
+//! reset applies the recorded nav marks, puts the fallers back on level 0, refills their
+//! landing cells, and begins the next frame step. `--details` reports the gather's shape and
+//! the stage's main-thread time (all but a dispatched gather, carve, or mark batch), its
+//! share, and its time per entry.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -32,11 +33,12 @@ const DigConfig = @import("../game/dig_controller.zig").DigConfig;
 const DigController = @import("../game/dig_controller.zig").DigController;
 const Player = @import("../game/player.zig").Player;
 const PlaneEntrySystem = @import("../game/systems/plane_entry.zig").PlaneEntrySystem;
+const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
+const runPlaneTraversal = @import("../game/simulation_pipeline.zig").runPlaneTraversal;
 const plane_entry_range_alignment_items = @import("../game/systems/plane_entry.zig").plane_entry_range_alignment_items;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const TileId = @import("../game/world/system.zig").TileId;
-const level_z_step = @import("../game/world/system.zig").level_z_step;
-const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const maxEventsPerStep = @import("../game/simulation.zig").maxEventsPerStep;
 const fixtures = @import("fixtures.zig");
@@ -151,12 +153,17 @@ const Fixture = struct {
     frame: SimulationFrame,
     dig: DigController,
     plane_entry: PlaneEntrySystem,
+    // Nav over the world, with no statics: the stage records its carves into it.
+    colliders: StaticColliderSystem,
+    nav: PathfindingSystem,
     player: Player,
     fallers: std.ArrayList(Faller) = .empty,
     dirt: TileId,
 
     fn deinit(self: *Fixture) void {
         self.fallers.deinit(self.allocator);
+        self.nav.deinit();
+        self.colliders.deinit();
         self.plane_entry.deinit();
         self.dig.deinit();
         self.frame.deinit();
@@ -165,9 +172,10 @@ const Fixture = struct {
         self.* = undefined;
     }
 
-    // Untimed, before each stage: puts every faller back on level 0 entering its hole,
-    // refills its landing cell, and begins the frame step.
+    // Untimed, before each stage: applies the last stage's nav marks, puts every faller back
+    // on level 0 entering its hole, refills its landing cell, and begins the frame step.
     fn resetStep(self: *Fixture) !void {
+        _ = try self.nav.applyBufferedNavUpdates(&self.colliders, &self.world, null);
         const tile_size = self.world.tile_size;
         const floor1 = self.world.denseFloorLayerForLevel(1).?;
         for (self.fallers.items) |faller| {
@@ -189,33 +197,18 @@ const Fixture = struct {
 // `index` crosses one cell boundary to the right; the first `faller_count` multiples of
 // `agent_count / faller_count` walk into their own hole instead. `landing_bands` is the
 // dirt level's band count (its floor first) and its walkable sparse tiles per chunk.
-fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, workload: Workload, landing_bands: usize) !Fixture {
+fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, workload: Workload, landing_bands: usize, participant_count: usize) !Fixture {
     const faller_count = workload.fallerCount(agent_count);
     std.debug.assert(faller_count <= agent_count);
     const layout = Layout.of(workload.worldSide(faller_count), faller_count);
-    var meta = try fixtures.loadTilesetMeta(allocator, io);
-    var meta_owned = true;
-    defer if (meta_owned) meta.deinit();
-    var world = WorldSystem{
-        .allocator = allocator,
-        .width = layout.side,
-        .height = layout.side,
-        .tile_size = meta.tileSize(),
-        .chunk_size_tiles = default_chunk_size_tiles,
-    };
+    var world = try fixtures.buildBandedWorld(allocator, io, layout.side, level_count, "grass", "dirt");
     errdefer world.deinit();
-    try world.buildCatalog(&meta);
-    const grass = try world.requireTileByName(&meta, "grass");
-    const dirt = try world.requireTileByName(&meta, "dirt");
-    const dig_config = try DigConfig.fromMeta(&meta);
-    for (0..level_count) |level_index| {
-        const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
-        const layer = try world.addDenseLayer(level, 0, .floor, if (level_index == 0) grass else dirt);
-        std.debug.assert(layer == level);
-    }
+    const meta = world.tilesetMeta().?;
+    const dirt = try world.requireTileByName(meta, "dirt");
+    const dig_config = try DigConfig.fromMeta(meta);
     // The landing level's extra walkable bands and sparse tiles, every chunk alike.
     std.debug.assert(landing_bands >= 1);
-    const overlay = try world.requireTileByName(&meta, "stone_floor");
+    const overlay = try world.requireTileByName(meta, "stone_floor");
     for (1..landing_bands) |_| _ = try world.addDenseLayer(1, 0, .obstacle, overlay);
     if (landing_bands > 1) {
         const edge = world.chunk_size_tiles;
@@ -227,8 +220,6 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, wo
             }
         };
     }
-    world.adoptTilesetMeta(meta);
-    meta_owned = false;
     for (0..faller_count) |faller_index| {
         const x, const y = layout.hole(faller_index);
         _ = try world.clearDenseTile(0, x, y);
@@ -279,6 +270,14 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, wo
     var plane_entry = PlaneEntrySystem.init(allocator);
     errdefer plane_entry.deinit();
     try plane_entry.reserve(agent_count);
+    var colliders = StaticColliderSystem.init(allocator);
+    errdefer colliders.deinit();
+    const extent = PathfindingSystem.worldNavExtent(&world);
+    try colliders.rebuild(&data, try extent.colliderGeometry());
+    var nav = PathfindingSystem.init(allocator);
+    errdefer nav.deinit();
+    try nav.reserve(.{ .worker_participant_count = participant_count });
+    try nav.rebuildNavFromColliders(&colliders, extent, null);
 
     return .{
         .allocator = allocator,
@@ -287,6 +286,8 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, wo
         .frame = frame,
         .dig = dig,
         .plane_entry = plane_entry,
+        .colliders = colliders,
+        .nav = nav,
         .player = player,
         .fallers = fallers,
         .dirt = dirt,
@@ -309,24 +310,21 @@ fn runBandedFallsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     return runCase(allocator, io, options, case, banded_agent_count, .banded_falls, item_count);
 }
 
-// One plane stage's gather and dig half, after `resetStep`. Returns the gathered entries.
-fn runStage(fixture: *Fixture, thread_system: ?*ThreadSystem) !usize {
-    const entries = try fixture.plane_entry.gather(&fixture.data, &fixture.world, fixture.player.entity, fixture.dig.tunnel_tile, thread_system);
-    const reservation = try fixture.dig.reservePlaneTraversalStage(&fixture.world, &fixture.data, &fixture.player, &fixture.frame, entries, thread_system);
-    try fixture.dig.commitPlaneTraversalStage(&fixture.world, &fixture.data, &fixture.player, &fixture.frame, reservation, thread_system);
-    std.debug.assert(reservation.carves == entries.len);
-    return entries.len;
+// One production plane stage, after `resetStep`. Returns the carves it wrote.
+fn runStage(fixture: *Fixture, thread_system: *ThreadSystem) !usize {
+    try runPlaneTraversal(&fixture.plane_entry, &fixture.dig, &fixture.nav, &fixture.world, &fixture.data, &fixture.player, &fixture.frame, thread_system);
+    return fixture.frame.events.stats.world_tile_changed;
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, landing_bands: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
-
-    var fixture = try buildFixture(allocator, io, item_count, workload, landing_bands);
+    var fixture = try buildFixture(allocator, io, item_count, workload, landing_bands, threads.participantSlotCount());
     defer fixture.deinit();
+    fixtures.setNavTuners(&fixture.nav, case);
     const plane_entry = &fixture.plane_entry;
     plane_entry.tuner = suite.adaptiveTunerForCase(case, plane_entry_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     plane_entry.config = .{
@@ -336,10 +334,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     };
 
     // A fixed threaded case with more than one range of agents dispatches the gather.
-    const expect_dispatch = if (thread_ptr) |thread_system|
-        !case.adaptive and thread_system.workerThreadCount() > 0 and item_count > plane_entry.config.items_per_range.?
-    else
-        false;
+    const expect_dispatch = !case.adaptive and threads.workerThreadCount() > 0 and item_count > plane_entry.config.items_per_range.?;
 
     try fixture.resetStep();
     for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
@@ -367,10 +362,10 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         const gather = plane_entry.last_batch;
         std.debug.assert(!expect_dispatch or (gather.range_count > 1 and !gather.ran_inline));
         accumulator.record(elapsed_ns, gather);
-        // Main is everything but the stages that ran on workers: the gather and the
-        // carve batch's plan and write stages.
+        // Main is everything but the stages that ran on workers: the gather, the carve
+        // batch's plan and write stages, and the nav mark stage.
         var off_main: u64 = 0;
-        for ([_]@TypeOf(gather){ gather, fixture.world.last_terrain_edit_plan_batch, fixture.world.last_terrain_edit_write_batch }) |batch| {
+        for ([_]@TypeOf(gather){ gather, fixture.world.last_terrain_edit_plan_batch, fixture.world.last_terrain_edit_write_batch, fixture.nav.last_mark_batch }) |batch| {
             if (!batch.ran_inline) off_main += batch.batch_duration_ns;
         }
         main_total += elapsed_ns -| off_main;

@@ -182,7 +182,6 @@ fn addObserver(data: *DataSystem, pos_x: f32, pos_y: f32, velocity_x: f32, veloc
     return entity;
 }
 
-// `meta` resolves tile ids only; nothing reads it after the world is built.
 fn createFixture(allocator: std.mem.Allocator, io: std.Io, count: usize, extra_sparse_tiles: usize) !Fixture {
     return createFixtureInOrder(allocator, io, count, extra_sparse_tiles, null);
 }
@@ -192,15 +191,11 @@ fn createFixtureInOrder(allocator: std.mem.Allocator, io: std.Io, count: usize, 
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
-    var meta = try fixtures.loadTilesetMeta(allocator, io);
-    defer meta.deinit();
-
-    const tile_size = meta.tileSize();
-    const bounds = @as(f32, @floatFromInt(world_tiles_side)) * tile_size;
-    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, bounds, bounds);
+    var world = try fixtures.buildBandedWorld(allocator, io, world_tiles_side, 1, "grass", "grass");
     errdefer world.deinit();
-    const tree = try world.requireTileByName(&meta, "tree_0");
-    const deco = try world.requireTileByName(&meta, "deco_0");
+    const tile_size = world.tile_size;
+    const tree = try world.requireTileByName(world.tilesetMeta().?, "tree_0");
+    const deco = try world.requireTileByName(world.tilesetMeta().?, "deco_0");
 
     const observer_offset_x = tile_size * observer_offset_tile_fraction;
     const pair_count = count / 2;
@@ -235,14 +230,10 @@ fn createDecorrelatedFixture(allocator: std.mem.Allocator, io: std.Io, count: us
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
-    var meta = try fixtures.loadTilesetMeta(allocator, io);
-    defer meta.deinit();
-
-    const tile_size = meta.tileSize();
-    const bounds = @as(f32, @floatFromInt(world_tiles_side)) * tile_size;
-    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, bounds, bounds);
+    var world = try fixtures.buildBandedWorld(allocator, io, world_tiles_side, 1, "grass", "grass");
     errdefer world.deinit();
-    const tree = try world.requireTileByName(&meta, "tree_0");
+    const tile_size = world.tile_size;
+    const tree = try world.requireTileByName(world.tilesetMeta().?, "tree_0");
 
     const observer_offset_x = tile_size * observer_offset_tile_fraction;
     const pair_count = count / 2;

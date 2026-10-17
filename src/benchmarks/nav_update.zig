@@ -9,8 +9,8 @@
 //! several per chunk past that. Passes when linear in digs up to 256 and in dirty cells past it.
 //!
 //! The static-obstacle groups time one static collision body moved one step on a 256² world
-//! through the commit seam: its `set_movement_body` command committed through a
-//! `SimulationFrame`, the collider sync and its nav record, and `reactToPostCommitNavEvents`.
+//! through the commit seam (`fixtures.CommitSeam`): its `set_movement_body` command, the
+//! budgeted commit, the collider sync and its nav record, and `reactToPostCommitNavEvents`.
 //! The move is the same in every case, so each passes when flat in its item count:
 //!   - `nav-update-entity-obstacles`: 10, 1,000, or 10,000 other static bodies in chunks away
 //!     from the moved body's 3x3 chunk block.
@@ -45,6 +45,7 @@ const TileEdit = @import("../game/systems/pathfinding/test_support.zig").TileEdi
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const structuralEventHeadroom = @import("../game/simulation.zig").structuralEventHeadroom;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const TileId = @import("../game/world/system.zig").TileId;
 const fixtures = @import("fixtures.zig");
@@ -54,7 +55,6 @@ const suite = @import("suite.zig");
 // with a few chunks of margin.
 const world_tiles: u16 = 256;
 const tile_size: f32 = 32.0;
-const world_bounds: f32 = @as(f32, @floatFromInt(world_tiles)) * tile_size;
 
 // Abstract chunk side in tiles. Nav takes the world's chunk, and the world builds at the
 // default, so the scattered footprint stays one dirty cell per distinct chunk (its item_count
@@ -123,17 +123,11 @@ const Fixture = struct {
 fn buildFixture(allocator: std.mem.Allocator, io: std.Io, participant_count: usize) !Fixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
-    var meta = try fixtures.loadTilesetMeta(allocator, io);
-    defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, world_bounds, world_bounds);
+    // Three walkable levels; the dig happens on level 1's obstacle band.
+    var world = try fixtures.buildBandedWorld(allocator, io, world_tiles, 3, "grass", "grass");
     errdefer world.deinit();
-    const grass = try world.requireTileByName(&meta, "grass");
-    const tree = try world.requireTileByName(&meta, "tree_0");
-    // Three levels (surface plus two underground floors); the dig happens on level 1.
-    _ = try world.addLevel(0);
-    _ = try world.addLevel(0);
-    _ = try world.addDenseLayer(1, 0, .floor, grass);
-    _ = try world.addDenseLayer(2, 0, .floor, grass);
+    const grass = try world.requireTileByName(world.tilesetMeta().?, "grass");
+    const tree = try world.requireTileByName(world.tilesetMeta().?, "tree_0");
     const obstacle_layer = try world.addDenseLayer(1, 0, .obstacle, grass);
 
     var colliders = StaticColliderSystem.init(allocator);
@@ -393,20 +387,17 @@ const StaticMoveFixture = struct {
         self.* = undefined;
     }
 
-    // One move to the other cell through the commit seam: its command written, the collider
-    // and static mark reserve, the commit, the collider capture, sync, and nav record, then
-    // the nav reaction. Returns the time from the command write through the reaction.
+    // One move to the other cell through the commit seam (`fixtures.CommitSeam`) with nav.
+    // Returns the time from the command write through the reaction.
     fn moveAndReact(self: *StaticMoveFixture, io: std.Io, thread_system: ?*ThreadSystem) !struct { ns: u64, stats: NavUpdateStats } {
         self.frame.beginStep();
+        const seam = fixtures.CommitSeam{
+            .colliders = &self.colliders,
+            .nav = .{ .system = &self.system, .world = &self.world },
+            .structural_headroom = fixtures.StaticMove.structural_headroom,
+        };
         const start_ns = suite.nowNs(io);
-        try fixtures.writeOneRange(StructuralCommand, &self.frame.structural_commands, &.{self.moved.command()});
-        try self.colliders.reserveForCommit(&self.data, 1);
-        try self.system.reserveStaticColliderMarks(self.colliders.pendingChangeCount() + 1);
-        _ = try self.frame.applyStructuralCommands(&self.data);
-        self.colliders.capture(&self.frame);
-        try self.colliders.sync(&self.data, thread_system);
-        self.system.recordStaticColliderChanges(self.colliders.changesThisStep());
-        const stats = try self.system.reactToPostCommitNavEvents(&self.frame, &self.colliders, &self.world, thread_system);
+        const stats = (try seam.commit(&self.frame, &self.data, &.{self.moved.command()}, thread_system)).nav;
         const ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         if (stats.incremental_rebuilds != 1) return error.StaticMoveNotApplied;
         self.moved.advance();
@@ -424,9 +415,7 @@ fn initStaticMoveFixture(allocator: std.mem.Allocator, io: std.Io, other_statics
     try addOtherStatics(allocator, &data, other_statics);
     try addDynamicBodies(&data, dynamic_bodies);
 
-    var meta = try fixtures.loadTilesetMeta(allocator, io);
-    defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, world_bounds, world_bounds);
+    var world = try fixtures.buildBandedWorld(allocator, io, world_tiles, 1, "grass", "grass");
     errdefer world.deinit();
 
     var colliders = StaticColliderSystem.init(allocator);
@@ -546,6 +535,8 @@ const StaticDenseFixture = struct {
     tail: bool,
     // Whether the changed statics sit one chunk over from their home chunk.
     shifted: bool = false,
+    // The commit's share: one step's moves, destroys, and creates.
+    structural_headroom: usize,
 
     fn deinit(self: *StaticDenseFixture) void {
         self.recreated.deinit(self.allocator);
@@ -576,11 +567,10 @@ const StaticDenseFixture = struct {
         };
     }
 
-    // One dense change through the commit seam: every move and every destroy + create
-    // written as one commit, the collider and static mark reserve, the commit, the collider
-    // capture, sync, and nav record, then the nav reaction. Returns the time from the
-    // command write through the reaction, its commit, sync, and reaction phases, and the
-    // splice and reaction off-main stage time.
+    // One dense change through the commit seam (`fixtures.CommitSeam`) with nav: every move
+    // and every destroy + create as one commit. Returns the time from the command build
+    // through the reaction, its commit, sync, and reaction phases, and the splice and
+    // reaction off-main stage time.
     fn changeAndReact(self: *StaticDenseFixture, io: std.Io, thread_system: ?*ThreadSystem) !DenseChangeTiming {
         self.frame.beginStep();
         const start_ns = suite.nowNs(io);
@@ -610,17 +600,17 @@ const StaticDenseFixture = struct {
                 try self.commands.append(self.allocator, .{ .create_entity = denseStaticTemplate(self.targetCorner(chunk, slot)) });
             }
         };
-        try fixtures.writeOneRange(StructuralCommand, &self.frame.structural_commands, self.commands.items);
-        try self.colliders.reserveForCommit(&self.data, self.commands.items.len);
-        try self.system.reserveStaticColliderMarks(self.colliders.pendingChangeCount() + self.commands.items.len);
-        _ = try self.frame.applyStructuralCommands(&self.data);
-        self.colliders.capture(&self.frame);
-        const sync_start_ns = suite.nowNs(io);
-        try self.colliders.sync(&self.data, thread_system);
-        self.system.recordStaticColliderChanges(self.colliders.changesThisStep());
-        const nav_start_ns = suite.nowNs(io);
-        const stats = try self.system.reactToPostCommitNavEvents(&self.frame, &self.colliders, &self.world, thread_system);
+        var clock = fixtures.CommitSeam.PhaseClock{ .io = io };
+        const seam = fixtures.CommitSeam{
+            .colliders = &self.colliders,
+            .nav = .{ .system = &self.system, .world = &self.world },
+            .structural_headroom = self.structural_headroom,
+            .clock = &clock,
+        };
+        const stats = (try seam.commit(&self.frame, &self.data, self.commands.items, thread_system)).nav;
         const end_ns = suite.nowNs(io);
+        const sync_start_ns = clock.captured_ns;
+        const nav_start_ns = clock.synced_ns;
         if (stats.incremental_rebuilds != 1) return error.StaticChangeNotApplied;
         if (self.colliders.changesThisStep().len != self.layout.chunk_count * dense_changes_per_chunk) return error.StaticChangesMissing;
         // The recreated statics' new ids, in create order.
@@ -697,7 +687,6 @@ const DenseLayout = struct {
 
 fn initStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, change_count: usize, participant_count: usize, tail: bool) !StaticDenseFixture {
     const layout = DenseLayout.init(change_count);
-    const world_side: f32 = @as(f32, @floatFromInt(layout.chunks_x * nav_chunk_tiles)) * tile_size;
 
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
@@ -725,9 +714,8 @@ fn initStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, change_count
         }
     }
 
-    var meta = try fixtures.loadTilesetMeta(allocator, io);
-    defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, world_side, world_side);
+    // Layout widths are a few chunks: within a level side.
+    var world = try fixtures.buildBandedWorld(allocator, io, @intCast(layout.chunks_x * nav_chunk_tiles), 1, "grass", "grass");
     errdefer world.deinit();
 
     var colliders = StaticColliderSystem.init(allocator);
@@ -749,6 +737,8 @@ fn initStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, change_count
         .recreated = recreated,
         .layout = layout,
         .tail = tail,
+        // Per chunk: the moves and destroys, and a create per destroy unless the tail only moves.
+        .structural_headroom = structuralEventHeadroom(if (tail) 0 else layout.chunk_count * dense_changes_per_chunk / 2, layout.chunk_count * dense_changes_per_chunk),
     };
 }
 

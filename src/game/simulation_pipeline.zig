@@ -435,6 +435,32 @@ pub const SimulationPipelineConfig = struct {
 /// Borrowed per-step inputs for pipeline update.
 /// The pipeline owns systems and stage order, but not persistent game data,
 /// frame storage, app services, or state transitions.
+/// The plane-traversal stage: the NPC cell entries gathered on workers first, the dig
+/// controller's reserve and commit over only them (and the player's cell entry), and the
+/// landing carves, one event range, recorded as nav marks right after the write into room
+/// reserved before it. Every write that landed is recorded, error included.
+pub fn runPlaneTraversal(
+    plane_entry: *PlaneEntrySystem,
+    dig: *DigController,
+    pathfinding: *PathfindingSystem,
+    world: *WorldSystem,
+    data: *DataSystem,
+    player: *Player,
+    frame: *SimulationFrame,
+    thread_system: *ThreadSystem,
+) !void {
+    const entries = try plane_entry.gather(data, world, player.entity, dig.tunnel_tile, thread_system);
+    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries, thread_system);
+    // The record room follows the carves the preflight counted, which may exceed the
+    // tracked population's budget until a failed population seam succeeds.
+    if (reservation.carves != 0) try pathfinding.reserveTerrainNavRecord(reservation.carves);
+    const first_event = frame.events.mergedItems().len;
+    const traversed = dig.commitPlaneTraversalStage(world, data, player, frame, reservation, thread_system);
+    // Earlier events keep their positions, so the tail is the stage's own events.
+    pathfinding.recordTerrainNavEvents(frame.events.mergedItems()[first_event..], world, thread_system);
+    try traversed;
+}
+
 pub const SimulationPipelineUpdateContext = struct {
     data: *DataSystem,
     frame: *SimulationFrame,
@@ -1577,25 +1603,14 @@ pub const SimulationPipeline = struct {
     }
 
     /// After positions settle: follow a ramp on cell entry, or fall one level when
-    /// standing over a hole. The NPC cell entries are gathered on workers first; the
-    /// reserve and commit visit only them. Landing carves are one event range, recorded
-    /// as nav marks right after the write into room reserved before it.
+    /// standing over a hole (`runPlaneTraversal`).
     fn stagePlaneTraversal(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         const grown_before = self.dig.plane_scratch_grown;
         const windows_grown_before = self.plane_entry.windows_grown;
-        const entries = try self.plane_entry.gather(context.data, context.world, context.player.entity, self.dig.tunnel_tile, context.thread_system);
+        try runPlaneTraversal(&self.plane_entry, &self.dig, &self.pathfinding, context.world, context.data, context.player, context.frame, context.thread_system);
         step.plane_entry = self.plane_entry.last_batch;
         step.plane_entry_windows_grown = @intCast(self.plane_entry.windows_grown - windows_grown_before);
-        const reservation = try self.dig.reservePlaneTraversalStage(context.world, context.data, context.player, context.frame, entries, context.thread_system);
-        // The record room follows the carves the preflight counted, which may exceed the
-        // tracked population's budget until a failed population seam succeeds.
-        if (reservation.carves != 0) try self.pathfinding.reserveTerrainNavRecord(reservation.carves);
-        const first_event = context.frame.events.mergedItems().len;
-        const traversed = self.dig.commitPlaneTraversalStage(context.world, context.data, context.player, context.frame, reservation, context.thread_system);
-        // Earlier events keep their positions, so the tail is the stage's own events.
-        self.pathfinding.recordTerrainNavEvents(context.frame.events.mergedItems()[first_event..], context.world, context.thread_system);
-        try traversed;
         step.dig_plane_scratch_grown = @intCast(self.dig.plane_scratch_grown - grown_before);
     }
 

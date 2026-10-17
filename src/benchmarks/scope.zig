@@ -2,15 +2,10 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! - `scope`: the scoped step (AI cognition, collision, movement, chunk derive, gathers, the
-//!   think set, and tier policy) over N entities whose levels (`index % 5`) give a mixed-tier
-//!   population: cognition, locomotion, kinematic, and dormant. The index build runs every
-//!   step outside the window (its own group times it). Prints `cognition_active=`, the rows
-//!   that ran cognition. Pass shape: time linear in the active (cognition + locomotion) rows,
-//!   never in N; asserts check fewer than N rows ran cognition.
-//! - `scope-cognition`: the think set alone (`compactCognition`) over a halo index built once
-//!   untimed: `spread` over the `scope` fixture, `dense_chunk` with every agent in one chunk
-//!   (one index record), whose ranges split the chunk. Pass shape: linear in the H indexed
+//! `scope-cognition`: the think set alone (`compactCognition`) over a halo index built once
+//!   untimed: `spread` over N entities on 16 x-chunks whose levels (`index % 5`) give a
+//!   mixed-tier population (cognition, locomotion, kinematic, dormant), `dense_chunk` with
+//!   every agent in one chunk (one index record), whose ranges split the chunk. Pass shape: linear in the H indexed
 //!   rows in both layouts, `spread` on workers at the largest size on the tuned case, the
 //!   main thread's share (the window merges) flat per row. Asserts check `spread`'s tuned case
 //!   off main at the largest size, one record for `dense_chunk`, every case's think set equal
@@ -19,25 +14,14 @@
 //!   (H) and `thinking=`; `--details` adds `main=` with `main_per_item=` (per indexed row).
 
 const std = @import("std");
-const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
-const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
-const movement_range_alignment_items = @import("../game/data_system.zig").movement_range_alignment_items;
-const movement = @import("../game/systems/movement.zig");
-const MovementSystem = @import("../game/systems/movement.zig").MovementSystem;
-const AiSystem = @import("../game/systems/ai.zig").AiSystem;
-const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
 const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
 const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
-const IndexPopulation = @import("../game/systems/spatial_index.zig").IndexPopulation;
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const CognitionResult = @import("../game/systems/simulation_scope.zig").CognitionResult;
-const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
-const collision_bench = @import("collision.zig");
-const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
 const SimulationScopeSystem = @import("../game/systems/simulation_scope.zig").SimulationScopeSystem;
 const ScopeConfig = @import("../game/systems/simulation_scope.zig").ScopeConfig;
 const scope_range_alignment_items = @import("../game/systems/simulation_scope.zig").scope_range_alignment_items;
@@ -45,16 +29,8 @@ const ActiveRegion = @import("../game/simulation_scope.zig").ActiveRegion;
 const tierForChunkDistance = @import("../game/simulation_scope.zig").tierForChunkDistance;
 const cognition_halo_chunks = @import("../game/simulation_scope.zig").cognition_halo_chunks;
 const cognition_stagger_n = @import("../game/simulation_scope.zig").cognition_stagger_n;
-const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
-const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
-const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
-
-const offMainNs = @import("../app/thread_system.zig").offMainNs;
-
-const delta_seconds: f32 = 1.0 / 60.0;
-const intent_seed: u64 = 0x5c0_9ed5;
 
 // Grid: 32px tiles, 8-tile (256px) chunks, 16 chunks across. Entities spread over
 // the 16 x-chunks and are banded into all four LOD tiers by distance from the
@@ -85,14 +61,6 @@ fn cognitionHaloRegion() ActiveRegion {
     };
 }
 
-pub const group = suite.BenchmarkGroup{
-    .name = "scope",
-    .item_label = "entities",
-    .defaultItemCounts = defaultItemCounts,
-    .runCase = runCase,
-    .write_workload = writeScopeWorkload,
-};
-
 pub const cognition_group = suite.BenchmarkGroup{
     .name = "scope-cognition",
     .item_label = CognitionCode.label,
@@ -101,28 +69,15 @@ pub const cognition_group = suite.BenchmarkGroup{
     .write_workload = writeCognitionWorkload,
 };
 
-const Fixture = struct {
-    data: DataSystem,
-    frame: SimulationFrame,
-    contacts: RangeOutputStream(CollisionContact),
-
-    fn deinit(self: *Fixture) void {
-        self.contacts.deinit();
-        self.frame.deinit();
-        self.data.deinit();
-        self.* = undefined;
-    }
-};
-
-pub fn defaultItemCounts(profile: suite.Profile) []const usize {
+fn defaultItemCounts(profile: suite.Profile) []const usize {
     return suite.eventScaleCounts(profile);
 }
 
-// `spread` is the `scope` fixture; `dense_chunk` puts every agent in chunk (0, 0).
+// `spread` banded over the x-chunks; `dense_chunk` puts every agent in chunk (0, 0).
 const CognitionLayout = enum(u8) { spread, dense_chunk };
 const CognitionCode = suite.ItemCode(struct { layout: CognitionLayout, agents: u32 }, &.{6});
 
-// Each layout at the `scope` sizes.
+// Each layout at the event-scale sizes.
 fn cognitionCodes(comptime counts: []const usize) [2 * counts.len]usize {
     var codes: [2 * counts.len]usize = undefined;
     for (counts, 0..) |count, index| {
@@ -141,36 +96,20 @@ fn cognitionItemCounts(profile: suite.Profile) []const usize {
     };
 }
 
-pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
+// `count` AI agents spread over the 16 x-chunks, rows stepping in y, each tiered by its chunk
+// and level (`index % 5`) from the visible window.
+fn createSpreadFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
-    var frame = SimulationFrame.init(allocator);
-    errdefer frame.deinit();
-    // Ranges for AI's navigation intents and the tier policy pass's structural
-    // commands (this bench's only stream writers), so a band crossing
-    // mid-measurement never allocates on the hot path.
-    const range_count = @max(maxRangeCount(count, ai_range_alignment_items), maxRangeCount(count, scope_range_alignment_items));
-    try frame.reserveStreams(range_count, 0, count, 0, 0, count);
-    var contacts = RangeOutputStream(CollisionContact).init(allocator);
-    errdefer contacts.deinit();
-
     for (0..count) |index| {
         const entity = try data.createEntity();
-        // Spread across the 16 x-chunks; rows step in y so bodies do not all pile
-        // into one broadphase column. Small velocity keeps the chunk derivation live.
         const chunk_col: f32 = @floatFromInt(index % grid_chunks);
         const row: f32 = @floatFromInt(index / grid_chunks);
         const position = math.Vec2{
             .x = chunk_col * chunk_px + 8.0 + @mod(row, 200.0),
             .y = 32.0 + @mod(row * 13.0, @as(f32, grid_tiles) * tile_size - 64.0),
         };
-        try data.setMovementBody(entity, .{
-            .position = position,
-            .previous_position = position,
-            .velocity = .{ .x = 1.0, .y = 0.5 },
-            .speed = 35.0 + @as(f32, @floatFromInt(index % 17)),
-        });
-        try data.setCollisionBounds(entity, .{ .size = .{ .x = 12, .y = 12 } });
+        try data.setMovementBody(entity, .{ .position = position, .previous_position = position });
         try data.setAiAgent(entity, .{
             .active_behavior = if (index % 3 == 0) .wander else .pursue,
             .wander_amplitude = 6.0 + @as(f32, @floatFromInt(index % 29)),
@@ -189,232 +128,13 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
             .stagger_phase = @intCast(index % cognition_stagger_n),
         });
     }
-
-    return .{ .data = data, .frame = frame, .contacts = contacts };
-}
-
-pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-
-    var fixture = try createFixture(allocator, item_count);
-    defer fixture.deinit();
-    var scope = SimulationScopeSystem.init(allocator);
-    defer scope.deinit();
-    var spatial_index = SpatialIndexSystem.init(allocator);
-    defer spatial_index.deinit();
-    try spatial_index.reserve(item_count);
-    var ai = AiSystem.init(allocator);
-    defer ai.deinit();
-    var collision = CollisionSystem.init(allocator);
-    defer collision.deinit();
-    var move = MovementSystem.init();
-    // Each stage trains its own adaptive tuner(s) from the case, exactly as that
-    // stage's own benchmark does (one tuner per independently-timed threaded stage).
-    if (suite.adaptiveTunerForCase(case, ai_range_alignment_items)) |tuner| {
-        ai.gather_tuner = tuner;
-        ai.separation_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
-        ai.intent_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
-    }
-    collision_bench.useCaseTuners(&collision, case);
-    // The reported primary batch is the movement stage; settle its tuner like the
-    // movement bench so the measured profile is the trained one.
-    if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
-        move.adaptive_tuner = tuner;
-    }
-
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-
-    var ctx = RunContext{ .scope = &scope, .spatial_index = &spatial_index, .ai = &ai, .collision = &collision, .move = &move, .fixture = &fixture, .case = case };
-
-    for (0..options.warmup_iterations) |_| {
-        _ = try runOnce(&ctx, io, if (threads) |*thread_system| thread_system else null);
-    }
-    if (case.adaptive) {
-        var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        // Every stage adapts inside the measured window, so gate on all of their
-        // tuners — including the scope stage's own gather/tier-policy tuners — before
-        // measuring, or the early iterations would time still-adapting dispatch.
-        while (!allTunersSettled(&ai, &collision, &move, &scope, &spatial_index) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runOnce(&ctx, io, if (threads) |*thread_system| thread_system else null);
-        }
-    }
-    const settled_before_measurement = if (case.adaptive) allTunersSettled(&ai, &collision, &move, &scope, &spatial_index) else false;
-
-    var accumulator = suite.StatsAccumulator.init(item_count);
-    var active_cognition: usize = 0;
-    for (0..options.iterations) |_| {
-        const start_ns = suite.nowNs(io);
-        const result = try runOnce(&ctx, io, if (threads) |*thread_system| thread_system else null);
-        const end_ns = suite.nowNs(io);
-        const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        // The index build is excluded from the window.
-        const net_ns = if (elapsed_ns > result.excluded_ns) elapsed_ns - result.excluded_ns else 0;
-        accumulator.record(net_ns, result.batch);
-        active_cognition = result.active_cognition;
-    }
-
-    var stats = accumulator.finish();
-    // The mixed-tier fixture keeps some rows out of cognition.
-    std.debug.assert(active_cognition < item_count);
-    stats.output_count = active_cognition;
-    if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(move.adaptive_tuner.report(), settled_before_measurement);
-    }
-    return stats;
-}
-
-/// True once every stage's adaptive tuner has settled. The measured window times
-/// the scope gathers + tier policy alongside AI + collision + movement, so all of
-/// their tuners must settle first. The spatial-index build tuners are gated too even
-/// though its own wall-clock cost is excluded from the reported window (see
-/// `runCase`), so warmup/settle iterations reflect the same dispatch shape the
-/// measured iterations will use.
-fn allTunersSettled(ai: *const AiSystem, collision: *const CollisionSystem, move: *const MovementSystem, scope: *const SimulationScopeSystem, spatial_index: *const SpatialIndexSystem) bool {
-    return move.adaptive_tuner.isSettled() and
-        ai.gather_tuner.isSettled() and ai.separation_tuner.isSettled() and ai.intent_tuner.isSettled() and
-        collision_bench.stageTunersSettled(collision) and
-        scope.chunk_derive_tuner.isSettled() and scope.collision_gather_tuner.isSettled() and
-        scope.ai_gather_tuner.isSettled() and scope.cognition_tuner.isSettled() and scope.tier_policy_tuner.isSettled() and
-        spatial_index.bucket_tuner.isSettled() and spatial_index.sort_tuner.isSettled() and spatial_index.link_tuner.isSettled();
-}
-
-const RunContext = struct {
-    scope: *SimulationScopeSystem,
-    spatial_index: *SpatialIndexSystem,
-    ai: *AiSystem,
-    collision: *CollisionSystem,
-    move: *MovementSystem,
-    fixture: *Fixture,
-    case: suite.BenchmarkCase,
-};
-
-const RunResult = struct {
-    batch: BatchStats,
-    active_cognition: usize,
-    // Wall-clock cost of this call's spatial-index build, to be subtracted by
-    // the caller from the outer start/end window (see the `runCase` comment).
-    excluded_ns: u64 = 0,
-};
-
-fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResult {
-    const fixture = ctx.fixture;
-    fixture.frame.beginStep();
-    ctx.scope.advanceStep();
-
-    // AI gates on the cognition halo (the same window the fixture banded tiers
-    // from) plus stagger; the cognition-tier subset all falls inside it.
-    const region = cognitionHaloRegion();
-    const scope_config = scopeConfig(ctx.case);
-
-    // Scope passes thread the same way as the downstream systems: serial cases run
-    // the *Serial variants, threaded cases the adaptive threaded gathers so the
-    // scope stage's own tuners train inside the measured window.
-    var collision_indices: ?[]const u32 = undefined;
-    var ai_halo_indices: []const u32 = undefined;
-    if (thread_system) |ts| {
-        collision_indices = (try ctx.scope.gatherCollisionBoundsIndices(&fixture.data, ts, scope_config)).indices;
-        ai_halo_indices = (try ctx.scope.gatherAiPopulations(&fixture.data, region, ts, scope_config)).halo;
-    } else {
-        collision_indices = try ctx.scope.gatherCollisionBoundsIndicesSerial(&fixture.data);
-        ai_halo_indices = (try ctx.scope.gatherAiPopulationsSerial(&fixture.data, region)).halo;
-    }
-
-    const ai_slice = fixture.data.aiAgentSliceConst();
-    const move_slice_const = fixture.data.movementBodySliceConst();
-
-    // Build the shared spatial index from this step's unstaggered halo (the
-    // previous positions AI reads). Timed separately and excluded from the
-    // returned batch's reported window — see the `runCase` comment.
-    const spatial_start_ns = suite.nowNs(io);
-    const halo_population = IndexPopulation{ .entities = ai_slice.entities, .rows = ai_halo_indices };
-    const spatial_stats = if (thread_system) |ts|
-        try ctx.spatial_index.build(&fixture.data, halo_population, index_geometry, ts, .{})
-    else
-        try ctx.spatial_index.buildSerial(&fixture.data, halo_population, index_geometry, .{});
-    _ = spatial_stats;
-    const spatial_end_ns = suite.nowNs(io);
-    const excluded_ns = suite.elapsedNs(spatial_start_ns, spatial_end_ns);
-    const spatial_view = ctx.spatial_index.view();
-    const ai_cognition_indices = if (thread_system) |ts|
-        (try ctx.scope.compactCognition(&spatial_view, ctx.scope.staggerStep(), true, ts, scope_config)).cognition
-    else
-        (try ctx.scope.compactCognitionSerial(&spatial_view, ctx.scope.staggerStep(), true)).cognition;
-
-    const chunk_grid = SimulationScopeSystem.ChunkGrid{
-        .tile_size = tile_size,
-        .chunk_size_tiles = chunk_size_tiles,
-        .width = grid_tiles,
-        .height = grid_tiles,
-    };
-
-    if (!ctx.case.usesThreadSystem()) {
-        _ = try ctx.ai.updateSerial(ai_slice, move_slice_const, spatial_view, &fixture.data, &fixture.frame, delta_seconds, .{
-            .intent_seed = intent_seed,
-            .focus_target = .{ .x = 480, .y = 270 },
-            .scope_dense_indices = ai_cognition_indices,
-        });
-        _ = try ctx.collision.updateSerialScoped(&fixture.data, &fixture.contacts, collision_indices);
-        var slice = fixture.data.movementBodySlice();
-        movement.updateSerial(&slice, delta_seconds);
-        // Chunk maintenance runs as its own pass over settled positions.
-        ctx.scope.deriveChunksSerial(&fixture.data, chunk_grid);
-        // Tier policy reads the chunk just derived; serial path emits one range.
-        try ctx.scope.queueTierChangesSerial(&fixture.data, visibleRegion(), &fixture.frame.structural_commands);
-        return .{ .batch = inlineBatch(move_slice_const.entities.len, movement_range_alignment_items), .active_cognition = ai_cognition_indices.len, .excluded_ns = excluded_ns };
-    }
-
-    _ = try ctx.ai.update(ai_slice, move_slice_const, spatial_view, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{
-        .items_per_range = ctx.case.stageItemsPerRange(ai_range_alignment_items),
-        .max_worker_threads = ctx.case.maxWorkerThreads(),
-        .adaptive = ctx.case.adaptive,
-        .intent_seed = intent_seed,
-        .focus_target = .{ .x = 480, .y = 270 },
-        .scope_dense_indices = ai_cognition_indices,
-    });
-    _ = try ctx.collision.update(&fixture.data, &fixture.contacts, thread_system.?, .{
-        .items_per_range = ctx.case.stageItemsPerRange(collision_range_alignment_items),
-        .max_worker_threads = ctx.case.maxWorkerThreads(),
-        .adaptive = ctx.case.adaptive,
-        .scope_dense_indices = collision_indices,
-    });
-    var slice = fixture.data.movementBodySlice();
-    const move_stats = ctx.move.update(&slice, thread_system.?, delta_seconds, .{
-        .items_per_range = ctx.case.stageItemsPerRange(movement_range_alignment_items),
-        .max_worker_threads = ctx.case.maxWorkerThreads(),
-        .adaptive = ctx.case.adaptive,
-    });
-    // Chunk maintenance runs as its own threaded pass over settled positions; its
-    // tuner trains inside the measured window like the other scope passes.
-    _ = ctx.scope.deriveChunks(&fixture.data, thread_system.?, chunk_grid, scope_config);
-    // Threaded tier policy trains its own tuner inside the measured window.
-    _ = try ctx.scope.queueTierChanges(&fixture.data, visibleRegion(), &fixture.frame.structural_commands, thread_system.?, scope_config);
-    return .{ .batch = move_stats.batch, .active_cognition = ai_cognition_indices.len, .excluded_ns = excluded_ns };
-}
-
-/// Scope-pass threading config for a case: adaptive cases let the scope tuners
-/// train (null range); fixed cases pin the same range size as the other stages.
-fn scopeConfig(case: suite.BenchmarkCase) ScopeConfig {
-    return .{
-        .items_per_range = case.stageItemsPerRange(scope_range_alignment_items),
-        .max_worker_threads = case.maxWorkerThreads(),
-        .adaptive = case.adaptive,
-    };
-}
-
-fn writeScopeWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
-    try writer.print("cognition_active={}", .{stats.output_count});
+    return data;
 }
 
 // Every agent a cognition-tier body in chunk (0, 0) on level 0, over its 8x8 index cells.
-fn createDenseChunkFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
+fn createDenseChunkFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
-    var frame = SimulationFrame.init(allocator);
-    errdefer frame.deinit();
-    var contacts = RangeOutputStream(CollisionContact).init(allocator);
-    errdefer contacts.deinit();
     const side: usize = @intFromFloat(chunk_px - 16);
     for (0..count) |index| {
         const entity = try data.createEntity();
@@ -426,18 +146,18 @@ fn createDenseChunkFixture(allocator: std.mem.Allocator, count: usize) !Fixture 
         try data.setAiAgent(entity, .{ .active_behavior = .wander });
         try data.setSimulationMetadata(entity, .{ .tier = .cognition, .stagger_phase = @intCast(index % cognition_stagger_n) });
     }
-    return .{ .data = data, .frame = frame, .contacts = contacts };
+    return data;
 }
 
-pub fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     const fields = try CognitionCode.decode(item_count);
-    var fixture = switch (fields.layout) {
-        .spread => try createFixture(allocator, fields.agents),
+    var data = switch (fields.layout) {
+        .spread => try createSpreadFixture(allocator, fields.agents),
         .dense_chunk => try createDenseChunkFixture(allocator, fields.agents),
     };
-    defer fixture.deinit();
+    defer data.deinit();
     var scope = SimulationScopeSystem.init(allocator);
     defer scope.deinit();
     try scope.reserve(fields.agents);
@@ -449,8 +169,8 @@ pub fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     // Positions never change, so the halo's index is built once, untimed.
     var spatial_index = SpatialIndexSystem.init(allocator);
     defer spatial_index.deinit();
-    const halo = (try scope.gatherAiPopulationsSerial(&fixture.data, cognitionHaloRegion())).halo;
-    _ = try spatial_index.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities, .rows = halo }, index_geometry, .{});
+    const halo = (try scope.gatherAiPopulationsSerial(&data, cognitionHaloRegion())).halo;
+    _ = try spatial_index.buildSerial(&data, .{ .entities = data.aiAgentSliceConst().entities, .rows = halo }, index_geometry, .{});
     const view = spatial_index.view();
     const indexed = view.entryCount();
     if (fields.layout == .dense_chunk) std.debug.assert(view.recordCount() == 1 and indexed == fields.agents);
@@ -512,4 +232,14 @@ fn writeCognitionWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: s
     try writer.print("indexed={} thinking={}", .{ stats.candidate_pairs, stats.output_count });
     if (view == .summary) return;
     try suite.writeMainShare(writer, stats, stats.candidate_pairs);
+}
+
+// Scope-pass threading config for a case: adaptive cases let the tuner train (null range);
+// fixed cases pin the case's range size.
+fn scopeConfig(case: suite.BenchmarkCase) ScopeConfig {
+    return .{
+        .items_per_range = case.stageItemsPerRange(scope_range_alignment_items),
+        .max_worker_threads = case.maxWorkerThreads(),
+        .adaptive = case.adaptive,
+    };
 }

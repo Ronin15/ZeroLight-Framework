@@ -3,9 +3,10 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Fixture builders shared by the bench groups: a case's thread system, bodies, one-range
-//! stream writes, a static moved through the static-collider seam, the world tileset and
-//! banded worlds, a 4-connected flood, a coprime-stride shuffle, the nav reaction's and the
-//! static colliders' tuner setup, and the render benches' texture table and phase timers.
+//! stream writes, the structural-commit seam and a static moved through it, the world
+//! tileset and banded worlds, a 4-connected flood, a coprime-stride shuffle, the nav
+//! reaction's and the static colliders' tuner setup, and the render benches' texture table
+//! and phase timers.
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -24,6 +25,8 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const CollisionResponseMobility = @import("../game/data_system.zig").CollisionResponseMobility;
 const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const StructuralCommitStats = @import("../game/data_system.zig").StructuralCommitStats;
+const maxEventsPerStep = @import("../game/simulation.zig").maxEventsPerStep;
+const structuralEventHeadroom = @import("../game/simulation.zig").structuralEventHeadroom;
 const PathRequest = @import("../game/simulation.zig").PathRequest;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
@@ -33,6 +36,8 @@ const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const level_z_step = @import("../game/world/system.zig").level_z_step;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats;
+const SteeringSystem = @import("../game/systems/steering/system.zig").SteeringSystem;
 const evict_range_alignment_items = @import("../game/systems/pathfinding/types.zig").evict_range_alignment_items;
 const nav_mark_range_alignment_items = @import("../game/systems/pathfinding/nav_reaction.zig").nav_mark_range_alignment_items;
 const suite = @import("suite.zig");
@@ -66,25 +71,63 @@ pub fn addBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, mobility
     return entity;
 }
 
-/// One structural commit through the static-collider seam, in the pipeline's order:
-/// `commands` written as one range of `frame`'s structural commands, the collider reserve,
-/// the commit, then the collider capture and sync (its splice stages on `thread_system`
-/// when set). Runs in `frame`'s current step, whose structural commands are empty; the
-/// step's changes stay in the frame for the caller.
-pub fn commitThroughColliderSeam(
-    frame: *SimulationFrame,
-    data: *DataSystem,
+/// The systems a bench's structural-commit seam runs with: a bench holds no
+/// `SimulationPipeline`, so `commit` calls the seam's systems in the demo seam's order. `nav`
+/// and `steering` are null when the bench builds none.
+pub const CommitSeam = struct {
     colliders: *StaticColliderSystem,
-    commands: []const StructuralCommand,
-    thread_system: ?*ThreadSystem,
-) !StructuralCommitStats {
-    try writeOneRange(StructuralCommand, &frame.structural_commands, commands);
-    try colliders.reserveForCommit(data, commands.len);
-    const stats = try frame.applyStructuralCommands(data);
-    colliders.capture(frame);
-    try colliders.sync(data, thread_system);
-    return stats;
-}
+    nav: ?Nav = null,
+    steering: ?*SteeringSystem = null,
+    /// The caller's part of the commit's `.structural_commit` event share, as a pipeline's
+    /// `structural_headroom` (`structuralEventHeadroom` of the commands it queues a step).
+    structural_headroom: usize,
+    clock: ?*PhaseClock = null,
+
+    pub const Nav = struct {
+        system: *PathfindingSystem,
+        world: *const WorldSystem,
+    };
+
+    pub const Result = struct {
+        structural: StructuralCommitStats,
+        nav: NavUpdateStats = .{},
+    };
+
+    /// Phase marks of one commit: after the collider capture, and after the collider sync
+    /// and its nav record.
+    pub const PhaseClock = struct {
+        io: std.Io,
+        captured_ns: i96 = 0,
+        synced_ns: i96 = 0,
+    };
+
+    /// One structural commit in the demo seam's order (`commitStructuralAndReact`):
+    /// `commands` written as one range of `frame`'s structural commands, the collider and
+    /// static nav-mark reserve, the budgeted commit, the collider capture, the collider sync
+    /// and its nav record, then the nav and steering post-commit reactions (splice and nav
+    /// stages on `thread_system` when set). The population seam does not run: a bench grows
+    /// no pipeline capacity. Runs in `frame`'s current step, whose structural commands are
+    /// empty; the step's changes stay in the frame for the caller.
+    pub fn commit(self: CommitSeam, frame: *SimulationFrame, data: *DataSystem, commands: []const StructuralCommand, thread_system: ?*ThreadSystem) !Result {
+        try writeOneRange(StructuralCommand, &frame.structural_commands, commands);
+        const nav_may_emit = if (self.nav) |nav| self.colliders.hasPendingChanges() or nav.system.navReactionMayEmit(data, frame, nav.world) else false;
+        try self.colliders.reserveForCommit(data, commands.len);
+        if (self.nav) |nav| try nav.system.reserveStaticColliderMarks(self.colliders.pendingChangeCount() + commands.len);
+        const structural = try frame.applyStructuralCommandsBudgeted(data, .{
+            .extra_required_events = if (nav_may_emit) maxEventsPerStep(.nav_reaction, .{}) else 0,
+            .structural_event_share = maxEventsPerStep(.structural_commit, .{ .structural_headroom = self.structural_headroom }),
+        });
+        self.colliders.capture(frame);
+        if (self.clock) |clock| clock.captured_ns = suite.nowNs(clock.io);
+        try self.colliders.sync(data, thread_system);
+        if (self.nav) |nav| nav.system.recordStaticColliderChanges(self.colliders.changesThisStep());
+        if (self.clock) |clock| clock.synced_ns = suite.nowNs(clock.io);
+        var result = Result{ .structural = structural };
+        if (self.nav) |nav| result.nav = try nav.system.reactToPostCommitNavEvents(frame, self.colliders, nav.world, thread_system);
+        if (self.steering) |steering| steering.reactToPostCommitSteeringEvents(frame);
+        return result;
+    }
+};
 
 /// Replaces `stream`'s contents with one range of `count` items and returns its writer; the
 /// caller writes exactly `count` items, then calls the writer's `finish` and the stream's
@@ -113,6 +156,9 @@ pub fn writeRequests(stream: *RangeOutputStream(PathRequest), requests: []const 
 /// One static body moved back and forth between two positions, one structural command per
 /// step: the next move's `set_movement_body`, then `advance` once it committed.
 pub const StaticMove = struct {
+    /// The commit seam's share for the move's one command a step.
+    pub const structural_headroom = structuralEventHeadroom(0, 1);
+
     entity: EntityId,
     // The body starts at the first.
     positions: [2]math.Vec2,

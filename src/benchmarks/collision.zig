@@ -23,8 +23,8 @@
 //! - `collision-static-heavy`: the dynamics spread uniformly over the world. Pass shape:
 //!   time per dynamic flat in statics.
 //! - `collision-static-index-change`: the clustered fixture; each step moves one static
-//!   through the commit seam (reserve, commit, collider capture, and sync) and then runs
-//!   one collision step. Pass shape: flat in statics.
+//!   through the commit seam (`fixtures.CommitSeam`: reserve, budgeted commit, collider
+//!   capture, and sync) and then runs one collision step. Pass shape: flat in statics.
 //! Asserts check fixture invariants only: the analytic contact count (one per overlapping
 //! dynamic) in every static group; in `collision-static-index-change` also the collider row
 //! count, and that each move commits, syncs, and changes chunks.
@@ -50,7 +50,6 @@ const CollisionStrips = @import("../game/systems/collision.zig").CollisionStrips
 const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
 const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
 const EntityId = @import("../game/data_system.zig").EntityId;
-const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
@@ -439,9 +438,9 @@ const StaticMover = struct {
     // `thread_system` when set).
     fn moveAndSync(self: *StaticMover, data: *DataSystem, thread_system: ?*ThreadSystem) !void {
         self.frame.beginStep();
-        const move = [_]StructuralCommand{self.move.command()};
-        const commit = try fixtures.commitThroughColliderSeam(&self.frame, data, &self.colliders, &move, thread_system);
-        if (commit.components_set != 1) return error.StaticMoveNotApplied;
+        const seam = fixtures.CommitSeam{ .colliders = &self.colliders, .structural_headroom = fixtures.StaticMove.structural_headroom };
+        const commit = try seam.commit(&self.frame, data, &.{self.move.command()}, thread_system);
+        if (commit.structural.components_set != 1) return error.StaticMoveNotApplied;
         const changes = self.colliders.changesThisStep();
         if (changes.len != 1) return error.StaticChangeNotSynced;
         const chunk_tiles = self.colliders.geometry.?.grid.chunk_tiles;

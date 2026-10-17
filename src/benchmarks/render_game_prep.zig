@@ -102,7 +102,6 @@ pub fn defaultItemCounts(profile: suite.Profile) []const usize {
 const Fixture = struct {
     data: DataSystem,
     particles: ParticleSystem,
-    tileset_meta: world_tileset_meta.WorldTilesetMeta,
     world: WorldSystem,
     scene_prep: render_prep.DynamicScenePrep,
     player_entity: EntityId,
@@ -123,7 +122,6 @@ const Fixture = struct {
         self.scene_prep.deinit();
         self.particles.deinit();
         self.world.deinit();
-        self.tileset_meta.deinit();
         self.data.deinit();
         self.* = undefined;
     }
@@ -448,11 +446,6 @@ fn emitPreparedDraw(
     }
 }
 
-/// How far `initFixture` got building `Fixture`'s heap-owning fields, in
-/// construction order. Backs the single consolidated `errdefer` in
-/// `initFixture` that unwinds everything built so far on any later failure.
-const InitStage = enum(u8) { scene_prep, tileset_meta, world };
-
 fn initFixture(
     fixture: *Fixture,
     allocator: std.mem.Allocator,
@@ -464,11 +457,17 @@ fn initFixture(
     const particle_capacity = particleCapacity(item_count);
     const tile_texture = fixtures.textureId(1, 1);
 
+    // A square walkable level holding the sparse grid and the entity layout.
+    const tile_size_px = world_tileset_meta.required_tile_size;
+    const entity_layout = entitySpawnLayout(item_count);
+    const sparse_grid_side = suite.ceilSqrt(sparse_tile_count);
+    const sparse_world_tiles = @max(@as(u16, @intCast(sparse_grid_side * 2 + 8)), 64);
+    const entity_tiles: u16 = @intFromFloat(@ceil(@max(entity_layout.width, entity_layout.height) / tile_size_px));
+    const world_tiles = @max(sparse_world_tiles, entity_tiles);
     fixture.* = .{
         .item_count = item_count,
         .data = DataSystem.init(allocator),
         .particles = try ParticleSystem.init(allocator, .{ .capacity = particle_capacity }),
-        .tileset_meta = undefined,
         .world = undefined,
         .scene_prep = render_prep.DynamicScenePrep.init(allocator),
         .player_entity = undefined,
@@ -481,41 +480,18 @@ fn initFixture(
         .dynamic_record_capacity = 0,
         .sparse_tile_count = sparse_tile_count,
     };
-    // `tileset_meta`/`world` must be built directly at their final `fixture.*`
-    // address rather than a temporary local, because `WorldSystem` retains the
-    // `*const WorldTilesetMeta` pointer it's given (`buildCatalog`) for its own
-    // lifetime; moving `tileset_meta` after the fact would dangle that pointer.
-    // `stage` tracks how far construction got so this single `errdefer` is the
-    // one place responsible for unwinding everything built so far, in reverse
-    // init order — adding a future heap-owning field only needs one new
-    // `InitStage` variant, one line here, and one `stage = .field;` below,
-    // instead of a fresh standalone `errdefer` that must be placed exactly right.
-    // `data`/`particles`/`scene_prep` are all validly constructed the instant
-    // the literal above finishes (a failing `try` inside it never reaches this
-    // point), so `stage` starts past all three.
-    var stage: InitStage = .scene_prep;
     errdefer {
-        if (@backingInt(stage) >= @backingInt(InitStage.world)) fixture.world.deinit();
-        if (@backingInt(stage) >= @backingInt(InitStage.tileset_meta)) fixture.tileset_meta.deinit();
         fixture.scene_prep.deinit();
         fixture.particles.deinit();
         fixture.data.deinit();
     }
+    fixture.world = try fixtures.buildBandedWorld(allocator, io, world_tiles, 1, "grass", "grass");
+    errdefer fixture.world.deinit();
 
     fixture.static_group_count = benchStaticGroups(tile_texture, fixture_config, &fixture.static_groups);
-
-    fixture.tileset_meta = try fixtures.loadTilesetMeta(allocator, io);
-    stage = .tileset_meta;
-
-    const tile_size_px = fixture.tileset_meta.tileSize();
-    const entity_layout = entitySpawnLayout(item_count);
-    const sparse_grid_side = suite.ceilSqrt(sparse_tile_count);
-    const sparse_world_tiles = @max(@as(u16, @intCast(sparse_grid_side * 2 + 8)), 64);
-    const sparse_world_px = @as(f32, @floatFromInt(sparse_world_tiles)) * tile_size_px;
-    const world_width_px = @max(sparse_world_px, entity_layout.width);
-    const world_height_px = @max(sparse_world_px, entity_layout.height);
-    fixture.world = try WorldSystem.initDemoFromMeta(allocator, &fixture.tileset_meta, world_width_px, world_height_px);
-    stage = .world;
+    const world_px = @as(f32, @floatFromInt(world_tiles)) * tile_size_px;
+    const world_width_px = world_px;
+    const world_height_px = world_px;
 
     // Render-prep's dense-window entity cull bounds the deep submit limit by
     // the world's real level count (WorldSystem.levelInWindow), so a deep
@@ -527,7 +503,7 @@ fn initFixture(
         _ = try fixture.world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
     }
 
-    const deco = try fixture.world.requireTileByName(&fixture.tileset_meta, "deco_0");
+    const deco = try fixture.world.requireTileByName(fixture.world.tilesetMeta().?, "deco_0");
     // Sparse tiles sit on the player's level so both variants draw them: sparse
     // tiles draw only on the render window's levels.
     const level: u16 = fixture_config.player_level;
