@@ -30,6 +30,7 @@ const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
 const logging = @import("../../core/logging.zig");
 const simd = @import("../../core/simd.zig");
+const insertionSort = @import("../../core/sort.zig").insertion;
 const factionsWithStance = @import("../faction.zig").factionsWithStance;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
@@ -957,7 +958,7 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, block: *PerceptionBlock
         .spatial = &job.spatial,
         .player_candidate = job.player_candidate,
     };
-    std.mem.sort(usize, survivors[0..survivor_count], sort_ctx, survivorLessThan);
+    insertionSort(usize, survivors[0..survivor_count], sort_ctx, survivorLessThan);
     range_stats.sensed_count += survivor_count;
 
     var target_visible = false;

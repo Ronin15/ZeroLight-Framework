@@ -29,6 +29,7 @@ const hot_soa_column_alignment = @import("../data_system.zig").hot_soa_column_al
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 const simd = @import("../../core/simd.zig");
 const logging = @import("../../core/logging.zig");
+const pdqSort = @import("../../core/sort.zig").pdq;
 const CollisionContact = @import("../simulation.zig").CollisionContact;
 const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
 
@@ -674,7 +675,7 @@ pub const CollisionSystem = struct {
         const full_sort = @as(u128, inversion_count) * 100 > @as(u128, self.order.items.len) * max_percent;
         if (full_sort) {
             const proxies = self.sliceConst();
-            std.mem.sort(usize, self.order.items, proxies, proxyIndexLessThan);
+            pdqSort(usize, self.order.items, proxies, proxyIndexLessThan);
             return true;
         }
         self.insertionSortOrder();

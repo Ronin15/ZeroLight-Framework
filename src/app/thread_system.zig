@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const logging = @import("../core/logging.zig");
+const insertionSort = @import("../core/sort.zig").insertion;
 const diagnostics_enabled = @import("runtime_perf_log.zig").enabled;
 const StageTimer = @import("runtime_perf_log.zig").StageTimer;
 const log = logging.app;
@@ -855,7 +856,7 @@ pub const AdaptiveWorkTuner = struct {
         std.debug.assert(self.sample_count > 0 and self.sample_count <= max_sample_window);
         var order: [max_sample_window]u8 = undefined;
         for (order[0..self.sample_count], 0..) |*slot, index| slot.* = @intCast(index); // index < max_sample_window
-        std.sort.insertion(u8, order[0..self.sample_count], self, sampleDurationLess);
+        insertionSort(u8, order[0..self.sample_count], self, sampleDurationLess);
         return order[(self.sample_count - 1) / 2];
     }
 

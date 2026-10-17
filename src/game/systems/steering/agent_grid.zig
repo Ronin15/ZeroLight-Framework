@@ -16,6 +16,7 @@ const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const math = @import("../../../core/math.zig");
 const simd = @import("../../../core/simd.zig");
+const pdqSort = @import("../../../core/sort.zig").pdq;
 const steering_range_alignment_items = @import("system.zig").steering_range_alignment_items;
 const min_spatial_cell_size = @import("system.zig").min_spatial_cell_size;
 const max_bands = @import("system.zig").max_bands;
@@ -263,7 +264,7 @@ pub const SpatialCellRange = struct {
 fn sortCellEntries(entries: []SpatialCellEntry, ranges: []SpatialCellRange, base: usize) usize {
     std.debug.assert(ranges.len >= entries.len);
     // pdqsort: agents move slowly so order is often nearly sorted; still O(n log n) worst case.
-    std.sort.pdq(SpatialCellEntry, entries, {}, spatialCellEntryLessThan);
+    pdqSort(SpatialCellEntry, entries, {}, spatialCellEntryLessThan);
     var range_count: usize = 0;
     var entry_index: usize = 0;
     while (entry_index < entries.len) {
@@ -301,7 +302,7 @@ fn chooseGridSplitters(agents: ConstAgentSnapshotSlice, cell_size: f32) [max_ban
     }
     var splitters: [max_bands - 1]CellKey = @splat(max_cell_key);
     if (valid == 0) return splitters;
-    std.sort.pdq(SpatialCellEntry, samples[0..valid], {}, spatialCellEntryLessThan);
+    pdqSort(SpatialCellEntry, samples[0..valid], {}, spatialCellEntryLessThan);
     for (&splitters, 1..) |*splitter, band| {
         const sample = samples[band * valid / max_bands];
         splitter.* = .{ .cell_y = sample.cell_y, .cell_x = sample.cell_x };

@@ -18,6 +18,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const logging = @import("../../core/logging.zig");
+const pdqSort = @import("../../core/sort.zig").pdq;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
@@ -941,7 +942,7 @@ pub const ChunkListMap = struct {
             if (std.sort.isSorted(SpliceRecord, window, self.entry_order, orderGreaterThan)) {
                 std.mem.reverse(SpliceRecord, window);
             } else {
-                std.sort.pdq(SpliceRecord, window, self.entry_order, orderLessThan);
+                pdqSort(SpliceRecord, window, self.entry_order, orderLessThan);
             }
         }
         const tail = self.slot_tails[touched.slot];

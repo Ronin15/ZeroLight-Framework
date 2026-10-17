@@ -5,6 +5,7 @@
 const std = @import("std");
 const Color = @import("../config.zig").Color;
 const math = @import("../core/math.zig");
+const pdqSort = @import("../core/sort.zig").pdq;
 const DataSystem = @import("data_system.zig").DataSystem;
 const ConstAssetReferenceSlice = @import("data_system.zig").ConstAssetReferenceSlice;
 const ConstMovementBodySlice = @import("data_system.zig").ConstMovementBodySlice;
@@ -275,7 +276,7 @@ pub const DynamicScenePrep = struct {
         }
 
         const records = self.records.items;
-        std.mem.sort(usize, self.sort_indices.items, records, sortRecordIndexLessThan);
+        pdqSort(usize, self.sort_indices.items, records, sortRecordIndexLessThan);
 
         var span_start: usize = 0;
         var current_depth = records[self.sort_indices.items[0]].depth;
@@ -566,7 +567,7 @@ fn collectDenseInterleaveDepths(scene: GameplayScene, prep: *const DynamicSceneP
     }
 
     const collected = scratch.depths[0..count];
-    std.mem.sort(i32, collected, {}, std.sort.asc(i32));
+    pdqSort(i32, collected, {}, std.sort.asc(i32));
     return collected;
 }
 

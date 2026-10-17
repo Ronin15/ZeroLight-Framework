@@ -29,6 +29,7 @@ const tile_store_no_link = @import("../../render/renderer.zig").tile_store_no_li
 const tile_store_uniform_bit = @import("../../render/renderer.zig").tile_store_uniform_bit;
 const tileStoreBlockElements = @import("../../render/renderer.zig").tileStoreBlockElements;
 const tileStoreUniformWord = @import("../../render/renderer.zig").tileStoreUniformWord;
+const pdqSort = @import("../../core/sort.zig").pdq;
 
 /// `gpu_slot` of a dense layer that is not resident.
 pub const no_slot: u32 = std.math.maxInt(u32);
@@ -539,7 +540,7 @@ pub const GpuTileMirror = struct {
             self.window = new_window;
         }
 
-        std.mem.sortUnstable(Region, self.regions.items, {}, regionLessThan);
+        pdqSort(Region, self.regions.items, {}, regionLessThan);
         const block_cells = geom.blockCells();
         for (self.regions.items) |region| {
             self.spans.appendAssumeCapacity(.{ .dst_element = region.dst, .count = region.count });

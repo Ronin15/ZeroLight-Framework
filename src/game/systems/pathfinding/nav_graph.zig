@@ -12,6 +12,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
 const logging = @import("../../../core/logging.zig");
+const pdqSort = @import("../../../core/sort.zig").pdq;
+const insertionSort = @import("../../../core/sort.zig").insertion;
 const WorldSystem = @import("../../world/system.zig").WorldSystem;
 const validateChunkGrid = @import("../../world/system.zig").validateChunkGrid;
 const ChunkGridError = @import("../../world/system.zig").ChunkGridError;
@@ -522,7 +524,7 @@ const key_window_alignment: usize = thread_shared_record_alignment / @sizeOf(u64
 
 // Sorts `keys` and drops repeats in place; returns the unique count. O(k log k).
 fn sortUnique(keys: []u64) usize {
-    std.sort.pdq(u64, keys, {}, std.sort.asc(u64));
+    pdqSort(u64, keys, {}, std.sort.asc(u64));
     var write: usize = 0;
     for (keys) |key| {
         if (write != 0 and keys[write - 1] == key) continue;
@@ -2004,7 +2006,7 @@ pub const NavGraph = struct {
                 }
             }
         }
-        std.sort.insertion(NavPortal, portals[0..count], {}, portalLessThan);
+        insertionSort(NavPortal, portals[0..count], {}, portalLessThan);
 
         const slot = level_graph.record_link_slot[record];
         if (slot != no_link_slot) {
@@ -2040,8 +2042,8 @@ pub const NavGraph = struct {
                     }
                 }
             }
-            std.sort.pdq(NavPortal, extra.items, {}, portalLessThan);
-            std.sort.pdq(NavLink, links.items, {}, linkLessThan);
+            pdqSort(NavPortal, extra.items, {}, portalLessThan);
+            pdqSort(NavLink, links.items, {}, linkLessThan);
         }
         const base = @as(usize, record) * level_graph.border_stride;
         @memcpy(level_graph.border.items[base .. base + count], portals[0..count]);
