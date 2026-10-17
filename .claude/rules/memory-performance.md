@@ -91,6 +91,11 @@ paths:
   `clearRetainingCapacity`, and capacity helpers on the owning store.
 - Publish hot float columns as `[]f32`, never `[]align(64) f32`; MAL does not
   guarantee aligned column bases.
+- Order every sorted store and index by its hot queries' access pattern: the
+  keys a query filters on (level, faction, kind) come before position, so
+  each hot query reads its rows as long contiguous runs that fill lane blocks.
+  A layout that hands a hot query fragments fails the design and is fixed in
+  the layout, never with a separate short-run or fragment path.
 
 ```zig
 fn appendMalRow(
