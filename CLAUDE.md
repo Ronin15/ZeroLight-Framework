@@ -52,6 +52,9 @@ orchestrates, verifies every agent claim against live code, and reports.
   implementation and against the live code. Local fixes, and work whose
   call a plan or review triage already made (a move, a dedupe, a fix with a
   known cause), go straight to `zig-specialist` with that call in the brief.
+- Before implementation, `zig-review-specialist` checks each design plan
+  against the rule files and live code; every departure is fixed in the plan
+  or goes to the owner before code starts.
 - `zig-review-specialist` reviews each slice, or each landing of a
   multi-commit slice, before it is committed; fixes fold into that commit.
   Every real finding is reported and checked against live code and
