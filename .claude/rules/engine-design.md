@@ -68,9 +68,12 @@ Every design, and every fix touching storage or per-change work, states:
 - A computed result (a proof, region, path, or summary) is stored at the unit
   it covers and shared by every requester it answers, never recomputed per
   requester; a result keyed finer than what it proves fails the cost model.
-- If part of the existing structure cannot pass, redesign that part; never
-  patch around it. Code, tests, and benches built on a failing part go with
-  it and are never references or baselines.
+- If part of the existing structure cannot pass, redesign that part to the
+  rules; never patch around it. Code, tests, and benches built on a failing
+  part go with it and are never design references or correctness baselines.
+  The redesign is then tuned within reason against the replaced code's
+  timings, same mode: a gap the added correctness or rule compliance costs is
+  reported, a gap from overhead is tuned out.
 - Default is keep: replace only the parts that fail the cost model; replacing
   a part that passes needs a concrete performance or efficiency benefit
   against its cost and risk.
