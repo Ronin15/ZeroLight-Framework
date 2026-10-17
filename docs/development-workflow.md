@@ -73,8 +73,8 @@ proofs: `.claude/rules/memory-performance.md`).
 CPU floor: every optimize mode, Debug included, defaults to the shipped CPU
 minimum, `x86_64_v2` (SSE4.2, POPCNT) on x86-64, `apple_m1` on macOS arm64,
 and the baseline model (NEON) on other aarch64. Gates and soaks test what
-ships; Debug benches measure the shipped instruction set on every machine; and Debug binaries carry no AVX-512, so they run under
-valgrind ([Profiling](#profiling)). `-Dcpu` or `-Dtarget` overrides
+ships, and Debug benches measure the shipped instruction set on every
+machine. `-Dcpu` or `-Dtarget` overrides
 (`-Dcpu=native` builds for the host); moving the floor (for example to v3) is a
 deliberate decision.
 
@@ -358,38 +358,22 @@ zig build bench -Dcallgrind=true -- --group ai --items 256 --warmup 1 --iteratio
 callgrind_annotate --inclusive=yes benchmark_outputs/callgrind/callgrind.out | less
 ```
 
-`-Dcallgrind=true` runs the bench binary under `valgrind --tool=callgrind`
-with the same `--` arguments. The profile goes to
-`benchmark_outputs/callgrind/callgrind.out` (gitignored, overwritten each run;
-`-Dcallgrind-out=<path>`, relative to the repo root, picks another file) and
-valgrind's own messages to the same path plus `.log`, so the bench table stays
-readable. Valgrind warns there about the Debug binary's DWARF line tables;
-function names still resolve, and some file names show as `???`. The `bench` step
-(only it) fails with one message when valgrind is not on `PATH`, when the host or target
-is not native Linux, when the target CPU has AVX-512 (valgrind cannot run it,
-for example `-Dcpu=native` on an AVX-512 host), or with `-Dsanitize-thread`.
+`-Dcallgrind=true` runs the bench under `valgrind --tool=callgrind` with the
+same `--` arguments, writing the profile to
+`benchmark_outputs/callgrind/callgrind.out` (`-Dcallgrind-out=<path>`
+overrides) and valgrind's messages to that path plus `.log`. Valgrind cannot
+decode AVX-512, so the `bench` step fails on a target CPU that has it, as it
+does on a non-Linux target, without valgrind on `PATH`, or with
+`-Dsanitize-thread`.
 
-`callgrind_annotate --inclusive=yes` lists instructions (`Ir`) per function,
-callees included; drop `--inclusive` for self cost, and use `--tree=both` or
-`kcachegrind` for call counts and the call graph. Process startup is in the
-totals (the environment map under the Debug allocator's stack-trace capture
-is a large share of a small run), so read the bench stage's own inclusive line,
-not the program total.
-
-What it answers: which functions execute the instructions, how often each is
-called, and a Debug regression broken down by function without timing noise
-(Debug wall time has tracked instruction count closely). What it does not answer:
-
-- wall time and threading: valgrind runs one thread at a time, so profile
-  serial cases (`--case serial-direct`);
-- SIMD-vs-scalar and inlining choices, which stay the release question of
-  `.claude/rules/memory-performance.md` § SIMD;
-- cache misses and memory stalls (the default run simulates no cache);
-- other OSes: valgrind runs on Linux only.
-
-Callgrind runs tens of times slower than the plain binary (about 25× on the
-example above), so callgrind runs use low entity counts only: about 256 to
-1,024 items, one warmup, one iteration.
+Read the stage's own inclusive line in `callgrind_annotate --inclusive=yes`,
+not the program total, which includes process startup. It answers which
+functions execute the instructions and how often each is called; it does not
+answer wall time or threading (valgrind runs one thread at a time, so profile
+serial cases), SIMD or inlining choices (`.claude/rules/memory-performance.md`
+§ SIMD), or cache stalls. Callgrind runs about 25× slower than the plain
+binary, so use low entity counts only: about 256 to 1,024 items, one warmup,
+one iteration.
 
 ## Benchmarks
 

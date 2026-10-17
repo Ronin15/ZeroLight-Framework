@@ -76,9 +76,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     // Every mode, Debug included, defaults to the shipped CPU floor (x86-64-v2:
     // SSE4.2 and POPCNT, which the chunk bit ops use; apple_m1 on macOS arm64;
-    // otherwise the arch baseline, NEON on aarch64), so Debug benches measure the
-    // shipped instruction set and stay runnable under valgrind. -Dtarget/-Dcpu
-    // override; -Dcpu=native builds for the host.
+    // otherwise the arch baseline, NEON on aarch64). -Dtarget/-Dcpu override;
+    // -Dcpu=native builds for the host.
     const target = b.standardTargetOptions(.{ .default_target = shippedCpuFloor(b.graph.host.result) });
     const app_name = b.option([]const u8, "app-name", "Executable name") orelse "my-sdl3-game";
     const window_title = b.option([]const u8, "window-title", "SDL window title") orelse "SDL3 Zig Game";
@@ -786,9 +785,8 @@ comptime {
 
 /// The bench binary under callgrind, writing the profile to `out_path` (relative to the
 /// build root, or absolute) and valgrind's own messages to `<out_path>.log` on every run, so
-/// the bench table stays readable. Fails the bench step (and only it) on what valgrind cannot
-/// run: a non-Linux or foreign-arch build, AVX-512 code (valgrind decodes no EVEX), and
-/// ThreadSanitizer (both intercept the same threads and memory).
+/// the bench table stays readable. Fails the bench step alone on a configuration
+/// valgrind cannot run (docs/development-workflow.md § Profiling).
 fn addCallgrindBenchRun(
     b: *std.Build,
     target: std.Target,
@@ -805,7 +803,7 @@ fn addCallgrindBenchRun(
             @tagName(host.cpu.arch), @tagName(host.os.tag), @tagName(target.cpu.arch), @tagName(target.os.tag),
         })
     else if (target.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(target.cpu.features, .avx512f))
-        b.fmt("-Dcallgrind=true cannot run AVX-512 code (valgrind has no AVX-512 support); target CPU {s} has it, so drop -Dcpu or pass -Dcpu=x86_64_v2", .{target.cpu.model.name})
+        b.fmt("-Dcallgrind=true needs a target CPU without AVX-512 ({s} has it); drop -Dcpu or pass -Dcpu=x86_64_v2", .{target.cpu.model.name})
     else if (valgrind == null)
         "-Dcallgrind=true needs valgrind on PATH"
     else
