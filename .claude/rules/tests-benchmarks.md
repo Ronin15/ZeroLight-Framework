@@ -1,7 +1,6 @@
 ---
 paths:
   - "src/**/*.zig"
-  - "tools/bench_run.py"
   - "tools/bench_ab.py"
 ---
 
