@@ -68,6 +68,13 @@ paths:
   and is judged like the tuned case; where it threads, `serial-direct` is a
   control, judged only for a worse growth order or added per-item work (a new
   scan or indirection), never for a constant gap.
+- A landing's before/after runs once, after its code is done. Each slower
+  case gets one verdict: a feature cost (the work the change adds, named and
+  reported), a constant (reported), or a regression (beyond spread after 3
+  reps on the path that is production, or a worse growth order). A
+  regression gets one attribution, one fix, and one re-measure of that case;
+  if it is still slower, it is reported and becomes a checklist item in its
+  owning slice.
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).

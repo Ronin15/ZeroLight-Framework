@@ -43,9 +43,10 @@ touch. Follow them and cite them by file; never restate them.
 5. Validate per `.claude/rules/build-validation.md`. Write `zig build test`
    output to a file and judge it by the exit code; a "failed command:" line
    echoing warn output is not a failure; on a real failure keep the failing
-   test's name and message. A change that can move a hot path gets its
-   before/after from `tools/bench_ab.py` on the groups the plan names, one run
-   per side (`tests-benchmarks.md`), never the full suite.
+   test's name and message. Run benches only to check a scaling bench's
+   asserts; the main session runs the landing's before/after, and profiling
+   goes to zig-debug-specialist. Never tune for a bench number unless the
+   brief names that case.
 
 ## Report
 
@@ -53,10 +54,7 @@ After folding review fixes, report to the main session for verification; a
 second review round is not the next step (one review per landing). An
 explanation of a bench result is a hypothesis unless a measurement tests it;
 say which, and never write an untested explanation into a bench's pass
-condition or comment. Callgrind on a small serial case is one way to test it
-(`docs/development-workflow.md` § Profiling), only for a result
-`tests-benchmarks.md` says to act on; a gap it calls a control is reported,
-not profiled. Run long jobs in the foreground or poll for a done
+condition or comment. Run long jobs in the foreground or poll for a done
 marker; never wait on `tail -f` with a timeout.
 
 Concise: cost model (each order marked measured with its bench group, or
