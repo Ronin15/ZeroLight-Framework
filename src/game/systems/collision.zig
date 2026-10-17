@@ -994,18 +994,28 @@ pub const CollisionSystem = struct {
     fn countEntryBoundOverflow(self: *CollisionSystem, entry_count: usize, fill_grew: bool) void {
         if (self.reserved_entry_bound == 0) return;
         if (!fill_grew and entry_count <= self.reserved_entry_bound) return;
-        self.noteEntryBoundOverflow(entry_count);
+        self.noteEntryBoundOverflow(entry_count, fill_grew);
     }
 
-    fn noteEntryBoundOverflow(self: *CollisionSystem, entry_count: usize) void {
+    // A spill slot growing is the designed path for bodies past their second strip (spill
+    // slots are never reserved), so it logs at info; entries past the reserved bound warn.
+    fn noteEntryBoundOverflow(self: *CollisionSystem, entry_count: usize, fill_grew: bool) void {
         @branchHint(.cold);
         self.entry_bound_overflows += 1;
         if (self.entry_bound_warned) return;
         self.entry_bound_warned = true;
-        if (comptime logging.enabled(.warn) and !builtin.is_test) logging.game.warn(
-            "collision: {d} sweep entries exceeded the reserved entry bound {d}, or a fill range spilled past its slot; collision stores grew in-stage",
-            .{ entry_count, self.reserved_entry_bound },
-        );
+        if (builtin.is_test) return;
+        if (entry_count > self.reserved_entry_bound) {
+            if (comptime logging.enabled(.warn)) logging.game.warn(
+                "collision: {d} sweep entries exceeded the reserved entry bound {d}; collision stores grew in-stage",
+                .{ entry_count, self.reserved_entry_bound },
+            );
+        } else if (fill_grew) {
+            if (comptime logging.enabled(.info)) logging.game.info(
+                "collision spill slots grew for bodies past their second strip ({d} sweep entries)",
+                .{entry_count},
+            );
+        }
     }
 
     fn growBroadphaseRangeBuffersIfNeeded(self: *CollisionSystem, range_count: usize) !bool {
