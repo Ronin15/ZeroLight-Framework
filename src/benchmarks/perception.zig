@@ -3,32 +3,28 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Perception throughput: gather, shared index query, FOV filter, bounded LOS raycast, and
-//! transition emit, over one population per group, with the index and the think set (every
-//! agent, in the index's cell-major order, as production orders it) built untimed.
-//! - `perception`: observer/hostile pairs on ordinary sparse-tile density. Pass shape: time
+//! transition emit over one population per group, with the index and the think set (every
+//! agent, in the index's cell-major order) built untimed.
+//! - `perception`: observer/hostile pairs at ordinary sparse-tile density. Pass shape: time
 //!   linear in observers, the main thread's time (the gather's window merge) flat per agent.
-//! - `perception-los-dense`: the same pairs plus `los_dense_extra_sparse_tiles` sparse
-//!   tiles no ray crosses, so only a per-cell LOS cost that scales with tile count can move
-//!   it. Pass shape: within spread of `perception`; asserts check its sensed, LOS, and found
-//!   counts equal `perception`'s.
-//! - `perception-scattered-dense-index`: the same pairs with `perception_dense_index` in a
-//!   shuffled order, so worker ranges write interleaved `PerceptionStore` slots. Pass shape:
-//!   within spread of `perception`.
-//! - `perception-cell-ordered`: the same pairs created in the think set's observer order, so
-//!   every `PerceptionStore` read and write ascends with the rows. Pass shape: `perception`
-//!   within spread of it, the scattered-write control; asserts check the rows' store slots
-//!   ascend.
-//! Every group but the crowd asserts at most one neighbor-block fill per run of observer
-//! rows sharing a cell, level, and faction, plus one per range (one vision range: one box).
-//! - `perception-crowd`: separated clusters of one observer (default
-//!   `AiPerception`) and one hostile on its level ahead of it. Variant `allies`
-//!   puts the hostile at half the vision range and adds allies inside the range;
-//!   variant `levels` stacks one hostile per level below the observer's at half the
-//!   range and puts the same-level hostile farther out, past the stack. Pass shape:
-//!   every observer finds its hostile in both variants, nothing is sensed across
-//!   levels, and candidate checks per observer stay flat in allies and in levels.
-//!   Asserts check it per config: every observer finds a threat, exactly one candidate
-//!   per observer survives FOV, and checks stay within `crowd_max_checks_per_observer`.
+//! - `perception-los-dense`: the same pairs plus `los_dense_extra_sparse_tiles` sparse tiles
+//!   no ray crosses, so only an LOS cost growing with tile count moves it. Pass shape: within
+//!   spread of `perception`; asserts check its sensed, LOS, and found counts equal
+//!   `perception`'s.
+//! - `perception-scattered-dense-index`: `perception_dense_index` shuffled, so worker ranges
+//!   write interleaved `PerceptionStore` slots. Pass shape: within spread of `perception`.
+//! - `perception-cell-ordered`: the pairs created in the think set's order, so every
+//!   `PerceptionStore` access ascends with the rows. Pass shape: `perception` within spread
+//!   of it; asserts check the store slots ascend.
+//! These four assert at most one neighbor-block fill per run of observer rows sharing a cell,
+//! level, and faction, plus one per range.
+//! - `perception-crowd`: separated clusters of one observer and one hostile ahead of it on
+//!   its level. Variant `allies` puts the hostile at half the vision range with allies inside
+//!   the range; `levels` stacks one hostile per level below at half the range and puts the
+//!   same-level hostile past the stack. Pass shape: every observer finds its hostile, nothing
+//!   is sensed across levels, and checks per observer stay flat in allies and levels. Asserts
+//!   check a threat found per observer, one FOV survivor each, and at most
+//!   `crowd_max_checks_per_observer` checks.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;

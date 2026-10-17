@@ -2,21 +2,18 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Decides which entities enter each fixed-step stage.
+//! Decides which entities enter each fixed-step stage:
+//!   movement: `tier.allowsMovement()`, no chunk filter.
+//!   collision: `tier.allowsCollision()`, no chunk filter.
+//!   spatial index, perception candidates: the cognition halo, no stagger.
+//!   AI, perception observers, memory, affect, decide: the think set, halo ∩
+//!     (stagger_phase == step % cognition_stagger_n), in the index's cell-major order
+//!     (`compactCognition`). `always_active` entities bypass halo and stagger;
+//!     `cognition_region == null` applies neither.
 //!
-//! Stage participation:
-//!   movement   — tier.allowsMovement()  — no chunk filter
-//!   collision  — tier.allowsCollision() — no chunk filter
-//!   spatial index / perception candidates — cognition halo, no stagger
-//!   ai / perception observers / memory / affect / decide —
-//!                 halo ∩ (stagger_phase == step % cognition_stagger_n), in the
-//!                 index's cell-major order (`compactCognition`)
-//!                 (always_active entities bypass halo and stagger;
-//!                 `cognition_region == null` applies neither halo nor stagger)
-//!
-//! The gathers run early and read the chunk columns the prior step's late `deriveChunks`
-//! wrote; `deriveChunks` runs after every position writer, so the same step's tier policy
-//! sees settled positions.
+//! The gathers run early and read the chunk columns the prior step's `deriveChunks` wrote;
+//! `deriveChunks` runs after every position writer, so the same step's tier policy sees
+//! settled positions.
 //!
 //! Each pass threads: a range writes its window of one item-sized buffer and its padded
 //! tally, and the main thread compacts or streams the windows in range order.

@@ -2,21 +2,19 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Sparse-tile render prep against the camera window as the world's sparse tile
-//! count grows. A 2048x2048 world of 8 levels holds exactly 256 sparse tiles inside
-//! a fixed 1280x720 camera window on the active level, over four depths; every other
-//! tile sits outside the window's chunks on all levels. The window's work is the
-//! same at every size, so each group is expected flat in the world's sparse count:
-//!   - `render-sparse-window-frame`: one frame's window update (unchanged, so
-//!     O(1)), depth range walk, and sparse submit into a headless `SpriteBatch`.
-//!   - `render-sparse-window-pan`: the window pans one chunk across, a frame, back,
-//!     a frame; each pan rebuilds the window's sparse list.
-//!   - `render-sparse-window-add`: one sparse tile added outside the window, then a
-//!     frame. Tiles are append-only in play, so each iteration's reset (untimed)
-//!     drops the added tile.
-//! The item count is the world's sparse tile count. Fixtures build once per case
-//! outside the timed loop. Sparse prep is main-thread work, so the groups measure
-//! the serial case only.
+//! Sparse-tile render prep against the camera window as the world's sparse tile count (the
+//! item count) grows. A 2048x2048 world of 8 levels holds exactly 256 sparse tiles inside a
+//! fixed 1280x720 camera window on the active level, over four depths; every other tile sits
+//! outside the window's chunks on all levels. The window's work is the same at every size,
+//! so each group passes when flat in the world's sparse count:
+//!   - `render-sparse-window-frame`: one frame's window update (unchanged, so O(1)), depth
+//!     range walk, and sparse submit into a headless `SpriteBatch`.
+//!   - `render-sparse-window-pan`: the window pans one chunk across, a frame, back, a frame;
+//!     each pan rebuilds the window's sparse list.
+//!   - `render-sparse-window-add`: one sparse tile added outside the window, then a frame.
+//!     Tiles are append-only in play, so the untimed reset drops the added tile.
+//! Fixtures build once per case outside the timed loop. Sparse prep is main-thread work, so
+//! the groups run serial only.
 
 const std = @import("std");
 const WorldDepth = @import("../game/render_depth.zig").WorldDepth;

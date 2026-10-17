@@ -2,100 +2,70 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Chunk-owned terrain scaling: one fixed-size terrain change per timed iteration on
-//! worlds along two scale axes, each at three sizes with the other fixed: level side
-//! 256, 1024, and 2048 at 8 levels, and 8, 32, and 128 levels at side 256. The change is
-//! the same at every level size and depth, so the cost model expects each group flat
-//! across both axes:
-//!   - `chunk-scale-dig`: 64 single-cell digs and refills, each in its own chunk.
-//!   - `chunk-scale-ramp`: 64 ramp digs, each in its own chunk on the deepest level
-//!     and linked to the level above, the way `DigController` digs a ramp: the
-//!     dedupe lookup, one reserve scope for the tile write, the exit, and the link,
-//!     the write, the exit cleared walkable on the level above, and the link add.
-//!     Links are append-only, so each iteration's reset (untimed) refills the cells
-//!     and exits, leaving their links dead, and the next iteration re-digs the same
-//!     cells, reviving those links: only the first iteration adds links. Flat.
-//!   - `chunk-scale-cave-in`: a chunk-aligned tunnel region of 4, 64, or 256 chunks
-//!     at 256² and 8 levels (the scale axes at 64 chunks), a quarter on each of four
-//!     stacked levels, collapses to solid and is carved back, each one batched edit
-//!     (`applyDenseCellWrites`). Linear in region chunks.
-//!   - `chunk-scale-explosion-fill`: a disk inscribed in a 4-, 64-, or 256-chunk
-//!     square on the deepest level (touching fewer chunks than the square) is blown
-//!     open and filled back, each one batched edit. Linear in region chunks. One
-//!     extra case (the sparse-props field set, 64 chunks at 256² and 8 levels) first
-//!     places 32 blocking sparse props in every chunk of the square, so each changed
-//!     cell's composed blocked bit also reads its chunk's sparse tiles.
-//!   - `chunk-scale-gpu-sync-dig`: the dig workload with a GPU tile sync after the
-//!     digs and after the refills (64 blocks taken, then freed). Flat. An edit sync scans
-//!     the window once per pass for each flagged resident layer, so two axes vary those
-//!     terms at 256² (`GpuSyncDigCode`): the window-edge axis (variant 0) digs
-//!     and refills the 4 cells of the center 2x2 chunks under a 2-, 6-, or 14-chunk window
-//!     at 8 levels, the same edits at every edge (linear in window chunks); the batched
-//!     axis (variant 1) times the syncs after an explosion disk inscribed in the fixed
-//!     window is blown open on every one of 2, 8, or 32 resident layers in one batched
-//!     edit and filled back in another, at 128 levels (linear in resident layers). The
-//!     batched edits are untimed.
-//!   - `chunk-scale-gpu-sync-level-enter`: the render window steps one level down
-//!     and back, each step one level entering (its window directory and 64 mixed
-//!     blocks) and one leaving. Flat across level size and depth.
-//!   - `chunk-scale-gpu-sync-pan`: a square window of 2, 6, or 14 chunks (at the
-//!     smallest scale; the scale axes at 6) over the two deepest levels pans one chunk
-//!     across and back, with a visibility update and a GPU sync after each step; the
-//!     window and the column it pans into are all mixed chunks. Each step scans
-//!     O(layers x e²) window chunks and uploads the entering column, O(layers x e).
-//!     Passes when flat across level size and depth, and the edge and resident-layer
-//!     axes match those orders.
-//! The pan and level-enter groups also run 8 and 32 resident layers at 256² and
-//! 128 levels (`WindowCode`); every other case renders 2.
-//! The GPU sync and batched groups render a fixed 8x8-chunk window over the dig
-//! cells (the pan group its own window), so their GPU work follows the window,
-//! never the level.
-//! Single-cell writes go through the step's reserve seam (`reserveDenseCellWrite`)
-//! first. Changes sit on the deepest levels at the level center; each iteration ends
-//! at its start state. Each group's item code (`suite.ItemCode`) holds `level side * 1000 +
-//! levels` at its bottom and the group's own fields above it. Fixtures and the batches' write lists build
-//! once per case outside the timed loop. The batched groups run serial,
-//! fixed-thread, and adaptive, with the two deepest levels GPU resident so the
-//! merge's render flags are timed; they report each stage's time and the main
-//! thread's share.
-//! Single-cell digs and GPU syncs are main-thread work, so their groups measure the
-//! serial case only. The GPU sync groups drive `syncDenseTileStore` against a
-//! headless renderer whose tile store has no GPU buffer: they time planning,
-//! commit, and the queued upload batch, which the bench drops after each sync as a
-//! frame copy pass would.
+//! Chunk-owned terrain scaling: one fixed-size terrain change per timed iteration on worlds
+//! along two scale axes, each at three sizes with the other fixed: level side 256, 1024, and
+//! 2048 at 8 levels, and 8, 32, and 128 levels at side 256. Changes sit at the level center on
+//! the deepest levels, single-cell writes reserve through `reserveDenseCellWrite` first, and
+//! each iteration ends at its start state. Fixtures and write lists build outside the timed
+//! loop. Item codes (`suite.ItemCode`) hold `level side * 1000 + levels` at the bottom and the
+//! group's own fields above it.
+//!   - `chunk-scale-dig`: 64 single-cell digs and refills, each in its own chunk. Flat.
+//!   - `chunk-scale-ramp`: 64 ramp digs on the deepest level, each linked to the level above
+//!     as `DigController` digs one: one reserve scope for the tile, exit, and link, then the
+//!     write, the exit cleared walkable, and the link add. The untimed reset refills cells and
+//!     exits; links are append-only, so they stay dead until the next dig revives them and
+//!     only the first iteration adds links. Flat.
+//!   - `chunk-scale-cave-in`: a chunk-aligned tunnel region of 4, 64, or 256 chunks (64 on the
+//!     scale axes), a quarter on each of four stacked levels, collapses to solid and is carved
+//!     back, each one batched edit (`applyDenseCellWrites`). Linear in region chunks.
+//!   - `chunk-scale-explosion-fill`: a disk inscribed in a 4-, 64-, or 256-chunk square on the
+//!     deepest level is blown open and filled back, each one batched edit. Linear in region
+//!     chunks. Its sparse-props case (64 chunks at 256², 8 levels) first places 32 blocking
+//!     sparse props in every chunk, so each changed cell's blocked bit also reads them.
+//!   - `chunk-scale-gpu-sync-dig`: the dig workload with a GPU tile sync after the digs and
+//!     after the refills. Flat. Two more axes at 256² (`GpuSyncDigCode`): variant 0 digs the
+//!     4 cells of the center 2x2 chunks under a 2-, 6-, or 14-chunk window at 8 levels (linear
+//!     in window chunks); variant 1 times the syncs after an untimed batched explosion and
+//!     fill on every one of 2, 8, or 32 resident layers at 128 levels (linear in resident
+//!     layers).
+//!   - `chunk-scale-gpu-sync-level-enter`: the render window steps one level down and back,
+//!     each step one level entering (its window directory and 64 mixed blocks) and one
+//!     leaving. Flat.
+//!   - `chunk-scale-gpu-sync-pan`: a square window of 2, 6, or 14 chunks (6 on the scale axes)
+//!     over the two deepest levels, all mixed chunks, pans one chunk across and back with a
+//!     visibility update and a sync per step. A step scans O(layers x e²) window chunks and
+//!     uploads the entering column, O(layers x e). Passes when flat in level size and depth
+//!     and the edge and resident-layer axes match those orders.
+//! Pan and level-enter also run 8 and 32 resident layers at 256² and 128 levels; every other
+//! case renders 2. The GPU sync and batched groups render a fixed 8x8-chunk window over the
+//! dig cells (pan its own), so GPU work follows the window, never the level. The batched
+//! groups run serial, fixed-thread, and adaptive with the two deepest levels resident, so the
+//! merge's render flags are timed, and report each stage's time and the main thread's share.
+//! Single-cell digs and GPU syncs are main-thread work and run serial only. The GPU sync
+//! groups drive `syncDenseTileStore` against a headless renderer whose tile store has no GPU
+//! buffer: they time planning, commit, and the queued upload batch, dropped after each sync.
 //!
-//! The `chunk-scale-nav-*` groups add the nav reaction to these changes, with nav built
-//! over every level of the same fixture (no render window): each step's change events
-//! whose movement blocking flipped are marked dirty and applied as one buffered nav
-//! update, as the post-commit reaction does. A listed config whose nav storage exceeds the
-//! bench's nav-size limit fails with its figure. `--details` prints the reaction's stage
-//! shapes, its connectivity and closure block, and its main-thread split.
-//!   - `chunk-scale-nav-dig`: the dig workload's 64 cells dug in one step and refilled in
-//!     the next, each step followed by the dig writers' nav records and the reaction. Flat.
-//!   - `chunk-scale-nav-ramp`: the ramp workload plus the reaction (each exit's obstacle
-//!     rect marked as one span); the untimed reset refills the cells and exits (their
-//!     links stay, dead, until the next dig revives them) and applies the reaction. Flat.
-//!   - `chunk-scale-nav-cave-in` and `chunk-scale-nav-explosion-fill`: the batched edits,
-//!     each followed by the writer's nav record of its tile events (published untimed into
-//!     a simulation frame, reserved before the write) and the post-commit nav reaction
-//!     itself (`reactToPostCommitNavEvents`); serial and threaded. `--details` reports the
-//!     terrain plan and write stages, the nav record and reaction (event interpretation,
-//!     marking, and apply), and the rest (the main thread's share). Linear in region
-//!     chunks, flat in level size and depth.
-//!   - `chunk-scale-nav-enclose`: pockets walled off one open surface component, each by a
-//!     one-chunk doorway; one batched edit fills every doorway and the next carves them
-//!     back, each followed by the post-commit nav reaction (serial and threaded). Variant 0
-//!     encloses P pockets of 4x4 chunks (linear in P); variant 1 encloses one pocket of edge E
-//!     chunks (linear in its area); variant 2 encloses a one-chunk tunnel of L chunks at its
-//!     mouth (linear in L, flat in level side). The connectivity flood runs in threaded
-//!     rounds.
-//!   - `chunk-scale-nav-level-add`: one level added with a solid floor band, then nav
-//!     updated for it. Its replace case (`LevelAddCode`'s replace field) first adds a level with a
-//!     walkable floor and updates nav (untimed), then times a blocking band added to that
-//!     newest level and nav's update. Depth grows by one per iteration (warmup included),
-//!     so A/B runs use the same `--warmup` and `--iterations`.
-//! Every nav group runs serial and threaded: the threaded cases give the reaction or
-//! build the case's thread system (the single-cell world writes stay on the main thread).
+//! The `chunk-scale-nav-*` groups add the nav reaction, with nav over every level of the same
+//! fixture (no render window): changes whose movement blocking flipped are marked dirty and
+//! applied as one buffered nav update. A config whose nav storage exceeds the nav-size limit
+//! fails with its figure. Each runs serial and threaded, with single-cell world writes on the
+//! main thread; `--details` prints the reaction's stage shapes, its connectivity and closure
+//! block, and its main-thread split.
+//!   - `chunk-scale-nav-dig`: the 64 cells dug in one step and refilled in the next, each step
+//!     followed by its nav records and the reaction. Flat.
+//!   - `chunk-scale-nav-ramp`: the ramp workload plus the reaction, each exit's obstacle rect
+//!     marked as one span; the untimed reset also applies the reaction. Flat.
+//!   - `chunk-scale-nav-cave-in`, `chunk-scale-nav-explosion-fill`: the batched edits, each
+//!     followed by its tile events' nav record (published untimed) and
+//!     `reactToPostCommitNavEvents`. Linear in region chunks, flat in level size and depth.
+//!   - `chunk-scale-nav-enclose`: one batched edit fills the one-chunk doorways walling
+//!     pockets off one open surface component and the next carves them back. Variant 0: P
+//!     pockets of 4x4 chunks (linear in P); variant 1: one pocket of edge E chunks (linear in
+//!     its area); variant 2: a one-chunk tunnel of L chunks closed at its mouth (linear in L).
+//!   - `chunk-scale-nav-level-add`: one level added with a solid floor band, then nav updated.
+//!     The replace case (`LevelAddCode`) first adds a walkable level and updates nav untimed,
+//!     then times a blocking band on it and the update. Depth grows by one per iteration,
+//!     warmup included, so A/B runs use the same `--warmup` and `--iterations`.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;

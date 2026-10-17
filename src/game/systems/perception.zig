@@ -3,27 +3,23 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! AI perception: each observer (a think-set agent with `AiPerception`) queries the shared
-//! `SpatialIndexView` for the factions hostile to it on its own level, skipping itself;
-//! the player candidate joins only on its level. A squared-form FOV filter and a bounded
+//! `SpatialIndexView` for the factions hostile to it on its own level, skipping itself; the
+//! player candidate joins only on its level. A squared-form FOV filter and a bounded
 //! line-of-sight raycast pick the nearest visible threat, written to the observer's
 //! `PerceptionStore` row; `entity_perceived`/`entity_lost` events derive from the changes.
 //!
-//! Sign convention: the index hands `dx, dy = observer - candidate`;
-//! `PerceptionVisitor.visitLanes` keeps `to = candidate - observer`, which every later step
-//! reads.
+//! The index hands `dx, dy = observer - candidate`; `PerceptionVisitor.visitLanes` keeps
+//! `to = candidate - observer`, which every later step reads. The FOV test needs
+//! `cos_half_fov >= 0` (`AiPerception` caps the half angle at pi/2) and runs in the query's
+//! lanes after the candidate cap, so only survivors leave the lanes. Scalar: the survivor
+//! compaction, the sort of at most `max_perception_scratch` survivors, and the LOS walk.
 //!
-//! The FOV test needs `cos_half_fov >= 0` (`AiPerception` caps the half angle at pi/2). It
-//! runs in the query's lanes after the candidate cap, so only survivors leave the lanes.
-//!
-//! Scalar exceptions: the survivor compaction, the at most 17-survivor sort, and the LOS
-//! grid walk, each stated at its site.
-//!
-//! Threading: the gather writes each range's window of rows and main moves them together
-//! in range order; each compute range derives its rows' facing, then writes only its rows'
-//! `PerceptionStore` and `final_*` columns and its own padded stats slot; the main thread
-//! emits the events after the join in row order. Serial and threaded paths run the same
-//! jobs. A compute range keeps one neighbor block, walking each run of rows that share a
-//! cell, level, and faction once per distinct scan box.
+//! Threading: each gather range writes its window of rows, merged by main in range order;
+//! each compute range derives its rows' facing and writes only its rows' `PerceptionStore`
+//! and `final_*` columns and its padded stats slot; main emits the events after the join in
+//! row order. Serial and threaded paths run the same jobs. A compute range keeps one
+//! neighbor block, walking each run of rows sharing a cell, level, and faction once per
+//! distinct scan box.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -989,16 +985,14 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, block: *PerceptionBlock
     const dense_index = job.perception_dense_index[i];
     job.perception_slice.target_visible[dense_index] = target_visible;
     job.perception_slice.nearest_threat[dense_index] = nearest_threat;
-    // Actual distance (not squared): nearest_threat_dist is the directly
-    // consumable magnitude a future steering/urgency consumer would want
-    // without paying a second sqrt.
+    // Actual distance, not squared, so consumers (affect) read it without a sqrt.
     job.perception_slice.nearest_threat_dist[dense_index] = nearest_threat_dist;
     if (target_visible) {
         job.perception_slice.last_seen_x[dense_index] = last_seen_x;
         job.perception_slice.last_seen_y[dense_index] = last_seen_y;
     }
-    // last_seen_x/y are deliberately left unchanged when target_visible is
-    // false, holding the last real sighting for a future memory slice.
+    // last_seen_x/y stay unchanged when target_visible is false, holding the last
+    // sighting that ai_memory snapshots on `entity_lost`.
 
     const hearing_range = job.hearing_range[i];
     const hearing_range_sq = hearing_range * hearing_range;
@@ -1036,7 +1030,7 @@ fn reconstructEntityId(index_bits: i32, generation_bits: i32) EntityId {
     return .{ .index = @bitCast(index_bits), .generation = @bitCast(generation_bits) };
 }
 
-/// Transition rules (see module doc): invalid->valid emits only
+/// Transition rules: invalid->valid emits only
 /// `entity_perceived`; valid->invalid emits only `entity_lost`; a
 /// valid->different-valid identity swap emits both, `entity_lost` (the
 /// previous target) before `entity_perceived` (the new one), in that order.

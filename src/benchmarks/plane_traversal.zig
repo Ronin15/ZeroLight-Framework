@@ -2,28 +2,26 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Plane traversal's per-agent cost: every AI agent crosses a cell boundary each step
-//! on the walkable level 0 of a 2-level world (solid level 1 below).
-//!   - `plane-traversal`: no holes or ramps, so no agent traverses. The worst case for
-//!     the per-agent cell-entry test, which finds nothing to commit.
-//!   - `plane-traversal-falls`: the same, plus a fixed 64 agents (fewer only when
-//!     there are fewer agents) spread through the AI rows entering their own level-0
-//!     hole, so 64 falls and 64 landing carves per step. The 64 is a workload constant.
-//!   - `plane-traversal-dense-falls`: an explosion under the crowd. Every 4th agent
-//!     enters its own level-0 hole, so falls and landing carves scale with the agents.
-//!   - `plane-traversal-dense-falls-banded`: the dense falls' worst-case landing shape.
-//!     A fixed 4096 agents (1024 fallers) land on a level holding the item count of
-//!     dense bands (one floor, the rest walkable overlays) and as many walkable sparse
-//!     tiles per chunk. The item count is that band count, so the stage's main time
-//!     per entry against it shows whether a landing costs its level's bands and
+//! Plane traversal's per-agent cost: every AI agent crosses a cell boundary each step on the
+//! walkable level 0 of a 2-level world (solid level 1 below). The item count is the AI agent
+//! count, except in the banded group.
+//!   - `plane-traversal`: no holes or ramps, so nothing traverses: the worst case for the
+//!     per-agent cell-entry test.
+//!   - `plane-traversal-falls`: the same plus a fixed 64 agents (fewer with fewer agents)
+//!     entering their own level-0 hole: 64 falls and landing carves per step.
+//!   - `plane-traversal-dense-falls`: an explosion under the crowd: every 4th agent enters its
+//!     own hole, so falls and carves scale with the agents.
+//!   - `plane-traversal-dense-falls-banded`: the worst-case landing shape. A fixed 4096 agents
+//!     (1024 fallers) land on a level holding the item count of dense bands (one floor, the
+//!     rest walkable overlays) and as many walkable sparse tiles per chunk; main time per
+//!     entry against the band count shows whether a landing costs its level's bands and
 //!     sparse tiles.
-//! Timed: the plane stage's NPC cell-entry gather (`PlaneEntrySystem`, serial or on the
-//! case's threads), then the dig reserve and commit over its entries, the commit's carve
-//! batch on the same threads. The untimed reset after each iteration puts the fallers
-//! back on level 0, refills their landing cells, and begins the next frame step. The item
-//! count is the AI agent count. `--details` reports the gather's shape and the stage's
-//! main-thread time (everything but a dispatched gather or carve-batch stage), its share,
-//! and its time per entry.
+//! Timed: the plane stage's NPC cell-entry gather (`PlaneEntrySystem`, serial or threaded),
+//! then the dig reserve and commit over its entries, with the carve batch on the same
+//! threads. The untimed reset puts the fallers back on level 0, refills their landing cells,
+//! and begins the next frame step. `--details` reports the gather's shape and the stage's
+//! main-thread time (all but a dispatched gather or carve batch), its share, and its time per
+//! entry.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;

@@ -5,24 +5,24 @@
 //! Shared spatial index groups, each timing the index alone (its consumers' groups build it
 //! untimed).
 //! - `spatial_index`: the build over shuffled slots, so keys reach the sort in store order.
-//!   Pass shape: H log(H/B) in indexed entities, the sort off main on the tuned case.
-//!   Asserts check the sort ran on workers at the largest size.
-//! - `spatial_index-shape`: the build in a `shape_world_chunks`² world with every body in
-//!   one chunk (`dense_chunk`), one per chunk (`sparse_chunks`), or `shape_deep_bodies`
-//!   over its levels (`deep_levels`). Pass shape: linear in H with the sort off main on the
-//!   tuned case at the largest H; `deep_levels` flat in levels, its storage linear in
-//!   levels. Asserts check every body indexed, the sort on workers, and the directories'
-//!   bytes whole against `chunk_slot_bytes` x chunks x levels.
+//!   Pass shape: H log(H/B) in H indexed entities over B key bands, the sort off main on the
+//!   tuned case. Asserts check the sort ran on workers at the largest size.
+//! - `spatial_index-shape`: the build in a `shape_world_chunks`² world with every body in one
+//!   chunk (`dense_chunk`), one per chunk (`sparse_chunks`), or `shape_deep_bodies` over its
+//!   levels (`deep_levels`). Pass shape: linear in H with the sort off main on the tuned case
+//!   at the largest H; `deep_levels` flat in levels, its storage linear in levels. Asserts
+//!   check every body indexed, the sort on workers, and the directories' bytes whole against
+//!   `chunk_slot_bytes` x chunks x levels.
 //! - `spatial_index-query`: one query per body from its own position, in the index's
-//!   cell-major order as the think set orders requesters, through one neighbor block.
-//!   `field` is a uniform four-faction field at the `ai` density, radius a quarter, one, or
-//!   four chunks, over `full`, `friendly`, or `hostile` factions: one block fill per key
-//!   (own cell), each walking the box's pieces once, and per-query time linear in its
-//!   checks, hostile <= friendly <= full. `dense_cell` puts N neutral bodies in one cell
-//!   with a one-cell radius: one fill for the run, and per-query time flat in N, judged from
-//!   timing. Asserts check each query's checks equal its budget or its box's entries of its
-//!   factions but itself, every visit of the query's factions and never self, one fill per
-//!   key, each field radius's chunk count, and every `dense_cell` body in one cell.
+//!   cell-major order, through one neighbor block. `field` is a uniform four-faction field at
+//!   the `ai` density, radius a quarter, one, or four chunks, over `full`, `friendly`, or
+//!   `hostile` factions: one block fill per key, each walking the box's pieces once, and
+//!   per-query time linear in its checks, hostile <= friendly <= full. `dense_cell` puts N
+//!   neutral bodies in one cell with a one-cell radius: one fill for the run, per-query time
+//!   flat in N, judged from timing. Asserts check each query's checks equal its budget or its
+//!   box's entries of its factions but itself, every visit of the query's factions and never
+//!   self, one fill per key, each field radius's chunk count, and every `dense_cell` body in
+//!   one cell.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;

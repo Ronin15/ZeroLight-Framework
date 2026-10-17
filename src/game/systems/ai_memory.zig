@@ -2,48 +2,27 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! AI short-term memory processor: decays every gathered agent's `AiMemory`
-//! row (staleness climbs, familiarity relaxes toward zero,
-//! ring contacts age out), refreshes from this step's perception
-//! transitions (`entity_perceived`/`entity_lost` `SimulationEvent`s emitted by
-//! `perception.zig` at the `domain_reaction` stage), then continuously tracks
-//! still-visible same-identity targets from perception's hot `last_seen_*`.
+//! AI short-term memory: each step decays every gathered agent's `AiMemory` row (staleness
+//! climbs, familiarity relaxes toward zero, ring contacts age out), refreshes it from
+//! perception's `entity_perceived`/`entity_lost` events, then tracks still-visible targets
+//! from perception's `last_seen_*`.
 //!
-//! The gathered set is the think set's memory rows, ordered ascending through a member
-//! bitmap, so every pass writes its own rows in row order for any think order. It walks
-//! `scope_dense_indices` (or every `ai_agents.entities` row), keeping only entities that
-//! carry BOTH `AiPerception` and `AiMemory` — memory is defined as a downstream consumer
-//! of perception, never running for a memory-only entity. Per step: workers translate
-//! each think row to its memory row and perception row; main marks those memory rows in a
-//! hierarchical bitmap (one bit per memory row, and at each summary level one bit per
-//! nonzero word below) and files each one's perception row under it, then walks the summary
-//! levels down to the nonzero row words ascending; workers extract each range's words' set
-//! bits ascending into its window, beside each row's perception row; main compacts the
-//! windows and clears the touched words. Decay then gathers four rows at a time into lanes,
-//! decays, and scatters back; the visibility pass reads perception at the carried rows.
+//! The gathered set is the think set's (or every AI agent's) rows carrying both
+//! `AiPerception` and `AiMemory`, in ascending memory-row order for any think order: workers
+//! translate think rows to memory and perception rows, main marks them in a hierarchical
+//! member bitmap, workers extract each range's set bits in order, and main compacts the
+//! windows. Decay gathers four rows per lane group.
 //!
-//! Ordering within one `update`/`updateSerial` call:
-//! 1. Decay (staleness +1, familiarity decays, ring ages) on the gathered set.
-//! 2. Event refresh (`entity_perceived` / `entity_lost`) so a same-step
-//!    reacquisition or loss lands at `staleness == 0` rather than `1`.
-//! 3. Continuous visibility pass over the gathered set: when perception still
-//!    reports `target_visible` for the same identity as `last_known_target`,
-//!    refresh `last_known_x/y` from `last_seen_*`, keep `staleness = 0`, and
-//!    raise familiarity by `ai_memory_familiarity_gain_rate` (clamped).
-//!
-//! On `entity_lost`: snapshot perception's frozen `last_seen_*` into
-//! `last_known_*` for that observer and reset `staleness` to 0 so it climbs
-//! from the moment of loss (not from first sight). An identity-swap emits
-//! `entity_lost` then `entity_perceived` in the same pass; the perceived
-//! handler retargets `last_known_target` after the loss snapshot.
-//!
-//! The event refresh pass is unscoped (reads every `domain_reaction` event in
-//! `frame.events`, not just this step's gathered subset): since `perception.zig`
-//! itself only emits transitions for its own scoped population, an entity
-//! excluded from this step's cognition scope never has perception events to
-//! react to anyway, so scope-freeze falls out naturally rather than needing a
-//! second filter here. Continuous visibility / familiarity only run on the
-//! gathered (scoped) set, matching decay.
+//! Order within one `update`/`updateSerial`:
+//! 1. Decay over the gathered set.
+//! 2. Event refresh, after decay so a same-step acquire or loss lands at `staleness == 0`. It
+//!    reads every `domain_reaction` event, not only the gathered set's; perception emits only
+//!    for its own scoped observers. On `entity_lost`, perception's frozen `last_seen_*`
+//!    becomes `last_known_*` and staleness resets to 0; an identity swap's `entity_perceived`
+//!    follows its loss and retargets `last_known_target`.
+//! 3. Visibility over the gathered set: while perception's visible `nearest_threat` is
+//!    `last_known_target`, `last_known_*` follows `last_seen_*`, staleness stays 0, and
+//!    familiarity rises by `ai_memory_familiarity_gain_rate` (clamped).
 
 const std = @import("std");
 const builtin = @import("builtin");

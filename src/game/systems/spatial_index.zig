@@ -16,8 +16,6 @@
 //! it. The key is (level, own cell, scan box, factions); queries with one key share one
 //! `NeighborBlock`, which copies the stream once. Every structure the view exposes is
 //! identical for any partition of the build.
-//!
-//! Collision broadphase keeps its own sweep-and-prune order and does not use this index.
 
 const std = @import("std");
 const math = @import("../../core/math.zig");

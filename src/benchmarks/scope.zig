@@ -3,20 +3,18 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! - `scope`: the scoped step (AI cognition, collision, movement, chunk derive, gathers, the
-//!   think set, and tier policy) over N entities whose levels (`index % 5`) give a
-//!   mixed-tier population: cognition, locomotion, kinematic, and dormant. The index build
-//!   runs every step but is excluded from the window (its own group times it).
-//!   `output_count` is the rows that ran cognition. Pass shape: time linear in the active
-//!   (cognition + locomotion) rows, never in N; asserts check fewer than N rows ran
-//!   cognition.
+//!   think set, and tier policy) over N entities whose levels (`index % 5`) give a mixed-tier
+//!   population: cognition, locomotion, kinematic, and dormant. The index build runs every
+//!   step outside the window (its own group times it). `output_count` is the rows that ran
+//!   cognition. Pass shape: time linear in the active (cognition + locomotion) rows, never in
+//!   N; asserts check fewer than N rows ran cognition.
 //! - `scope-cognition`: the think set alone (`compactCognition`) over a halo index built once
 //!   untimed: `spread` over the `scope` fixture, `dense_chunk` with every agent in one chunk
-//!   (one index record), whose ranges split the one chunk. Pass shape: linear in the H
-//!   indexed rows in both layouts, `spread` on workers at the largest size on the tuned case;
-//!   the main thread's share (the window merges) flat per row. Asserts check `spread`'s
-//!   tuned case off main at the largest size, one record for `dense_chunk`, every case's
-//!   think set equal to the serial pass's, and every indexed row counted once, thinking or
-//!   skipped.
+//!   (one index record), whose ranges split the chunk. Pass shape: linear in the H indexed
+//!   rows in both layouts, `spread` on workers at the largest size on the tuned case, the
+//!   main thread's share (the window merges) flat per row. Asserts check `spread`'s tuned case
+//!   off main at the largest size, one record for `dense_chunk`, every case's think set equal
+//!   to the serial pass's, and every indexed row counted once, thinking or skipped.
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -175,11 +173,9 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
             .wander_amplitude = 6.0 + @as(f32, @floatFromInt(index % 29)),
             .gain_pursue = if (index % 3 == 0) 0.0 else 0.5,
         });
-        // Spread the population across depth/levels too (forward-looking: NPCs are
-        // level 0 today). The cube LOD distance weights one level as a full band, so
-        // levels 0–4 fan the population into all four tiers regardless of x/y, and the
-        // off-level entities are excluded from cognition by the cube — a real mixed
-        // workload the gathers and tier policy actually scan.
+        // The cube LOD distance weights one level as a full band, so levels 0–4 fan the
+        // population into all four tiers regardless of x/y, and the cube excludes the
+        // off-level entities from cognition.
         const chunk_x: i32 = @intCast(index % grid_chunks);
         const level: u16 = @intCast(index % 5);
         const tier = tierForChunkDistance(visibleRegion().lodDistance(.{ .x = chunk_x, .y = 0 }, level));

@@ -2,26 +2,23 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! AiMemorySystem throughput bench: one memory step per iteration, its four threaded
-//! stages (translate think rows to memory rows, order the member rows ascending, decay,
-//! the visibility pass) plus the main thread's mark, compact, unmark, and event refresh.
-//! Every `ai_memory_event_stride`th event row gets a synthetic perceived event each
-//! iteration, so `refreshed_count` scales with the think set like `processed_count` does,
-//! without event injection itself dominating the measured window.
-//!
-//! - `ai-memory`: every agent's memory, the think set in store order. Pass shape: time
-//!   linear in agents; the tuned case within spread of the best control; the main thread's
-//!   time per processed row flat across sizes.
-//! - `ai-memory-shuffled`: the same step over a stride shuffle of every agent as the think
-//!   set, as a cell-major think set arrives. Pass shape: within spread of `ai-memory` at the
-//!   same size, and threaded like it.
+//! AiMemorySystem throughput: one memory step per iteration, its four threaded stages
+//! (translate think rows to memory rows, order the member rows ascending, decay, visibility)
+//! plus the main thread's mark, compact, unmark, and event refresh. Every
+//! `ai_memory_event_stride`th AI row (the think rows in `ai-memory-sparse`) gets a synthetic
+//! perceived event each iteration, so `refreshed_count` scales with the think set without the
+//! injection dominating the window.
+//! - `ai-memory`: every agent's memory, the think set in store order. Pass shape: time linear
+//!   in agents; the tuned case within spread of the best control; main's time per processed
+//!   row flat across sizes.
+//! - `ai-memory-shuffled`: the same step over a stride shuffle of every agent, as a
+//!   cell-major think set arrives. Pass shape: within spread of `ai-memory` at the same size,
+//!   and threaded like it.
 //! - `ai-memory-sparse`: a fixed think set of 256 rows, 4 in each of 64 row words spread
-//!   evenly over a memory store that grows, in a stride-shuffled order, so every stage's
-//!   items stay fixed. Pass shape: per-step time flat in memory rows.
-//!
-//! Asserts check the shape: every think row carries memory, the translate, decay, and
-//! visibility stages each run over the think set, and the order stage over its touched
-//! words (fixed in `ai-memory-sparse`).
+//!   evenly over a growing memory store, stride-shuffled, so every stage's items stay fixed.
+//!   Pass shape: per-step time flat in memory rows.
+//! Asserts check every think row carries memory, the translate, decay, and visibility stages
+//! each run over the think set, and the order stage over its touched words.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;

@@ -2,26 +2,24 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! `production-step`: the production fixed step (`GameDemoState.update`: the pipeline,
-//! then the structural-commit seam) at one population, one axis moved at a time from a
-//! base of a spread population on a banded walkable world. Shapes: `spread` (a uniform
-//! grid over every level, the population split across levels) and `crowd` (a square at a
-//! fixed pitch around the observer, on the surface). The state is built through
-//! `initWithWorld` with no demo spawn and the production pathfinding defaults; the
-//! population is committed through the production structural applier and grown through
-//! the population seam.
+//! `production-step`: the production fixed step (`GameDemoState.update`: the pipeline, then
+//! the structural-commit seam) at one population, one axis moved at a time from a base of a
+//! spread population on a banded walkable world. Shapes: `spread` (a uniform grid over every
+//! level, the population split across levels) and `crowd` (a square at a fixed pitch around
+//! the observer, on the surface). The state is built through `initWithWorld` with no demo
+//! spawn and the production pathfinding defaults; the population is committed through the
+//! production structural applier and grown through the population seam.
 //!
-//! Each sample binds a fresh runtime perf log and reads its stage timers and batches:
-//! `main` is the step's wall time minus the off-main time of the logged batches that ran
-//! on workers (an upper bound: unlogged batches count as main), and `untimed` is the wall
-//! time no top-level stage timer holds. `tiers=` splits the rows by scope tier (cognition,
-//! locomotion, kinematic, dormant) and `thinking=` counts the rows the AI stage ran this
-//! step. ReleaseFast compiles the log out, so only the step total prints there.
+//! Each sample binds a fresh runtime perf log: `main` is the step's wall time minus the
+//! off-main time of the logged batches that ran on workers (an upper bound: unlogged batches
+//! count as main), and `untimed` is the wall time no top-level stage timer holds. `tiers=`
+//! splits the rows by scope tier and `thinking=` counts the rows the AI stage ran. ReleaseFast
+//! compiles the log out, so only the step total prints there.
 //!
-//! Pass shape: step and main time linear in population for both shapes; in level side and
-//! in level count at a fixed population, every row advances at its tier and the cost per
-//! advancing row stays flat (no worse than flat in level count); flat in inert rows.
-//! Asserts check only the committed population and that every step finishes.
+//! Pass shape: step and main time linear in population for both shapes; in level side and in
+//! level count at a fixed population, every row advances at its tier and the cost per
+//! advancing row stays flat; flat in inert rows. Asserts check only the committed population
+//! and that every step finishes.
 
 const std = @import("std");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;

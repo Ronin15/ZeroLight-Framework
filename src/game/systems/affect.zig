@@ -2,64 +2,24 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Emotion-drive appraisal processor: for every cognition-scoped agent that
-//! carries `AiAffect`, appraises this step's `AiPerception`/`AiMemory` state
-//! (both optional per row — a missing component contributes no signal, it
-//! never excludes the row) plus its own `AiAgent.active_behavior` into four
-//! independent drives (fear, curiosity, aggression, fatigue), decays each
-//! toward its own per-entity baseline, and emits a threshold-crossing event
-//! on a rising or falling edge. A true Schmitt trigger (each drive's bit in
-//! `AiAffect.above_threshold_mask`, persisted across steps) gates the edges,
-//! so a value hovering at threshold cannot refire the same edge twice. Runs
-//! after perception and ai_memory (both must have written this step's state
-//! first) and before AI reads it — arbitration (`arbitration.zig`)
-//! reads the resulting drives one stage later via `AiConfig.affect_slice`;
-//! this system only appraises and decays them, it never switches behavior
-//! itself.
+//! Emotion-drive appraisal: for each think-set agent carrying `AiAffect`, appraises this
+//! step's `AiPerception` and `AiMemory` state and its `AiAgent.active_behavior` into four
+//! independent drives (fear, curiosity, aggression, fatigue), decays each toward its
+//! per-entity baseline, clamps it to [0, 1], and emits threshold-crossing events. A missing
+//! perception or memory component contributes no signal and never excludes the row. Runs after
+//! perception and ai_memory and before `ai_decide`, which reads the drives through
+//! `AiConfig.affect_slice`; this system never switches behavior or couples drives.
 //!
-//! Gather mirrors ai_memory.zig/perception.zig's population-domain shape:
-//! walk scope_dense_indices (or every ai_agents row), keeping rows that carry
-//! both AiAgent and AiAffect. Unlike ai_memory.zig, AiPerception and AiMemory
-//! are each independently optional here, so gather resolves them with
-//! `orelse` and packs a "no signal" default rather than skipping the row.
-//! This packs a contiguous per-row scratch table (entity, this row's own
-//! AiAffectStore index, and the raw signal values needed by the delta
-//! formulas below) — the same gather-into-packed-scratch idiom
-//! perception.zig's PerceptionGatherRow uses to turn a branchy,
-//! optional-component gather into a dense array that a later vectorized pass
-//! can read with plain contiguous loads.
+//! Each drive's bit in `AiAffect.above_threshold_mask` persists across steps as a Schmitt
+//! trigger: rising fires when the bit is clear and the value reaches threshold, falling when
+//! it is set and the value drops below threshold - `ai_affect_threshold_hysteresis`.
 //!
-//! The compute pass vectorizes across ROWS (four scattered rows per lane
-//! group), one drive-column pass at a time — the same shape ai_memory.zig's
-//! processDecayRange uses for its own staleness/familiarity columns (gather
-//! this row's own baseline/decay_rate/threshold/current value via
-//! simd.gatherFloat4, indexed by the row's own AiAffectStore index; never a
-//! splatted global constant). Each drive's delta is computed from the packed
-//! scratch columns with plain vector ops, added to the current value, decayed
-//! toward baseline via simd.lerpFloat4, clamped to [0, 1], and scattered back.
-//! The threshold-crossing check runs scalarly per lane afterward (mirrors
-//! ai_memory.zig's ageRingForRow: a vectorized combine followed by a small
-//! branchy per-lane remainder), reading and updating this row's persisted
-//! above_threshold_mask bit for the drive: rising fires when the bit is clear
-//! and the new value reaches threshold; falling fires when the bit is set and
-//! the new value drops below threshold - ai_affect_threshold_hysteresis. A
-//! scalar tail repeats the same math for the remainder.
-//!
-//! Event emission: workers only mark each row's per-drive
-//! "crossed"/"rising" bits in the gather rows' `crossing_bits` column; after
-//! the join the main thread popcounts the column, applies this system's own
-//! per-step cap, and emits the crossings in (gather row, drive declaration)
-//! order as one range (`AffectSystem.emitCrossingEvents`). That order is fixed
-//! by construction, so it is partition-independent with no event scratch and
-//! no sort. Up to four events can fire per row per step (one per independent
-//! drive) rather than perception's two-per-row swap cap.
-//!
-//! Deliberately deferred: fear and aggression share the same visible-hostile
-//! signal but use independent gain constants and are never cross-coupled;
-//! there is no cross-drive modulation of any kind within this system --
-//! arbitration.zig is the sole consumer that weighs drives against each
-//! other (and against behaviors), and it does so downstream, over this
-//! system's already-independent output.
+//! The main thread packs each row's signals into `AffectGatherRow` scratch. The compute pass
+//! runs one drive column at a time, four rows per lane group gathered by their
+//! `AiAffectStore` index, with a scalar tail. Workers write only their rows' `crossing_bits`;
+//! after the join the main thread applies the per-step cap and emits crossings in (gather row,
+//! drive declaration) order (`emitCrossingEvents`), partition-independent with no event
+//! scratch or sort.
 
 const std = @import("std");
 const builtin = @import("builtin");

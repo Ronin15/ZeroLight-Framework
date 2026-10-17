@@ -4,40 +4,33 @@
 
 //! Incremental nav update over a 3-level 256² world: each timed sample toggles a dirty
 //! footprint of `item_count` cells on level 1 open, then blocked, each half one buffered nav
-//! update (the terrain record of its writes untimed), so only the chunks the footprint touches
-//! and their neighbours are patched. The reported mean is the two halves' average.
-//!   - `nav-update-scattered`: digs spread over the world's 256 chunks, one per chunk up to
-//!     256 and several per chunk past that. Passes when linear in digs up to 256 (one dirty
-//!     chunk each) and linear in dirty cells past it.
-//!   - `nav-update-multichunk`: one compact block of the item count's cells centered on a
-//!     chunk corner. Passes when linear in the chunks the block touches.
+//! update (its terrain record untimed), so only the touched chunks and their neighbours patch.
+//! The mean is the two halves' average.
+//!   - `nav-update-scattered`: digs one per chunk over the world's 256 chunks, several per
+//!     chunk past that. Passes when linear in digs up to 256 and in dirty cells past it.
+//!   - `nav-update-multichunk`: one compact block centered on a chunk corner. Passes when
+//!     linear in the chunks the block touches.
 //!
-//! Two static-obstacle groups time one static collision body moved one step: its
-//! `set_movement_body` command committed through a `SimulationFrame` and the post-commit nav
-//! reaction (`reactToPostCommitNavEvents`), on a 256² world, timed through the commit seam
-//! (collider and static mark reserve, commit, capture, collider sync and its nav record,
-//! reaction). The move is the same in every case, so each passes when flat in its item count:
-//!   - `nav-update-entity-obstacles`: 10, 1,000, or 10,000 other static bodies (the item count)
-//!     spread over chunks away from the moved body's 3x3 chunk block.
-//!   - `nav-update-static-population`: 1,000, 10,000, or 50,000 dynamic collision bodies (the
-//!     item count) spread over the level, and no other static body.
-//! Each case builds its own world, bodies, and nav outside the timed loop; the moved body
-//! alternates between two cells of one chunk. `outputs` is the chunks the reaction patched and
-//! `candidates` the collision bodies present.
+//! The static-obstacle groups time one static collision body moved one step on a 256² world
+//! through the commit seam: its `set_movement_body` command committed through a
+//! `SimulationFrame`, the collider sync and its nav record, and `reactToPostCommitNavEvents`.
+//! The move is the same in every case, so each passes when flat in its item count:
+//!   - `nav-update-entity-obstacles`: 10, 1,000, or 10,000 other static bodies in chunks away
+//!     from the moved body's 3x3 chunk block.
+//!   - `nav-update-static-population`: 1,000, 10,000, or 50,000 dynamic bodies and no other
+//!     static body.
+//! Each case builds its world, bodies, and nav untimed; the moved body alternates between two
+//! cells of one chunk. `outputs` is the chunks patched and `candidates` the bodies present.
 //!
-//! `nav-update-static-dense` times many statics changed in one commit through the same seam:
-//! 64, 1,024, or 16,384 changes (the item count), half moving one chunk over and half
-//! destroyed and recreated one chunk over at reused entity indices, among 64 statics per
-//! chunk, so every chunk list they enter is about 64 long. Passes when linear in the change
-//! count, with the sorted list placement threaded.
-//! `nav-update-static-dense-tail` is its sibling where every insert lands past its list's
-//! tail: 32 changed statics per chunk, created after every one of the 64 residents per
-//! chunk, all move one chunk over and back each step, commands in (chunk, slot) order, so
-//! each list's inserts arrive in ascending entity order. Passes when linear in the change
-//! count.
+//! `nav-update-static-dense`: 64, 1,024, or 16,384 statics changed in one commit through the
+//! same seam, half moved one chunk over and half destroyed and recreated there at reused
+//! entity indices, among 64 statics per chunk. Passes when linear in the change count, with
+//! the sorted list splices threaded. `nav-update-static-dense-tail`: every insert lands past
+//! its list's tail (32 statics per chunk, created after the 64 residents, moved one chunk over
+//! and back each step in (chunk, slot) order). Passes when linear in the change count.
 //!
-//! Every group runs serial and threaded; `--details` prints the reaction's mark (when it
-//! marks events), plan, remask, and patch shapes.
+//! Every group runs serial and threaded; `--details` prints the reaction's mark, plan,
+//! remask, and patch shapes.
 
 const std = @import("std");
 const math = @import("../core/math.zig");
