@@ -19,10 +19,13 @@ const logging = @import("../../core/logging.zig");
 const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const SlotList = @import("../../app/thread_system.zig").SlotList;
 const StageThreads = @import("../../app/thread_system.zig").StageThreads;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const compactSliceWindows = @import("../../app/thread_system.zig").compactSliceWindows;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
@@ -102,17 +105,11 @@ pub const PlaneEntryConfig = struct {
     adaptive: bool = true,
 };
 
-// One range's entry count, written once by its job. Padded to a cache line.
-const PlaneEntryTally = struct {
-    count: usize align(thread_shared_record_alignment) = 0,
-};
-
-comptime {
-    std.debug.assert(@sizeOf(PlaneEntryTally) % thread_shared_record_alignment == 0);
-}
+// One range's entry count, written once by its job into its padded slot.
+const PlaneEntryTally = struct { kept: usize = 0 };
 
 const EntryList = std.array_list.Aligned(PlaneEntry, .fromByteUnits(thread_shared_record_alignment));
-const TallyList = std.array_list.Aligned(PlaneEntryTally, .fromByteUnits(thread_shared_record_alignment));
+const TallyList = SlotList(PlaneEntryTally);
 
 pub const PlaneEntrySystem = struct {
     allocator: std.mem.Allocator,
@@ -212,7 +209,7 @@ pub const PlaneEntrySystem = struct {
         job.tallies = self.tallies.items;
         job.items_per_range = selection.items_per_range;
         self.last_batch = stage.run(selection, item_count, plane_entry_range_alignment_items, &job, planeEntryJob);
-        compactWindows(&self.entries, self.tallies.items, selection.items_per_range);
+        self.entries.items.len = compactSliceWindows(PlaneEntry, PlaneEntryTally, self.entries.items, self.tallies.items, selection.items_per_range);
         return self.entries.items;
     }
 
@@ -236,21 +233,6 @@ pub const PlaneEntrySystem = struct {
         }
     }
 };
-
-// Compacts range r's `count` entries at `r * items_per_range` into one prefix in range
-// order. Each window starts at or after the running total, so a forward copy is safe.
-fn compactWindows(entries: *EntryList, tallies: []const PlaneEntryTally, items_per_range: usize) void {
-    var dst: usize = 0;
-    for (tallies, 0..) |tally, range_index| {
-        const src = range_index * items_per_range;
-        std.debug.assert(dst <= src);
-        if (dst != src and tally.count != 0) {
-            @memmove(entries.items[dst..][0..tally.count], entries.items[src..][0..tally.count]);
-        }
-        dst += tally.count;
-    }
-    entries.items.len = dst;
-}
 
 // The world's cell grid as the lane cell test reads it.
 const CellGrid = struct {
@@ -284,7 +266,7 @@ const GatherInput = struct {
 const PlaneEntryJob = struct {
     input: GatherInput,
     entries: []PlaneEntry,
-    tallies: []PlaneEntryTally,
+    tallies: []PaddedSlot(PlaneEntryTally),
     items_per_range: usize,
 };
 
@@ -295,7 +277,7 @@ fn planeEntryJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.entries.len);
     std.debug.assert(range.end <= job.input.entities.len);
-    job.tallies[range.index].count = gatherRange(&job.input, range.start, range.end, job.entries[range.start..range.end]);
+    job.tallies[range.index].value.kept = gatherRange(&job.input, range.start, range.end, job.entries[range.start..range.end]);
 }
 
 // Lane cells of one block: each lane's current body-center cell, and whether its
