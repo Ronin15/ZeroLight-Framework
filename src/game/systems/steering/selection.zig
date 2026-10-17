@@ -248,6 +248,7 @@ const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
 const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
 const direction_epsilon = @import("directions.zig").direction_epsilon;
 const expectEveryStageThreaded = @import("test_support.zig").expectEveryStageThreaded;
+const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
 const selectionIntent = @import("test_support.zig").selectionIntent;
 const addSteeredEntity = @import("test_support.zig").addSteeredEntity;
 const appendNavigationIntents = @import("test_support.zig").appendNavigationIntents;
@@ -279,7 +280,7 @@ test "steering keeps highest priority navigation intent with stable tie order" {
         .{ .entity = agent, .goal = .{ .x = 0, .y = 96 }, .direct_direction_y = 1, .priority = 10 },
         .{ .entity = agent, .goal = .{ .x = 96, .y = 96 }, .direct_direction_x = 1, .direct_direction_y = 1, .priority = 10 },
     });
-    const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 3), stats.navigation_intent_count);
     try std.testing.expectEqual(@as(usize, 1), stats.selected_intent_count);
     const intent = frame.intents.mergedItems()[0].movement;
@@ -341,7 +342,7 @@ test "steering threaded arbitration keeps the first appearance and the best inte
         frame.beginStep();
         try appendNavigationIntents(&frame, &intents);
         const stats = if (run == 0)
-            try steering.updateSerial(&data, &frame, &pathfinding, &colliders)
+            try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders)
         else
             try steering.update(&data, &frame, &threads, &pathfinding, &colliders, .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
         if (run == 1) try expectEveryStageThreaded(stats);
@@ -393,7 +394,7 @@ test "steering claims stay correct across the claim stamp wrap" {
             if (run == 1 and step_index == 1) steering.claim_stamp = std.math.maxInt(u32) - 1;
             frame.beginStep();
             try appendNavigationIntents(&frame, step_intents);
-            const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+            const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
             counts[run][step_index] = stats.selected_intent_count;
             for (frame.intents.mergedItems(), 0..) |merged, index| outputs[run][step_index][index] = merged.movement;
         }
@@ -454,7 +455,7 @@ test "steering claim band count does not follow the resolve partition" {
         const stats = if (items_per_range) |range_items|
             try steering.update(&data, &frame, &threads, &pathfinding, &colliders, .{ .items_per_range = range_items, .max_worker_threads = 2, .adaptive = false })
         else
-            try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+            try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
         if (items_per_range) |range_items| {
             try std.testing.expectEqual(@divCeil(intents.len, range_items), stats.select_resolve_batch.range_count);
             // Three 16-row claim blocks over 40 steering rows, whatever the resolve ranges.

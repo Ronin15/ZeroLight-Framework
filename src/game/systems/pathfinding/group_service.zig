@@ -16,7 +16,6 @@ const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWork
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
-const inlineBatch = @import("../../../app/thread_system.zig").inlineBatch;
 const GroupField = @import("group_field.zig").GroupField;
 const initialPoolBlocks = @import("group_field.zig").initialPoolBlocks;
 const PathfindingConfig = @import("types.zig").PathfindingConfig;
@@ -43,7 +42,7 @@ pub fn groupFieldThreshold(self: *const PathfindingSystem) usize {
 /// expansions one field per item: the advance pass over fields building at step
 /// start, then the main-thread decisions in tally order (they see the post-advance
 /// states), then the begin pass over fields begun this step.
-pub fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats, threads: ?StageThreads) void {
+pub fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats, threads: StageThreads) void {
     if (!self.graph.valid()) return;
     const threshold = groupFieldThreshold(self);
     std.debug.assert(self.group_field_slots.capacity >= self.group_fields.items.len);
@@ -99,20 +98,15 @@ pub fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats, th
 // never depends on pool capacity. A growth that runs out of memory leaves its field
 // stalled for the next step. Returns the first round's batch (later rounds happen only
 // while pools warm up).
-fn expandGroupFieldSlots(self: *PathfindingSystem, threads: ?StageThreads, tuner: *AdaptiveWorkTuner) BatchStats {
+fn expandGroupFieldSlots(self: *PathfindingSystem, threads: StageThreads, tuner: *AdaptiveWorkTuner) BatchStats {
     var first: ?BatchStats = null;
     while (self.group_field_slots.items.len != 0) {
         const slots = self.group_field_slots.items;
         const round_tuner = if (first == null) tuner else &self.tuners.group_field_stall;
-        const batch = if (threads) |stage| dispatched: {
-            const round = stage.stage(round_tuner);
-            const selection = round.select(slots.len, 1);
-            var job = GroupFieldJob{ .system = self, .slots = slots, .range_count = selection.range_count };
-            break :dispatched round.run(selection, slots.len, 1, &job, groupFieldExpandJob);
-        } else serial: {
-            for (slots) |slot| expandGroupField(self, slot);
-            break :serial inlineBatch(slots.len, 1);
-        };
+        const round = threads.stage(round_tuner);
+        const selection = round.select(slots.len, 1);
+        var job = GroupFieldJob{ .system = self, .slots = slots, .range_count = selection.range_count };
+        const batch = round.run(selection, slots.len, 1, &job, groupFieldExpandJob);
         if (first == null) first = batch;
         var stalled: usize = 0;
         for (slots) |slot| {
@@ -323,6 +317,7 @@ const types = @import("types.zig");
 const PathStatus = @import("types.zig").PathStatus;
 const GroupFieldState = @import("group_field.zig").GroupFieldState;
 const test_support = @import("test_support.zig");
+const updatePathfindingInline = @import("test_support.zig").updatePathfindingInline;
 const addNavBody = test_support.addNavBody;
 const appendPathRequest = test_support.appendPathRequest;
 const baselineCapacity = test_support.baselineCapacity;
@@ -362,7 +357,7 @@ test "pathfinding group mode builds one shared field sampled by all agents" {
     // First step: the field does not exist yet during acceptance, so the shared
     // goal dedups to exactly one individual solve while the field is
     // built (and finishes, given the default budget) this same step.
-    const first_stats = try system.updateSerial(&stream, 8, .{});
+    const first_stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), first_stats.group_fields_built);
     try std.testing.expectEqual(@as(usize, 1), first_stats.accepted_requests);
     var ready_field_count: usize = 0;
@@ -373,7 +368,7 @@ test "pathfinding group mode builds one shared field sampled by all agents" {
 
     // Second step: the ready field answers all three; no individual solves, and
     // every agent samples the one shared field.
-    const second_stats = try system.updateSerial(&stream, 8, .{});
+    const second_stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), second_stats.accepted_requests);
     try std.testing.expectEqual(@as(usize, 0), second_stats.group_fields_built);
     try std.testing.expectEqual(@as(usize, 3), second_stats.group_field_samples);
@@ -407,12 +402,12 @@ test "pathfinding warmed group-field request/sample step is allocation-free" {
     try appendPathRequest(&stream, .{ .entity = c, .kind = .group, .start = .{ .x = 72, .y = 8 }, .goal = goal });
 
     // Unmeasured warm-up step: builds the field to .ready (allocation is expected here).
-    const first_stats = try system.updateSerial(&stream, 8, .{});
+    const first_stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), first_stats.group_fields_built);
 
     const original = system.allocator;
     system.allocator = std.testing.failing_allocator;
-    const second_stats = try system.updateSerial(&stream, 8, .{});
+    const second_stats = try updatePathfindingInline(&system, &stream, 8, .{});
     system.allocator = original;
 
     try std.testing.expectEqual(@as(usize, 0), second_stats.group_fields_built);
@@ -443,7 +438,7 @@ test "pathfinding skips the group flow field below the agent threshold" {
     try below.reserve(3, 3);
     try appendPathRequest(&below, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
     try appendPathRequest(&below, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal });
-    const below_stats = try system.updateSerial(&below, 8, .{});
+    const below_stats = try updatePathfindingInline(&system, &below, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), below_stats.group_fields_built);
     try std.testing.expectEqual(@as(usize, 1), below_stats.accepted_requests);
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goal, .default, null).status);
@@ -455,7 +450,7 @@ test "pathfinding skips the group flow field below the agent threshold" {
     try appendPathRequest(&at, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
     try appendPathRequest(&at, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal });
     try appendPathRequest(&at, .{ .entity = c, .kind = .group, .start = .{ .x = 72, .y = 8 }, .goal = goal });
-    const at_stats = try system.updateSerial(&at, 8, .{});
+    const at_stats = try updatePathfindingInline(&system, &at, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), at_stats.group_fields_built);
 }
 
@@ -473,7 +468,7 @@ test "pathfinding builds no group field when no group requests arrive" {
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = a, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 200, .y = 200 } });
 
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), stats.group_fields_built);
     for (system.group_fields.items) |field| {
         try std.testing.expectEqual(GroupFieldState.empty, field.state);
@@ -501,7 +496,7 @@ test "pathfinding group field reuses within a nav cell and throttles cross-cell 
         // cell; cross into a new cell occasionally.
         const goal_x: f32 = 100.0 + @as(f32, @floatFromInt(i)) * 10.0;
         try appendPathRequest(&stream, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = goal_x, .y = 100 } });
-        const stats = try system.updateSerial(&stream, 8, .{});
+        const stats = try updatePathfindingInline(&system, &stream, 8, .{});
         rebuild_count += stats.group_fields_built;
     }
     // Without throttle a moving goal would rebuild every cell crossing; the
@@ -540,7 +535,7 @@ test "pathfinding distinct same-class group goals keep separate fields without p
         try stream.reserve(2, 2);
         try appendPathRequest(&stream, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal_a });
         try appendPathRequest(&stream, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal_b });
-        const stats = try system.updateSerial(&stream, 8, .{});
+        const stats = try updatePathfindingInline(&system, &stream, 8, .{});
         built_total += stats.group_fields_built;
     }
 
@@ -581,7 +576,7 @@ test "pathfinding group field latches via cross-step accumulation when intake is
         try stream.reserve(2, 2);
         try appendPathRequest(&stream, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
         try appendPathRequest(&stream, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal });
-        const stats = try system.updateSerial(&stream, 8, .{});
+        const stats = try updatePathfindingInline(&system, &stream, 8, .{});
         built += stats.group_fields_built;
     }
     // No single step ever delivered the threshold count, yet accumulation latched.
@@ -614,7 +609,7 @@ test "pathfinding sub-threshold transient crowd decays back to no group field" {
     try burst.reserve(2, 2);
     try appendPathRequest(&burst, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
     try appendPathRequest(&burst, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal });
-    const burst_stats = try system.updateSerial(&burst, 8, .{});
+    const burst_stats = try updatePathfindingInline(&system, &burst, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), burst_stats.group_fields_built);
 
     // No further group requests: the carried tally halves to zero and compacts away,
@@ -622,7 +617,7 @@ test "pathfinding sub-threshold transient crowd decays back to no group field" {
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
     for (0..3) |_| {
-        const stats = try system.updateSerial(&empty, 8, .{});
+        const stats = try updatePathfindingInline(&system, &empty, 8, .{});
         try std.testing.expectEqual(@as(usize, 0), stats.group_fields_built);
     }
     try std.testing.expectEqual(@as(usize, 0), system.group_requests.items.len);
@@ -645,14 +640,14 @@ test "pathfinding group field within the same nav cell reuses without rebuilding
     var first = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer first.deinit();
     try appendPathRequest(&first, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 40, .y = 40 } });
-    const first_stats = try system.updateSerial(&first, 8, .{});
+    const first_stats = try updatePathfindingInline(&system, &first, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), first_stats.group_fields_built);
 
     // A goal that stays inside the same nav cell reuses the field, no rebuild.
     var second = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer second.deinit();
     try appendPathRequest(&second, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 56, .y = 56 } });
-    const reuse_stats = try system.updateSerial(&second, 8, .{});
+    const reuse_stats = try updatePathfindingInline(&system, &second, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), reuse_stats.group_fields_built);
     try std.testing.expect(reuse_stats.group_field_reuses >= 1);
 }
@@ -674,7 +669,7 @@ test "pathfinding group field reports building across frames under tiny budget" 
     defer stream.deinit();
     const goal = math.Vec2{ .x = 240, .y = 240 };
     try appendPathRequest(&stream, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
-    _ = try system.updateSerial(&stream, 8, .{});
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
 
     const key = system.graph.keyForWorld(0, goal, .default).?;
     const field_after_first = groupFieldOf(&system, key).?;
@@ -690,7 +685,7 @@ test "pathfinding group field reports building across frames under tiny budget" 
         try empty.prepareRangeCounts(0);
         try empty.prefix();
         empty.finishWrite();
-        _ = try system.updateSerial(&empty, 8, .{});
+        _ = try updatePathfindingInline(&system, &empty, 8, .{});
     }
     try std.testing.expect(guard > 0);
     try std.testing.expectEqual(GroupFieldState.ready, groupFieldOf(&system, key).?.state);
@@ -729,7 +724,7 @@ test "group-field threshold is independent of world size" {
         try stream.reserve(2, 2);
         try appendPathRequest(&stream, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
         try appendPathRequest(&stream, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal });
-        const stats = try system.updateSerial(&stream, 2, .{});
+        const stats = try updatePathfindingInline(&system, &stream, 2, .{});
         built += stats.group_fields_built;
     }
     try std.testing.expectEqual(@as(usize, 0), built);
@@ -825,7 +820,7 @@ test "threaded group-field service equals serial for four fields building, finis
     var waited_steps: usize = 0;
     for (group_service_schedule) |goals| {
         try writeGroupGoals(&stream, requester, goals);
-        const serial_stats = try serial.updateSerial(&stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+        const serial_stats = try updatePathfindingInline(&serial, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
         const stats = try threaded.update(&stream, intake_test_agents, &threads, .{ .adaptive = false, .items_per_range = 1, .max_solve_admissions_per_step = 0 });
         try expectRequestStatsEqual(serial_stats, stats);
         try expectGroupFieldsEqual(&serial, &threaded);
@@ -917,15 +912,15 @@ test "threaded group-field service with stall rounds equals serial and runs on w
     defer warm.deinit();
     try warm.reserve(stallingFieldCapacity(1));
     try warm.rebuildStaticNavGrid(&data, 2048, 2048, 32);
-    for (0..80) |_| _ = try warm.updateSerial(&stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+    for (0..80) |_| _ = try updatePathfindingInline(&warm, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
     warm.clearRuntimeState();
     const warm_grows = warm.group_field_pool_growth.count;
 
     var threaded_passes: usize = 0;
     for (0..80) |_| {
-        const serial_stats = try serial.updateSerial(&stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+        const serial_stats = try updatePathfindingInline(&serial, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
         const stats = try threaded.update(&stream, intake_test_agents, &threads, .{ .adaptive = false, .items_per_range = 1, .max_solve_admissions_per_step = 0 });
-        _ = try warm.updateSerial(&stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+        _ = try updatePathfindingInline(&warm, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
         try expectRequestStatsEqual(serial_stats, stats);
         try expectGroupFieldsEqual(&serial, &threaded);
         // Stalled fields resume in the same step: per-step progress never depends on pools.
@@ -966,10 +961,10 @@ test "a first group-field build that cannot allocate builds nothing and retries"
     try system.reserve(stallingFieldCapacity(1));
     try system.rebuildStaticNavGrid(&data, 2048, 2048, 32);
     // A request-free step sizes the per-step pools for the agent count first.
-    _ = try system.updateSerial(&empty, intake_test_agents, config);
+    _ = try updatePathfindingInline(&system, &empty, intake_test_agents, config);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     system.allocator = failing.allocator();
-    const failed = try system.updateSerial(&stream, intake_test_agents, config);
+    const failed = try updatePathfindingInline(&system, &stream, intake_test_agents, config);
     system.allocator = std.testing.allocator;
     try std.testing.expectEqual(@as(usize, 0), failed.group_fields_built);
     try std.testing.expectEqual(@as(u64, 1), system.group_field_pool_failure.count);
@@ -979,14 +974,14 @@ test "a first group-field build that cannot allocate builds nothing and retries"
     }
 
     // The next step builds the same field a fresh system builds on its first step.
-    const retried = try system.updateSerial(&stream, intake_test_agents, config);
+    const retried = try updatePathfindingInline(&system, &stream, intake_test_agents, config);
     try std.testing.expectEqual(@as(usize, 1), retried.group_fields_built);
     var fresh = PathfindingSystem.init(std.testing.allocator);
     defer fresh.deinit();
     try fresh.reserve(stallingFieldCapacity(1));
     try fresh.rebuildStaticNavGrid(&data, 2048, 2048, 32);
-    _ = try fresh.updateSerial(&empty, intake_test_agents, config);
-    _ = try fresh.updateSerial(&stream, intake_test_agents, config);
+    _ = try updatePathfindingInline(&fresh, &empty, intake_test_agents, config);
+    _ = try updatePathfindingInline(&fresh, &stream, intake_test_agents, config);
     const grid = system.graph.grid(0).?;
     const field = &system.group_fields.items[0];
     const expected = &fresh.group_fields.items[0];
@@ -1020,7 +1015,7 @@ test "a group field for a blocked goal builds at the goal table's live goal" {
     const table_goal: u32 = 8 * 24 + 12;
     try std.testing.expect(!grid.isBlockedIndex(table_goal) and table_goal != system.goals.live.items[0]);
     system.goals.live.items[0] = table_goal;
-    _ = try system.updateSerial(&stream, 16, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &stream, 16, .{ .max_solve_admissions_per_step = 0 });
     const field = groupFieldOf(&system, system.graph.keyForWorld(0, goal, .default).?).?;
     try std.testing.expectEqual(@as(usize, table_goal), field.goal_index);
 }
@@ -1046,7 +1041,7 @@ test "group fields past their slots never evict an active goal's field: the slot
     var built: usize = 0;
     var ready_since: [2]?usize = .{ null, null };
     for (0..24) |step| {
-        const stats = try system.updateSerial(&stream, 16, .{});
+        const stats = try updatePathfindingInline(&system, &stream, 16, .{});
         built += stats.group_fields_built;
         for (keys[0..2], &ready_since) |key, *since| {
             const field = groupFieldOf(&system, key) orelse return error.TestExpectedField;
@@ -1087,7 +1082,7 @@ test "a field capped below a 2048-cell level readies within its build steps, and
     const key = system.graph.keyForWorld(0, goal, .default).?;
     var steps: usize = 0;
     while (steps <= types.default_group_field_max_build_steps) : (steps += 1) {
-        _ = try system.updateSerial(&stream, 8, .{});
+        _ = try updatePathfindingInline(&system, &stream, 8, .{});
         try std.testing.expect(system.statusForWorld(0, far, 0, goal, .default, null).status != .unavailable);
         if (groupFieldOf(&system, key).?.state == .ready) break;
     }
@@ -1099,7 +1094,7 @@ test "a field capped below a 2048-cell level readies within its build steps, and
     try std.testing.expectEqual(@as(usize, 2), near_view.path_len);
     // Further steps sample the field for the near sharer only; the far one keeps its path.
     for (0..3) |_| {
-        const stats = try system.updateSerial(&stream, 8, .{});
+        const stats = try updatePathfindingInline(&system, &stream, 8, .{});
         try std.testing.expectEqual(@as(usize, 1), stats.group_field_samples);
         try std.testing.expect(system.statusForWorld(0, far, 0, goal, .default, null).status != .unavailable);
     }

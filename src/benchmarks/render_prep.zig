@@ -50,10 +50,10 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     // Warm up and settle through the same decomposed path used for measurement so
     // settled_before_measurement and work_tuning reflect the path actually timed.
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(batch.adaptive_tuner.isSettled())) {
+    while (warm.next(batch.adaptive_tuner.phase == .settled)) {
         _ = try runMeasuredOnce(item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
     }
-    const settled_before_measurement = if (case.adaptive) batch.adaptive_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) (batch.adaptive_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var phase_accumulator = fixtures.PhaseAccumulator(suite.RenderPrepPhaseSummary){};
@@ -78,7 +78,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     stats.sample_count = last_prep.draw_group_count;
     stats.render_prep_phases = phase_accumulator.finish(options.iterations);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(batch.adaptive_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&batch.adaptive_tuner), settled_before_measurement);
     }
     return stats;
 }

@@ -11,7 +11,6 @@
 const std = @import("std");
 const simd = @import("../../../core/simd.zig");
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
-const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
@@ -49,7 +48,7 @@ pub const IntakeTallyList = std.array_list.Aligned(IntakeTally, .fromByteUnits(t
 /// duplicates, the pending cap, and pending pushes, O(records + group keys). One
 /// classifier for every partition, equal to the serial request-order loop. Acceptance is
 /// the only stage that mutates the pending-key set; cached hits never enter pending work.
-pub fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest, gates: StepGates, threads: ?StageThreads) PathfindingStats {
+pub fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest, gates: StepGates, threads: StageThreads) PathfindingStats {
     var stats = PathfindingStats{};
     // Cross-step decaying accumulation: halve every carried tally before this
     // step's requests fold in, so a SUSTAINED shared goal accumulates toward the
@@ -66,7 +65,7 @@ pub fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest, g
     const item_count = @min(requests.len, self.limits.frame_requests);
     stats.dropped_requests += requests.len - item_count;
     if (item_count == 0) return stats;
-    const dispatch: ?Dispatch = if (threads) |stage| stage.stage(&self.tuners.intake) else null;
+    const dispatch = threads.stage(&self.tuners.intake);
     const shape = stageShape(dispatch, item_count, intake_range_alignment_items);
     std.debug.assert(self.intake_records.capacity >= item_count);
     std.debug.assert(self.intake_group_counts.capacity >= item_count);
@@ -344,6 +343,7 @@ const EntityId = @import("../../data_system.zig").EntityId;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const test_support = @import("test_support.zig");
+const updatePathfindingInline = @import("test_support.zig").updatePathfindingInline;
 const addNavBody = test_support.addNavBody;
 const appendIndividual = test_support.appendIndividual;
 const appendPathRequest = test_support.appendPathRequest;
@@ -456,7 +456,7 @@ fn intakeScenarioSystem(data: *const DataSystem, requester: EntityId, participan
     for (0..3) |index| {
         try appendPathRequest(&stream, .{ .entity = requester, .kind = .group, .start = cellWorld(@intCast(index), 3), .goal = IntakeGoals.field });
     }
-    _ = try system.updateSerial(&stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
     try std.testing.expectEqual(intake_prefilled_count + 1, system.pending.len);
 
     const step = system.step_counter;
@@ -533,7 +533,7 @@ test "threaded request intake equals serial intake across range sizes and worker
     var serial = try intakeScenarioSystem(&data, requester, 1);
     defer serial.deinit();
     _ = try serial.resolveGoals(PathRequest, table_requests, null, .{});
-    const serial_stats = try serial.updateSerial(&stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+    const serial_stats = try updatePathfindingInline(&serial, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
     // The scenario reaches every class: two sealed requests, the expired sealed one, and two
     // sealed blocked ones read unavailable from reach, never pending.
     try std.testing.expectEqual(@as(usize, 2), serial_stats.group_field_samples);
@@ -591,7 +591,7 @@ fn repeatsTestSystem(data: *const DataSystem, participant_count: usize, filler: 
     try system.reserve(capacity);
     try system.rebuildStaticNavGrid(data, 512, 512, 32);
     if (filler) |stream| {
-        _ = try system.updateSerial(stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+        _ = try updatePathfindingInline(&system, stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
         try std.testing.expectEqual(intake_test_agents, system.pending.len);
     }
     return system;
@@ -617,7 +617,7 @@ test "threaded intake folds a new goal's repeats per range and equals serial whe
         const prefill: ?*const RangeOutputStream(PathRequest) = if (pending_full) &filler else null;
         var serial = try repeatsTestSystem(&data, 1, prefill);
         defer serial.deinit();
-        const serial_stats = try serial.updateSerial(&repeated, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+        const serial_stats = try updatePathfindingInline(&serial, &repeated, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
         if (pending_full) {
             try std.testing.expectEqual(intake_test_agents, serial_stats.dropped_requests);
             try std.testing.expectEqual(@as(usize, 0), serial_stats.accepted_requests);
@@ -726,7 +726,7 @@ test "group tallies keep first-occurrence order and exact counts with more than 
     defer serial.deinit();
     try serial.reserve(capacity);
     try serial.rebuildStaticNavGrid(&data, 512, 512, 32);
-    const serial_stats = try serial.updateSerial(&stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+    const serial_stats = try updatePathfindingInline(&serial, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
     try std.testing.expectEqual(@as(usize, 12), serial_stats.distinct_group_keys);
     for (serial.group_requests.items, 0..) |tally, key_index| {
         try std.testing.expectEqualDeep(serial.graph.keyForWorld(0, cellWorld(@intCast(key_index), 12), .default).?, tally.key);

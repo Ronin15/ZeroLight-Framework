@@ -330,11 +330,11 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 
     try fixture.resetStep();
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(plane_entry.tuner.isSettled())) {
+    while (warm.next(plane_entry.tuner.phase == .settled)) {
         _ = try runStage(&fixture, thread_ptr);
         try fixture.resetStep();
     }
-    const settled_before_measurement = if (case.adaptive) plane_entry.tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) (plane_entry.tuner.phase == .settled) else false;
 
     // The banded group's size axis is its landing band count.
     var accumulator = suite.StatsAccumulator.init(if (workload == .banded_falls) landing_bands else item_count);
@@ -361,7 +361,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     stats.output_count = entries;
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(plane_entry.tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&plane_entry.tuner), settled_before_measurement);
     }
     return stats;
 }

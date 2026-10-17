@@ -246,9 +246,9 @@ fn stagesOffMainNs(stats: SteeringStats) u64 {
 
 // Every steering stage tuner has settled.
 fn stageTunersSettled(system: *const SteeringSystem) bool {
-    return system.adaptive_tuner.isSettled() and system.agents_tuner.isSettled() and system.select_resolve_tuner.isSettled() and
-        system.select_claim_tuner.isSettled() and system.directions_tuner.isSettled() and system.grid_bucket_tuner.isSettled() and
-        system.grid_sort_tuner.isSettled();
+    return (system.adaptive_tuner.phase == .settled) and (system.agents_tuner.phase == .settled) and (system.select_resolve_tuner.phase == .settled) and
+        (system.select_claim_tuner.phase == .settled) and (system.directions_tuner.phase == .settled) and (system.grid_bucket_tuner.phase == .settled) and
+        (system.grid_sort_tuner.phase == .settled);
 }
 
 // Entries in the agent grid's largest band after the last step.
@@ -294,7 +294,7 @@ fn measureCase(
         system.grid_sort_tuner = suite.adaptiveTunerForPartition(case, 1, 1).?;
     }
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
@@ -333,7 +333,7 @@ fn measureCase(
         .band_max = largestGridBand(&system),
     };
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.adaptive_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.adaptive_tuner), settled_before_measurement);
     }
     return .{ .stats = stats, .last = last_stats };
 }
@@ -353,9 +353,6 @@ fn runOnce(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSy
 
 // The steering update for `case` over the step's navigation intents.
 fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
-    if (!case.usesThreadSystem()) {
-        return try system.updateSerial(&fixture.data, &fixture.frame, &fixture.pathfinding, &fixture.colliders);
-    }
     return try system.update(&fixture.data, &fixture.frame, thread_system.?, &fixture.pathfinding, &fixture.colliders, .{
         .items_per_range = case.stageItemsPerRange(steering_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),

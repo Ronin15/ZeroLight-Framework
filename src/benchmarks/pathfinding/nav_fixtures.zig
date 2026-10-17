@@ -50,12 +50,6 @@ pub fn coldSettleLimit(options: suite.Options) usize {
 }
 
 pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
-    if (!case.usesThreadSystem()) {
-        return try system.updateSerial(requests, agent_count, .{
-            .max_solved_requests_per_step = solve_budget,
-            .max_solve_admissions_per_step = fallback_budget,
-        });
-    }
     return try system.update(requests, agent_count, thread_system.?, .{
         .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),

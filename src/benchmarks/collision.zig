@@ -469,7 +469,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var contacts = RangeOutputStream(CollisionContact).init(allocator);
     defer contacts.deinit();
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
@@ -477,10 +477,10 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     while (warm.next(stageTunersSettled(&system))) {
         _ = try runOnce(&system, data, mover, &contacts, thread_ptr, case);
     }
-    const fill_settled_before_measurement = case.adaptive and system.fill_tuner.isSettled();
-    const sort_settled_before_measurement = case.adaptive and system.sort_tuner.isSettled();
-    const broadphase_settled_before_measurement = if (case.adaptive) system.broadphase_tuner.isSettled() else false;
-    const narrowphase_settled_before_measurement = if (case.adaptive) system.narrowphase_tuner.isSettled() else false;
+    const fill_settled_before_measurement = case.adaptive and (system.fill_tuner.phase == .settled);
+    const sort_settled_before_measurement = case.adaptive and (system.sort_tuner.phase == .settled);
+    const broadphase_settled_before_measurement = if (case.adaptive) (system.broadphase_tuner.phase == .settled) else false;
+    const narrowphase_settled_before_measurement = if (case.adaptive) (system.narrowphase_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_collision_stats = CollisionStats{};
@@ -502,8 +502,8 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     stats.collision_stages = .{
         .fill = suite.batchSummaryFromBatch(last_collision_stats.fill_batch),
         .sort = suite.batchSummaryFromBatch(last_collision_stats.sort_batch),
-        .fill_tuning = if (case.adaptive) suite.workTuningSummary(system.fill_tuner.report(), fill_settled_before_measurement) else null,
-        .sort_tuning = if (case.adaptive) suite.workTuningSummary(system.sort_tuner.report(), sort_settled_before_measurement) else null,
+        .fill_tuning = if (case.adaptive) suite.workTuningSummary(suite.tunerReport(&system.fill_tuner), fill_settled_before_measurement) else null,
+        .sort_tuning = if (case.adaptive) suite.workTuningSummary(suite.tunerReport(&system.sort_tuner), sort_settled_before_measurement) else null,
         .entries = last_collision_stats.entry_count,
         .visits = last_collision_stats.broadphase_visits,
     };
@@ -512,8 +512,8 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     stats.output_count = last_collision_stats.contact_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(last_collision_stats.narrowphase_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.broadphase_tuner.report(), broadphase_settled_before_measurement);
-        stats.secondary_work_tuning = suite.workTuningSummary(system.narrowphase_tuner.report(), narrowphase_settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.broadphase_tuner), broadphase_settled_before_measurement);
+        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.narrowphase_tuner), narrowphase_settled_before_measurement);
     }
     return stats;
 }
@@ -527,8 +527,8 @@ pub fn useCaseTuners(system: *CollisionSystem, case: suite.BenchmarkCase) void {
 
 /// Every stage tuner of `system` settled.
 pub fn stageTunersSettled(system: *const CollisionSystem) bool {
-    return system.fill_tuner.isSettled() and system.sort_tuner.isSettled() and
-        system.broadphase_tuner.isSettled() and system.narrowphase_tuner.isSettled();
+    return (system.fill_tuner.phase == .settled) and (system.sort_tuner.phase == .settled) and
+        (system.broadphase_tuner.phase == .settled) and (system.narrowphase_tuner.phase == .settled);
 }
 
 fn runOnce(
@@ -540,9 +540,6 @@ fn runOnce(
     case: suite.BenchmarkCase,
 ) !CollisionStats {
     if (mover) |static_mover| try static_mover.moveAndSync(data, if (case.usesThreadSystem()) thread_system else null);
-    if (!case.usesThreadSystem()) {
-        return try system.updateSerial(data, contacts);
-    }
 
     return try system.update(data, contacts, thread_system.?, .{
         .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),

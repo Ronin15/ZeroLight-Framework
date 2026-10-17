@@ -219,7 +219,7 @@ fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: ?*ThreadSystem) !
 
 // A toggle stage tuner set's plan, remask, and patch tuners settled.
 fn toggleTunersSettled(tuners: *const fixtures.NavTuners) bool {
-    return tuners.nav.getPtrConst(.plan).isSettled() and tuners.nav.getPtrConst(.remask).isSettled() and tuners.nav.getPtrConst(.patch).isSettled();
+    return (tuners.nav.getPtrConst(.plan).phase == .settled) and (tuners.nav.getPtrConst(.remask).phase == .settled) and (tuners.nav.getPtrConst(.patch).phase == .settled);
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -244,8 +244,8 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // allocation-free) and the tuners have trained an inline baseline before timing.
     var warm = suite.Warmup.init(options, case, 1);
     while (warm.next(toggleTunersSettled(&fixture.system.tuners) and toggleTunersSettled(&fixture.revert_tuners))) _ = try runToggle(&fixture, io, thread_ptr);
-    const remask_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.remask).isSettled() else false;
-    const patch_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.patch).isSettled() else false;
+    const remask_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) else false;
+    const patch_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled) else false;
 
     // Throughput is over the cells edited: the footprint is capped, so a count above the cap
     // edits fewer cells.
@@ -262,8 +262,8 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.open_stats.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(fixture.open_stats.patch_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.remask).report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.patch).report(), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.remask)), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.patch)), patch_settled);
     }
     return stats;
 }
@@ -433,9 +433,9 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     fixtures.setSpliceTuners(&fixture.colliders, case);
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(fixture.system.tuners.nav_mark.isSettled() and fixture.system.tuners.nav.getPtrConst(.plan).isSettled() and fixture.system.tuners.nav.getPtrConst(.remask).isSettled() and fixture.system.tuners.nav.getPtrConst(.patch).isSettled())) _ = try fixture.moveAndReact(io, thread_ptr);
-    const remask_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.remask).isSettled() else false;
-    const patch_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.patch).isSettled() else false;
+    while (warm.next((fixture.system.tuners.nav_mark.phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.plan).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled))) _ = try fixture.moveAndReact(io, thread_ptr);
+    const remask_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) else false;
+    const patch_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(other_statics + dynamic_bodies);
     var chunks_patched: usize = 0;
@@ -456,8 +456,8 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.patch_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.remask).report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.patch).report(), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.remask)), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.patch)), patch_settled);
     }
     return stats;
 }
@@ -736,9 +736,9 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     fixtures.setSpliceTuners(&fixture.colliders, case);
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(fixture.colliders.splice_tuner.isSettled() and fixture.colliders.query_splice_tuner.isSettled() and fixture.system.tuners.nav.getPtrConst(.plan).isSettled() and fixture.system.tuners.nav.getPtrConst(.remask).isSettled() and fixture.system.tuners.nav.getPtrConst(.patch).isSettled())) _ = try fixture.changeAndReact(io, thread_ptr);
-    const remask_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.remask).isSettled() else false;
-    const patch_settled = if (case.adaptive) fixture.system.tuners.nav.getPtrConst(.patch).isSettled() else false;
+    while (warm.next((fixture.colliders.splice_tuner.phase == .settled) and (fixture.colliders.query_splice_tuner.phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.plan).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled))) _ = try fixture.changeAndReact(io, thread_ptr);
+    const remask_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) else false;
+    const patch_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled) else false;
 
     const change_count = fixture.layout.chunk_count * dense_changes_per_chunk;
     var accumulator = suite.StatsAccumulator.init(change_count);
@@ -778,8 +778,8 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         };
     }
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.remask).report(), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.patch).report(), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.remask)), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.patch)), patch_settled);
     }
     return stats;
 }

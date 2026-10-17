@@ -1075,13 +1075,6 @@ pub const SpatialIndexSystem = struct {
         return self.buildBanded(data, population, stages, chooseSplitters(data, population, self.grid));
     }
 
-    /// `build` on the calling thread alone.
-    pub fn buildSerial(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation, geometry: IndexGeometry, config: SpatialIndexConfig) !SpatialIndexStats {
-        const slot_count = try self.beginBuild(population, geometry, config);
-        if (slot_count == 0) return self.finishEmptyBuild(.{});
-        return self.buildDirect(data, population);
-    }
-
     // A build with no entries: the directories cut back to the geometry's levels, so levels
     // grown for bodies that are gone are released.
     fn finishEmptyBuild(self: *SpatialIndexSystem, stats: SpatialIndexStats) error{OutOfMemory}!SpatialIndexStats {
@@ -1655,6 +1648,7 @@ fn chooseSplitters(data: *const DataSystem, population: IndexPopulation, grid: G
 // ---- Tests --------------------------------------------------------------------
 
 const testing = std.testing;
+const buildInline = @import("spatial_index_test_support.zig").buildInline;
 
 // The test queries' budget ceiling, past every test layout's entry count, and their block.
 const max_test_checks: u16 = 512;
@@ -2143,7 +2137,7 @@ test "serial and threaded index builds match across layouts, splitters, range si
 
         var reference_system = SpatialIndexSystem.init(testing.allocator);
         defer reference_system.deinit();
-        _ = try reference_system.buildSerial(&data, population, layout_geometry, config);
+        _ = try buildInline(&reference_system, &data, population, layout_geometry, config);
         var reference = try TestCapture.capture(&reference_system);
         defer reference.deinit();
         // The one cell holds every faction, each its own cell.
@@ -2268,7 +2262,7 @@ test "serial and threaded builds over population rows match, each entry carrying
 
     var reference_system = SpatialIndexSystem.init(testing.allocator);
     defer reference_system.deinit();
-    _ = try reference_system.buildSerial(&data, population, layout_geometry, config);
+    _ = try buildInline(&reference_system, &data, population, layout_geometry, config);
     var reference = try TestCapture.capture(&reference_system);
     defer reference.deinit();
     const index = reference_system.view();
@@ -2316,7 +2310,7 @@ test "cell-major runs cover each record once in (local_y, local_x, faction, slot
         try fillTestLayout(&data, layout);
         var system = SpatialIndexSystem.init(testing.allocator);
         defer system.deinit();
-        _ = try system.buildSerial(&data, aiPopulation(&data), layout_geometry, testConfig(layout_cell_size));
+        _ = try buildInline(&system, &data, aiPopulation(&data), layout_geometry, testConfig(layout_cell_size));
         const index = system.view();
         const keys = system.keys.items;
         var expected: std.ArrayList(CellMajorEntry) = .empty;
@@ -2362,7 +2356,7 @@ test "cell-major spans over any window split walk the records' cell-major order 
         try fillTestLayout(&data, layout);
         var system = SpatialIndexSystem.init(testing.allocator);
         defer system.deinit();
-        _ = try system.buildSerial(&data, aiPopulation(&data), layout_geometry, testConfig(layout_cell_size));
+        _ = try buildInline(&system, &data, aiPopulation(&data), layout_geometry, testConfig(layout_cell_size));
         const index = system.view();
         const entry_count = index.entryCount();
         var expected: std.ArrayList(u32) = .empty;
@@ -2407,7 +2401,7 @@ test "queryNeighbors visits a cell's entries in slot order, skipping self withou
     _ = try addTestBody(&data, 1, 0);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
 
     var visitor = RecordingVisitor{};
@@ -2436,7 +2430,7 @@ test "queryNeighbors stops at its check budget before the tipping entry, and on 
     _ = try addTestBody(&data, 5, 15);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
 
     var capped = RecordingVisitor{};
@@ -2472,7 +2466,7 @@ test "an index over population rows maps each slot to its row's entity, skips bo
     const rows = [_]u32{ 3, 2, 0 };
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    const stats = try system.buildSerial(&data, .{ .entities = data.aiAgentSliceConst().entities, .rows = &rows }, testGeometry(10, 4, 1), testConfig(10));
+    const stats = try buildInline(&system, &data, .{ .entities = data.aiAgentSliceConst().entities, .rows = &rows }, testGeometry(10, 4, 1), testConfig(10));
     try testing.expectEqual(@as(usize, 2), stats.entity_count);
     const index = system.view();
     // Level 0's cell (0, 0) holds slot 2 (`near`), level 2's cell (1, 0) slot 0 (`far`),
@@ -2535,7 +2529,7 @@ test "a query visits only its own level: rows at the same xy on other levels are
     for (&stacked, 1..) |*entity, level| entity.* = try addTaggedBody(&data, 8, 5, @intCast(level), .neutral);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
 
     var visitor = RecordingVisitor{};
@@ -2568,7 +2562,7 @@ test "a hostile-masked query checks only hostile rows on its level: an ally crow
     for (1..9) |level| _ = try addTaggedBody(&data, 20, 20, @intCast(level), .hostile);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
 
     var visitor = RecordingVisitor{};
@@ -2597,7 +2591,7 @@ test "a query visits each piece's faction runs in (cell row, chunk, faction, cel
     const cell_b_hostile_late = try addTaggedBody(&data, 15, 5, 0, .hostile);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
 
     const cases = [_]struct { factions: FactionSet, checks: u16, expected: []const EntityId }{
@@ -2637,7 +2631,7 @@ test "self is skipped without a check at its cell's first, middle, and last entr
     const upstairs = try addTaggedBody(&data, 2, 3, 1, .neutral);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 2), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 4, 2), testConfig(10));
     const index = system.view();
     const movement = data.movementBodySliceConst();
 
@@ -2797,7 +2791,7 @@ test "queryNeighbors visits exactly a brute-force scan's in-box entries of its l
 
     var serial = SpatialIndexSystem.init(testing.allocator);
     defer serial.deinit();
-    _ = try serial.buildSerial(&data, population, brute_force_geometry, config);
+    _ = try buildInline(&serial, &data, population, brute_force_geometry, config);
     var reference = try TestCapture.capture(&serial);
     defer reference.deinit();
 
@@ -2840,7 +2834,7 @@ test "queries from inside and outside the grid visit exactly the entries within 
     try fillBruteForceLayout(&data);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), brute_force_geometry, testConfig(4));
+    _ = try buildInline(&system, &data, aiPopulation(&data), brute_force_geometry, testConfig(4));
     const index = system.view();
     const tags = EntryTags.read(&data, index);
     const points = [_][2]f32{ .{ 400, 100 }, .{ 2, 2 }, .{ -30, 120 }, .{ 1050, 20 }, .{ 500, 280 }, .{ -40, -40 } };
@@ -2880,7 +2874,7 @@ test "row parts hold each chunk row's cells at their local x, and a chunk or row
 
     var serial = SpatialIndexSystem.init(testing.allocator);
     defer serial.deinit();
-    _ = try serial.buildSerial(&data, population, geometry, config);
+    _ = try buildInline(&serial, &data, population, geometry, config);
     const one_band = serial.view();
     // Chunk-major: chunk 0's row 0, chunk 1's rows 0 and 3, chunk 2's row 0.
     try testing.expectEqualSlices(RowPart, &.{
@@ -2940,7 +2934,7 @@ test "index keys in lanes match keyForPosition, including the scalar tail, at 12
         const geometry = IndexGeometry{ .tile_size = tile_size, .chunk_size_tiles = 16, .chunks_x = 2, .chunks_y = 2, .level_count = 1 };
         var system = SpatialIndexSystem.init(testing.allocator);
         defer system.deinit();
-        const stats = try system.buildSerial(&data, aiPopulation(&data), geometry, .{});
+        const stats = try buildInline(&system, &data, aiPopulation(&data), geometry, .{});
         try testing.expectEqual(@as(usize, 25), stats.entity_count);
         try testing.expectEqual(@as(u32, if (tile_size == 24) 12 else 16), system.grid.cells_per_chunk);
         try testing.expectEqual(@as(f32, 32), system.grid.cell_size);
@@ -2964,7 +2958,7 @@ test "the block stream matches the brute-force scan with self at every position,
     data.movementBodySlice().previous_x[4] = std.math.nan(f32);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 1, 1), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 1, 1), testConfig(10));
     const index = system.view();
     const tags = EntryTags.read(&data, index);
 
@@ -2996,7 +2990,7 @@ test "a block query visits its key's scan-order stream over every layout, budget
         try fillTestLayout(&data, layout);
         var system = SpatialIndexSystem.init(testing.allocator);
         defer system.deinit();
-        _ = try system.buildSerial(&data, aiPopulation(&data), layout_geometry, testConfig(layout_cell_size));
+        _ = try buildInline(&system, &data, aiPopulation(&data), layout_geometry, testConfig(layout_cell_size));
         const index = system.view();
         if (index.entryCount() > 512) continue;
         const tags = EntryTags.read(&data, index);
@@ -3033,7 +3027,7 @@ test "a reused block gives bit-identical visits to a fresh block, and a key chan
     try fillBruteForceLayout(&data);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), brute_force_geometry, testConfig(4));
+    _ = try buildInline(&system, &data, aiPopulation(&data), brute_force_geometry, testConfig(4));
     const index = system.view();
     // Two keys: the dense cell and a cell rows away, each from two points of its cell.
     const dense = [_]NeighborQuery{
@@ -3062,7 +3056,7 @@ test "a block at capacity ends at the budget" {
     for (0..40) |slot| _ = try addTestBody(&data, 1 + @as(f32, @floatFromInt(slot)) * 0.2, 5);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
     try testing.expectEqual(@as(usize, 1), index.rows.len);
     for ([_]EntityId{ EntityId.invalid, index.entityAt(3) }) |self| {
@@ -3090,7 +3084,7 @@ test "a stale self is a candidate: only a matching generation is skipped" {
     try testing.expect(first.generation != second.generation);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
 
     var visited: [2]EntityId = undefined;
@@ -3114,7 +3108,7 @@ test "self is compared only in the own piece's span, even in the batch that ends
     const away = try addTestBody(&data, 3, 12);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
 
     var visited: [3]EntityId = undefined;
@@ -3136,7 +3130,7 @@ test "self in a dense cell is skipped where the budget reaches it and costs no c
     for (0..512) |_| _ = try addTestBody(&data, 1 + random.float(f32) * 8, 1 + random.float(f32) * 8);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
     try testing.expectEqual(@as(usize, 1), index.rows.len);
 
@@ -3163,7 +3157,7 @@ test "a self indexed in another piece than the query point's is a candidate" {
     const other = try addTestBody(&data, 6, 25);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
 
     // Two cell rows below self's: self is in the box but not in the query point's piece.
@@ -3197,7 +3191,7 @@ test "a radius of 1e30 scans the whole level without overflow" {
     try fillBruteForceLayout(&data);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), brute_force_geometry, testConfig(4));
+    _ = try buildInline(&system, &data, aiPopulation(&data), brute_force_geometry, testConfig(4));
     const index = system.view();
     const tags = EntryTags.read(&data, index);
     for (0..3) |level| {
@@ -3234,12 +3228,12 @@ test "a build after a populated one leaves no stale cells or slots, serial and t
     const empties = [_]IndexPopulation{ aiPopulation(&empty_data), .{ .entities = &.{} } };
     for (empties) |empty| {
         for ([_]bool{ false, true }) |threaded| {
-            _ = try system.buildSerial(&data, aiPopulation(&data), geometry, .{});
+            _ = try buildInline(&system, &data, aiPopulation(&data), geometry, .{});
             try testing.expect(system.view().entryCount() == 40);
             const stats = if (threaded)
                 try system.build(&empty_data, empty, geometry, &threads, .{ .items_per_range = 16, .adaptive = false })
             else
-                try system.buildSerial(&empty_data, empty, geometry, .{});
+                try buildInline(&system, &empty_data, empty, geometry, .{});
             try testing.expectEqual(@as(usize, 0), stats.entity_count);
             const index = system.view();
             try testing.expectEqual(@as(usize, 0), index.entryCount());
@@ -3256,8 +3250,8 @@ test "a build after a populated one leaves no stale cells or slots, serial and t
     }
 
     // Chunk (0, 0) populated in one build and empty in the next is rejected by its stamp.
-    _ = try system.buildSerial(&data, aiPopulation(&data), geometry, .{});
-    _ = try system.buildSerial(&moved_data, aiPopulation(&moved_data), geometry, .{});
+    _ = try buildInline(&system, &data, aiPopulation(&data), geometry, .{});
+    _ = try buildInline(&system, &moved_data, aiPopulation(&moved_data), geometry, .{});
     const moved = system.view();
     try testing.expect(moved.level_slots[0][0].build != moved.build_stamp);
     try testing.expectEqual(moved.build_stamp, moved.level_slots[0][4 + 1].build);
@@ -3273,20 +3267,20 @@ test "the level directories follow the geometry: reset on a grid change, grown f
     const body = try addTestBody(&data, 10, 10);
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
     try testing.expectEqual(@as(usize, 2), system.level_slots.items.len);
     try testing.expectEqual(2 * 16 * chunk_slot_bytes, system.directoryBytes());
 
     // A body on a level past the geometry's gets its directory, and the next build without
     // it releases the tail.
     try data.setWorldLevel(body, 4);
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
     try testing.expectEqual(@as(usize, 5), system.level_slots.items.len);
     var visitor = RecordingVisitor{};
     _ = testQuery(system.view(), .{ .x = 10, .y = 10, .level = 4, .radius = 8, .max_candidate_checks = 8 }, &visitor);
     try testing.expectEqual(@as(usize, 1), visitor.count);
     try data.setWorldLevel(body, 1);
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
     try testing.expectEqual(@as(usize, 2), system.level_slots.items.len);
 
     // An empty build, with no slots or with only bodiless ones, serial and threaded,
@@ -3303,12 +3297,12 @@ test "the level directories follow the geometry: reset on a grid change, grown f
     for (empties) |empty| {
         for ([_]bool{ false, true }) |threaded| {
             try data.setWorldLevel(body, 4);
-            _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
+            _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
             try testing.expectEqual(@as(usize, 5), system.level_slots.items.len);
             const stats = if (threaded)
                 try system.build(empty.data, empty.population, testGeometry(32, 4, 2), &threads, .{ .items_per_range = 16, .adaptive = false })
             else
-                try system.buildSerial(empty.data, empty.population, testGeometry(32, 4, 2), .{});
+                try buildInline(&system, empty.data, empty.population, testGeometry(32, 4, 2), .{});
             try testing.expectEqual(@as(usize, 0), stats.entity_count);
             try testing.expectEqual(@as(usize, 2), system.level_slots.items.len);
             try testing.expectEqual(2 * 16 * chunk_slot_bytes, system.directoryBytes());
@@ -3317,7 +3311,7 @@ test "the level directories follow the geometry: reset on a grid change, grown f
     try data.setWorldLevel(body, 1);
 
     // A grid change rebuilds every directory at the new chunk count.
-    _ = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 8, 3), .{});
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 8, 3), .{});
     try testing.expectEqual(@as(usize, 3), system.level_slots.items.len);
     try testing.expectEqual(3 * 64 * chunk_slot_bytes, system.directoryBytes());
     for (system.level_slots.items) |slots| try testing.expectEqual(@as(usize, 64), slots.len);
@@ -3357,7 +3351,7 @@ test "the index builds correctly above a small reserved capacity" {
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
     try system.reserve(4);
-    const stats = try system.buildSerial(&data, aiPopulation(&data), testGeometry(32, 4, 1), .{});
+    const stats = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 4, 1), .{});
     try testing.expectEqual(@as(usize, 40), stats.entity_count);
     try testing.expectEqual(@as(usize, 40), system.view().entryCount());
     try testing.expect(system.view().rows.len > 0);
@@ -3385,7 +3379,7 @@ test "after reserve and reserveGeometry, threaded builds at 2 and 4 partitions p
 
     var reference = SpatialIndexSystem.init(testing.allocator);
     defer reference.deinit();
-    _ = try reference.buildSerial(&data, population, geometry, .{});
+    _ = try buildInline(&reference, &data, population, geometry, .{});
 
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
@@ -3406,7 +3400,7 @@ test "after reserve and reserveGeometry, threaded builds at 2 and 4 partitions p
         try testing.expectEqualSlices(u32, reference.view().entity_index, system.view().entity_index);
         try testing.expectEqualSlices(u32, reference.view().entity_generation, system.view().entity_generation);
     }
-    const serial_stats = try system.buildSerial(&data, population, geometry, .{});
+    const serial_stats = try buildInline(&system, &data, population, geometry, .{});
     try testing.expectEqual(population_count, serial_stats.entity_count);
     var visitor = RecordingVisitor{};
     const full_stats = testQuery(system.view(), .{ .x = 0, .y = 0, .level = 0, .radius = 400, .max_candidate_checks = 16 }, &visitor);

@@ -308,7 +308,7 @@ pub fn floodTunerWorkers(system: *const PathfindingSystem, case: suite.Benchmark
 /// `floodTunerWorkers` for the flood tuner of the stage tuner set `tuners`.
 pub fn floodTunerWorkersOf(tuners: *const NavTuners, case: suite.BenchmarkCase) ?usize {
     if (!case.adaptive or !case.usesThreadSystem()) return null;
-    const tuner = tuners.nav.getPtrConst(.conn_flood).report();
+    const tuner = tuners.nav.getPtrConst(.conn_flood);
     return if (tuner.has_threaded_profile) tuner.current_profile.worker_threads else 0;
 }
 

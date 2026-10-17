@@ -163,14 +163,14 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         system.link_tuner = suite.adaptiveTunerForCase(case, spatial_index_range_alignment_items).?;
     }
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr = if (threads) |*thread_system| thread_system else null;
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(system.bucket_tuner.isSettled() and system.sort_tuner.isSettled() and system.link_tuner.isSettled())) _ = try runOnce(&system, data, geometry, thread_ptr, case);
-    const bucket_settled_before_measurement = if (case.adaptive) system.bucket_tuner.isSettled() else false;
-    const sort_settled_before_measurement = if (case.adaptive) system.sort_tuner.isSettled() else false;
+    while (warm.next((system.bucket_tuner.phase == .settled) and (system.sort_tuner.phase == .settled) and (system.link_tuner.phase == .settled))) _ = try runOnce(&system, data, geometry, thread_ptr, case);
+    const bucket_settled_before_measurement = if (case.adaptive) (system.bucket_tuner.phase == .settled) else false;
+    const sort_settled_before_measurement = if (case.adaptive) (system.sort_tuner.phase == .settled) else false;
 
     const tuned = case.adaptive and case.adaptive_range_mode == .tuned;
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -195,17 +195,14 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.sort_batch);
     stats.splice_batch = suite.batchSummaryFromBatch(last_stats.link_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.bucket_tuner.report(), bucket_settled_before_measurement);
-        stats.secondary_work_tuning = suite.workTuningSummary(system.sort_tuner.report(), sort_settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.bucket_tuner), bucket_settled_before_measurement);
+        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.sort_tuner), sort_settled_before_measurement);
     }
     return .{ .stats = stats, .directory_bytes = system.directoryBytes() };
 }
 
 fn runOnce(system: *SpatialIndexSystem, data: *const DataSystem, geometry: IndexGeometry, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SpatialIndexStats {
     const population = IndexPopulation{ .entities = data.aiAgentSliceConst().entities };
-    if (!case.usesThreadSystem()) {
-        return try system.buildSerial(data, population, geometry, .{});
-    }
 
     return try system.build(data, population, geometry, thread_system.?, .{
         .items_per_range = case.stageItemsPerRange(spatial_index_range_alignment_items),
@@ -489,10 +486,12 @@ fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         .hostile => .initOne(.hostile),
     };
 
-    // Positions never change, so the index is built once, untimed.
+    // Positions never change, so the index is built once, untimed and inline.
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
     var system = SpatialIndexSystem.init(allocator);
     defer system.deinit();
-    _ = try system.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, geometry, .{});
+    _ = try system.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, geometry, &threads, .{});
     // The bench's cells are the index's.
     std.debug.assert(system.view().cells_per_chunk == cells_per_chunk and system.view().cell_size == cell_size);
 

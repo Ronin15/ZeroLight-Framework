@@ -419,6 +419,7 @@ fn runHits(cache: *const ResultCache, geometry: ChunkGeometry, owner: u32, start
 // ----------------------------------------------------------------------------------------
 
 const test_support = @import("test_support.zig");
+const updatePathfindingInline = @import("test_support.zig").updatePathfindingInline;
 const PathStatus = @import("types.zig").PathStatus;
 const GroupFieldState = @import("group_field.zig").GroupFieldState;
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
@@ -880,7 +881,7 @@ test "one dig leaves unrelated pending requests, fields, tallies, and paths inta
     var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer group.deinit();
     for (0..3) |index| try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = pocketGoal(70 + index), .goal = pocketGoal(33) });
-    for (0..4) |_| _ = try system.updateSerial(&group, 16, .{});
+    for (0..4) |_| _ = try updatePathfindingInline(&system, &group, 16, .{});
     const field_key = system.graph.keyForWorld(0, pocketGoal(33), .default).?;
     const field_state = group_service.groupFieldOf(&system, field_key).?.state;
     try std.testing.expect(field_state != .empty);
@@ -904,7 +905,7 @@ test "one dig leaves unrelated pending requests, fields, tallies, and paths inta
     // The queued request is solved on the next update.
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const after = try system.updateSerial(&empty, 16, .{});
+    const after = try updatePathfindingInline(&system, &empty, 16, .{});
     try std.testing.expectEqual(@as(usize, 1), after.available_results);
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, tileCenter(16, 20), 0, queued_goal, .default, null).status);
 }
@@ -928,7 +929,7 @@ fn fieldDropMatchesReference(meta: *const WorldTilesetMeta, cell: [2]u16, budget
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .kind = .group, .start = tileCenter(12, 12), .goal = tileCenter(9, 9) });
-    _ = try system.updateSerial(&stream, 8, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &stream, 8, .{ .max_solve_admissions_per_step = 0 });
     const key = system.graph.keyForWorld(0, tileCenter(9, 9), .default).?;
     const field = group_service.groupFieldOf(&system, key) orelse return error.TestExpectedField;
     try std.testing.expectEqual(@as(GroupFieldState, if (budget == 1) .building else .ready), field.state);
@@ -1006,7 +1007,7 @@ test "threaded eviction with paths and fields equals serial over a dense change 
         var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer group.deinit();
         try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = tileCenter(20, 20), .goal = tileCenter(26, 26) });
-        _ = try system.updateSerial(&group, 16, .{ .max_solve_admissions_per_step = 0 });
+        _ = try updatePathfindingInline(&system, &group, 16, .{ .max_solve_admissions_per_step = 0 });
     }
     systems[1].nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);
@@ -1081,7 +1082,7 @@ test "a nav worker cap of zero keeps the mark and eviction stages inline on a mu
         var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer group.deinit();
         try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = tileCenter(20, 20), .goal = tileCenter(26, 26) });
-        _ = try system.updateSerial(&group, 16, .{ .max_solve_admissions_per_step = 0 });
+        _ = try updatePathfindingInline(&system, &group, 16, .{ .max_solve_admissions_per_step = 0 });
         system.nav_controls = .{ .adaptive = false, .items_per_range = 1, .max_worker_threads = cap };
     }
     try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);
@@ -1128,7 +1129,7 @@ test "eviction with paths and fields allocates nothing after its pre-commit rese
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     var route: usize = 0;
     while (route < 32) : (route += 16) try solveRegistryRoutes(&system, requester, pocket_world_side, route, 16, 16, null, .{});
-    _ = try system.updateSerial(&group, 16, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &group, 16, .{ .max_solve_admissions_per_step = 0 });
 
     try setRegistryCells(&system, &fixture, &pocket_change_cells, fixture.tree);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
@@ -1167,12 +1168,12 @@ test "a level rebuilt by a content revision evicts only its own results and fiel
         try appendPathRequest(&stream, .{ .entity = requester, .start_level = level, .goal_level = level, .start = cellWorld(1, 1), .goal = cellWorld(9, 9) });
         try appendPathRequest(&stream, .{ .entity = requester, .kind = .group, .start_level = level, .goal_level = level, .start = cellWorld(2, 1), .goal = cellWorld(5, 8) });
     }
-    _ = try system.updateSerial(&stream, 8, .{});
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
     stream.clearRetainingCapacity();
     for ([_]u16{ 0, 1 }) |level| {
         try appendPathRequest(&stream, .{ .entity = requester, .start_level = level, .goal_level = level, .start = cellWorld(1, 1), .goal = cellWorld(10, 3) });
     }
-    _ = try system.updateSerial(&stream, 8, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &stream, 8, .{ .max_solve_admissions_per_step = 0 });
     const solved = [_]PathQueryKey{ system.graph.keyForWorld(0, cellWorld(9, 9), .default).?, system.graph.keyForWorld(1, cellWorld(9, 9), .default).? };
     const fields = [_]PathQueryKey{ system.graph.keyForWorld(0, cellWorld(5, 8), .default).?, system.graph.keyForWorld(1, cellWorld(5, 8), .default).? };
     for (solved, fields) |result_key, field_key| {
@@ -1197,7 +1198,7 @@ test "a level rebuilt by a content revision evicts only its own results and fiel
     try std.testing.expectEqual(@as(usize, 2), system.pending.len);
     for (0..system.pending.len) |index| try std.testing.expect(system.pending_keys.contains(system.pending.at(index).key));
     try expectRegistryMatchesCache(&system);
-    const answered = try system.updateSerial(&stream, 8, .{});
+    const answered = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), answered.available_results);
     try std.testing.expectEqual(@as(usize, 1), answered.unavailable_results);
 }
@@ -1251,10 +1252,10 @@ fn solveLinkedRoutes(system: *PathfindingSystem, data: *DataSystem, world: *cons
     }
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    _ = try system.updateSerial(&stream, 8, .{});
+    _ = try updatePathfindingInline(system, &stream, 8, .{});
     for (0..16) |_| {
         if (system.pending.len == 0) break;
-        _ = try system.updateSerial(&empty, 8, .{});
+        _ = try updatePathfindingInline(system, &empty, 8, .{});
     }
     for (keys) |key| try std.testing.expect(system.completed.slotIndex(key) != null);
     return keys;

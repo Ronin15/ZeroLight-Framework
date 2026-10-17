@@ -614,25 +614,6 @@ pub const CollisionSystem = struct {
         return stats;
     }
 
-    pub fn updateSerial(
-        self: *CollisionSystem,
-        data: *const DataSystem,
-        contacts: *RangeOutputStream(CollisionContact),
-    ) !CollisionStats {
-        return self.updateSerialScoped(data, contacts, null);
-    }
-
-    /// `update` on the calling thread alone over only the scoped bodies (null = all), at the
-    /// default strips.
-    pub fn updateSerialScoped(
-        self: *CollisionSystem,
-        data: *const DataSystem,
-        contacts: *RangeOutputStream(CollisionContact),
-        scope_dense_indices: ?[]const u32,
-    ) !CollisionStats {
-        return self.updateDirect(data, contacts, scope_dense_indices, .default);
-    }
-
     // The serial step: one fill straight into the keys, one band's sort, one sweep, and one
     // narrowphase range.
     fn updateDirect(
@@ -648,7 +629,7 @@ pub const CollisionSystem = struct {
             return stats;
         }
 
-        const broadphase = try self.buildBroadphaseCandidatesSerial(stats.entry_count);
+        const broadphase = try self.buildBroadphaseCandidatesDirect(stats.entry_count);
         stats.broadphase_batch = inlineBatch(stats.entry_count, collision_range_alignment_items);
         stats.broadphase_simd_groups = broadphase.simd_groups;
         stats.broadphase_visits = broadphase.visits;
@@ -1050,7 +1031,7 @@ pub const CollisionSystem = struct {
     // the scene needs, then grow once to it and replay (the sweep reads only const entry
     // columns), so the serial broadphase allocates nothing after warmup even when pairs
     // outnumber entries.
-    fn buildBroadphaseCandidatesSerial(self: *CollisionSystem, entry_count: usize) !BroadphaseBuildResult {
+    fn buildBroadphaseCandidatesDirect(self: *CollisionSystem, entry_count: usize) !BroadphaseBuildResult {
         var buffer = BroadphaseRangeBuffer{ .pairs = self.candidate_pairs };
         defer self.candidate_pairs = buffer.pairs;
         try buffer.pairs.ensureTotalCapacity(self.allocator, estimateBroadphasePairCapacity(entry_count, entry_count));
@@ -1873,6 +1854,18 @@ fn fillReferenceLayout(data: *DataSystem) !void {
     try Add.box(data, &count, .{ .x = 1004, .y = 4, .w = 10, .h = 10 });
 }
 
+// `CollisionSystem.update` over the scoped bodies (null = all), inline: a thread system with
+// no workers.
+fn updateScopedInline(system: *CollisionSystem, data: *const DataSystem, contacts: *RangeOutputStream(CollisionContact), scope_dense_indices: ?[]const u32) !CollisionStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    return system.update(data, contacts, &threads, .{ .scope_dense_indices = scope_dense_indices });
+}
+
+fn updateInline(system: *CollisionSystem, data: *const DataSystem, contacts: *RangeOutputStream(CollisionContact)) !CollisionStats {
+    return updateScopedInline(system, data, contacts, null);
+}
+
 test "collision contacts are stable and reject non-overlaps" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1885,7 +1878,7 @@ test "collision contacts are stable and reject non-overlaps" {
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
 
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
 
     try std.testing.expectEqual(@as(usize, 3), stats.body_count);
     try std.testing.expectEqual(@as(usize, 1), stats.candidate_pair_count);
@@ -1914,7 +1907,7 @@ test "collision broadphase filters y misses before narrowphase" {
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
 
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
 
     try std.testing.expectEqual(@as(usize, 1), stats.candidate_pair_count);
     try std.testing.expectEqual(@as(usize, 1), stats.contact_count);
@@ -1934,7 +1927,7 @@ test "collision broadphase uses simd groups while preserving contact order" {
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
 
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
     const merged = contacts.mergedItems();
 
     try std.testing.expect(stats.broadphase_simd_groups > 0);
@@ -1957,7 +1950,7 @@ test "serial contacts equal a brute-force same-level reference in every field an
     defer system.deinit();
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
     // Bodies over two or more strips have more than one entry.
     try std.testing.expect(stats.entry_count > stats.body_count);
     try expectSameContacts(expected, contacts.mergedItems());
@@ -2066,7 +2059,7 @@ test "warm and cold steps write identical contacts" {
     var serial_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer serial_contacts.deinit();
     _ = try warm.update(&data, &warm_contacts, &threads, config);
-    _ = try serial.updateSerial(&data, &serial_contacts);
+    _ = try updateInline(&serial, &data, &serial_contacts);
 
     // Every body moves, so the warm order is stale on both paths.
     const movement = data.movementBodySlice();
@@ -2078,7 +2071,7 @@ test "warm and cold steps write identical contacts" {
     defer std.testing.allocator.free(expected);
     try std.testing.expect(warm.warm_count == data.collisionBoundsSliceConst().entities.len and serial.warm_count == warm.warm_count);
     _ = try warm.update(&data, &warm_contacts, &threads, config);
-    _ = try serial.updateSerial(&data, &serial_contacts);
+    _ = try updateInline(&serial, &data, &serial_contacts);
     try expectSameContacts(expected, warm_contacts.mergedItems());
     try expectSameContacts(expected, serial_contacts.mergedItems());
 
@@ -2132,7 +2125,7 @@ test "a serial fill past its spill slot replays to the reference contacts" {
     defer system.deinit();
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
     try std.testing.expectEqual(@as(usize, 8 * 4), stats.entry_count);
     try std.testing.expect(expected.len > 0);
     try expectSameContacts(expected, contacts.mergedItems());
@@ -2282,7 +2275,7 @@ test "threaded collision matches serial contact order" {
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
-    _ = try serial_system.updateSerial(&serial_data, &serial_contacts);
+    _ = try updateInline(&serial_system, &serial_data, &serial_contacts);
     const threaded_stats = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
         .items_per_range = collision_range_alignment_items,
         .max_worker_threads = 2,
@@ -2320,10 +2313,10 @@ test "threaded collision records one sample into each stage tuner and none into 
     try std.testing.expectEqual(@as(usize, 64), stats.broadphase_batch.item_count);
     try std.testing.expect(stats.narrowphase_batch.item_count > 0);
     for ([_]*const AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner }) |tuner| {
-        try std.testing.expectEqual(@as(usize, 1), tuner.report().sample_count);
+        try std.testing.expectEqual(@as(usize, 1), tuner.sample_count);
         try std.testing.expect(tuner.last_request != null);
     }
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
     try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
@@ -2361,7 +2354,7 @@ test "threaded collision broadphase overflow-replay matches serial contacts" {
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
-    _ = try serial_system.updateSerial(&serial_data, &serial_contacts);
+    _ = try updateInline(&serial_system, &serial_data, &serial_contacts);
     const threaded_stats = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
         .items_per_range = collision_range_alignment_items,
         .max_worker_threads = 2,
@@ -2478,7 +2471,7 @@ test "collision update reuses warmed scratch without steady state allocation" {
     defer system.deinit();
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    _ = try system.updateSerial(&data, &contacts);
+    _ = try updateInline(&system, &data, &contacts);
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -2491,7 +2484,7 @@ test "collision update reuses warmed scratch without steady state allocation" {
         contacts.allocator = original_contacts_allocator;
     }
 
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
     try std.testing.expectEqual(@as(usize, 32), stats.body_count);
     try std.testing.expect(contacts.mergedItems().len > 0);
 }
@@ -2513,7 +2506,7 @@ test "serial collision broadphase warms clustered overflow without steady state 
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
 
-    const warm_stats = try system.updateSerial(&data, &contacts);
+    const warm_stats = try updateInline(&system, &data, &contacts);
     // Confirm the fixture actually exercises the overflow-regrow path.
     try std.testing.expect(warm_stats.candidate_pair_count > warm_stats.body_count);
 
@@ -2528,7 +2521,7 @@ test "serial collision broadphase warms clustered overflow without steady state 
         contacts.allocator = original_contacts_allocator;
     }
 
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
     try std.testing.expectEqual(@as(usize, 24), stats.body_count);
     try std.testing.expect(stats.candidate_pair_count > stats.body_count);
     try std.testing.expect(contacts.mergedItems().len > 0);
@@ -2625,7 +2618,7 @@ test "collision reserve makes the first serial update allocation-free" {
         contacts.allocator = original_contacts_allocator;
     }
 
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
     try std.testing.expectEqual(@as(usize, 4), stats.body_count);
     try std.testing.expectEqual(@as(usize, 2), contacts.mergedItems().len);
@@ -2680,7 +2673,7 @@ test "after reserve, threaded broad/narrowphase at 32- then 16-item ranges alloc
     defer reference.deinit();
     var reference_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer reference_contacts.deinit();
-    _ = try reference.updateSerial(&data, &reference_contacts);
+    _ = try updateInline(&reference, &data, &reference_contacts);
     const expected = reference_contacts.mergedItems();
     try std.testing.expect(expected.len > 0);
 
@@ -2732,7 +2725,7 @@ test "after reserve, ~2 pairs per body on the multi-worker path allocate nothing
     defer reference.deinit();
     var reference_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer reference_contacts.deinit();
-    const reference_stats = try reference.updateSerial(&data, &reference_contacts);
+    const reference_stats = try updateInline(&reference, &data, &reference_contacts);
     try std.testing.expectEqual(@as(usize, 2 * body_count - 3), reference_stats.candidate_pair_count);
     const expected = reference_contacts.mergedItems();
     try std.testing.expect(expected.len > body_count);
@@ -2787,7 +2780,7 @@ test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body
     defer reference.deinit();
     var reference_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer reference_contacts.deinit();
-    const reference_stats = try reference.updateSerial(&data, &reference_contacts);
+    const reference_stats = try updateInline(&reference, &data, &reference_contacts);
     try std.testing.expectEqual(@as(usize, 4 * body_count - 10), reference_stats.candidate_pair_count);
 
     var system = CollisionSystem.init(std.testing.allocator);
@@ -2845,7 +2838,7 @@ test "a broadphase slot replay within the total pair bound is counted" {
     defer reference.deinit();
     var reference_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer reference_contacts.deinit();
-    const reference_stats = try reference.updateSerial(&data, &reference_contacts);
+    const reference_stats = try updateInline(&reference, &data, &reference_contacts);
     try std.testing.expectEqual(@as(usize, 120 + 64), reference_stats.candidate_pair_count);
 
     var system = CollisionSystem.init(std.testing.allocator);
@@ -2888,7 +2881,7 @@ test "candidate pairs past the reserved pair bound are counted, even inside the 
     defer reference.deinit();
     var reference_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer reference_contacts.deinit();
-    const reference_stats = try reference.updateSerial(&data, &reference_contacts);
+    const reference_stats = try updateInline(&reference, &data, &reference_contacts);
     try std.testing.expectEqual(@as(usize, 28), reference_stats.candidate_pair_count);
     try std.testing.expect(!reference_stats.pair_bound_exceeded);
     try std.testing.expectEqual(@as(u64, 0), reference.pair_bound_overflows);
@@ -2906,7 +2899,7 @@ test "candidate pairs past the reserved pair bound are counted, even inside the 
 
     for (0..2) |step| {
         const stats = if (step == 0)
-            try system.updateSerial(&data, &contacts)
+            try updateInline(&system, &data, &contacts)
         else
             try system.update(&data, &contacts, &threads, .{});
         try std.testing.expect(stats.pair_bound_exceeded);
@@ -2917,7 +2910,7 @@ test "candidate pairs past the reserved pair bound are counted, even inside the 
     // A capacity whose bound covers the scene stops counting.
     try system.reserve(8);
     try std.testing.expectEqual(@as(usize, 32), system.reserved_pair_bound);
-    const covered = try system.updateSerial(&data, &contacts);
+    const covered = try updateInline(&system, &data, &contacts);
     try std.testing.expect(!covered.pair_bound_exceeded);
     try std.testing.expectEqual(@as(u64, 2), system.pair_bound_overflows);
 }
@@ -2938,7 +2931,7 @@ test "candidate pairs past the reserved pair bound are counted once per step on 
     defer reference.deinit();
     var reference_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer reference_contacts.deinit();
-    const reference_stats = try reference.updateSerial(&data, &reference_contacts);
+    const reference_stats = try updateInline(&reference, &data, &reference_contacts);
     try std.testing.expectEqual(@as(usize, 145), reference_stats.candidate_pair_count);
 
     var system = CollisionSystem.init(std.testing.allocator);
@@ -2982,7 +2975,7 @@ test "collision proxies and entries round capacity for cache-line range splittin
     defer system.deinit();
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
 
     // MultiArrayList columns are not 64-byte aligned; capacity is still rounded
     // for cache-line range splitting via hotStoreCapacity.
@@ -3006,7 +2999,7 @@ test "collision ignores XY overlap across different world_levels" {
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
 
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
     try std.testing.expectEqual(@as(usize, 2), stats.body_count);
     try std.testing.expectEqual(@as(usize, 0), stats.candidate_pair_count);
     try std.testing.expectEqual(@as(usize, 0), stats.contact_count);
@@ -3026,7 +3019,7 @@ test "collision same world_level still emits XY overlap contacts" {
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
 
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
     try std.testing.expectEqual(@as(usize, 1), stats.candidate_pair_count);
     try std.testing.expectEqual(@as(usize, 1), stats.contact_count);
     try std.testing.expectEqual(first.index, contacts.mergedItems()[0].a.index);
@@ -3055,7 +3048,7 @@ test "collision simd broadphase same-level gate filters mixed world_levels" {
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
 
-    const stats = try system.updateSerial(&data, &contacts);
+    const stats = try updateInline(&system, &data, &contacts);
     try std.testing.expect(stats.broadphase_simd_groups > 0);
 
     // Same-level only: level-0 pairs among {e0,e1,e4} (3) + level-1 {e2,e3} (1).
@@ -3086,7 +3079,7 @@ test "scope_dense_indices limits collision fill to scoped bounds rows" {
     defer contacts.deinit();
 
     const scope = [_]u32{1};
-    const stats = try system.updateSerialScoped(&data, &contacts, &scope);
+    const stats = try updateScopedInline(&system, &data, &contacts, &scope);
     try std.testing.expectEqual(@as(usize, 1), stats.body_count);
     try std.testing.expectEqual(@as(usize, 0), stats.candidate_pair_count);
     try std.testing.expectEqual(@as(usize, 0), stats.contact_count);

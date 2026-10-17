@@ -2230,7 +2230,8 @@ test "same-texture dynamic run straddling a static span interleaves by order" {
             }
         }.resolve,
     };
-    try batch.buildSerial(resolver);
+    try batch.ensureFrameStorage();
+    _ = batch.buildAssumeCapacity(resolver, null, .{});
     try std.testing.expectEqual(@as(usize, 2), batch.draw_groups.items.len);
 
     var list: std.ArrayList(DrawGroup) = .empty;

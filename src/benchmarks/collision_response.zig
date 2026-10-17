@@ -193,14 +193,11 @@ fn stageRunOnce(
     thread_system: ?*ThreadSystem,
     case: suite.BenchmarkCase,
 ) !CollisionResponseStats {
-    const stats = if (thread_system) |threads|
-        try system.update(&fixture.data, &fixture.frame, fixture.observer, threads, .{
-            .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
-            .max_worker_threads = case.maxWorkerThreads(),
-            .adaptive = case.adaptive,
-        })
-    else
-        try system.updateSerial(&fixture.data, &fixture.frame, fixture.observer);
+    const stats = try system.update(&fixture.data, &fixture.frame, fixture.observer, thread_system.?, .{
+        .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
+        .max_worker_threads = case.maxWorkerThreads(),
+        .adaptive = case.adaptive,
+    });
     std.debug.assert(stats.contact_count == fixture.frame.contacts.mergedItems().len);
     std.debug.assert(stats.intent_count == fixture.expected_intents);
     std.debug.assert(stats.trigger_count == fixture.expected_triggers);
@@ -213,13 +210,13 @@ fn stageRunOnce(
 // An inline-settled gather never dispatches the apply, so its tuner settles alone.
 fn stageTunersSettled(system: *const CollisionResponseSystem) bool {
     const gather = &system.gather_tuner;
-    return gather.isSettled() and (!gather.report().has_threaded_profile or system.apply_tuner.isSettled());
+    return (gather.phase == .settled) and (!gather.has_threaded_profile or (system.apply_tuner.phase == .settled));
 }
 
 fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
@@ -269,8 +266,8 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.apply_batch);
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.gather_tuner.report(), settled_before_measurement);
-        stats.secondary_work_tuning = suite.workTuningSummary(system.apply_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.gather_tuner), settled_before_measurement);
+        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.apply_tuner), settled_before_measurement);
     }
     return stats;
 }

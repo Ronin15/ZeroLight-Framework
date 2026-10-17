@@ -7,12 +7,9 @@
 //! order. Free functions over `*SteeringSystem`; its step calls `writeMovementIntents`.
 
 const std = @import("std");
-const BatchSelection = @import("../../../app/thread_system.zig").BatchSelection;
-const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
-const inlineBatch = @import("../../../app/thread_system.zig").inlineBatch;
 const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const math = @import("../../../core/math.zig");
@@ -56,17 +53,14 @@ const max_obstacle_work: u16 = 512;
 pub fn writeMovementIntents(
     self: *SteeringSystem,
     frame: *SimulationFrame,
-    threads: ?StageThreads,
+    threads: StageThreads,
     obstacles: ColliderView,
     steering: ConstSteeringAgentSlice,
     stats: *SteeringStats,
 ) !void {
     const count = stats.selected_intent_count;
-    const movement: ?Dispatch = if (threads) |stage| stage.stage(&self.adaptive_tuner) else null;
-    const selection: BatchSelection = if (movement) |stage|
-        stage.select(count, steering_range_alignment_items)
-    else
-        .{ .profile = .{ .worker_threads = 0, .items_per_range = count }, .items_per_range = count, .worker_threads = 0, .range_count = 1 };
+    const movement = threads.stage(&self.adaptive_tuner);
+    const selection = movement.select(count, steering_range_alignment_items);
     const range_count = selection.range_count;
     const work = selectedWorkSliceConst(self);
     const intent_base = try frame.intents.appendRangeCounts(range_count);
@@ -102,12 +96,7 @@ pub fn writeMovementIntents(
         .tallies = self.movement_tallies.items,
         .range_count = range_count,
     };
-    if (movement) |stage| {
-        stats.batch = stage.run(selection, count, steering_range_alignment_items, &context, writeSteeringMovementJob);
-    } else {
-        writeSteeringMovementJob(&context, .{ .index = 0, .start = 0, .end = count }, WorkerId.main);
-        stats.batch = inlineBatch(count, steering_range_alignment_items);
-    }
+    stats.batch = movement.run(selection, count, steering_range_alignment_items, &context, writeSteeringMovementJob);
     frame.intents.finishWrite();
     frame.path_requests.finishWrite();
 
@@ -432,6 +421,7 @@ const EntityId = @import("../../data_system.zig").EntityId;
 const NavigationIntent = @import("../../simulation.zig").NavigationIntent;
 const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
 const addSteeredEntity = @import("test_support.zig").addSteeredEntity;
+const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
 const addStaticObstacle = @import("test_support.zig").addStaticObstacle;
 const appendNavigationIntent = @import("test_support.zig").appendNavigationIntent;
 const appendNavigationIntents = @import("test_support.zig").appendNavigationIntents;
@@ -464,7 +454,7 @@ test "steering applies local agent and static obstacle avoidance" {
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     const movement = frame.intents.mergedItems()[0].movement;
     try std.testing.expect(stats.agent_neighbor_samples > 0);
     try std.testing.expect(stats.obstacle_samples > 0);
@@ -499,7 +489,7 @@ test "steering local agent avoidance ignores XY overlap across different world_l
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     const movement = frame.intents.mergedItems()[0].movement;
     try std.testing.expectEqual(@as(usize, 0), stats.agent_neighbor_samples);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), movement.direction_x, 0.001);
@@ -534,7 +524,7 @@ test "steering static obstacle avoidance ignores XY overlap across different wor
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const cross_stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const cross_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     const cross = frame.intents.mergedItems()[0].movement;
     // The other level's lists are never walked.
     try std.testing.expectEqual(@as(usize, 0), cross_stats.obstacle_candidate_checks);
@@ -546,7 +536,7 @@ test "steering static obstacle avoidance ignores XY overlap across different wor
     try commitStaticsForTest(&frame, &data, &colliders, &.{.{ .set_world_level = .{ .entity = obstacle, .level = 1 } }});
     steering.reactToPostCommitSteeringEvents(&frame);
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const same_stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const same_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     const same = frame.intents.mergedItems()[0].movement;
     try std.testing.expectEqual(@as(usize, 1), same_stats.obstacle_candidate_checks);
     try std.testing.expectEqual(@as(usize, 1), same_stats.obstacle_samples);
@@ -601,7 +591,7 @@ test "steering multi-level obstacle gate matches between serial and real threade
     var serial_system = SteeringSystem.init(std.testing.allocator);
     defer serial_system.deinit();
     try serial_system.reserve(128);
-    const serial_stats = try serial_system.updateSerial(&data, &serial_frame, &pathfinding, &colliders);
+    const serial_stats = try updateSteeringInline(&serial_system, &data, &serial_frame, &pathfinding, &colliders);
     const serial = serial_frame.intents.mergedItems();
     try std.testing.expect(serial.len > 0);
     try std.testing.expect(serial_stats.obstacle_samples > 0);
@@ -670,7 +660,7 @@ test "steering pushes from a static's committed position the step after its move
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const parked_stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const parked_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 0), parked_stats.obstacle_samples);
     try std.testing.expectApproxEqAbs(@as(f32, 0), frame.intents.mergedItems()[0].movement.direction_y, 0.001);
 
@@ -683,7 +673,7 @@ test "steering pushes from a static's committed position the step after its move
     } }});
     steering.reactToPostCommitSteeringEvents(&frame);
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const moved_stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const moved_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 1), moved_stats.obstacle_samples);
     // Pushed away from the box, toward +y.
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_y > 0.05);
@@ -738,7 +728,7 @@ test "steering obstacle pushes equal a scalar push over the query's hits" {
     for (&intents, agents) |*intent, agent| intent.* = .{ .entity = agent, .goal = .{ .x = 999, .y = 0 }, .direct_direction_x = 1 };
     frame.beginStep();
     try appendNavigationIntents(&frame, &intents);
-    const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
 
     // The reference: the direct direction plus the scalar push of each hit in query order.
     const view = colliders.view();
@@ -846,7 +836,7 @@ test "steering bounds dense crowd candidate checks" {
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expect(stats.agent_candidate_checks <= max_agent_candidate_checks);
     try std.testing.expect(stats.agent_neighbor_samples <= 256);
     try std.testing.expect(stats.agent_candidate_checks > 0);
@@ -877,7 +867,7 @@ test "steering stops the obstacle walk at the hit cap among dense co-located sta
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     // Every co-located static meets the query box, so each entry read is a hit: the walk
     // stops at the hit cap after reading `max_obstacle_hits` of the 128 entries.
     try std.testing.expectEqual(@as(usize, max_obstacle_hits), stats.obstacle_candidate_checks);
@@ -910,7 +900,7 @@ fn obstacleSamplesBehindFarEntries(far_count: usize) !usize {
     try steering.reserve(1);
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 999, .y = 300 }, .direct_direction_x = 1 });
-    const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expect(stats.obstacle_candidate_checks <= max_obstacle_work);
     return stats.obstacle_samples;
 }

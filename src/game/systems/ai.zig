@@ -14,8 +14,7 @@
 //! block per query kind, so consecutive rows of one cell (the think set is cell-major)
 //! share one walk.
 //!
-//! Serial and threaded paths run the same `writeAiSeparationJob`/`writeAiIntentsJob`; the
-//! serial path calls them on one full range.
+//! Inline and threaded dispatches run the same `writeAiSeparationJob`/`writeAiIntentsJob`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -31,7 +30,6 @@ const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
-const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const compactRowWindows = @import("../../app/thread_system.zig").compactRowWindows;
 const setRowCount = @import("../../app/thread_system.zig").setRowCount;
@@ -452,58 +450,6 @@ pub const AiSystem = struct {
         };
     }
 
-    /// True single-threaded twin of `update`: identical work, dispatched as a
-    /// single full-range call to the same `writeAiSeparationJob`/
-    /// `writeAiIntentsJob` functions `update` runs through
-    /// `parallelForWithOptions` (mirrors the existing
-    /// `computeAiSeparationsSerial` pattern) — arbitration and steering logic
-    /// live in exactly one place for both paths, not two hand-duplicated ones.
-    pub fn updateSerial(
-        self: *AiSystem,
-        ai_agents: ConstAiAgentSlice,
-        movement: ConstMovementBodySlice,
-        spatial: SpatialIndexView,
-        data: *DataSystem,
-        frame: *SimulationFrame,
-        delta_seconds: f32,
-        config: AiConfig,
-    ) !AiStats {
-        _ = delta_seconds;
-        const held_focus_target = self.resolveFocusTarget(config);
-        try self.gatherAiDataSerial(gatherInputs(ai_agents, movement, data, config, held_focus_target));
-        const entity_count = self.rows.len;
-        if (entity_count == 0) return .{};
-        self.resetSeparationScratch();
-        try self.computeAiSeparationsSerial(spatial, config.interest_markers);
-        const fills = self.sumBlockFills();
-        const gathered = self.rows.slice();
-        const rcount: usize = 1;
-        const navigation_stream = config.navigation_intents orelse &frame.navigation_intents;
-        const range_base = try navigation_stream.appendRangeCounts(rcount);
-        navigation_stream.addCount(range_base, entity_count);
-        try navigation_stream.prefixAppendedRanges(range_base);
-
-        var context = buildAiJobContext(gathered, navigation_stream, data, config, range_base, rcount);
-        writeAiIntentsJob(&context, .{ .index = 0, .start = 0, .end = entity_count }, WorkerId.main);
-
-        navigation_stream.finishWrite();
-        const separation_batch = inlineBatch(entity_count, ai_range_alignment_items);
-        const intent_batch = inlineBatch(entity_count, ai_range_alignment_items);
-        return .{
-            .entity_count = entity_count,
-            .intent_count = entity_count,
-            .navigation_intent_count = entity_count,
-            .separation_candidate_checks = sumU16(gathered.items(.separation_candidate_count)),
-            .separation_neighbor_samples = sumU8(gathered.items(.separation_neighbor_count)),
-            .separation_block_fills = fills.separation_block_fills,
-            .cohere_block_fills = fills.cohere_block_fills,
-            .gather_batch = inlineBatch(entity_count, ai_range_alignment_items),
-            .separation_batch = separation_batch,
-            .intent_batch = intent_batch,
-            .batch = separation_batch,
-        };
-    }
-
     // The gather over the think rows on workers under `gather_tuner`: each range writes its
     // rows' window, then main moves the windows together in range order.
     fn gatherAiData(self: *AiSystem, inputs: AiGatherInputs, thread_system: *ThreadSystem, config: AiConfig) !BatchStats {
@@ -520,16 +466,6 @@ pub const AiSystem = struct {
         const batch = gather.run(selection, n, ai_range_alignment_items, &context, gatherAiJob);
         compactRowWindows(AiGatherRow, AiRangeTally, &self.rows, self.range_tallies.items, selection.items_per_range);
         return batch;
-    }
-
-    // `gatherAiData` as one range on the calling thread.
-    fn gatherAiDataSerial(self: *AiSystem, inputs: AiGatherInputs) !void {
-        const n = try self.prepareGather(inputs);
-        if (n == 0) return;
-        try self.prepareRangeTallies(1);
-        var context = AiGatherContext{ .inputs = inputs, .rows = self.rows.slice(), .items_per_range = n, .tallies = self.range_tallies.items };
-        gatherAiJob(&context, .{ .index = 0, .start = 0, .end = n }, WorkerId.main);
-        compactRowWindows(AiGatherRow, AiRangeTally, &self.rows, self.range_tallies.items, n);
     }
 
     // Sizes the rows to one window slot per think row before dispatch; returns the count.
@@ -584,12 +520,6 @@ pub const AiSystem = struct {
         @memset(gathered.items(.separation_neighbor_count), 0);
         @memset(gathered.items(.separation_candidate_count), 0);
         @memset(gathered.items(.cohere), RowCohere{});
-    }
-
-    fn computeAiSeparationsSerial(self: *AiSystem, spatial: SpatialIndexView, markers: ?*const InterestMarkerStore) !void {
-        try self.prepareRangeTallies(1);
-        var context = buildAiSeparationContext(self.rows.slice(), spatial, self.range_tallies.items, markers);
-        writeAiSeparationJob(&context, .{ .index = 0, .start = 0, .end = self.rows.len }, WorkerId.main);
     }
 };
 
@@ -793,9 +723,7 @@ fn buildAiSeparationContext(
     };
 }
 
-/// Builds the shared per-row job context both `update` (via
-/// `parallelForWithOptions`) and `updateSerial` (via a single full-range
-/// call) hand to `writeAiIntentsJob`. `ai_agent_hot` is arbitration's mutable
+/// Builds the per-row job context `update` hands to `writeAiIntentsJob`. `ai_agent_hot` is arbitration's mutable
 /// hot-column write-back target (see `resolveRowArbitration`); each row's
 /// `agent_dense_index` is unique within one gather, so concurrent workers
 /// never write the same hot-column slot.
@@ -1295,6 +1223,36 @@ fn expectAiGatherColumnsAligned(rows: *const std.MultiArrayList(AiGatherRow)) !v
     try std.testing.expectEqual(count, s.items(.resolved).len);
 }
 
+// `AiSystem.update` inline as one range: a thread system with no workers.
+fn updateInline(
+    system: *AiSystem,
+    ai_agents: ConstAiAgentSlice,
+    movement: ConstMovementBodySlice,
+    spatial: SpatialIndexView,
+    data: *DataSystem,
+    frame: *SimulationFrame,
+    delta_seconds: f32,
+    config: AiConfig,
+) !AiStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    return system.update(ai_agents, movement, spatial, data, frame, &threads, delta_seconds, config);
+}
+
+// `AiSystem.gatherAiData` inline as one range: a thread system with no workers.
+fn gatherInline(system: *AiSystem, inputs: AiGatherInputs) !void {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    _ = try system.gatherAiData(inputs, &threads, .{});
+}
+
+// The unstaggered think set over `view`, compacted inline.
+fn thinkSetInline(scope: *SimulationScopeSystem, view: *const SpatialIndexView) ![]const u32 {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    return (try scope.compactCognition(view, 0, false, &threads, .{})).cognition;
+}
+
 test "ai gather rows keep MAL columns compact after gather" {
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1316,7 +1274,7 @@ test "ai gather rows keep MAL columns compact after gather" {
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 0xabc,
         .focus_target = .{ .x = 100, .y = 100 },
     });
@@ -1353,7 +1311,7 @@ test "ai processor emits deterministic NavigationIntent for same seed" {
     frame.beginStep();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    _ = try ai_sys.updateSerial(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 0x12345678 });
+    _ = try updateInline(&ai_sys, ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 0x12345678 });
     const serial_intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 2), serial_intents.len);
     try std.testing.expectEqual(e0.index, serial_intents[0].entity.index); // order by append in gather (stable)
@@ -1372,7 +1330,7 @@ test "ai processor emits deterministic NavigationIntent for same seed" {
 
     // Different seed produces different (or at least reproducible other) dirs
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 0xdeadbeef });
+    _ = try updateInline(&ai_sys, ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 0xdeadbeef });
     const other = frame.navigation_intents.mergedItems();
     // Not strictly required different but for coverage; allow equal only if degenerate
     _ = other;
@@ -1399,7 +1357,7 @@ test "ai goal requantization: zero hysteresis snaps to the live target every ste
     try frame.reserveStreams(1, 0, 3, 0, 0, 0);
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 100, .y = 100 },
         .focus_entity = target,
@@ -1411,7 +1369,7 @@ test "ai goal requantization: zero hysteresis snaps to the live target every ste
 
     // Even a tiny displacement snaps immediately with the default (0) hysteresis.
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 105, .y = 100 },
         .focus_entity = target,
@@ -1444,7 +1402,7 @@ test "ai goal requantization: nonzero hysteresis holds the goal until displaceme
     const hysteresis: f32 = 50;
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 100, .y = 100 },
         .focus_entity = target,
@@ -1457,7 +1415,7 @@ test "ai goal requantization: nonzero hysteresis holds the goal until displaceme
 
     // 20px displacement stays under the 50px threshold: goal holds.
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 120, .y = 100 },
         .focus_entity = target,
@@ -1470,7 +1428,7 @@ test "ai goal requantization: nonzero hysteresis holds the goal until displaceme
 
     // 100px displacement from the held goal clears the 50px threshold: goal snaps.
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 200, .y = 100 },
         .focus_entity = target,
@@ -1512,7 +1470,7 @@ test "ai goal requantization: decideDir's steering target is the same held goal 
     const hysteresis: f32 = 1000;
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 100, .y = 0 },
         .focus_entity = target,
@@ -1529,7 +1487,7 @@ test "ai goal requantization: decideDir's steering target is the same held goal 
     // 1000px hysteresis so the goal holds -- and so does the steering
     // direction, since both now derive from the same held goal.
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 0, .y = 100 },
         .focus_entity = target,
@@ -1572,7 +1530,7 @@ test "ai processor appends navigation intents without clearing existing stream o
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 2 });
+    const stats = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 2 });
 
     const intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 1), stats.intent_count);
@@ -1629,7 +1587,7 @@ test "ai stages stay inline when their batches sit below their tuner gate" {
     defer frame.deinit();
     try frame.reserveStreams(4, 0, agent_count, 0, 0, 0);
 
-    const warmup_windows = ai_sys.intent_tuner.report().sample_window * 4;
+    const warmup_windows = ai_sys.intent_tuner.config.sample_window * 4;
     var last_stats: AiStats = .{};
     var window: usize = 0;
     while (window < warmup_windows) : (window += 1) {
@@ -1729,10 +1687,10 @@ test "ai update records one sample into each stage tuner and none into the share
     const stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, .{ .intent_seed = 3 });
     try std.testing.expectEqual(@as(usize, 128), stats.intent_count);
     for ([_]*const AdaptiveWorkTuner{ &ai_sys.gather_tuner, &ai_sys.separation_tuner, &ai_sys.intent_tuner }) |tuner| {
-        try std.testing.expectEqual(@as(usize, 1), tuner.report().sample_count);
+        try std.testing.expectEqual(@as(usize, 1), tuner.sample_count);
         try std.testing.expect(tuner.last_request != null);
     }
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
     try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
@@ -1772,7 +1730,7 @@ test "ai wander direction resamples across steps but stays deterministic for a f
     defer frame_a.deinit();
     try frame_a.reserveStreams(1, 0, 3, 0, 0, 0);
     frame_a.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_a, 0.016, .{ .intent_seed = 0x1234abcd, .step = 5, .wander_resample_period_steps = 1 });
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame_a, 0.016, .{ .intent_seed = 0x1234abcd, .step = 5, .wander_resample_period_steps = 1 });
     const step5_first = frame_a.navigation_intents.mergedItems()[0];
     frame_a.phase = .finished;
 
@@ -1780,7 +1738,7 @@ test "ai wander direction resamples across steps but stays deterministic for a f
     defer frame_b.deinit();
     try frame_b.reserveStreams(1, 0, 3, 0, 0, 0);
     frame_b.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_b, 0.016, .{ .intent_seed = 0x1234abcd, .step = 5, .wander_resample_period_steps = 1 });
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame_b, 0.016, .{ .intent_seed = 0x1234abcd, .step = 5, .wander_resample_period_steps = 1 });
     const step5_second = frame_b.navigation_intents.mergedItems()[0];
     frame_b.phase = .finished;
 
@@ -1791,7 +1749,7 @@ test "ai wander direction resamples across steps but stays deterministic for a f
     defer frame_c.deinit();
     try frame_c.reserveStreams(1, 0, 3, 0, 0, 0);
     frame_c.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_c, 0.016, .{ .intent_seed = 0x1234abcd, .step = 9, .wander_resample_period_steps = 1 });
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame_c, 0.016, .{ .intent_seed = 0x1234abcd, .step = 9, .wander_resample_period_steps = 1 });
     const step9 = frame_c.navigation_intents.mergedItems()[0];
     frame_c.phase = .finished;
 
@@ -1823,7 +1781,7 @@ test "ai wander direction holds steady within a resample epoch then changes at t
     defer frame_a.deinit();
     try frame_a.reserveStreams(1, 0, 3, 0, 0, 0);
     frame_a.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_a, 0.016, .{ .intent_seed = 0x1234abcd, .step = 0, .wander_resample_period_steps = period });
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame_a, 0.016, .{ .intent_seed = 0x1234abcd, .step = 0, .wander_resample_period_steps = period });
     const early = frame_a.navigation_intents.mergedItems()[0];
     frame_a.phase = .finished;
 
@@ -1831,7 +1789,7 @@ test "ai wander direction holds steady within a resample epoch then changes at t
     defer frame_b.deinit();
     try frame_b.reserveStreams(1, 0, 3, 0, 0, 0);
     frame_b.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_b, 0.016, .{ .intent_seed = 0x1234abcd, .step = period - 1, .wander_resample_period_steps = period });
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame_b, 0.016, .{ .intent_seed = 0x1234abcd, .step = period - 1, .wander_resample_period_steps = period });
     const still_within_epoch = frame_b.navigation_intents.mergedItems()[0];
     frame_b.phase = .finished;
 
@@ -1842,7 +1800,7 @@ test "ai wander direction holds steady within a resample epoch then changes at t
     defer frame_c.deinit();
     try frame_c.reserveStreams(1, 0, 3, 0, 0, 0);
     frame_c.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_c, 0.016, .{ .intent_seed = 0x1234abcd, .step = period, .wander_resample_period_steps = period });
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame_c, 0.016, .{ .intent_seed = 0x1234abcd, .step = period, .wander_resample_period_steps = period });
     const next_epoch = frame_c.navigation_intents.mergedItems()[0];
     frame_c.phase = .finished;
 
@@ -1890,7 +1848,7 @@ test "ai processor no steady-state allocation (FailingAllocator)" {
 
     frame.beginStep();
     // Should reuse reserved; no alloc in hot emit path.
-    _ = try ai_sys.updateSerial(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 1 });
+    _ = try updateInline(&ai_sys, ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 1 });
     try std.testing.expect(frame.navigation_intents.mergedItems().len == 1);
     frame.phase = .finished;
 }
@@ -2011,7 +1969,7 @@ test "ai think-set gather over a halo index has no steady-state allocation after
     }
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, cfg);
+    _ = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, cfg);
     try std.testing.expectEqual(@as(usize, 2), ai_sys.rows.len);
     frame.phase = .finished;
 }
@@ -2041,7 +1999,7 @@ test "ai sparse high entity index does not allocate during warmed gather" {
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     frame.beginStep();
-    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 1 });
+    _ = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 1 });
     frame.phase = .finished;
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
@@ -2058,7 +2016,7 @@ test "ai sparse high entity index does not allocate during warmed gather" {
     }
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 2 });
+    _ = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 2 });
     try std.testing.expectEqual(@as(usize, 1), frame.navigation_intents.mergedItems().len);
     frame.phase = .finished;
 }
@@ -2120,7 +2078,7 @@ test "ai memory-retargeted seek has no steady-state allocation after warmup (Fai
     }
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
 
     const intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 1), intents.len);
@@ -2182,7 +2140,7 @@ test "ai investigate targets world interest marker without entity goal" {
     defer ai_sys.deinit();
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
     frame.phase = .finished;
 
     const intents = frame.navigation_intents.mergedItems();
@@ -2221,8 +2179,10 @@ test "ai interest gate skips the marker scan for a zero-investigate-gain row" {
     defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiDataSerial(.{ .ai_slice = ai_slice, .movement = move_slice, .data = &data });
-    try ai_sys.computeAiSeparationsSerial(spatial_sys.view(), &markers);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .interest_markers = &markers });
 
     const rows = ai_sys.rows.slice();
     const entities = rows.items(.entity);
@@ -2267,8 +2227,10 @@ test "ai factionless agent never discovers a faction-restricted marker" {
     defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiDataSerial(.{ .ai_slice = ai_slice, .movement = move_slice, .data = &data });
-    try ai_sys.computeAiSeparationsSerial(spatial_sys.view(), &markers);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .interest_markers = &markers });
 
     const rows = ai_sys.rows.slice();
     const entities = rows.items(.entity);
@@ -2329,7 +2291,7 @@ test "ai investigate ignores cover resource and patrol markers for goals" {
     defer ai_sys.deinit();
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
 
     const intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 1), intents.len);
@@ -2395,7 +2357,7 @@ test "ai null interest_markers leaves investigate on stimulus and ring only" {
     defer ai_sys.deinit();
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
     frame.phase = .finished;
 
     const intents = frame.navigation_intents.mergedItems();
@@ -2440,7 +2402,7 @@ test "ai gather direct table and separation blend produce correct order + dirs (
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     // Use explicit seek_target (not COM) + seed; gather must pick prior pos for exactly the 3 ai in ai order.
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 0xaaa,
         .focus_target = .{ .x = 200, .y = 150 },
     });
@@ -2491,7 +2453,7 @@ test "ai serial and threaded (0 workers) produce identical intents with separati
     serial_frame.beginStep();
     var serial_ai = AiSystem.init(std.testing.allocator);
     defer serial_ai.deinit();
-    _ = try serial_ai.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, cfg);
+    _ = try updateInline(&serial_ai, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, cfg);
     const serial = serial_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 2), serial.len);
 
@@ -2551,7 +2513,7 @@ test "ai serial and real threaded workers produce identical rows and intents on 
     var scope = SimulationScopeSystem.init(std.testing.allocator);
     defer scope.deinit();
     // The think set in the index's cell-major order, as the pipeline orders it.
-    const think_set = (try scope.compactCognitionSerial(&serial_view, 0, false)).cognition;
+    const think_set = try thinkSetInline(&scope, &serial_view);
     try std.testing.expect(think_set.len > 100);
 
     const base_cfg: AiConfig = .{ .intent_seed = 0x1234abcd, .focus_target = .{ .x = 300, .y = 200 }, .scope_dense_indices = think_set };
@@ -2561,7 +2523,7 @@ test "ai serial and real threaded workers produce identical rows and intents on 
     defer serial_frame.deinit();
     try serial_frame.reserveStreams(16, 0, 140, 0, 0, 0);
     serial_frame.beginStep();
-    const serial_stats = try serial_ai.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_view, &serial_data, &serial_frame, 0.016, base_cfg);
+    const serial_stats = try updateInline(&serial_ai, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_view, &serial_data, &serial_frame, 0.016, base_cfg);
     const serial = serial_frame.navigation_intents.mergedItems();
     const serial_rows = serial_ai.rows.slice();
     var cohere_rows: usize = 0;
@@ -2636,7 +2598,9 @@ test "the threaded gather writes every row the serial gather does, skipping bodi
 
     var serial_ai = AiSystem.init(std.testing.allocator);
     defer serial_ai.deinit();
-    try serial_ai.gatherAiDataSerial(inputs);
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer inline_threads.deinit();
+    _ = try serial_ai.gatherAiData(inputs, &inline_threads, .{});
     // Every eleventh agent has no body.
     try std.testing.expectEqual(@as(usize, 140 - 12), serial_ai.rows.len);
     for ([_]usize{ 16, 48 }) |items_per_range| {
@@ -2669,14 +2633,14 @@ test "rows of one cell fill one separation block, and cohere rows of one cell on
     const view = spatial_sys.view();
     var scope = SimulationScopeSystem.init(std.testing.allocator);
     defer scope.deinit();
-    const think_set = (try scope.compactCognitionSerial(&view, 0, false)).cognition;
+    const think_set = try thinkSetInline(&scope, &view);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(2, 0, 16, 0, 0, 0);
     frame.beginStep();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), view, &data, &frame, 0.016, .{ .scope_dense_indices = think_set });
+    const stats = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), view, &data, &frame, 0.016, .{ .scope_dense_indices = think_set });
     try std.testing.expectEqual(@as(usize, 12), stats.entity_count);
     try std.testing.expectEqual(cells.len, stats.separation_block_fills);
     try std.testing.expectEqual(cells.len, stats.cohere_block_fills);
@@ -2684,7 +2648,7 @@ test "rows of one cell fill one separation block, and cohere rows of one cell on
     // Rows interleaving the cells refill at every key change: A B C A B C A B C A C C.
     const shuffled = [_]u32{ 0, 4, 7, 1, 5, 8, 2, 6, 9, 3, 10, 11 };
     frame.beginStep();
-    const shuffled_stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), view, &data, &frame, 0.016, .{ .scope_dense_indices = &shuffled });
+    const shuffled_stats = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), view, &data, &frame, 0.016, .{ .scope_dense_indices = &shuffled });
     try std.testing.expectEqual(@as(usize, 11), shuffled_stats.separation_block_fills);
 }
 
@@ -2722,7 +2686,7 @@ test "ai spatial separation caps dense neighbor samples" {
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     frame.beginStep();
-    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
+    const stats = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 100, .y = 100 },
     });
@@ -2773,7 +2737,7 @@ test "ai spatial separation finds neighbors past the grid edge at negative coord
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     frame.beginStep();
-    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
+    const stats = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 0, .y = 0 },
     });
@@ -2816,7 +2780,7 @@ test "think rows skip themselves and find halo neighbors" {
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
+    const stats = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
         .scope_dense_indices = &think,
     });
 
@@ -2861,7 +2825,7 @@ test "separation and cohere read only the row's level, and cohere only friendly 
     defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiDataSerial(.{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data });
+    try gatherInline(&ai_sys, .{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data });
     const context = buildAiSeparationContext(ai_sys.rows.slice(), spatial_sys.view(), ai_sys.range_tallies.items, null);
     var separation_block = SeparationBlock{};
     var cohere_block = CohereBlock{};
@@ -2946,7 +2910,7 @@ test "ai computeBoundedSeparation matches a one-cell lane-order reference bit-fo
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiDataSerial(.{ .ai_slice = ai_slice, .movement = movement_slice, .data = &data });
+    try gatherInline(&ai_sys, .{ .ai_slice = ai_slice, .movement = movement_slice, .data = &data });
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
@@ -3031,7 +2995,7 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered lane oracle across
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiDataSerial(.{ .ai_slice = ai_slice, .movement = movement_slice, .data = &data });
+    try gatherInline(&ai_sys, .{ .ai_slice = ai_slice, .movement = movement_slice, .data = &data });
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
@@ -3094,7 +3058,7 @@ test "cohere finds its ally past more hostiles than its check budget" {
     defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiDataSerial(.{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data });
+    try gatherInline(&ai_sys, .{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data });
     const context = buildAiSeparationContext(ai_sys.rows.slice(), spatial_sys.view(), ai_sys.range_tallies.items, null);
     var cohere_block = CohereBlock{};
     const cohere = computeCohereNeighbors(&context, 0, &cohere_block);
@@ -3116,7 +3080,7 @@ test "cohere caps at its neighbor count, summing the first in scan order in lane
     defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiDataSerial(.{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data });
+    try gatherInline(&ai_sys, .{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data });
     const gathered = ai_sys.rows.slice();
     const context = buildAiSeparationContext(gathered, spatial_sys.view(), ai_sys.range_tallies.items, null);
     var cohere_block = CohereBlock{};
@@ -3165,7 +3129,7 @@ test "ai seek retargets toward fresh AiMemory last-known position when perceptio
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         // Distinct from the memory position (0, 100) so a wrong fallback is
         // trivially distinguishable: seek_target implies heading (1, 0),
@@ -3227,7 +3191,7 @@ test "ai emits .individual for every resolved goal even when nav_request_kind is
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 100, .y = 0 },
         .nav_request_kind = .group,
@@ -3296,7 +3260,7 @@ test "ai seek keeps the default seek target when memory can't override it" {
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 100, .y = 0 },
         .focus_entity = remembered_target,
@@ -3347,7 +3311,7 @@ test "ai memory override does not apply while perception still reports the targe
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 100, .y = 0 },
         .perception_slice = data.aiPerceptionSliceConst(),
@@ -3395,7 +3359,7 @@ test "ai serial and threaded (0 workers) agree on a memory-overridden seek targe
     defer serial_frame.deinit();
     try serial_frame.reserveStreams(1, 0, 2, 0, 0, 0);
     serial_frame.beginStep();
-    _ = try serial_ai.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, .{
+    _ = try updateInline(&serial_ai, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 100, .y = 0 },
         .perception_slice = serial_data.aiPerceptionSliceConst(),
@@ -3468,7 +3432,7 @@ test "arbitration pursue resolves from a non-player hostile entity, not context.
     try frame.reserveStreams(1, 0, 2, 0, 0, 0);
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         // Opt-in fallback wired exactly like the demo's player broadcast --
         // must lose to the visible hostile.
@@ -3507,7 +3471,7 @@ test "arbitration graceful degrade to wander when perception/memory/affect are a
     try frame.reserveStreams(1, 0, 2, 0, 0, 0);
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 7 });
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 7 });
 
     const intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 1), intents.len);
@@ -3551,7 +3515,7 @@ test "invalid pursue goal writes wander active_behavior so fatigue does not trea
     try frame.reserveStreams(1, 0, 2, 0, 0, 0);
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .perception_slice = data.aiPerceptionSliceConst(),
     });
@@ -3618,7 +3582,7 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
     defer serial_frame.deinit();
     try serial_frame.reserveStreams(4, 0, 12, 0, 0, 0);
     serial_frame.beginStep();
-    _ = try serial_ai.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, .{
+    _ = try updateInline(&serial_ai, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, .{
         .intent_seed = 0x51de51de,
         .step = 3,
         .perception_slice = serial_data.aiPerceptionSliceConst(),
@@ -3705,7 +3669,7 @@ test "arbitration cohere goal is the mean of friendly spatial neighbors" {
     try frame.reserveStreams(1, 0, 4, 0, 0, 0);
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 1 });
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 1 });
 
     const intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 4), intents.len);
@@ -3772,6 +3736,6 @@ test "arbitration call path has no steady-state allocation after warmup (Failing
     }
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
+    _ = try updateInline(&ai_sys, ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
     try std.testing.expectEqual(@as(usize, 1), frame.navigation_intents.mergedItems().len);
 }

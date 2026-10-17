@@ -384,7 +384,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 // step is one solve. Items/s is requests answered, not solves.
 fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     // The field threshold above every sharer count (the agent ceiling clamps it), so the
@@ -397,11 +397,11 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     setPathStageTuners(system, case);
 
     var warm = suite.Warmup.custom(case, 1 + coldWarmup(options), coldSettleLimit(options));
-    while (warm.next(system.tuners.solve.isSettled())) {
+    while (warm.next(system.tuners.solve.phase == .settled)) {
         system.clearRuntimeState();
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
     }
-    const settled = if (case.adaptive) system.tuners.solve.isSettled() else false;
+    const settled = if (case.adaptive) (system.tuners.solve.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -417,7 +417,7 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.output_count = last_stats.available_results + last_stats.unavailable_results + last_stats.duplicate_requests + last_stats.cache_hits;
     stats.candidate_pairs = last_stats.duplicate_requests + last_stats.cache_hits;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), settled);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), settled);
     return stats;
 }
 
@@ -444,7 +444,7 @@ const hard_fallback_admissions: usize = 128;
 
 fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     var fixture = try initRequestFixture(allocator, io, workload, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
@@ -460,11 +460,11 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     const measure_count = if (mode.isCold()) coldIterations(options) else options.iterations;
     // Only a cold mode settles: the hot cache's steps never train the solve tuner.
     var warm = suite.Warmup.custom(case, warmup_count, if (mode.isCold()) coldSettleLimit(options) else 0);
-    while (warm.next(system.tuners.solve.isSettled())) {
+    while (warm.next(system.tuners.solve.phase == .settled)) {
         if (mode.isCold()) system.clearRuntimeState();
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
     }
-    const settled_before_measurement = if (case.adaptive) system.tuners.solve.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) (system.tuners.solve.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -503,7 +503,7 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     }
     stats.items_per_second = suite.itemsPerSecond(serviced, stats.mean_ns);
     if (case.adaptive and mode.isCold()) {
-        stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), settled_before_measurement);
     }
     return stats;
 }
@@ -514,7 +514,7 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     // The refill step solves one ceiling; a full-ceiling drain step needs another behind it.
     if (item_count < 2 * default_max_solves_per_frame) return error.DrainQueueBelowTwoCeilings;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     var fixture = try initRequestFixture(allocator, io, .unique_open, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
@@ -561,7 +561,7 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.candidate_pairs = last_stats.solved_requests;
     stats.deferred_count = last_stats.pending_requests;
     stats.items_per_second = suite.itemsPerSecond(last_stats.solved_requests, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), false);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), false);
     return stats;
 }
 
@@ -583,7 +583,7 @@ fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathReq
         steps += 1;
         const all_hits = stats.cache_hits == item_count;
         if (!all_hits and steps > fill_limit) return error.HotCacheNotWarm;
-        const tuner_ready = !case.adaptive or system.tuners.intake.isSettled() or steps >= settle_limit;
+        const tuner_ready = !case.adaptive or (system.tuners.intake.phase == .settled) or steps >= settle_limit;
         if (all_hits and tuner_ready) return;
     }
 }
@@ -626,7 +626,7 @@ fn runQueries(ctx: *QueryContext, thread_system: ?*ThreadSystem, case: suite.Ben
 // its own cached path, so the waypoint scan has a deep match to find.
 fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     var fixture = try initRequestFixture(allocator, io, .unique_open, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
@@ -635,7 +635,7 @@ fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     // Warm: the per-step solve ceiling caps each step, so enough steps drain the queue.
     const warm_steps = item_count / default_max_solves_per_frame + 4;
-    for (0..warm_steps) |_| _ = try system.updateSerial(&fixture.requests, item_count, .{});
+    for (0..warm_steps) |_| _ = try system.update(&fixture.requests, item_count, thread_ptr.?, .{});
 
     const starts = try allocator.alloc(math.Vec2, item_count);
     defer allocator.free(starts);
@@ -717,7 +717,7 @@ fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const side = std.math.cast(u16, item_count) orelse return error.EscalatedDetourSideTooWide;
     if (side % default_chunk_size_tiles != 0 or side < 4 * default_chunk_size_tiles) return error.EscalatedDetourSideNotChunked;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const open = try buildDetourWorld(allocator, io, side);
@@ -861,7 +861,7 @@ fn packCapacity(agent_count: usize, participant_count: usize) PathfindingCapacit
 // the same pack and every member samples the field.
 fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
@@ -927,7 +927,7 @@ const MovingTotals = struct {
 fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     // Fixed cycle counts: --warmup and --iterations do not apply.
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
@@ -968,7 +968,7 @@ fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io: std
     // Fixed cycle counts: --warmup and --iterations do not apply.
     _ = options;
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
@@ -1051,7 +1051,7 @@ fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Opt
     const packs = item_count;
     if (packs == 0 or group_field_pack_side / packs < group_field_pack_band_min) return error.GroupFieldPacksTooMany;
     const agent_count = packs * group_field_pack_agents;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
@@ -1184,7 +1184,7 @@ fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOut
 fn runGroupFieldTunnelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const agent_count = group_field_tunnel_fields * group_field_tunnel_agents;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 

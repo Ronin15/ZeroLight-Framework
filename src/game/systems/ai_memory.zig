@@ -13,7 +13,7 @@
 //! member bitmap, workers extract each range's set bits in order, and main compacts the
 //! windows. Decay gathers four rows per lane group.
 //!
-//! Order within one `update`/`updateSerial`:
+//! Order within one `update`:
 //! 1. Decay over the gathered set.
 //! 2. Event refresh, after decay so a same-step acquire or loss lands at `staleness == 0`. It
 //!    reads every `domain_reaction` event, not only the gathered set's; perception emits only
@@ -193,24 +193,13 @@ pub const AiMemorySystem = struct {
         return self.step(ai_agents, data, frame, .{ .thread_system = thread_system, .config = config }, config.scope_dense_indices);
     }
 
-    pub fn updateSerial(
-        self: *AiMemorySystem,
-        ai_agents: ConstAiAgentSlice,
-        data: *DataSystem,
-        frame: *SimulationFrame,
-        config: AiMemoryConfig,
-    ) !AiMemoryStats {
-        return self.step(ai_agents, data, frame, null, config.scope_dense_indices);
-    }
-
-    // One body for both paths: each stage runs under its own tuner with `threads`, or
-    // inline as one range without.
+    // Each stage runs under its own tuner on `threads`.
     fn step(
         self: *AiMemorySystem,
         ai_agents: ConstAiAgentSlice,
         data: *DataSystem,
         frame: *SimulationFrame,
-        threads: ?MemoryThreads,
+        threads: MemoryThreads,
         think: ?[]const u32,
     ) !AiMemoryStats {
         self.memory_dense_indices.clearRetainingCapacity();
@@ -227,12 +216,12 @@ pub const AiMemorySystem = struct {
             self.think_rows.items.len = think_count;
             self.think_perception_rows.items.len = think_count;
             var translate = TranslateJob{ .think = think, .entities = ai_agents.entities, .data = data, .out = self.think_rows.items, .out_perception = self.think_perception_rows.items };
-            stats.gather_batch = runStage(stageOf(threads, &self.gather_tuner), think_count, ai_memory_range_alignment_items, &translate, &translate.range_count, translateJob);
+            stats.gather_batch = runStage(threads.stage(&self.gather_tuner), think_count, ai_memory_range_alignment_items, &translate, &translate.range_count, translateJob);
 
             const members = self.mark(row_count);
             if (members != 0) {
                 self.collectTouchedWords(row_count);
-                stats.order_batch = self.orderMembers(row_count, stageOf(threads, &self.order_tuner));
+                stats.order_batch = self.orderMembers(row_count, threads.stage(&self.order_tuner));
                 std.debug.assert(self.memory_dense_indices.items.len == members and self.perception_dense_indices.items.len == members);
                 self.unmark();
             }
@@ -240,14 +229,14 @@ pub const AiMemorySystem = struct {
             var decay = AiMemoryDecayContext{ .slice = memory_slice, .indices = self.memory_dense_indices.items };
             // Range alignment 1: the indexed gather/scatter path processes each row
             // independently of any contiguous-range shape.
-            stats.batch = runStage(stageOf(threads, &self.decay_tuner), members, 1, &decay, &decay.range_count, aiMemoryDecayJob);
+            stats.batch = runStage(threads.stage(&self.decay_tuner), members, 1, &decay, &decay.range_count, aiMemoryDecayJob);
             stats.processed_count = members;
         }
 
         stats.refreshed_count = refreshFromEvents(data, &memory_slice, perception_slice, frame);
 
         var visible = VisibleJob{ .memory = memory_slice, .perception = perception_slice, .rows = self.memory_dense_indices.items, .perception_rows = self.perception_dense_indices.items };
-        stats.visible_batch = runStage(stageOf(threads, &self.visible_tuner), visible.rows.len, 1, &visible, &visible.range_count, visibleJob);
+        stats.visible_batch = runStage(threads.stage(&self.visible_tuner), visible.rows.len, 1, &visible, &visible.range_count, visibleJob);
         return stats;
     }
 
@@ -411,12 +400,6 @@ pub const AiMemorySystem = struct {
         }
     }
 };
-
-// One stage under its own tuner with `threads`, or inline without.
-fn stageOf(threads: ?MemoryThreads, tuner: *AdaptiveWorkTuner) ?Dispatch {
-    const held = threads orelse return null;
-    return held.stage(tuner);
-}
 
 const TranslateJob = struct {
     think: ?[]const u32,
@@ -756,6 +739,13 @@ fn appendLostEvent(frame: *SimulationFrame, observer: EntityId, target: EntityId
     try frame.events.appendRequired(.{ .stage = .domain_reaction, .payload = .{ .entity_lost = .{ .observer = observer, .target = target } } });
 }
 
+// `AiMemorySystem.update` inline as one range: a thread system with no workers.
+fn updateInline(system: *AiMemorySystem, ai_agents: ConstAiAgentSlice, data: *DataSystem, frame: *SimulationFrame, config: AiMemoryConfig) !AiMemoryStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    return system.update(ai_agents, data, frame, &threads, config);
+}
+
 test "AiMemorySystem refreshes from a perception-acquired event and snapshots on lost" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
@@ -794,7 +784,7 @@ test "AiMemorySystem refreshes from a perception-acquired event and snapshots on
     );
     frame.beginStep();
     try appendLostEvent(&frame, observer2, target);
-    const stats2 = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    const stats2 = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     try testing.expectEqual(@as(usize, 1), stats2.refreshed_count);
     const lost_memory = data.aiMemoryConst(observer2).?;
     try testing.expectEqual(target, lost_memory.last_known_target);
@@ -825,7 +815,7 @@ test "AiMemorySystem continuous visibility refreshes last_known to latest last_s
     // Acquire at first-seen position.
     frame.beginStep();
     try appendPerceivedEvent(&frame, observer, target);
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     try testing.expectEqual(@as(f32, 10), data.aiMemoryConst(observer).?.last_known_x);
     try testing.expectEqual(@as(f32, 0), data.aiMemoryConst(observer).?.staleness);
 
@@ -840,7 +830,7 @@ test "AiMemorySystem continuous visibility refreshes last_known to latest last_s
         perception.last_seen_y[pidx] = x * 0.5;
         frame.beginStep();
         // No transition events while still visible with the same identity.
-        _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+        _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
         const memory = data.aiMemoryConst(observer).?;
         try testing.expectEqual(target, memory.last_known_target);
         try testing.expectEqual(x, memory.last_known_x);
@@ -861,7 +851,7 @@ test "AiMemorySystem continuous visibility refreshes last_known to latest last_s
     }
     frame.beginStep();
     try appendLostEvent(&frame, observer, target);
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     var memory = data.aiMemoryConst(observer).?;
     try testing.expectEqual(target, memory.last_known_target);
     try testing.expectEqual(final_x, memory.last_known_x);
@@ -869,7 +859,7 @@ test "AiMemorySystem continuous visibility refreshes last_known to latest last_s
     try testing.expectEqual(@as(f32, 0), memory.staleness);
 
     frame.beginStep();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     memory = data.aiMemoryConst(observer).?;
     try testing.expectEqual(final_x, memory.last_known_x);
     try testing.expectEqual(final_y, memory.last_known_y);
@@ -897,7 +887,7 @@ test "AiMemorySystem familiarity rises under sustained same-identity visibility"
 
     frame.beginStep();
     try appendPerceivedEvent(&frame, observer, target);
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     const after_acquire = data.aiMemoryConst(observer).?.familiarity;
     try testing.expect(after_acquire > 0);
 
@@ -905,7 +895,7 @@ test "AiMemorySystem familiarity rises under sustained same-identity visibility"
     var step: usize = 0;
     while (step < 8) : (step += 1) {
         frame.beginStep();
-        _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+        _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
         const familiarity = data.aiMemoryConst(observer).?.familiarity;
         try testing.expect(familiarity > prev);
         prev = familiarity;
@@ -917,7 +907,7 @@ test "AiMemorySystem familiarity rises under sustained same-identity visibility"
     const idle = try addAgentWithPerceptionAndMemory(&data, 20, 20, .{}, .{ .familiarity = 0.5 });
     const idle_before = data.aiMemoryConst(idle).?.familiarity;
     frame.beginStep();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     try testing.expect(data.aiMemoryConst(idle).?.familiarity < idle_before);
 }
 
@@ -948,7 +938,7 @@ test "AiMemorySystem decay is byte-identical between threaded and serial paths" 
 
     for (0..5) |_| {
         frame_a.beginStep();
-        _ = try sys_a.updateSerial(data_a.aiAgentSliceConst(), &data_a, &frame_a, .{});
+        _ = try updateInline(&sys_a, data_a.aiAgentSliceConst(), &data_a, &frame_a, .{});
         frame_b.beginStep();
         _ = try sys_b.update(data_b.aiAgentSliceConst(), &data_b, &frame_b, &threads, .{});
     }
@@ -980,7 +970,7 @@ test "AiMemorySystem ring eviction overwrites oldest slot and repeated target up
     for (targets[0..4]) |target| {
         frame.beginStep();
         try appendPerceivedEvent(&frame, observer, target);
-        _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+        _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     }
     var memory = data.aiMemoryConst(observer).?;
     try testing.expectEqual(@as(u8, 0), memory.ring_next_slot);
@@ -989,7 +979,7 @@ test "AiMemorySystem ring eviction overwrites oldest slot and repeated target up
     // Repeated target (index 1) updates in place; cursor must not move.
     frame.beginStep();
     try appendPerceivedEvent(&frame, observer, targets[1]);
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     memory = data.aiMemoryConst(observer).?;
     try testing.expectEqual(@as(u8, 0), memory.ring_next_slot);
     try testing.expectEqual(targets[1], memory.ring[1].entity);
@@ -998,7 +988,7 @@ test "AiMemorySystem ring eviction overwrites oldest slot and repeated target up
     // A 5th distinct target overwrites the oldest slot (0) and advances the cursor.
     frame.beginStep();
     try appendPerceivedEvent(&frame, observer, targets[4]);
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     memory = data.aiMemoryConst(observer).?;
     try testing.expectEqual(targets[4], memory.ring[0].entity);
     try testing.expectEqual(@as(u8, 1), memory.ring_next_slot);
@@ -1020,13 +1010,13 @@ test "AiMemorySystem expires a ring contact once its age reaches max staleness" 
 
     frame.beginStep();
     try appendPerceivedEvent(&frame, observer, target);
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     try testing.expectEqual(target, data.aiMemoryConst(observer).?.ring[0].entity);
 
     var step: usize = 0;
     while (step < @as(usize, @intFromFloat(max_ai_memory_staleness))) : (step += 1) {
         frame.beginStep();
-        _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+        _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     }
 
     try testing.expectEqual(EntityId.invalid, data.aiMemoryConst(observer).?.ring[0].entity);
@@ -1048,7 +1038,7 @@ test "AiMemorySystem freezes an out-of-scope entity's memory row and resumes wit
 
     frame.beginStep();
     const both = [_]u32{ 0, 1 };
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{ .scope_dense_indices = &both });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{ .scope_dense_indices = &both });
     try testing.expectEqual(@as(f32, 11), data.aiMemoryConst(data.aiAgentSliceConst().entities[0]).?.staleness);
     try testing.expectEqual(@as(f32, 11), data.aiMemoryConst(data.aiAgentSliceConst().entities[1]).?.staleness);
 
@@ -1056,14 +1046,14 @@ test "AiMemorySystem freezes an out-of-scope entity's memory row and resumes wit
     const only_a = [_]u32{0};
     for (0..3) |_| {
         frame.beginStep();
-        _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{ .scope_dense_indices = &only_a });
+        _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{ .scope_dense_indices = &only_a });
     }
     try testing.expectEqual(@as(f32, 14), data.aiMemoryConst(data.aiAgentSliceConst().entities[0]).?.staleness);
     try testing.expectEqual(@as(f32, 11), data.aiMemoryConst(data.aiAgentSliceConst().entities[1]).?.staleness);
 
     // Back in scope: resumes from exactly the frozen value, no reset, no catch-up.
     frame.beginStep();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{ .scope_dense_indices = &both });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{ .scope_dense_indices = &both });
     try testing.expectEqual(@as(f32, 12), data.aiMemoryConst(data.aiAgentSliceConst().entities[1]).?.staleness);
 }
 
@@ -1084,7 +1074,7 @@ test "AiMemorySystem never gathers an entity with AiMemory but no AiPerception" 
     try frame.reserveStreams(1, 0, 0, 0, 0, 0);
     frame.beginStep();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     try testing.expectEqual(@as(usize, 0), stats.processed_count);
     try testing.expectEqual(@as(usize, 0), sys.memory_dense_indices.items.len);
     try testing.expectEqual(@as(f32, 100), data.aiMemoryConst(entity).?.staleness);
@@ -1110,7 +1100,7 @@ test "AiMemorySystem serial has no steady-state allocation after warmup (Failing
     defer sys.allocator = original_allocator;
 
     frame.beginStep();
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
     try testing.expectEqual(@as(usize, 1), stats.processed_count);
 }
 
@@ -1196,10 +1186,10 @@ test "AiMemorySystem each stage records one sample into its own tuner and none i
     const stats = try sys.update(data.aiAgentSliceConst(), &data, &frame, &threads, .{});
     try testing.expectEqual(@as(usize, 64), stats.processed_count);
     for ([_]*const AdaptiveWorkTuner{ &sys.gather_tuner, &sys.order_tuner, &sys.decay_tuner, &sys.visible_tuner }) |tuner| {
-        try testing.expectEqual(@as(usize, 1), tuner.report().sample_count);
+        try testing.expectEqual(@as(usize, 1), tuner.sample_count);
         try testing.expect(tuner.last_request != null);
     }
-    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
     try testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
@@ -1286,7 +1276,7 @@ const OrderFixture = struct {
         for (0..order_fixture_steps) |step| {
             try self.beginStep(step);
             const ai = self.data.aiAgentSliceConst();
-            const stats = if (threads) |ts| try sys.update(ai, &self.data, &self.frame, ts, step_config) else try sys.updateSerial(ai, &self.data, &self.frame, step_config);
+            const stats = if (threads) |ts| try sys.update(ai, &self.data, &self.frame, ts, step_config) else try updateInline(sys, ai, &self.data, &self.frame, step_config);
             result.processed += stats.processed_count;
             result.refreshed += stats.refreshed_count;
             result.last = stats;
@@ -1443,7 +1433,7 @@ test "AiMemorySystem decay list is the think set's memory rows ascending, and th
     try expectMasksClear(&sys);
 
     try fixture.beginStep(1);
-    _ = try sys.updateSerial(ai, &fixture.data, &fixture.frame, config);
+    _ = try updateInline(&sys, ai, &fixture.data, &fixture.frame, config);
     try testing.expectEqualSlices(u32, expected.items, sys.memory_dense_indices.items);
     try expectMasksClear(&sys);
 }
@@ -1467,7 +1457,7 @@ test "AiMemorySystem growth past reserve orders correctly and counts once" {
 
     for (0..2) |_| {
         frame.beginStep();
-        const stats = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+        const stats = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
         try testing.expectEqual(agent_count, stats.processed_count);
         try testing.expectEqual(agent_count, sys.memory_dense_indices.items.len);
         for (sys.memory_dense_indices.items, 0..) |row, rank| try testing.expectEqual(@as(u32, @intCast(rank)), row);
@@ -1507,7 +1497,7 @@ test "AiMemorySystem scratch growth fails each allocation as OutOfMemory with st
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
         sys.allocator = failing.allocator();
         frame.beginStep();
-        const failed = sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+        const failed = updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
         sys.allocator = testing.allocator;
         // Past the last allocation: the sweep covered every one.
         if (!failing.has_induced_failure) {
@@ -1523,7 +1513,7 @@ test "AiMemorySystem scratch growth fails each allocation as OutOfMemory with st
         try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&staleness_before), std.mem.sliceAsBytes(data.aiMemorySliceConst().staleness));
 
         frame.beginStep();
-        const stats = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+        const stats = try updateInline(&sys, data.aiAgentSliceConst(), &data, &frame, .{});
         try testing.expectEqual(agent_count, stats.processed_count);
         for (sys.memory_dense_indices.items, 0..) |row, rank| try testing.expectEqual(@as(u32, @intCast(rank)), row);
         try expectMasksClear(&sys);

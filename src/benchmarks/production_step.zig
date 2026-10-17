@@ -46,7 +46,7 @@ const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const StateTransitions = @import("../app/state.zig").StateTransitions;
-const AdaptiveWorkReport = @import("../app/thread_system.zig").AdaptiveWorkReport;
+const AdaptiveWorkReport = suite.AdaptiveWorkReport;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const TimeLoop = @import("../app/time_loop.zig").TimeLoop;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -660,7 +660,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     stats.batch_carried = false;
     stats.output_count = population;
     if (comptime runtime_perf_log.enabled) {
-        stats.production_step = census.finish(population, threads.adaptive_tuner.report());
+        stats.production_step = census.finish(population, suite.tunerReport(&threads.adaptive_tuner));
         if (span_record) |*record| {
             try record.expectRowsUnchanged(&state.data);
             try checkStackedSeparation(allocator, &stats.production_step.?, fields, record);

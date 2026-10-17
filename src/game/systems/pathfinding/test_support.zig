@@ -81,6 +81,13 @@ pub fn appendPathRequest(stream: *RangeOutputStream(PathRequest), request: PathR
 // Field cell cap for the small test worlds; keeps each field's table small.
 const test_group_field_max_cells: usize = 4096;
 
+/// `PathfindingSystem.update` inline as one range: a thread system with no workers.
+pub fn updatePathfindingInline(system: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig) !PathfindingStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    return system.update(requests, agent_count, &threads, config);
+}
+
 pub fn baselineCapacity() PathfindingCapacity {
     // Per-step request/cache caps are derived elastically from the agent count
     // (floored at min_capacity_floor = 8), so only the non-derived knobs are set
@@ -1037,7 +1044,7 @@ pub fn solveIndividualGoals(system: *PathfindingSystem, requester: EntityId, goa
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     for (goals) |goal| try appendIndividual(&stream, requester, goal);
-    return system.updateSerial(&stream, agent_count, .{});
+    return updatePathfindingInline(system, &stream, agent_count, .{});
 }
 
 /// The stored cells of `goal`'s cached plain path, copied out.
@@ -1125,7 +1132,7 @@ pub fn solveRegistryRoutes(system: *PathfindingSystem, requester: EntityId, side
         if (threads) |thread_system| {
             _ = try system.update(requests, agent_count, thread_system, config);
         } else {
-            _ = try system.updateSerial(requests, agent_count, config);
+            _ = try updatePathfindingInline(system, requests, agent_count, config);
         }
         requests = &empty;
         if (system.pending.len == 0) return;
@@ -1424,7 +1431,7 @@ pub fn solveFrom(system: *PathfindingSystem, requester: EntityId, start: math.Ve
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
-    return system.updateSerial(&stream, 16, config);
+    return updatePathfindingInline(system, &stream, 16, config);
 }
 
 /// Builds a 12x12-tile single-level world with a vertical tree wall at column 5 that
@@ -1454,5 +1461,5 @@ pub fn solveStep(system: *PathfindingSystem, requester: EntityId, start: math.Ve
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
-    return system.updateSerial(&stream, 8, .{});
+    return updatePathfindingInline(system, &stream, 8, .{});
 }

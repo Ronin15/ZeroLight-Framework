@@ -398,21 +398,6 @@ pub const ParticleSystem = struct {
         };
     }
 
-    pub fn updateSerial(self: *ParticleSystem, delta_seconds: f32) ParticleUpdateStats {
-        const active_before = self.activeCount();
-        if (active_before == 0) return .{};
-
-        var particles = self.slice();
-        processRange(&particles, .{ .start = 0, .end = active_before }, delta_seconds);
-        const removed = self.removeExpiredSwap();
-        return .{
-            .active_before = active_before,
-            .active_after = self.activeCount(),
-            .removed_count = removed,
-            .batch = inlineBatch(active_before, particle_range_alignment_items),
-        };
-    }
-
     pub fn syncPreviousPositions(self: *ParticleSystem) void {
         var slice_data = self.slice();
         for (0..slice_data.len()) |index| {
@@ -562,6 +547,13 @@ const ParticleJobContext = struct {
     range_count: usize,
 };
 
+// `ParticleSystem.update` inline as one range: a thread system with no workers.
+fn updateInline(system: *ParticleSystem, delta_seconds: f32) !ParticleUpdateStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    return system.update(&threads, delta_seconds, .{});
+}
+
 fn updateSerialScalarForTest(system: *ParticleSystem, delta_seconds: f32) ParticleUpdateStats {
     const active_before = system.activeCount();
     if (active_before == 0) return .{};
@@ -669,7 +661,7 @@ test "particle columns remain aligned after expired swap removal" {
     _ = particles.emit(.{ .lifetime = 4, .velocity = .{ .x = 2, .y = 2 } });
     _ = particles.emit(.{ .lifetime = 0.1, .velocity = .{ .x = 3, .y = 3 } });
 
-    const stats = particles.updateSerial(0.2);
+    const stats = try updateInline(&particles, 0.2);
 
     try std.testing.expectEqual(@as(usize, 2), stats.removed_count);
     try std.testing.expectEqual(@as(usize, 1), particles.activeCount());
@@ -721,7 +713,7 @@ test "serial particle simd path matches scalar path" {
         fillParticles(&simd_particles, count);
         fillParticles(&scalar_particles, count);
 
-        _ = simd_particles.updateSerial(0.25);
+        _ = try updateInline(&simd_particles, 0.25);
         _ = updateSerialScalarForTest(&scalar_particles, 0.25);
 
         try expectParticlesApproxEqual(&simd_particles, &scalar_particles);
@@ -749,7 +741,7 @@ test "threaded particle update matches serial update" {
         .max_worker_threads = 2,
         .adaptive = false,
     });
-    _ = serial_particles.updateSerial(0.25);
+    _ = try updateInline(&serial_particles, 0.25);
 
     try std.testing.expect(!stats.batch.ran_inline);
     try std.testing.expectEqual(particle_range_alignment_items, stats.batch.items_per_range);
@@ -767,7 +759,7 @@ test "threaded particle update matches serial across multiple range splits and w
     var serial_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = item_count });
     defer serial_particles.deinit();
     fillParticles(&serial_particles, item_count);
-    _ = serial_particles.updateSerial(0.25);
+    _ = try updateInline(&serial_particles, 0.25);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 4,
@@ -817,9 +809,9 @@ test "particle explicit items_per_range bypasses tuner" {
     });
 
     try std.testing.expectEqual(particle_range_alignment_items, stats.batch.items_per_range);
-    try std.testing.expectEqual(@as(usize, 0), particles.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), particles.adaptive_tuner.sample_count);
     try std.testing.expect(particles.adaptive_tuner.last_request == null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
     try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
@@ -840,9 +832,9 @@ test "particle system owns adaptive tuner for default update" {
     const stats = particles.update(&threads, 0.25, .{ .max_worker_threads = 2 });
 
     try std.testing.expectEqual(particle_range_alignment_items * 8, stats.active_before);
-    try std.testing.expectEqual(@as(usize, 1), particles.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 1), particles.adaptive_tuner.sample_count);
     try std.testing.expect(particles.adaptive_tuner.last_request != null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
     try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 

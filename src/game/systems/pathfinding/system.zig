@@ -24,7 +24,6 @@ const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const StageControls = @import("../../../app/thread_system.zig").StageControls;
 const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
-const inlineBatch = @import("../../../app/thread_system.zig").inlineBatch;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
 const stageShape = @import("../../../app/thread_system.zig").stageShape;
 const DataSystem = @import("../../data_system.zig").DataSystem;
@@ -80,7 +79,7 @@ const listBytesBound = @import("nav_graph.zig").listBytesBound;
 const PathfindingCapacity = @import("types.zig").PathfindingCapacity;
 const PathfindingConfig = @import("types.zig").PathfindingConfig;
 // Threading for the request-side stages of one update: the thread system and the caller's
-// control config. Absent in `updateSerial`, where every stage runs inline.
+// control config.
 const StageThreads = @import("../../../app/thread_system.zig").StageThreads(PathfindingConfig);
 const PathfindingStats = @import("types.zig").PathfindingStats;
 const PathView = @import("types.zig").PathView;
@@ -1068,12 +1067,12 @@ pub const PathfindingSystem = struct {
         self.goal_table_growth.record(1, .info, "path goal table grew to {d} intents", .{self.goals.limit});
     }
 
-    // Shared accept + group-service + solve-limit prologue for update/updateSerial.
+    // Accept + group-service + solve-limit prologue of `update`.
     // Safe-point elastic resize runs here, after last frame's publish and before any
     // accept/solve, so no live worker index or pool offset spans it; a shrink's resize copy
     // threads under `threads`. A returned solve_count of 0 means no solve runs this step
     // (caller publishes the pending counts and returns).
-    fn beginUpdate(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, threads: ?StageThreads, stats: *PathfindingStats) !usize {
+    fn beginUpdate(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, threads: StageThreads, stats: *PathfindingStats) !usize {
         self.step_counter +%= 1;
         self.last_resize_copy_batch = .{};
         var resize_timer = StageTimer.begin();
@@ -1101,10 +1100,10 @@ pub const PathfindingSystem = struct {
         return self.effectiveSolveLimit(config);
     }
 
-    // Shared solve prologue for update/updateSerial: runs beginUpdate and handles the
+    // Solve prologue of `update`: runs beginUpdate and handles the
     // no-solve early-out. Returns the solve count, or null when no solve runs this step (the
     // caller publishes the pending counts via `stats` and returns it unchanged).
-    fn beginSolve(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, threads: ?StageThreads, stats: *PathfindingStats) !?usize {
+    fn beginSolve(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, threads: StageThreads, stats: *PathfindingStats) !?usize {
         const solve_count = try self.beginUpdate(requests, agent_count, config, threads, stats);
         if (solve_count == 0) {
             stats.pending_requests = self.pending.len;
@@ -1116,11 +1115,11 @@ pub const PathfindingSystem = struct {
     // Shared publish + compaction epilogue; finalizes the pending/deferred counts. On a
     // publish-reserve OOM nothing is claimed and pending is left intact for retry; the
     // caller's flush still applies the ops logged so far.
-    fn finishUpdate(self: *PathfindingSystem, solve_count: usize, threads: ?StageThreads, stats: *PathfindingStats) !void {
+    fn finishUpdate(self: *PathfindingSystem, solve_count: usize, threads: StageThreads, stats: *PathfindingStats) !void {
         var publish_timer = StageTimer.begin();
         try publish.reservePublish(self);
         publish.claimPublish(self, stats);
-        stats.publish_copy_batch = publish.publishCopy(self, if (threads) |stage| stage.stage(&self.tuners.publish_copy) else null);
+        stats.publish_copy_batch = publish.publishCopy(self, threads.stage(&self.tuners.publish_copy));
         self.compactPendingAfterSolve(solve_count, stats);
         stats.publish_ns = publish_timer.lap();
         stats.pending_requests = self.pending.len;
@@ -1181,39 +1180,6 @@ pub const PathfindingSystem = struct {
         }
         stats.solve_ns = solve_timer.lap();
         try self.finishUpdate(solve_count, threads, stats);
-    }
-
-    /// One fixed-step update with every stage inline. At most one request per steering
-    /// agent: `requests` holds at most `max(agent_count, min_capacity_floor)` (asserted).
-    /// Returns with the path registry flushed, on success and on error.
-    pub fn updateSerial(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig) error{OutOfMemory}!PathfindingStats {
-        var stats = PathfindingStats{};
-        errdefer _ = publish.flushRegistry(self, null, null);
-        try self.updateInline(requests, agent_count, config, &stats);
-        stats.registry_flush_batch = publish.flushRegistry(self, null, &stats);
-        return stats;
-    }
-
-    fn updateInline(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, stats: *PathfindingStats) !void {
-        const solve_count = (try self.beginSolve(requests, agent_count, config, null, stats)) orelse return;
-        var solve_timer = StageTimer.begin();
-        self.prepareSolvePhase(solve_count, effectiveAdmissionLimit(config), stats);
-        if (self.solve_indices.items.len != 0) {
-            // reserve() always provisions at least one scratch slot, so none means an update
-            // before reserve(): a Debug assert catches it, and a release build leaves every
-            // admission `.deferred` for a retry instead of reading past the scratch.
-            if (builtin.mode == .debug) std.debug.assert(self.scratch_slots.items.len != 0);
-            if (self.scratch_slots.items.len != 0) {
-                self.resetSolvedPaths();
-                const scratch = &self.scratch_slots.items[0];
-                for (self.solve_indices.items, 0..) |pending_index, ordinal| {
-                    self.solve_results.items[ordinal] = solveOne(self, pending_index, scratch, ordinal);
-                }
-            }
-        }
-        stats.solve_batch = inlineBatch(self.solve_indices.items.len, pathfinding_range_alignment_items);
-        stats.solve_ns = solve_timer.lap();
-        try self.finishUpdate(solve_count, null, stats);
     }
 
     fn resetSolvedPaths(self: *PathfindingSystem) void {
@@ -1434,6 +1400,7 @@ fn resizeCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 const PathStatus = @import("types.zig").PathStatus;
 const GroupFieldState = @import("group_field.zig").GroupFieldState;
 const test_support = @import("test_support.zig");
+const updatePathfindingInline = @import("test_support.zig").updatePathfindingInline;
 const addNavBody = @import("test_support.zig").addNavBody;
 const appendPathRequest = @import("test_support.zig").appendPathRequest;
 const baselineCapacity = @import("test_support.zig").baselineCapacity;
@@ -1490,7 +1457,7 @@ test "pathfinding individual solve produces deterministic available path and way
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 96, .y = 96 } });
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
 
     const view = system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 96, .y = 96 }, .default, null);
@@ -1517,7 +1484,7 @@ test "pathfinding blocked start drops without poisoning the goal for other agent
     var blocked_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer blocked_stream.deinit();
     try appendPathRequest(&blocked_stream, .{ .entity = blocked_agent, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 96, .y = 96 } });
-    const blocked_stats = try system.updateSerial(&blocked_stream, 8, .{});
+    const blocked_stats = try updatePathfindingInline(&system, &blocked_stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), blocked_stats.start_invalid_dropped);
     try std.testing.expectEqual(@as(usize, 0), blocked_stats.unavailable_results);
 
@@ -1529,7 +1496,7 @@ test "pathfinding blocked start drops without poisoning the goal for other agent
     var open_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer open_stream.deinit();
     try appendPathRequest(&open_stream, .{ .entity = open_agent, .start = .{ .x = 40, .y = 40 }, .goal = .{ .x = 96, .y = 96 } });
-    const open_stats = try system.updateSerial(&open_stream, 8, .{});
+    const open_stats = try updatePathfindingInline(&system, &open_stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), open_stats.available_results);
     const view = system.statusForWorld(0, .{ .x = 40, .y = 40 }, 0, .{ .x = 96, .y = 96 }, .default, null);
     try std.testing.expectEqual(PathStatus.available, view.status);
@@ -1558,7 +1525,7 @@ test "pathfinding zero admission budget leaves an empty solve batch without pani
     var serial_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer serial_stream.deinit();
     try appendPathRequest(&serial_stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 96, .y = 96 } });
-    const serial_stats = try system.updateSerial(&serial_stream, 8, .{ .max_solve_admissions_per_step = 0 });
+    const serial_stats = try updatePathfindingInline(&system, &serial_stream, 8, .{ .max_solve_admissions_per_step = 0 });
     try std.testing.expectEqual(@as(usize, 0), serial_stats.available_results);
     try std.testing.expectEqual(@as(usize, 1), serial_stats.pending_requests);
 
@@ -1595,7 +1562,7 @@ test "pathfinding goal-keyed dedup reuses one accepted request under start drift
             .start = .{ .x = start_x, .y = 8 },
             .goal = .{ .x = 480, .y = 480 },
         });
-        const stats = try system.updateSerial(&stream, 8, .{});
+        const stats = try updatePathfindingInline(&system, &stream, 8, .{});
         accepted_total += stats.accepted_requests;
     }
     // Exactly one A* solve was accepted; later drifting starts reuse the cache.
@@ -1620,7 +1587,7 @@ test "pathfinding projects goal in obstacle to nearest open cell" {
     // Goal world position falls inside the blocked cell.
     try appendPathRequest(&stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 104, .y = 104 } });
 
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.goal_projected);
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 104, .y = 104 }, .default, null).status);
@@ -1643,7 +1610,7 @@ test "pathfinding spills to pending when node budget is exhausted" {
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 488, .y = 488 } });
 
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.budget_exhausted);
     try std.testing.expectEqual(@as(usize, 0), stats.unavailable_results);
     try std.testing.expectEqual(@as(usize, 1), stats.pending_requests);
@@ -1667,7 +1634,7 @@ test "pathfinding rejects disconnected goals" {
     try appendPathRequest(&stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 128, .y = 8 } });
 
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 128, .y = 8 }, .default, null).status);
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     // Start and goal are different labels of the level's one chunk: reach answers at intake,
     // with no solve and nothing cached.
     try std.testing.expectEqual(@as(usize, 1), stats.unavailable_results);
@@ -1695,7 +1662,7 @@ test "pathfinding drops an out-of-range level request instead of clamping and so
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .goal_level = 1, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 96, .y = 96 } });
 
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.dropped_requests);
     try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests);
     try std.testing.expectEqual(@as(usize, 0), stats.available_results);
@@ -1723,7 +1690,7 @@ test "pathfinding pending_requests equals post-compaction pending in the serial 
     try appendPathRequest(&stream, .{ .entity = c, .start = .{ .x = 72, .y = 8 }, .goal = .{ .x = 200, .y = 72 } });
 
     // Per-step solve budget of 1 (config override) throttles to one solve/step.
-    const stats = try system.updateSerial(&stream, 3, .{ .max_solved_requests_per_step = 1 });
+    const stats = try updatePathfindingInline(&system, &stream, 3, .{ .max_solved_requests_per_step = 1 });
     try std.testing.expectEqual(@as(usize, 1), stats.solved_requests);
     try std.testing.expectEqual(system.pending.len, stats.pending_requests);
     try std.testing.expectEqual(@as(usize, 2), stats.pending_requests);
@@ -1785,7 +1752,7 @@ test "pathfinding same-level group agent falls through on a field-sample miss in
 
     // Builds and readies the shared field (mirrors "pathfinding group mode builds one
     // shared field sampled by all agents").
-    _ = try system.updateSerial(&stream, 8, .{});
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
     var ready_field_count: usize = 0;
     for (system.group_fields.items) |field| {
         if (field.state == .ready) ready_field_count += 1;
@@ -1827,7 +1794,7 @@ test "pathfinding threaded solve matches serial solve" {
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = .{ .x = 16, .y = 16 }, .goal = .{ .x = 144, .y = 144 } });
 
-    _ = try serial_system.updateSerial(&stream, 8, .{});
+    _ = try updatePathfindingInline(&serial_system, &stream, 8, .{});
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     _ = try threaded_system.update(&stream, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
@@ -1937,7 +1904,7 @@ test "pathfinding threaded multi-goal solve keeps disjoint per-request paths" {
         });
     }
 
-    _ = try serial_system.updateSerial(&stream, 8, .{});
+    _ = try updatePathfindingInline(&serial_system, &stream, 8, .{});
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     _ = try threaded_system.update(&stream, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
@@ -1972,11 +1939,11 @@ test "pathfinding warmed individual update does not allocate" {
 
     // One step warms the path registry's storage at its publish reserve; the same solve
     // and publish after a cache clear allocates nothing.
-    _ = try system.updateSerial(&stream, 8, .{});
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
     system.clearRuntimeState();
     const original_allocator = system.allocator;
     system.allocator = std.testing.failing_allocator;
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     system.allocator = original_allocator;
 
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
@@ -2009,7 +1976,7 @@ test "pathfinding request storage stays within its bound after reserve, solves, 
         request.* = .{ .entity = try data.createEntity(), .start = .{ .x = 16, .y = 16 + 32 * row }, .goal = .{ .x = 368, .y = 368 - 32 * row } };
         try appendPathRequest(&stream, request.*);
     }
-    _ = try system.updateSerial(&stream, requests.len, .{});
+    _ = try updatePathfindingInline(&system, &stream, requests.len, .{});
     _ = try system.resolveGoals(PathRequest, &requests, null, .{});
     try std.testing.expect(system.completed.count() != 0);
     try expectRequestStorageWithin(&system, capacity, shape);
@@ -2062,7 +2029,7 @@ test "pathfinding cross-level link steers an off-level agent toward the start-le
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
     try std.testing.expectEqual(@as(usize, 1), stats.cross_level_solves);
     try std.testing.expectEqual(@as(usize, 1), stats.abstract_solves);
@@ -2106,7 +2073,7 @@ test "pathfinding cross-level goal with no link is unavailable, not pending fore
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.unavailable_results);
     try std.testing.expectEqual(@as(usize, 0), stats.pending_requests);
     const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null);
@@ -2152,7 +2119,7 @@ test "pathfinding blocked link endpoint excludes the link until unblocked and re
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    const blocked_stats = try system.updateSerial(&blocked_stream, 8, .{});
+    const blocked_stats = try updatePathfindingInline(&system, &blocked_stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), blocked_stats.unavailable_results);
 
     // Identical world but the endpoint is open. Rebuilding the same system bumps
@@ -2182,7 +2149,7 @@ test "pathfinding blocked link endpoint excludes the link until unblocked and re
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    const open_stats = try system.updateSerial(&open_stream, 8, .{});
+    const open_stats = try updatePathfindingInline(&system, &open_stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), open_stats.available_results);
     try std.testing.expectEqual(@as(usize, 1), open_stats.cross_level_solves);
 }
@@ -2221,7 +2188,7 @@ test "pathfinding per-level obstacle independence: level 0 obstacle is absent on
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 176, .y = 176 },
     });
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
     const view = system.statusForWorld(1, .{ .x = 16, .y = 16 }, 1, .{ .x = 176, .y = 176 }, .default, null);
     try std.testing.expectEqual(PathStatus.available, view.status);
@@ -2285,7 +2252,7 @@ test "pathfinding multi-hop same-level corridor travels obstacle-free past a con
             .start = start_world,
             .goal = cellCenterWorld(goal_cell),
         });
-        const stats = try system.updateSerial(&stream, 8, .{});
+        const stats = try updatePathfindingInline(&system, &stream, 8, .{});
         if (step == 0 and stats.abstract_solves != 0) first_via_abstract = true;
         const view = system.statusForWorld(0, start_world, 0, cellCenterWorld(goal_cell), .default, null);
         if (view.status == .unavailable) return error.TestUnexpectedResult;
@@ -2380,7 +2347,7 @@ test "pathfinding abstract seeding scans only the start level and stays within b
             .start = .{ .x = 16, .y = 16 },
             .goal = .{ .x = extent - 16, .y = extent - 16 },
         });
-        const stats = try system.updateSerial(&stream, 8, .{});
+        const stats = try updatePathfindingInline(&system, &stream, 8, .{});
         try std.testing.expectEqual(@as(usize, 0), stats.unavailable_results);
     }
 }
@@ -2422,7 +2389,7 @@ test "pathfinding cross-level group member falls back to an individual corridor"
     try first.reserve(2, 2);
     try appendPathRequest(&first, .{ .entity = on_level, .kind = .group, .start_level = 1, .goal_level = 1, .start = .{ .x = 16, .y = 16 }, .goal = goal });
     try appendPathRequest(&first, .{ .entity = off_level, .kind = .group, .start_level = 0, .goal_level = 1, .start = .{ .x = 16, .y = 16 }, .goal = goal });
-    _ = try system.updateSerial(&first, 8, .{});
+    _ = try updatePathfindingInline(&system, &first, 8, .{});
 
     // Advance until the group field is ready on level 1.
     var guard: usize = 0;
@@ -2437,7 +2404,7 @@ test "pathfinding cross-level group member falls back to an individual corridor"
         try step_stream.reserve(2, 2);
         try appendPathRequest(&step_stream, .{ .entity = on_level, .kind = .group, .start_level = 1, .goal_level = 1, .start = .{ .x = 16, .y = 16 }, .goal = goal });
         try appendPathRequest(&step_stream, .{ .entity = off_level, .kind = .group, .start_level = 0, .goal_level = 1, .start = .{ .x = 16, .y = 16 }, .goal = goal });
-        _ = try system.updateSerial(&step_stream, 8, .{});
+        _ = try updatePathfindingInline(&system, &step_stream, 8, .{});
     }
 
     // The on-level member samples the ready group field.
@@ -2460,7 +2427,7 @@ test "pathfinding cross-level group member falls back to an individual corridor"
         try step_stream.reserve(2, 2);
         try appendPathRequest(&step_stream, .{ .entity = on_level, .kind = .group, .start_level = 1, .goal_level = 1, .start = .{ .x = 16, .y = 16 }, .goal = goal });
         try appendPathRequest(&step_stream, .{ .entity = off_level, .kind = .group, .start_level = 0, .goal_level = 1, .start = .{ .x = 16, .y = 16 }, .goal = goal });
-        _ = try system.updateSerial(&step_stream, 8, .{});
+        _ = try updatePathfindingInline(&system, &step_stream, 8, .{});
     }
     try std.testing.expect(reached);
 }
@@ -2502,7 +2469,7 @@ test "pathfinding directed link traverses one way only" {
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    const forward_stats = try system.updateSerial(&forward, 8, .{});
+    const forward_stats = try updatePathfindingInline(&system, &forward, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), forward_stats.available_results);
 
     // B -> A (1 -> 0) fails: no reverse edge.
@@ -2515,7 +2482,7 @@ test "pathfinding directed link traverses one way only" {
         .start = .{ .x = 80, .y = 80 },
         .goal = .{ .x = 16, .y = 16 },
     });
-    const backward_stats = try system.updateSerial(&backward, 8, .{});
+    const backward_stats = try updatePathfindingInline(&system, &backward, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), backward_stats.unavailable_results);
 }
 
@@ -2575,7 +2542,7 @@ test "pathfinding cross-level corridor stays obstacle-free on the destination le
             .start = start_world,
             .goal = cellCenterWorld(goal_cell),
         });
-        _ = try system.updateSerial(&stream, 8, .{});
+        _ = try updatePathfindingInline(&system, &stream, 8, .{});
         const view = system.statusForWorld(level, start_world, 1, cellCenterWorld(goal_cell), .default, null);
         if (view.status == .unavailable) return error.TestUnexpectedResult;
         if (view.status != .available) continue;
@@ -2644,7 +2611,7 @@ test "pathfinding abstract saturation returns pending, not a cached unavailable"
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     // Saturation spills to a later frame: counted as budget_exhausted, never unavailable,
     // and the status reads pending (retryable).
     try std.testing.expect(stats.budget_exhausted >= 1);
@@ -2766,7 +2733,7 @@ test "pathfinding tier-1 budget_exhausted drops to missing (not a false unavaila
     });
 
     // Attempt 1 (tier 0): exhausts and promotes to tier 1.
-    const first = try system.updateSerial(&stream, 8, .{});
+    const first = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), first.budget_exhausted);
     try std.testing.expectEqual(@as(usize, 1), system.pending.len);
     try std.testing.expectEqual(@as(u8, 1), system.pending.at(0).tier);
@@ -2778,7 +2745,7 @@ test "pathfinding tier-1 budget_exhausted drops to missing (not a false unavaila
     system.capacity.max_abstract_nodes = 1;
 
     // Attempt 2 (tier 1): exhausts again -> dropped, never unavailable.
-    const second = try system.updateSerial(&stream, 8, .{});
+    const second = try updatePathfindingInline(&system, &stream, 8, .{});
     // It drops through seeding saturation: the start chunk's second seed passes the one-node
     // budget before any node is expanded, so no least-estimate node exists to publish toward.
     const tier1_abstract = &system.tier1_scratch.items[0].corridor.abstract;
@@ -2824,7 +2791,7 @@ test "pathfinding max_escalated_solves_per_step caps tier-1 admission to exactly
     try appendPathRequest(&stream, .{ .entity = requester_b, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 72, .y = 8 } });
     try appendPathRequest(&stream, .{ .entity = requester_c, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 104, .y = 8 } });
     try appendPathRequest(&stream, .{ .entity = requester_d, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 136, .y = 8 } });
-    _ = try system.updateSerial(&stream, 8, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &stream, 8, .{ .max_solve_admissions_per_step = 0 });
     try std.testing.expectEqual(@as(usize, 4), system.pending.len);
 
     // Promote every pending entry to tier 1 (as if each had already spilled once).
@@ -2832,7 +2799,7 @@ test "pathfinding max_escalated_solves_per_step caps tier-1 admission to exactly
 
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const stats = try system.updateSerial(&empty, 8, .{});
+    const stats = try updatePathfindingInline(&system, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 2), stats.escalated_solves);
     try std.testing.expectEqual(@as(usize, 2), stats.escalated_deferred);
     // The two admitted tier-1 requests solved trivially (short, same-level, open goals);
@@ -2970,11 +2937,11 @@ test "pathfinding warmed cross-level abstract solve does not allocate" {
     // A multi-hop abstract+stitched solve under the failing allocator must not touch
     // the heap: scratch and corridor stripes were warmed at reserve/rebuild, and the path
     // registry by one publish of the same solve before a cache clear.
-    _ = try system.updateSerial(&stream, 8, .{});
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
     system.clearRuntimeState();
     const original_allocator = system.allocator;
     system.allocator = std.testing.failing_allocator;
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     system.allocator = original_allocator;
 
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
@@ -2992,7 +2959,7 @@ fn driveAgentCount(system: *PathfindingSystem, requesters: []const EntityId, cou
         const start_x: f32 = 8.0 + @as(f32, @floatFromInt(i)) * 32.0;
         try appendPathRequest(&stream, .{ .entity = entity, .start = .{ .x = start_x, .y = 8 }, .goal = .{ .x = 480, .y = 480 } });
     }
-    return system.updateSerial(&stream, count, .{});
+    return updatePathfindingInline(system, &stream, count, .{});
 }
 
 test "pathfinding capacity grows when agent count jumps past the current cap" {
@@ -3041,7 +3008,7 @@ test "pathfinding per-frame solve budget stays fixed while queue and cache scale
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 480, .y = 480 } });
-    _ = try system.updateSerial(&stream, 4096, .{});
+    _ = try updatePathfindingInline(&system, &stream, 4096, .{});
 
     try std.testing.expectEqual(@as(usize, 4096), system.limits.pending_requests);
     try std.testing.expectEqual(@as(usize, 4096), system.limits.frame_requests);
@@ -3226,7 +3193,7 @@ test "pathfinding a capacity shrink to the live queue keeps every pending entry 
 fn updateNoRequests(system: *PathfindingSystem, agent_count: usize, config: PathfindingConfig) !PathfindingStats {
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    return system.updateSerial(&empty, agent_count, config);
+    return updatePathfindingInline(system, &empty, agent_count, config);
 }
 
 /// A system grown 8 -> 40 agents on a `side` x `side` world with a 2-step shrink window.
@@ -3277,7 +3244,7 @@ fn submitGoalWalk(system: *PathfindingSystem, requesters: []const EntityId, walk
             .goal = cellWorld(x, y),
         });
     }
-    return system.updateSerial(&stream, agent_count, config);
+    return updatePathfindingInline(system, &stream, agent_count, config);
 }
 
 /// Same step stats, pending queue, group tallies, and cached key set. Probe slots and owner
@@ -3516,7 +3483,7 @@ fn submitDistinctGoalBurst(system: *PathfindingSystem, requesters: []const Entit
             .goal = .{ .x = 8.0 + @as(f32, @floatFromInt(i + 1)) * 32.0, .y = 200 },
         });
     }
-    return system.updateSerial(&stream, agent_count, .{ .max_solve_admissions_per_step = 0 });
+    return updatePathfindingInline(system, &stream, agent_count, .{ .max_solve_admissions_per_step = 0 });
 }
 
 test "growForAgentCount grows at least 2x from the floor and keeps the shrink path" {
@@ -3676,7 +3643,7 @@ test "a budget re-reserve that runs out of memory keeps every solve inside its p
                 var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
                 defer stream.deinit();
                 try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
-                const stats = try system.updateSerial(&stream, 8, .{});
+                const stats = try updatePathfindingInline(&system, &stream, 8, .{});
                 try std.testing.expectEqual(@as(usize, 1), stats.budget_exhausted);
                 try std.testing.expectEqual(@as(usize, 0), stats.available_results);
             }
@@ -3717,7 +3684,7 @@ fn runLakeDetourScenario(system: *PathfindingSystem, side: usize, gap_offset: us
     var total_attempts: usize = 0;
     var frame: usize = 0;
     while (frame < 5) : (frame += 1) {
-        const stats = try system.updateSerial(if (frame == 0) &stream else &empty, 8, .{});
+        const stats = try updatePathfindingInline(system, if (frame == 0) &stream else &empty, 8, .{});
         total_attempts += stats.budget_exhausted;
         if (stats.available_results != 0 or stats.partial_results != 0 or stats.escalated_dropped != 0) {
             var result = stats;
@@ -3822,7 +3789,7 @@ fn solveHop(system: *PathfindingSystem, requester: EntityId, start: math.Vec2, g
     if (first.budget_exhausted == 0) return first;
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    return system.updateSerial(&empty, 8, .{});
+    return updatePathfindingInline(system, &empty, 8, .{});
 }
 
 test "a tier-1 stitch past its cell cap publishes the uncapped stitch's prefix as partial" {
@@ -3845,7 +3812,7 @@ test "a tier-1 stitch past its cell cap publishes the uncapped stitch's prefix a
     try std.testing.expectEqual(@as(u8, 1), system.pending.at(0).tier);
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const second = try system.updateSerial(&empty, 8, .{});
+    const second = try updatePathfindingInline(&system, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), second.escalated_solves);
     try std.testing.expectEqual(@as(usize, 1), second.partial_results);
     try std.testing.expectEqual(@as(usize, 0), second.available_results);
@@ -3897,7 +3864,7 @@ test "a partial answers no request from inside its end window" {
     try std.testing.expectEqual(PathStatus.partial, system.statusForWorld(0, end_position, 0, partial_goal, .default, null).status);
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    try std.testing.expectEqual(@as(usize, 1), (try system.updateSerial(&empty, 8, .{})).partial_results);
+    try std.testing.expectEqual(@as(usize, 1), (try updatePathfindingInline(&system, &empty, 8, .{})).partial_results);
 
     const next = cachedResult(&system, partial_goal).?;
     try std.testing.expectEqual(hop.end, cachedStitched(&system, 0, partial_goal).at(0));
@@ -3973,7 +3940,7 @@ test "a segment-cap prefix at tier 1 is partial; a segment node-budget spill sti
     try std.testing.expectEqual(@as(usize, 1), first.budget_exhausted);
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const second = try spill.updateSerial(&empty, 8, .{});
+    const second = try updatePathfindingInline(&spill, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), second.budget_exhausted);
     try std.testing.expectEqual(@as(usize, 1), second.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 0), second.partial_results);
@@ -4030,11 +3997,11 @@ fn solveLevelsHop(system: *PathfindingSystem, requester: EntityId, start_level: 
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start_level = start_level, .goal_level = goal_level, .start = start, .goal = goal });
-    const first = try system.updateSerial(&stream, 8, .{});
+    const first = try updatePathfindingInline(system, &stream, 8, .{});
     if (first.budget_exhausted == 0) return first;
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    return system.updateSerial(&empty, 8, .{});
+    return updatePathfindingInline(system, &empty, 8, .{});
 }
 
 test "a partial capped at or just past a link refreshes only on its end's level, at status and intake alike" {
@@ -4089,7 +4056,7 @@ test "a partial capped at or just past a link refreshes only on its end's level,
         var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer stream.deinit();
         try appendPathRequest(&stream, .{ .entity = requester, .start_level = 0, .goal_level = 1, .start = start, .goal = goal });
-        const from_start = try system.updateSerial(&stream, 8, .{});
+        const from_start = try updatePathfindingInline(&system, &stream, 8, .{});
         try std.testing.expectEqual(@as(usize, @intFromBool(at_start.refresh)), from_start.accepted_requests);
         try std.testing.expectEqual(@as(usize, @intFromBool(!at_start.refresh)), from_start.cache_hits);
         if (!past_jump) continue;
@@ -4100,7 +4067,7 @@ test "a partial capped at or just past a link refreshes only on its end's level,
         try std.testing.expect(at_end.refresh);
         stream.clearRetainingCapacity();
         try appendPathRequest(&stream, .{ .entity = requester, .start_level = 1, .goal_level = 1, .start = end_position, .goal = goal });
-        const from_end = try system.updateSerial(&stream, 8, .{});
+        const from_end = try updatePathfindingInline(&system, &stream, 8, .{});
         try std.testing.expectEqual(@as(usize, 1), from_end.accepted_requests);
         try std.testing.expectEqual(@as(usize, 0), from_end.cache_hits);
     }
@@ -4157,7 +4124,7 @@ test "a partial solved toward an older goal projection is not served after the p
     try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, start, goal, .{})).budget_exhausted);
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    try std.testing.expectEqual(@as(usize, 1), (try system.updateSerial(&empty, 16, .{})).partial_results);
+    try std.testing.expectEqual(@as(usize, 1), (try updatePathfindingInline(&system, &empty, 16, .{})).partial_results);
     const hop = system.completed.resultAt(system.completed.slotIndex(key).?);
     try std.testing.expect(hop.isPartial());
     try std.testing.expectEqual(@as(u32, 17 * 48 + 17), hop.goal_cell);
@@ -4245,7 +4212,7 @@ test "a saturated tier-1 search with no expanded node below its start's estimate
     try std.testing.expectEqual(@as(usize, 1), first.budget_exhausted);
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const second = try system.updateSerial(&empty, 8, .{});
+    const second = try updatePathfindingInline(&system, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), second.escalated_solves);
     try std.testing.expectEqual(@as(usize, 1), second.budget_exhausted);
     try std.testing.expectEqual(@as(usize, 1), second.escalated_dropped);
@@ -4360,7 +4327,7 @@ test "threaded least-estimate partials equal serial for any range size and worke
     try serial.reserve(capacity);
     try serial.rebuildStaticNavGridWithWorld(&data, &world, null);
     try queueWithTiers(&serial, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
-    const serial_stats = try serial.updateSerial(&empty, 8, .{});
+    const serial_stats = try updatePathfindingInline(&serial, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 4), serial_stats.partial_results);
     try std.testing.expectEqual(@as(usize, 0), serial_stats.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 4), serial_stats.budget_exhausted);
@@ -4477,8 +4444,8 @@ test "a field-budget re-reserve out of memory never leaves more fields than fiel
             try reference.reserve(expected_capacity);
             try reference.rebuildStaticNavGrid(&data, 2048, 2048, 32);
             for (0..6) |_| {
-                _ = try system.updateSerial(&stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
-                _ = try reference.updateSerial(&stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+                _ = try updatePathfindingInline(&system, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+                _ = try updatePathfindingInline(&reference, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
                 try expectGroupFieldsEqual(&reference, &system);
             }
             if (result) |_| break else |_| {}
@@ -4600,12 +4567,12 @@ test "pathfinding an elastic grow and shrink keep cached paths and pending" {
     var pending_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer pending_stream.deinit();
     for (pending_goals) |goal| try appendIndividual(&pending_stream, requester, goal);
-    _ = try system.updateSerial(&pending_stream, 40, no_admission);
+    _ = try updatePathfindingInline(&system, &pending_stream, 40, no_admission);
 
     // Sustained low load shrinks back to the floor.
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    for (0..system.capacity.capacity_shrink_window) |_| _ = try system.updateSerial(&empty, 1, no_admission);
+    for (0..system.capacity.capacity_shrink_window) |_| _ = try updatePathfindingInline(&system, &empty, 1, no_admission);
     try std.testing.expectEqual(min_capacity_floor, system.effective_agent_capacity);
 
     for (cached_goals, before) |goal, cells| {
@@ -4622,7 +4589,7 @@ test "pathfinding an elastic grow and shrink keep cached paths and pending" {
     var again = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer again.deinit();
     for (cached_goals) |goal| try appendIndividual(&again, requester, goal);
-    const again_stats = try system.updateSerial(&again, 8, no_admission);
+    const again_stats = try updatePathfindingInline(&system, &again, 8, no_admission);
     try std.testing.expectEqual(cached_goals.len, again_stats.cache_hits);
     try std.testing.expectEqual(@as(usize, 0), again_stats.solved_requests);
 }
@@ -4647,7 +4614,7 @@ fn queueWithTiers(system: *PathfindingSystem, requesters: []const EntityId, star
     defer stream.deinit();
     try stream.reserve(goals.len, goals.len);
     for (requesters[0..goals.len], goals) |requester, goal| try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
-    _ = try system.updateSerial(&stream, 8, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(system, &stream, 8, .{ .max_solve_admissions_per_step = 0 });
     try std.testing.expectEqual(goals.len, system.pending.len);
     for (tiers, 0..) |tier, index| system.pending.atPtr(index).tier = tier;
 }
@@ -4754,7 +4721,7 @@ test "an escalated solve through the tier-1 pool equals a participant reference"
         try std.testing.expectEqual(@as(u8, 1), pool.pending.at(0).tier);
         var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer empty.deinit();
-        const second = try pool.updateSerial(&empty, 8, .{});
+        const second = try updatePathfindingInline(&pool, &empty, 8, .{});
         try std.testing.expectEqual(@as(usize, 1), second.escalated_solves);
         try std.testing.expectEqual(@as(usize, 1), second.available_results);
         const expected = cachedStitched(&reference, 0, goal);
@@ -4797,7 +4764,7 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
     try queueWithTiers(&serial, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
-    const serial_stats = try serial.updateSerial(&empty, 8, .{});
+    const serial_stats = try updatePathfindingInline(&serial, &empty, 8, .{});
     try queueWithTiers(&threaded, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
     const stats = try threaded.update(&empty, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
 
@@ -4835,7 +4802,7 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
     try partial_serial.reserve(partial_capacity);
     try partial_serial.rebuildStaticNavGridWithWorld(&data, &world, null);
     try queueWithTiers(&partial_serial, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
-    const partial_stats = try partial_serial.updateSerial(&empty, 8, .{});
+    const partial_stats = try updatePathfindingInline(&partial_serial, &empty, 8, .{});
     try std.testing.expect(partial_stats.partial_results != 0);
     try std.testing.expectEqual(@as(usize, 4), partial_stats.partial_results + partial_stats.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 4) + partial_stats.escalated_dropped, partial_stats.budget_exhausted);
@@ -4874,7 +4841,7 @@ fn queueCrossLevelWithTiers(system: *PathfindingSystem, requesters: []const Enti
     defer stream.deinit();
     try stream.reserve(goals.len, goals.len);
     for (requesters[0..goals.len], goals) |requester, goal| try appendPathRequest(&stream, .{ .entity = requester, .start_level = 0, .goal_level = goal_level, .start = tileCenter(1, 1), .goal = goal });
-    _ = try system.updateSerial(&stream, goals.len, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(system, &stream, goals.len, .{ .max_solve_admissions_per_step = 0 });
     try std.testing.expectEqual(goals.len, system.pending.len);
     for (tiers, 0..) |tier, index| system.pending.atPtr(index).tier = tier;
 }
@@ -4927,7 +4894,7 @@ test "threaded cross-level solves equal serial, at tier 0 and through the tier-1
     for (requesters, goals) |requester, goal| {
         try appendPathRequest(&stream, .{ .entity = requester, .start_level = 0, .goal_level = 2, .start = tileCenter(1, 1), .goal = goal });
     }
-    const serial_stats = try serial.updateSerial(&stream, 8, .{});
+    const serial_stats = try updatePathfindingInline(&serial, &stream, 8, .{});
     const stats = try threaded.update(&stream, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
 
     try std.testing.expect(!stats.solve_batch.ran_inline);
@@ -4959,7 +4926,7 @@ test "threaded cross-level solves equal serial, at tier 0 and through the tier-1
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
     try empty.reserve(1, 0);
-    const serial_tiered = try serial.updateSerial(&empty, 8, .{});
+    const serial_tiered = try updatePathfindingInline(&serial, &empty, 8, .{});
     const tiered = try threaded.update(&empty, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
     try std.testing.expect(!tiered.solve_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 4), tiered.escalated_solves);
@@ -5092,7 +5059,7 @@ test "a pool reserve out of memory clamps escalated admissions to the reserved p
             try queueWithTiers(&system, &requesters, tileCenter(1, 1), escalation_goals[0..3], &.{ 1, 1, 1 });
             var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
             defer empty.deinit();
-            const stats = try system.updateSerial(&empty, 8, .{});
+            const stats = try updatePathfindingInline(&system, &empty, 8, .{});
             try std.testing.expectEqual(pool_entries, stats.escalated_solves);
             try std.testing.expectEqual(3 - pool_entries, stats.escalated_deferred);
             try std.testing.expectEqual(pool_entries, stats.available_results);
@@ -5117,7 +5084,7 @@ test "an elastic resize keeps a building group field building" {
     defer stream.deinit();
     const goal = math.Vec2{ .x = 240, .y = 240 };
     try appendPathRequest(&stream, .{ .entity = requester, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
-    _ = try system.updateSerial(&stream, 8, .{});
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
     const key = system.graph.keyForWorld(0, goal, .default).?;
     const field = group_service.groupFieldOf(&system, key).?;
     try std.testing.expectEqual(GroupFieldState.building, field.state);
@@ -5299,7 +5266,7 @@ test "an elastic grow and shrink keep cached paths and registrations, and a rena
 
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    for (0..system.capacity.capacity_shrink_window) |_| _ = try system.updateSerial(&empty, 1, .{});
+    for (0..system.capacity.capacity_shrink_window) |_| _ = try updatePathfindingInline(&system, &empty, 1, .{});
     try std.testing.expectEqual(@as(usize, 32), system.completed.logicalCapacity());
     const owner_after = system.completed.core.ownerOf(moved_key).?;
     try std.testing.expect(owner_after < 32);
@@ -5445,7 +5412,7 @@ fn requestPocketGoals(system: *PathfindingSystem, requester: EntityId, first: us
     defer stream.deinit();
     for (first..first + count) |index| try appendPathRequest(&stream, .{ .entity = requester, .start = outsideStart(index - first), .goal = pocketGoal(index) });
     if (threads) |thread_system| return system.update(&stream, agent_count, thread_system, config);
-    return system.updateSerial(&stream, agent_count, config);
+    return updatePathfindingInline(system, &stream, agent_count, config);
 }
 
 test "an agent sealed in a pocket reads its goal unavailable from reach, and an agent outside still reaches it" {
@@ -5578,7 +5545,7 @@ test "each solve outcome: an invalid graph, a missing goal level, no live goal, 
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = outsideStart(0), .goal = tileCenter(20, 20), .goal_level = 0 });
-    _ = try system.updateSerial(&stream, 16, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &stream, 16, .{ .max_solve_admissions_per_step = 0 });
     const goal_key = system.graph.keyForWorld(0, tileCenter(20, 20), .default).?;
     try std.testing.expect(system.pending_keys.contains(goal_key));
     // The pending request's goal sealed off before its solve.
@@ -5587,7 +5554,7 @@ test "each solve outcome: an invalid graph, a missing goal level, no live goal, 
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
     system.scratch_slots.items[0].corridor.abstract.reset();
-    const answered = try system.updateSerial(&empty, 16, .{});
+    const answered = try updatePathfindingInline(&system, &empty, 16, .{});
     try std.testing.expectEqual(@as(usize, 1), answered.solve_admissions);
     try std.testing.expectEqual(@as(usize, 1), answered.unavailable_results);
     try std.testing.expectEqual(@as(usize, 0), answered.solved_requests);
@@ -5688,7 +5655,7 @@ test "a dig opening a sealed pocket makes its goals reachable after that step's 
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
     system.scratch_slots.items[0].corridor.abstract.reset();
-    const answered = try system.updateSerial(&empty, 16, .{});
+    const answered = try updatePathfindingInline(&system, &empty, 16, .{});
     try std.testing.expectEqual(@as(usize, 1), answered.solve_admissions);
     try std.testing.expectEqual(@as(usize, 1), answered.unavailable_results);
     try std.testing.expectEqual(@as(usize, 0), answered.solved_requests);
@@ -5823,7 +5790,7 @@ test "a crowd at one blocked unreachable goal shares one projection: the resolve
     try std.testing.expectEqual(@as(usize, 1), resolve.distinct);
     try std.testing.expectEqual(@as(usize, 1), resolve.distinct);
     for (stream.mergedItems()) |request| try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, request.start, 0, goal, .default, null).status);
-    const stats = try system.updateSerial(&stream, crowd, .{});
+    const stats = try updatePathfindingInline(&system, &stream, crowd, .{});
     try std.testing.expectEqual(@as(usize, 0), stats.goal_fallbacks);
     try std.testing.expectEqual(@as(usize, crowd), stats.unavailable_results);
     try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests + system.pending.len);
@@ -5978,7 +5945,7 @@ test "a reserve on a live system keeps the deferred requests and group tallies i
     try appendPathRequest(&stream, .{ .entity = requester, .kind = .group, .start = cellWorld(1, 1), .goal = cellWorld(12, 12) });
     try appendIndividual(&stream, requester, cellWorld(9, 3));
     // No admission: both requests stay deferred, and the group goal holds a tally.
-    _ = try system.updateSerial(&stream, 8, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &stream, 8, .{ .max_solve_admissions_per_step = 0 });
     try std.testing.expectEqual(@as(usize, 2), system.pending.len);
     try std.testing.expectEqual(@as(usize, 1), system.group_requests.items.len);
 
@@ -5990,7 +5957,7 @@ test "a reserve on a live system keeps the deferred requests and group tallies i
     try std.testing.expectEqualDeep(group_key, system.group_requests.items[0].key);
 
     // The next step folds the repeats into the live entries and solves both.
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests);
     try std.testing.expectEqual(@as(usize, 2), stats.duplicate_requests);
     try std.testing.expectEqual(@as(usize, 2), stats.solved_requests);
@@ -6009,7 +5976,7 @@ test "a reserve on a grown live system keeps its agent capacity and drops no def
     defer stream.deinit();
     // 20 distinct deferred goals at a 40-agent crowd: past the floor's 8-request limits.
     for (0..20) |index| try appendIndividual(&stream, requester, cellWorld(@intCast(2 + index % 12), @intCast(3 + index / 12)));
-    _ = try system.updateSerial(&stream, 40, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &stream, 40, .{ .max_solve_admissions_per_step = 0 });
     try std.testing.expectEqual(@as(usize, 20), system.pending.len);
     const agents = system.effective_agent_capacity;
     const cached = system.completed.logicalCapacity();

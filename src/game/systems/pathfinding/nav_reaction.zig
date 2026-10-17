@@ -525,6 +525,7 @@ const PathRequest = @import("../../simulation.zig").PathRequest;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const PathStatus = @import("types.zig").PathStatus;
 const test_support = @import("test_support.zig");
+const updatePathfindingInline = @import("test_support.zig").updatePathfindingInline;
 const addNavBody = @import("test_support.zig").addNavBody;
 const appendPathRequest = @import("test_support.zig").appendPathRequest;
 const baselineCapacity = @import("test_support.zig").baselineCapacity;
@@ -1401,7 +1402,7 @@ test "pathfinding incremental update flips cross-level link liveness when the en
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    try std.testing.expectEqual(@as(usize, 1), (try system.updateSerial(&blocked_stream, 8, .{})).unavailable_results);
+    try std.testing.expectEqual(@as(usize, 1), (try updatePathfindingInline(&system, &blocked_stream, 8, .{})).unavailable_results);
 
     // Open the endpoint cell (2,2) on level 1 via the world tile API + incremental update:
     // the endpoint's record gains the link, so the same cross-level goal is now reachable.
@@ -1421,7 +1422,7 @@ test "pathfinding incremental update flips cross-level link liveness when the en
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    const open_stats = try system.updateSerial(&open_stream, 8, .{});
+    const open_stats = try updatePathfindingInline(&system, &open_stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), open_stats.available_results);
     try std.testing.expectEqual(@as(usize, 1), open_stats.cross_level_solves);
 }

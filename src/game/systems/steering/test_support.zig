@@ -16,6 +16,15 @@ const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
 const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
 const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 const SteeringStats = @import("system.zig").SteeringStats;
+const SteeringSystem = @import("system.zig").SteeringSystem;
+const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
+
+/// `SteeringSystem.update` inline as one range: a thread system with no workers.
+pub fn updateSteeringInline(steering: *SteeringSystem, data: *const DataSystem, frame: *SimulationFrame, pathfinding: *const PathfindingSystem, colliders: *const StaticColliderSystem) !SteeringStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    return steering.update(data, frame, &threads, pathfinding, colliders, .{});
+}
 
 pub fn expectEveryStageThreaded(stats: SteeringStats) !void {
     for ([_]BatchStats{ stats.agents_batch, stats.select_resolve_batch, stats.select_claim_batch, stats.directions_batch, stats.grid_bucket_batch, stats.grid_sort_batch, stats.batch }) |batch| {

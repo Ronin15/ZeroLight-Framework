@@ -138,7 +138,10 @@ test "player movement clamps to state bounds" {
 
     try player.applyInput(&data, &input);
     var movement_slice = data.movementBodySlice();
-    movement.updateSerial(&movement_slice, 1.0);
+    var threads = try @import("../app/thread_system.zig").ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    var movement_system = movement.MovementSystem.init();
+    _ = movement_system.update(&movement_slice, &threads, 1.0, .{});
     try player.clampToBounds(&data, 800, 450);
 
     const body = data.movementBodyConst(player.entity).?;

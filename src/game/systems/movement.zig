@@ -93,13 +93,6 @@ pub const MovementSystem = struct {
     }
 };
 
-/// `MovementSystem.applyIntents` as one inline range, without a thread system.
-pub fn applyIntentsSerial(bodies: *data.DataSystem, frame: *const SimulationFrame) void {
-    const intents = frame.intents.mergedItems();
-    const slice = bodies.movementBodySlice();
-    applyIntentRange(bodies, intents, &slice, .{ .start = 0, .end = intents.len });
-}
-
 const ApplyIntentsJobContext = struct {
     bodies: *const data.DataSystem,
     intents: []const SimulationIntent,
@@ -227,10 +220,6 @@ fn updateMovementBodies(
     };
 }
 
-pub fn updateSerial(slice: *data.MovementBodySlice, delta_seconds: f32) void {
-    processRange(slice, .{ .start = 0, .end = slice.entities.len }, delta_seconds);
-}
-
 fn syncPreviousPositionsImpl(slice: *data.MovementBodySlice) void {
     for (0..slice.entities.len) |index| {
         slice.previous_x[index] = slice.position_x[index];
@@ -323,6 +312,22 @@ fn expectMovementDataApproxEqual(actual: *const data.DataSystem, expected: *cons
     }
 }
 
+// `MovementSystem.update` inline as one range: a thread system with no workers.
+fn updateInline(slice: *data.MovementBodySlice, delta_seconds: f32) !void {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    var system = MovementSystem.init();
+    _ = system.update(slice, &threads, delta_seconds, .{});
+}
+
+// `MovementSystem.applyIntents` inline as one range: a thread system with no workers.
+fn applyIntentsInline(bodies: *data.DataSystem, frame: *const SimulationFrame) !void {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    var system = MovementSystem.init();
+    _ = system.applyIntents(bodies, frame, &threads, .{});
+}
+
 test "serial movement uses simd lanes and scalar tails like scalar integration" {
     inline for (.{ 0, 3, 4, 9 }) |count| {
         var simd_data = data.DataSystem.init(std.testing.allocator);
@@ -334,7 +339,7 @@ test "serial movement uses simd lanes and scalar tails like scalar integration" 
         try fillMovementData(&scalar_data, count);
 
         var simd_slice = simd_data.movementBodySlice();
-        updateSerial(&simd_slice, 0.25);
+        try updateInline(&simd_slice, 0.25);
         var scalar_slice = scalar_data.movementBodySlice();
         processRangeScalar(&scalar_slice, .{ .start = 0, .end = scalar_slice.entities.len }, 0.25);
 
@@ -366,7 +371,7 @@ test "threaded movement matches serial movement" {
         .adaptive = false,
     });
     var serial_slice = serial_data.movementBodySlice();
-    updateSerial(&serial_slice, 0.5);
+    try updateInline(&serial_slice, 0.5);
 
     try std.testing.expectEqual(serial_data.movementBodySliceConst().entities.len, stats.body_count);
     try std.testing.expect(!stats.batch.ran_inline);
@@ -386,7 +391,7 @@ test "threaded movement matches serial across multiple range splits and worker c
     defer serial_data.deinit();
     try fillMovementData(&serial_data, item_count);
     var serial_slice = serial_data.movementBodySlice();
-    updateSerial(&serial_slice, 0.5);
+    try updateInline(&serial_slice, 0.5);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 4,
@@ -440,9 +445,9 @@ test "movement explicit items_per_range bypasses tuner" {
     });
 
     try std.testing.expectEqual(data.movement_range_alignment_items, stats.batch.items_per_range);
-    try std.testing.expectEqual(@as(usize, 0), system.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), system.adaptive_tuner.sample_count);
     try std.testing.expect(system.adaptive_tuner.last_request == null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
     try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
@@ -465,11 +470,11 @@ test "movement system owns adaptive tuner for default update" {
     const stats = system.update(&slice, &threads, 0.5, .{ .max_worker_threads = 2 });
 
     try std.testing.expectEqual(game_data.movementBodySliceConst().entities.len, stats.body_count);
-    try std.testing.expectEqual(@as(usize, 1), system.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 1), system.adaptive_tuner.sample_count);
     try std.testing.expect(system.adaptive_tuner.last_request != null);
-    try std.testing.expectEqual(@as(usize, 0), system.apply_intents_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), system.apply_intents_tuner.sample_count);
     try std.testing.expect(system.apply_intents_tuner.last_request == null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
     try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
@@ -508,7 +513,7 @@ test "integrate leaves the discrete z plane untouched" {
     game_data.movementBodyPtr(entity).?.snapZ(3);
 
     var slice = game_data.movementBodySlice();
-    updateSerial(&slice, 0.5);
+    try updateInline(&slice, 0.5);
 
     const body = game_data.movementBodyConst(entity).?;
     try std.testing.expectEqual(@as(i32, 3), body.position_z);
@@ -611,7 +616,7 @@ test "dormant rows carry zero velocity and stay frozen across a full-range integ
     try std.testing.expectEqual(@as(f32, 0), dormant_body.velocity.y);
 
     var slice = game_data.movementBodySlice();
-    updateSerial(&slice, 0.5);
+    try updateInline(&slice, 0.5);
 
     // Dormant row unmoved; moving row integrated pos + vel*dt exactly.
     const after_dormant = game_data.movementBodyConst(going_dormant).?;
@@ -733,7 +738,7 @@ test "applied intents set velocity from direction and speed, default speed when 
     var fixture = try initIntentFixture(data.movement_range_alignment_items * 2 + 3, true);
     defer fixture.deinit();
 
-    applyIntentsSerial(&fixture.game_data, &fixture.frame);
+    try applyIntentsInline(&fixture.game_data, &fixture.frame);
 
     const slice = fixture.game_data.movementBodySliceConst();
     try std.testing.expectEqual(fixture.agent_count + 1, slice.entities.len);
@@ -756,7 +761,7 @@ test "threaded intent apply matches serial across range splits and worker counts
     const agent_count = data.movement_range_alignment_items * 8 + 3;
     var serial = try initIntentFixture(agent_count, true);
     defer serial.deinit();
-    applyIntentsSerial(&serial.game_data, &serial.frame);
+    try applyIntentsInline(&serial.game_data, &serial.frame);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 4,
@@ -793,7 +798,7 @@ test "intent lanes match the scalar apply bit for bit" {
         var scalar = try initIntentFixture(agent_count, false);
         defer scalar.deinit();
 
-        applyIntentsSerial(&lanes.game_data, &lanes.frame);
+        try applyIntentsInline(&lanes.game_data, &lanes.frame);
         applyIntentRangeScalar(&scalar.game_data, &scalar.frame);
 
         try expectVelocityBitsEqual(&lanes.game_data, &scalar.game_data);
@@ -855,11 +860,11 @@ test "intent apply records into its own tuner" {
     var system = MovementSystem.init();
     _ = system.applyIntents(&fixture.game_data, &fixture.frame, &threads, .{ .max_worker_threads = 2 });
 
-    try std.testing.expectEqual(@as(usize, 1), system.apply_intents_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 1), system.apply_intents_tuner.sample_count);
     try std.testing.expect(system.apply_intents_tuner.last_request != null);
-    try std.testing.expectEqual(@as(usize, 0), system.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), system.adaptive_tuner.sample_count);
     try std.testing.expect(system.adaptive_tuner.last_request == null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
     try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
@@ -878,7 +883,7 @@ test "empty intent stream applies nothing and records no batch" {
 
     try std.testing.expectEqual(@as(usize, 0), stats.intent_count);
     try std.testing.expectEqual(@as(usize, 0), stats.batch.range_count);
-    try std.testing.expectEqual(@as(usize, 0), system.apply_intents_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), system.apply_intents_tuner.sample_count);
     const slice = fixture.game_data.movementBodySliceConst();
     for (slice.velocity_x, slice.velocity_y) |velocity_x, velocity_y| {
         try std.testing.expectEqual(unapplied_velocity, velocity_x);

@@ -374,6 +374,7 @@ fn registryFlushJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
 // ----------------------------------------------------------------------------------------
 
 const test_support = @import("test_support.zig");
+const updatePathfindingInline = @import("test_support.zig").updatePathfindingInline;
 const builtin = @import("builtin");
 const stamped_table = @import("../../stamped_table.zig");
 const math = @import("../../../core/math.zig");
@@ -422,7 +423,7 @@ test "solve results land at their solve ordinal and publish in pending order" {
     defer stream.deinit();
     const goals = [_]math.Vec2{ cellWorld(6, 1), cellWorld(6, 3), cellWorld(6, 5), cellWorld(6, 7) };
     for (goals) |goal| try appendIndividual(&stream, requester, goal);
-    _ = try system.updateSerial(&stream, 8, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &stream, 8, .{ .max_solve_admissions_per_step = 0 });
     try std.testing.expectEqual(goals.len, system.pending.len);
     // Pending 0 and 1 are escalated: the one-per-step tier-1 cap admits 0 and defers 1,
     // so ordinals 0, 1, 2 hold pending 0, 2, 3.
@@ -433,7 +434,7 @@ test "solve results land at their solve ordinal and publish in pending order" {
 
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const stats = try system.updateSerial(&empty, 8, .{});
+    const stats = try updatePathfindingInline(&system, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.escalated_deferred);
     try std.testing.expectEqualSlices(usize, &.{ 0, 2, 3 }, system.solve_indices.items);
     try std.testing.expectEqual(@as(usize, 3), system.solve_results.items.len);
@@ -546,7 +547,7 @@ test "pathfinding a publish reserve out of memory claims nothing, leaves pending
     // With memory back, the next step publishes the same requests without new intake.
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const retry = try system.updateSerial(&empty, 8, .{});
+    const retry = try updatePathfindingInline(&system, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), retry.accepted_requests);
     try std.testing.expectEqual(goals.len + 1, retry.available_results);
     try std.testing.expectEqual(@as(usize, 0), system.pending.len);
@@ -599,7 +600,7 @@ test "the path registry holds every run of every published path, and the increme
     // A shrink with renames: sustained low load drops the capacity to the floor's 32.
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    for (0..system.capacity.capacity_shrink_window) |_| _ = try system.updateSerial(&empty, 1, .{});
+    for (0..system.capacity.capacity_shrink_window) |_| _ = try updatePathfindingInline(&system, &empty, 1, .{});
     try std.testing.expectEqual(@as(usize, 32), system.completed.logicalCapacity());
     try expectRegistryMatchesCache(&system);
 }
@@ -645,7 +646,7 @@ test "threaded publish equals serial across range sizes and worker counts (cache
         const route = registryRoute(index, 24);
         try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
     }
-    const serial_stats = try serial.updateSerial(&stream, 64, .{});
+    const serial_stats = try updatePathfindingInline(&serial, &stream, 64, .{});
     try std.testing.expectEqual(@as(usize, 48), serial_stats.available_results);
     try std.testing.expect(serial_stats.registrations_added > 48);
     try std.testing.expect(serial.completed.long_block_count != 0);
@@ -723,7 +724,7 @@ fn shrinkThroughUpdates(serial: *PathfindingSystem, threaded: *PathfindingSystem
     var flushes = ShrinkFlushes{};
     for (0..serial.capacity.capacity_shrink_window) |_| {
         const serial_capacity = serial.completed.logicalCapacity();
-        const serial_stats = try serial.updateSerial(&empty, 1, .{});
+        const serial_stats = try updatePathfindingInline(serial, &empty, 1, .{});
         if (serial.completed.logicalCapacity() < serial_capacity) flushes.serial = serial_stats.registry_flush_batch;
         const capacity = threaded.completed.logicalCapacity();
         const stats = try threaded.update(&empty, 1, threads, config);
@@ -749,10 +750,10 @@ test "a shrink's registry flush runs on workers at about one pair per range unde
     var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
     defer threaded.deinit();
     // The shrink's fixed-shape flush leaves the flush tuner untouched.
-    const tuner_before = threaded.tuners.registry_flush.report();
+    const tuner_before = threaded.tuners.registry_flush;
     const flushes = try shrinkThroughUpdates(&serial, &threaded, &threads, .{});
     const flush = flushes.threaded;
-    const tuner_after = threaded.tuners.registry_flush.report();
+    const tuner_after = threaded.tuners.registry_flush;
     try std.testing.expectEqual(tuner_before.sample_count, tuner_after.sample_count);
     try std.testing.expectEqual(tuner_before.phase, tuner_after.phase);
     try std.testing.expectEqual(tuner_before.current_profile, tuner_after.current_profile);

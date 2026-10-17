@@ -90,8 +90,8 @@ fn dispatchOnce(
 }
 
 fn tunerSettled(thread_system: *const ThreadSystem, fixed_tuner: *const ?AdaptiveWorkTuner) bool {
-    if (fixed_tuner.*) |*tuner| return tuner.isSettled();
-    return thread_system.adaptive_tuner.isSettled();
+    if (fixed_tuner.*) |*tuner| return (tuner.phase == .settled);
+    return (thread_system.adaptive_tuner.phase == .settled);
 }
 
 // The shape every threaded batch must have, whoever chose it.
@@ -154,11 +154,11 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     }
 
     for (items) |item| std.debug.assert(item == dispatches);
-    if (thread_ptr) |thread_system| std.debug.assert(thread_system.forcedInlineBatchCount() == 0);
+    if (thread_ptr) |thread_system| std.debug.assert(!thread_system.shared.control.forced_inline_warned.load(.monotonic));
     var stats = accumulator.finish();
     stats.output_count = item_count;
     if (case.adaptive) {
-        const report = if (fixed_tuner) |*tuner| tuner.report() else thread_ptr.?.adaptive_tuner.report();
+        const report = if (fixed_tuner) |*tuner| suite.tunerReport(tuner) else suite.tunerReport(&thread_ptr.?.adaptive_tuner);
         stats.work_tuning = suite.workTuningSummary(report, settled_before_measurement);
     }
     return stats;

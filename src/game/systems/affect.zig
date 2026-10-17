@@ -33,7 +33,6 @@ const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const AiBehavior = @import("../data_system.zig").AiBehavior;
@@ -161,8 +160,8 @@ pub const AffectSystem = struct {
     compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
     /// Sizes the gather rows (including the per-row crossing bits) for `pop`
-    /// agents; no partition-sized scratch exists, so `update`/`updateSerial`
-    /// allocate nothing after this under any `items_per_range`. Grow-only;
+    /// agents; no partition-sized scratch exists, so `update`
+    /// allocates nothing after this under any `items_per_range`. Grow-only;
     /// re-run by the pipeline's population seam.
     pub fn reserve(self: *AffectSystem, pop: usize) !void {
         if (pop == 0) return;
@@ -207,29 +206,6 @@ pub const AffectSystem = struct {
             .processed_count = count,
             .threshold_crossed_count = merge.crossed,
             .batch = batch,
-        };
-    }
-
-    pub fn updateSerial(
-        self: *AffectSystem,
-        ai_agents: ConstAiAgentSlice,
-        data: *DataSystem,
-        events: *SimulationEvents,
-        config: AffectConfig,
-    ) !AffectStats {
-        try self.gatherScopedIndices(ai_agents, data, config.scope_dense_indices);
-        const count = self.rows.len;
-        if (count == 0) return .{};
-
-        const range_count: usize = 1;
-        var job = self.buildJobContext(data, range_count);
-        processAffectRange(&job, .{ .index = 0, .start = 0, .end = count });
-
-        const merge = try self.emitCrossingEvents(events, config.max_events_per_step);
-        return .{
-            .processed_count = count,
-            .threshold_crossed_count = merge.crossed,
-            .batch = inlineBatch(count, affect_range_alignment_items),
         };
     }
 
@@ -704,6 +680,13 @@ fn addAgentWithPerceptionMemoryAffect(
     return entity;
 }
 
+// `AffectSystem.update` inline as one range: a thread system with no workers.
+fn updateInline(system: *AffectSystem, ai_agents: ConstAiAgentSlice, data: *DataSystem, events: *SimulationEvents, config: AffectConfig) !AffectStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    return system.update(ai_agents, data, events, &threads, config);
+}
+
 test "decays toward baseline with no perception/memory present, and fatigue responds to behavior" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
@@ -724,7 +707,7 @@ test "decays toward baseline with no perception/memory present, and fatigue resp
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try testing.expectEqual(@as(usize, 2), stats.processed_count);
 
     // Wandering relaxes toward the low baseline (no delta added).
@@ -751,7 +734,7 @@ test "fear and aggression rise together for a close visible hostile, and fall as
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    for (0..10) |_| _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    for (0..10) |_| _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     const settled = data.aiAffectConst(entity).?;
     try testing.expect(settled.fear > 0);
     try testing.expect(settled.aggression > 0);
@@ -761,7 +744,7 @@ test "fear and aggression rise together for a close visible hostile, and fall as
     // sensing state (mirrors how PerceptionSystem itself would write this).
     const perception_index = data.aiPerceptionDenseIndex(entity).?;
     data.perceptionSlice().target_visible[perception_index] = false;
-    for (0..10) |_| _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    for (0..10) |_| _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     const after = data.aiAffectConst(entity).?;
     try testing.expect(after.fear < settled.fear);
     try testing.expect(after.aggression < settled.aggression);
@@ -791,7 +774,7 @@ test "curiosity rises from heard_stimulus and separately from low familiarity" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try testing.expect(data.aiAffectConst(hearer).?.curiosity > 0);
     try testing.expect(data.aiAffectConst(novelty_seeker).?.curiosity > 0);
 }
@@ -807,7 +790,7 @@ test "fatigue rises under seek and decays under wander across steps" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    for (0..10) |_| _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    for (0..10) |_| _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     const seeking_fatigue = data.aiAffectConst(entity).?.fatigue;
     try testing.expect(seeking_fatigue > 0);
 
@@ -817,7 +800,7 @@ test "fatigue rises under seek and decays under wander across steps" {
     // flips target_visible via perceptionSlice()).
     const agent_index = data.aiAgentDenseIndex(entity).?;
     data.aiAgentSlice().active_behavior[agent_index] = .wander;
-    for (0..10) |_| _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    for (0..10) |_| _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try testing.expect(data.aiAffectConst(entity).?.fatigue < seeking_fatigue);
 }
 
@@ -833,7 +816,7 @@ test "fatigue rises under flee just like pursue, matching arbitration's exertion
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    for (0..10) |_| _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    for (0..10) |_| _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try testing.expect(data.aiAffectConst(fleer).?.fatigue > 0);
     try testing.expect(data.aiAffectConst(fleer).?.fatigue > data.aiAffectConst(wanderer).?.fatigue);
 }
@@ -862,7 +845,7 @@ test "threshold crossing emits exactly one rising then one falling event, with n
 
     // Step 1: fear rises from 0 to (0 + gain_fear) decayed fully to baseline
     // 0.65, crossing threshold 0.6 upward. Rising event expected.
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     var rising_count: usize = 0;
     for (events.mergedItems()) |event| {
         if (event.payload == .affect_threshold_crossed and event.payload.affect_threshold_crossed.rising) rising_count += 1;
@@ -875,7 +858,7 @@ test "threshold crossing emits exactly one rising then one falling event, with n
     // band prevents flapping right at the threshold).
     for (0..5) |_| {
         events.clearRetainingCapacity();
-        _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+        _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
         try testing.expectEqual(@as(usize, 0), events.mergedItems().len);
     }
 
@@ -884,7 +867,7 @@ test "threshold crossing emits exactly one rising then one falling event, with n
     // tunable) below the falling threshold is what forces the falling edge.
     try data.setAiAffect(entity, .{ .baseline_fear = 0.4, .decay_rate_fear = 1.0, .threshold_fear = 0.6 });
     events.clearRetainingCapacity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     var falling_count: usize = 0;
     for (events.mergedItems()) |event| {
         if (event.payload == .affect_threshold_crossed and !event.payload.affect_threshold_crossed.rising) falling_count += 1;
@@ -927,14 +910,14 @@ test "Schmitt trigger does not refire a rising edge while oscillating in-band, a
     defer events.deinit();
 
     // (a) 0 -> 0.601 crosses threshold (0.6) upward: exactly one rising event.
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try expectCrossingCounts(events.mergedItems(), 1, 0);
 
     // (b) dips to 0.599, still above the falling edge (0.6 - 0.05 = 0.55):
     // the hysteresis band was never left, so no event fires.
     try data.setAiAffect(entity, .{ .baseline_fear = 0.599, .decay_rate_fear = 1.0, .threshold_fear = 0.6 });
     events.clearRetainingCapacity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try expectCrossingCounts(events.mergedItems(), 0, 0);
 
     // (c) regression case: crosses threshold upward again without the drive
@@ -942,20 +925,20 @@ test "Schmitt trigger does not refire a rising edge while oscillating in-band, a
     // already set, so this must NOT refire rising.
     try data.setAiAffect(entity, .{ .baseline_fear = 0.601, .decay_rate_fear = 1.0, .threshold_fear = 0.6 });
     events.clearRetainingCapacity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try expectCrossingCounts(events.mergedItems(), 0, 0);
 
     // (d) genuinely drops below the falling edge: exactly one falling event.
     try data.setAiAffect(entity, .{ .baseline_fear = 0.4, .decay_rate_fear = 1.0, .threshold_fear = 0.6 });
     events.clearRetainingCapacity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try expectCrossingCounts(events.mergedItems(), 0, 1);
 
     // (e) having truly left and now re-entered, this rising edge is new and
     // must fire.
     try data.setAiAffect(entity, .{ .baseline_fear = 0.601, .decay_rate_fear = 1.0, .threshold_fear = 0.6 });
     events.clearRetainingCapacity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try expectCrossingCounts(events.mergedItems(), 1, 0);
 }
 
@@ -981,20 +964,20 @@ test "a threshold just above the hysteresis floor still rises and falls, not per
     defer events.deinit();
 
     // Rises: baseline sits just above threshold.
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try expectCrossingCounts(events.mergedItems(), 1, 0);
 
     // Falls: baseline drops to 0, which is still strictly below threshold - hysteresis
     // even though threshold itself is barely above the floor.
     try data.setAiAffect(entity, .{ .baseline_fear = 0, .decay_rate_fear = 1.0, .threshold_fear = low_threshold });
     events.clearRetainingCapacity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try expectCrossingCounts(events.mergedItems(), 0, 1);
 
     // Rises again: proves the bit was genuinely cleared, not permanently latched.
     try data.setAiAffect(entity, .{ .baseline_fear = low_threshold + 0.01, .decay_rate_fear = 1.0, .threshold_fear = low_threshold });
     events.clearRetainingCapacity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try expectCrossingCounts(events.mergedItems(), 1, 0);
 }
 
@@ -1040,7 +1023,7 @@ test "serial and threaded updates are byte-identical" {
 
     for (0..5) |_| {
         events_a.clearRetainingCapacity();
-        _ = try sys_a.updateSerial(data_a.aiAgentSliceConst(), &data_a, &events_a, .{});
+        _ = try updateInline(&sys_a, data_a.aiAgentSliceConst(), &data_a, &events_a, .{});
         events_b.clearRetainingCapacity();
         _ = try sys_b.update(data_b.aiAgentSliceConst(), &data_b, &events_b, &threads, .{
             .items_per_range = affect_range_alignment_items,
@@ -1104,7 +1087,7 @@ test "serial and threaded emit identical order and cap membership when different
     var events_threaded = SimulationEvents.init(testing.allocator);
     defer events_threaded.deinit();
 
-    _ = try sys_serial.updateSerial(data_serial.aiAgentSliceConst(), &data_serial, &events_serial, .{});
+    _ = try updateInline(&sys_serial, data_serial.aiAgentSliceConst(), &data_serial, &events_serial, .{});
     _ = try sys_threaded.update(data_threaded.aiAgentSliceConst(), &data_threaded, &events_threaded, &threads, .{
         .items_per_range = affect_range_alignment_items,
         .max_worker_threads = 2,
@@ -1127,7 +1110,7 @@ test "serial and threaded emit identical order and cap membership when different
         const slice = data.aiAffectSlice();
         @memset(slice.above_threshold_mask, 0);
     }
-    _ = try sys_serial.updateSerial(data_serial.aiAgentSliceConst(), &data_serial, &events_serial, .{ .max_events_per_step = 1 });
+    _ = try updateInline(&sys_serial, data_serial.aiAgentSliceConst(), &data_serial, &events_serial, .{ .max_events_per_step = 1 });
     _ = try sys_threaded.update(data_threaded.aiAgentSliceConst(), &data_threaded, &events_threaded, &threads, .{
         .items_per_range = affect_range_alignment_items,
         .max_worker_threads = 2,
@@ -1153,7 +1136,7 @@ test "an entity outside scope_dense_indices is untouched" {
     defer events.deinit();
 
     const only_first = [_]u32{0};
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{ .scope_dense_indices = &only_first });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{ .scope_dense_indices = &only_first });
 
     const entities = data.aiAgentSliceConst().entities;
     try testing.expect(data.aiAffectConst(entities[0]).?.fatigue > 0);
@@ -1177,7 +1160,7 @@ test "serial has no steady-state allocation after warmup (FailingAllocator)" {
     sys.allocator = failing.allocator();
     defer sys.allocator = original_allocator;
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try testing.expectEqual(@as(usize, 1), stats.processed_count);
 }
 
@@ -1270,9 +1253,9 @@ test "threaded update records one sample into the compute tuner and none into th
 
     const stats = try sys.update(data.aiAgentSliceConst(), &data, &events, &threads, .{});
     try testing.expectEqual(@as(usize, 64), stats.processed_count);
-    try testing.expectEqual(@as(usize, 1), sys.compute_tuner.report().sample_count);
+    try testing.expectEqual(@as(usize, 1), sys.compute_tuner.sample_count);
     try testing.expect(sys.compute_tuner.last_request != null);
-    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
     try testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
@@ -1314,7 +1297,7 @@ test "crossings are emitted in (gather row, drive declaration) order, not entity
         .{ .entity = entities[0], .drive = .aggression },
     };
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{ .scope_dense_indices = &scope });
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{ .scope_dense_indices = &scope });
     try testing.expectEqual(@as(usize, 4), stats.threshold_crossed_count);
     const items = events.mergedItems();
     try testing.expectEqual(expected.len, items.len);
@@ -1328,7 +1311,7 @@ test "crossings are emitted in (gather row, drive declaration) order, not entity
     // The cap keeps the first three in that same order and drops the last.
     @memset(data.aiAffectSlice().above_threshold_mask, 0);
     events.clearRetainingCapacity();
-    const capped = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{ .scope_dense_indices = &scope, .max_events_per_step = 3 });
+    const capped = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{ .scope_dense_indices = &scope, .max_events_per_step = 3 });
     try testing.expectEqual(@as(usize, 3), capped.threshold_crossed_count);
     try testing.expectEqual(@as(usize, 1), events.stats.dropped);
     const capped_items = events.mergedItems();
@@ -1373,7 +1356,7 @@ test "a tight event capacity forces a graceful drop instead of a throw" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{ .max_events_per_step = 1 });
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{ .max_events_per_step = 1 });
     try testing.expectEqual(@as(usize, 1), stats.threshold_crossed_count);
     const items = events.mergedItems();
     try testing.expectEqual(@as(usize, 1), items.len);
@@ -1385,6 +1368,6 @@ test "a tight event capacity forces a graceful drop instead of a throw" {
 
     // The flag is once-only: a later step never clears it.
     events.clearRetainingCapacity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{ .max_events_per_step = 1 });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{ .max_events_per_step = 1 });
     try testing.expect(sys.dropped_events_warned);
 }

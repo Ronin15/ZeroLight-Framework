@@ -23,7 +23,6 @@ const SlotList = @import("../../../app/thread_system.zig").SlotList;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const band_tuner_config = @import("../../../app/thread_system.zig").band_tuner_config;
-const inlineBatch = @import("../../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const setRowCount = @import("../../../app/thread_system.zig").setRowCount;
 const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
@@ -96,7 +95,6 @@ pub const SteeringConfig = struct {
 };
 
 // Threading for one update's stages: the thread system and the caller's control config.
-// Absent in `updateSerial`, where every stage runs inline.
 pub const StageThreads = @import("../../../app/thread_system.zig").StageThreads(SteeringConfig);
 
 pub const SteeringStats = struct {
@@ -272,22 +270,11 @@ pub const SteeringSystem = struct {
         return self.step(data, frame, .{ .thread_system = thread_system, .config = config }, pathfinding, colliders.view());
     }
 
-    /// One steering step with every stage inline on the calling thread.
-    pub fn updateSerial(
-        self: *SteeringSystem,
-        data: *const DataSystem,
-        frame: *SimulationFrame,
-        pathfinding: *const PathfindingSystem,
-        colliders: *const StaticColliderSystem,
-    ) !SteeringStats {
-        return self.step(data, frame, null, pathfinding, colliders.view());
-    }
-
     fn step(
         self: *SteeringSystem,
         data: *const DataSystem,
         frame: *SimulationFrame,
-        threads: ?StageThreads,
+        threads: StageThreads,
         pathfinding: *const PathfindingSystem,
         obstacles: ColliderView,
     ) !SteeringStats {
@@ -329,7 +316,7 @@ pub const SteeringSystem = struct {
         data: *const DataSystem,
         steering: ConstSteeringAgentSlice,
         build_snapshot: bool,
-        threads: ?StageThreads,
+        threads: StageThreads,
         stats: *SteeringStats,
     ) void {
         const agent_count = steering.entities.len;
@@ -374,21 +361,13 @@ pub const SteeringSystem = struct {
         };
         var range_count: usize = 0;
         if (agent_count != 0) {
-            if (threads) |stage| {
-                const agents = stage.stage(&self.agents_tuner);
-                const selection = agents.select(agent_count, steering_range_alignment_items);
-                setSlotCount(AgentsTally, &self.agents_tallies, selection.range_count);
-                job.items_per_range = selection.items_per_range;
-                job.tallies = self.agents_tallies.items;
-                stats.agents_batch = agents.run(selection, agent_count, steering_range_alignment_items, &job, agentsJob);
-                range_count = selection.range_count;
-            } else {
-                setSlotCount(AgentsTally, &self.agents_tallies, 1);
-                job.tallies = self.agents_tallies.items;
-                agentsJob(&job, .{ .index = 0, .start = 0, .end = agent_count }, WorkerId.main);
-                stats.agents_batch = inlineBatch(agent_count, steering_range_alignment_items);
-                range_count = 1;
-            }
+            const agents = threads.stage(&self.agents_tuner);
+            const selection = agents.select(agent_count, steering_range_alignment_items);
+            setSlotCount(AgentsTally, &self.agents_tallies, selection.range_count);
+            job.items_per_range = selection.items_per_range;
+            job.tallies = self.agents_tallies.items;
+            stats.agents_batch = agents.run(selection, agent_count, steering_range_alignment_items, &job, agentsJob);
+            range_count = selection.range_count;
         }
         if (refresh_movement_index) self.steering_movement_index_valid = true;
 
@@ -760,6 +739,8 @@ const PathRequest = @import("../../simulation.zig").PathRequest;
 const AgentBands = @import("selection.zig").AgentBands;
 const requestsBefore = @import("avoidance.zig").requestsBefore;
 const expectEveryStageThreaded = @import("test_support.zig").expectEveryStageThreaded;
+const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
+const updatePathfindingInline = @import("../pathfinding/test_support.zig").updatePathfindingInline;
 const selectionIntent = @import("test_support.zig").selectionIntent;
 const addSteeredEntity = @import("test_support.zig").addSteeredEntity;
 const addStaticObstacle = @import("test_support.zig").addStaticObstacle;
@@ -808,7 +789,7 @@ test "steering agent snapshot holds each steering row's previous position, and n
         .{ .entity = bodiless, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 },
         .{ .entity = second, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 },
     });
-    const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     // The bodiless agent's intent resolves no movement row.
     try std.testing.expectEqual(@as(usize, 2), stats.selected_intent_count);
 
@@ -845,7 +826,7 @@ test "steering movement index cache rebuilds only after structural invalidate" {
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    _ = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expect(steering.steering_movement_index_valid);
     try std.testing.expectEqual(@as(usize, 1), steering.steering_movement_index.items.len);
     const cached_mi = steering.steering_movement_index.items[0];
@@ -854,7 +835,7 @@ test "steering movement index cache rebuilds only after structural invalidate" {
     // Second step without structural events reuses the cache.
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    _ = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expect(steering.steering_movement_index_valid);
     try std.testing.expectEqual(cached_mi, steering.steering_movement_index.items[0]);
 
@@ -922,7 +903,7 @@ test "steering serial and real threaded workers produce identical movement inten
     var serial_system = SteeringSystem.init(std.testing.allocator);
     defer serial_system.deinit();
     try serial_system.reserve(128);
-    const serial_stats = try serial_system.updateSerial(&data, &serial_frame, &pathfinding, &colliders);
+    const serial_stats = try updateSteeringInline(&serial_system, &data, &serial_frame, &pathfinding, &colliders);
     const serial = serial_frame.intents.mergedItems();
     try std.testing.expect(serial_stats.obstacle_samples > 0);
 
@@ -1007,7 +988,7 @@ test "steering serial matches threaded intents across multiple range splits and 
     var serial_system = SteeringSystem.init(std.testing.allocator);
     defer serial_system.deinit();
     try serial_system.reserve(128);
-    _ = try serial_system.updateSerial(&data, &serial_frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&serial_system, &data, &serial_frame, &pathfinding, &colliders);
     const serial = serial_frame.intents.mergedItems();
     try std.testing.expect(serial.len > 0);
 
@@ -1097,7 +1078,7 @@ test "steering update is allocation-free after reserves from the first step" {
         setCollidersAllocator(&colliders, std.testing.allocator);
     }
 
-    const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(usize, 1), stats.movement_intent_count);
     try std.testing.expect(stats.obstacle_samples > 0);
@@ -1112,7 +1093,7 @@ test "steering update is allocation-free after reserves from the first step" {
         .{ .entity = newcomer, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 },
         .{ .entity = other, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 },
     });
-    const churn = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const churn = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(usize, 2), churn.movement_intent_count);
     try std.testing.expectEqual(@as(usize, 2), steering.runtime_rows.len);
@@ -1241,12 +1222,12 @@ test "steering runtime rows go with destroyed entities within a one-agent reserv
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    _ = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 1), steering.runtime_rows.len);
 
     try std.testing.expect(data.destroyEntity(agent));
     frame.beginStep();
-    _ = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 0), steering.runtime_rows.len);
 }
 
@@ -1581,7 +1562,7 @@ fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trac
         const stats = if (thread_system) |threads|
             try system.update(&data, &frame, threads, &pathfinding, &colliders, config)
         else
-            try system.updateSerial(&data, &frame, &pathfinding, &colliders);
+            try updateSteeringInline(&system, &data, &frame, &pathfinding, &colliders);
         if (thread_system) |threads| {
             if (threads.workerThreadCount() == 0 or (config.max_worker_threads orelse 1) == 0) {
                 try expectSerialSelectionAndGrid(stats);
@@ -1593,7 +1574,7 @@ fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trac
         }
         try expectRequestPrefixesCount(&system, stats);
         try trace.record(&frame, stats, &system);
-        _ = try pathfinding.updateSerial(&frame.path_requests, agents.items.len, .{});
+        _ = try updatePathfindingInline(&pathfinding, &frame.path_requests, agents.items.len, .{});
     }
 }
 
@@ -1656,7 +1637,7 @@ fn runRekeyScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, churn
     for (agents.items, 0..) |agent, index| try intents.append(std.testing.allocator, selectionIntent(agent, index, 0, 0));
     frame.beginStep();
     try appendNavigationIntents(&frame, intents.items);
-    const first = if (thread_system) |threads| try system.update(&data, &frame, threads, &pathfinding, &colliders, config) else try system.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const first = if (thread_system) |threads| try system.update(&data, &frame, threads, &pathfinding, &colliders, config) else try updateSteeringInline(&system, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(rekey_agent_count, first.path_request_count);
 
     switch (churn) {
@@ -1672,7 +1653,7 @@ fn runRekeyScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, churn
     for (agents.items) |agent| try intents.append(std.testing.allocator, .{ .entity = agent, .goal = .{ .x = 999, .y = 999 }, .direct_direction_y = 1 });
     frame.beginStep();
     try appendNavigationIntents(&frame, intents.items);
-    const second = if (thread_system) |threads| try system.update(&data, &frame, threads, &pathfinding, &colliders, config) else try system.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const second = if (thread_system) |threads| try system.update(&data, &frame, threads, &pathfinding, &colliders, config) else try updateSteeringInline(&system, &data, &frame, &pathfinding, &colliders);
     if (thread_system != null) try expectEveryStageThreaded(second);
     // Each runtime row holds its steering row's entity.
     const steering_entities = data.steeringAgentSliceConst().entities;

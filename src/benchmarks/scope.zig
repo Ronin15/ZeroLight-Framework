@@ -151,29 +151,31 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     defer scope.deinit();
     try scope.reserve(fields.agents);
     if (suite.adaptiveTunerForCase(case, scope_range_alignment_items)) |tuner| scope.cognition_tuner = tuner;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr = if (threads) |*thread_system| thread_system else null;
 
-    // Positions never change, so the halo's index is built once, untimed.
+    // Positions never change, so the halo's index is built once, untimed and inline.
+    var setup_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
+    defer setup_threads.deinit();
     var spatial_index = SpatialIndexSystem.init(allocator);
     defer spatial_index.deinit();
-    const halo = (try scope.gatherAiPopulationsSerial(&data, cognitionHaloRegion())).halo;
-    _ = try spatial_index.buildSerial(&data, .{ .entities = data.aiAgentSliceConst().entities, .rows = halo }, index_geometry, .{});
+    const halo = (try scope.gatherAiPopulations(&data, cognitionHaloRegion(), &setup_threads, .{})).halo;
+    _ = try spatial_index.build(&data, .{ .entities = data.aiAgentSliceConst().entities, .rows = halo }, index_geometry, &setup_threads, .{});
     const view = spatial_index.view();
     const indexed = view.entryCount();
     if (fields.layout == .dense_chunk) std.debug.assert(view.recordCount() == 1 and indexed == fields.agents);
-    // The serial pass's think set, untimed: every case must match it.
+    // The inline pass's think set, untimed: every case must match it.
     const serial_think = blk: {
         var reference = SimulationScopeSystem.init(allocator);
         defer reference.deinit();
-        break :blk try allocator.dupe(u32, (try reference.compactCognitionSerial(&view, 0, true)).cognition);
+        break :blk try allocator.dupe(u32, (try reference.compactCognition(&view, 0, true, &setup_threads, .{})).cognition);
     };
     defer allocator.free(serial_think);
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(scope.cognition_tuner.isSettled())) _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
-    const settled_before_measurement = if (case.adaptive) scope.cognition_tuner.isSettled() else false;
+    while (warm.next(scope.cognition_tuner.phase == .settled)) _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
+    const settled_before_measurement = if (case.adaptive) (scope.cognition_tuner.phase == .settled) else false;
 
     const counts = &suite.event_scale_counts;
     // `dense_chunk` runs inline where its tuner measures that cheaper.
@@ -200,13 +202,12 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.candidate_pairs = indexed;
     stats.output_count = think_rows;
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(scope.cognition_tuner.report(), settled_before_measurement);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&scope.cognition_tuner), settled_before_measurement);
     return stats;
 }
 
 fn runCognitionOnce(scope: *SimulationScopeSystem, view: *const SpatialIndexView, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !CognitionResult {
-    if (thread_system) |ts| return scope.compactCognition(view, 0, true, ts, scopeConfig(case));
-    return scope.compactCognitionSerial(view, 0, true);
+    return scope.compactCognition(view, 0, true, thread_system.?, scopeConfig(case));
 }
 
 // `candidate_pairs` holds the indexed rows and `output_count` the rows that think; `main` is

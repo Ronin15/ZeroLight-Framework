@@ -191,17 +191,19 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
 pub fn runCellOrderedCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    // The default fixture's think set is the creation order.
+    // The default fixture's think set is the creation order, built inline.
+    var setup_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
+    defer setup_threads.deinit();
     const order = blk: {
         var plain = try createFixture(allocator, item_count);
         defer plain.deinit();
         var index = SpatialIndexSystem.init(allocator);
         defer index.deinit();
-        _ = try index.buildSerial(&plain.data, .{ .entities = plain.data.aiAgentSliceConst().entities }, fixtureIndexGeometry(item_count), .{});
+        _ = try index.build(&plain.data, .{ .entities = plain.data.aiAgentSliceConst().entities }, fixtureIndexGeometry(item_count), &setup_threads, .{});
         const view = index.view();
         var scope = SimulationScopeSystem.init(allocator);
         defer scope.deinit();
-        break :blk try allocator.dupe(u32, (try scope.compactCognitionSerial(&view, 0, false)).cognition);
+        break :blk try allocator.dupe(u32, (try scope.compactCognition(&view, 0, false, &setup_threads, .{})).cognition);
     };
     defer allocator.free(order);
     var fixture = try createFixtureInOrder(allocator, item_count, order);
@@ -219,28 +221,28 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         system.intent_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
     }
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     // Positions never change, so the index is built once, untimed (its own group times it).
     var spatial_sys = SpatialIndexSystem.init(allocator);
     defer spatial_sys.deinit();
-    _ = try spatial_sys.buildSerial(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, fixtureIndexGeometry(item_count), .{});
+    _ = try spatial_sys.build(&fixture.data, .{ .entities = fixture.data.aiAgentSliceConst().entities }, fixtureIndexGeometry(item_count), &threads.?, .{ .adaptive = false });
     const spatial_view = spatial_sys.view();
     var scope = SimulationScopeSystem.init(allocator);
     defer scope.deinit();
-    const think_set = (try scope.compactCognitionSerial(&spatial_view, 0, false)).cognition;
+    const think_set = (try scope.compactCognition(&spatial_view, 0, false, &threads.?, .{ .adaptive = false })).cognition;
     std.debug.assert(think_set.len == item_count);
     if (think_ascends) {
         for (think_set, 0..) |row, rank| std.debug.assert(row == rank);
     }
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(system.gather_tuner.isSettled() and system.separation_tuner.isSettled() and system.intent_tuner.isSettled())) {
+    while (warm.next((system.gather_tuner.phase == .settled) and (system.separation_tuner.phase == .settled) and (system.intent_tuner.phase == .settled))) {
         _ = try runOnce(&system, fixture, spatial_view, think_set, if (threads) |*thread_system| thread_system else null, case);
     }
-    const separation_settled_before_measurement = if (case.adaptive) system.separation_tuner.isSettled() else false;
-    const intent_settled_before_measurement = if (case.adaptive) system.intent_tuner.isSettled() else false;
+    const separation_settled_before_measurement = if (case.adaptive) (system.separation_tuner.phase == .settled) else false;
+    const intent_settled_before_measurement = if (case.adaptive) (system.intent_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_ai_stats = AiStats{};
@@ -269,8 +271,8 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.splice_batch = suite.batchSummaryFromBatch(last_ai_stats.gather_batch);
     stats.ai_behavior_histogram = behaviorHistogram(fixture.data.aiAgentSliceConst().behaviors);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.separation_tuner.report(), separation_settled_before_measurement);
-        stats.secondary_work_tuning = suite.workTuningSummary(system.intent_tuner.report(), intent_settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.separation_tuner), separation_settled_before_measurement);
+        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.intent_tuner), intent_settled_before_measurement);
     }
     return stats;
 }
@@ -296,18 +298,6 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView,
     fixture.frame.beginStep();
     const ai_slice = fixture.data.aiAgentSliceConst();
     const movement_slice = fixture.data.movementBodySliceConst();
-    if (!case.usesThreadSystem()) {
-        return try system.updateSerial(ai_slice, movement_slice, spatial_view, &fixture.data, &fixture.frame, delta_seconds, .{
-            .intent_seed = intent_seed,
-            .focus_target = benchmarkSeekTarget(),
-            .focus_entity = fixture.focus_entity,
-            .perception_slice = fixture.data.aiPerceptionSliceConst(),
-            .memory_slice = fixture.data.aiMemorySliceConst(),
-            .affect_slice = fixture.data.aiAffectSliceConst(),
-            .interest_markers = &fixture.markers,
-            .scope_dense_indices = think_set,
-        });
-    }
 
     return try system.update(ai_slice, movement_slice, spatial_view, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{
         .items_per_range = case.stageItemsPerRange(ai_range_alignment_items),

@@ -66,14 +66,14 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         particles.adaptive_tuner = tuner;
     }
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(particles.adaptive_tuner.isSettled())) {
+    while (warm.next(particles.adaptive_tuner.phase == .settled)) {
         _ = runOnce(&particles, if (threads) |*thread_system| thread_system else null, case);
     }
-    const settled_before_measurement = if (case.adaptive) particles.adaptive_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) (particles.adaptive_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
@@ -87,16 +87,12 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     var stats = accumulator.finish();
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(particles.adaptive_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&particles.adaptive_tuner), settled_before_measurement);
     }
     return stats;
 }
 
 fn runOnce(particles: *ParticleSystem, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) BatchStats {
-    if (!case.usesThreadSystem()) {
-        return particles.updateSerial(delta_seconds).batch;
-    }
-
     return particles.update(thread_system.?, delta_seconds, .{
         .items_per_range = case.stageItemsPerRange(particle_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),

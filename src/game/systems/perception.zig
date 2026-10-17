@@ -17,7 +17,7 @@
 //! Threading: each gather range writes its window of rows, merged by main in range order;
 //! each compute range derives its rows' facing and writes only its rows' `PerceptionStore`
 //! and `final_*` columns and its padded stats slot; main emits the events after the join in
-//! row order. Serial and threaded paths run the same jobs. A compute range keeps one
+//! row order. Inline and threaded dispatches run the same jobs. A compute range keeps one
 //! neighbor block, walking each run of rows sharing a cell, level, and faction once per
 //! distinct scan box.
 
@@ -35,7 +35,6 @@ const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
@@ -232,7 +231,7 @@ pub const PerceptionSystem = struct {
 
     /// Sizes observer rows and the per-range stats tallies
     /// (`maxRangeCount`, every partition the tuner can pick) for `pop` agents;
-    /// nothing partition-sized remains, so `update`/`updateSerial` allocate
+    /// nothing partition-sized remains, so `update` allocates
     /// nothing after this under any `items_per_range`. Grow-only; re-run by
     /// the pipeline's population seam.
     pub fn reserve(self: *PerceptionSystem, pop: usize) !void {
@@ -290,46 +289,6 @@ pub const PerceptionSystem = struct {
         };
     }
 
-    pub fn updateSerial(
-        self: *PerceptionSystem,
-        ai_agents: ConstAiAgentSlice,
-        movement: ConstMovementBodySlice,
-        spatial: SpatialIndexView,
-        world: *const WorldSystem,
-        data: *DataSystem,
-        events: *SimulationEvents,
-        config: PerceptionConfig,
-    ) !PerceptionStats {
-        const perception_slice = data.perceptionSlice();
-        try self.gatherPerceptionDataSerial(.{ .ai_agents = ai_agents, .movement = movement, .data = data, .perception_slice = perception_slice, .scope_dense_indices = config.scope_dense_indices, .cell_size = spatial.cell_size });
-        const observer_count = self.rows.len;
-        if (observer_count == 0) return .{ .candidate_population_count = spatial.entryCount() };
-
-        const range_count: usize = 1;
-        try self.prepareRangeStats(range_count);
-
-        var job = self.buildJobContext(perception_slice, spatial, world, config.player_candidate, config.stimuli, range_count);
-        computePerceptionRange(&job, .{ .index = 0, .start = 0, .end = observer_count });
-
-        const totals = self.sumRangeStats(range_count);
-        const merge = try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
-        return .{
-            .observer_count = observer_count,
-            .candidate_population_count = spatial.entryCount(),
-            .sensed_count = totals.sensed_count,
-            .nearest_threat_found_count = totals.nearest_threat_found,
-            .los_checks = totals.los_checks,
-            .los_blocked = totals.los_blocked,
-            .candidate_checks = totals.candidate_checks,
-            .block_fills = totals.block_fills,
-            .perceived_events = merge.perceived,
-            .lost_events = merge.lost,
-            .dropped_events = merge.dropped,
-            .gather_batch = inlineBatch(observer_count, perception_range_alignment_items),
-            .batch = inlineBatch(observer_count, perception_range_alignment_items),
-        };
-    }
-
     fn buildJobContext(
         self: *PerceptionSystem,
         perception_slice: PerceptionSlice,
@@ -384,16 +343,6 @@ pub const PerceptionSystem = struct {
         const batch = gather.run(selection, n, perception_range_alignment_items, &context, gatherPerceptionJob);
         compactRowWindows(PerceptionGatherRow, PerceptionRangeStats, &self.rows, context.range_stats, selection.items_per_range);
         return batch;
-    }
-
-    // `gatherPerceptionData` as one range on the calling thread.
-    fn gatherPerceptionDataSerial(self: *PerceptionSystem, inputs: PerceptionGatherInputs) !void {
-        const n = try self.prepareGather(inputs);
-        if (n == 0) return;
-        try self.prepareRangeStats(1);
-        var context = PerceptionGatherContext{ .inputs = inputs, .rows = self.rows.slice(), .items_per_range = n, .range_stats = self.range_stats.items[0..1] };
-        gatherPerceptionJob(&context, .{ .index = 0, .start = 0, .end = n }, WorkerId.main);
-        compactRowWindows(PerceptionGatherRow, PerceptionRangeStats, &self.rows, context.range_stats, n);
     }
 
     // Sizes the rows to one window slot per think row before dispatch; returns the count.
@@ -1128,6 +1077,22 @@ fn stackedWorld(allocator: std.mem.Allocator, width: u16, height: u16, tile_size
     return world;
 }
 
+// `PerceptionSystem.update` inline as one range: a thread system with no workers.
+fn updateInline(
+    system: *PerceptionSystem,
+    ai_agents: ConstAiAgentSlice,
+    movement: ConstMovementBodySlice,
+    spatial: SpatialIndexView,
+    world: *const WorldSystem,
+    data: *DataSystem,
+    events: *SimulationEvents,
+    config: PerceptionConfig,
+) !PerceptionStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    return system.update(ai_agents, movement, spatial, world, data, events, &threads, config);
+}
+
 test "perception production compute tuner uses central gate and range alignment" {
     var system = PerceptionSystem.init(std.testing.allocator);
     defer system.deinit();
@@ -1248,7 +1213,7 @@ test "the compute range's facing matches computeFacingScalar lane-for-lane, incl
     var world = try minimalWorld(testing.allocator, 8, 8, 32);
     defer world.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
     for (entities, velocities, prev_facings) |ent, v, prev| {
         const expected = computeFacingScalar(v[0], v[1], .{ .x = prev[0], .y = prev[1] });
@@ -1284,7 +1249,7 @@ test "an observer skips itself by entity, not by its filtered observer row" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .scope_dense_indices = &scope,
     });
 
@@ -1318,7 +1283,7 @@ test "think observer acquires an off-phase hostile from the halo candidate set" 
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .scope_dense_indices = &think,
     });
 
@@ -1353,7 +1318,7 @@ test "off-phase observer acquires the on-phase ally on the reverse think step" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .scope_dense_indices = &think,
     });
 
@@ -1388,7 +1353,7 @@ test "gapped think set: both observers skip themselves and acquire the off-phase
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .scope_dense_indices = &think,
     });
 
@@ -1417,7 +1382,7 @@ test "candidate outside vision_range is never selected" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
     try testing.expect(!data.aiPerceptionConst(observer).?.target_visible);
 }
@@ -1439,7 +1404,7 @@ test "FOV gating: candidate outside the cone is not perceived, inside is" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expect(!data.aiPerceptionConst(observer).?.target_visible);
 
     // Now place a candidate directly ahead instead.
@@ -1454,7 +1419,7 @@ test "FOV gating: candidate outside the cone is not perceived, inside is" {
     defer sys2.deinit();
     var events2 = SimulationEvents.init(testing.allocator);
     defer events2.deinit();
-    _ = try sys2.updateSerial(data2.aiAgentSliceConst(), data2.movementBodySliceConst(), spatial_sys2.view(), &world, &data2, &events2, .{});
+    _ = try updateInline(&sys2, data2.aiAgentSliceConst(), data2.movementBodySliceConst(), spatial_sys2.view(), &world, &data2, &events2, .{});
     try testing.expect(data2.aiPerceptionConst(observer2).?.target_visible);
 }
 
@@ -1475,7 +1440,7 @@ test "stance gating: only hostile candidates ever become nearest_threat" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(perception.target_visible);
@@ -1506,7 +1471,7 @@ test "candidate_checks counts only hostile rows on the observer's level" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
     // The neutral, the ally, and the level-0 hostiles cost no check.
     try testing.expectEqual(@as(usize, 1), stats.candidate_checks);
@@ -1535,7 +1500,7 @@ test "same-level gating skips cross-level candidates even when closest" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(perception.target_visible);
@@ -1594,7 +1559,7 @@ test "observers with interleaved vision boxes in one cell each read their own bo
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expectEqual(ranges.len, stats.observer_count);
     // One block fill per distinct box of the one row group.
     try testing.expectEqual(@as(usize, 3), stats.block_fills);
@@ -1622,7 +1587,7 @@ test "an observer behind 256 allies finds the hostile past them" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expectEqual(@as(usize, 1), stats.candidate_checks);
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(perception.target_visible);
@@ -1649,7 +1614,7 @@ test "an observer under hostiles stacked on other levels finds the farther same-
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expectEqual(@as(usize, 1), stats.candidate_checks);
     try testing.expectEqual(@as(usize, 1), stats.sensed_count);
     const perception = data.aiPerceptionConst(observer).?;
@@ -1673,7 +1638,7 @@ test "a hostile player on another level never enters an observer's candidates" {
     defer events.deinit();
 
     // Squarely ahead and in range, one level down.
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .player_candidate = .{ .entity = player, .pos_x = 20, .pos_y = 0, .faction = .player, .level = 1 },
     });
     try testing.expectEqual(@as(usize, 0), stats.sensed_count);
@@ -1696,7 +1661,7 @@ test "hearing detects an in-range same-level stimulus" {
     defer events.deinit();
 
     const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 30, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 }};
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(!perception.target_visible);
@@ -1720,7 +1685,7 @@ test "hearing ignores zero-intensity in-range stimulus" {
     defer events.deinit();
 
     const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 30, .y = 0 }, .intensity = 0, .kind = .dig, .level = 0 }};
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
     try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
 }
@@ -1740,7 +1705,7 @@ test "hearing ignores an out-of-range stimulus" {
     defer events.deinit();
 
     const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 100, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 }};
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
     try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
 }
@@ -1760,7 +1725,7 @@ test "hearing ignores a stimulus on a different level" {
     defer events.deinit();
 
     const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 30, .y = 0 }, .intensity = 1, .kind = .dig, .level = 1 }};
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
     try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
 }
@@ -1783,7 +1748,7 @@ test "hearing picks the nearest of multiple in-range stimuli" {
         .{ .position = .{ .x = 40, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 },
         .{ .position = .{ .x = 20, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 },
     };
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(perception.heard_stimulus);
@@ -1810,7 +1775,7 @@ test "hearing intensity ranking prefers louder stimulus over nearer quieter one"
         .{ .position = .{ .x = 10, .y = 0 }, .intensity = 0.35, .kind = .footstep, .level = 0 },
         .{ .position = .{ .x = 50, .y = 0 }, .intensity = 1.0, .kind = .dig, .level = 0 },
     };
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(perception.heard_stimulus);
@@ -1833,16 +1798,16 @@ test "hearing acquires non-dig footstep and impact kinds" {
     defer events.deinit();
 
     const foot = [_]WorldStimulus{.{ .position = .{ .x = 25, .y = 0 }, .intensity = 0.35, .kind = .footstep, .level = 0 }};
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &foot });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &foot });
     try testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
     try testing.expectEqual(@as(f32, 25), data.aiPerceptionConst(observer).?.heard_stimulus_x);
 
     // Clear heard by running with empty stimuli
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &.{} });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &.{} });
     try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
 
     const impact = [_]WorldStimulus{.{ .position = .{ .x = 15, .y = 0 }, .intensity = 0.85, .kind = .impact, .level = 0 }};
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &impact });
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &impact });
     try testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
     try testing.expectEqual(@as(f32, 15), data.aiPerceptionConst(observer).?.heard_stimulus_x);
 }
@@ -1893,7 +1858,7 @@ test "LOS gating skips a blocked nearer candidate in favor of a farther clear on
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(perception.target_visible);
@@ -1940,7 +1905,7 @@ test "LOS blocks a diagonal ray through a mid-segment occluder's interior, not j
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(!perception.target_visible);
@@ -2085,18 +2050,18 @@ test "a same-step blocking edit between observer and target occludes LOS with no
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
     try testing.expect(data.aiPerceptionConst(observer).?.target_visible);
 
     // The edit is the only thing between the two updates: no event, no reaction.
     _ = (try world.setDenseTile(fixture.layer, 4, 1, tree)) orelse return error.TestExpectedEqual;
     events.clearRetainingCapacity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
     try testing.expect(!data.aiPerceptionConst(observer).?.target_visible);
 
     _ = (try world.setDenseTile(fixture.layer, 4, 1, grass)) orelse return error.TestExpectedEqual;
     events.clearRetainingCapacity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
     try testing.expect(data.aiPerceptionConst(observer).?.target_visible);
 }
 
@@ -2279,7 +2244,7 @@ test "player-candidate detection: hostile player within vision/FOV becomes neare
     defer events.deinit();
 
     const player = try data.createEntity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .player_candidate = .{ .entity = player, .pos_x = 20, .pos_y = 0, .faction = .player, .level = 0 },
     });
 
@@ -2304,7 +2269,7 @@ test "a hostile player on the observer's nonzero level becomes nearest_threat" {
     defer events.deinit();
 
     const player = try data.createEntity();
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .player_candidate = .{ .entity = player, .pos_x = 20, .pos_y = 0, .faction = .player, .level = 2 },
     });
 
@@ -2329,7 +2294,7 @@ test "transitions: invalid to valid emits entity_perceived" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expectEqual(@as(usize, 1), stats.perceived_events);
     try testing.expectEqual(@as(usize, 0), stats.lost_events);
     const merged = events.mergedItems();
@@ -2352,7 +2317,7 @@ test "transitions: valid to invalid emits entity_lost" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expect(data.aiPerceptionConst(observer).?.target_visible);
     events.clearRetainingCapacity();
 
@@ -2362,7 +2327,7 @@ test "transitions: valid to invalid emits entity_lost" {
     var spatial_sys2 = try testSpatialIndex(&data);
     defer spatial_sys2.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys2.view(), &world, &data, &events, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys2.view(), &world, &data, &events, .{});
     try testing.expectEqual(@as(usize, 0), stats.perceived_events);
     try testing.expectEqual(@as(usize, 1), stats.lost_events);
     const merged = events.mergedItems();
@@ -2386,10 +2351,10 @@ test "transitions: unchanged nearest_threat emits no event" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     events.clearRetainingCapacity();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expectEqual(@as(usize, 0), stats.perceived_events);
     try testing.expectEqual(@as(usize, 0), stats.lost_events);
     try testing.expectEqual(@as(usize, 0), events.mergedItems().len);
@@ -2410,7 +2375,7 @@ test "transitions: identity swap without passing through invalid emits lost then
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expectEqual(first_threat.index, data.aiPerceptionConst(observer).?.nearest_threat.index);
     events.clearRetainingCapacity();
 
@@ -2422,7 +2387,7 @@ test "transitions: identity swap without passing through invalid emits lost then
     var spatial_sys2 = try testSpatialIndex(&data);
     defer spatial_sys2.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys2.view(), &world, &data, &events, .{});
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys2.view(), &world, &data, &events, .{});
     try testing.expectEqual(@as(usize, 1), stats.perceived_events);
     try testing.expectEqual(@as(usize, 1), stats.lost_events);
     const merged = events.mergedItems();
@@ -2449,7 +2414,7 @@ test "PerceptionSystem enforces its own per-step event cap and records the drop 
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .max_events_per_step = 1,
     });
     try testing.expectEqual(@as(usize, 1), stats.perceived_events + stats.lost_events);
@@ -2460,7 +2425,7 @@ test "PerceptionSystem enforces its own per-step event cap and records the drop 
 
     // The flag is once-only: a later capped step never clears it.
     events.clearRetainingCapacity();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .max_events_per_step = 1,
     });
     try testing.expect(sys.dropped_events_warned);
@@ -2529,7 +2494,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         defer sys.deinit();
         var events = SimulationEvents.init(testing.allocator);
         defer events.deinit();
-        _ = try sys.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), spatial.view(), &world, &serial_data, &events, .{});
+        _ = try updateInline(&sys, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), spatial.view(), &world, &serial_data, &events, .{});
         try testing.expectEqual(serial_ids.first_threat.index, serial_data.aiPerceptionConst(serial_ids.observer_a).?.nearest_threat.index);
     }
     {
@@ -2539,7 +2504,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         defer sys.deinit();
         var events = SimulationEvents.init(testing.allocator);
         defer events.deinit();
-        _ = try sys.updateSerial(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), spatial.view(), &world, &threaded_data, &events, .{});
+        _ = try updateInline(&sys, threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), spatial.view(), &world, &threaded_data, &events, .{});
         try testing.expectEqual(threaded_ids.first_threat.index, threaded_data.aiPerceptionConst(threaded_ids.observer_a).?.nearest_threat.index);
     }
 
@@ -2565,9 +2530,8 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
     defer serial_sys.deinit();
     var serial_events = SimulationEvents.init(testing.allocator);
     defer serial_events.deinit();
-    // updateSerial always uses range_count=1; drive serial through update with
-    // max_worker_threads=0 so the same multi-range compute + row-order emit is
-    // exercised on both sides.
+    // No workers with a fixed range size, so the same multi-range compute + row-order emit
+    // is exercised on both sides.
     var serial_threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0, .items_per_range = range_items });
     defer serial_threads.deinit();
     const serial_stats = try serial_sys.update(
@@ -2655,7 +2619,7 @@ test "serial and threaded PerceptionSystem updates route through identical math"
     defer serial_sys.deinit();
     var serial_events = SimulationEvents.init(testing.allocator);
     defer serial_events.deinit();
-    _ = try serial_sys.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &world, &serial_data, &serial_events, .{ .stimuli = &stimuli });
+    _ = try updateInline(&serial_sys, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &world, &serial_data, &serial_events, .{ .stimuli = &stimuli });
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = perception_range_alignment_items });
     defer threads.deinit();
@@ -2731,9 +2695,9 @@ test "threaded PerceptionSystem update records one sample into the compute tuner
 
     const stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, .{});
     try testing.expectEqual(observer_total, stats.observer_count);
-    try testing.expectEqual(@as(usize, 1), sys.compute_tuner.report().sample_count);
+    try testing.expectEqual(@as(usize, 1), sys.compute_tuner.sample_count);
     try testing.expect(sys.compute_tuner.last_request != null);
-    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
     try testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
@@ -2770,7 +2734,7 @@ test "PerceptionSystem has no steady-state allocation after warmup (FailingAlloc
 
     // `job.stimuli` is a borrowed slice, never copied, so passing it here
     // adds no allocation.
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
     try testing.expectEqual(@as(usize, 1), stats.observer_count);
     try testing.expect(data.aiPerceptionConst(data.aiAgentSliceConst().entities[0]).?.heard_stimulus);
 }
@@ -2811,7 +2775,7 @@ test "PerceptionSystem think-set gather over a halo index has no steady-state al
         events.stream.allocator = original_events_allocator;
     }
 
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, cfg);
+    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, cfg);
     try testing.expectEqual(@as(usize, 2), stats.observer_count);
     try testing.expectEqual(@as(usize, 4), stats.candidate_population_count);
     try testing.expectEqual(@as(usize, 2), sys.rows.len);

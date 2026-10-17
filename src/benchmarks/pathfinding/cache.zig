@@ -188,7 +188,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const result_count = code.cached_results;
     const region_edge = std.math.cast(u16, std.math.sqrt(region_chunks)) orelse return error.EvictRegionTooLarge;
     if (@as(usize, region_edge) * region_edge != region_chunks) return error.EvictRegionNotSquare;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
@@ -325,7 +325,7 @@ const ElasticRamp = struct {
 
 fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
@@ -468,7 +468,7 @@ const ShrinkReport = struct {
 fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     if (item_count / elastic_shrink_divisor < min_capacity_floor) return error.ElasticShrinkBelowCapacityFloor;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);

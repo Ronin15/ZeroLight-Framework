@@ -5,7 +5,6 @@
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const movement_range_alignment_items = @import("../game/data_system.zig").movement_range_alignment_items;
 const movement = @import("../game/systems/movement.zig");
@@ -61,7 +60,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var data = try createFixture(allocator, item_count);
     defer data.deinit();
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     var system = MovementSystem.init();
@@ -70,10 +69,10 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     }
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(system.adaptive_tuner.isSettled())) {
+    while (warm.next(system.adaptive_tuner.phase == .settled)) {
         _ = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
     }
-    const settled_before_measurement = if (case.adaptive) system.adaptive_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) (system.adaptive_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
@@ -86,7 +85,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     var stats = accumulator.finish();
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.adaptive_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.adaptive_tuner), settled_before_measurement);
     }
     return stats;
 }
@@ -98,10 +97,6 @@ fn runOnce(
     case: suite.BenchmarkCase,
 ) BatchStats {
     var slice = data.movementBodySlice();
-    if (!case.usesThreadSystem()) {
-        movement.updateSerial(&slice, delta_seconds);
-        return inlineBatch(data.movementBodySliceConst().entities.len, movement_range_alignment_items);
-    }
 
     const stats = system.update(&slice, thread_system.?, delta_seconds, .{
         .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
@@ -219,10 +214,6 @@ fn applyIntentsOnce(
     thread_system: ?*ThreadSystem,
     case: suite.BenchmarkCase,
 ) BatchStats {
-    if (!case.usesThreadSystem()) {
-        movement.applyIntentsSerial(&fixture.data, &fixture.frame);
-        return inlineBatch(fixture.frame.intents.mergedItems().len, movement_range_alignment_items);
-    }
     const stats = system.applyIntents(&fixture.data, &fixture.frame, thread_system.?, .{
         .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
@@ -242,7 +233,7 @@ fn runApplyIntentsSortedCase(allocator: std.mem.Allocator, io: std.Io, options: 
 fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, order_kind: IntentOrder) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
@@ -260,10 +251,10 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
         false;
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(system.apply_intents_tuner.isSettled())) {
+    while (warm.next(system.apply_intents_tuner.phase == .settled)) {
         _ = applyIntentsOnce(&system, &fixture, thread_ptr, case);
     }
-    const settled_before_measurement = if (case.adaptive) system.apply_intents_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) (system.apply_intents_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
@@ -283,7 +274,7 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     stats.output_count = applied;
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.apply_intents_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.apply_intents_tuner), settled_before_measurement);
     }
     return stats;
 }

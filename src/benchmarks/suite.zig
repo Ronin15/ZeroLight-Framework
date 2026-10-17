@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const AdaptiveWorkPhase = @import("../app/thread_system.zig").AdaptiveWorkPhase;
-const AdaptiveWorkReport = @import("../app/thread_system.zig").AdaptiveWorkReport;
+const AdaptiveWorkProfile = @import("../app/thread_system.zig").AdaptiveWorkProfile;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -655,6 +655,47 @@ pub const StatsAccumulator = struct {
         };
     }
 };
+
+/// A tuner's state as the bench reports it, read from its fields.
+pub const AdaptiveWorkReport = struct {
+    phase: AdaptiveWorkPhase = .learning,
+    initial_profile: AdaptiveWorkProfile = .{},
+    current_profile: AdaptiveWorkProfile = .{},
+    best_profile: AdaptiveWorkProfile = .{},
+    candidate_profile: ?AdaptiveWorkProfile = null,
+    sample_count: usize = 0,
+    sample_window: usize = 1,
+    failed_profile_count: usize = 0,
+    settled_window_count: usize = 0,
+    retune_after_settled_windows: usize = 1,
+    best_mean_batch_duration_ns: u64 = 0,
+    baseline_mean_batch_duration_ns: u64 = 0,
+    has_threaded_profile: bool = false,
+    probing: bool = false,
+    probe_window_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
+    demotion_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
+};
+
+pub fn tunerReport(tuner: *const AdaptiveWorkTuner) AdaptiveWorkReport {
+    return .{
+        .phase = tuner.phase,
+        .initial_profile = tuner.initial_profile,
+        .current_profile = tuner.current_profile,
+        .best_profile = tuner.best_profile,
+        .candidate_profile = tuner.candidate_profile,
+        .sample_count = tuner.sample_count,
+        .sample_window = tuner.config.sample_window,
+        .failed_profile_count = tuner.failed_profile_count,
+        .settled_window_count = tuner.settled_window_count,
+        .retune_after_settled_windows = tuner.config.retune_after_settled_windows,
+        .best_mean_batch_duration_ns = tuner.best_mean_batch_duration_ns,
+        .baseline_mean_batch_duration_ns = tuner.baseline_mean_batch_duration_ns,
+        .has_threaded_profile = tuner.has_threaded_profile,
+        .probing = tuner.phase == .probing,
+        .probe_window_count = tuner.probe_window_count,
+        .demotion_count = tuner.demotion_count,
+    };
+}
 
 pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement: bool) WorkTuningSummary {
     return .{
@@ -1794,7 +1835,7 @@ test "work tuning summary preserves settled phase" {
 
 test "fixed adaptive benchmark case disables range probing" {
     const tuner = adaptiveTunerForCase(default_cases[6], 16).?;
-    const report = tuner.report();
+    const report = tunerReport(&tuner);
 
     try std.testing.expectEqual(@as(usize, 64), report.initial_profile.items_per_range);
     try std.testing.expectEqual(@as(usize, 64), report.current_profile.items_per_range);

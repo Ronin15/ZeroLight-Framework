@@ -1674,7 +1674,7 @@ test "a demo ramp dig is routable from both levels the next step" {
     }.of;
     try appendPathRequest(&stream, .{ .entity = demo.player.entity, .start_level = 1, .goal_level = 0, .start = center(4, 2), .goal = center(0, 4) });
     try appendPathRequest(&stream, .{ .entity = demo.player.entity, .start_level = 0, .goal_level = 1, .start = center(0, 4), .goal = center(4, 2) });
-    const stats = try demo.pipeline.pathfinding.updateSerial(&stream, 8, .{});
+    const stats = try @import("systems/pathfinding/test_support.zig").updatePathfindingInline(&demo.pipeline.pathfinding, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 2), stats.available_results);
     try std.testing.expectEqual(@as(usize, 2), stats.cross_level_solves);
 
@@ -2156,7 +2156,7 @@ fn lateralSteeringOnceForTest(pipeline: *SimulationPipeline, frame: *SimulationF
     writer.write(.{ .entity = agent, .goal = goal, .direct_direction_x = 1 });
     writer.finish();
     frame.navigation_intents.finishWrite();
-    _ = try pipeline.steering.updateSerial(data, frame, &pipeline.pathfinding, &pipeline.static_colliders);
+    _ = try @import("systems/steering/test_support.zig").updateSteeringInline(&pipeline.steering, data, frame, &pipeline.pathfinding, &pipeline.static_colliders);
     for (frame.intents.mergedItems()) |intent| {
         if (intent.movement.entity.eql(agent)) return intent.movement.direction_y;
     }

@@ -162,7 +162,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         system.visible_tuner = suite.adaptiveTunerForCase(case, 1).?;
     }
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     var warm = suite.Warmup.init(options, case, 0);
@@ -197,13 +197,13 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     stats.query_splice_batch = suite.batchSummaryFromBatch(last_stats.order_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.visible_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.decay_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.decay_tuner), settled_before_measurement);
     }
     return stats;
 }
 
 fn tunersSettled(system: *const AiMemorySystem) bool {
-    return system.gather_tuner.isSettled() and system.order_tuner.isSettled() and system.decay_tuner.isSettled() and system.visible_tuner.isSettled();
+    return (system.gather_tuner.phase == .settled) and (system.order_tuner.phase == .settled) and (system.decay_tuner.phase == .settled) and (system.visible_tuner.phase == .settled);
 }
 
 const Run = struct {
@@ -217,10 +217,6 @@ fn runOnce(system: *AiMemorySystem, fixture: *Fixture, run: Run, thread_system: 
     fixture.frame.beginStep();
     const ai_slice = fixture.data.aiAgentSliceConst();
     try injectPerceivedEvents(&fixture.frame, ai_slice, run.event_rows, fixture.target);
-
-    if (!case.usesThreadSystem()) {
-        return try system.updateSerial(ai_slice, &fixture.data, &fixture.frame, .{ .scope_dense_indices = run.think_set });
-    }
 
     return try system.update(ai_slice, &fixture.data, &fixture.frame, thread_system.?, .{
         .items_per_range = case.stageItemsPerRange(ai_memory_range_alignment_items),

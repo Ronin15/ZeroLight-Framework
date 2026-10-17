@@ -10,7 +10,6 @@ const std = @import("std");
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
-const inlineBatch = @import("../../../app/thread_system.zig").inlineBatch;
 const setRowCount = @import("../../../app/thread_system.zig").setRowCount;
 const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
@@ -55,7 +54,7 @@ pub fn prepareDirections(
     steering: ConstSteeringAgentSlice,
     intents: []const NavigationIntent,
     pathfinding: *const PathfindingSystem,
-    threads: ?StageThreads,
+    threads: StageThreads,
     stats: *SteeringStats,
 ) void {
     const intent_count = intents.len;
@@ -84,21 +83,13 @@ pub fn prepareDirections(
         .items_per_range = intent_count,
         .tallies = &.{},
     };
-    var range_count: usize = 1;
-    if (threads) |stage| {
-        const directions = stage.stage(&self.directions_tuner);
-        const selection = directions.select(intent_count, steering_range_alignment_items);
-        setSlotCount(DirectionsTally, &self.directions_tallies, selection.range_count);
-        job.items_per_range = selection.items_per_range;
-        job.tallies = self.directions_tallies.items;
-        stats.directions_batch = directions.run(selection, intent_count, steering_range_alignment_items, &job, directionsJob);
-        range_count = selection.range_count;
-    } else {
-        setSlotCount(DirectionsTally, &self.directions_tallies, 1);
-        job.tallies = self.directions_tallies.items;
-        directionsJob(&job, .{ .index = 0, .start = 0, .end = intent_count }, WorkerId.main);
-        stats.directions_batch = inlineBatch(intent_count, steering_range_alignment_items);
-    }
+    const directions = threads.stage(&self.directions_tuner);
+    const selection = directions.select(intent_count, steering_range_alignment_items);
+    setSlotCount(DirectionsTally, &self.directions_tallies, selection.range_count);
+    job.items_per_range = selection.items_per_range;
+    job.tallies = self.directions_tallies.items;
+    stats.directions_batch = directions.run(selection, intent_count, steering_range_alignment_items, &job, directionsJob);
+    const range_count = selection.range_count;
 
     self.selected_windows.clearRetainingCapacity();
     std.debug.assert(self.selected_windows.capacity >= range_count);
@@ -510,6 +501,8 @@ const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 // Test-only fixtures for multi-level start_level regression (not production API).
 const WorldSystem = @import("../../world/system.zig").WorldSystem;
 const loadTestWorldMeta = @import("../pathfinding/test_support.zig").loadTestWorldMeta;
+const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
+const updatePathfindingInline = @import("../pathfinding/test_support.zig").updatePathfindingInline;
 const worldColliders = @import("../pathfinding/test_support.zig").worldColliders;
 const requireTestTile = @import("../pathfinding/test_support.zig").requireTestTile;
 const default_cache_ttl_steps = @import("../pathfinding/types.zig").default_cache_ttl_steps;
@@ -542,16 +535,16 @@ test "steering requests missing paths then follows available path results" {
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const missing_stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const missing_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 1), missing_stats.path_request_count);
     try std.testing.expectEqual(@as(usize, 1), frame.path_requests.mergedItems().len);
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
 
-    _ = try pathfinding.updateSerial(&frame.path_requests, 1, .{});
+    _ = try updatePathfindingInline(&pathfinding, &frame.path_requests, 1, .{});
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 0, .direct_direction_y = 1 });
-    const available_stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const available_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 1), available_stats.path_available_count);
     try std.testing.expectEqual(@as(usize, 0), available_stats.path_request_count);
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
@@ -587,9 +580,9 @@ test "steering follows a partial path, requests the next hop inside its end wind
 
     frame.beginStep();
     try appendNavigationIntent(&frame, intent);
-    try std.testing.expectEqual(@as(usize, 1), (try steering.updateSerial(&data, &frame, &pathfinding, &colliders)).path_request_count);
-    _ = try pathfinding.updateSerial(&frame.path_requests, 1, .{});
-    try std.testing.expectEqual(@as(usize, 1), (try pathfinding.updateSerial(&empty, 1, .{})).partial_results);
+    try std.testing.expectEqual(@as(usize, 1), (try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders)).path_request_count);
+    _ = try updatePathfindingInline(&pathfinding, &frame.path_requests, 1, .{});
+    try std.testing.expectEqual(@as(usize, 1), (try updatePathfindingInline(&pathfinding, &empty, 1, .{})).partial_results);
     const key = pathfinding.graph.keyForWorld(0, goal, .default).?;
     const slot = pathfinding.completed.freshSlotIndex(key, pathfinding.step_counter, default_cache_ttl_steps).?;
     const result = pathfinding.completed.resultAt(slot);
@@ -605,7 +598,7 @@ test "steering follows a partial path, requests the next hop inside its end wind
         try data.setMovementBody(agent, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 32 });
         frame.beginStep();
         try appendNavigationIntent(&frame, intent);
-        const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+        const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
         try std.testing.expectEqual(@as(usize, 1), stats.path_partial_count);
         try std.testing.expectEqual(@as(usize, 0), stats.path_request_count);
         try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
@@ -615,7 +608,7 @@ test "steering follows a partial path, requests the next hop inside its end wind
     try data.setMovementBody(agent, .{ .position = near_end, .previous_position = near_end, .velocity = .{}, .speed = 32 });
     frame.beginStep();
     try appendNavigationIntent(&frame, intent);
-    const refresh_stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const refresh_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 1), refresh_stats.path_request_count);
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
 
@@ -627,7 +620,7 @@ test "steering follows a partial path, requests the next hop inside its end wind
     for (1..held_steps + 1) |step| {
         frame.beginStep();
         try appendNavigationIntent(&frame, intent);
-        const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+        const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
         try std.testing.expectEqual(@as(usize, 1), stats.path_partial_count);
         try std.testing.expectEqual(@as(usize, 0), stats.stuck_replan_count);
         if (stats.path_request_count == 0) continue;
@@ -654,11 +647,11 @@ test "steering follows a partial path, requests the next hop inside its end wind
     // The last held step's request solves: the agent at the old end follows the next hop.
     try std.testing.expectEqual(held_steps, last_request);
     try std.testing.expectEqual(@as(usize, 1), frame.path_requests.mergedItems().len);
-    _ = try pathfinding.updateSerial(&frame.path_requests, 1, .{});
-    try std.testing.expectEqual(@as(usize, 1), (try pathfinding.updateSerial(&empty, 1, .{})).partial_results);
+    _ = try updatePathfindingInline(&pathfinding, &frame.path_requests, 1, .{});
+    try std.testing.expectEqual(@as(usize, 1), (try updatePathfindingInline(&pathfinding, &empty, 1, .{})).partial_results);
     frame.beginStep();
     try appendNavigationIntent(&frame, intent);
-    const next_hop = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const next_hop = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 1), next_hop.path_partial_count);
     try std.testing.expectEqual(@as(usize, 0), next_hop.path_request_count);
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
@@ -690,7 +683,7 @@ test "steering smooths a discrete target-direction flip over several steps inste
     // First observation for this runtime row is used as-is: no startup lag.
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 999, .y = 999 }, .direct_direction_x = 1, .direct_direction_y = 0 });
-    _ = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     const first = frame.intents.mergedItems()[0].movement;
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), first.direction_x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), first.direction_y, 0.001);
@@ -699,7 +692,7 @@ test "steering smooths a discrete target-direction flip over several steps inste
     // jump straight to direction_y == 1; smoothing should only partially turn.
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 999, .y = 999 }, .direct_direction_x = 0, .direct_direction_y = 1 });
-    _ = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     const second = frame.intents.mergedItems()[0].movement;
     try std.testing.expect(second.direction_y > 0.0);
     try std.testing.expect(second.direction_y < 0.9);
@@ -710,7 +703,7 @@ test "steering smooths a discrete target-direction flip over several steps inste
     while (i < 40) : (i += 1) {
         frame.beginStep();
         try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 999, .y = 999 }, .direct_direction_x = 0, .direct_direction_y = 1 });
-        _ = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+        _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     }
     const converged = frame.intents.mergedItems()[0].movement;
     try std.testing.expect(converged.direction_y > 0.95);
@@ -719,7 +712,7 @@ test "steering smooths a discrete target-direction flip over several steps inste
 test "steering sources path request start level from movement scope level" {
     // The avoidance pass's path request takes its start level from the selected intent's
     // movementScopeLevel, which `directions` records (scope.level, kept in sync with
-    // world_level via setWorldLevel). Exercised through a full updateSerial so a
+    // world_level via setWorldLevel). Exercised through a full inline update so a
     // future edit cannot quietly hardcode start_level back to 0. Multi-level nav
     // is required: statusForWorld treats an out-of-range start level as
     // unavailable and never emits a request (not missing).
@@ -762,7 +755,7 @@ test "steering sources path request start level from movement scope level" {
         .{ .entity = surface, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 },
         .{ .entity = underground, .goal_level = 2, .goal = .{ .x = 96, .y = 32 }, .direct_direction_x = 1 },
     });
-    _ = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
 
     const requests = frame.path_requests.mergedItems();
     try std.testing.expectEqual(@as(usize, 2), requests.len);
@@ -809,12 +802,12 @@ test "steering missing path requests respect replan cooldown" {
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const first = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const first = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 1), first.path_request_count);
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const second = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const second = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 0), second.path_request_count);
     try std.testing.expectEqual(@as(usize, 1), second.replan_cooldown_count);
     try std.testing.expectEqual(@as(usize, 0), frame.path_requests.mergedItems().len);
@@ -847,14 +840,14 @@ test "steering reads an unreachable goal unavailable from status on the first st
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 144, .y = 0 }, .direct_direction_x = 1 });
-    const first = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const first = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 1), first.path_unavailable_count);
     try std.testing.expectEqual(@as(usize, 0), first.path_request_count);
     try std.testing.expectEqual(@as(usize, 0), first.unavailable_backoff_count);
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 144, .y = 0 }, .direct_direction_x = 1 });
-    const second = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+    const second = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 1), second.path_unavailable_count);
     try std.testing.expectEqual(@as(usize, 1), second.unavailable_backoff_count);
     try std.testing.expectEqual(@as(usize, 0), second.path_request_count);
@@ -886,10 +879,10 @@ test "steering reads a goal its start cannot reach unavailable from status every
     for (0..16) |_| {
         frame.beginStep();
         try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 128, .y = 0 }, .direct_direction_x = 1 });
-        const stats = try steering.updateSerial(&data, &frame, &pathfinding, &colliders);
+        const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
         try std.testing.expectEqual(@as(usize, 1), stats.path_unavailable_count);
         try std.testing.expectEqual(@as(usize, 0), stats.path_request_count);
-        const solve = try pathfinding.updateSerial(&frame.path_requests, 1, .{});
+        const solve = try updatePathfindingInline(&pathfinding, &frame.path_requests, 1, .{});
         try std.testing.expectEqual(@as(usize, 0), solve.solved_requests + solve.accepted_requests);
     }
 }

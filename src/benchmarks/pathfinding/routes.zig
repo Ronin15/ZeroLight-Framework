@@ -300,7 +300,7 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     const side = code.level_side;
     const levels = code.levels;
     if (levels != 1 or side < 256) return error.LevelSizeBadConfig;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
@@ -403,7 +403,7 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     const levels = config.levels;
     const teleport_count = config.teleports;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
@@ -492,7 +492,7 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     const levels = code.levels;
     if (levels <= shaft_goal_level or side < 256) return error.CrossLevelShaftBadConfig;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);
@@ -1010,12 +1010,12 @@ const LongPathCycle = struct {
     }
 };
 
-// Times one serial step that must solve exactly one request, at `tier`, and reads that solve
+// Times one inline step that must solve exactly one request, at `tier`, and reads that solve
 // from its scratch: the participant's corridor for a first attempt, the first tier-1 pool
 // entry (the step's only escalated admission) for an escalated one.
-fn runLongPathAttempt(io: std.Io, system: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), request: PathRequest, agent_count: usize, tier: u8) !LongPathAttempt {
+fn runLongPathAttempt(io: std.Io, threads: *ThreadSystem, system: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), request: PathRequest, agent_count: usize, tier: u8) !LongPathAttempt {
     const start_ns = suite.nowNs(io);
-    const stats = try system.updateSerial(requests, agent_count, .{
+    const stats = try system.update(requests, agent_count, threads, .{
         .max_solved_requests_per_step = agent_count,
         .max_solve_admissions_per_step = agent_count,
     });
@@ -1074,14 +1074,14 @@ fn corridorEndsAtGoal(system: *const PathfindingSystem, corridor: []const usize,
 // One request cycle from empty runtime state: the first attempt, the escalated attempt when
 // the first exhausted, then every agent's status. No request stays pending after the second
 // attempt: it solves or drops.
-fn runLongPathCycle(io: std.Io, fixture: *RouteFixture, empty: *const RangeOutputStream(PathRequest), requests: []const PathRequest) !LongPathCycle {
+fn runLongPathCycle(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, empty: *const RangeOutputStream(PathRequest), requests: []const PathRequest) !LongPathCycle {
     const system = &fixture.system;
     system.clearRuntimeState();
-    const first = try runLongPathAttempt(io, system, &fixture.requests, requests[0], requests.len, 0);
+    const first = try runLongPathAttempt(io, threads, system, &fixture.requests, requests[0], requests.len, 0);
     var escalated: ?LongPathAttempt = null;
     if (first.outcome != .available) {
         if (system.pending.len != 1 or system.pending.at(0).tier != 1) return error.LongPathNotEscalated;
-        escalated = try runLongPathAttempt(io, system, empty, requests[0], requests.len, 1);
+        escalated = try runLongPathAttempt(io, threads, system, empty, requests[0], requests.len, 1);
     }
     if (system.pending.len != 0) return error.LongPathStillPending;
     var cycle = LongPathCycle{ .first = first, .escalated = escalated, .available = 0, .partial = 0, .missing = 0 };
@@ -1123,7 +1123,7 @@ const LongPathWalk = struct {
 };
 
 // Walks `request`'s agent from empty runtime state to its goal (see the group comment).
-fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, step_limit: usize) !LongPathWalk {
+fn runLongPathWalk(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, step_limit: usize) !LongPathWalk {
     const system = &fixture.system;
     system.clearRuntimeState();
     const grid = system.graph.grid(request.start_level) orelse return error.RouteUnavailable;
@@ -1157,7 +1157,7 @@ fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
         tier0_abstract.reset();
         tier1_abstract.reset();
         const start_ns = suite.nowNs(io);
-        const stats = try system.updateSerial(stream, 1, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
+        const stats = try system.update(stream, 1, threads, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
         walk.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
         walk.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
         if (stats.unavailable_results != 0) return error.RouteUnavailable;
@@ -1171,15 +1171,15 @@ fn runLongPathWalk(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
     return walk;
 }
 
-fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest, blocked: usize) !suite.RunStats {
+fn runLongPathWalkCase(allocator: std.mem.Allocator, io: std.Io, threads: *ThreadSystem, options: suite.Options, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest, blocked: usize) !suite.RunStats {
     var stream = RangeOutputStream(PathRequest).init(allocator);
     defer stream.deinit();
     const step_limit = 4 * config.routeCells() + 64;
-    for (0..coldWarmup(options)) |_| _ = try runLongPathWalk(io, fixture, &stream, request, step_limit);
+    for (0..coldWarmup(options)) |_| _ = try runLongPathWalk(io, threads, fixture, &stream, request, step_limit);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var reference: ?LongPathWalk = null;
     for (0..coldIterations(options)) |_| {
-        const walk = try runLongPathWalk(io, fixture, &stream, request, step_limit);
+        const walk = try runLongPathWalk(io, threads, fixture, &stream, request, step_limit);
         if (reference) |kept| {
             if (!kept.sameWork(walk)) return error.LongPathWorkVaried;
         } else reference = walk;
@@ -1234,7 +1234,7 @@ const LongPathHops = struct {
 // Chains `request`'s hops from empty runtime state: each hop's request runs its first attempt
 // and, when that promoted, its escalated attempt; a partial restarts the chain at its end, on
 // its level, until a hop arrives (`.available`) or drops (`.missing`).
-fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, hop_limit: usize) !LongPathHops {
+fn runLongPathHops(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, hop_limit: usize) !LongPathHops {
     const system = &fixture.system;
     system.clearRuntimeState();
     const tier0_abstract = &system.scratch_slots.items[0].corridor.abstract;
@@ -1254,7 +1254,7 @@ fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
             tier0_abstract.reset();
             tier1_abstract.reset();
             const start_ns = suite.nowNs(io);
-            const stats = try system.updateSerial(stream, 1, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
+            const stats = try system.update(stream, 1, threads, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
             chain.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
             try fixtures.writeRequests(stream, &.{});
             chain.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
@@ -1284,16 +1284,16 @@ fn runLongPathHops(io: std.Io, fixture: *RouteFixture, stream: *RangeOutputStrea
     }
 }
 
-fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest) !suite.RunStats {
+fn runLongPathHopsCase(allocator: std.mem.Allocator, io: std.Io, threads: *ThreadSystem, options: suite.Options, item_count: usize, config: LongPathConfig, fixture: *RouteFixture, request: PathRequest) !suite.RunStats {
     var stream = RangeOutputStream(PathRequest).init(allocator);
     defer stream.deinit();
     // Every published hop advances at least one cell.
     const hop_limit = config.routeCells() + 64;
-    for (0..coldWarmup(options)) |_| _ = try runLongPathHops(io, fixture, &stream, request, hop_limit);
+    for (0..coldWarmup(options)) |_| _ = try runLongPathHops(io, threads, fixture, &stream, request, hop_limit);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var reference: ?LongPathHops = null;
     for (0..coldIterations(options)) |_| {
-        const chain = try runLongPathHops(io, fixture, &stream, request, hop_limit);
+        const chain = try runLongPathHops(io, threads, fixture, &stream, request, hop_limit);
         if (reference) |kept| {
             if (!kept.sameWork(chain)) return error.LongPathWorkVaried;
         } else reference = chain;
@@ -1338,6 +1338,8 @@ fn writeLongPathAttempt(details: *suite.DetailLines, label: []const u8, attempt:
 
 fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     std.debug.assert(!case.usesThreadSystem());
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
     const config = try LongPathConfig.decode(item_count);
     const levels = config.levels();
     const agent_count = config.agents();
@@ -1373,20 +1375,20 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // Every variant checks the nav's bytes again once its paths are cached and registered.
     if (config.variant == .walk or config.variant == .hops) {
         const stats = if (config.variant == .walk)
-            try runLongPathWalkCase(allocator, io, options, item_count, config, &fixture, agents[0], built.blocked)
+            try runLongPathWalkCase(allocator, io, &threads, options, item_count, config, &fixture, agents[0], built.blocked)
         else
-            try runLongPathHopsCase(allocator, io, options, item_count, config, &fixture, agents[0]);
+            try runLongPathHopsCase(allocator, io, &threads, options, item_count, config, &fixture, agents[0]);
         try nav_size.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
         return stats;
     }
 
-    for (0..coldWarmup(options)) |_| _ = try runLongPathCycle(io, &fixture, &empty, agents);
+    for (0..coldWarmup(options)) |_| _ = try runLongPathCycle(io, &threads, &fixture, &empty, agents);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var reference: ?LongPathCycle = null;
     var first_ns: u64 = 0;
     var escalated_ns: u64 = 0;
     for (0..coldIterations(options)) |_| {
-        const cycle = try runLongPathCycle(io, &fixture, &empty, agents);
+        const cycle = try runLongPathCycle(io, &threads, &fixture, &empty, agents);
         if (reference) |kept| {
             if (!kept.sameWork(cycle)) return error.LongPathWorkVaried;
         } else reference = cycle;
@@ -1574,11 +1576,11 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     const system = &fixture.system;
     setPathStageTuners(system, case);
     var warm = suite.Warmup.custom(case, options.warmup_iterations, coldSettleLimit(options));
-    while (warm.next(system.tuners.solve.isSettled())) {
+    while (warm.next(system.tuners.solve.phase == .settled)) {
         system.clearRuntimeState();
         _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
     }
-    const settled = if (case.adaptive) system.tuners.solve.isSettled() else false;
+    const settled = if (case.adaptive) (system.tuners.solve.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -1599,7 +1601,7 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     stats.output_count = last_stats.available_results;
     stats.candidate_pairs = abstract_nodes;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(system.tuners.solve.report(), settled);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), settled);
     return stats;
 }
 
@@ -1641,7 +1643,7 @@ const LinkFoldConfig = struct {
 fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try LinkFoldConfig.decode(item_count);
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
     const participant_count = fixtures.participantCount(thread_ptr);

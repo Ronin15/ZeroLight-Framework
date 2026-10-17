@@ -98,14 +98,14 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         system.compute_tuner = tuner;
     }
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
+    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer if (threads) |*thread_system| thread_system.deinit();
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(system.compute_tuner.isSettled())) {
+    while (warm.next(system.compute_tuner.phase == .settled)) {
         _ = try runOnce(&system, &fixture, think_set, if (threads) |*thread_system| thread_system else null, case);
     }
-    const settled_before_measurement = if (case.adaptive) system.compute_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) (system.compute_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = AffectStats{};
@@ -121,7 +121,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     stats.candidate_pairs = last_stats.processed_count;
     stats.output_count = last_stats.threshold_crossed_count;
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.compute_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.compute_tuner), settled_before_measurement);
     }
     return stats;
 }
@@ -129,10 +129,6 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 fn runOnce(system: *AffectSystem, fixture: *Fixture, think_set: ?[]const u32, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !AffectStats {
     fixture.events.clearRetainingCapacity();
     const ai_slice = fixture.data.aiAgentSliceConst();
-
-    if (!case.usesThreadSystem()) {
-        return try system.updateSerial(ai_slice, &fixture.data, &fixture.events, .{ .scope_dense_indices = think_set });
-    }
 
     return try system.update(ai_slice, &fixture.data, &fixture.events, thread_system.?, .{
         .items_per_range = case.stageItemsPerRange(affect_range_alignment_items),

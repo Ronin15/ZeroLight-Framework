@@ -2109,6 +2109,7 @@ const no_colliders = &test_support.no_colliders;
 const EntityId = @import("../../data_system.zig").EntityId;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const test_support = @import("test_support.zig");
+const updatePathfindingInline = @import("test_support.zig").updatePathfindingInline;
 const abstractCapacity = test_support.abstractCapacity;
 const addNavBody = test_support.addNavBody;
 const loadTestWorldMeta = test_support.loadTestWorldMeta;
@@ -3310,7 +3311,7 @@ fn routes(system: *PathfindingSystem, data: *DataSystem, world: *const WorldSyst
         .start = center(start, tile),
         .goal = center(goal, tile),
     });
-    const stats = try system.updateSerial(&stream, 8, .{});
+    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     return stats.available_results == 1;
 }
 

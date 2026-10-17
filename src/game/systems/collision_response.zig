@@ -145,7 +145,6 @@ pub const CollisionResponseConfig = struct {
 };
 
 // Threading for one update's stages: the thread system and the caller's control config.
-// Absent in `updateSerial`, where both stages run inline.
 const ResponseThreads = @import("../../app/thread_system.zig").StageThreads(CollisionResponseConfig);
 
 pub const CollisionResponseStats = struct {
@@ -240,11 +239,6 @@ pub const CollisionResponseSystem = struct {
         return self.run(data, frame, observer, .{ .thread_system = thread_system, .config = config });
     }
 
-    /// `update` with both stages inline on the calling thread.
-    pub fn updateSerial(self: *CollisionResponseSystem, data: *DataSystem, frame: *SimulationFrame, observer: EntityId) error{OutOfMemory}!CollisionResponseStats {
-        return self.run(data, frame, observer, null);
-    }
-
     /// Indices into `frame.contacts` of the last update's contacts naming `observer`, in
     /// contact order. Valid until the next update or until the contact stream changes;
     /// the caller passes the frame and observer that update saw.
@@ -258,7 +252,7 @@ pub const CollisionResponseSystem = struct {
         try self.ensureContactCapacity(max_contacts);
     }
 
-    fn run(self: *CollisionResponseSystem, data: *DataSystem, frame: *SimulationFrame, observer: EntityId, threads: ?ResponseThreads) !CollisionResponseStats {
+    fn run(self: *CollisionResponseSystem, data: *DataSystem, frame: *SimulationFrame, observer: EntityId, threads: ResponseThreads) !CollisionResponseStats {
         const step = (try self.beginStep(data, frame, observer)) orelse return .{};
         const input = step.input;
         const columns = step.columns;
@@ -789,6 +783,13 @@ fn writeContacts(frame: *SimulationFrame, contacts: []const CollisionContact) !v
     frame.contacts.finishWrite();
 }
 
+// `CollisionResponseSystem.update` inline as one range: a thread system with no workers.
+fn updateInline(system: *CollisionResponseSystem, data: *DataSystem, frame: *SimulationFrame, observer: EntityId) !CollisionResponseStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
+    return system.update(data, frame, observer, &threads, .{});
+}
+
 test "solid dynamic response separates from static and stops normal velocity" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -801,7 +802,7 @@ test "solid dynamic response separates from static and stops normal velocity" {
 
     var system = CollisionResponseSystem.init(std.testing.allocator);
     defer system.deinit();
-    const stats = try system.updateSerial(&data, &frame, EntityId.invalid);
+    const stats = try updateInline(&system, &data, &frame, EntityId.invalid);
 
     try std.testing.expectEqual(@as(usize, 1), stats.intent_count);
     const body = data.movementBodyConst(dynamic).?;
@@ -822,7 +823,7 @@ test "bounce dynamic response reflects normal velocity by restitution" {
 
     var system = CollisionResponseSystem.init(std.testing.allocator);
     defer system.deinit();
-    _ = try system.updateSerial(&data, &frame, EntityId.invalid);
+    _ = try updateInline(&system, &data, &frame, EntityId.invalid);
 
     const body = data.movementBodyConst(dynamic).?;
     try std.testing.expectApproxEqAbs(@as(f32, 6), body.position.x, 0.001);
@@ -841,7 +842,7 @@ test "bounce response preserves separating normal velocity" {
 
     var system = CollisionResponseSystem.init(std.testing.allocator);
     defer system.deinit();
-    _ = try system.updateSerial(&data, &frame, EntityId.invalid);
+    _ = try updateInline(&system, &data, &frame, EntityId.invalid);
 
     const body = data.movementBodyConst(dynamic).?;
     try std.testing.expectApproxEqAbs(@as(f32, 6), body.position.x, 0.001);
@@ -860,7 +861,7 @@ test "solid response preserves separating normal velocity" {
 
     var system = CollisionResponseSystem.init(std.testing.allocator);
     defer system.deinit();
-    _ = try system.updateSerial(&data, &frame, EntityId.invalid);
+    _ = try updateInline(&system, &data, &frame, EntityId.invalid);
 
     const body = data.movementBodyConst(dynamic).?;
     try std.testing.expectApproxEqAbs(@as(f32, 7), body.position.x, 0.001);
@@ -880,7 +881,7 @@ test "solid versus bounce dynamic pair gives response to bounce entity" {
 
     var system = CollisionResponseSystem.init(std.testing.allocator);
     defer system.deinit();
-    _ = try system.updateSerial(&data, &frame, EntityId.invalid);
+    _ = try updateInline(&system, &data, &frame, EntityId.invalid);
 
     const solid_body = data.movementBodyConst(solid).?;
     const bounce_body = data.movementBodyConst(bounce).?;
@@ -908,7 +909,7 @@ test "trigger response emits event without physical correction" {
 
     var system = CollisionResponseSystem.init(std.testing.allocator);
     defer system.deinit();
-    const stats = try system.updateSerial(&data, &frame, EntityId.invalid);
+    const stats = try updateInline(&system, &data, &frame, EntityId.invalid);
 
     try std.testing.expectEqual(@as(usize, 0), stats.intent_count);
     try std.testing.expectEqual(@as(usize, 1), stats.trigger_count);
@@ -934,7 +935,7 @@ test "response remaps stale cached movement index before writing" {
 
     var system = CollisionResponseSystem.init(std.testing.allocator);
     defer system.deinit();
-    _ = try system.updateSerial(&data, &frame, EntityId.invalid);
+    _ = try updateInline(&system, &data, &frame, EntityId.invalid);
 
     const target_after = data.movementBodyConst(target).?;
     const wrong_after = data.movementBodyConst(wrong).?;
@@ -969,7 +970,7 @@ test "warmed response update does not allocate" {
         frame.collision_triggers.allocator = original_trigger_allocator;
     }
 
-    const stats = try system.updateSerial(&data, &frame, EntityId.invalid);
+    const stats = try updateInline(&system, &data, &frame, EntityId.invalid);
 
     try std.testing.expectEqual(@as(usize, 1), stats.trigger_count);
     try std.testing.expectEqual(@as(usize, 1), frame.collision_triggers.mergedItems().len);
@@ -1006,7 +1007,7 @@ test "warmed solid response update does not allocate" {
     system.allocator = failing_allocator.allocator();
     defer system.allocator = original_system_allocator;
 
-    const stats = try system.updateSerial(&data, &frame, EntityId.invalid);
+    const stats = try updateInline(&system, &data, &frame, EntityId.invalid);
 
     try std.testing.expectEqual(@as(usize, 1), stats.intent_count);
     try std.testing.expectEqual(@as(usize, 0), stats.trigger_count);
@@ -1031,7 +1032,7 @@ test "serial response math uses simd chunks and scalar tails" {
 
     var system = CollisionResponseSystem.init(std.testing.allocator);
     defer system.deinit();
-    const stats = try system.updateSerial(&data, &frame, EntityId.invalid);
+    const stats = try updateInline(&system, &data, &frame, EntityId.invalid);
 
     try std.testing.expectEqual(@as(usize, simd.lane_count + 1), stats.intent_count);
     try std.testing.expectEqual(@as(usize, simd.lane_count), simd.vectorizedEnd(stats.intent_count));
@@ -1064,7 +1065,7 @@ test "multi-contact stacking applies ordered solid corrections to one dynamic" {
 
     var system = CollisionResponseSystem.init(std.testing.allocator);
     defer system.deinit();
-    const stats = try system.updateSerial(&data, &frame, EntityId.invalid);
+    const stats = try updateInline(&system, &data, &frame, EntityId.invalid);
 
     try std.testing.expectEqual(@as(usize, 2), stats.contact_count);
     try std.testing.expectEqual(@as(usize, 2), stats.intent_count);
@@ -1227,7 +1228,7 @@ const RingResult = struct {
     }
 };
 
-// One response step from the fixture's initial movement state; serial with no threads.
+// One response step from the fixture's initial movement state; inline with no threads.
 fn runRing(
     allocator: std.mem.Allocator,
     system: *CollisionResponseSystem,
@@ -1239,7 +1240,7 @@ fn runRing(
     const stats = if (threads) |thread_system|
         try system.update(&fixture.data, &fixture.frame, fixture.observer, thread_system, config)
     else
-        try system.updateSerial(&fixture.data, &fixture.frame, fixture.observer);
+        try updateInline(system, &fixture.data, &fixture.frame, fixture.observer);
     var movement = try MovementSnapshot.capture(allocator, &fixture.data);
     errdefer movement.deinit(allocator);
     const triggers = try allocator.dupe(CollisionTriggerEvent, fixture.frame.collision_triggers.mergedItems());
@@ -1337,9 +1338,9 @@ test "threaded response matches serial bit for bit across range sizes, worker co
             try std.testing.expectEqual(@as(usize, 1), inline_gather.stats.gather_batch.range_count);
             try std.testing.expect(inline_gather.stats.apply_batch.ran_inline);
             try std.testing.expectEqual(@as(u64, 0), inline_gather.stats.apply_batch.batch_duration_ns);
-            try std.testing.expectEqual(@as(usize, 0), system.apply_tuner.report().sample_count);
-            try std.testing.expectEqual(@as(u64, 0), system.apply_tuner.report().baseline_mean_batch_duration_ns);
-            try std.testing.expectEqual(@as(usize, 1), system.gather_tuner.report().sample_count);
+            try std.testing.expectEqual(@as(usize, 0), system.apply_tuner.sample_count);
+            try std.testing.expectEqual(@as(u64, 0), system.apply_tuner.baseline_mean_batch_duration_ns);
+            try std.testing.expectEqual(@as(usize, 1), system.gather_tuner.sample_count);
             try expectRingResultsEqual(serial, inline_gather);
         }
     }
@@ -1514,16 +1515,16 @@ test "response stages record into their own tuners" {
 
     var system = CollisionResponseSystem.init(allocator);
     defer system.deinit();
-    const window = system.gather_tuner.report().sample_window;
+    const window = system.gather_tuner.config.sample_window;
     for (0..window) |_| {
         fixture.restore();
         _ = try system.update(&fixture.data, &fixture.frame, fixture.observer, &threads, .{ .max_worker_threads = 2 });
     }
-    try std.testing.expect(system.gather_tuner.report().baseline_mean_batch_duration_ns > 0);
+    try std.testing.expect(system.gather_tuner.baseline_mean_batch_duration_ns > 0);
     // A gather that learns inline applies its own windows; the apply tuner hears nothing.
-    try std.testing.expect(!system.gather_tuner.report().has_threaded_profile);
-    try std.testing.expectEqual(@as(usize, 0), system.apply_tuner.report().sample_count);
-    try std.testing.expectEqual(@as(u64, 0), system.apply_tuner.report().baseline_mean_batch_duration_ns);
+    try std.testing.expect(!system.gather_tuner.has_threaded_profile);
+    try std.testing.expectEqual(@as(usize, 0), system.apply_tuner.sample_count);
+    try std.testing.expectEqual(@as(u64, 0), system.apply_tuner.baseline_mean_batch_duration_ns);
 
     // The apply runs only after a gather on workers: pin the gather to a threaded profile.
     pinTunerProfile(&system.gather_tuner, .{ .worker_threads = 2, .items_per_range = 16 });
@@ -1533,8 +1534,8 @@ test "response stages record into their own tuners" {
         try std.testing.expect(!stats.gather_batch.ran_inline);
     }
 
-    try std.testing.expect(system.apply_tuner.report().baseline_mean_batch_duration_ns > 0);
-    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().baseline_mean_batch_duration_ns);
+    try std.testing.expect(system.apply_tuner.baseline_mean_batch_duration_ns > 0);
+    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.baseline_mean_batch_duration_ns);
 }
 
 test "an empty contact stream records no batch and leaves no triggers or observer contacts" {
@@ -1550,7 +1551,7 @@ test "an empty contact stream records no batch and leaves no triggers or observe
     const full = try system.update(&fixture.data, &fixture.frame, fixture.observer, &threads, .{ .max_worker_threads = 2 });
     try std.testing.expect(full.trigger_count > 0);
     try std.testing.expect(system.observerContacts(&fixture.frame, fixture.observer).len > 0);
-    const samples_before = system.gather_tuner.report().sample_count;
+    const samples_before = system.gather_tuner.sample_count;
 
     fixture.frame.contacts.clearRetainingCapacity();
     const empty = try system.update(&fixture.data, &fixture.frame, fixture.observer, &threads, .{ .max_worker_threads = 2 });
@@ -1560,7 +1561,7 @@ test "an empty contact stream records no batch and leaves no triggers or observe
     try std.testing.expectEqual(@as(usize, 0), empty.trigger_count);
     try std.testing.expectEqual(@as(usize, 0), empty.gather_batch.range_count);
     try std.testing.expectEqual(@as(usize, 0), empty.apply_batch.range_count);
-    try std.testing.expectEqual(samples_before, system.gather_tuner.report().sample_count);
+    try std.testing.expectEqual(samples_before, system.gather_tuner.sample_count);
     try std.testing.expectEqual(@as(usize, 0), fixture.frame.collision_triggers.mergedItems().len);
     // Consumers read the observer contacts through this accessor.
     try std.testing.expectEqual(@as(usize, 0), system.observerContacts(&fixture.frame, fixture.observer).len);
@@ -1650,7 +1651,7 @@ test "a step of over 2^31 - 1 contacts fails as OutOfMemory before clearing outp
         frame.contacts.merged_len = count;
         frame.contacts.prefix_ready = true;
         system.observer_source_contacts = 7;
-        try std.testing.expectError(error.OutOfMemory, system.updateSerial(&data, &frame, EntityId.invalid));
+        try std.testing.expectError(error.OutOfMemory, updateInline(&system, &data, &frame, EntityId.invalid));
         if (count > limit) {
             try std.testing.expect(!failing.has_induced_failure);
             try std.testing.expectEqual(@as(usize, 7), system.observer_source_contacts);

@@ -439,23 +439,6 @@ pub const SpriteBatch = struct {
         try self.draw_groups.ensureTotalCapacity(self.allocator, self.commands.items.len);
     }
 
-    pub fn buildSerial(self: *SpriteBatch, texture_resolver: TextureResolver) !void {
-        // `build` allocates via `ensureFrameStorage`; surface OutOfMemory/Overflow to the
-        // caller rather than folding a recoverable failure into ReleaseFast UB. Callers that
-        // have already reserved capacity should call `buildAssumeCapacity` directly.
-        _ = try self.build(texture_resolver, null, .{ .adaptive = false });
-    }
-
-    pub fn build(
-        self: *SpriteBatch,
-        texture_resolver: TextureResolver,
-        thread_system: ?*ThreadSystem,
-        prep_config: SpritePrepConfig,
-    ) !SpritePrepStats {
-        try self.ensureFrameStorage();
-        return self.buildAssumeCapacity(texture_resolver, thread_system, prep_config);
-    }
-
     /// Builds prepared vertices and draw groups without allocating. Callers must
     /// reserve storage for the current command count before entering this path.
     pub fn buildAssumeCapacity(
@@ -846,6 +829,12 @@ fn initBatchTest(allocator: std.mem.Allocator, table: *const TestTextureTable) !
     return batch;
 }
 
+// The renderer's frame prep: reserve the frame's storage, then build without allocating.
+fn prepare(batch: *SpriteBatch, texture_resolver: TextureResolver, thread_system: ?*ThreadSystem, prep_config: SpritePrepConfig) !SpritePrepStats {
+    try batch.ensureFrameStorage();
+    return batch.buildAssumeCapacity(texture_resolver, thread_system, prep_config);
+}
+
 test "batch builder skips invalid stale and destroyed texture ids" {
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
@@ -874,7 +863,7 @@ test "batch builder skips invalid stale and destroyed texture ids" {
         .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepare(&batch, table.resolver(), null, .{});
 
     try std.testing.expectEqual(@as(usize, 6), batch.positions.items.len);
     try std.testing.expectEqual(@as(usize, 1), batch.draw_groups.items.len);
@@ -909,7 +898,7 @@ test "batch builder groups by texture and coordinate presentation" {
         .coordinate_space = .drawable,
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepare(&batch, table.resolver(), null, .{});
 
     try std.testing.expectEqual(@as(usize, 18), batch.positions.items.len);
     try std.testing.expectEqual(@as(usize, 3), batch.draw_groups.items.len);
@@ -948,7 +937,7 @@ test "world vertices ignore camera now that the transform is baked on the GPU" {
         .coordinate_space = .logical,
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepare(&batch, table.resolver(), null, .{});
 
     // All spaces emit world/identity-space geometry; the camera is applied by
     // the renderer's vertex uniform, never on the CPU.
@@ -989,7 +978,7 @@ test "batch builder preserves ordered submission stream" {
         .order = RenderOrder.world(@backingInt(OrderedStreamDepth.far)),
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepare(&batch, table.resolver(), null, .{});
 
     try std.testing.expectEqual(@as(f32, 10), batch.positions.items[0][0]);
     try std.testing.expectEqual(@as(f32, 20), batch.positions.items[6][0]);
@@ -1062,7 +1051,7 @@ test "batch builder splits a same-texture run on render order change" {
         .order = RenderOrder.world(1),
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepare(&batch, table.resolver(), null, .{});
 
     try std.testing.expectEqual(@as(usize, 2), batch.draw_groups.items.len);
     try std.testing.expectEqual(@as(i32, -2), batch.draw_groups.items[0].order.depth);
@@ -1098,7 +1087,7 @@ test "world and logical vertices stay independent of drawable presentation" {
         .coordinate_space = .drawable,
     });
 
-    try batch.buildSerial(table.resolver());
+    _ = try prepare(&batch, table.resolver(), null, .{});
 
     try std.testing.expectEqual(@as(f32, 20), batch.positions.items[0][0]);
     try std.testing.expectEqual(@as(f32, 30), batch.positions.items[0][1]);
@@ -1121,7 +1110,7 @@ test "safe sprite batch build reserves missing frame storage" {
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
     });
-    const stats = try batch.build(table.resolver(), null, .{ .adaptive = false });
+    const stats = try prepare(&batch, table.resolver(), null, .{ .adaptive = false });
 
     try std.testing.expectEqual(@as(usize, 1), stats.command_count);
     try std.testing.expectEqual(@as(usize, 6), batch.positions.items.len);
@@ -1288,14 +1277,14 @@ test "parallel sprite prep matches serial vertices and draw groups" {
     try addParallelParityCommands(&serial);
     try addParallelParityCommands(&threaded);
 
-    try serial.buildSerial(table.resolver());
+    _ = try prepare(&serial, table.resolver(), null, .{});
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{
         .max_worker_threads = 2,
         .items_per_range = 1,
     });
     defer threads.deinit();
-    const stats = try threaded.build(table.resolver(), &threads, .{
+    const stats = try prepare(&threaded, table.resolver(), &threads, .{
         .items_per_range = 1,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -1341,11 +1330,11 @@ test "sprite prep records one sample into its own tuner and none into the shared
     });
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-    _ = try batch.build(table.resolver(), &threads, .{});
+    _ = try prepare(&batch, table.resolver(), &threads, .{});
 
-    try std.testing.expectEqual(@as(usize, 1), batch.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 1), batch.adaptive_tuner.sample_count);
     try std.testing.expect(batch.adaptive_tuner.last_request != null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
     try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
@@ -1378,11 +1367,11 @@ test "sprite prep adaptive gate keeps cheap batches inline" {
     });
     defer threads.deinit();
 
-    const warmup_windows = batch.adaptive_tuner.report().sample_window * 4;
+    const warmup_windows = batch.adaptive_tuner.config.sample_window * 4;
     var last_stats: SpritePrepStats = .{};
     var window: usize = 0;
     while (window < warmup_windows) : (window += 1) {
-        last_stats = try batch.build(table.resolver(), &threads, .{});
+        last_stats = try prepare(&batch, table.resolver(), &threads, .{});
     }
 
     try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, batch.adaptive_tuner.config.threaded_batch_ns);
