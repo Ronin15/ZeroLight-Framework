@@ -206,7 +206,6 @@ the [archive](framework-implementation-slices-archive.md).
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
-| [**84**](roadmap/slices/slice-84.md) | Not started | Level-Aware Shared Neighbor Index — after 83 |
 | [**85**](roadmap/slices/slice-85.md) | Not started | Steering On The Shared Neighbor Index — after 84, 86 |
 | [**86**](roadmap/slices/slice-86.md) | Not started | Collision Subsystem Pass — after 83, 84 |
 | [**87**](roadmap/slices/slice-87.md) | Not started | Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items |
@@ -273,9 +272,10 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    in the slice. The measuring landing (`5d5a089`) benched today's code; each
    finding, with its `file:line` re-checked there, its measured number, and
    its pass shape, lives in its slice. 83 landed (`3c42b4f`, `176ed03`,
-   `13e88ad`; `verify` passes). Order:
+   `13e88ad`; `verify` passes); 84's programming landed (`c52a5ff`,
+   `08e4799`, `3efa1e4`, `320023a`). Order:
    [83](roadmap/archive/slice-83.md) prep →
-   [84](roadmap/slices/slice-84.md) spatial index →
+   [84](roadmap/archive/slice-84.md) spatial index →
    [86](roadmap/slices/slice-86.md) collision →
    [85](roadmap/slices/slice-85.md) steering → tile gate
    ([35](roadmap/slices/slice-35.md)'s `world_gate` items) →
@@ -297,9 +297,9 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    - Render backend pass: 87, last.
 
    Items the 2026-10-16 audits and the 84 chunk-index review routed here
-   (tags name findings in the local `.claude/reports/` audit files). Refs in
-   84's items describe its uncommitted landing; every ref is re-checked right
-   before implementation (`.claude/rules/engine-design.md` § Cost model).
+   (tags name findings in the local `.claude/reports/` audit files). Every
+   ref is re-checked right before implementation
+   (`.claude/rules/engine-design.md` § Cost model).
    - 84: index order and its fragment paths (code H1, review 1 and 8);
      cohere's check budget (code H1); TSan before merge (review open
      question); carried stage inputs (code M1); the vectorized separation
@@ -324,7 +324,8 @@ roadmap flow (Suggested Order) resumes after the AI branch.
      `hotStoreCapacity` copies (code L8).
    - 74: the steering seam copy (code M3); `production-step` spawn path (code
      L4).
-   - 68A: think-set compact on main (contiguity audit, noticed in passing).
+   - 68A: think-set compact on main (contiguity audit, noticed in passing;
+     closed by 84).
    - 52A: `build.zig` doc pointer (code L9, docs L14).
    - 75: census timers (docs L18).
 
@@ -364,7 +365,7 @@ Each branch opens by measuring first (bench-only landing on today's code), then
 writes the findings into slice checklists or new slice files.
 
 **Core findings** (measured at `5d5a089`; detail in each slice):
-- **High:** spatial index and perception check budget (84); collision
+- **High:** spatial index and perception check budget (84, landed); collision
   broadphase (86); tile gate (35); render collect (87); inert rows (86 for
   collision, 75 for movement and tiers, 87 for render collect).
 - **Medium:** destructible resolve (72 D1); structural commands past the
@@ -378,9 +379,11 @@ writes the findings into slice checklists or new slice files.
   `engine-design.md` § Target scale. Owned by 75; its tier mechanics land in
   the core branch.
 - **High:**
-  - **Per-row gathers on main** (perception, decide, memory, affect, stagger
-    filter): five population walks per step, every agent in every world once
-    75 lands. New slice; 68A's gather item moves into it.
+  - **Per-row gathers on main:** 84 moved the perception, decide, memory, and
+    stagger-filter walks to workers; affect's gather is 88's item.
+  - **Perception's hostile cap** keeps the first 16 candidates in scan order,
+    not the nearest, so in a crowd of more than 16 hostiles in range the
+    nearest visible one can be missed (derived).
   - **Sensory bus** (new slice):
     - fixed caps drop stimuli simulation reads;
     - a dig can in principle be refused when the bus is full;

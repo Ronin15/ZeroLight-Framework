@@ -35,7 +35,8 @@ traversal, and audio treat it through the same paths as any entity.
   (`src/game/simulation_pipeline.zig:1159`) builds intents for
   `player.entity`.
 - Perception: a separate `PlayerPerceptionCandidate`
-  (`simulation_pipeline.zig:1389`) beside the halo candidates.
+  (`simulation_pipeline.zig:1396`) beside the candidates the spatial index
+  supplies.
 - Tile gate: `gatePlayerToWalkableTiles` and `Player.clampToBounds`
   (`src/game/systems/world_gate.zig:25`) apart from the NPC gate.
 - Plane traversal: NPC entries exclude the player

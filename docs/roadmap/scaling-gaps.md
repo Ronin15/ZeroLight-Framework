@@ -49,8 +49,8 @@ and the collision gather (~0.09 ms).
 - [ ] **AI separation density.** Separation samples rise 2–3× running through
       the pack and scale with cognition density. The `ai_separation` batch
       line separates gather from math; Slice 55 removes queries for coasting
-      rows and Slice 35 owns the per-row math. Candidate and sample caps stay
-      fixed. (`ai.zig`)
+      rows; the per-neighbor math runs in lanes over shared neighbor blocks
+      (Slice 84). Candidate and sample caps stay fixed. (`ai.zig`)
 - [ ] **Path group fields and cache pressure.** At 2048 movers
       `group_built = 0` because the demo pins `min_group_field_agents = 2000`
       after measuring that pending dedup and the cache serve shared-goal
@@ -59,5 +59,12 @@ and the collision gather (~0.09 ms).
       [Slice 71B](slices/slice-71b.md) (71B.3). (`game_demo_state.zig`,
       pathfinding capacity)
 - [ ] **Perception tail.** Stage avg ~0.16 ms, max ~2.4 ms. Bench a denser
-      observer case before touching the gather; the FOV path is partly SIMD.
-      (`perception.zig`)
+      observer case before touching the gather; the FOV runs in the query's
+      lanes (Slice 84). (`perception.zig`)
+- [ ] **Perception's neighbor block at sharing factor 1.** At `perception`
+      2,048 each block key serves one observer (measured k = 1), so the block
+      copies the stream with no reuse. ReleaseFast
+      `perception` serial at 10,000 went 662 → 906 µs against `08e4799`
+      (`3efa1e4`), tuned within spread. Reopens when perception runs inline at
+      scale (the tuned case reports `inline` at a size where the serial gap
+      holds); `perception` is the bench. (`perception.zig`)

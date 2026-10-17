@@ -51,6 +51,15 @@ in its owning slice.
       spawned through the production spawn path spread across the phases; a
       test that would fail with the overwrite
       (`.claude/rules/tests-benchmarks.md` § Tests); serial == threaded.
+      Phase is the think set's one membership test (`cognitionJob`,
+      `src/game/systems/simulation_scope.zig:866`, over the phase the index
+      stores, `spatial_index.zig:393`), so spreading the phases changes
+      membership only; per-entity phases stay
+      (`src/game/simulation_scope.zig:142-145`).
+      Neighbor-block sharing per step then falls to agents per cell ÷
+      `cognition_stagger_n` (derived: about 2.3 per key at the `ai` density,
+      whose benches think every agent; `production-step`'s census reports the
+      real figure).
 - [ ] DataSystem hot-pass data layout (contiguity audit H5): the stores stay
       dense SoA; the stagger assignment and the cross-store reads are fixed in
       the layout (`.claude/rules/memory-performance.md` § Data-oriented
@@ -62,11 +71,12 @@ in its owning slice.
       `world_level`, `data_system/system.zig:944-950`); faction and
       `world_level` are separate stores (`faction_level.zig:17`, `:22`); each
       cross-store read resolves through the entity slot table
-      (`data_system/system.zig:445-455`, `:756-760`). Consumers:
-      `gatherAiData` (`systems/ai.zig:509`), `gatherPerceptionData`
-      (`perception.zig:415`), `compactCognitionFromHalo`
-      (`simulation_scope.zig:418`), `collisionGatherJob` and `aiGatherJob`
-      (`:772`, `:801`), collision `gatherBodies` (`collision.zig:455`), the
+      (`data_system/system.zig:445-455`, `:756-760`). Consumers: the
+      windowed threaded gathers `gatherAiData` (`systems/ai.zig:509`) and
+      `gatherPerceptionData` (`perception.zig:373`), the think-set compaction
+      `compactCognition` (`simulation_scope.zig:396`, which reads only index
+      columns), `collisionGatherJob` and `aiGatherJob`
+      (`:787`, `:816`), collision `gatherBodies` (`collision.zig:455`), the
       `world_gate` walks (`world_gate.zig:41`, `:119`), and render collect
       (87). Failure scenario (derived): with phases striped by row, each
       step's P/4 think set touches every cache line of each AI and movement
@@ -80,11 +90,54 @@ in its owning slice.
       (`.claude/rules/engine-design.md` § Cost model); serial == threaded and
       deterministic. Coordinates with 75 (tier and cadence), 73 (think
       interval), 68A (gathers off main), 86 (collision gather), and 35
-      (`world_gate`).
+      (`world_gate`). The think set arrives in the index's cell-major order
+      (level, chunk, local cell, faction, slot; `docs/architecture.md`), so
+      the order within a phase follows it, faction after the cell: no
+      think-set pass filters on faction. A phase-ordered store may replace
+      `compactCognition` with an O(think rows) producer of the same order;
+      the consumers do not change. Once production writes ascend,
+      `ai-cell-ordered` and `perception-cell-ordered` measure the same stream
+      as `ai` and `perception` and go; `ai-memory-shuffled` and
+      `ai-affect-shuffled` stay as the swap-remove churn shape.
+- [ ] Affect's gather leaves main. Failure: `gatherScopedIndices`
+      (`systems/affect.zig:259-307`) walks the think set on the main thread,
+      resolving the affect, perception, and memory rows per entity and
+      appending one row each, per-item work beyond an ordered merge
+      (`.claude/rules/threading.md`); the AI, perception, and memory gathers
+      already run on workers. Failure scenario: once 75 thinks every agent,
+      main pays three slot lookups per agent in the world every step. Pass: a
+      windowed threaded gather merged in range order, serial == threaded, a
+      `FailingAllocator` proof on a multi-worker step, and the pipeline
+      workers test (`simulation_pipeline.zig:5445-5467`) covering it.
+- [ ] AI memory's visibility pass reads perception in row order. Failure:
+      `refreshVisibleTargets` (`systems/ai_memory.zig:681-709`) walks members
+      in ascending memory row and reads `target_visible`, `nearest_threat`,
+      and `last_seen_*` at each member's perception row, which ascends only
+      while the perception and memory stores share a row order
+      (`.claude/rules/memory-performance.md` § Data-oriented design). Failure
+      scenario (derived): swap-remove churn on either store makes every
+      member's perception reads scattered, every step. Pass: the stores share
+      the H5 order, so the pass reads both as forward streams; an
+      `ai-memory` variant with a shuffled perception store is within spread
+      of the co-ordered one.
 - [ ] `DataSystem` and its non-AI stores against the cost model and the
       rules: row layout and growth seams, the structural applier's per-commit
       cost, handle and generation churn, and per-step walks a store forces on
       its consumers. Each finding becomes an item here.
+- [ ] A store's `u32` row cap fails as `OutOfMemory` at its growth seam
+      (`.claude/rules/budgets-capacities.md`). Failure: past `maxInt(u32)`
+      rows the stores return distinct errors: `data_system/movement.zig:59`,
+      `agents.zig:102`, `:220`, `collision.zig:55`, `:129`,
+      `faction_level.zig:35`, `:96`, `affect.zig:79`, `destructible.zig:31`,
+      `perception.zig:64`, `visual.zig:79`, `:180`, `:311`; entity slots at
+      `system.zig:185`; the `validateLimits` arms at `structural.zig:84-98`
+      but `:96`; and `TooManyWorldLevelRows` in `PlaneStageError`
+      (`src/game/dig_controller.zig:101`). Memory already does
+      (`memory.zig:87`, `structural.zig:96`). Failure scenario: a caller that
+      retries `OutOfMemory` with state intact meets an unhandled
+      `TooMany*Rows` at the cap. Pass: each returns `error.OutOfMemory`, the
+      `TooMany*` members leave the error sets, and a cap test per store like
+      memory's (`structural.zig:786`).
 - [ ] Step contracts (`simulation.zig`): per-step stream capacity and reserve
       against population and per-world load, event caps that simulation reads,
       `finishWrite` cost. Each finding becomes an item here.

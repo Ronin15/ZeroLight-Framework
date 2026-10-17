@@ -15,7 +15,7 @@ working; links to sibling open slices become `../slices/slice-<id>.md`), move
 its row from the index's Open Frontier table to the table below, and keep its
 acceptance history intact.
 
-**Archived coverage:** Slices 0–7, 8, 9–17, 18–25E, 26–32, 34, 36, 37, 39–41, 45, 47, 48, 81, 82, 83.
+**Archived coverage:** Slices 0–7, 8, 9–17, 18–25E, 26–32, 34, 36, 37, 39–41, 45, 47, 48, 81, 82, 83, 84.
 
 > Residual follow-ups from archived slices are never incomplete archive
 > checklists. Where they live today: Slice 30's deferred `memory_expired`
@@ -80,6 +80,7 @@ acceptance history intact.
 | [81](roadmap/archive/slice-81.md) | Split The Pathfinding Module | Pathfinding package split by job (publish, group service, intake, eviction, nav reaction, one-way closure, link bounds); bench file into `benchmarks/pathfinding/`, nav estimate into `nav_size.zig`. |
 | [82](roadmap/archive/slice-82.md) | Split The World Module | World files into `src/game/world/`; `world_system.zig` split into system, render, edit, worldgen. |
 | [83](roadmap/archive/slice-83.md) | Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners | Steering split into `src/game/systems/steering/`, pipeline fixtures into `pipeline_test_support.zig`, every production stage on its own tuner. |
+| [84](roadmap/archive/slice-84.md) | Level-Aware Shared Neighbor Index | One level- and faction-major chunk index per step built on workers; lane-group neighbor queries over per-cell shared blocks; cell-major think set; AI memory and gathers on workers. |
 
 ## Historical Order
 

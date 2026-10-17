@@ -39,9 +39,11 @@ Scope comes from one camera and puts far entities to sleep.
   movement integrates the full contiguous range.
 - Inside the cognition halo an agent thinks one step in
   `cognition_stagger_n` (4) by `stagger_phase`; `gatherAiPopulations`
-  excludes out-of-halo agents entirely; the spatial index and perception
-  candidates use the unstaggered halo; `always_active` bypasses halo,
-  stagger, and demotion.
+  excludes out-of-halo agents entirely; the spatial index (every neighbor
+  query's candidates) indexes the unstaggered halo, and the think set is its
+  rows on this step's phase, in the index's cell-major order
+  (`ai_cognition_order`, Slice 84); `always_active` bypasses halo, stagger,
+  and demotion.
 - Source: `simViewRegion` (`src/game/simulation_pipeline.zig`) reads
   `sim_view` = `GameDemoState.simViewRect()`, the camera as of the previous
   step's end (`updateCamera` runs after `pipeline.update`), anchored at
@@ -95,6 +97,14 @@ Scope comes from one camera and puts far entities to sleep.
 - Per-step cost follows population divided by each band's cadence, never
   world extent × world count; serial and threaded paths with parity
   (`.claude/rules/threading.md`).
+- The think set's membership is one phase test over the indexed rows
+  (`cognitionJob`, `src/game/systems/simulation_scope.zig:866`), and band
+  cadence replaces that test. With the whole population indexed, that pass
+  costs one compare per indexed row every step on workers, so to meet the
+  cost line above it walks only rows that can think this step, or an
+  O(think rows) producer in the same cell-major order replaces it. The think
+  set reads each entry's `population_row` as its AI row; a population 75
+  hands the index keeps that mapping.
 - Needs from 64G: whole-world chunked nav. From 73: the per-agent think
   interval, which 75's distance bands feed as one input (55's idle coasting
   is another).

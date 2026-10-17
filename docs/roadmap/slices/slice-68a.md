@@ -25,16 +25,19 @@ sensing (Slice 55 rejects it).
 
 ### Current foundation
 
-- `SpatialIndexSystem` (`src/game/systems/spatial_index.zig`) already
-  gathers the unstaggered halo on workers into padded per-range slots and
-  merges them in range order; `SpatialIndexRow` is entity, position, cell;
-  `view()` exposes positions, entries, ranges, and the dense lookup;
-  `buildSerial` is the serial twin.
+- `SpatialIndexSystem` (`src/game/systems/spatial_index.zig`, Slice 84)
+  builds the unstaggered halo's index on workers into per-chunk records keyed
+  by level and faction; `view()` carries each entry's position, entity
+  (`entity_index`, `entity_generation`), `population_row` (its AI row), and
+  `cognition_phase`; `buildSerial` is the serial twin. `spatial_index_build`
+  carries `movement_positions` and `world_level`.
 - `PerceptionSystem.gatherPerceptionData`
-  (`src/game/systems/perception.zig`) and `AiSystem.gatherAiData`
-  (`src/game/systems/ai.zig`) each walk the halo serially on the main thread,
-  resolving movement, faction, and level per row into their own candidate
-  tables; both module docs call this a deliberate duplicate gather.
+  (`src/game/systems/perception.zig:373`) and `AiSystem.gatherAiData`
+  (`src/game/systems/ai.zig:509`) keep no candidate tables and walk no halo:
+  each walks only its think rows on workers, in windows main merges in range
+  order, resolving movement, faction, and level per row through the entity
+  slot table. The think set comes from the index on workers
+  (`compactCognition`, `src/game/systems/simulation_scope.zig:396`).
 - `DataSystem.movementVisualDenseIndices` (`src/game/data_system/system.zig`)
   is the single-resolve precedent.
 - From earlier slices: 55's decide set and `ai-idle-*` benches; 75's
@@ -83,17 +86,15 @@ sensing (Slice 55 rejects it).
       self-validating lookup; module doc updated.
 - [ ] Perception and AI drop their candidate tables and halo walks; config
       fields that described the pairing are deleted; pairing asserts added.
-- [ ] The think-set compact leaves main (contiguity audit, noticed in
-      passing). Failure: `compactCognitionFromHalo`
-      (`src/game/systems/simulation_scope.zig:418-444`) resolves each halo
-      row's movement slot and tests its stagger phase on main, per-row work
-      beyond an ordered merge (`.claude/rules/threading.md`). Failure
-      scenario: once 75 indexes the whole population, main pays a slot
-      resolve per agent in the world every step to pick the rows that think.
-      Pass: main holds only the ordered merge of the think set; serial ==
-      threaded; `decide-consumers` shows main cost linear in decide rows.
+      Slice 84 removed the tables, the halo walks, and the dual-list config
+      fields; the pairing asserts land with the table and map.
+- [x] The think-set compact leaves main: `compactCognition` runs on workers
+      over the index's columns and main merges the windows (Slice 84,
+      `3efa1e4`); serial == threaded tests; `scope-cognition` measures main's
+      share per row.
 - [ ] Slice 56's arc query maps rows through the table's entity column.
-- [ ] Contract: `spatial_index_build` carries `world_level`.
+- [x] Contract: `spatial_index_build` carries `world_level` (Slice 84,
+      `c52a5ff`).
 - [ ] Tests: view columns equal direct lookups; stale-map and swap-remove
       safety; stage-3 level snapshot; serial == threaded; existing perception,
       AI, and pipeline suites unchanged.

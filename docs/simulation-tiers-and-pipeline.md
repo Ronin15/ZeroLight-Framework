@@ -62,39 +62,56 @@ The concrete processor order is pipeline-owned for one gameplay state instance.
 commit/domain reactions, and render-prep reservation at the state boundary; it
 passes the borrowed audio command buffer through the pipeline-owned
 `AudioController` rather than holding audio policy itself.
-`SimulationPipeline` opens each step with the backbone **scope pass** (stagger
-advance and the two-population gather: unstaggered cognition halo plus the
-stagger-filtered think set; chunk columns are derived later in a dedicated
-`chunk_derive` stage from each body's final settled position — not in-pass
-during movement), builds the shared **spatial index** (`SpatialIndexSystem`,
-Slice 28) from the unstaggered halo for neighbor queries, runs the
-**perception stage** (`PerceptionSystem`, Slice 29) with halo **candidates**
-and think-set **observers** against that same spatial index (range/FOV/line-of-sight,
-writing sensed state to `PerceptionStore`), then the **memory stage**
-(`AiMemorySystem`, Slice 30) over the cognition-scoped `AiPerception`+`AiMemory`
-subset (decaying staleness/familiarity/ring contacts and refreshing from this
-step's perception-acquisition events; decay is itself scope-gated through the
-same cognition-scope dense-index list, so an entity demoted out of the
-cognition halo simply stops being gathered — its memory row freezes rather
-than decaying, and resumes cleanly on resync, with no separate freeze
-mechanism needed), then the **affect stage**
-(`AffectSystem`, Slice 31) over the cognition-scoped `AiAffect` subset
-(appraising this step's just-written perception/memory state, both
-independently optional per row, plus each agent's own `AiAgent.behavior`, into
-four drives — fear, curiosity, aggression, fatigue — decayed toward per-entity
-baselines), then owns AI navigation-intent production, the step's goal table
-(`path_goal_resolve`), steering/path status,
-pathfinding, sparse movement-intent application, movement, collision detection,
-collision response, bounds clamp + world-tile gating, and plane traversal — AI,
-movement, and collision run scope-gated through a `scope_dense_indices` option.
+`SimulationPipeline` runs its `stage_order` (`docs/architecture.md` holds
+scope/tier ownership and the gating rules per stage). "On workers" below means
+a threaded pass under its own tuner, which may keep it inline below its gate:
+
+1. `dig_world_edit`: the dig's world edit and the step's stimuli (deferred
+   impacts promoted, the dig, at most one player footstep).
+2. `scope_advance_and_ai_gather`: the **scope pass** advances the stagger clock
+   and gathers the unstaggered cognition halo on workers. Chunk columns come
+   later, from `chunk_derive`.
+3. `spatial_index_build`: the shared **spatial index** of the halo at the
+   previous step's positions and levels (carried); bucket, sort, and link run
+   on workers (`docs/architecture.md`).
+4. `ai_cognition_order`: the **think set**, the indexed rows on this step's
+   stagger phase plus `always_active` (every row with no cognition region), in
+   the index's cell-major order, compacted on workers over cell-major
+   positions. Rows sharing a cell are adjacent in every later think-set stage;
+   results never depend on that order.
+   A row's stagger phase is set at movement-body append
+   (`dense_index % cognition_stagger_n`); `setSimulationMetadata` keeps it,
+   and takes the level from the `world_level` row, unless the write names
+   them (`simulation_scope.zig` `EntitySimulationMetadata`).
+5. `perception_update` (`PerceptionSystem`): think-set observers against the
+   index (range, FOV, line of sight), writing sensed state to `PerceptionStore`;
+   the gather and the compute run on workers. Carries positions and levels.
+6. `ai_memory_update` (`AiMemorySystem`): over the think set's rows carrying
+   `AiPerception` and `AiMemory`, in ascending memory-row order for any think
+   order. Workers translate think rows to memory and perception rows; main
+   marks each member in a hierarchical row bitmap; workers order the members
+   over the touched row words; workers decay; main refreshes from this step's
+   perception events; workers track still-visible targets, reading each row's
+   carried perception row. A row demoted out of the halo is not gathered, so
+   its memory freezes and resumes cleanly on resync.
+7. `affect_update` (`AffectSystem`): appraises this step's perception and
+   memory state (each optional per row) and the agent's `ai_behavior` (carried)
+   into four drives decayed toward per-entity baselines. Its gather runs on
+   main ([Slice 88](roadmap/slices/slice-88.md)); the compute runs on workers.
+8. `ai_decide` (`AiSystem`): gather, separation and cohere, and intent emission,
+   each on workers. Carries positions, levels, and interest markers.
+9. `path_goal_resolve` → `steering_update` → `pathfinding_update` →
+   `apply_ai_movement_intents` → `movement_integrate`: the step's goal table,
+   steering and path status, frame-delayed pathfinding, sparse movement-intent
+   application, and movement.
+10. The late-stage pose order below, then `chunk_derive` → `action_react` →
+    `tier_policy`. The **simulation-LOD tier policy** assigns each entity a
+    cognition/locomotion/kinematic/dormant tier by cube distance and emits
+    deferred `set_simulation_tier` commands at the commit seam (the Target
+    Model keeps `dormant` for inert things only).
+
 Collision broadphase keeps its own sweep-and-prune structure rather than
-consuming the spatial index (see `docs/architecture.md`). It closes with
-`chunk_derive`, then `action_react` (destructible / action-intent consumer),
-then the **simulation-LOD tier policy**, which assigns each entity a
-cognition/locomotion/kinematic/dormant tier by cube distance and emits deferred
-`set_simulation_tier` commands at the commit seam (the Target Model keeps
-`dormant` for inert things only). See `docs/architecture.md` for scope/tier
-ownership and the gating rules per stage.
+consuming the spatial index (see `docs/architecture.md`).
 
 **Sim-view rule (Slice 49).** Every scope band (cognition halo, tier policy,
 and later coast/spawn bands) derives from the fixed-step
@@ -167,7 +184,10 @@ before it is written fails the build instead of silently corrupting behavior.
   (`action_intents` from input capture, `interest_markers` from world
   authoring, `structural_events` from the post-step commit) or a later stage's
   write consumed as previous-step state (`affect_update` carries `ai_behavior`,
-  which `ai_decide` writes later in the same step). A carried resource that an
+  which `ai_decide` writes later in the same step; `spatial_index_build`,
+  `perception_update`, and `ai_decide` carry the previous step's
+  `movement_positions` and `world_level`, so a reorder past a position or
+  level writer fails the build). A carried resource that an
   earlier stage writes is a compile error; declare it as a read.
 - Event payloads are four tags. `perception_events` (`entity_perceived`,
   `entity_lost`) is written by `perception_update` and read by

@@ -21,15 +21,17 @@ Slice 75's distance bands are another.
   movement-body append (`src/game/simulation_scope.zig`); the tier and LOD
   distance helpers live there too.
 - `SimulationScopeSystem` (`src/game/systems/simulation_scope.zig`) gathers
-  the unstaggered halo and the staggered think set (`gatherAiPopulations`
-  with a serial twin, padded per-range slots, range-ordered merge).
+  the unstaggered halo (`gatherAiPopulations`, with a serial twin, padded
+  per-range slots, range-ordered merge); `compactCognition` picks the
+  staggered think set from the index built over it (`ai_cognition_order`).
 - `simViewRegion(context)` in `src/game/simulation_pipeline.zig` is the one
   scope-band source; `stageTierPolicy` already reads it.
 - Coasting already happens off-phase: an agent with no `NavigationIntent` is
   never selected by steering, and `MovementSystem.applyIntents` leaves its
   velocity alone.
 - `AiSystem.gatherAiData` (`src/game/systems/ai.zig`) accepts any ordered
-  subsequence of the halo as its think list; `resolveRowArbitration`
+  subsequence of the cell-major think set (Slice 84) as its think list, so a
+  coasting filter keeps that order when it drops rows; `resolveRowArbitration`
   persists `active_behavior`, `commitment_remaining`, `last_score`.
 - Arbitration (`src/game/systems/arbitration.zig`): a score is
   `gain × (...)`, so inputs only zero-gain behaviors consume cannot change

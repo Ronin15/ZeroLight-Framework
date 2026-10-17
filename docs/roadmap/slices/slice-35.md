@@ -11,7 +11,7 @@ SIMD kernels across agents, so per-agent cognition cost stays low at large
 populations in every world, bit-identical across scalar/SIMD and
 serial/threaded paths. It also lands `world_gate.apply` as a threaded SIMD
 range job with its serial path, and the `world-gate` bench that measures it.
-AI separation's accumulate is [84](slice-84.md)'s and steering's agent
+AI separation's accumulate is [84](../archive/slice-84.md)'s and steering's agent
 avoidance [85](slice-85.md)'s.
 
 ### Current foundation

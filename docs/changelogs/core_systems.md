@@ -8,8 +8,9 @@ Base: `5673672` (`Merge pull request #12 from Ronin15/module_layout`)
 
 Tip: in progress. Slice 50 landed (programming complete); its ReleaseFast
 `zig build test` and the owner's Windows and Mac runs are open in the slice.
-The measuring landing benched the branch's baseline; Slice 83 landed, its
-`verify` open in the slice.
+The measuring landing benched the branch's baseline; Slice 83 landed
+(`verify` passes at `13e88ad`); Slice 84's programming landed, with its open
+items in the slice.
 
 ## Summary
 
@@ -19,9 +20,11 @@ nested and foreign callers in every build mode, its dispatch is lock-free with
 the claim counter on its own cache line, workers carry names, tests and
 benches run under ThreadSanitizer, and the tuner gate is derived from the
 measured dispatch floor. A bench-only measuring landing then measured today's
-code and wrote each finding into its slice, and Slice 83 split steering and the
-pipeline tests and gave every production stage its own tuner. Measured numbers
-are Debug unless labelled.
+code and wrote each finding into its slice, Slice 83 split steering and the
+pipeline tests and gave every production stage its own tuner, and Slice 84
+rebuilt the shared neighbor index as a level- and faction-keyed chunk index
+built on workers and shared per cell. Measured numbers are Debug unless
+labelled.
 
 ## Slice 50: Thread System Hardening
 
@@ -84,10 +87,11 @@ are Debug unless labelled.
   `per_body`, `gather`, `sort`, `main`, and the spatial index `main`; groups
   list only the cases they run (`BenchmarkGroup.cases`). Baseline (23-worker
   host):
-  - `production-step` tuned: spread P 16,384 9.8 ms (collision 2.7, clamp
-    1.9 ms); crowd P 16,384 38.8 ms (collision 11.0, spatial index 8.0, AI
-    4.8 ms); main carries 75–88% of the step in every config. Half the rows
-    are dormant at the base config, 87% at 32 levels.
+  - `production-step` tuned, one run (wall step, main per stage): spread P
+    16,384 9.8 ms (collision 2.95, clamp 1.92 ms main); crowd P 16,384 38.8 ms
+    (collision 11.6, spatial index 8.15 ms main); main carries 75–88% of the
+    step in every config. Half the rows are dormant at the base config, 87% at
+    32 levels.
   - `perception-crowd`: 0/1,024 observers find their hostile behind 256 allies
     or at 32 levels (the hostile scratch fills before the level check).
   - Collision per body, serial: 2.9 → 26.2 µs as aspect goes 1 → 256, and
@@ -95,8 +99,8 @@ are Debug unless labelled.
   - `render-game-prep-offview`: collect 0.44 → 8.6 ms as off-view rows go
     4,096 → 262,144 with 1,088 collected.
   - `world-gate` serial: 17.2 ms at 65,536 bodies.
-  - `world-create` tuned: 142 ms at 2048² × 8 (nav 122 ms); 0 bytes after
-    destroy.
+  - `world-create` tuned: 141.7 ms at 2048² × 8 (nav 117.5 ms); 0 bytes
+    after destroy.
 
 ## Slice 83: Core-Branch Prep
 
@@ -107,11 +111,49 @@ are Debug unless labelled.
 - `176ed03`: the pipeline's scenario fixtures move to
   `pipeline_test_support.zig`; `simulation_pipeline.zig` 7,599 → 6,328
   lines. Test names and order unchanged.
-- `13e88ad`: every production stage dispatches with a tuner it owns: nine
+- `13e88ad`: every production stage dispatches with a tuner it owns: ten
   caller-settable tuner fields and four fallbacks to the shared tuner are
   gone, and scope's `deriveChunks` gets the same treatment. An own-tuner
   test per stage, and a pipeline test that 11 stage batches ran on workers
   with the shared tuner untouched. Debug A/B on nine groups: nothing slower.
+
+## Slice 84: Level-Aware Shared Neighbor Index
+
+- `c52a5ff`: the index builds on workers on steering's banded pattern (bucket
+  and sort stages under tuners the index owns, main holding the ordered merge),
+  with a content-sized row-segment lookup in place of `DenseCellLookup`, a
+  comptime visitor, and the halo side tables gone from AI and perception; visit
+  order and every test expectation unchanged. Against `b745929`:
+  `production-step` crowd P 16,384 tuned main 32.07 → 20.72 ms (spatial index
+  0.27 ms main, 30/30 steps on workers); `spatial_index` tuned 184 / 474 /
+  952 µs at 1,024 / 4,096 / 10,000 entities.
+- `08e4799`: entries keyed level | chunk | faction | local cell | slot, per-chunk
+  records with faction row masks, one run per (piece, faction); queries per
+  level and faction set; self as a cleared lane; the lane-group visit
+  (`NeighborLanes`), with separation and cohere summing in lanes; sorts on
+  `core/sort.zig`; `perception_update` and `ai_decide` carry positions and
+  levels. `perception-crowd` (1,024 observers) finds every hostile behind 256
+  allies and at 32 levels, where `5d5a089` found none. Against `b745929`, tuned:
+  `perception` 928 → 772 µs at 2,048; `spatial_index` 4.09 ms → 863 µs at
+  10,000; `spatial_index-query dense_cell` 0.72 / 3.71 / 34.1 → 0.46 / 1.87 /
+  7.48 ms at 256 / 1,024 / 4,096 bodies (against the pre-lane tree), quadratic
+  to linear.
+- `3efa1e4`: per-cell shared `NeighborBlock`s, the cell-major think set
+  (`ai_cognition_order` on workers), the AI and perception gathers on workers,
+  perception's FOV in lanes, and AI memory in ascending row order for any think
+  order; memory's row cap fails as `OutOfMemory`. Against `08e4799`, tuned, at
+  2,048 entities: `ai` 2.28–2.71 → 1.11–1.40 ms; `perception` 755–824 →
+  363–528 µs; `perception-crowd` allies 256 (1,024 observers) 9.25–9.94 →
+  1.31–1.52 ms. `spatial_index` at 10,000 798 → 898 µs (the `population_row`
+  column, planned cost); `ai-memory` −37% at 10,000, +20% at 1,024 (inline,
+  the row ordering's planned cost). ReleaseFast (labelled): `ai` tuned at
+  10,000 986 → 433 µs.
+- `6d9f0da`: `plane_entry` compacts its windows through
+  `thread_system.compactSliceWindows`.
+- `320023a` (rule `eb061b9`): production per-step and per-change sorts move to
+  `core/sort.zig`'s whole-element swaps (43 sites in 22 files at the sweep);
+  stable total-order sorts become `pdq`, tie-holding ones keep `std.mem.sort`.
+  `perception` at 2,048: serial 2.62 → 2.26 ms; tuned within noise.
 
 ## Other Changes
 
@@ -189,3 +231,49 @@ are Debug unless labelled.
 - `9af57be` Roadmap: Slice 66F, Steamworks runtime integration
 - `041c5e3` Slice 66F: a Steam build requires Steam; the non-Steam build is -Dsteam=false (owner 2026-10-16)
 - `13e88ad` Slice 83: every production stage dispatches with a tuner it owns
+- `b745929` Slice 83 docs: steering package, pipeline test support, stage-owned tuners, measuring-landing bench groups
+- `c52a5ff` Slice 84: the neighbor index builds on workers, with row-segment lookup; no outcome change
+- `1a50197` Debug builds at the shipped CPU floor; bench_ab compares at one CPU; -Dcallgrind profiles benches
+- `6a9ea07` Profiling docs: one line on why valgrind needs a CPU without AVX-512, nowhere else
+- `50b3857` engine-design.md: a flagged part is redesigned to the rules, then tuned within reason against the code it replaces
+- `336333b` CLAUDE.md: zig-review-specialist checks each design plan against the rules before implementation
+- `c9f481d` Revert the CLAUDE.md design-plan review step
+- `89f34c5` memory-performance.md: sorted stores and indexes are ordered so hot queries read contiguous runs
+- `7c27a40` zig-review-specialist: a contiguity check on every sorted store and index, in every review and design
+- `d51e8ae` zig-review-specialist: the contiguity check cites the rule instead of restating it
+- `a8489d2` Roadmap: the 2026-10-16 audits and Slice 84 review routed into their slices, in fix order
+- `555992b` Roadmap: DataSystem hot-pass contiguity is an engineering item in 88, not an owner question
+- `9b0d0fa` Roadmap: audit items kept only where a rule backs them; the calls the rules decide are made
+- `7805239` memory-performance.md: data-oriented design is the bar for every hot loop; the contiguity bullet folds into it
+- `21c5eb5` Roadmap: every audit item verified against the rules and live code; fixes, restores, and the 83 archive
+- `2463ebb` Roadmap: 84's docs commit keeps one place per explanation
+- `b85bc93` Slice 66F: restore the owner's later Steam features section as written in 9af57be
+- `10ae134` build-validation.md: modes compare only with themselves, and a ReleaseFast run never excuses a Debug finding
+- `f828085` memory-performance.md: data groups by its storage unit, filter keys order it within the unit; SIMD results stay in lanes through their consumer
+- `01fee45` memory-performance.md: a loop feeding a lane consumer ends in one masked lane batch, not a scalar tail
+- `74f847e` Shared results include intermediate work; design settles data layout before kernels
+- `c26c3c1` Bench A/B separates code from fixture; perf attribution checks data shape first
+- `732bf1f` Rules: one verdict per Debug gap; storage-unit grouping only where data has one; short runs are a layout fix
+- `08e4799` Slice 84: level- and faction-major chunk index built on workers; lane-group neighbor visit
+- `b530d86` tests-benchmarks.md: the tuned case's inline/threaded report decides whether serial is production or a control
+- `a939342` Agents: callgrind only for a regression tests-benchmarks.md says to act on, never a control's constant gap
+- `d665b87` Bench verdicts: one A/B per landing, one verdict per slower case, one round per regression
+- `339c804` zig-specialist runs the landing's one A/B and gives the verdicts; profiling stays with zig-debug-specialist
+- `0f6f721` zig-design-specialist: state each requester kind's measured sharing factor; a near-one factor must earn the sharing form's cost
+- `a42a8c9` tests-benchmarks.md: verdicts name noise, planned cost, immaterial constant, and regression (what gets optimized)
+- `453aa14` Design covers every consumer of a changed order, with a fallback for bench-gated allowances; findings route by their fix
+- `9f24388` Rules: one definition of a Debug regression, in tests-benchmarks.md
+- `2b8a2ba` Routing: findings and failures route by their fix; a regression is one debug-specialist unit
+- `35033b7` Agents can do what the rules ask: shape runs, review-fix reruns, derived sharing factors
+- `236f168` TSan cadence lives in build-validation.md; DW cites it
+- `a22c808` Close scalar loopholes: no "simple logic" scalar exception, no sanctioned scalar tail, right-sized ReleaseFast runs
+- `9f7103c` Rules live in rule files: agents and CLAUDE.md cite them
+- `2ab6fa0` Guidance: workflow-set outputs win over single-landing defaults; stale citations fixed
+- `ef82fc1` bench_ab: tuned rows show each side's worker_threads cell; defaults to warmup 1, iterations 3
+- `3efa1e4` Slice 84: per-cell shared neighbor blocks, cell-major think set, gathers and memory order on workers
+- `6d9f0da` plane_entry: window compaction through thread_system.compactSliceWindows
+- `eb061b9` zig-style: production sorts use core/sort.zig
+- `320023a` Slice 84: production sorts on core/sort.zig whole-element swaps
+- `b40c71e` Slice 71A: stimulus pools grow and over-budget stimuli defer
+- `908ac83` Comments: trim module docs to their contracts
+- `ad67f3c` Agents: docs-specialist on Sonnet writes docs commits and roadmap routing

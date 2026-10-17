@@ -93,6 +93,13 @@ sized to today's four drives and five behaviors:
   distance bands are inputs to it. Drive decay and task timing are defined
   per elapsed step, so a slower tick lowers fidelity without changing
   rates.
+- The interval decides think-set membership, never its order: due agents
+  reach the think-set stages in the index's cell-major order (Slice 84;
+  `docs/architecture.md`). A test inside the think set's phase test
+  (`cognitionJob`, `src/game/systems/simulation_scope.zig:866`) keeps that
+  order; a schedule that emits due agents unordered (a timing wheel) buckets
+  them by index cell first, O(due agents). An unordered think set stays
+  correct but loses neighbor-block reuse.
 - Serial equals threaded, SIMD equals scalar, and same-seed runs are
   bit-identical (`.claude/rules/threading.md`,
   `.claude/rules/memory-performance.md`, `.claude/rules/simulation.md`

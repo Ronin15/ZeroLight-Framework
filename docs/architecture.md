@@ -155,8 +155,10 @@ Designs start here, then read the live structure below (rules:
   `OrderedIndexSet` (the ordered chunk/level set nav's plan merge and the world's
   write grouping drain).
 - `src/game/systems/spatial_index.zig` owns `SpatialIndexSystem`, the
-  pipeline-shared per-step uniform grid built once from the cognition-scoped
-  population and read by AI separation and perception.
+  pipeline-shared neighbor index, built each step on workers from a handed
+  population into per-chunk records keyed by level and faction, and read by
+  AI separation and cohere and by perception (steering after Slice 85);
+  `spatial_index_test_support.zig` holds its test-only fixtures.
 - `src/game/systems/perception.zig` owns `PerceptionSystem`: vision
   (range/FOV/LOS/faction-stance gating) and hearing (transient world
   stimuli), emitting `entity_perceived`/`entity_lost` events on acquire/lose
@@ -243,6 +245,9 @@ Designs start here, then read the live structure below (rules:
 - Sprite and audio startup assets are declared in `src/assets/manifest.zig` and
   live under the same traversal-safe asset root.
 - `src/core/math.zig` and `src/core/simd.zig` contain small shared math and portable SIMD helpers.
+- `src/core/sort.zig` holds `pdq` and `insertion`, std's sorts with
+  whole-element swaps; production sorts use them (`.claude/rules/zig-style.md`
+  § Style).
 - `src/core/rng.zig` provides a deterministic, stateless, seeded per-entity RNG
   facility (`mix64`/`uniformF32`/`boundedU32`/`unitVec2`) for reproducible
   gameplay randomness (AI wander, etc.).
@@ -588,7 +593,8 @@ Processor-specific batches can align range starts to hot-column boundaries
 through `parallelForWithOptions`.
 
 Systems with multiple independently timed threaded stages own one tuner per
-stage (broadphase and narrowphase, AI gather and decision emission). A stage
+stage (broadphase and narrowphase; AI gather, separation, and decision
+emission; the index's bucket, sort, and link). A stage
 that preselects a profile passes it with its own tuner, so inline samples still
 train that stage, and diagnostics report inline stages as `inline`
 (`.claude/rules/threading.md`).
@@ -601,7 +607,9 @@ config), `stageShape`/`runShaped`/`runStage` (pre-size range windows for the sha
 the dispatch will use, then run), and `RoundDispatch` (a multi-round stage selects
 once and records one tuner sample per step). Beside them: the 64-byte
 `thread_shared_record_alignment`, `paddingForCacheLine`, `PaddedSlot`/`SlotList`,
-`BandPartition`, `inlineBatch`, `accumulateBatch`, and `offMainNs`.
+`BandPartition`, `inlineBatch`, `accumulateBatch`, `offMainNs`, and
+`compactRowWindows`/`compactSliceWindows` (main's range-order merge of a
+windowed gather's MAL rows or slice items).
 
 ## Gameplay Data
 
@@ -687,7 +695,8 @@ The current gameplay fixed-step pipeline is:
    `dig_world_edit` (author world-tile edits from player digging), then at most
    one player footstep when velocity is non-trivial — all before
    `perception_update` reads `frame.stimuli` → `scope_advance_and_ai_gather` →
-   `spatial_index_build` (shared `SpatialIndexSystem`, Slice 28) →
+   `spatial_index_build` (shared `SpatialIndexSystem`) →
+   `ai_cognition_order` (the think set in the index's cell-major order) →
    `perception_update` (vision/hearing,
    Slice 29) → `ai_memory_update` (Slice 30) → `affect_update` (Slice 31) →
    `ai_decide` → `path_goal_resolve` (the step's goal table) →
@@ -738,9 +747,10 @@ collision gate on tier only (no chunk filter, so off-screen entities keep moving
 and colliding) and short-circuit to full-active in O(1) via incremental
 `tier_counts` when nothing is dormant/kinematic; **cognition thinking** (perception
 observers, memory, affect, AI decide) gates on tier + camera halo + a per-entity
-stagger cadence, while the shared spatial index and perception **candidates** are
-built from the unstaggered cognition halo so off-phase agents remain visible;
-steering inherits think-set scope transitively through the navigation-intent
+stagger cadence, while the shared spatial index (and so every neighbor query's
+candidates) is built from the unstaggered cognition halo so off-phase agents
+remain visible; the think set is the indexed rows on this step's phase
+(`ai_cognition_order`); steering inherits think-set scope transitively through the navigation-intent
 stream. Tier wake/sleep changes flow through deferred
 `set_simulation_tier` structural commands at the commit seam, never inside worker
 ranges. Scope bounds active work per step; benches at large counts show how
@@ -768,7 +778,7 @@ similar). Cross-entity classification (faction/stance), a deterministic
 per-entity RNG facility in `src/core`, and a shared per-frame spatial index are
 shared substrate these stages consume. Because they *think* only for in-halo, on-phase cognition entities, their
 think cost scales with the stagger-filtered set (~N/4), not total entity
-count; the shared index and candidate table scale with the unstaggered halo.
+count; the shared index scales with the unstaggered halo.
 
 **Emotion model (Slice 31 substrate):** `AiAffect` stores independent scalar
 drives (`fear`, `curiosity`, `aggression`, `fatigue`) in `[0, 1]`, each with
@@ -880,11 +890,69 @@ order (O(1) per record), and reserves everything before dispatch.
 `observerContacts` (the contacts naming the observer) serves player impacts and
 collision audio, replacing two scans of every contact.
 
+`SpatialIndexSystem` (`src/game/systems/spatial_index.zig`) is the pipeline's one
+neighbor index. `spatial_index_build` builds it each step from the unstaggered
+cognition halo at the previous step's positions and levels, and every neighbor
+query that step reads it (`.claude/rules/simulation.md`).
+
+- **Key and records.** Each entry sorts by one 128-bit key: level | chunk_y |
+  chunk_x | faction | local_y | local_x | slot. Cells tile the world's chunk grid
+  at the configured cell rounded to a whole fraction of a chunk (at most 64 per
+  chunk edge), and positions off the grid clamp to its edge cells. Level and
+  chunk group entries by their storage unit; faction orders them ahead of
+  position inside the chunk because every hot query filters on it
+  (`.claude/rules/memory-performance.md` § Data-oriented design). The entry
+  columns (`x`, `y`, `entity_index`, `entity_generation`, `population_row`,
+  `cognition_phase`) are dense in key order. Each populated chunk has one
+  `ChunkRecord`: per faction, a 64-bit row mask (bit y set when the faction holds
+  a cell on local row y) and its first `RowPart`, one (chunk, faction, local row)'s
+  occupied cells as a 64-bit mask. A cell's entries are one contiguous run. Each
+  level has a directory of 16-byte `ChunkSlot`s, one per world chunk, valid only
+  under the build's stamp; it grows for a body on a level past the world's, and an
+  empty build cuts it back to the world's levels. Every view structure is
+  identical for any partition of the build.
+- **Query.** `queryNeighbors` reads one level and a faction set within a world
+  radius; the scan box derives from the view's cell size. It visits the box's
+  pieces (cell row, then chunk) and, in each piece, one run per present wanted
+  faction, so allies and rows on other levels cost no check. Entries reach the
+  visitor four at a time (`NeighborLanes`: positions, `dx`, `dy`, `dist2`, and the
+  inside mask); an entry's lane is its rank in the scan order mod 4, and consumers
+  that sum floats sum in lane order. Every scanned entry of the level and factions
+  counts against the fixed check budget except `self`, compared only in the query
+  point's own piece. A visitor's `LaneStop` ends the query after one lane.
+- **Shared blocks.** A query's key is (level, own cell, scan box, factions); radius
+  and budget stay out of it. Consecutive queries with one key share one
+  `NeighborBlock`, a stack copy of the key's entry stream filled on demand, so the
+  agents of one cell walk their neighborhood once (`.claude/rules/engine-design.md`
+  § Cost model) while each still tests its own position, radius, budget, and FOV.
+  AI keeps one block per query kind per range, perception one per range; each
+  counts its fills.
+- **Think set.** `ai_cognition_order` (`SimulationScopeSystem.compactCognition`)
+  keeps the indexed rows whose `cognition_phase` is this step's (or
+  `always_active`; every row with no cognition region), in cell-major order: records in key order, each by (local_y, local_x, faction, slot).
+  `CellMajorSpan` walks any window of cell-major positions, so ranges split a
+  dense chunk like any other. Rows sharing a cell sit together in every think-set
+  stage, which is what lets blocks reuse; every result is the same for any think
+  order.
+- **Workers.** The build runs three stages, each under a tuner the index owns:
+  `index_bucket` over population slots (resolve each body once, pack its key in
+  lanes, place it in one of 64 key bands chosen from a fixed 256-slot sample),
+  `index_sort` over entry keys (each band gathers its segments, sorts with
+  `core/sort.zig`'s `pdq`, and writes its entries and cells), and `index_link`
+  over cells (row parts, records, directory slots). Main picks the splitters, sums
+  the band prefixes, and fits the directories; `buildSerial` runs one band on the
+  calling thread. Only the sort, the build's cost driver, records
+  `.spatial_index_build` in the runtime perf log (`.claude/rules/threading.md`).
+
 `PerceptionSystem` (`src/game/systems/perception.zig`, Slice 29) runs over the
-cognition-scoped `AiPerception` subset right after the shared spatial index is
-built, reusing the same `SpatialIndexView` `AiSystem` consumes rather than
-building its own grid. Vision applies range/FOV/line-of-sight gating (faction
-stance and same-level checks included). `hasLineOfSight` walks every grid
+think set's `AiPerception` rows. Each observer queries the shared index for the
+factions hostile to it on its own level; the player joins as a candidate only on
+its level. The first 16 candidates in scan order take a squared-form FOV test in
+the query's lanes, survivors are compacted and sorted nearest first, and a
+bounded line-of-sight raycast picks the nearest visible threat. The gather runs
+on workers into per-range windows that main merges in range order; each compute
+range derives its rows' facing and writes only its rows, and main emits the
+transition events after the join in row order. `hasLineOfSight` walks every grid
 cell the segment touches past the observer's own cell, bounded by the ray's
 own cell count (|dcx| + |dcy|). Through an exact grid corner either side cell
 blocks (pathfinding's no-corner-cutting rule), and a ray along a grid line also
@@ -911,12 +979,11 @@ default) with drops surfaced through event stats rather than an unhandled
 capacity error.
 
 `AiSystem` (first AI processor) is a decision emitter over ai_agent entities.
-It receives const AiAgent + movement prior-position slices and a read-only
-`SpatialIndexView` from the pipeline-owned `SpatialIndexSystem`
-(`src/game/systems/spatial_index.zig`, Slice 28) — the shared per-step spatial
-index, built once from the unstaggered cognition halo, that AI
-separation queries for bounded local-separation samples instead of building
-its own grid. Think rows map into halo rows via `spatial_self_index`. Per row, `AiSystem` gathers perception/memory/affect signals
+It receives const AiAgent + movement prior-position slices and the read-only
+`SpatialIndexView`. Separation queries every faction on the row's level and
+cohere the row's friendly factions, both skipping the row itself and summing in
+lane order. Its gather runs on workers into per-range windows that main merges in
+range order. Per row, `AiSystem` gathers perception/memory/affect signals
 (each independently optional; an absent component contributes zero signal)
 into `arbitration.Signals` and runs them through
 `src/game/systems/arbitration.zig`'s pure utility-arbitration chain:
@@ -937,15 +1004,15 @@ order **heard stimulus → nearest in-range world interest marker → freshest
 The separation job queries `WorldSystem.interest_markers` read-only (fixed
 radius, not world-sized) only for rows with `gain_investigate > 0`. Gather
 stores the row's level and does not scan. Cohere reads a friendly-neighbor mean
-gathered from the same shared spatial index. This utility arbitration decides
+from the same shared index. This utility arbitration decides
 *what* an agent wants (a behavior and a goal); it is a distinct mechanism from
 `SteeringSystem`'s stream-priority arbitration below, which decides *which*
 emitter wins when multiple systems submit a `NavigationIntent` for the same
 entity. `AiSystem` then emits threaded navigation intents through
-`SimulationFrame.navigation_intents` (count/prefix/write). Separation and
-intent emission have independent AdaptiveWorkTuner state and benchmark stats
-so each stage can remain inline or thread independently; the index build has
-its own separate tuner on `SpatialIndexSystem`. `CollisionSystem`'s
+`SimulationFrame.navigation_intents` (count/prefix/write). The gather,
+separation, and intent emission have independent AdaptiveWorkTuner state and
+benchmark stats so each stage can remain inline or thread independently; the
+index's build stages have their own tuners on `SpatialIndexSystem`. `CollisionSystem`'s
 sweep-and-prune broadphase (see above) is intentionally not ported onto this
 index — it is a different, already-tuned algorithm, not a duplicate grid
 build.
@@ -1156,8 +1223,8 @@ contract. Threaded processors that produce events, intents, contacts, or
 deferred structural commands use typed range-owned output buffers: count outputs
 per stable range, prefix offsets on the main thread, write contiguous output
 slices, merge by range index, and consume the result as a batch. Passes with at
-most one output per item (scope gathers and tier policy, the spatial gather, the
-collision narrowphase) write fixed per-range windows of one item-count buffer
+most one output per item (scope gathers, tier policy, and the think set; the AI
+and perception gathers; the collision narrowphase) write fixed per-range windows of one item-count buffer
 plus a padded tally and compact in range order, so their capacity-seam reserve
 covers every partition (Slice 72 C5). Events derived from per-row state after
 the join (perception transitions, affect crossings) use no output buffer at all

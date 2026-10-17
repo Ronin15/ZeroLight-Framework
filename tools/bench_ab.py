@@ -3,38 +3,10 @@
 
 Runs only the named bench groups (never the full suite), a base git ref
 against the working tree, one run per side by default, and prints per-(group,
-item, case) times and a verdict (`.claude/rules/tests-benchmarks.md`). One run
-per side: a change beyond NOISE_PCT counts, and a `slower` case is confirmed by
-rerunning only that group, size, and case with `--reps 3`. With reps, it prints
-medians and min-max spread, and a change counts only when the two sides' ranges
-do not overlap.
-
-The base ref is exported once with `git archive` under
-`benchmark_outputs/ab-base/<sha>/` and reused while it exists (its build cache
-stays warm; both sides share the repo's `.zig-cache`, so a new base rebuilds
-only what differs). Raw outputs and the summary go to
-`benchmark_outputs/ab-<stamp>/`. Cases default to `serial-direct` and
-`thread-adaptive-tuned-range`; the forced-thread cases are scheduler controls
-(`--all-cases` runs every case). A run must name its config with
-`-- --items N` (or pass `--grid` for every config): one config answers a
-regression question; a full grid is rarely the right signal. Runs use `--warmup 1 --iterations 3`
-unless the forwarded bench args set them.
-
-Each side's raw outputs are cached under `benchmark_outputs/ab-cache/`, keyed
-by the side's build inputs (`src/`, `build.zig*`, `assets/` as git trees, the
-working tree's content included, so a landing's measured tree is the next
-landing's cached base), the build mode, the CPU, the case, and the
-forwarded args. A side with enough cached reps younger than
-`CACHE_MAX_AGE_S` is not rerun; that side is then not interleaved with the
-other, so `--fresh` reruns both when a verdict sits at the edge of spread. `--optimize ReleaseFast` is only for a
-question Debug cannot answer (`.claude/rules/build-validation.md`).
-
-Both sides build with the same explicit `-Dcpu`, by default the host's shipped
-CPU floor (the mapping in `build.zig`'s `shippedCpuFloor`: `x86_64_v2` on
-x86-64, `apple_m1` on macOS arm64, `baseline` elsewhere), so a base ref from
-before Debug defaulted to the floor still builds at the tree's CPU. `--cpu`
-overrides it for both sides (`--cpu native`). The CPU is part of the cache key,
-so runs at another CPU are never reused.
+item, case) times and a verdict (`.claude/rules/tests-benchmarks.md`). Base
+export, reps and spread, the run cache, cases, the CPU floor, and output
+locations: `tools/README.md` § `bench_ab.py`. A run must name its config with
+`-- --items N` (or pass `--grid` for every config).
 
 Usage:
     tools/bench_ab.py --group chunk-scale-dig -- --items 1024032

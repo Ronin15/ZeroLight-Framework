@@ -64,11 +64,8 @@ package paths automatically. If you already have SDL installed globally, pass
 `SDL3-3.4.10`, `SDL3_ttf-3.2.2`, and `SDL3_mixer-3.2.4` directories.
 
 On a Windows host, `zig build run`, `test`, `bench`, and `gpu-smoke` prepend the
-SDL DLL directories to `PATH` for the launched process. Because that reads the
-host environment at configure time, `build.zig` poisons Zig 0.17's configure
-cache on Windows hosts, so `build.zig` re-runs on every `zig build` there. Linux
-and macOS hosts (including Windows cross-builds) keep the configure cache,
-except under `-Dsanitize-thread` or `-Dcallgrind` (`docs/development-workflow.md`).
+SDL DLL directories to `PATH` for the launched process; the configure-cache
+consequence is in `docs/development-workflow.md` § Windows SDL Packages.
 
 Windows shader builds require `glslc`, `spirv-cross`, and `dxc` on `PATH` or
 passed with `-Dshader-compiler`, `-Dshader-cross-compiler`, and

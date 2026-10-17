@@ -1,6 +1,6 @@
 ## Slice 86: Collision Subsystem Pass
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (layout and tuners), [Slice 84](slice-84.md) (branch order) · Related: [Slice 71B](slice-71b.md) (the static structure's 64B row), [Slice 72](slice-72.md) D1 (destructible resolve), [Slice 75](slice-75.md) (collision fidelity per band) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (layout and tuners), [Slice 84](../archive/slice-84.md) (branch order) · Related: [Slice 71B](slice-71b.md) (the static structure's 64B row), [Slice 72](slice-72.md) D1 (destructible resolve), [Slice 75](slice-75.md) (collision fidelity per band) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: not started.** Owner direction 2026-10-11: collision as a whole
 subsystem against the current cost model and rules. 71B.1's collision queries
@@ -163,6 +163,21 @@ order stay deterministic for the order-sensitive consumers.
       reads each key's registrations as one contiguous run; it lands with the
       static-collider item, whose lists use the same `ChunkListMap`
       (`src/game/systems/chunk_list_map.zig`).
+- [ ] Collision response's `apply` stage dispatches items that track its work.
+      Failure: it dispatches one item per fixed band (`collision_response.zig:296`,
+      `:307`; at most `max_bands` 64, `:56`), a fixed partition count whose work
+      varies behind it (`.claude/rules/threading.md`: "A stage's items are units
+      whose count tracks its work (runs, keys, rows), never a fixed partition
+      count whose work varies behind it"). Failure scenario: a step of 16 intents
+      and one of 16,384 both dispatch at most 64 items (one per band), and a
+      crowd landing its intents in one band dispatches one item holding all
+      the work, so the stage's item count says nothing about its work and its
+      tuner samples a count the work does not track (derived). Pass:
+      apply items are units counted by the placed intents or movement-row
+      blocks they hold, with results independent of the item count (the
+      `max_bands` comment states they already are); `collision-response-stage`
+      shows apply items per range tracking intents at 1,024, 4,096, and 16,384;
+      serial == threaded across range sizes.
 - [ ] Benches at the worst-case shapes (thin, tall, deep, dense), with the
       shape asserts landing with each fix (`.claude/rules/tests-benchmarks.md`).
 - [ ] Tests: identical contacts and order across worker counts; cross-level,

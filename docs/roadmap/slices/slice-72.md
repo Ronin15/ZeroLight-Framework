@@ -2,9 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none (F and G re-scoped against [Slice 64G](slice-64g.md) first) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: in progress.** A1–A4, B1, C1–C7, D3, E2, G1–G3, H2, H3, I1, I2, K6
-landed (D3, E2, G1–G3, H2, H3 with 64G); E3, F1–F3, and J3 superseded; E4 and K3
-moved into 64G; M1, D1, D4, E1, E5–E9, H1, H4, J1, J2, J4, K1, K2, K4, K5, X1
+**Status: in progress.** A1–A4, B1, C1–C7, D3, D4, E2, G1–G3, H2, H3, I1, I2,
+K6 landed (D3, E2, G1–G3, H2, H3 with 64G; D4 with Slice 84); E3, F1–F3, and J3
+superseded; E4 and K3 moved into 64G; M1, D1, E1, E5–E9, H1, H4, J1, J2, J4, K1, K2, K4, K5, X1
 open.
 
 Goal: no live behavior (iteration order, deferral, refusal, drops,
@@ -35,10 +35,7 @@ content across world sizes.
   (`resize_dropped`); the group tally is
   capped at `min(512, n)`; elastic capacity starts at a floor of 8;
   destructible cell resolve scans only the first
-  `destructible_cell_scan_budget` (256) dense rows; the spatial-index dense
-  window is halo-derived on every instance and clamps a wider populated box
-  out silently (Slice 84 retires it); AI scan radius uses an unenforced
-  `grid_cell_size` (32);
+  `destructible_cell_scan_budget` (256) dense rows;
   `solved_paths` and the worker path pool stripes share lines across
   workers; GPU static streams are created at the first upload's exact size;
   `StateTransitions.reserve` sets the refusal bound.
@@ -102,7 +99,9 @@ content across world sizes.
       Today's tie-break kept; `destructible-resolve` flat in destructible
       count at three counts; 61, 63, and 71D resolve text updated.
 - [x] D3 · LOS visit limit from the ray's own length.
-- [ ] D4 · AI scan radius from the live spatial cell size.
+- [x] D4 · AI scan radius from the live spatial cell size. Queries take a
+      world radius and the index derives the scan box
+      (`spatial_index.zig:535`); `grid_cell_size` is gone.
 - [ ] E1 · A pathfinding shrink never drops accepted work.
 - [x] E2 · Elastic resizes preserve cache entries and pending work, with a
       `pathfinding-elastic-ramp` bench (solves after ≤ before).
