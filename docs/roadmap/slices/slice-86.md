@@ -192,7 +192,11 @@ order stay deterministic for the order-sensitive consumers.
       at n = 4K / 32K / 256K, against a flat 2 for the merge. Pass: each band
       sorts each run and merges them (a merge buffer with its reserve and a
       `FailingAllocator` proof), measured by the collision bench groups at warm
-      shapes, serial and threaded.
+      shapes, serial and threaded. It reuses the proven pieces: each run sorts
+      with `core/sort.zig` `pdq` (`zig-style.md` § sorts; the key ends in the
+      entity index, so `entryLessThan`, `collision.zig:189`, is a total order
+      and stability is not needed), and the runs merge through the existing
+      `mergeIntoSorted` (`collision.zig:1430`).
 - [ ] After the item above, collision has one path
       (`.claude/rules/tests-benchmarks.md` § Test and production code, point
       1). Delete `updateDirect` (`collision.zig:628`), `buildDirect` (`:704`),
