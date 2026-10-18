@@ -32,15 +32,15 @@ avoidance [85](slice-85.md)'s.
 ### Architecture notes
 
 - Restructures existing loops only; the utility/sticky arbitration contract
-  stays (`.claude/rules/simulation.md` § AI and affect). It measures against
+  stays (`.grok/rules/simulation.md` § AI and affect). It measures against
   the cognition structure 55 lands on (re-based on 73).
 - Vector math goes through `core`; branches become masks; only irreducible
   loops stay scalar, each with its reason at the site
-  (`.claude/rules/memory-performance.md` § SIMD and core math).
+  (`.grok/rules/memory-performance.md` § SIMD and core math).
 - Scalar equals SIMD and serial equals threaded, bit for bit
-  (`.claude/rules/threading.md`, `.claude/rules/simulation.md` § Determinism).
+  (`.grok/rules/threading.md`, `.grok/rules/simulation.md` § Determinism).
 - `world_gate.apply` ships serial and threaded paths in its first
-  implementation (`.claude/rules/threading.md`): the NPC bounds clamp and
+  implementation (`.grok/rules/threading.md`): the NPC bounds clamp and
   tile gate become one threaded SIMD range job over AI movement rows; the
   player gate stays scalar.
 - Composes with 55: 55 cuts the rows reaching decide; 35 cuts
@@ -70,9 +70,9 @@ avoidance [85](slice-85.md)'s.
 
 - [ ] Every parity test passes, bit-stable across layouts.
 - [ ] The `ai` bench at three or more agent counts shows no regression beyond
-      run-to-run spread (`.claude/rules/tests-benchmarks.md`); a SIMD gain
+      run-to-run spread (`.grok/rules/tests-benchmarks.md`); a SIMD gain
       claim comes only from the targeted ReleaseFast run
-      (`.claude/rules/build-validation.md`); `world-gate` covers serial and
+      (`.grok/rules/build-validation.md`); `world-gate` covers serial and
       threaded at the same body counts.
 - [ ] The warmed proofs allocate nothing.
 - [ ] `zig build verify` passes.

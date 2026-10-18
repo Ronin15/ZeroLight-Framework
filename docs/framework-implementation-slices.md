@@ -3,7 +3,7 @@
 The roadmap index and agent implementation contract. Work is organized as
 numbered **slices**: one complete, verifiable feature each, with a **Goal**,
 **Checklist**, and **Acceptance checks**. Technical rules live only in
-`.claude/rules/`; this file holds roadmap process, and slice files hold intent
+`.grok/rules/`; this file holds roadmap process, and slice files hold intent
 and data (section shape below), never rules or designs.
 
 **Layout.** Each open slice or sub-slice is one file under
@@ -55,7 +55,7 @@ files it links. Do not load the whole roadmap.
   The rules and architecture.md win over code; code that disagrees with them
   is wrong. Code wins over a stale Current foundation. Module placement
   follows architecture.md § Source Layout.
-- Every slice follows the rules in `.claude/rules/`; a slice cites a rule file
+- Every slice follows the rules in `.grok/rules/`; a slice cites a rule file
   and never restates or adds a rule. A slice that needs a new rule has a
   checklist item to add it to the owning rule file when it lands. The planned
   merged stage order is Table T4.
@@ -70,7 +70,7 @@ files it links. Do not load the whole roadmap.
   `stage_order` positions, and component tags follow Tables
   T1–T6 in the [VoidLight port track](roadmap/tracks/voidlight-port.md); a slice
   that changes one updates the table in the same change.
-- Validate per `.claude/rules/build-validation.md`; `zig build verify` passes
+- Validate per `.grok/rules/build-validation.md`; `zig build verify` passes
   before a slice is complete.
 
 ## Agent Workflow: Implementing A Slice
@@ -83,16 +83,16 @@ files it links. Do not load the whole roadmap.
    other slice files unless linked.
 3. **Design plan right before implementation.** `zig-design-specialist`
    writes the plan for each slice or landing whose design is open, against
-   the live code (`CLAUDE.md` § Agent Pipeline). The plan goes to the
+   the live code (`AGENTS.md` § Agent Pipeline). The plan goes to the
    implementer, not into the slice.
 4. **Implement only that slice's scope** in the owning `src/` modules.
-5. **Review before commit** (`CLAUDE.md` § Agent Pipeline); fixes fold into
+5. **Review before commit** (`AGENTS.md` § Agent Pipeline); fixes fold into
    the commit.
 6. **Pass every Acceptance check.** Items marked "(added by Slice N)" are
    part of this slice's scope.
 7. **Docs commit, once the slice's programming is done:** check off Checklist
    items, update durable docs (`architecture.md`, rendering/sim docs) and
-   Tables T1–T6 from the landings' commit notes (`CLAUDE.md` § Agent
+   Tables T1–T6 from the landings' commit notes (`AGENTS.md` § Agent
    Pipeline), and bring every open slice the landed code affects up to
    date: its Current foundation and `file:line` refs, items the landing
    closed or made obsolete, and the interfaces or orders it builds on.
@@ -106,7 +106,7 @@ files it links. Do not load the whole roadmap.
 | --- | --- |
 | Header line | Roadmap index link · Depends on (linked slices) · Track |
 | **Goal** | What "done" means for this chunk |
-| **Current foundation** | What already exists; build on it unless it fails the cost model (`.claude/rules/engine-design.md`), then replace the failing part |
+| **Current foundation** | What already exists; build on it unless it fails the cost model (`.grok/rules/engine-design.md`), then replace the failing part |
 | **Architecture notes** / **Problem** | Constraints and ownership boundaries, citing rule files; never an internal design |
 | **Checklist** | `[ ]` / `[x]` intent-level steps — check off as you land each |
 | **Acceptance checks** | `[ ]` / `[x]` verification gates — all required before complete |
@@ -215,7 +215,7 @@ the [archive](framework-implementation-slices-archive.md).
 
 **Recently settled (archive only):** 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
-**Benches:** `.claude/rules/tests-benchmarks.md`. `frame-battle` (Slice 52C:
+**Benches:** `.grok/rules/tests-benchmarks.md`. `frame-battle` (Slice 52C:
 full fixed step plus CPU render-prep) tracks scaling shape across commits; 66E
 adds the self-hosted perf runner.
 
@@ -236,7 +236,7 @@ residual only); open work grows beside that loop.
 | **World presentation** | **60** → **69B** / **69C** → **70B** (69D–69F gated) | Camera rig and scene composite, regional weather, time skip, presentation polish. |
 
 - **AI expandability:** Slice 32's arbitration path is a rule in
-  `.claude/rules/simulation.md` (AI and affect).
+  `.grok/rules/simulation.md` (AI and affect).
 - **Component headroom:** 14 of 32 `Component` tags used (`enum(u5)` +
   `ComponentMask = u32`); the VoidLight port projects 10 more and Slice 71A one
   (`ai_post`): **25 of 32** (Table T5).
@@ -301,7 +301,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    Items the 2026-10-16 audits and the 84 chunk-index review routed here
    (tags name findings in the local `.claude/reports/` audit files). Every
    ref is re-checked right before implementation
-   (`.claude/rules/engine-design.md` § Cost model).
+   (`.grok/rules/engine-design.md` § Cost model).
    - 84: index order and its fragment paths (code H1, review 1 and 8);
      cohere's check budget (code H1); TSan before merge (review open
      question); carried stage inputs (code M1); the vectorized separation

@@ -29,14 +29,14 @@ up the same step.
 
 ### Architecture notes
 
-- Owner: `DestructibleController` (`.claude/rules/simulation.md` §
+- Owner: `DestructibleController` (`.grok/rules/simulation.md` §
   Controllers and processors); entity hits go through deferred structural
   commands, never direct store mutation.
 - Region cost follows the region, never level size, depth, or world count;
   terrain writes go through the dense path on the thread system
-  (`.claude/rules/engine-design.md`, `.claude/rules/threading.md`).
-- Never refused for capacity (`.claude/rules/budgets-capacities.md`);
-  deterministic (`.claude/rules/simulation.md` § Determinism).
+  (`.grok/rules/engine-design.md`, `.grok/rules/threading.md`).
+- Never refused for capacity (`.grok/rules/budgets-capacities.md`);
+  deterministic (`.grok/rules/simulation.md` § Determinism).
 
 ### Checklist
 
@@ -52,7 +52,7 @@ up the same step.
 - [ ] Explosion entity commands past the structural share defer through
       [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an over-share
       explosion defers its entity commands and the step succeeds
-      (`.claude/rules/budgets-capacities.md`).
+      (`.grok/rules/budgets-capacities.md`).
 - [ ] Downstream reactions take an explosion without a per-cell event cap.
 - [ ] The explosion writer reserves its nav record before its write and records
       every applied write on every exit path, as the dig stage does.

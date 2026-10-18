@@ -40,8 +40,8 @@ digests at every size.
 
 - Owner direction: benches measure scaling shape, never a target count; the
   demo's population and world size are never bench sizes or thresholds
-  (`.claude/rules/engine-design.md` § Target scale,
-  `.claude/rules/tests-benchmarks.md`).
+  (`.grok/rules/engine-design.md` § Target scale,
+  `.grok/rules/tests-benchmarks.md`).
 - `frame-battle` runs at least three points each along population and world
   extent (level size, depth), building its fixture directly rather than from
   the demo config, with a fixed settle step count (never scaled) so every case
@@ -55,7 +55,7 @@ digests at every size.
   job, never as archived references. A mismatch fails the job and is fixed at
   its cause (**zig-debug-specialist**), never by relaxing exact equality.
 - Bench-fixture correctness relies on internal asserts in real runs; no test
-  calls the bench (`.claude/rules/tests-benchmarks.md`).
+  calls the bench (`.grok/rules/tests-benchmarks.md`).
 - Workflows: `ci.yml` (Linux, Linux TSan, Linux gpu-smoke, Windows, macOS),
   `shader-artifacts.yml` (regenerate on Windows with pinned Vulkan SDK and a
   hash-checked DXC, then require no diff), `release.yml` (sniper-container
@@ -108,7 +108,7 @@ digests at every size.
       changelog's Windows `test`/`bench` residual (`run` and `gpu-smoke` stay
       manual).
 - [ ] Add the determinism-mismatch handling rule to
-      `.claude/rules/simulation.md` when this lands.
+      `.grok/rules/simulation.md` when this lands.
 
 ### Acceptance checks
 

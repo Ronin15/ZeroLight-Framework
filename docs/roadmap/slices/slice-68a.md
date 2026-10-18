@@ -58,19 +58,19 @@ sensing (Slice 55 rejects it).
   body, asserted in Debug and ReleaseSafe.
 - Main-thread work drops to O(decide rows) over the post-75 population;
   worker work rises by a few column reads per row
-  (`.claude/rules/threading.md`: the main thread holds only ordered merge).
+  (`.grok/rules/threading.md`: the main thread holds only ordered merge).
 - Fairness: the bus counts stay fixed per world; deferral age is a
   persistent per-agent counter written only by the emitter; selection is
   deterministic (age first, then rotation rank) and allocation-free
-  (`.claude/rules/budgets-capacities.md`: a chronically short budget gets
+  (`.grok/rules/budgets-capacities.md`: a chronically short budget gets
   deterministic deferral, never a bigger number).
 - The age counter is hashed and saved (Slice 49 lists, Slice 46 section,
   relative bumps); the table and map are per-step derived and excluded
   (64B).
 - The soak runs realistic to extreme populations from content, never a demo
   count as a target; numbers are machine-specific trend data, never claims
-  or gates (`.claude/rules/tests-benchmarks.md`,
-  `.claude/rules/build-validation.md`).
+  or gates (`.grok/rules/tests-benchmarks.md`,
+  `.grok/rules/build-validation.md`).
 - VoidLight reference: only the idea that one per-frame snapshot serves
   several consumers; not thread-local position-keyed caches,
   completion-order command application, or unbudgeted action dispatch.
@@ -107,7 +107,7 @@ sensing (Slice 55 rejects it).
 - [ ] Fairness tests: starvation bound, parity with rotation at zero ages,
       serial == threaded, cooldown kept, saturation.
 - [ ] Soak procedure written in this slice with the row schema; pointer
-      added to `.claude/rules/tests-benchmarks.md`.
+      added to `.grok/rules/tests-benchmarks.md`.
 - [ ] Docs: `docs/architecture.md`, `docs/simulation-tiers-and-pipeline.md`,
       `docs/development-workflow.md`.
 

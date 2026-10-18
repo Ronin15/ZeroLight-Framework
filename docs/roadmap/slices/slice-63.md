@@ -39,7 +39,7 @@ Goal: bounded, deterministic social state per world.
   `[-100, 100]`, ±50 stance bands, diagonal locked) and the per-NPC ledger.
   `attitude(npc, subject)` is standing plus ledger.
 - Ledger size is content per archetype, never a fixed slot count
-  (`.claude/rules/budgets-capacities.md`).
+  (`.grok/rules/budgets-capacities.md`).
 - Stance changes apply only at the commit seam and are read next step; the
   stance lookup stays one index on the hot path.
 - Merchant profiles are strict content (markup, sell rate, refusal
@@ -60,7 +60,7 @@ Goal: bounded, deterministic social state per world.
   Slice 49's lists and saved by Slice 46 (Ground Rules).
 - The trade screen reads sim state read-only and only enqueues intents;
   session validity is checked in the menu's fixed `update`
-  (`.claude/rules/input-state.md`).
+  (`.grok/rules/input-state.md`).
 - Out of scope: guard theft alert (71A), AI selling (71D).
 - VoidLight reference: port the directed standing with incident deltas
   (assault −10, kill −30, theft −25, gift +15), buy 1.2 / sell 0.6 with

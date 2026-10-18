@@ -50,18 +50,18 @@ with its invariant held in code and tested, and no unreachable branch.
 
 - `InputState` stays the simulation's only input; app commands stay in
   `FrameCommands`; fixed update never runs in render cadence
-  (`.claude/rules/input-state.md`).
+  (`.grok/rules/input-state.md`).
 - What the simulation reads per step is per-step input, so a pending press
   is consumed at a step, never at a frame
-  (`.claude/rules/simulation.md` § Determinism).
+  (`.grok/rules/simulation.md` § Determinism).
 - Pause, modal block, and pad disconnect clear any new per-step input state
   on the same paths that call `releaseHeldGameplay`.
 - Snapping changes only how many fixed steps run in a frame, never a step's
-  length or contents (`.claude/rules/simulation.md` § Determinism), and
+  length or contents (`.grok/rules/simulation.md` § Determinism), and
   never hides a real hitch: intervals outside the snap tolerance keep their
   measured value. The refresh interval follows the window's current display,
   including after a move between displays. Frame pacing policy stays in
-  `frame_pacer.zig` (`.claude/rules/memory-performance.md`).
+  `frame_pacer.zig` (`.grok/rules/memory-performance.md`).
 - `TimeLoop.max_updates_per_frame` stays a work budget (Slice 72 keeps it).
 
 ### Checklist

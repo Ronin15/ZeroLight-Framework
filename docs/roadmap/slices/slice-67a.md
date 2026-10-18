@@ -45,7 +45,7 @@ Goal:
 - App and UI only; no simulation or checksum change (Slice 67).
 - `Engine` resolves each pointer event to logical space once and passes it
   in the per-event context; `src/game/ui/` never sees SDL types
-  (`.claude/rules/input-state.md`, `.claude/rules/engine-design.md`).
+  (`.grok/rules/input-state.md`, `.grok/rules/engine-design.md`).
 - Hover focuses only on motion, so a stationary cursor never steals focus
   from keyboard or gamepad navigation; there is one focus highlight for
   every device. Motion is never consumed (pass-through overlays keep
@@ -70,7 +70,7 @@ Goal:
   writes the latest version once, so a later layout change cannot
   re-migrate it.
 - Hit testing and repeat cost are fixed per event and per frame,
-  independent of content size (`.claude/rules/budgets-capacities.md`).
+  independent of content size (`.grok/rules/budgets-capacities.md`).
 - Documented behavior change: on non-QWERTY layouts defaults bind physical
   positions; QWERTY is unchanged.
 - VoidLight reference: `UIManager::handleInput` hit order, modal swallow,
@@ -118,7 +118,7 @@ Goal:
       default wording; `docs/architecture.md` input flow; Table T2;
       `src/tests.zig`.
 - [ ] Add the settings migration-freeze rule to
-      `.claude/rules/input-state.md` when this lands.
+      `.grok/rules/input-state.md` when this lands.
 
 ### Acceptance checks
 

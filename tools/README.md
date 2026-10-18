@@ -60,7 +60,7 @@ confirmed with `--reps 3` on that case alone, where the summary prints each
 side's median and min-max spread and calls `slower`/`faster` only when the two
 ranges do not overlap, otherwise `within spread`. Raw outputs and `summary.txt` go to
 `benchmark_outputs/ab-<stamp>/`; a tuned row also prints each side's `worker_threads` cell (`0/N` is inline). Debug by default; `--optimize ReleaseFast` follows
-`.claude/rules/build-validation.md`. Both sides build with the
+`.grok/rules/build-validation.md`. Both sides build with the
 same `-Dcpu`, the shipped floor by default (`docs/development-workflow.md`
 § Release Modes; `--cpu native` to override), so a base from before Debug moved
 to the floor still compares like for like. The CPU is part of the cache key. Cases default to

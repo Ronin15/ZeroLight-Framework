@@ -74,21 +74,21 @@ Scope comes from one camera and puts far entities to sleep.
   movement stays near full rate; `dormant` only for inert things, which still
   change slowly; only unimportant ambient spawns are recycled, far from the
   observer; worlds the observer is not in still step; nothing is evicted from
-  the simulation (`.claude/rules/engine-design.md` § Target scale).
+  the simulation (`.grok/rules/engine-design.md` § Target scale).
 - Tiers set fidelity, never whether an entity advances
-  (`.claude/rules/simulation.md` § Scope and tiers); the live tier policy and
+  (`.grok/rules/simulation.md` § Scope and tiers); the live tier policy and
   the halo-only AI gather contradict this and are replaced.
 - Cadences are pure functions of deterministic state (band, entity,
   `StepIndex`), never wall clock, render cadence, or measured cost
-  (`.claude/rules/simulation.md` § Determinism). Per-step work budgets are
+  (`.grok/rules/simulation.md` § Determinism). Per-step work budgets are
   fixed counts with deterministic deferral
-  (`.claude/rules/budgets-capacities.md`).
+  (`.grok/rules/budgets-capacities.md`).
 - Scope derives from the observer's fixed-step view and defines a lowest
   band that 74 applies to worlds the observer is not in, instead of the
   full-active fallback. The Scope-and-tiers rule names a single `sim_view`
   and is updated in the same change.
 - Far agents path over the whole-world chunked nav within the fixed per-step
-  request budget (`.claude/rules/pathfinding.md`; needs 64G).
+  request budget (`.grok/rules/pathfinding.md`; needs 64G).
 - 62 owns the important/ambient population classes and the recycling
   itself; 75 provides the deterministic far-from-observer signal it uses.
 - 75 owns spatial-index coverage of the whole population: every agent thinks,
@@ -96,7 +96,7 @@ Scope comes from one camera and puts far entities to sleep.
   band.
 - Per-step cost follows population divided by each band's cadence, never
   world extent × world count; serial and threaded paths with parity
-  (`.claude/rules/threading.md`).
+  (`.grok/rules/threading.md`).
 - The think set's membership is one phase test over the indexed rows
   (`cognitionJob`, `src/game/systems/simulation_scope.zig:866`), and band
   cadence replaces that test. With the whole population indexed, that pass
@@ -116,7 +116,7 @@ Scope comes from one camera and puts far entities to sleep.
 ### Checklist
 
 - [ ] Fidelity bands from the observer, including a lowest band for 74; the
-      § Scope and tiers rule in `.claude/rules/simulation.md` updated in the
+      § Scope and tiers rule in `.grok/rules/simulation.md` updated in the
       same change.
 - [ ] Every agent thinks at its band's cadence; no agent is excluded from
       cognition by distance.
@@ -133,7 +133,7 @@ Scope comes from one camera and puts far entities to sleep.
       [86](slice-86.md); render collect's is [87](slice-87.md).
 - [ ] Bench-only (`--details`) timers for the untimed stages, so the
       `production-step` census attributes the 2–20% `untimed` share before
-      this slice's policy change (`.claude/rules/threading.md`).
+      this slice's policy change (`.grok/rules/threading.md`).
 - [ ] A deterministic far-from-observer signal for 62's ambient
       recycling.
 - [ ] Far path requests over the whole-world nav within the fixed request

@@ -37,7 +37,7 @@ no stage falls back to `ThreadSystem`'s shared tuner.
 
 - File moves only: no behavior, API, or test change beyond imports
   (81 and 82 precedent). Placement per `docs/architecture.md` § Source Layout.
-- A production processor owns its tuner state (`.claude/rules/threading.md`).
+- A production processor owns its tuner state (`.grok/rules/threading.md`).
 
 ### Checklist
 

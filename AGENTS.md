@@ -1,18 +1,16 @@
-# CLAUDE.md
+# AGENTS.md
 
 ## Project Snapshot
 
 A 2D game framework on **Zig 0.17** and **SDL3 / SDL_GPU** with a fixed-step
 **60Hz** data-oriented simulation: engine core for a fully simulated,
 multi-world colony simulator (target and the demo's role:
-`.claude/rules/engine-design.md` § Target scale).
+`.grok/rules/engine-design.md` § Target scale).
 
 ## Rules And Docs
 
-- **Rules** live only in `.claude/rules/`, one topic per file
-  (`engine-design.md`). Files without `paths:` load every session; the rest
-  load when a matching file is Read, so Read a file you only grepped before
-  relying on its rules.
+- **Rules** live only in `.grok/rules/`, one topic per file
+  (`engine-design.md`). Every rule file loads every session.
 - Docs, briefs, plans, and reports cite rule files by name and never restate
   them; a plan cites the rule each decision meets, a review the rule each
   standards finding breaks.
@@ -37,7 +35,9 @@ Add code under the owning module: boundaries in `engine-design.md`
 ## Agent Pipeline
 
 Non-trivial Zig design, implementation, review, and debugging goes through the
-`.claude/agents/` specialists. Trivial means a local fix in 1–2 files with no
+`.grok/agents/` specialists. Spawn one with `spawn_subagent` and
+`subagent_type` set to its name. The brief is the child's whole prompt: it
+does not see this session. Trivial means a local fix in 1–2 files with no
 design question; the main session may do that inline. The main session
 orchestrates, verifies every agent claim against live code, and reports.
 
@@ -56,9 +56,9 @@ orchestrates, verifies every agent claim against live code, and reports.
   becomes a checklist item in the owning slice with its `file:line`, failure
   scenario, and pass condition, never only a memory note.
 - `zig-debug-specialist` for failures.
-- `docs-specialist` (Sonnet, owner's choice) writes the doc changes for a
-  slice's docs commit and routes findings into roadmap slices; it edits docs
-  only, and the main session commits.
+- `docs-specialist` writes the doc changes for a slice's docs commit and
+  routes findings into roadmap slices; it edits docs only, and the main
+  session commits.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
 - Terse reports and docs, never by dropping findings. Make engineering calls
@@ -81,7 +81,7 @@ orchestrates, verifies every agent claim against live code, and reports.
   (`docs-specialist`) writes them once from the code as landed (checklist
   check-offs, durable docs, tables).
 - Agents work from live code and the sources the brief names (plans and
-  reports in `.claude/reports/`, commit bodies), never from memory or chat
+  reports in `.grok/reports/`, commit bodies), never from memory or chat
   summaries. They cannot spawn agents: each reports what is outside its role
   and recommends handoffs; the main session routes them.
 - An explanation of a failure or bench result is a hypothesis until a
@@ -96,12 +96,13 @@ Zig 0.17.0 minimum. `zig build -l` lists the steps;
 `zig build bench -- --group <name>` targets one bench group. Details: DW.
 Validation cadence and modes: `build-validation.md`.
 
-## Claude Code Tooling (`.claude/`)
+## Grok Tooling (`.grok/`)
 
-- Agent names stay stable: the `workflows/` call them by name (`agentType`).
-- Design and review agents write plans and reports to `.claude/reports/`
+- Agent names stay stable: `.claude/workflows/` calls them by name (`agentType`).
+- Design and review agents write plans and reports to `.grok/reports/`
   (gitignored); briefs cite the file instead of pasting it.
 - `tools/bench_ab.py` is the before/after bench; `zig-specialist` runs it
   (DW § Benchmarks).
-- `hooks/zig-fmt.sh` runs `zig fmt` on each edited `.zig`/`.zon` file (needs
-  `jq`); it does not replace validation.
+- `hooks/zig-fmt.sh` runs `zig fmt` on each `.zig`/`.zon` file a
+  `search_replace` or `write` just edited (needs `jq`); it does not replace
+  validation.

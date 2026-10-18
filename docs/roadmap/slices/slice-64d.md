@@ -40,10 +40,10 @@ path, which uses `@mulAdd` and lowers to per-lane `fmaf` calls on
   and NaN results with unspecified sign and payload (64B canonicalizes NaN in
   the checksum).
 - No allocation, state, or RNG; IEEE ops and selects only
-  (`.claude/rules/memory-performance.md` § SIMD and core math).
+  (`.grok/rules/memory-performance.md` § SIMD and core math).
 - The consuming slice's SIMD kernel uses `atan2Float4` and its scalar tail
   `math.atan2`, and it adds its own serial-vs-threaded parity test
-  (`.claude/rules/threading.md`).
+  (`.grok/rules/threading.md`).
 
 ### Checklist
 

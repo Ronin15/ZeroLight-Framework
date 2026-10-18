@@ -41,19 +41,19 @@ Nav is chunk-owned (64G).
 
 ### Architecture notes
 
-- `PathfindingSystem` owns it end to end (`.claude/rules/pathfinding.md`);
+- `PathfindingSystem` owns it end to end (`.grok/rules/pathfinding.md`);
   the state and pipeline only invoke it. No new `StageId`.
 - Needs from 64G: chunk-owned nav with an all-or-nothing per-step apply over
   dirty chunks, so a deferred job copies and swaps only the dirty chunks,
   never a whole graph. Memory follows the in-flight batch.
 - The classification threshold and latency `k` are fixed constants, never
-  derived from map size (`.claude/rules/budgets-capacities.md`).
+  derived from map size (`.grok/rules/budgets-capacities.md`).
 - From submit to publish the affected chunks are frozen: readers see the
   pre-batch graph; marks and new links arriving in the window are held
   (grown, never dropped) and applied at the publish step's seam; at most one
   deferred batch per world is in flight.
 - Publish step and result are identical with no lane, a thread-less lane,
-  or a fast, slow, or full lane (51's handoff; `.claude/rules/simulation.md`
+  or a fast, slow, or full lane (51's handoff; `.grok/rules/simulation.md`
   § Determinism). An OOM in the job leaves the front intact and re-marks the
   batch.
 - The job reads only its plan and the frozen chunks (51's frozen borrow) and
@@ -66,7 +66,7 @@ Nav is chunk-owned (64G).
   the loaded session equals the continuing session normalized at the save
   step.
 - Open: the lane is one serial thread, while nav threading must scale with
-  the number of updates (`.claude/rules/pathfinding.md`). The design pass
+  the number of updates (`.grok/rules/pathfinding.md`). The design pass
   decides between the lane and a pool rebuild spread across steps, against
   64G's measured dense-change cost.
 - VoidLight: port building off-thread and publishing whole; do not port

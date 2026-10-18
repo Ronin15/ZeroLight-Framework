@@ -38,7 +38,7 @@ symmetrically.
 
 - Elevation is a stored per-level fact set when the level is created, never
   derived from index, append order, or `base_z`; levels are added in play at
-  the seam (`.claude/rules/budgets-capacities.md`).
+  the seam (`.grok/rules/budgets-capacities.md`).
 - `addLevel` keeps its signature: the first level is the surface, each later
   `addLevel` sits one below the lowest, so every existing multi-level fixture
   keeps its meaning. Levels above the surface come from an explicit elevated
@@ -49,7 +49,7 @@ symmetrically.
 - "Is there a level above" is an elevation-adjacency lookup, not an index
   comparison.
 - The render window cap bounds levels drawn, never levels that exist; it does
-  not grow with elevation count (`.claude/rules/render.md`).
+  not grow with elevation count (`.grok/rules/render.md`).
 - Needs from 64G: collision bodies reach nav on every level; per-chunk
   render pages so the window is a selection of levels, not a level-sized
   buffer.
