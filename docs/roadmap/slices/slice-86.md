@@ -179,7 +179,9 @@ order stay deterministic for the order-sensitive consumers.
       shows apply items per range tracking intents at 1,024, 4,096, and 16,384;
       serial == threaded across range sizes.
 - [ ] Collision's banded fill and sort fails the cost model when it runs
-      inline, and production runs it inline whenever the tuner keeps collision
+      inline (lands before the response and contiguity landings, with the
+      item after it: every later collision A/B and the static gate measure
+      this path), and production runs it inline whenever the tuner keeps collision
       inline. Failure: the banded path (`sortJob` -> `EntryWriter.finishBand`)
       concatenates the first, second, and spilled runs per band and runs one
       `pdq`, O(E log(E/64)) on an already-settled order, where `buildDirect`
@@ -200,7 +202,8 @@ order stay deterministic for the order-sensitive consumers.
       one path). Pass: no `*Direct` collision entry remains; the collision
       benches and tests run the production path.
 - [ ] `CollisionResponseSystem.run` has a separate no-worker serial path
-      (`collision_response.zig:270`, the `else` of `withWorkers`;
+      (lands with the response gather rework, which edits the same run;
+      `collision_response.zig:270`, the `else` of `withWorkers`;
       `.claude/rules/tests-benchmarks.md` § Test and production code, point
       1). Pass: it is removed after a cost check that the stage run inline
       does no worse (`collision-response-stage`, serial and inline, same
