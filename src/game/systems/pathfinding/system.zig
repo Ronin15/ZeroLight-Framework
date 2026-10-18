@@ -1622,7 +1622,6 @@ test "pathfinding a one-solve step budget solves one request and leaves the rest
 }
 
 test "pathfinding a one-solve step budget solves one request and leaves the rest pending in the threaded update path" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
@@ -1699,8 +1698,6 @@ test "pathfinding same-level group agent falls through on a field-sample miss in
 }
 
 test "pathfinding threaded solve matches serial solve" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
@@ -1734,8 +1731,6 @@ test "pathfinding threaded solve matches serial solve" {
 }
 
 test "pathfinding threaded multi-worker solve has no steady-state allocation after warmup (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const count = 8;
@@ -1746,7 +1741,6 @@ test "pathfinding threaded multi-worker solve has no steady-state allocation aft
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
@@ -1797,7 +1791,6 @@ test "pathfinding threaded multi-worker solve has no steady-state allocation aft
 }
 
 test "pathfinding threaded multi-goal solve keeps disjoint per-request paths" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const count = 8;
@@ -4275,7 +4268,6 @@ test "a capped stitch toward the least-estimate node is cut to its last cell bel
 }
 
 test "threaded least-estimate partials equal serial for any range size and worker count" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4306,7 +4298,6 @@ test "threaded least-estimate partials equal serial for any range size and worke
     for ([_]usize{ 1, 3 }) |workers| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
         defer threads.deinit();
-        if (threads.workerThreadCount() == 0) return error.SkipZigTest;
         for ([_]usize{ 1, 2, 3 }) |items_per_range| {
             var threaded_capacity = capacity;
             threaded_capacity.worker_participant_count = threads.participantSlotCount();
@@ -4708,7 +4699,6 @@ test "an escalated solve through the tier-1 pool equals a participant reference"
 }
 
 test "threaded escalated solves take distinct tier-1 slots and equal serial" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4720,7 +4710,6 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
     for (&requesters) |*requester| requester.* = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var capacity = abstractCapacity();
     capacity.group_field_max_cells = 16;
@@ -4787,7 +4776,6 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
     for ([_]usize{ 1, 3 }) |workers| {
         var partial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
         defer partial_threads.deinit();
-        if (partial_threads.workerThreadCount() == 0) return error.SkipZigTest;
         for ([_]usize{ 1, 2, 3 }) |items_per_range| {
             var threaded_capacity = partial_capacity;
             threaded_capacity.worker_participant_count = partial_threads.participantSlotCount();
@@ -4824,7 +4812,6 @@ fn queueCrossLevelWithTiers(system: *PathfindingSystem, requesters: []const Enti
 }
 
 test "threaded cross-level solves equal serial, at tier 0 and through the tier-1 pool, their crossing searches included" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4845,7 +4832,6 @@ test "threaded cross-level solves equal serial, at tier 0 and through the tier-1
     for (&requesters) |*requester| requester.* = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var capacity = abstractCapacity();
     capacity.group_field_max_cells = 16;
@@ -4932,7 +4918,6 @@ test "threaded cross-level solves equal serial, at tier 0 and through the tier-1
 }
 
 test "a reserved threaded solve with escalations allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4944,7 +4929,6 @@ test "a reserved threaded solve with escalations allocates nothing on a multi-wo
     for (&requesters) |*requester| requester.* = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     // The second pass's 8-cell stitched cap makes the escalated solves publish partials.
     for ([_]usize{ abstractCapacity().max_stitched_path_cells, 8 }) |stitched_cells| {
@@ -5135,7 +5119,6 @@ fn logEveryOpKind(system: *PathfindingSystem) !void {
 }
 
 test "threaded registry flush equals serial with victims, re-puts, and renames in the log" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5145,7 +5128,6 @@ test "threaded registry flush equals serial with victims, re-puts, and renames i
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var systems: [2]PathfindingSystem = undefined;
     var built: usize = 0;
     defer for (systems[0..built]) |*system| system.deinit();
@@ -5177,7 +5159,6 @@ test "threaded registry flush equals serial with victims, re-puts, and renames i
 }
 
 test "threaded registry flush over unit-weighted pairs equals serial across range sizes and worker counts, on workers" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5199,7 +5180,6 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
     for ([_]usize{ 1, 3, flush_pair_count + 4 }) |workers| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
         defer threads.deinit();
-        if (threads.workerThreadCount() == 0) return error.SkipZigTest;
         var worker_ranges: usize = 0;
         // Ranges far smaller than a pair (most hold no pair start), ranges that cut pairs,
         // and two ranges of several pairs each.
@@ -5268,7 +5248,6 @@ test "an elastic grow and shrink keep cached paths and registrations, and a rena
 }
 
 test "threaded resize copy equals serial for inline and long moves, and runs on workers" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5278,7 +5257,6 @@ test "threaded resize copy equals serial for inline and long moves, and runs on 
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var serial = try shrinkFixture(&data, &fixture, requester, 1);
     defer serial.deinit();
     var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
@@ -5305,7 +5283,6 @@ test "threaded resize copy equals serial for inline and long moves, and runs on 
 }
 
 test "a shrink's resize copy allocates nothing after its prepare on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5315,7 +5292,6 @@ test "a shrink's resize copy allocates nothing after its prepare on a multi-work
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var system = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
     defer system.deinit();
     const capacity = system.capacity;
@@ -5426,7 +5402,6 @@ test "an agent sealed in a pocket reads its goal unavailable from reach, and an 
 }
 
 test "a goal sealed in a pocket is unavailable at status and intake to agents outside it, with no pending or solve, inline and threaded, and an agent inside still gets a path" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);

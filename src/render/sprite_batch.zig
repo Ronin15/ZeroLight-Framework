@@ -8,7 +8,6 @@
 //! stage expands vertices.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWorkTunerConfig;
 
@@ -1246,8 +1245,6 @@ test "ui stack order keeps upper state background above lower state text" {
 }
 
 test "parallel sprite prep matches serial vertices and draw groups" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 64, .height = 32 } },
@@ -1295,8 +1292,6 @@ test "parallel sprite prep matches serial vertices and draw groups" {
 }
 
 test "sprite prep records one sample into its own tuner and none into the shared tuner" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 16, .height = 16 } },
@@ -1322,7 +1317,6 @@ test "sprite prep records one sample into its own tuner and none into the shared
         .items_per_range = 1,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     _ = try prepare(&batch, table.resolver(), &threads, .{});
 
     try std.testing.expectEqual(@as(usize, 1), batch.adaptive_tuner.sample_count);
@@ -1332,8 +1326,6 @@ test "sprite prep records one sample into its own tuner and none into the shared
 }
 
 test "sprite prep adaptive gate keeps cheap batches inline" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 16, .height = 16 } },
@@ -1372,8 +1364,6 @@ test "sprite prep adaptive gate keeps cheap batches inline" {
 }
 
 test "warmed multi-worker sprite prep does not allocate" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 16, .height = 16 } },

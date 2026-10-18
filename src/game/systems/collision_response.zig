@@ -1273,11 +1273,9 @@ fn expectRingResultsEqual(expected: RingResult, actual: RingResult) !void {
 const contactsNaming = @import("collision_response_test_support.zig").contactsNaming;
 
 test "threaded response matches serial bit for bit across range sizes, worker counts and band counts" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 3 });
     defer threads.deinit();
-    if (threads.workerThreadCount() < 3) return error.SkipZigTest;
 
     for ([_]usize{ 40, 1100 }, [_]usize{ 3, max_bands }) |movement_rows, band_count| {
         try std.testing.expectEqual(band_count, RowBands.init(movement_rows).band_count);
@@ -1465,13 +1463,11 @@ test "apply lanes match the scalar apply bit for bit" {
 }
 
 test "threaded multi-worker response allocates nothing after reserveForContacts" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 40);
     defer fixture.deinit(allocator);
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() < 2) return error.SkipZigTest;
     const contact_count = fixture.frame.contacts.mergedItems().len;
 
     var system = CollisionResponseSystem.init(allocator);
@@ -1494,13 +1490,11 @@ test "threaded multi-worker response allocates nothing after reserveForContacts"
 }
 
 test "response stages record into their own tuners" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 40);
     defer fixture.deinit(allocator);
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var system = CollisionResponseSystem.init(allocator);
     defer system.deinit();
@@ -1527,7 +1521,6 @@ test "response stages record into their own tuners" {
 }
 
 test "an empty contact stream records no batch and leaves no triggers or observer contacts" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 40);
     defer fixture.deinit(allocator);
@@ -1554,7 +1547,6 @@ test "an empty contact stream records no batch and leaves no triggers or observe
 }
 
 test "observer contacts list every contact naming the observer in contact order" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 40);
     defer fixture.deinit(allocator);
@@ -1587,14 +1579,12 @@ test "observer contacts list every contact naming the observer in contact order"
 }
 
 test "contacts past the reserve grow on main before dispatch and match serial" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 66);
     defer fixture.deinit(allocator);
     try std.testing.expect(fixture.frame.contacts.mergedItems().len >= 200);
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var serial_system = CollisionResponseSystem.init(allocator);
     defer serial_system.deinit();

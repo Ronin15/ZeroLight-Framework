@@ -292,8 +292,6 @@ test "steering keeps highest priority navigation intent with stable tie order" {
 }
 
 test "steering threaded arbitration keeps the first appearance and the best intent across ranges" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     // Far enough apart that no agent pushes another.
@@ -333,7 +331,6 @@ test "steering threaded arbitration keeps the first appearance and the best inte
     var outputs: [2][40]MovementIntent = undefined;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     for (&outputs, 0..) |*output, run| {
         var frame = SimulationFrame.init(std.testing.allocator);
         defer frame.deinit();
@@ -415,8 +412,6 @@ test "steering claims stay correct across the claim stamp wrap" {
 }
 
 test "steering claim band count does not follow the resolve partition" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     // Far enough apart that no agent pushes another.
@@ -440,7 +435,6 @@ test "steering claim band count does not follow the resolve partition" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     // Serial, then five and two resolve ranges.
     const resolve_ranges = [_]?usize{ null, 16, 48 };
     var outputs: [resolve_ranges.len][40]MovementIntent = undefined;

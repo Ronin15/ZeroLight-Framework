@@ -558,7 +558,6 @@ test "steering static obstacle avoidance ignores XY overlap across different wor
 }
 
 test "steering multi-level obstacle gate matches between serial and real threaded workers" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Alternating agent levels over one static box per level at overlapping XY:
     // each agent may only react to its own floor's box, identically under every
@@ -615,7 +614,6 @@ test "steering multi-level obstacle gate matches between serial and real threade
         .items_per_range = steering_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const splits = [_]struct { items_per_range: usize, workers: usize }{
         .{ .items_per_range = steering_range_alignment_items, .workers = 2 },

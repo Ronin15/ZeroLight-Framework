@@ -3181,7 +3181,6 @@ fn writeParityStep(run: *TestWorld, systems: []const *PathfindingSystem, tile: T
 test "threaded connectivity stages equal the inline ones column for column across worker counts and range sizes" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     for ([_]usize{ 1, 2, 4 }) |workers| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
         defer threads.deinit();
@@ -3217,7 +3216,6 @@ test "threaded connectivity stages equal the inline ones column for column acros
 }
 
 test "an enclosing batch reserved with the real allocator commits on a multi-worker ThreadSystem without allocating" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture = try TestWorld.init(10, 1);
     defer fixture.deinit();
     try twoRooms(&fixture);
@@ -3243,7 +3241,6 @@ test "an enclosing batch reserved with the real allocator commits on a multi-wor
 }
 
 test "the post-commit nav reaction runs the connectivity flood on workers" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture = try TestWorld.init(10, 1);
     defer fixture.deinit();
     try twoRooms(&fixture);
@@ -3364,7 +3361,6 @@ fn enclosePockets(fixture: *TestWorld, systems: []const *PathfindingSystem, gaps
 test "enclosing eight pockets of one component in one batch floods on workers and equals the inline run" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4, .items_per_range = 1 });
     defer threads.deinit();
     for ([_]u16{ 2, 8 }) |edge| {
@@ -3398,7 +3394,6 @@ test "enclosing eight pockets of one component in one batch floods on workers an
 test "threaded floods equal inline ones column for column when families meet and rounds are narrow" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     for ([_]usize{ 1, 4 }) |workers| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
         defer threads.deinit();
@@ -3490,7 +3485,6 @@ test "a dense batch's staging frees down within two release windows of one-chunk
 test "a step that frees a dense batch's staging commits its batch on a multi-worker ThreadSystem without allocating, then releases" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture = try TestWorld.init(16, 1);
     defer fixture.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4, .items_per_range = 1 });
@@ -3792,7 +3786,6 @@ test "a hub family wider than one round splits the same in wide and narrow round
 }
 
 test "a flooding reaction reaches its adaptive tuner as one sample at the batch's set count and selected profile" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4 });
     defer threads.deinit();
     const tunnels: u16 = 16;

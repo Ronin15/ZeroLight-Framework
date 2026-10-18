@@ -456,7 +456,6 @@ test "the goal table is equal serial and threaded across worker counts and range
 test "a reserved goal resolve allocates nothing on a real multi-worker thread system, and a failed growth leaves the table invalid and its storage intact (FailingAllocator)" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var system = try blockedGoalSystem(std.testing.allocator, &data);
@@ -466,7 +465,6 @@ test "a reserved goal resolve allocates nothing on a real multi-worker thread sy
     mixedIntents(grid, &intents);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     try system.reserveGoals(intents.len);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     system.allocator = failing.allocator();

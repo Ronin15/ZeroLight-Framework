@@ -17,7 +17,6 @@
 
 const std = @import("std");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
-const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
 const logging = @import("../../core/logging.zig");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -1499,7 +1498,6 @@ test "chunk lists stay in entity order under any add/remove order" {
 }
 
 test "sync runs out of memory at every allocation and leaves the structure unchanged; the retry applies it, serial and threaded" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
@@ -1665,7 +1663,6 @@ fn denseMixedCommands(random: std.Random, data: *const DataSystem, live: []const
 }
 
 test "a dense mixed collider sync lists every chunk in entity order, threaded equal to serial and to a rebuild" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
     var serial = try SeamFixture.init();
@@ -1700,10 +1697,8 @@ test "a dense mixed collider sync lists every chunk in entity order, threaded eq
 }
 
 test "a splice worker cap of zero keeps the chunk splice inline on a multi-worker ThreadSystem and lists the same chunks" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var uncapped = try SeamFixture.init();
     defer uncapped.deinit();
     var capped = try SeamFixture.init();
@@ -1809,7 +1804,6 @@ test "a destroy-heavy sync grows no rows" {
 }
 
 test "a threaded sync after its reserves allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var fixture = try SeamFixture.init();
@@ -2330,7 +2324,6 @@ fn anchorChurnCommands(random: std.Random, data: *const DataSystem, live: []cons
 }
 
 test "anchor blocks equal a rebuild after random incremental syncs, serial and threaded" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
     var serial = try SeamFixture.init();

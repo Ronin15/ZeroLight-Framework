@@ -314,7 +314,6 @@ fn groupFieldExpandJob(context: *anyopaque, range: ParallelRange, _: WorkerId) v
     for (job.slots[range.start..range.end]) |slot| expandGroupField(job.system, slot);
 }
 
-const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
@@ -832,7 +831,6 @@ const group_service_schedule = [_][]const math.Vec2{
 };
 
 test "threaded group-field service equals serial for four fields building, finishing, rekeyed, and taken over by a waiting goal" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const requester = try data.createEntity();
@@ -868,10 +866,8 @@ test "threaded group-field service equals serial for four fields building, finis
 }
 
 test "group-field service allocates nothing on workers (FailingAllocator, multi-worker)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const requester = try data.createEntity();
@@ -910,7 +906,6 @@ test "group-field service allocates nothing on workers (FailingAllocator, multi-
 }
 
 test "threaded group-field service with stall rounds equals serial and runs on workers" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const requester = try data.createEntity();

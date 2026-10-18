@@ -17,7 +17,6 @@
 //! `world_obstacle_changed`) for the post-commit nav re-mask.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const logging = @import("../core/logging.zig");
 const math = @import("../core/math.zig");
 const InputState = @import("../app/input.zig").InputState;
@@ -1298,7 +1297,6 @@ fn runCrossChunkFalls(meta: *const world_tileset_meta.WorldTilesetMeta, threads:
 }
 
 test "plane stage carves landings entered out of chunk order across levels in one ordered batch, serial and threaded alike" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();

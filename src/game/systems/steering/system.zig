@@ -870,8 +870,6 @@ test "steering movement index cache rebuilds only after structural invalidate" {
 }
 
 test "steering serial and real threaded workers produce identical movement intents" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var intents = std.ArrayList(NavigationIntent).empty;
@@ -928,7 +926,6 @@ test "steering serial and real threaded workers produce identical movement inten
         .items_per_range = steering_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const threaded_stats = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, .{
         .items_per_range = steering_range_alignment_items,
         .max_worker_threads = 2,
@@ -947,7 +944,6 @@ test "steering serial and real threaded workers produce identical movement inten
 }
 
 test "steering serial matches threaded intents across multiple range splits and worker counts" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // The single-split parity test above pins one fixed split; the AdaptiveWorkTuner
     // instead picks range/worker counts dynamically, and its probe-driven choice is not
@@ -1002,7 +998,6 @@ test "steering serial matches threaded intents across multiple range splits and 
         .items_per_range = steering_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const splits = [_]struct { items_per_range: usize, workers: usize }{
         .{ .items_per_range = steering_range_alignment_items, .workers = 2 },
@@ -1106,8 +1101,6 @@ test "steering update is allocation-free after reserves from the first step" {
 }
 
 test "steering threaded multi-worker update is allocation-free after reserves from the first step (FailingAllocator)" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var agents: [steering_range_alignment_items * 4]EntityId = undefined;
@@ -1137,7 +1130,6 @@ test "steering threaded multi-worker update is allocation-free after reserves fr
         .items_per_range = steering_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
@@ -1255,8 +1247,6 @@ test "steering production stage tuners use the central gate and their stage's ra
 }
 
 test "steering threaded prepare equals serial across range splits and worker counts" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var serial = ParityTrace{};
     defer serial.deinit();
     try runParityScenario(null, .{}, &serial);
@@ -1270,7 +1260,6 @@ test "steering threaded prepare equals serial across range splits and worker cou
         .items_per_range = steering_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     for ([_]usize{ 16, 32, 48, 128 }) |items_per_range| {
         for ([_]usize{ 1, 2, 3 }) |workers| {
@@ -1283,8 +1272,6 @@ test "steering threaded prepare equals serial across range splits and worker cou
 }
 
 test "steering with no worker to give runs the serial selection and grid and matches serial" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var serial = ParityTrace{};
     defer serial.deinit();
     try runParityScenario(null, .{}, &serial);
@@ -1301,7 +1288,6 @@ test "steering with no worker to give runs the serial selection and grid and mat
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var capped = ParityTrace{};
     defer capped.deinit();
     try runParityScenario(&threads, .{ .items_per_range = 32, .max_worker_threads = 0, .adaptive = false }, &capped);
@@ -1309,13 +1295,10 @@ test "steering with no worker to give runs the serial selection and grid and mat
 }
 
 test "steering runtime state follows its entity across swap-removes" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
     const threaded_config: SteeringConfig = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 2, .adaptive = false };
     for ([_]bool{ false, true }) |threaded| {
-        if (threaded and threads.workerThreadCount() == 0) return error.SkipZigTest;
         const thread_system: ?*ThreadSystem = if (threaded) &threads else null;
         var control = RekeyOutcome{};
         defer control.deinit();
@@ -1354,15 +1337,12 @@ test "steering runtime state follows its entity across swap-removes" {
 }
 
 test "steering stages kept inline by their tuners run the threaded stage jobs inline" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var serial = ParityTrace{};
     defer serial.deinit();
     try runParityScenario(null, .{}, &serial);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     // Fresh adaptive tuners learn inline for a whole sample window, so every tuned stage
     // stays on the main thread for a scenario no longer than one window.
     try std.testing.expect(parity_step_count <= steering_adaptive_tuner_config.sample_window);

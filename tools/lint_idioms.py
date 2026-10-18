@@ -38,12 +38,28 @@ reviewer diligence:
    because the caller is another file. Both are review checks, not lint hits.
    Every hit is removed from production; no annotation exempts one. The only
    exemptions are the owner's `OWNER_KEPT_API` entries.
+10. No `error.SkipZigTest` under `src/` (tests, benches, and smoke included).
+11. A `test` block, and a file-scope helper only tests reach, does not
+    reference `runtime_perf_log`, `perf_counters`, or `.perf`. `src/benchmarks/`
+    and `*test_support.zig` may: benches read counters, and support files serve
+    benches. Production code outside `test` blocks may too. `build.zig`'s
+    `perf_counters` option is not a hit.
+12. Relative imports that resolve under `src/` point down. A hit names the
+    file, the import, and the layer it crosses. An import that stays inside
+    its own layer is not a hit. `src/game/` may import `render/`, `assets/`,
+    `core/`, `platform/`, and `src/app/`. `src/app/` may import `src/game/`
+    only from the files that construct states (`engine.zig` builds
+    `MainMenuState`, `pause_controller.zig` builds `PauseState`). `render/`,
+    `assets/`, `core/`, and `platform/` do not import `game/`. `core/` imports
+    only `core/`. `platform/` imports only `core/` (and its own layer). No
+    layer imports `src/tests.zig`, `src/benchmark_runner.zig`,
+    `src/gpu_smoke.zig`, `src/gpu_smoke_impl.zig`, or `src/benchmarks/`.
 
 Scans every `src/**/*.zig` file plus `build.zig`. Rules in SRC_ONLY_PATTERNS
 apply to `src/` only. All rules match code with string/char-literal contents
 blanked and `//` comments removed, so text inside literals never trips a rule.
 
-Run via `zig build idiom-lint` (also part of `zig build verify`).
+Run via `zig build idiom-lint` (also part of `zig build check` and `zig build verify`).
 """
 
 from __future__ import annotations
@@ -225,6 +241,47 @@ def strip_line_comment(line: str) -> str:
     return line if idx < 0 else line[:idx]
 
 
+def in_literal(line: str, pos: int) -> bool:
+    """True when `pos` sits inside a string or char literal."""
+    quote = ""
+    escaped = False
+    for index, char in enumerate(line):
+        if index >= pos:
+            break
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+    return quote != ""
+
+
+def strip_code_comment(line: str) -> str:
+    """Drop a `//` comment without cutting a `//` that sits inside a string or char literal."""
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char == "/" and index + 1 < len(line) and line[index + 1] == "/":
+            return line[:index]
+        index += 1
+    return line
+
+
 def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
     issues: list[tuple[str, int, str, str]] = []
     rel = str(path.relative_to(REPO_ROOT))
@@ -331,6 +388,16 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
                         raw.strip(),
                     )
                 )
+
+        if path.is_relative_to(SRC_DIR) and "error.SkipZigTest" in code:
+            issues.append(
+                (
+                    rel,
+                    lineno,
+                    "`error.SkipZigTest` is banned under src/ (tests, benches, and smoke included)",
+                    raw.strip(),
+                )
+            )
 
     codes = [strip_line_comment(blank_literals(raw)) for raw in lines]
     quoted_refs = {
@@ -591,6 +658,183 @@ def lint_test_only_api(files: list[Path]) -> list[tuple[str, int, str, str]]:
     return issues
 
 
+# Rule 11. `.perf` is a member access, not the `perf_counters` identifier (`_` is a word char).
+PERF_REF = re.compile(r"\bruntime_perf_log\b|\bperf_counters\b|(?<![\w])\.perf\b")
+
+# Rule 12. Layers and the dev-tool roots no layer may import.
+LAYERS = ("game", "app", "render", "assets", "core", "platform")
+DEV_ROOTS = {
+    "src/tests.zig",
+    "src/benchmark_runner.zig",
+    "src/gpu_smoke.zig",
+    "src/gpu_smoke_impl.zig",
+}
+# App files that construct a game state. Read from src/app/: Engine builds MainMenuState;
+# PauseController builds PauseState. Any other app → game import is a hit.
+APP_STATE_CTORS = {"src/app/engine.zig", "src/app/pause_controller.zig"}
+RELATIVE_IMPORT = re.compile(r'@import\(\s*"([^"]+)"\s*\)')
+
+
+def perf_check_exempt(rel: str) -> bool:
+    """Bench files and `*test_support.zig` may read counters outside `test` blocks.
+    Their `test` blocks are still logic tests and are scanned."""
+    return rel.startswith("src/benchmarks/") or rel.endswith("test_support.zig")
+
+
+def test_block_line_indexes(lines: list[str]) -> set[int]:
+    """Line indexes inside top-level `test` blocks. `zig fmt` closes them with a `}` in column 0."""
+    indexes: set[int] = set()
+    in_test = False
+    for index, raw in enumerate(lines):
+        if TEST_DECL.match(raw):
+            in_test = True
+        elif raw.startswith("}") and in_test:
+            in_test = False
+            continue
+        if in_test:
+            indexes.add(index)
+    return indexes
+
+
+def test_only_helper_line_indexes(path: Path, lines: list[str]) -> set[int]:
+    """Line indexes of file-scope helpers only tests reach: the same spans rule 9 treats as test code."""
+    if not is_production(path):
+        return set()
+    decls, refs = production_lines(path)
+    indexes: set[int] = set()
+    for first, last in test_fixture_spans(decls, refs):
+        indexes.update(range(first, last + 1))
+    index = 0
+    while index < len(lines):
+        fn = TOP_LEVEL_FN.match(lines[index])
+        if not fn or lines[index].rstrip().endswith("}"):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines) and not lines[end].startswith("}"):
+            end += 1
+        body = lines[index : end + 1]
+        if TEST_HELPER_NAME.search(fn.group(1)) or any("std.testing" in line for line in body):
+            indexes.update(range(index, end + 1))
+        index = end + 1
+    return indexes
+
+
+def lint_test_perf(files: list[Path]) -> list[tuple[str, int, str, str]]:
+    issues: list[tuple[str, int, str, str]] = []
+    for path in files:
+        if not path.is_relative_to(SRC_DIR):
+            continue
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        checked = test_block_line_indexes(lines)
+        if not perf_check_exempt(rel):
+            checked |= test_only_helper_line_indexes(path, lines)
+        for index in sorted(checked):
+            raw = lines[index]
+            code = strip_line_comment(blank_literals(raw))
+            if PERF_REF.search(code):
+                issues.append(
+                    (
+                        rel,
+                        index + 1,
+                        "test code references `runtime_perf_log`, `perf_counters`, or `.perf`; "
+                        "tests do not read perf counters (bench code and test-support helpers outside test blocks may)",
+                        raw.strip(),
+                    )
+                )
+    return issues
+
+
+def src_layer(rel: str) -> str | None:
+    """The ownership layer of a `src/` path, `benchmarks` or `devroot` for those roots, else None."""
+    if not rel.startswith("src/"):
+        return None
+    if rel in DEV_ROOTS:
+        return "devroot"
+    parts = rel.split("/")
+    if len(parts) >= 2 and parts[1] == "benchmarks":
+        return "benchmarks"
+    if len(parts) >= 2 and parts[1] in LAYERS:
+        return parts[1]
+    return None
+
+
+def resolve_src_import(path: Path, spec: str) -> str | None:
+    """A relative import's `src/` path, or None when `spec` is a module name (`std`, `sdl_c`)."""
+    if not (spec.startswith(".") or spec.endswith(".zig") or "/" in spec):
+        return None
+    target = (path.parent / spec).resolve()
+    try:
+        rel = target.relative_to(REPO_ROOT)
+    except ValueError:
+        return None
+    rel_s = rel.as_posix()
+    if not rel_s.startswith("src/"):
+        return None
+    return rel_s
+
+
+def layer_name(layer: str | None, rel: str) -> str:
+    if layer == "devroot":
+        return "dev-tool root"
+    if layer is None:
+        return rel
+    return layer
+
+
+def import_violation(src_rel: str, target_rel: str) -> str | None:
+    source = src_layer(src_rel)
+    if source not in LAYERS:
+        return None
+    target = src_layer(target_rel)
+    if source == target:
+        return None
+    dest = layer_name(target, target_rel)
+    if target in {"devroot", "benchmarks"}:
+        return f"import crosses {source} → {dest}; a layer does not import a dev-tool root"
+    if source == "core" and not target_rel.startswith("src/core/"):
+        return f"import crosses core → {dest}; core imports only src/core"
+    if source == "platform" and not (
+        target_rel.startswith("src/platform/") or target_rel.startswith("src/core/")
+    ):
+        return f"import crosses platform → {dest}; platform imports only src/core"
+    if target == "game" and source in {"render", "assets", "core", "platform"}:
+        return f"import crosses {source} → game; {source} does not import game"
+    if source == "app" and target == "game" and src_rel not in APP_STATE_CTORS:
+        return (
+            "import crosses app → game; app imports game only to construct states "
+            "(src/app/engine.zig, src/app/pause_controller.zig)"
+        )
+    return None
+
+
+def lint_layer_imports(files: list[Path]) -> list[tuple[str, int, str, str]]:
+    issues: list[tuple[str, int, str, str]] = []
+    for path in files:
+        if not path.is_relative_to(SRC_DIR):
+            continue
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for index, raw in enumerate(lines):
+            # Leave the import string intact. Blanking it first would erase the
+            # path. Skip a `//` that sits inside a literal so it cannot hide the
+            # rest of the line.
+            code = strip_code_comment(raw)
+            for match in RELATIVE_IMPORT.finditer(code):
+                if in_literal(code, match.start()):
+                    continue
+                spec = match.group(1)
+                target = resolve_src_import(path, spec)
+                if target is None:
+                    continue
+                violation = import_violation(rel, target)
+                if violation is None:
+                    continue
+                issues.append((rel, index + 1, f"import `{spec}` {violation}", raw.strip()))
+    return issues
+
+
 def main() -> None:
     if not SRC_DIR.is_dir():
         print(f"idiom-lint: source directory not found: {SRC_DIR}", file=sys.stderr)
@@ -601,6 +845,8 @@ def main() -> None:
     for path in files:
         issues.extend(lint_file(path))
     issues.extend(lint_test_only_api(files))
+    issues.extend(lint_test_perf(files))
+    issues.extend(lint_layer_imports(files))
 
     if issues:
         for rel, lineno, message, snippet in issues:

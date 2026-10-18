@@ -315,6 +315,8 @@ pub fn build(b: *std.Build) void {
     const idiom_lint_cmd = b.addSystemCommand(&.{ "python3", "tools/lint_idioms.py" });
     const idiom_lint_step = b.step("idiom-lint", "Lint Zig sources for idiom/currency regressions (naming, deprecated stdlib, unsafe catch unreachable)");
     idiom_lint_step.dependOn(&idiom_lint_cmd.step);
+    // Created after `check_step`: check is the iterate command, so it runs this lint.
+    check_step.dependOn(&idiom_lint_cmd.step);
 
     const verify_step = b.step("verify", "Run non-interactive checks for local development");
     verify_step.dependOn(check_step);

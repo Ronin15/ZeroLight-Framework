@@ -985,8 +985,6 @@ test "a threshold just above the hysteresis floor still rises and falls, not per
 }
 
 test "serial and threaded updates are byte-identical" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data_a = DataSystem.init(testing.allocator);
     defer data_a.deinit();
     var data_b = DataSystem.init(testing.allocator);
@@ -1013,7 +1011,6 @@ test "serial and threaded updates are byte-identical" {
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = affect_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var sys_a = AffectSystem.init(testing.allocator);
     defer sys_a.deinit();
@@ -1046,7 +1043,6 @@ test "serial and threaded updates are byte-identical" {
 }
 
 test "serial and threaded emit identical order and cap membership when different drives cross across ranges" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // 20 agents span two ranges at items_per_range=16: [0,16) and [16,20).
     // Agent 0 (range 0) crosses aggression only; agent 16 (range 1) crosses
@@ -1079,7 +1075,6 @@ test "serial and threaded emit identical order and cap membership when different
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = affect_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var sys_serial = AffectSystem.init(testing.allocator);
     defer sys_serial.deinit();
@@ -1168,7 +1163,6 @@ test "serial has no steady-state allocation after warmup (FailingAllocator)" {
 }
 
 test "after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // The only reserved store is the gather rows (crossing bits
     // included), so `reserve` alone (no warm step) covers the tuner's 64-item
@@ -1191,7 +1185,6 @@ test "after reserve alone, threaded updates at 64- then 16-item ranges allocate 
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = affect_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var sys = AffectSystem.init(testing.allocator);
     defer sys.deinit();
@@ -1229,8 +1222,6 @@ test "after reserve alone, threaded updates at 64- then 16-item ranges allocate 
 }
 
 test "threaded update records one sample into the compute tuner and none into the shared tuner" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     for (0..64) |_| {
@@ -1245,7 +1236,6 @@ test "threaded update records one sample into the compute tuner and none into th
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var sys = AffectSystem.init(testing.allocator);
     defer sys.deinit();

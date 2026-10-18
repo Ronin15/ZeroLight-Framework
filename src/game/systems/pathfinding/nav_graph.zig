@@ -2147,7 +2147,6 @@ test "incremental nav update remask matches the composed world mask across level
 test "threaded initial nav build matches a serial build across levels" {
     // A build given a thread system dispatches its remask and patch stages through it;
     // pinned to a fixed one-chunk partition here so the stages really fan out.
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2533,7 +2532,6 @@ test "incremental nav update forced-parallel remask and patch match a serial ful
     // unexercised. This pins both: forcing adaptive=false with items_per_range=1 over a multi-chunk
     // dig drives the parallel path (asserted via ran_inline == false for BOTH stages), and the
     // disjoint-window result must still be byte-identical to a fresh serial full rebuild.
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2978,7 +2976,6 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
     // The remask's cell blocks and the patch's records and link slots are reserved on the
     // main thread before dispatch; workers only fill what was claimed. This proves it on a
     // real multi-worker ThreadSystem, with a static collider listed in a remasked chunk.
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -3616,7 +3613,6 @@ test "nav apply runs out of memory at every allocation, leaves each level intact
 }
 
 test "threaded nav apply runs out of memory at every allocation on a multi-worker ThreadSystem and the retry equals a full rebuild" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     for (std.meta.tags(OomEdit)) |edit| try expectNavApplyOutOfMemorySafe(edit, &threads);
@@ -4123,7 +4119,6 @@ test "an all-solid level holds no records; an open level one per chunk" {
 test "the threaded key plan equals the inline plan for marks across many chunks and levels" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4252,7 +4247,6 @@ test "the threaded plan merge equals the sorted unique keys of every stream for 
 test "the threaded key plan equals the inline plan on 65 levels across the plan level set's word boundary" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4329,7 +4323,6 @@ fn expectPlanSetsClear(graph: *const NavGraph) !void {
 }
 
 test "a threaded plan, a level replace, a level append, and a world rebuild each leave every level's plan sets clear and sized to its chunks" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4419,7 +4412,6 @@ fn referencePlan(allocator: std.mem.Allocator, graph: *const NavGraph, world: *c
 }
 
 test "the key plan equals the plan by definition for multi-chunk marks at level edges and new links, inline and threaded" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var data = DataSystem.init(allocator);
     defer data.deinit();

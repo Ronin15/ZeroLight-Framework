@@ -1985,8 +1985,6 @@ test "inline parallel ranges expose stable range indices" {
 }
 
 test "adaptive inline runs as one direct main-thread range" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2014,8 +2012,6 @@ test "adaptive inline runs as one direct main-thread range" {
 }
 
 test "threaded parallel ranges expose stable range indices" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var starts: [16]usize = @splat(std.math.maxInt(usize));
     var ends: [16]usize = @splat(0);
     var context = RangeIndexContext{
@@ -2042,8 +2038,6 @@ test "threaded parallel ranges expose stable range indices" {
 }
 
 test "worker thread parallel for covers every item exactly once" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2066,8 +2060,6 @@ test "worker thread parallel for covers every item exactly once" {
 }
 
 test "parallel for options use provided adaptive work tuner" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2100,8 +2092,6 @@ test "parallel for options use provided adaptive work tuner" {
 }
 
 test "parallel for options record selected adaptive profile" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2133,8 +2123,6 @@ test "parallel for options record selected adaptive profile" {
 }
 
 test "parallel for options record selected inline adaptive profile" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2168,8 +2156,6 @@ test "parallel for options record selected inline adaptive profile" {
 }
 
 test "single selected range runs inline even when worker threads exist" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var hits: [8]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2190,8 +2176,6 @@ test "single selected range runs inline even when worker threads exist" {
 }
 
 test "small measured-expensive batch can activate worker threads" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var hits: [8]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2224,8 +2208,6 @@ test "small measured-expensive batch can activate worker threads" {
 }
 
 test "parallel for options cap active workers and align ranges" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var hits: [256]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2445,7 +2427,6 @@ fn stageTestJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 }
 
 test "run stage with no items selects nothing and leaves the range count untouched" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var tuner = AdaptiveWorkTuner.init(.{});
@@ -2471,7 +2452,6 @@ test "run stage with no dispatch runs one inline range on the calling thread" {
 }
 
 test "run stage on workers writes the dispatched range count before dispatch" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var tuner = AdaptiveWorkTuner.init(.{});
@@ -2486,7 +2466,6 @@ test "run stage on workers writes the dispatched range count before dispatch" {
 }
 
 test "a dispatch worker cap of zero runs inline with workers present, and a cap of one uses one worker" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var tuner = AdaptiveWorkTuner.init(.{});
@@ -2508,7 +2487,6 @@ test "a dispatch worker cap of zero runs inline with workers present, and a cap 
 }
 
 test "round dispatch records one tuner sample per step, and folds inline rounds with no dispatch" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     const round_items = [_]usize{ 10, 12, 8 };
@@ -3866,8 +3844,6 @@ test "batch submission does not allocate after init" {
 }
 
 test "threaded batch submission does not allocate after init" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
         .items_per_range = 16,
@@ -3935,8 +3911,6 @@ fn countParticipantRanges(context: *anyopaque, range: ParallelRange, id: WorkerI
 }
 
 test "per-participant range counts stay exact under heavy claiming" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     const item_count = 4096;
     const worker_count = 7;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -3999,8 +3973,6 @@ fn expectExactFixedBatch(
 }
 
 test "back-to-back threaded dispatches stay exact as worker and range counts cycle" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     const worker_count = 7;
     const max_ranges = 64;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
@@ -4020,8 +3992,6 @@ test "back-to-back threaded dispatches stay exact as worker and range counts cyc
 }
 
 test "every counted worker wakes once and runs its first range at every worker count" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     const worker_count = 23;
     const max_ranges = 4 * (worker_count + 1);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
@@ -4040,8 +4010,6 @@ test "every counted worker wakes once and runs its first range at every worker c
 }
 
 test "back-to-back batches stay exact as the counted set changes out of order with stale permits" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     const worker_count = 15;
     const max_ranges = 2 * (worker_count + 1);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
@@ -4118,7 +4086,6 @@ fn runCompletionOrderBatch(threads: *ThreadSystem, worker_last: bool) !void {
 }
 
 test "a batch main finishes last joins without waiting on the completion event" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 1 });
     defer threads.deinit();
 
@@ -4130,7 +4097,6 @@ test "a batch main finishes last joins without waiting on the completion event" 
 }
 
 test "a batch a worker finishes last wakes main through the completion event" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 1 });
     defer threads.deinit();
 
@@ -4146,8 +4112,6 @@ test "a batch a worker finishes last wakes main through the completion event" {
 }
 
 test "stale wake permits run no batch and decrement nothing, inside or outside a batch" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     const worker_count = 4;
     const range_count = 32;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = worker_count });
@@ -4171,8 +4135,6 @@ test "stale wake permits run no batch and decrement nothing, inside or outside a
 }
 
 test "deinit right after init joins workers with startup and shutdown permits pending" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     for (0..32) |_| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4 });
         threads.deinit();
@@ -4276,7 +4238,6 @@ fn nestedFixedRangeCount(threads: *const ThreadSystem) usize {
 }
 
 test "a nested batch from a worker job runs inline on that worker and covers every item once" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4318,7 +4279,6 @@ fn ownerNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId)
 }
 
 test "a nested batch from the owner's own range runs inline on the main id and warns once" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4386,7 +4346,6 @@ fn shapeNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId)
 }
 
 test "a nested batch keeps a selected profile's range shape and a nested stage selects the untuned shape" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4492,7 +4451,6 @@ fn tunerNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId)
 }
 
 test "a nested batch leaves the stage tuner and the shared tuner untouched" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4518,7 +4476,6 @@ test "a nested batch leaves the stage tuner and the shared tuner untouched" {
 }
 
 test "forced inline batches allocate nothing on a multi-worker system" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4565,7 +4522,6 @@ fn classifyOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId) voi
 // A foreign caller panics (`requireCallerRole`); the panic itself cannot run in-process,
 // so this covers the classification that triggers it.
 test "callers classify as owner, nested participant, or foreign" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var own = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer own.deinit();
     var other = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
@@ -4618,7 +4574,6 @@ fn ownerThreadedNestingOuterJob(context: *anyopaque, range: ParallelRange, id: W
 }
 
 test "a nested batch from the owner's range of a threaded batch runs inline on the main id" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4662,7 +4617,6 @@ fn selectedNestingOuterJob(context: *anyopaque, range: ParallelRange, _: WorkerI
 }
 
 test "a nested run of an owner's tuned selection keeps its aligned range set" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 64 });
     defer threads.deinit();
 
@@ -4738,7 +4692,6 @@ fn roundNestingOuterJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
 }
 
 test "rounds run inside a batch leave the stage tuner unsampled" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
 
@@ -4772,7 +4725,8 @@ test "accumulate batch marks the total forced inline when any batch was" {
 
 test "every woken worker carries its worker name on linux" {
     const builtin = @import("builtin");
-    if (builtin.single_threaded or builtin.os.tag != .linux) return error.SkipZigTest;
+    // Darwin names only the calling thread, so the worker-name check is Linux.
+    if (comptime builtin.os.tag != .linux) return;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
 

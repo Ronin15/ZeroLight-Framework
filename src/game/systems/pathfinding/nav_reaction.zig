@@ -526,7 +526,6 @@ fn navMarkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 // Tests
 // ----------------------------------------------------------------------------------------
 
-const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const EntityId = @import("../../data_system.zig").EntityId;
@@ -1260,7 +1259,6 @@ test "pathfinding threaded incremental nav update is allocation-free at steady s
     // edits in five distinct chunks, adaptive=false/items_per_range=1 to force every stage
     // off the inline path, under a failing allocator on both system.allocator and
     // system.graph.allocator.
-    if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1507,7 +1505,6 @@ fn markEventsForTest(system: *PathfindingSystem, events: []const SimulationEvent
 }
 
 test "threaded nav mark interpretation equals serial for a dense multi-chunk edit with runs straddling ranges and mixed tile and obstacle events" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1542,7 +1539,6 @@ test "threaded nav mark interpretation equals serial for a dense multi-chunk edi
 }
 
 test "a terrain nav record after its reserve allocates nothing inline and on a multi-worker ThreadSystem, threaded equal to inline; an out-of-memory reserve records no mark (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);

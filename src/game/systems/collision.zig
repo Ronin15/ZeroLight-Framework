@@ -1972,7 +1972,6 @@ test "serial contacts equal a brute-force same-level reference in every field an
 }
 
 test "threaded contacts equal the reference across range sizes and worker counts" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     try fillReferenceLayout(&data);
@@ -1981,7 +1980,6 @@ test "threaded contacts equal the reference across range sizes and worker counts
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4, .items_per_range = collision_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     for ([_]usize{ 16, 32, 48, 128 }) |items_per_range| for ([_]usize{ 1, 2, 4 }) |workers| {
         var system = CollisionSystem.init(std.testing.allocator);
         defer system.deinit();
@@ -1993,7 +1991,6 @@ test "threaded contacts equal the reference across range sizes and worker counts
 }
 
 test "fill, sort, broadphase, and narrowphase run on workers" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     try fillReferenceLayout(&data);
@@ -2004,7 +2001,6 @@ test "fill, sort, broadphase, and narrowphase run on workers" {
     defer contacts.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = collision_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
     for ([_]BatchStats{ stats.broadphase_batch, stats.narrowphase_batch }) |batch| {
         try std.testing.expect(!batch.ran_inline);
@@ -2055,13 +2051,11 @@ test "fill lanes write the scalar key for every copy of every body" {
 }
 
 test "warm and cold steps write identical contacts" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     try fillReferenceLayout(&data);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const config: CollisionConfig = .{ .items_per_range = collision_range_alignment_items, .max_worker_threads = 2, .adaptive = false };
 
     var warm = CollisionSystem.init(std.testing.allocator);
@@ -2098,7 +2092,6 @@ test "warm and cold steps write identical contacts" {
 }
 
 test "a fill range past its spill slot replays to the reference contacts" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     // 64 bodies at a 64-body reserve (128-entry bound), four fill ranges of 16. The last 16
     // bodies span three strips each: their third copies spill to slot 3, which `reserve`
     // leaves empty, so the slot grows and the fill replays inside the total bound.
@@ -2116,7 +2109,6 @@ test "a fill range past its spill slot replays to the reference contacts" {
     defer contacts.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
     try std.testing.expectEqual(@as(usize, 96), stats.entry_count);
     try std.testing.expect(stats.entry_count <= system.reserved_entry_bound);
@@ -2144,7 +2136,6 @@ test "a serial fill past its spill slot replays to the reference contacts" {
 }
 
 test "threaded contacts at a non-default strip height equal its reference" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     try fillReferenceLayout(&data);
@@ -2160,13 +2151,11 @@ test "threaded contacts at a non-default strip height equal its reference" {
     defer contacts.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     _ = try system.update(&data, &contacts, &threads, .{ .items_per_range = collision_range_alignment_items, .max_worker_threads = 2, .adaptive = false, .strips = strips });
     try expectSameContacts(expected, contacts.mergedItems());
 }
 
 test "after a spill slot grows, later multi-worker steps allocate nothing" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     // Tall bodies spill past their second strip. The first steps grow the spill slots (the
     // cold order, then the warm one); a step at the same warm order reuses them.
     const body_count: usize = 64;
@@ -2187,7 +2176,6 @@ test "after a spill slot grows, later multi-worker steps allocate nothing" {
     try CollisionSystem.reserveContactStream(&contacts, body_count);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const config: CollisionConfig = .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false };
     for (0..2) |_| _ = try system.update(&data, &contacts, &threads, config);
 
@@ -2206,7 +2194,6 @@ test "after a spill slot grows, later multi-worker steps allocate nothing" {
 }
 
 test "after reserve, a multi-worker step over bodies on two strips allocates nothing" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     // An 8 x 8 grid (pitch 6, size 8) whose lower rows cross the strip edge at 32: within
     // one extra copy per body and four pairs per entry.
     const body_count: usize = 64;
@@ -2226,7 +2213,6 @@ test "after reserve, a multi-worker step over bodies on two strips allocates not
     try CollisionSystem.reserveContactStream(&contacts, body_count);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -2252,8 +2238,6 @@ test "after reserve, a multi-worker step over bodies on two strips allocates not
 }
 
 test "threaded collision matches serial contact order" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var serial_data = DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     var threaded_data = DataSystem.init(std.testing.allocator);
@@ -2279,7 +2263,6 @@ test "threaded collision matches serial contact order" {
         .items_per_range = collision_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     _ = try updateInline(&serial_system, &serial_data, &serial_contacts);
     const threaded_stats = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
@@ -2296,8 +2279,6 @@ test "threaded collision matches serial contact order" {
 }
 
 test "threaded collision records one sample into each stage tuner and none into the shared tuner" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     for (0..64) |index| {
@@ -2312,7 +2293,6 @@ test "threaded collision records one sample into each stage tuner and none into 
     defer contacts.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const stats = try system.update(&data, &contacts, &threads, .{});
     try std.testing.expectEqual(@as(usize, 64), stats.broadphase_batch.item_count);
@@ -2326,8 +2306,6 @@ test "threaded collision records one sample into each stage tuner and none into 
 }
 
 test "threaded collision broadphase overflow-replay matches serial contacts" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var serial_data = DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     var threaded_data = DataSystem.init(std.testing.allocator);
@@ -2357,7 +2335,6 @@ test "threaded collision broadphase overflow-replay matches serial contacts" {
         .items_per_range = collision_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     _ = try updateInline(&serial_system, &serial_data, &serial_contacts);
     const threaded_stats = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
@@ -2433,8 +2410,6 @@ test "thread-written collision range scratch uses cache-line sized slots" {
 }
 
 test "threaded broadphase prewarms empty range buffers before dispatch" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     for (0..64) |index| {
@@ -2452,7 +2427,6 @@ test "threaded broadphase prewarms empty range buffers before dispatch" {
         .items_per_range = collision_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const stats = try system.update(&data, &contacts, &threads, .{
         .items_per_range = collision_range_alignment_items,
@@ -2533,8 +2507,6 @@ test "serial collision broadphase warms clustered overflow without steady state 
 }
 
 test "threaded collision update reuses warmed range scratch without steady state allocation" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     for (0..32) |index| {
@@ -2552,7 +2524,6 @@ test "threaded collision update reuses warmed range scratch without steady state
         .items_per_range = collision_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const warmup = try system.update(&data, &contacts, &threads, .{
         .items_per_range = collision_range_alignment_items,
@@ -2665,7 +2636,6 @@ test "after reserve, threaded broad/narrowphase at 32- then 16-item ranges alloc
     // slots, broadphase slots reserved to the per-range bound for maxRangeCount ranges, the
     // narrowphase staging to the candidate pairs. A sparse chain (each body overlaps only
     // its neighbour) keeps the pair count within the reserved pair capacity.
-    if (builtin.single_threaded) return error.SkipZigTest;
 
     const body_count: usize = 64;
     var data = DataSystem.init(std.testing.allocator);
@@ -2690,7 +2660,6 @@ test "after reserve, threaded broad/narrowphase at 32- then 16-item ranges alloc
     try contacts.reserve(maxRangeCount(body_count, collision_range_alignment_items), body_count);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -2717,7 +2686,6 @@ test "after reserve, ~2 pairs per body on the multi-worker path allocate nothing
     // pairs over 64 bodies, within the per-range slot bound, so the broadphase never
     // replays. The merged candidates, narrowphase staging and tallies must hold them from
     // `reserve` alone, not grow in-stage.
-    if (builtin.single_threaded) return error.SkipZigTest;
 
     const body_count: usize = 64;
     var data = DataSystem.init(std.testing.allocator);
@@ -2744,7 +2712,6 @@ test "after reserve, ~2 pairs per body on the multi-worker path allocate nothing
     try contacts.reserve(maxRangeCount(pair_bound, collision_range_alignment_items), pair_bound);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -2772,7 +2739,6 @@ test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body
     // per item (374 pairs, 3.9 per body). A 2-range partition puts 48 entries (192 pairs) in
     // range 0, a 3-range one 32 (128 pairs): past a slot clamped to the 96-body capacity, so
     // range slots must be reserved per entry, not per body.
-    if (builtin.single_threaded) return error.SkipZigTest;
 
     const body_count: usize = 96;
     var data = DataSystem.init(std.testing.allocator);
@@ -2796,7 +2762,6 @@ test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body
     try CollisionSystem.reserveContactStream(&contacts, body_count);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -2826,7 +2791,6 @@ test "a broadphase slot replay within the total pair bound flags its step" {
     // total bound. The slot grows and the broadphase replays: one flagged step, contacts
     // identical to the serial run. The grown slot then holds the cluster, so the next step
     // flags nothing.
-    if (builtin.single_threaded) return error.SkipZigTest;
 
     const body_count: usize = 64;
     var data = DataSystem.init(std.testing.allocator);
@@ -2854,7 +2818,6 @@ test "a broadphase slot replay within the total pair bound flags its step" {
     try CollisionSystem.reserveContactStream(&contacts, body_count);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const config: CollisionConfig = .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false };
     const replayed = try system.update(&data, &contacts, &threads, config);
@@ -2918,7 +2881,6 @@ test "candidate pairs past the reserved pair bound flag every step on the multi-
     // `reserve(32)` declares a 128-pair bound. 32 bodies each overlapping their next
     // five make 145 pairs, over broadphase ranges of 16: past the bound every step, each
     // flagged. Contacts match the serial run both times.
-    if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2941,7 +2903,6 @@ test "candidate pairs past the reserved pair bound flag every step on the multi-
     defer contacts.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     for (0..2) |_| {
         const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });

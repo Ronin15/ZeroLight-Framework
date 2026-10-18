@@ -4,7 +4,6 @@
 
 const config = @import("../config.zig");
 const math = @import("../core/math.zig");
-const builtin = @import("builtin");
 const std = @import("std");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
@@ -1796,8 +1795,6 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
 }
 
 test "demo owns and completes a simulation frame during update" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -1849,8 +1846,6 @@ test "demo owns and completes a simulation frame during update" {
 }
 
 test "demo queues jet loop audio only on movement edges" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -1909,8 +1904,6 @@ test "demo queues jet loop audio only on movement edges" {
 }
 
 test "demo collision response blocks player against obstacles" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -1951,8 +1944,6 @@ test "demo collision response blocks player against obstacles" {
 }
 
 test "demo ai processor drives non-player squares via intents (seek_target deterministic, 0-worker serial path)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2009,8 +2000,6 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
 }
 
 test "demo collision response handles player contacts with moving entities" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{

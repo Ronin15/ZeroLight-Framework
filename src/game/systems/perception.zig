@@ -2424,7 +2424,6 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
     // multi-worker threaded paths must keep the same single survivor event
     // (row order, `entity_lost` before `entity_perceived` within a row — A's
     // lost, row 0's first write).
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // items_per_range is aligned up to perception_range_alignment_items (16), so
     // a two-observer fixture collapses to one range. Pad with silent fillers so
@@ -2536,7 +2535,6 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
     defer threaded_spatial.deinit();
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = range_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var threaded_sys = PerceptionSystem.init(testing.allocator);
     defer threaded_sys.deinit();
     var threaded_events = SimulationEvents.init(testing.allocator);
@@ -2572,8 +2570,6 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
 }
 
 test "serial and threaded PerceptionSystem updates route through identical math" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var serial_data = DataSystem.init(testing.allocator);
     defer serial_data.deinit();
     var threaded_data = DataSystem.init(testing.allocator);
@@ -2610,7 +2606,6 @@ test "serial and threaded PerceptionSystem updates route through identical math"
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = perception_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var threaded_sys = PerceptionSystem.init(testing.allocator);
     defer threaded_sys.deinit();
@@ -2651,8 +2646,6 @@ test "serial and threaded PerceptionSystem updates route through identical math"
 }
 
 test "threaded PerceptionSystem update records one sample into the compute tuner and none into the shared tuner" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     for (0..8) |h| {
@@ -2672,7 +2665,6 @@ test "threaded PerceptionSystem update records one sample into the compute tuner
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var sys = PerceptionSystem.init(testing.allocator);
     defer sys.deinit();
@@ -2768,7 +2760,6 @@ test "PerceptionSystem think-set gather over a halo index has no steady-state al
 }
 
 test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Nothing partition-sized is left to reserve, so `reserve`
     // alone (no warm step) covers the tuner's 64-item initial profile and the
@@ -2796,7 +2787,6 @@ test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = perception_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var sys = PerceptionSystem.init(testing.allocator);
     defer sys.deinit();

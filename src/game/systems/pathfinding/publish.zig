@@ -386,7 +386,6 @@ fn registryFlushJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
 
 const test_support = @import("test_support.zig");
 const updatePathfindingInline = @import("test_support.zig").updatePathfindingInline;
-const builtin = @import("builtin");
 const stamped_table = @import("../../stamped_table.zig");
 const math = @import("../../../core/math.zig");
 const DataSystem = @import("../../data_system.zig").DataSystem;
@@ -653,7 +652,6 @@ test "re-putting a key replaces its registrations" {
 }
 
 test "threaded publish equals serial across range sizes and worker counts (cache bytes and per-shard lists), and publish_copy and registry_flush run on workers" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -677,7 +675,6 @@ test "threaded publish equals serial across range sizes and worker counts (cache
     for ([_]usize{ 1, 3 }) |workers| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
         defer threads.deinit();
-        if (threads.workerThreadCount() == 0) return error.SkipZigTest;
         for ([_]usize{ 1, 3, 8 }) |items_per_range| {
             var threaded = try registrySystemWith(&data, &fixture.world, 64, .{ .stored_path_cells = 8, .participants = threads.participantSlotCount() });
             defer threaded.deinit();
@@ -692,7 +689,6 @@ test "threaded publish equals serial across range sizes and worker counts (cache
 }
 
 test "publish after its reserve allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -702,7 +698,6 @@ test "publish after its reserve allocates nothing on a multi-worker ThreadSystem
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var system = try registrySystemWith(&data, &fixture.world, 64, .{ .stored_path_cells = 8, .participants = threads.participantSlotCount() });
     defer system.deinit();
     // One publish of the routes reserves the registry, its windows, and long pages; cleared,
@@ -752,7 +747,6 @@ fn shrinkThroughUpdates(serial: *PathfindingSystem, threaded: *PathfindingSystem
 }
 
 test "a shrink's registry flush runs on workers at about one pair per range under the adaptive control, renames included, and equals the serial flush" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -762,7 +756,6 @@ test "a shrink's registry flush runs on workers at about one pair per range unde
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var serial = try shrinkFixture(&data, &fixture, requester, 1);
     defer serial.deinit();
     var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
@@ -790,7 +783,6 @@ test "a shrink's registry flush runs on workers at about one pair per range unde
 }
 
 test "a shrink's registry flush keeps a configured range size and equals the serial flush" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -800,7 +792,6 @@ test "a shrink's registry flush keeps a configured range size and equals the ser
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var serial = try shrinkFixture(&data, &fixture, requester, 1);
     defer serial.deinit();
     var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());

@@ -2,7 +2,6 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-const builtin = @import("builtin");
 const std = @import("std");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const data = @import("../data_system.zig");
@@ -352,8 +351,6 @@ test "serial movement uses simd lanes and scalar tails like scalar integration" 
 }
 
 test "threaded movement matches serial movement" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var threaded_data = data.DataSystem.init(std.testing.allocator);
     defer threaded_data.deinit();
     var serial_data = data.DataSystem.init(std.testing.allocator);
@@ -384,7 +381,6 @@ test "threaded movement matches serial movement" {
 }
 
 test "threaded movement matches serial across multiple range splits and worker counts" {
-    if (builtin.single_threaded) return error.SkipZigTest;
 
     // The single-split parity test above pins one fixed split; the AdaptiveWorkTuner
     // instead picks range/worker counts dynamically, and its probe-driven choice is not
@@ -402,7 +398,6 @@ test "threaded movement matches serial across multiple range splits and worker c
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const splits = [_]struct { items_per_range: usize, workers: usize }{
         .{ .items_per_range = data.movement_range_alignment_items, .workers = 2 },
@@ -429,8 +424,6 @@ test "threaded movement matches serial across multiple range splits and worker c
 }
 
 test "movement explicit items_per_range bypasses tuner" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var game_data = data.DataSystem.init(std.testing.allocator);
     defer game_data.deinit();
     try fillMovementData(&game_data, data.movement_range_alignment_items * 8);
@@ -456,8 +449,6 @@ test "movement explicit items_per_range bypasses tuner" {
 }
 
 test "movement system owns adaptive tuner for default update" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var game_data = data.DataSystem.init(std.testing.allocator);
     defer game_data.deinit();
     try fillMovementData(&game_data, data.movement_range_alignment_items * 8);
@@ -467,7 +458,6 @@ test "movement system owns adaptive tuner for default update" {
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var system = MovementSystem.init();
     var slice = game_data.movementBodySlice();
@@ -557,8 +547,6 @@ test "warmed movement update does not allocate" {
 }
 
 test "threaded multi-worker movement update has no steady-state allocation after warmup (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var game_data = data.DataSystem.init(std.testing.allocator);
     defer game_data.deinit();
     try fillMovementData(&game_data, data.movement_range_alignment_items * 8);
@@ -568,7 +556,6 @@ test "threaded multi-worker movement update has no steady-state allocation after
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var system = MovementSystem.init();
     var slice = game_data.movementBodySlice();
@@ -760,8 +747,6 @@ test "applied intents set velocity from direction and speed, default speed when 
 }
 
 test "threaded intent apply matches serial across range splits and worker counts" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     const agent_count = data.movement_range_alignment_items * 8 + 3;
     var serial = try initIntentFixture(agent_count, true);
     defer serial.deinit();
@@ -772,7 +757,6 @@ test "threaded intent apply matches serial across range splits and worker counts
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const splits = [_]struct { items_per_range: usize, workers: usize }{
         .{ .items_per_range = data.movement_range_alignment_items, .workers = 2 },
@@ -809,8 +793,6 @@ test "intent lanes match the scalar apply bit for bit" {
 }
 
 test "threaded multi-worker intent apply allocates nothing after warmup (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var fixture = try initIntentFixture(data.movement_range_alignment_items * 8, true);
     defer fixture.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -818,7 +800,6 @@ test "threaded multi-worker intent apply allocates nothing after warmup (Failing
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var system = MovementSystem.init();
     const config = MovementConfig{
@@ -847,8 +828,6 @@ test "threaded multi-worker intent apply allocates nothing after warmup (Failing
 }
 
 test "intent apply records into its own tuner" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var fixture = try initIntentFixture(data.movement_range_alignment_items * 8, false);
     defer fixture.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -856,7 +835,6 @@ test "intent apply records into its own tuner" {
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var system = MovementSystem.init();
     _ = system.applyIntents(&fixture.game_data, &fixture.frame, &threads, .{ .max_worker_threads = 2 });

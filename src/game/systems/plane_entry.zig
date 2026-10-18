@@ -692,7 +692,6 @@ test "plane entry gather: serial, inline, and threaded entries and stage results
     if (builtin.single_threaded) return;
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return;
     for ([_]usize{ 16, 32, 64 }) |items_per_range| {
         var outcome = try runParityStage(population, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false }, want);
         defer outcome.deinit();
@@ -841,7 +840,6 @@ test "plane entry gather never yields the player, even as an AI agent; the stage
 }
 
 test "warmed plane entry gather allocates nothing on real workers (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     // Not a range multiple, so the last range is a short tail.
     const population = plane_entry_range_alignment_items * 8 + 3;
@@ -857,7 +855,6 @@ test "warmed plane entry gather allocates nothing on real workers (FailingAlloca
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var system = PlaneEntrySystem.init(allocator);
     defer system.deinit();
     try system.reserve(population);

@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
-const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const rng = @import("../../core/rng.zig");
@@ -1560,14 +1559,11 @@ test "ai production adaptive tuners use central gate and range alignment" {
 // stay inline on any host and build mode; the wiring under test is that each stage
 // dispatches through its own tuner.
 test "ai stages stay inline when their batches sit below their tuner gate" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 8,
         .items_per_range = 1,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1608,13 +1604,11 @@ test "ai stages stay inline when their batches sit below their tuner gate" {
 }
 
 test "ai processor uses committed adaptive threaded profiles with default thread worker config" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
         .items_per_range = 1,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1663,11 +1657,8 @@ test "ai processor uses committed adaptive threaded profiles with default thread
 }
 
 test "ai update records one sample into each stage tuner and none into the shared tuner" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1862,8 +1853,6 @@ test "ai processor no steady-state allocation (FailingAllocator)" {
 }
 
 test "ai threaded multi-worker update has no steady-state allocation after warmup (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
     for (0..64) |i| {
@@ -1888,7 +1877,6 @@ test "ai threaded multi-worker update has no steady-state allocation after warmu
         .items_per_range = ai_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
@@ -2430,7 +2418,6 @@ test "ai gather direct table and separation blend produce correct order + dirs (
 }
 
 test "ai serial and threaded produce identical intents with separation + seek_target" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     // Two DataSystems: arbitration write-back mutates sticky columns, so serial
     // and threaded must start from identical unmutated state.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -2468,7 +2455,6 @@ test "ai serial and threaded produce identical intents with separation + seek_ta
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var threaded_frame = SimulationFrame.init(std.testing.allocator);
     defer threaded_frame.deinit();
     try threaded_frame.reserveStreams(8, 0, agent_count, 0, 0, 0);
@@ -2537,8 +2523,6 @@ fn fillParityAgents(data: *DataSystem) !void {
 const SimulationScopeSystem = @import("simulation_scope.zig").SimulationScopeSystem;
 
 test "ai serial and real threaded workers produce identical rows and intents on cell-major rows at every range size" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var serial_data = DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     try fillParityAgents(&serial_data);
@@ -2569,7 +2553,6 @@ test "ai serial and real threaded workers produce identical rows and intents on 
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     for ([_]usize{ 1, 4, 16 }) |items_per_range| {
         // Arbitration writes sticky columns back, so each run starts from fresh state.
@@ -2620,13 +2603,11 @@ test "ai serial and real threaded workers produce identical rows and intents on 
 }
 
 test "the threaded gather writes every row the serial gather does, skipping bodiless rows" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     try fillParityAgents(&data);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const inputs = AiGatherInputs{ .ai_slice = data.aiAgentSliceConst(), .movement = data.movementBodySliceConst(), .data = &data, .focus_target = .{ .x = 1, .y = 2 }, .focus_entity = EntityId.invalid };
 
     var serial_ai = AiSystem.init(std.testing.allocator);
@@ -3319,7 +3300,6 @@ test "ai memory override does not apply while perception still reports the targe
 }
 
 test "ai serial and threaded agree on a memory-overridden seek target" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     // Two DataSystems: arbitration write-back mutates sticky columns.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
@@ -3364,7 +3344,6 @@ test "ai serial and threaded agree on a memory-overridden seek target" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var threaded_ai = AiSystem.init(std.testing.allocator);
     defer threaded_ai.deinit();
     var threaded_frame = SimulationFrame.init(std.testing.allocator);
@@ -3531,7 +3510,6 @@ test "invalid pursue goal writes wander active_behavior so fatigue does not trea
 }
 
 test "arbitration serial and threaded parity across perception + memory + affect signals" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     // Two DataSystems: arbitration write-back mutates sticky columns.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
@@ -3602,7 +3580,6 @@ test "arbitration serial and threaded parity across perception + memory + affect
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var threaded_ai = AiSystem.init(std.testing.allocator);
     defer threaded_ai.deinit();
     var threaded_frame = SimulationFrame.init(std.testing.allocator);

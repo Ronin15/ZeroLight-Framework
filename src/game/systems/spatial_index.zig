@@ -2105,11 +2105,8 @@ fn testStages(threads: *ThreadSystem, tuners: *[3]AdaptiveWorkTuner, workers: us
 }
 
 test "serial and threaded index builds match across layouts, splitters, range sizes, and worker counts" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3, .items_per_range = 16 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     for (std.meta.tags(TestLayout)) |layout| {
         var data = DataSystem.init(testing.allocator);
@@ -2168,11 +2165,8 @@ test "serial and threaded index builds match across layouts, splitters, range si
 }
 
 test "the threaded index splits a one-row corridor, a cluster with a far outlier, and a one-row-part crowd across bands" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     for ([_]TestLayout{ .one_row, .cluster_outlier, .dense_row_part }) |layout| {
         var data = DataSystem.init(testing.allocator);
@@ -2228,11 +2222,8 @@ fn setTestPhases(data: *DataSystem) !void {
 }
 
 test "serial and threaded builds over population rows match, each entry carrying its row and cognition phase" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
@@ -3343,7 +3334,6 @@ test "the index builds correctly above a small reserved capacity" {
 
 test "after reserve and reserveGeometry, threaded builds at 2 and 4 partitions per stage, a serial build, and queries allocate nothing" {
     // No warm build: the reserves alone cover every partition the tuners can pick.
-    if (builtin.single_threaded) return error.SkipZigTest;
 
     // One body per cell, so the link stage partitions like the others.
     const population_count: usize = 64;
@@ -3359,7 +3349,6 @@ test "after reserve and reserveGeometry, threaded builds at 2 and 4 partitions p
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
     // Without real workers the threaded build runs serially and this proof passes falsely.
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var reference = SpatialIndexSystem.init(testing.allocator);
     defer reference.deinit();

@@ -8,7 +8,6 @@
 //! global scheduler or dynamic system registry.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const math = @import("../core/math.zig");
 const logging = @import("../core/logging.zig");
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
@@ -1725,8 +1724,6 @@ test "stage contracts split event families and carry out-of-graph inputs" {
 }
 
 test "pipeline updates full active player-only state through serial path" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -1774,7 +1771,6 @@ test "pipeline updates full active player-only state through serial path" {
 }
 
 test "pipeline commits the dig stage's world edit before plane traversal reads it in the same step" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Both stages declare `world_tiles` (dig writes, plane_traversal reads), so
     // the comptime reads-before-writes check already requires dig first. This
@@ -1860,7 +1856,6 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
 }
 
 test "pipeline update after reserve allocates nothing on frame streams with dig, fall, and contact" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Same dig-then-fall fixture as the causal order test, plus an overlapping
     // pair at the origin so collision writes a contact. The pair sits off the
@@ -2022,8 +2017,6 @@ test "eventCapacitySum equals capacity_limit after reserve" {
 }
 
 test "pipeline resamples AI wander direction across fixed steps" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -2114,8 +2107,6 @@ test "pipeline syncs movement previous positions" {
 }
 
 test "pipeline runs ai_memory after perception and before ai, feeding memory into AI's cold-pursue retarget" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data); // Spawns at (400, 225).
@@ -2190,8 +2181,6 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
 }
 
 test "pipeline does not retarget a cold agent toward memory of an entity other than the current focus entity" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data); // Spawns at (400, 225); this is the pipeline's focus_entity.
@@ -2261,8 +2250,6 @@ test "pipeline does not retarget a cold agent toward memory of an entity other t
 }
 
 test "pipeline runs affect after perception and ai_memory, before ai" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -2340,8 +2327,6 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
 }
 
 test "pipeline fear selects flee before movement, not only a positive drive" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -2410,8 +2395,6 @@ test "pipeline fear selects flee before movement, not only a positive drive" {
 }
 
 test "pipeline perception acquire refreshes memory last_known the same step" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -2481,8 +2464,6 @@ test "pipeline perception acquire refreshes memory last_known the same step" {
 }
 
 test "chunk_derive matches the pose after a contact push crosses a chunk boundary" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -2557,8 +2538,6 @@ test "chunk_derive matches the pose after a contact push crosses a chunk boundar
 }
 
 test "pipeline resolves an aggressive non-player entity's pursue goal to another non-player entity, not the player" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -3555,7 +3534,6 @@ fn runContactBoundScenario(mode: CollisionResponseMode) !void {
     defer frame.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .movement_body_capacity = 4,
@@ -4002,8 +3980,6 @@ test "player tile gate slides along solid dirt and is a no-op on the surface" {
 }
 
 test "pipeline skips NPC plane traversal for dormant tier but still falls active-tier NPCs" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
@@ -4114,8 +4090,6 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
 }
 
 test "pipeline runs the perception stage scoped to cognition-tier ai agents without perturbing movement/ai" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -4197,7 +4171,6 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
 }
 
 test "simulation scope region ignores the render visibility window" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Run A rewrites the render window between steps as varying-alpha render
     // frames would; run B never renders. Cognition region, think set, stagger
@@ -4208,8 +4181,6 @@ test "simulation scope region ignores the render visibility window" {
 }
 
 test "pipeline dual-list perception: think observer acquires off-phase halo hostile" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -4310,8 +4281,6 @@ test "pipeline dual-list perception: think observer acquires off-phase halo host
 }
 
 test "default-config pipeline publishes every perception acquisition and refreshes memory" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -4358,8 +4327,6 @@ test "default-config pipeline publishes every perception acquisition and refresh
 }
 
 test "derived perception share covers an identity swap for every observer" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -4431,8 +4398,6 @@ test "derived affect share is the drive count times AiAffect rows" {
 }
 
 test "perception share grows at the seam so newly created observers never truncate" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -4506,7 +4471,6 @@ test "perception share grows at the seam so newly created observers never trunca
 }
 
 test "pipeline commits the dig stage's world edit before the tile gate reads walkability in the same step" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Both stages declare `world_tiles` (dig writes, bounds_and_tile_gate reads),
     // so the comptime check requires dig first. This causal test proves the real
@@ -4604,7 +4568,6 @@ test "stageContract declares world_tiles reads for gate, plane traversal, and pe
 }
 
 test "pipeline tile gate after collision response rejects contact push into solid underground dirt" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Causal: collision_respond can push a body into solid underground tiles.
     // bounds_and_tile_gate must run AFTER response so the end-of-step pose is
@@ -4689,7 +4652,6 @@ test "pipeline tile gate after collision response rejects contact push into soli
 }
 
 test "pipeline chunk_derive after collision pose settle matches settled world position" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Causal: chunk_derive must run AFTER collision_respond (and gate/plane) so
     // scope chunk columns match the settled pose. If derive ran before response,
@@ -4778,8 +4740,6 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
 }
 
 test "pipeline scope chunks and nav chunks are the world's chunks" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
@@ -4845,7 +4805,6 @@ test "pipeline scope chunks and nav chunks are the world's chunks" {
 }
 
 test "pipeline plane traversal batches fall landing tile events into one range" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Two NPCs fall through surface holes in the same step; both landing carves
     // must publish as world_tile_changed events that share ONE events range
@@ -5166,7 +5125,6 @@ test "plane traversal multi-fall after its reserve commits and publishes allocat
 }
 
 test "pipeline commits the dig stage's stimulus before perception reads it in the same step" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // `dig_world_edit` appends a `.dig` `WorldStimulus` to `frame.stimuli`, which
     // `perception_update` consumes for hearing. The two share no tracked
@@ -5243,8 +5201,6 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
 }
 
 test "pipeline promotes deferred impacts before perception on the following step" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -5318,8 +5274,6 @@ test "pipeline promotes deferred impacts before perception on the following step
 }
 
 test "pipeline defers player collision impacts until the next step" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -5413,8 +5367,6 @@ test "pipeline defers player collision impacts until the next step" {
 }
 
 test "head-on player impact enqueues even after collision response zeroes approach velocity" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -5492,8 +5444,6 @@ test "head-on player impact enqueues even after collision response zeroes approa
 }
 
 test "pipeline emits player footstep stimulus before perception in the same step" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -6015,8 +5965,6 @@ test "captureActionIntent keeps latch open when tryAppend soft-drops" {
 }
 
 test "captureActionIntent then pipeline.update reports action_intents_consumed" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -6104,8 +6052,6 @@ test "captureActionIntent soft-drop recovers after beginStep while held" {
 }
 
 test "pipeline.update reports action_intents_dropped after capture soft-drop" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -6203,8 +6149,6 @@ test "standing player collision does not enqueue deferred impact without motion"
 }
 
 test "sticky dig linger reaches every stagger phase within the linger window" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
@@ -6536,19 +6480,16 @@ test "population seam grows every pipeline capacity so the next step allocates n
 }
 
 test "population growth on the multi-worker path allocates nothing on the first step after growth" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     _ = try runPopulationGrowthScenario(2, true, null);
 }
 
 test "a partition retune after population growth allocates nothing" {
     // 2 workers at 32-item ranges, then re-pinned to 16-item ranges (2 -> 3 ranges at
     // 37 bodies): no per-range output warms in-stage on the new partition.
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     _ = try runPopulationGrowthScenario(2, true, .{ .worker_threads = 2, .items_per_range = 16 });
 }
 
 test "population growth scenario is identical on the serial and multi-worker paths" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const serial = try runPopulationGrowthScenario(0, false, null);
     const threaded = try runPopulationGrowthScenario(2, false, null);
     try std.testing.expectEqual(serial.world_tile_changed, threaded.world_tile_changed);
@@ -6559,13 +6500,11 @@ test "population growth scenario is identical on the serial and multi-worker pat
 }
 
 test "a pathing crowd grown at the population seam keeps its first step's growth to the counted path registry, then runs goal resolve, path intake and registry flush threaded allocating nothing" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     try runPathingCrowdGrowthScenario(16, .{ .worker_threads = 2, .items_per_range = 16 });
 }
 
 test "a partition retune after a pathing crowd grows runs goal resolve, path intake and registry flush threaded allocating nothing" {
     // 22 items: one 32-item range, then two 16-item ranges.
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     try runPathingCrowdGrowthScenario(32, .{ .worker_threads = 2, .items_per_range = 16 });
 }
 
@@ -6574,7 +6513,6 @@ test "after population growth the seam's stream range counts are the binding res
     // the ranges. Seven bodies (player, five walls, a crate) grow by 25 pursuers to 32
     // rows (capacity 64), then 32 more fill the capacity without another growth, so on a
     // 16-item partition every producer appends its bound's ranges.
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var world = WorldSystem{
         .allocator = std.testing.allocator,
         .width = 25,
@@ -6678,7 +6616,6 @@ test "after population growth the seam's stream range counts are the binding res
 }
 
 test "the AI movement intent apply runs on workers in the pipeline, allocation-free and matching the serial step" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const serial = try runApplyIntentsScenario(0);
     const threaded = try runApplyIntentsScenario(2);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_x), std.mem.sliceAsBytes(&threaded.velocity_x));
@@ -6686,8 +6623,6 @@ test "the AI movement intent apply runs on workers in the pipeline, allocation-f
 }
 
 test "production steps on workers record nothing into the thread system's shared tuner" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -6714,7 +6649,6 @@ test "production steps on workers record nothing into the thread system's shared
     defer frame.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{
         .contact_capacity = body_count * 8,
         .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
@@ -6758,17 +6692,14 @@ test "production steps on workers record nothing into the thread system's shared
 }
 
 test "after population growth, ~2 solid contacts per body on the multi-worker path allocate nothing" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     try runContactBoundScenario(.solid);
 }
 
 test "after population growth, ~2 trigger contacts per body on the multi-worker path allocate nothing" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     try runContactBoundScenario(.trigger);
 }
 
 test "collision response runs on workers in the pipeline, allocation-free and matching the serial step" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const serial = try runCollisionRespondScenario(0);
     const threaded = try runCollisionRespondScenario(2);
     try std.testing.expectEqual(serial.intent_count, threaded.intent_count);
@@ -6900,10 +6831,8 @@ test "population sync that runs out of memory growing pathfinding keeps the old 
 }
 
 test "a pipeline built over steering agents sizes pathfinding for them, so its first update allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 8 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const agent_count = 40;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -7046,7 +6975,6 @@ test "a collider sync that runs out of memory keeps its change and the next step
 }
 
 test "a nav-mark reserve OOM before a dig leaves world and nav intact and the retry applies it" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: NavSeamFixture = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -7076,7 +7004,6 @@ test "a nav-mark reserve OOM before a dig leaves world and nav intact and the re
 }
 
 test "a nav-mark reserve OOM before plane traversal leaves world and nav intact and the retry applies it" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: NavSeamFixture = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -7118,7 +7045,6 @@ test "a nav-mark reserve OOM before plane traversal leaves world and nav intact 
 }
 
 test "a plane traversal past a failed population seam reserves its nav record from its carves and the seam then matches a rebuild" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: NavSeamFixture = undefined;
     try fixture.init(.{
         .tiles_per_side = 16,
@@ -7206,7 +7132,6 @@ test "a plane traversal past a failed population seam reserves its nav record fr
 }
 
 test "a dig whose step fails before the commit seam reaches nav at the next seam" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: NavSeamFixture = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -7224,7 +7149,6 @@ test "a dig whose step fails before the commit seam reaches nav at the next seam
 }
 
 test "a collider-sync OOM in a dig step still applies the dig the next step" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: NavSeamFixture = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -7254,7 +7178,6 @@ test "a collider-sync OOM in a dig step still applies the dig the next step" {
 }
 
 test "a static nav-mark reserve OOM commits nothing and the retried commit reaches nav" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: NavSeamFixture = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -7281,7 +7204,6 @@ test "a static nav-mark reserve OOM commits nothing and the retried commit reach
 }
 
 test "a nav apply OOM keeps the step's dig and static marks and the next step applies both" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: NavSeamFixture = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -7647,7 +7569,6 @@ test "the goal resolve stage writes path_goals, read by steering's status querie
 }
 
 test "a crowd pursuing a blocked goal whose projection is sealed reads it unavailable on the first step, with one shared projection and no request" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     // The crowd's goal: the focus target, the player at (400, 225), nav cell (12, 7). A 3x3

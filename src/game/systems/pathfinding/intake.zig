@@ -546,7 +546,6 @@ const intake_table_requests: usize = 15;
 test "threaded request intake equals serial intake across range sizes and worker counts" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     try addIntakeBodies(&data);
@@ -645,7 +644,6 @@ fn repeatsTestSystem(data: *const DataSystem, participant_count: usize, filler: 
 }
 
 test "threaded intake folds a new goal's repeats per range and equals serial when accepted and when pending is full" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const requester = try data.createEntity();
@@ -720,10 +718,8 @@ test "intake cell conversion in four lanes equals worldToCellClamped" {
 }
 
 test "request intake after reserve allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 8 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     try addIntakeBodies(&data);

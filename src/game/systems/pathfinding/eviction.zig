@@ -428,7 +428,6 @@ const updatePathfindingInline = @import("test_support.zig").updatePathfindingInl
 const PathStatus = @import("types.zig").PathStatus;
 const GroupFieldState = @import("group_field.zig").GroupFieldState;
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
-const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
@@ -722,7 +721,6 @@ const dense_change_cells = blk: {
 };
 
 test "eviction allocates nothing after its pre-commit reserve on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -732,7 +730,6 @@ test "eviction allocates nothing after its pre-commit reserve on a multi-worker 
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var system = try registrySystem(&data, &fixture.world, 64);
     defer system.deinit();
     system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
@@ -807,7 +804,6 @@ test "an eviction reserve out of memory leaves graph, cache, registry, and marks
 test "threaded eviction equals serial over a dense region (bounds, flags, hits, cache bytes), and the eviction stages run on workers" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -817,7 +813,6 @@ test "threaded eviction equals serial over a dense region (bounds, flags, hits, 
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var serial = try registrySystem(&data, &fixture.world, 64);
     defer serial.deinit();
     var threaded = try registrySystem(&data, &fixture.world, 64);
@@ -1006,7 +1001,6 @@ const pocket_change_cells = blk: {
 test "threaded eviction with paths and fields equals serial over a dense change (bounds, flags, hits), and runs on workers" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1016,7 +1010,6 @@ test "threaded eviction with paths and fields equals serial over a dense change 
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var systems: [2]PathfindingSystem = undefined;
     var built: usize = 0;
     defer for (systems[0..built]) |*system| system.deinit();
@@ -1054,14 +1047,12 @@ test "threaded eviction with paths and fields equals serial over a dense change 
 }
 
 test "a nav worker cap of zero keeps the mark and eviction stages inline on a multi-worker ThreadSystem and changes no result" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     // Uncapped first, then capped: a fixed partition that runs every stage on workers
     // unless the cap holds it inline.
     const caps = [_]?usize{ null, 0 };
@@ -1114,7 +1105,6 @@ test "a nav worker cap of zero keeps the mark and eviction stages inline on a mu
 }
 
 test "eviction with paths and fields allocates nothing after its pre-commit reserve on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1124,7 +1114,6 @@ test "eviction with paths and fields allocates nothing after its pre-commit rese
     const requester = try data.createEntity();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var system = try evictionFixture(&data, &fixture, requester, threads.participantSlotCount(), 32);
     defer system.deinit();
     system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };

@@ -19,7 +19,6 @@
 //! tally, and the main thread compacts or streams the windows in range order.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const simd = @import("../../core/simd.zig");
 const math = @import("../../core/math.zig");
@@ -1136,12 +1135,10 @@ test "deriveChunks recomputes every row's chunk from its settled position" {
 }
 
 test "threaded deriveChunks matches serial across the range block and tail" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = scope_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const grid = SimulationScopeSystem.ChunkGrid{ .tile_size = 32, .chunk_size_tiles = 8, .width = 256, .height = 256 };
     const count = scope_range_alignment_items * 8 + 3; // multi-range block + scalar tail
@@ -1183,12 +1180,10 @@ test "threaded deriveChunks matches serial across the range block and tail" {
 }
 
 test "threaded deriveChunks records one sample into its own tuner and none into the shared tuner" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var data = DataSystem.init(allocator);
     defer data.deinit();
@@ -1210,7 +1205,6 @@ test "threaded deriveChunks records one sample into its own tuner and none into 
 }
 
 test "scoped collision excludes kinematic and dormant bodies from contacts" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const collision = @import("collision.zig");
     const CollisionContact = @import("../simulation.zig").CollisionContact;
@@ -1420,7 +1414,6 @@ fn fillParityPopulation(data: *DataSystem, count: usize) !void {
 }
 
 test "threaded ai gather and think set match serial" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var data = DataSystem.init(allocator);
@@ -1429,7 +1422,6 @@ test "threaded ai gather and think set match serial" {
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const fixed = ScopeConfig{ .items_per_range = scope_range_alignment_items, .max_worker_threads = 2, .adaptive = false };
 
     var serial_sys = SimulationScopeSystem.init(allocator);
@@ -1453,7 +1445,6 @@ test "threaded ai gather and think set match serial" {
 }
 
 test "threaded tier policy matches serial" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var data = DataSystem.init(allocator);
@@ -1469,7 +1460,6 @@ test "threaded tier policy matches serial" {
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var visible = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 2, .y = 8 });
     visible.level = 0;
@@ -1498,7 +1488,6 @@ test "threaded tier policy matches serial" {
 }
 
 test "real worker threads match serial across every scope pass" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var data = DataSystem.init(allocator);
@@ -1517,7 +1506,6 @@ test "real worker threads match serial across every scope pass" {
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = scope_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 2, .y = 8 });
     const fixed = ScopeConfig{ .items_per_range = scope_range_alignment_items, .max_worker_threads = 2, .adaptive = false };
@@ -1567,7 +1555,6 @@ test "thread-written scope range tallies use cache-line sized slots" {
 }
 
 test "warmed scope threaded gathers and tier policy do not allocate (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var data = DataSystem.init(allocator);
@@ -1656,7 +1643,6 @@ test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges
     // `reserve` alone (no warm pass) covers every partition the tuner can
     // pick, because each pass writes per-range windows of one item-count buffer and the
     // tallies are reserved to maxRangeCount. A retune to more ranges allocates nothing.
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
     var data = DataSystem.init(allocator);
@@ -1675,7 +1661,6 @@ test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const ai_region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
     var visible_region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 2, .y = 8 });
@@ -1876,7 +1861,6 @@ fn bruteForceThinkSet(data: *const DataSystem, view: SpatialIndexView, halo: []c
 }
 
 test "the think set is the halo's phase set in the index's cell-major order, serial and threaded" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var data = DataSystem.init(allocator);
     defer data.deinit();
@@ -1896,7 +1880,6 @@ test "the think set is the halo's phase set in the index's cell-major order, ser
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 4 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var threaded_sys = SimulationScopeSystem.init(allocator);
     defer threaded_sys.deinit();
 
@@ -1922,7 +1905,6 @@ test "the think set is the halo's phase set in the index's cell-major order, ser
 }
 
 test "a one-chunk crowd's think set splits across ranges and workers, equal to the halo's phase set" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var data = DataSystem.init(allocator);
     defer data.deinit();
@@ -1937,7 +1919,6 @@ test "a one-chunk crowd's think set splits across ranges and workers, equal to t
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 4 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var threaded_sys = SimulationScopeSystem.init(allocator);
     defer threaded_sys.deinit();
 
@@ -1981,7 +1962,6 @@ test "the think set reads the phases the index was built with" {
 }
 
 test "after reserve, the threaded think set at 32- then 16-item ranges allocates nothing" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var data = DataSystem.init(allocator);
     defer data.deinit();
@@ -1989,7 +1969,6 @@ test "after reserve, the threaded think set at 32- then 16-item ranges allocates
     try fillCognitionPopulation(&data, population);
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var sys = SimulationScopeSystem.init(allocator);
     defer sys.deinit();

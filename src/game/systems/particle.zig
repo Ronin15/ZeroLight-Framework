@@ -6,7 +6,6 @@
 //! This system intentionally owns its own fixed-capacity SoA pool because
 //! particles are visual effect state, not persistent DataSystem entities.
 
-const builtin = @import("builtin");
 const std = @import("std");
 const config = @import("../../config.zig");
 const math = @import("../../core/math.zig");
@@ -721,8 +720,6 @@ test "serial particle simd path matches scalar path" {
 }
 
 test "threaded particle update matches serial update" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var threaded_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = particle_range_alignment_items * 8 });
     defer threaded_particles.deinit();
     var serial_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = particle_range_alignment_items * 8 });
@@ -749,7 +746,6 @@ test "threaded particle update matches serial update" {
 }
 
 test "threaded particle update matches serial across multiple range splits and worker counts" {
-    if (builtin.single_threaded) return error.SkipZigTest;
 
     // The single-split parity test above pins one fixed split; the AdaptiveWorkTuner
     // instead picks range/worker counts dynamically, and its probe-driven choice is not
@@ -766,7 +762,6 @@ test "threaded particle update matches serial across multiple range splits and w
         .items_per_range = particle_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const splits = [_]struct { items_per_range: usize, workers: usize }{
         .{ .items_per_range = particle_range_alignment_items, .workers = 2 },
@@ -791,8 +786,6 @@ test "threaded particle update matches serial across multiple range splits and w
 }
 
 test "particle explicit items_per_range bypasses tuner" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = particle_range_alignment_items * 8 });
     defer particles.deinit();
     fillParticles(&particles, particle_range_alignment_items * 8);
@@ -816,8 +809,6 @@ test "particle explicit items_per_range bypasses tuner" {
 }
 
 test "particle system owns adaptive tuner for default update" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = particle_range_alignment_items * 8 });
     defer particles.deinit();
     fillParticles(&particles, particle_range_alignment_items * 8);
@@ -827,7 +818,6 @@ test "particle system owns adaptive tuner for default update" {
         .items_per_range = particle_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const stats = particles.update(&threads, 0.25, .{ .max_worker_threads = 2 });
 
@@ -895,8 +885,6 @@ test "warmed particle update and emission do not allocate" {
 }
 
 test "threaded multi-worker particle update has no steady-state allocation after warmup (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     const count = particle_range_alignment_items * 8;
     var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = count });
     defer particles.deinit();
@@ -907,7 +895,6 @@ test "threaded multi-worker particle update has no steady-state allocation after
         .items_per_range = particle_range_alignment_items,
     });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const warmup = particles.update(&threads, 0.016, .{
         .items_per_range = particle_range_alignment_items,

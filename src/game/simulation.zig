@@ -7,7 +7,6 @@
 //! per-step streams for processor events, intents, and deferred structure.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const math = @import("../core/math.zig");
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
@@ -1230,8 +1229,6 @@ test "range output stream merges by range index" {
 }
 
 test "range output stream keeps deterministic order across threaded passes" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
     var stream = RangeOutputStream(TestStreamEvent).init(std.testing.allocator);
     defer stream.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{

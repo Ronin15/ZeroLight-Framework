@@ -2320,7 +2320,6 @@ fn randomBatchWrites(random: std.Random, tiles: TerrainTestTiles, out: []DenseCe
 }
 
 test "a batched dense edit is identical inline and threaded and matches its canonical events" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
@@ -2363,12 +2362,10 @@ test "a batched dense edit is identical inline and threaded and matches its cano
 }
 
 test "a terrain edit worker cap of zero on a multi-worker ThreadSystem writes the same terrain and events" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var uncapped = try testBatchEditWorld(&meta);
     defer uncapped.deinit();
     var capped = try testBatchEditWorld(&meta);
@@ -2458,7 +2455,6 @@ fn addRandomSparseTiles(world: *WorldSystem, tiles: TerrainTestTiles, seed: u64,
 }
 
 test "a batched dense edit over many sparse tiles is identical inline, threaded, and as single-cell writes" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
@@ -2506,7 +2502,6 @@ test "a batched dense edit over many sparse tiles is identical inline, threaded,
 }
 
 test "a batched dense edit over sparse tiles in short border chunks is identical inline, threaded, and as single-cell writes" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
@@ -2587,7 +2582,6 @@ test "a batched dense edit over sparse tiles in short border chunks is identical
 }
 
 test "a batched dense edit marks resident layers identically inline and threaded and the next sync matches the CPU" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
@@ -2790,7 +2784,6 @@ fn batchEditAllocationTest(meta: *const WorldTilesetMeta, threads: *ThreadSystem
 }
 
 test "a batched dense edit fails cleanly at every allocation on the multi-worker path and its retry lands (FailingAllocator)" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
@@ -2804,7 +2797,6 @@ test "a batched dense edit fails cleanly at every allocation on the multi-worker
 }
 
 test "a warmed batched dense edit allocates nothing (FailingAllocator)" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
@@ -2907,7 +2899,6 @@ fn randomWideBandWrites(random: std.Random, tiles: TerrainTestTiles, out: []Dens
 }
 
 test "a level grows past 64 bands and a batched edit across all of them is identical inline and threaded and matches single-cell writes" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
@@ -3060,7 +3051,6 @@ test "a 1x1 border chunk turning uniform at another tile reads back from the GPU
 }
 
 test "a one-chunk batched dense edit runs inline" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
@@ -3084,7 +3074,6 @@ test "a one-chunk batched dense edit runs inline" {
 }
 
 test "a batched dense edit blocks and reopens a whole short border chunk" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
@@ -3278,7 +3267,6 @@ test "a batched dense edit on a world with no level is an invalid level" {
 }
 
 test "a batched dense edit rejects unordered chunks and invalid writes before any change" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });

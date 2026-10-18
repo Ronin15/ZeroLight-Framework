@@ -409,7 +409,6 @@ test "underground demo levels are solid dirt until a cell is dug walkable" {
 }
 
 test "procedural world build is identical serial and threaded" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
@@ -505,7 +504,6 @@ fn buildProceduralWorldForAllocationTest(allocator: std.mem.Allocator, meta: *co
 }
 
 test "procedural world build fails cleanly at every allocation on the multi-worker path (FailingAllocator)" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });

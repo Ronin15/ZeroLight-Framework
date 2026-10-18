@@ -16,7 +16,6 @@
 //! merge, the world's batch grouping) drain chunk and level indices through in order.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const logging = @import("../../core/logging.zig");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const pdqSort = @import("../../core/sort.zig").pdq;
@@ -1231,7 +1230,6 @@ fn randomBatches(map: *ChunkListMap, seed: u64, threads: ?Dispatch) !usize {
 }
 
 test "a threaded batch commit equals the inline commit for any partition" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
     var inline_map = ChunkListMap.init(std.testing.allocator, "test lists");
@@ -1250,7 +1248,6 @@ test "a threaded batch commit equals the inline commit for any partition" {
 }
 
 test "reserve and reserveBatch, then a threaded batch, allocate nothing on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var tuner = AdaptiveWorkTuner.init(.{});
@@ -1327,7 +1324,6 @@ fn stageArrivalOrders(map: *ChunkListMap, threads: ?Dispatch) !BatchStats {
 }
 
 test "a key's ascending, descending, and mixed arrivals produce the same list as a tail rebuild, inline and threaded" {
-    if (builtin.single_threaded) return error.SkipZigTest;
     var inline_map = ChunkListMap.init(std.testing.allocator, "test lists");
     defer inline_map.deinit();
     _ = try stageArrivalOrders(&inline_map, null);

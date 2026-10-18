@@ -367,11 +367,8 @@ const ensureStepCapacity = @import("system.zig").ensureStepCapacity;
 const AgentSnapshotRow = @import("system.zig").AgentSnapshotRow;
 
 test "steering banded agent grid gives every cell the same entries as one band" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 3, .adaptive = false } };
     const inline_ranges = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 0, .adaptive = false } };
 
@@ -411,11 +408,8 @@ test "steering banded agent grid gives every cell the same entries as one band" 
 }
 
 test "steering agent grid splits a one-row corridor and a cluster with a far outlier across bands" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 3, .adaptive = false } };
 
     for ([_]GridTestLayout{ .one_row, .cluster_outlier }) |layout| {
@@ -431,11 +425,8 @@ test "steering agent grid splits a one-row corridor and a cluster with a far out
 }
 
 test "steering agent grid splits rows that alternate between two clusters across bands" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 3, .adaptive = false } };
 
     // Row counts at and near power-of-two multiples of the sample count, with the clusters

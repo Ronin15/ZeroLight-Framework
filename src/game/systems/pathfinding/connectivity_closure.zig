@@ -2867,7 +2867,6 @@ fn ranOnWorkers(batch: BatchStats) bool {
 test "threaded closure stages equal the inline ones word for word across worker counts and range sizes, and the rows run on workers" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 8;
     for ([_]usize{ 1, 2, 4 }) |workers| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
@@ -2922,7 +2921,6 @@ test "threaded closure stages equal the inline ones word for word across worker 
 }
 
 test "a one-way toggle and a terminal root split prepared with the real allocator commit on a multi-worker ThreadSystem without allocating" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3107,7 +3105,6 @@ test "the heir of a component that falls into five pieces narrows; the other pie
 }
 
 test "a block narrowing prepared with the real allocator commits on a multi-worker ThreadSystem without allocating" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3241,7 +3238,6 @@ test "retiring or narrowing a system frees its old block in the same batch; live
 }
 
 test "a relocating batch on a multi-worker ThreadSystem lands its pieces in the same nav reaction: the tail and residents are empty after it" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 16;
     const rooms: usize = 256;
     var fixture = try latticeWorld(chunks, 1);
@@ -3274,7 +3270,6 @@ test "a relocating batch on a multi-worker ThreadSystem lands its pieces in the 
 }
 
 test "a relocating batch committed under a failing allocator on a multi-worker ThreadSystem leaves its pieces resident; a failed landing defers with the closure intact; a prepare under failure returns OutOfMemory with state intact; disarmed, it lands and matches the rebuild" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3716,7 +3711,6 @@ test "a one-way link between unbuilt levels commits without allocating, stays de
 }
 
 test "the post-commit nav reaction runs the closure rows on workers" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3788,10 +3782,8 @@ fn runCappedNavScenario(scenario: CappedNavScenario, threads: *ThreadSystem, cap
 }
 
 test "a nav worker cap of zero keeps every graph, connectivity, and closure stage inline on a multi-worker ThreadSystem and changes no result" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     for (std.meta.tags(CappedNavScenario)) |scenario| {
         const uncapped = try runCappedNavScenario(scenario, &threads, null);
         const capped = try runCappedNavScenario(scenario, &threads, 0);

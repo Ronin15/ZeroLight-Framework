@@ -1117,7 +1117,6 @@ fn shuffledThinkRows(rows: []u32) void {
 }
 
 test "AiMemorySystem threaded update has no steady-state allocation after warmup (FailingAllocator)" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Two order ranges of touched row words, so every stage runs on workers.
     const agent_count = 2 * ai_memory_range_alignment_items * word_bits;
@@ -1132,7 +1131,6 @@ test "AiMemorySystem threaded update has no steady-state allocation after warmup
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = ai_memory_range_alignment_items });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var sys = AiMemorySystem.init(testing.allocator);
     defer sys.deinit();
@@ -1161,8 +1159,6 @@ test "AiMemorySystem threaded update has no steady-state allocation after warmup
 }
 
 test "AiMemorySystem each stage records one sample into its own tuner and none into the shared tuner" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     for (0..64) |i| {
@@ -1172,7 +1168,6 @@ test "AiMemorySystem each stage records one sample into its own tuner and none i
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var sys = AiMemorySystem.init(testing.allocator);
     defer sys.deinit();
@@ -1356,8 +1351,6 @@ test "AiMemorySystem results are bit-identical for any think-set order" {
 }
 
 test "AiMemorySystem serial equals threaded across range sizes and worker counts" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
     var think: [order_fixture_agents]u32 = undefined;
     shuffledThinkRows(&think);
 
