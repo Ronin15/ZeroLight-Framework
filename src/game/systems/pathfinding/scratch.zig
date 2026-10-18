@@ -410,18 +410,14 @@ pub const SearchScratch = struct {
     path_scratch: std.ArrayList(u32) = .empty,
     // This participant's tier-0 corridor scratch.
     corridor: CorridorScratch = .{},
-    // Diagnostic only: highest per-solve stitch segment count (solve.zig's
-    // stitchCorridor) this worker has produced since the last aggregation. NOT
-    // reset by reset() (that runs per-segment, many times per solve); the owning
-    // PathfindingSystem aggregates and clears it once per step in finishUpdate, so
-    // it reflects one step's true worst case rather than a single solve's.
-    max_stitch_segments_used: usize = 0,
-    // Crossing boxes the heuristic settled, and solves whose crossing search its budget froze,
-    // in this worker's solves since the last aggregation (finishUpdate); kept only with
-    // `runtime_perf_log.enabled`.
+    // Kept only with `runtime_perf_log.enabled`, in this worker's solves since the last
+    // merge (finishUpdate, once per step; `reset` runs per segment and keeps them): the
+    // highest per-solve stitch segment count (`stitchCorridor`), crossing boxes the
+    // heuristic settled, and solves whose crossing search its budget froze.
     perf: Perf = .{},
 
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        max_stitch_segments_used: usize = 0,
         crossing_boxes_settled: usize = 0,
         crossing_budget_frozen: usize = 0,
     } else struct {};
@@ -430,8 +426,7 @@ pub const SearchScratch = struct {
         std.debug.assert(@alignOf(SearchScratch) == thread_shared_record_alignment);
         std.debug.assert(@sizeOf(SearchScratch) % thread_shared_record_alignment == 0);
         assertFieldsClassified(SearchScratch, &.{ "open", "slots", "path_scratch", "corridor" }, &.{
-            "generation",               "explored", "explored_budget", "explored_limit", "open_limit", "slot_shift",
-            "max_stitch_segments_used", "perf",
+            "generation", "explored", "explored_budget", "explored_limit", "open_limit", "slot_shift", "perf",
         });
     }
 

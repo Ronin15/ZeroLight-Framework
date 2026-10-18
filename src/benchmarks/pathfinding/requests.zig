@@ -410,9 +410,9 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
         accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solve_batch);
-        if (last_stats.perf.group_field_begin_batch.item_count != 0 or last_stats.group_fields_built != 0) return error.SharedGoalBeganField;
+        if (last_stats.perf.group_field_begin_batch.item_count != 0 or last_stats.perf.group_fields_built != 0) return error.SharedGoalBeganField;
     }
-    if (last_stats.solve_admissions != 1) return error.SharedGoalNotOneSolve;
+    if (last_stats.perf.solve_admissions != 1) return error.SharedGoalNotOneSolve;
     var stats = accumulator.finish();
     stats.output_count = last_stats.perf.available_results + last_stats.perf.unavailable_results + last_stats.perf.duplicate_requests + last_stats.perf.cache_hits;
     stats.candidate_pairs = last_stats.perf.duplicate_requests + last_stats.perf.cache_hits;
@@ -483,15 +483,15 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var stats = accumulator.finish();
     stage_report.write(&stats.details);
     stats.output_count = last_stats.perf.available_results;
-    stats.deferred_count = last_stats.pending_requests;
-    stats.fallback_deferred_count = last_stats.admission_deferred_requests;
-    stats.cache_evictions = last_stats.cache_evictions;
+    stats.deferred_count = last_stats.perf.pending_requests;
+    stats.fallback_deferred_count = last_stats.perf.admission_deferred_requests;
+    stats.cache_evictions = last_stats.perf.cache_evictions;
     // Throughput counts what the step serviced: cache hits when warm, admissions when cold
     // at the admission window, published results when cold; the per-step ceiling defers the
     // rest.
     const serviced: usize = switch (mode) {
         .hot_cache => last_stats.perf.cache_hits,
-        .cold_fallback => last_stats.solve_admissions,
+        .cold_fallback => last_stats.perf.solve_admissions,
         .cold_solve => last_stats.perf.available_results,
     };
     stats.candidate_pairs = serviced;
@@ -559,7 +559,7 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stage_report.write(&stats.details);
     stats.output_count = last_stats.perf.available_results + last_stats.perf.unavailable_results;
     stats.candidate_pairs = last_stats.perf.solved_requests;
-    stats.deferred_count = last_stats.pending_requests;
+    stats.deferred_count = last_stats.perf.pending_requests;
     stats.items_per_second = suite.itemsPerSecond(last_stats.perf.solved_requests, stats.mean_ns);
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), false);
     return stats;
@@ -747,7 +747,7 @@ fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: sui
         accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solve_batch);
     }
     // The fixed tier-1 budget solves the detour; a second exhaustion would drop it.
-    if (last_stats.perf.available_results != 1 or last_stats.escalated_solves != 1) return error.EscalatedDetourUnsolved;
+    if (last_stats.perf.available_results != 1 or last_stats.perf.escalated_solves != 1) return error.EscalatedDetourUnsolved;
     var stats = accumulator.finish();
     stats.output_count = last_stats.perf.available_results;
     stats.candidate_pairs = last_stats.perf.solved_requests;
@@ -883,7 +883,7 @@ fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: su
         accumulator.record(elapsed_ns, last_stats.solve_batch);
         stage_report.add(elapsed_ns, last_stats);
         // A ready field answers every member: no build, no per-agent solve.
-        if (last_stats.group_fields_built != 0 or last_stats.perf.group_field_samples != item_count) return error.GroupFieldNotSampled;
+        if (last_stats.perf.group_fields_built != 0 or last_stats.perf.group_field_samples != item_count) return error.GroupFieldNotSampled;
     }
 
     var stats = accumulator.finish();
@@ -902,9 +902,9 @@ const MovingTotals = struct {
     samples: usize = 0,
 
     fn add(self: *MovingTotals, stats: PathfindingStats) void {
-        self.escalated += stats.escalated_solves;
-        self.throttled += stats.group_field_rebuild_throttled;
-        self.built += stats.group_fields_built;
+        self.escalated += stats.perf.escalated_solves;
+        self.throttled += stats.perf.group_field_rebuild_throttled;
+        self.built += stats.perf.group_fields_built;
         self.samples += stats.perf.group_field_samples;
     }
 
@@ -1084,7 +1084,7 @@ fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Opt
             if (!measured) continue;
             accumulator.record(elapsed_ns, stats.perf.group_field_batch);
             stage_report.add(elapsed_ns, stats);
-            built_total += stats.group_fields_built;
+            built_total += stats.perf.group_fields_built;
             samples_total += stats.perf.group_field_samples;
         }
     }

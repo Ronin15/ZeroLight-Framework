@@ -903,7 +903,8 @@ test "one dig leaves unrelated pending requests, fields, tallies, and paths inta
     try std.testing.expect(field_state != .empty);
     // A request left pending.
     const queued_goal = tileCenter(25, 28);
-    try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, tileCenter(16, 20), queued_goal, .{ .max_solve_admissions_per_step = 0 })).pending_requests);
+    _ = try solveFrom(&system, requester, tileCenter(16, 20), queued_goal, .{ .max_solve_admissions_per_step = 0 });
+    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
     const tallies = system.group_requests.items.len;
     try std.testing.expect(tallies != 0);
 

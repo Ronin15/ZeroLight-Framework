@@ -850,25 +850,32 @@ pub const PathfindingSystem = struct {
 
     /// A key's live goal on `goal_grid`, its goal level's grid: the key's cell when open,
     /// else the nearest open cell within the projection radius, read from the step's goal
-    /// table when it holds the key, else computed (`fallback`). `cell` null: no open cell,
+    /// table when it holds the key, else computed (a fallback). `cell` null: no open cell,
     /// so every start reads unavailable. O(1) for an open cell or a table hit, O(radius²)
     /// for a fallback. Const; safe on workers while the table is read-only.
     pub fn liveGoal(self: *const PathfindingSystem, key: PathQueryKey, goal_grid: *const NavGrid) LiveGoal {
         const key_index = goal_grid.indexForCell(key.goal) orelse return .{};
         // `indexForCell` bounded the cell to the grid.
         if (!goal_grid.isBlockedXY(@intCast(key.goal.x), @intCast(key.goal.y))) return .{ .cell = key_index };
+        var live_goal = LiveGoal{};
+        if (comptime runtime_perf_log.enabled) live_goal.perf.blocked = true;
         if (self.goals.lookup(goalRef(traversalOf(key.agent_class), key.goal_level, key_index))) |live| {
-            return .{ .cell = if (live == no_cell) null else live, .blocked = true };
+            live_goal.cell = if (live == no_cell) null else live;
+            return live_goal;
         }
-        return .{ .cell = goal_grid.projectToNearestOpen(key.goal, default_goal_projection_radius), .blocked = true, .fallback = true };
+        if (comptime runtime_perf_log.enabled) live_goal.perf.fallback = true;
+        live_goal.cell = goal_grid.projectToNearestOpen(key.goal, default_goal_projection_radius);
+        return live_goal;
     }
 
     const LiveGoal = struct {
         cell: ?usize = null,
-        // The key's cell was blocked: `cell` is its projection.
-        blocked: bool = false,
-        // The goal table did not hold the blocked key, so the projection was computed.
-        fallback: bool = false,
+        // Kept only with `runtime_perf_log.enabled`: the key's cell was blocked (`cell` is its
+        // projection), and the goal table did not hold it, so the projection was computed.
+        perf: if (runtime_perf_log.enabled) struct {
+            blocked: bool = false,
+            fallback: bool = false,
+        } else struct {} = .{},
     };
 
     /// Reach from `start_index` on `start_level` to `goal_index` on `goal_level` for agents of
@@ -983,7 +990,7 @@ pub const PathfindingSystem = struct {
         var group_timer = StageTimer.begin();
         group_service.serviceGroupFields(self, stats, threads);
         stats.group_service_ns = group_timer.lap();
-        stats.distinct_group_keys = self.group_requests.items.len;
+        if (comptime runtime_perf_log.enabled) stats.perf.distinct_group_keys = self.group_requests.items.len;
         return self.effectiveSolveLimit(config);
     }
 
@@ -993,7 +1000,7 @@ pub const PathfindingSystem = struct {
     fn beginSolve(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, threads: StageThreads, stats: *PathfindingStats) !?usize {
         const solve_count = try self.beginUpdate(requests, agent_count, config, threads, stats);
         if (solve_count == 0) {
-            stats.pending_requests = self.pending.len;
+            if (comptime runtime_perf_log.enabled) stats.perf.pending_requests = self.pending.len;
             return null;
         }
         return solve_count;
@@ -1010,16 +1017,12 @@ pub const PathfindingSystem = struct {
         if (comptime runtime_perf_log.enabled) stats.perf.publish_copy_batch = publish_copy_batch;
         self.compactPendingAfterSolve(solve_count, stats);
         stats.publish_ns = publish_timer.lap();
-        stats.pending_requests = self.pending.len;
-        // Aggregate this step's worst per-worker stitch segment usage (see
-        // SearchScratch.max_stitch_segments_used), then clear each worker's counter so
-        // next step's aggregation reflects only next step's solves.
-        for (self.scratch_slots.items) |*scratch| {
-            if (scratch.max_stitch_segments_used > stats.max_stitch_segments_observed) {
-                stats.max_stitch_segments_observed = scratch.max_stitch_segments_used;
-            }
-            scratch.max_stitch_segments_used = 0;
-            if (comptime runtime_perf_log.enabled) {
+        // Merge the workers' step counters (the worst stitch segment usage, crossing work),
+        // then clear each so next step's merge reflects only next step's solves.
+        if (comptime runtime_perf_log.enabled) {
+            stats.perf.pending_requests = self.pending.len;
+            for (self.scratch_slots.items) |*scratch| {
+                stats.perf.max_stitch_segments_observed = @max(stats.perf.max_stitch_segments_observed, scratch.perf.max_stitch_segments_used);
                 stats.perf.crossing_boxes_settled += scratch.perf.crossing_boxes_settled;
                 stats.perf.crossing_budget_frozen += scratch.perf.crossing_budget_frozen;
                 scratch.perf = .{};
@@ -1114,20 +1117,18 @@ pub const PathfindingSystem = struct {
         for (0..solve_count) |pending_index| {
             const is_escalated = self.pending.at(pending_index).tier != 0;
             if (is_escalated and escalated_admitted >= self.capacity.max_escalated_solves_per_step) {
-                stats.escalated_deferred += 1;
+                if (comptime runtime_perf_log.enabled) stats.perf.escalated_deferred += 1;
                 continue;
             }
             if (self.solve_indices.items.len < admission_limit) {
                 self.solve_indices.appendAssumeCapacity(pending_index);
                 self.solve_tier1_slot.appendAssumeCapacity(if (is_escalated) @intCast(escalated_admitted) else no_tier1_slot);
-                if (is_escalated) {
-                    escalated_admitted += 1;
-                    stats.escalated_solves += 1;
-                }
-            } else {
-                stats.admission_deferred_requests += 1;
+                if (is_escalated) escalated_admitted += 1;
+            } else if (comptime runtime_perf_log.enabled) {
+                stats.perf.admission_deferred_requests += 1;
             }
         }
+        if (comptime runtime_perf_log.enabled) stats.perf.escalated_solves = escalated_admitted;
         self.solve_results.clearRetainingCapacity();
         for (0..self.solve_indices.items.len) |_| {
             self.solve_results.appendAssumeCapacity(.{ .deferred = emptyKey(self.graph.version) });
@@ -1318,7 +1319,6 @@ const fixed_threads_config = @import("test_support.zig").fixed_threads_config;
 const flushUnits = @import("test_support.zig").flushUnits;
 const shrinkFixture = @import("test_support.zig").shrinkFixture;
 const intake_test_agents = @import("test_support.zig").intake_test_agents;
-const expectRequestStatsEqual = @import("test_support.zig").expectRequestStatsEqual;
 const expectQueuesEqual = @import("test_support.zig").expectQueuesEqual;
 const writeGroupGoals = @import("test_support.zig").writeGroupGoals;
 const expectGroupFieldsEqual = @import("test_support.zig").expectGroupFieldsEqual;
@@ -1341,6 +1341,21 @@ const no_colliders = &test_support.no_colliders;
 fn solveResultCount(system: *const PathfindingSystem, kind: std.meta.Tag(PathSolveResult)) usize {
     var count: usize = 0;
     for (system.solve_results.items) |result| count += @intFromBool(std.meta.activeTag(result) == kind);
+    return count;
+}
+
+// Whether the last update took `key`'s request into pending work: the key is pending, or its
+// result was published this step. For a key that was neither before the update.
+fn acceptedLastStep(system: *const PathfindingSystem, key: PathQueryKey) bool {
+    if (system.pending_keys.contains(key)) return true;
+    const stored_step = cachedStep(system, key) orelse return false;
+    return stored_step == system.step_counter;
+}
+
+// This step's admitted tier-1 (escalated) solves: the admissions holding a tier-1 entry.
+fn escalatedAdmissions(system: *const PathfindingSystem) usize {
+    var count: usize = 0;
+    for (system.solve_tier1_slot.items) |slot| count += @intFromBool(slot != no_tier1_slot);
     return count;
 }
 
@@ -1425,9 +1440,9 @@ test "pathfinding zero admission budget leaves an empty solve batch without pani
     var serial_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer serial_stream.deinit();
     try appendPathRequest(&serial_stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 96, .y = 96 } });
-    const serial_stats = try updatePathfindingInline(&system, &serial_stream, 8, .{ .max_solve_admissions_per_step = 0 });
+    _ = try updatePathfindingInline(&system, &serial_stream, 8, .{ .max_solve_admissions_per_step = 0 });
     try std.testing.expectEqual(@as(usize, 0), system.completed.count());
-    try std.testing.expectEqual(@as(usize, 1), serial_stats.pending_requests);
+    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
 
     if (!builtin.single_threaded) {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
@@ -1451,7 +1466,8 @@ test "pathfinding goal-keyed dedup reuses one accepted request under start drift
     try system.reserve(baselineCapacity());
     try system.rebuildStaticNavGrid(&data, 512, 512, 32);
 
-    var accepted_total: usize = 0;
+    const goal = math.Vec2{ .x = 480, .y = 480 };
+    var solved_step: ?u32 = null;
     const steps: usize = 6;
     for (0..steps) |i| {
         var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
@@ -1461,13 +1477,17 @@ test "pathfinding goal-keyed dedup reuses one accepted request under start drift
         try appendPathRequest(&stream, .{
             .entity = requester,
             .start = .{ .x = start_x, .y = 8 },
-            .goal = .{ .x = 480, .y = 480 },
+            .goal = goal,
         });
-        const stats = try updatePathfindingInline(&system, &stream, 8, .{});
-        accepted_total += stats.accepted_requests;
+        _ = try updatePathfindingInline(&system, &stream, 8, .{});
+        // Exactly one A* solve was accepted, in the first step; later drifting starts reuse
+        // the cache, so nothing queues and the stored result keeps its solve's step.
+        try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+        const stored_step = cachedStep(&system, system.graph.keyForWorld(0, goal, .default).?);
+        if (i == 0) solved_step = stored_step;
+        try std.testing.expect(solved_step != null);
+        try std.testing.expectEqual(solved_step, stored_step);
     }
-    // Exactly one A* solve was accepted; later drifting starts reuse the cache.
-    try std.testing.expectEqual(@as(usize, 1), accepted_total);
 }
 
 test "pathfinding projects goal in obstacle to nearest open cell" {
@@ -1488,9 +1508,14 @@ test "pathfinding projects goal in obstacle to nearest open cell" {
     // Goal world position falls inside the blocked cell.
     try appendPathRequest(&stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 104, .y = 104 } });
 
-    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
-    try std.testing.expectEqual(@as(usize, 1), stats.goal_projected);
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expect(solvedLastStep(&system, .{ .x = 104, .y = 104 }));
+    // Solved toward the projection: an open cell off the blocked goal's own.
+    const grid = system.graph.grid(0).?;
+    const key = system.graph.keyForWorld(0, .{ .x = 104, .y = 104 }, .default).?;
+    const projection = grid.projectToNearestOpen(key.goal, default_goal_projection_radius) orelse return error.TestExpectedProjection;
+    try std.testing.expect(projection != grid.indexForCell(key.goal).?);
+    try std.testing.expectEqual(@as(u32, @intCast(projection)), system.completed.resultAt(system.completed.slotIndex(key).?).goal_cell);
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 104, .y = 104 }, .default, null).status);
 }
 
@@ -1511,9 +1536,9 @@ test "pathfinding spills to pending when node budget is exhausted" {
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 488, .y = 488 } });
 
-    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
     // The tier-0 attempt exhausted its budget: promoted to tier 1, still pending.
-    try std.testing.expectEqual(@as(usize, 1), stats.pending_requests);
+    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
     try std.testing.expectEqual(@as(u8, 1), system.pending.at(0).tier);
     try std.testing.expectEqual(@as(usize, 0), system.completed.count());
     const view = system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 488, .y = 488 }, .default, null);
@@ -1563,14 +1588,13 @@ test "pathfinding drops an out-of-range level request instead of clamping and so
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .goal_level = 1, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 96, .y = 96 } });
 
-    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
-    try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests);
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), system.pending.len);
     try std.testing.expectEqual(@as(usize, 0), system.completed.count());
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 1, .{ .x = 96, .y = 96 }, .default, null).status);
 }
 
-test "pathfinding pending_requests equals post-compaction pending in the serial update path" {
+test "pathfinding a one-solve step budget solves one request and leaves the rest pending in the serial update path" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
@@ -1590,15 +1614,14 @@ test "pathfinding pending_requests equals post-compaction pending in the serial 
     try appendPathRequest(&stream, .{ .entity = c, .start = .{ .x = 72, .y = 8 }, .goal = .{ .x = 200, .y = 72 } });
 
     // Per-step solve budget of 1 (config override) throttles to one solve/step.
-    const stats = try updatePathfindingInline(&system, &stream, 3, .{ .max_solved_requests_per_step = 1 });
+    _ = try updatePathfindingInline(&system, &stream, 3, .{ .max_solved_requests_per_step = 1 });
     var solved: usize = 0;
     for ([_]math.Vec2{ .{ .x = 200, .y = 8 }, .{ .x = 200, .y = 40 }, .{ .x = 200, .y = 72 } }) |goal| solved += @intFromBool(solvedLastStep(&system, goal));
     try std.testing.expectEqual(@as(usize, 1), solved);
-    try std.testing.expectEqual(system.pending.len, stats.pending_requests);
-    try std.testing.expectEqual(@as(usize, 2), stats.pending_requests);
+    try std.testing.expectEqual(@as(usize, 2), system.pending.len);
 }
 
-test "pathfinding pending_requests equals post-compaction pending in the threaded update path" {
+test "pathfinding a one-solve step budget solves one request and leaves the rest pending in the threaded update path" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1620,9 +1643,11 @@ test "pathfinding pending_requests equals post-compaction pending in the threade
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
-    const stats = try system.update(&stream, 2, &threads, .{ .adaptive = false, .items_per_range = 1, .max_solved_requests_per_step = 1 });
-    try std.testing.expectEqual(system.pending.len, stats.pending_requests);
-    try std.testing.expectEqual(@as(usize, 1), stats.pending_requests);
+    _ = try system.update(&stream, 2, &threads, .{ .adaptive = false, .items_per_range = 1, .max_solved_requests_per_step = 1 });
+    var solved: usize = 0;
+    for ([_]math.Vec2{ .{ .x = 200, .y = 8 }, .{ .x = 200, .y = 40 } }) |goal| solved += @intFromBool(solvedLastStep(&system, goal));
+    try std.testing.expectEqual(@as(usize, 1), solved);
+    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
 }
 
 test "pathfinding same-level group agent falls through on a field-sample miss instead of a hard unavailable" {
@@ -1976,8 +2001,8 @@ test "pathfinding cross-level goal with no link is unavailable, not pending fore
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
-    try std.testing.expectEqual(@as(usize, 0), stats.pending_requests);
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
     try std.testing.expectEqual(@as(usize, 0), system.completed.count());
     const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null);
     try std.testing.expectEqual(PathStatus.unavailable, view.status);
@@ -2514,11 +2539,11 @@ test "pathfinding abstract saturation returns pending, not a cached unavailable"
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
     // Saturation spills to a later frame: a budget_exhausted result, never unavailable,
     // and the status reads pending (retryable).
     try std.testing.expectEqual(@as(usize, 1), solveResultCount(&system, .budget_exhausted));
-    try std.testing.expectEqual(@as(usize, 1), stats.pending_requests);
+    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
     const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null);
     try std.testing.expectEqual(PathStatus.pending, view.status);
     // The two-tier ladder: the FIRST (tier-0) exhaustion promotes to tier 1 immediately
@@ -2649,14 +2674,13 @@ test "pathfinding tier-1 budget_exhausted drops to missing (not a false unavaila
     system.capacity.max_abstract_nodes = 1;
 
     // Attempt 2 (tier 1): exhausts again -> dropped, never unavailable.
-    const second = try updatePathfindingInline(&system, &stream, 8, .{});
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
     // It drops through seeding saturation: the start chunk's second seed passes the one-node
     // budget before any node is expanded, so no least-estimate node exists to publish toward.
     const tier1_abstract = &system.tier1_scratch.items[0].corridor.abstract;
     for (tier1_abstract.slots) |slot| try std.testing.expect(slot.stamp >> 1 != tier1_abstract.generation or slot.stamp & 1 == 0);
     try std.testing.expectEqual(@as(usize, 1), solveResultCount(&system, .budget_exhausted));
     try std.testing.expectEqual(@as(usize, 1), system.solve_results.items.len);
-    try std.testing.expectEqual(@as(usize, 0), second.pending_requests);
     // Exactly two solve attempts total: one per step, and nothing left pending for a third.
     try std.testing.expectEqual(@as(usize, 0), system.pending.len);
 
@@ -2701,9 +2725,9 @@ test "pathfinding max_escalated_solves_per_step caps tier-1 admission to exactly
 
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const stats = try updatePathfindingInline(&system, &empty, 8, .{});
-    try std.testing.expectEqual(@as(usize, 2), stats.escalated_solves);
-    try std.testing.expectEqual(@as(usize, 2), stats.escalated_deferred);
+    _ = try updatePathfindingInline(&system, &empty, 8, .{});
+    try std.testing.expectEqual(@as(usize, 2), system.solve_results.items.len);
+    try std.testing.expectEqual(@as(usize, 2), escalatedAdmissions(&system));
     // The two admitted tier-1 requests solved trivially (short, same-level, open goals);
     // the other two waited out this step and are still pending at tier 1.
     try std.testing.expectEqual(@as(usize, 2), system.pending.len);
@@ -2883,11 +2907,12 @@ test "pathfinding capacity grows when agent count jumps past the current cap" {
 
     // A jump to 40 agents grows the live capacity amortized to at least 40 and the
     // per-step caps follow; every distinct goal still solves (here all share one).
-    const stats = try driveAgentCount(&system, &requesters, 40);
+    _ = try driveAgentCount(&system, &requesters, 40);
     try std.testing.expect(system.effective_agent_capacity >= 40);
     try std.testing.expect(system.limits.pending_requests >= 40);
     try std.testing.expect(system.completed.core.slots.items.len >= 40 * cached_results_per_agent);
-    try std.testing.expectEqual(@as(usize, 1), stats.accepted_requests);
+    // The shared goal was accepted once: one solve.
+    try std.testing.expectEqual(@as(usize, 1), system.solve_results.items.len);
     try std.testing.expect(solvedLastStep(&system, .{ .x = 480, .y = 480 }));
 }
 
@@ -3002,8 +3027,8 @@ test "pathfinding a capacity shrink keeps every live pending request and group t
     const no_admission = PathfindingConfig{ .max_solve_admissions_per_step = 0 };
 
     // 200 distinct goals stay pending (no admission).
-    const fill_stats = try submitGoalWalk(&system, &requesters, .{}, pending_count, no_admission);
-    try std.testing.expectEqual(@as(usize, pending_count), fill_stats.accepted_requests);
+    _ = try submitGoalWalk(&system, &requesters, .{}, pending_count, no_admission);
+    try std.testing.expectEqual(@as(usize, pending_count), system.pending.len);
     try std.testing.expectEqual(@as(usize, pending_count), system.effective_agent_capacity);
 
     // A low-load window at one agent: a shrink would size below the live queue, so none runs.
@@ -3165,11 +3190,9 @@ fn walkRequestsHeld(system: *const PathfindingSystem, walk: GoalWalk, count: usi
     return held;
 }
 
-/// Same step stats, pending queue, group tallies, and cached key set. Probe slots and owner
-/// ids are layout, which differs between differently sized caches, so only keys compare.
-fn expectGatedStateEqual(expected: *const PathfindingSystem, expected_stats: PathfindingStats, actual: *const PathfindingSystem, actual_stats: PathfindingStats) !void {
-    try expectRequestStatsEqual(expected_stats, actual_stats);
-    try std.testing.expectEqual(expected_stats.admission_deferred_requests, actual_stats.admission_deferred_requests);
+/// Same pending queue, group tallies, and cached key set. Probe slots and owner ids are
+/// layout, which differs between differently sized caches, so only keys compare.
+fn expectGatedStateEqual(expected: *const PathfindingSystem, actual: *const PathfindingSystem) !void {
     try expectQueuesEqual(expected, actual);
     try std.testing.expectEqual(expected.completed.count(), actual.completed.count());
     const core = &expected.completed.core;
@@ -3219,12 +3242,15 @@ test "pathfinding gates follow the live agent count, never capacity history" {
         .{ .walk = .{ .first = 3 * agents, .group = true }, .config = no_admission, .accepted = 0, .dropped = agents },
     };
     for (steps) |step| {
-        const fresh_stats = try submitGoalWalk(&fresh, &requesters, step.walk, agents, step.config);
-        try std.testing.expectEqual(step.accepted, fresh_stats.accepted_requests);
-        try std.testing.expectEqual(step.dropped, agents - walkRequestsHeld(&fresh, step.walk, agents));
+        // Accepted: the walk's goals held (pending or cached) after the step and not before.
+        const held_before = walkRequestsHeld(&fresh, step.walk, agents);
+        _ = try submitGoalWalk(&fresh, &requesters, step.walk, agents, step.config);
+        const held_after = walkRequestsHeld(&fresh, step.walk, agents);
+        try std.testing.expectEqual(step.accepted, held_after - held_before);
+        try std.testing.expectEqual(step.dropped, agents - held_after);
         inline for (.{ &grown, &held }) |system| {
-            const stats = try submitGoalWalk(system, &requesters, step.walk, agents, step.config);
-            try expectGatedStateEqual(&fresh, fresh_stats, system, stats);
+            _ = try submitGoalWalk(system, &requesters, step.walk, agents, step.config);
+            try expectGatedStateEqual(&fresh, system);
         }
     }
     // The last goals got no tally, and the step-5 tallies decayed away.
@@ -3261,11 +3287,14 @@ test "pathfinding a backlog past 512 agents admits the same requests at any capa
         .{ .walk = .{ .first = agents, .width_cells = 64 }, .accepted = 88, .dropped = 0 },
     };
     for (steps) |step| {
-        const fresh_stats = try submitGoalWalk(&fresh, &requesters, step.walk, agents, .{});
-        try std.testing.expectEqual(step.accepted, fresh_stats.accepted_requests);
-        try std.testing.expectEqual(step.dropped, agents - walkRequestsHeld(&fresh, step.walk, agents));
-        const grown_stats = try submitGoalWalk(&grown, &requesters, step.walk, agents, .{});
-        try expectGatedStateEqual(&fresh, fresh_stats, &grown, grown_stats);
+        // Accepted: the walk's goals held (pending or cached) after the step and not before.
+        const held_before = walkRequestsHeld(&fresh, step.walk, agents);
+        _ = try submitGoalWalk(&fresh, &requesters, step.walk, agents, .{});
+        const held_after = walkRequestsHeld(&fresh, step.walk, agents);
+        try std.testing.expectEqual(step.accepted, held_after - held_before);
+        try std.testing.expectEqual(step.dropped, agents - held_after);
+        _ = try submitGoalWalk(&grown, &requesters, step.walk, agents, .{});
+        try expectGatedStateEqual(&fresh, &grown);
     }
     try std.testing.expect(fresh.completed.count() < fresh.completed.logicalCapacity());
 }
@@ -3292,12 +3321,12 @@ test "pathfinding an update past the agent ceiling raises it past the crowd and 
         system.allocator = failing.allocator();
         const result = submitGoalWalk(&system, &requesters, .{}, requesters.len, no_admission);
         system.allocator = real_allocator;
-        if (result) |stats| {
+        if (result) |_| {
             // The ceiling rises 1.5x past the crowd (18); the pools double from 8 to 16.
             try std.testing.expectEqual(PathfindingSystem.grownAgentBudget(requesters.len), system.agentBudget());
             try std.testing.expectEqual(@as(usize, 18), system.agentBudget());
             try std.testing.expectEqual(@as(usize, 16), system.effective_agent_capacity);
-            try std.testing.expectEqual(requesters.len - min_capacity_floor, stats.accepted_requests);
+            // The four requests past the old ceiling were accepted beside the eight pending.
             try std.testing.expectEqual(requesters.len, system.pending.len);
             try expectPoolsFitLogicalCaps(&system);
             succeeded = true;
@@ -3337,11 +3366,11 @@ test "pathfinding pending-gate drops are independent of world size" {
     // 40 goals fill the pending gate at 40 agents; the next 40 drop.
     const no_admission = PathfindingConfig{ .max_solve_admissions_per_step = 0 };
     inline for (.{ &small, &large }) |system| {
-        const fill = try submitGoalWalk(system, &requesters, .{}, requesters.len, no_admission);
-        try std.testing.expectEqual(requesters.len, fill.accepted_requests);
-        const past_gate = try submitGoalWalk(system, &requesters, .{ .first = requesters.len }, requesters.len, no_admission);
+        _ = try submitGoalWalk(system, &requesters, .{}, requesters.len, no_admission);
+        try std.testing.expectEqual(requesters.len, system.pending.len);
+        _ = try submitGoalWalk(system, &requesters, .{ .first = requesters.len }, requesters.len, no_admission);
         try std.testing.expectEqual(@as(usize, 0), walkRequestsHeld(system, .{ .first = requesters.len }, requesters.len));
-        try std.testing.expectEqual(@as(usize, 0), past_gate.accepted_requests);
+        try std.testing.expectEqual(requesters.len, system.pending.len);
     }
 }
 
@@ -3470,9 +3499,8 @@ test "an agent budget raise admits the whole crowd" {
     try std.testing.expect(system.coversAgentCount(requesters.len));
 
     // All 12 distinct requests are accepted; none drop.
-    const stats = try submitDistinctGoalBurst(&system, &requesters, requesters.len, requesters.len);
+    _ = try submitDistinctGoalBurst(&system, &requesters, requesters.len, requesters.len);
     try std.testing.expectEqual(@as(usize, 12), system.pending.len);
-    try std.testing.expectEqual(@as(usize, 12), stats.accepted_requests);
 }
 
 test "a grow that runs out of memory mid-resize keeps logical limits within every pool" {
@@ -3508,9 +3536,8 @@ test "a grow that runs out of memory mid-resize keeps logical limits within ever
             try std.testing.expectEqual(min_capacity_floor, system.limits.frame_requests);
             try expectPoolsFitLogicalCaps(&system);
             // The next update runs safely at the old limits (no grow at 8 agents).
-            const stats = try submitDistinctGoalBurst(&system, requesters[0..min_capacity_floor], min_capacity_floor, min_capacity_floor);
+            _ = try submitDistinctGoalBurst(&system, requesters[0..min_capacity_floor], min_capacity_floor, min_capacity_floor);
             try std.testing.expectEqual(min_capacity_floor, system.pending.len);
-            try std.testing.expectEqual(min_capacity_floor, stats.accepted_requests);
         }
     }
     try std.testing.expect(succeeded);
@@ -3583,7 +3610,6 @@ const LakeDetour = struct {
     // The final step's published results.
     available: usize,
     partial: usize,
-    stats: PathfindingStats,
 };
 
 fn runLakeDetourScenario(system: *PathfindingSystem, side: usize, gap_offset: usize) !LakeDetour {
@@ -3611,13 +3637,13 @@ fn runLakeDetourScenario(system: *PathfindingSystem, side: usize, gap_offset: us
     var total_attempts: usize = 0;
     var frame: usize = 0;
     while (frame < 5) : (frame += 1) {
-        const stats = try updatePathfindingInline(system, if (frame == 0) &stream else &empty, 8, .{});
+        _ = try updatePathfindingInline(system, if (frame == 0) &stream else &empty, 8, .{});
         total_attempts += solveResultCount(system, .budget_exhausted);
         const available = solveResultCount(system, .available);
         const partial = solveResultCount(system, .partial);
         // Published, or dropped from pending after its tier-1 attempt.
         if (available != 0 or partial != 0 or system.pending.len == 0) {
-            return .{ .exhausted_attempts = total_attempts, .available = available, .partial = partial, .stats = stats };
+            return .{ .exhausted_attempts = total_attempts, .available = available, .partial = partial };
         }
     }
     return error.TestUnexpectedResult;
@@ -3666,7 +3692,6 @@ test "pathfinding max_stitch_segments bounds stitching independent of corridor l
     const result = try runLakeDetourScenario(&system, 256, 5);
     try std.testing.expectEqual(@as(usize, 0), result.available);
     try std.testing.expectEqual(@as(usize, 1), result.partial);
-    try std.testing.expectEqual(@as(usize, 1), result.stats.max_stitch_segments_observed);
 }
 
 // ---- Partial results ---------------------------------------------------------------
@@ -3746,8 +3771,8 @@ test "a tier-1 stitch past its cell cap publishes the uncapped stitch's prefix a
     try std.testing.expectEqual(@as(u8, 1), system.pending.at(0).tier);
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const second = try updatePathfindingInline(&system, &empty, 8, .{});
-    try std.testing.expectEqual(@as(usize, 1), second.escalated_solves);
+    _ = try updatePathfindingInline(&system, &empty, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), escalatedAdmissions(&system));
     // The one escalated solve published a partial.
     try std.testing.expectEqual(@as(usize, 1), system.solve_results.items.len);
     try std.testing.expectEqual(@as(usize, 1), solveResultCount(&system, .partial));
@@ -3787,14 +3812,14 @@ test "a partial answers no request from inside its end window" {
     // From the start (outside the window): served by the partial, which stays as stored.
     const hop_key = system.graph.keyForWorld(0, partial_goal, .default).?;
     const hop_step = cachedStep(&system, hop_key).?;
-    const from_start = try solveStep(&system, requester, partial_start, partial_goal);
+    _ = try solveStep(&system, requester, partial_start, partial_goal);
     try std.testing.expectEqual(hop_step, cachedStep(&system, hop_key).?);
-    try std.testing.expectEqual(@as(usize, 0), from_start.accepted_requests);
-    try std.testing.expectEqual(@as(usize, 0), from_start.solve_admissions);
+    // Nothing accepted, so nothing solved.
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
 
     // From the end (inside the window): a new request, its tier-0 attempt promoting.
-    const from_end = try solveStep(&system, requester, end_position, partial_goal);
-    try std.testing.expectEqual(@as(usize, 1), from_end.accepted_requests);
+    _ = try solveStep(&system, requester, end_position, partial_goal);
+    try std.testing.expectEqual(@as(usize, 1), system.pending.len);
     try std.testing.expectEqual(@as(usize, 1), solveResultCount(&system, .budget_exhausted));
     try std.testing.expectEqual(@as(u8, 1), system.pending.at(0).tier);
     // The old partial still serves while the hop solves.
@@ -4000,8 +4025,8 @@ test "a partial capped at or just past a link refreshes only on its end's level,
         try appendPathRequest(&stream, .{ .entity = requester, .start_level = 0, .goal_level = 1, .start = start, .goal = goal });
         const key = system.graph.keyForWorld(1, goal, .default).?;
         const stored_step = cachedStep(&system, key).?;
-        const from_start = try updatePathfindingInline(&system, &stream, 8, .{});
-        try std.testing.expectEqual(@as(usize, @intFromBool(at_start.refresh)), from_start.accepted_requests);
+        _ = try updatePathfindingInline(&system, &stream, 8, .{});
+        try std.testing.expectEqual(at_start.refresh, acceptedLastStep(&system, key));
         // A hit leaves the partial as stored.
         if (!at_start.refresh) try std.testing.expectEqual(stored_step, cachedStep(&system, key).?);
         if (!past_jump) continue;
@@ -4012,8 +4037,8 @@ test "a partial capped at or just past a link refreshes only on its end's level,
         try std.testing.expect(at_end.refresh);
         stream.clearRetainingCapacity();
         try appendPathRequest(&stream, .{ .entity = requester, .start_level = 1, .goal_level = 1, .start = end_position, .goal = goal });
-        const from_end = try updatePathfindingInline(&system, &stream, 8, .{});
-        try std.testing.expectEqual(@as(usize, 1), from_end.accepted_requests);
+        _ = try updatePathfindingInline(&system, &stream, 8, .{});
+        try std.testing.expect(acceptedLastStep(&system, key));
     }
 }
 
@@ -4038,8 +4063,8 @@ test "status refreshes a partial exactly where intake re-solves it: one chunk si
         try std.testing.expectEqual(PathStatus.partial, view.status);
         try std.testing.expectEqual(distance == side, view.refresh);
         const stored_step = cachedStep(&system, key).?;
-        const stats = try solveStep(&system, requester, position, partial_goal);
-        try std.testing.expectEqual(@as(usize, @intFromBool(view.refresh)), stats.accepted_requests);
+        _ = try solveStep(&system, requester, position, partial_goal);
+        try std.testing.expectEqual(view.refresh, acceptedLastStep(&system, key));
         if (!view.refresh) try std.testing.expectEqual(stored_step, cachedStep(&system, key).?);
     }
 }
@@ -4087,8 +4112,8 @@ test "a partial solved toward an older goal projection is not served after the p
     try std.testing.expect(system.completed.slotIndex(key) != null);
     try std.testing.expectEqual(@as(?usize, 19 * 48 + 20), system.liveGoal(key, grid).cell);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
-    const again = try solveFrom(&system, requester, start, goal, .{});
-    try std.testing.expectEqual(@as(usize, 1), again.accepted_requests);
+    _ = try solveFrom(&system, requester, start, goal, .{});
+    try std.testing.expect(acceptedLastStep(&system, key));
 }
 
 // The partial strip under abstract caps short of its route: tier 0 claims at most two nodes and
@@ -4124,10 +4149,10 @@ test "a saturated tier-1 search publishes a partial ending on its least-estimate
     var hops: usize = 0;
     while (true) : (hops += 1) {
         if (hops == 16) return error.TestUnexpectedResult;
-        const stats = try solveHop(&system, requester, position, partial_goal);
+        _ = try solveHop(&system, requester, position, partial_goal);
         if (statusOf(&system, position, partial_goal) == .available) break;
         // The saturated tier-1 search publishes instead of dropping.
-        try std.testing.expectEqual(@as(usize, 1), stats.escalated_solves);
+        try std.testing.expectEqual(@as(usize, 1), escalatedAdmissions(&system));
         try expectPublished(&system, 0, partial_goal, true);
         const hop = cachedResult(&system, partial_goal).?;
         try std.testing.expect(hop.isPartial());
@@ -4161,8 +4186,8 @@ test "a saturated tier-1 search with no expanded node below its start's estimate
     try std.testing.expectEqual(@as(usize, 1), solveResultCount(&system, .budget_exhausted));
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const second = try updatePathfindingInline(&system, &empty, 8, .{});
-    try std.testing.expectEqual(@as(usize, 1), second.escalated_solves);
+    _ = try updatePathfindingInline(&system, &empty, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), escalatedAdmissions(&system));
     try std.testing.expectEqual(@as(usize, 1), solveResultCount(&system, .budget_exhausted));
     try std.testing.expectEqual(@as(usize, 0), system.completed.count());
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, partial_goal, .default, null).status);
@@ -4275,7 +4300,7 @@ test "threaded least-estimate partials equal serial for any range size and worke
     try serial.reserve(capacity);
     try serial.rebuildStaticNavGridWithWorld(&data, &world, null);
     try queueWithTiers(&serial, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
-    const serial_stats = try updatePathfindingInline(&serial, &empty, 8, .{});
+    _ = try updatePathfindingInline(&serial, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 4), solveResultCount(&serial, .partial));
     try std.testing.expectEqual(@as(usize, 4), solveResultCount(&serial, .budget_exhausted));
     for ([_]usize{ 1, 3 }) |workers| {
@@ -4295,7 +4320,7 @@ test "threaded least-estimate partials equal serial for any range size and worke
             try expectSameCache(&serial, &threaded);
             try std.testing.expectEqual(@as(usize, 4), solveResultCount(&threaded, .partial));
             try std.testing.expectEqual(@as(usize, 4), solveResultCount(&threaded, .budget_exhausted));
-            try std.testing.expectEqual(serial_stats.escalated_solves, stats.escalated_solves);
+            try std.testing.expectEqual(escalatedAdmissions(&serial), escalatedAdmissions(&threaded));
             try std.testing.expectEqual(serial.pending.len, threaded.pending.len);
             for (0..serial.pending.len) |index| {
                 try std.testing.expect(std.meta.eql(serial.pending.at(index), threaded.pending.at(index)));
@@ -4672,8 +4697,8 @@ test "an escalated solve through the tier-1 pool equals a participant reference"
         try std.testing.expectEqual(@as(u8, 1), pool.pending.at(0).tier);
         var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer empty.deinit();
-        const second = try updatePathfindingInline(&pool, &empty, 8, .{});
-        try std.testing.expectEqual(@as(usize, 1), second.escalated_solves);
+        _ = try updatePathfindingInline(&pool, &empty, 8, .{});
+        try std.testing.expectEqual(@as(usize, 1), escalatedAdmissions(&pool));
         try expectPublished(&pool, 0, goal, false);
         const expected = cachedStitched(&reference, 0, goal);
         try std.testing.expect(expected.len() > 1);
@@ -4715,14 +4740,14 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
     try queueWithTiers(&serial, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
-    const serial_stats = try updatePathfindingInline(&serial, &empty, 8, .{});
+    _ = try updatePathfindingInline(&serial, &empty, 8, .{});
     try queueWithTiers(&threaded, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
     const stats = try threaded.update(&empty, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
 
     try std.testing.expect(!stats.solve_batch.ran_inline);
     try std.testing.expect(stats.solve_batch.range_count > 1);
-    try std.testing.expectEqual(@as(usize, 4), stats.escalated_solves);
-    try std.testing.expectEqual(serial_stats.escalated_solves, stats.escalated_solves);
+    try std.testing.expectEqual(@as(usize, 4), escalatedAdmissions(&threaded));
+    try std.testing.expectEqual(escalatedAdmissions(&serial), escalatedAdmissions(&threaded));
     try std.testing.expectEqual(escalation_goals.len, solveResultCount(&serial, .available));
     try std.testing.expectEqual(escalation_goals.len, solveResultCount(&threaded, .available));
     // Each escalated admission holds its own pool entry, in admission order.
@@ -4753,7 +4778,7 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
     try partial_serial.reserve(partial_capacity);
     try partial_serial.rebuildStaticNavGridWithWorld(&data, &world, null);
     try queueWithTiers(&partial_serial, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
-    const partial_stats = try updatePathfindingInline(&partial_serial, &empty, 8, .{});
+    _ = try updatePathfindingInline(&partial_serial, &empty, 8, .{});
     const serial_partials = solveResultCount(&partial_serial, .partial);
     const serial_exhausted = solveResultCount(&partial_serial, .budget_exhausted);
     try std.testing.expect(serial_partials != 0);
@@ -4777,7 +4802,7 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
             try std.testing.expectEqual(serial_partials, solveResultCount(&partial_threaded, .partial));
             try std.testing.expectEqual(solveResultCount(&partial_serial, .available), solveResultCount(&partial_threaded, .available));
             try std.testing.expectEqual(serial_exhausted, solveResultCount(&partial_threaded, .budget_exhausted));
-            try std.testing.expectEqual(partial_stats.escalated_solves, threaded_stats.escalated_solves);
+            try std.testing.expectEqual(escalatedAdmissions(&partial_serial), escalatedAdmissions(&partial_threaded));
             try std.testing.expectEqual(partial_serial.pending.len, partial_threaded.pending.len);
             for (0..partial_serial.pending.len) |index| {
                 try std.testing.expect(std.meta.eql(partial_serial.pending.at(index), partial_threaded.pending.at(index)));
@@ -4878,11 +4903,11 @@ test "threaded cross-level solves equal serial, at tier 0 and through the tier-1
     _ = try updatePathfindingInline(&serial, &empty, 8, .{});
     const tiered = try threaded.update(&empty, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
     try std.testing.expect(!tiered.solve_batch.ran_inline);
-    try std.testing.expectEqual(@as(usize, 4), tiered.escalated_solves);
+    try std.testing.expectEqual(@as(usize, 4), escalatedAdmissions(&threaded));
     try std.testing.expectEqual(goals.len, solveResultCount(&serial, .available));
     try std.testing.expectEqual(goals.len, solveResultCount(&threaded, .available));
     // Every pool entry the step used ran its own crossing search.
-    for (threaded.tier1_scratch.items[0..tiered.escalated_solves]) |*entry| try std.testing.expect(entry.corridor.abstract.crossing.settles != 0);
+    for (threaded.tier1_scratch.items[0..escalatedAdmissions(&threaded)]) |*entry| try std.testing.expect(entry.corridor.abstract.crossing.settles != 0);
     for (goals) |goal| try expectSameStitched(cachedStitched(&serial, 2, goal), cachedStitched(&threaded, 2, goal));
 
     // The warmed threaded re-solve, heuristic and box scans included, allocates nothing.
@@ -4901,8 +4926,8 @@ test "threaded cross-level solves equal serial, at tier 0 and through the tier-1
     // And so does a warmed tier-1 re-solve through the pool.
     threaded.clearRuntimeState();
     try queueCrossLevelWithTiers(&threaded, &requesters, 2, &goals, &tiers);
-    const warmed_tiered = try threaded.update(&empty, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
-    try std.testing.expectEqual(@as(usize, 4), warmed_tiered.escalated_solves);
+    _ = try threaded.update(&empty, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
+    try std.testing.expectEqual(@as(usize, 4), escalatedAdmissions(&threaded));
     try std.testing.expectEqual(goals.len, solveResultCount(&threaded, .available));
 }
 
@@ -4954,7 +4979,7 @@ test "a reserved threaded solve with escalations allocates nothing on a multi-wo
         try queueWithTiers(&system, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
         const stats = try system.update(&empty, 8, &threads, config);
         try std.testing.expect(!stats.solve_batch.ran_inline);
-        try std.testing.expectEqual(@as(usize, 4), stats.escalated_solves);
+        try std.testing.expectEqual(@as(usize, 4), escalatedAdmissions(&system));
         if (stitched_cells == 8) {
             const partials = solveResultCount(&system, .partial);
             try std.testing.expect(partials != 0);
@@ -5007,10 +5032,12 @@ test "a pool reserve out of memory clamps escalated admissions to the reserved p
             try queueWithTiers(&system, &requesters, tileCenter(1, 1), escalation_goals[0..3], &.{ 1, 1, 1 });
             var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
             defer empty.deinit();
-            const stats = try updatePathfindingInline(&system, &empty, 8, .{});
-            try std.testing.expectEqual(pool_entries, stats.escalated_solves);
-            try std.testing.expectEqual(3 - pool_entries, stats.escalated_deferred);
+            _ = try updatePathfindingInline(&system, &empty, 8, .{});
+            try std.testing.expectEqual(pool_entries, escalatedAdmissions(&system));
             try std.testing.expectEqual(pool_entries, solveResultCount(&system, .available));
+            // The rest wait out the step, still pending at tier 1.
+            try std.testing.expectEqual(3 - pool_entries, system.pending.len);
+            for (0..system.pending.len) |index| try std.testing.expectEqual(@as(u8, 1), system.pending.at(index).tier);
         }
     }
     try std.testing.expect(partial_pools > 1);
@@ -5055,6 +5082,13 @@ test "an elastic resize keeps a building group field building" {
 
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 
+// How many of the 24-tile registry world's routes [0, count) hold a cached result.
+fn cachedRouteCount(system: *const PathfindingSystem, count: usize) usize {
+    var cached: usize = 0;
+    for (0..count) |index| cached += @intFromBool(system.completed.slotIndex(registryRouteKey(system, index, 24)) != null);
+    return cached;
+}
+
 // Fills `system`'s 64-entry cache with routes [0, 64), then publishes routes [64, 80) into
 // the full cache inline without flushing (the production update minus its closing flush,
 // on a 0-worker thread system): the flush has victims in the log and adds in every
@@ -5072,7 +5106,8 @@ fn prepareMixedFlush(system: *PathfindingSystem, requester: EntityId) !void {
     defer threads.deinit();
     var stats = PathfindingStats{};
     try system.updateThreaded(&stream, 16, .{ .thread_system = &threads, .config = .{} }, &stats);
-    try std.testing.expect(stats.cache_evictions != 0);
+    // The full cache evicted earlier routes for the new ones.
+    try std.testing.expect(cachedRouteCount(system, 64) < 64);
     try std.testing.expect(system.completed.core.ownerLog().len != 0 and system.publish_ranges != 0);
 }
 
@@ -5084,6 +5119,7 @@ fn logEveryOpKind(system: *PathfindingSystem) !void {
     try system.resizePreservingLiveState(system.capacity, 1, null);
     try std.testing.expectEqual(@as(usize, 32), system.completed.logicalCapacity());
     var stats = PathfindingStats{};
+    const cached_routes = cachedRouteCount(system, 64);
     system.completed.core.beginPublish();
     const reput = system.completed.core.keyOf(0);
     var fresh = [_]PathQueryKey{ reput, emptyKey(system.graph.version), emptyKey(system.graph.version) };
@@ -5093,7 +5129,8 @@ fn logEveryOpKind(system: *PathfindingSystem) !void {
         const claimed = system.completed.claim(key, 1, 0, 0, .{ .level = 0, .cell = 0 }, 0, system.step_counter, &stats);
         system.completed.destination(claimed)[0] = 0;
     }
-    try std.testing.expectEqual(@as(usize, 2), stats.cache_evictions);
+    // The two new keys each evicted a route; the re-put keeps its own.
+    try std.testing.expectEqual(cached_routes - 2, cachedRouteCount(system, 64));
     for (fresh) |key| system.completed.removeAt(system.completed.slotIndex(key).?);
 }
 
@@ -5377,9 +5414,9 @@ test "an agent sealed in a pocket reads its goal unavailable from reach, and an 
     const goal = tileCenter(20, 20);
     // The sealed-in agent's start cannot reach the goal: answered at intake, never pending.
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, pocketGoal(11), 0, goal, .default, null).status);
-    const sealed = try solveFrom(&system, requester, pocketGoal(11), goal, .{});
+    _ = try solveFrom(&system, requester, pocketGoal(11), goal, .{});
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, pocketGoal(11), 0, goal, .default, null).status);
-    try std.testing.expectEqual(@as(usize, 0), sealed.accepted_requests + system.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
     try std.testing.expectEqual(@as(usize, 0), system.completed.count());
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, outsideStart(0), 0, goal, .default, null).status);
     // The outside agent reaches the same goal.
@@ -5404,14 +5441,14 @@ test "a goal sealed in a pocket is unavailable at status and intake to agents ou
     const goal = pocketGoal(55);
     // Before any request, every outside start reads unavailable.
     for (0..6) |index| try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outsideStart(index * 7), 0, goal, .default, null).status);
-    const inline_stats = try solveFrom(&system, requester, outsideStart(3), goal, .{});
+    _ = try solveFrom(&system, requester, outsideStart(3), goal, .{});
     try std.testing.expectEqual(PathStatus.unavailable, statusOf(&system, outsideStart(3), goal));
-    try std.testing.expectEqual(@as(usize, 0), inline_stats.accepted_requests + system.pending.len + system.completed.count());
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len + system.completed.count());
     // Threaded intake: requests to every pocket goal from outside, over several ranges.
     const threaded = try requestPocketGoals(&system, requester, 0, 16, 16, &threads, .{ .adaptive = false, .items_per_range = 8 });
     try std.testing.expect(!threaded.intake_batch.ran_inline);
     for (0..16) |index| try std.testing.expectEqual(PathStatus.unavailable, statusOf(&system, outsideStart(index), pocketGoal(index)));
-    try std.testing.expectEqual(@as(usize, 0), threaded.accepted_requests + system.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
     try std.testing.expectEqual(@as(usize, 0), system.completed.count());
     // A start inside the pocket reaches it.
     const inside_start = pocketGoal(2);
@@ -5505,8 +5542,7 @@ test "each solve outcome: an invalid graph, a missing goal level, no live goal, 
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
     system.scratch_slots.items[0].corridor.abstract.reset();
-    const answered = try updatePathfindingInline(&system, &empty, 16, .{});
-    try std.testing.expectEqual(@as(usize, 1), answered.solve_admissions);
+    _ = try updatePathfindingInline(&system, &empty, 16, .{});
     try std.testing.expectEqual(@as(usize, 1), system.solve_results.items.len);
     try std.testing.expectEqual(@as(usize, 1), solveResultCount(&system, .unavailable));
     try std.testing.expectEqual(@as(usize, 0), lastSolveNodes(&system));
@@ -5530,9 +5566,9 @@ test "a goal with no open cell within the projection radius is unavailable for e
     defer system.deinit();
     const goal = tileCenter(20, 20);
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, tileCenter(45, 45), 0, goal, .default, null).status);
-    const stats = try solveFrom(&system, requester, tileCenter(45, 45), goal, .{});
+    _ = try solveFrom(&system, requester, tileCenter(45, 45), goal, .{});
     try std.testing.expectEqual(PathStatus.unavailable, statusOf(&system, tileCenter(45, 45), goal));
-    try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests + system.pending.len + system.completed.count());
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len + system.completed.count());
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, tileCenter(1, 45), 0, goal, .default, null).status);
 }
 
@@ -5570,17 +5606,19 @@ test "a blocked goal whose projection lies in a sealed area is unavailable at st
     const start = tileCenter(45, 45);
     const goal = tileCenter(14, 1);
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, start, 0, goal, .default, null).status);
-    const sealed = try solveFrom(&system, requester, start, goal, .{});
+    _ = try solveFrom(&system, requester, start, goal, .{});
     try std.testing.expectEqual(PathStatus.unavailable, statusOf(&system, start, goal));
-    try std.testing.expectEqual(@as(usize, 0), sealed.accepted_requests + system.pending.len + system.completed.count());
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len + system.completed.count());
     // A tunnel stopping one cell short of the key's still-blocked cell: its projection is
     // now (15, 1), reachable.
     try digProjectionTunnel(&system, &fixture, 15);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
-    const solved = try solveFrom(&system, requester, start, goal, .{});
+    _ = try solveFrom(&system, requester, start, goal, .{});
     try std.testing.expect(solvedLastStep(&system, goal));
-    try std.testing.expectEqual(@as(usize, 1), solved.goal_projected);
+    // Solved toward the projection (15, 1).
+    const key = system.graph.keyForWorld(0, goal, .default).?;
+    try std.testing.expectEqual(@as(u32, 1 * 48 + 15), system.completed.resultAt(system.completed.slotIndex(key).?).goal_cell);
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default, null).status);
 }
 
@@ -5610,8 +5648,7 @@ test "a dig opening a sealed pocket makes its goals reachable after that step's 
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
     system.scratch_slots.items[0].corridor.abstract.reset();
-    const answered = try updatePathfindingInline(&system, &empty, 16, .{});
-    try std.testing.expectEqual(@as(usize, 1), answered.solve_admissions);
+    _ = try updatePathfindingInline(&system, &empty, 16, .{});
     try std.testing.expectEqual(@as(usize, 1), system.solve_results.items.len);
     try std.testing.expectEqual(@as(usize, 1), solveResultCount(&system, .unavailable));
     try std.testing.expectEqual(@as(usize, 0), lastSolveNodes(&system));
@@ -5685,8 +5722,7 @@ test "a cached path to an older projection is not served after the projection mo
     try std.testing.expect(system.completed.slotIndex(key) != null);
     try std.testing.expectEqual(@as(?usize, 19 * 48 + 20), system.liveGoal(key, grid).cell);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
-    const again = try solveFrom(&system, requester, start, goal, .{});
-    try std.testing.expectEqual(@as(usize, 1), again.accepted_requests);
+    _ = try solveFrom(&system, requester, start, goal, .{});
     try std.testing.expect(solvedLastStep(&system, goal));
     try std.testing.expectEqual(@as(usize, 1), system.completed.count());
     try std.testing.expectEqual(@as(u32, 19 * 48 + 20), (try expectStoredEnd(&system, key)).cell);
@@ -5753,11 +5789,14 @@ test "a crowd at one blocked unreachable goal shares one projection: the resolve
     try std.testing.expectEqual(@as(usize, 1), resolve.distinct);
     try std.testing.expectEqual(@as(usize, 1), resolve.distinct);
     for (stream.mergedItems()) |request| try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, request.start, 0, goal, .default, null).status);
-    const stats = try updatePathfindingInline(&system, &stream, crowd, .{});
-    // Intake read the one projection from the table, never its own.
-    try std.testing.expect(!system.liveGoal(system.graph.keyForWorld(0, goal, .default).?, system.graph.grid(0).?).fallback);
+    _ = try updatePathfindingInline(&system, &stream, crowd, .{});
+    // Intake read the one projection from the table, never its own: the table holds it.
+    const goal_key = system.graph.keyForWorld(0, goal, .default).?;
+    const goal_grid = system.graph.grid(0).?;
+    const table_projection = system.goals.lookup(goalRef(.walk, 0, goal_grid.indexForCell(goal_key.goal).?)) orelse return error.TestExpectedTableProjection;
+    try std.testing.expectEqual(@as(?usize, table_projection), system.liveGoal(goal_key, goal_grid).cell);
     for (stream.mergedItems()) |request| try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, request.start, 0, goal, .default, null).status);
-    try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests + system.pending.len);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
 }
 
 test "the default class walks, and reach by class equals connectivity reach on the walk graph" {
@@ -5882,7 +5921,7 @@ test "status and intake read unavailable exactly when a reference directed searc
                 if (grid.isBlockedIndex(to)) continue;
                 clearRequestsKeepingFields(&system);
                 const goal = grid.cellCenter(to);
-                const stats = try solveFrom(&system, requester, start, goal, .{});
+                _ = try solveFrom(&system, requester, start, goal, .{});
                 if (reached[to]) {
                     // Published whole, or over its first budget: promoted and still pending.
                     if (solvedLastStep(&system, goal)) {
@@ -5893,7 +5932,7 @@ test "status and intake read unavailable exactly when a reference directed searc
                         try std.testing.expectEqual(@as(u8, 1), system.pending.at(0).tier);
                     }
                 } else {
-                    try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests + system.pending.len + system.completed.count());
+                    try std.testing.expectEqual(@as(usize, 0), system.pending.len + system.completed.count());
                 }
             }
         }
@@ -5926,8 +5965,9 @@ test "a reserve on a live system keeps the deferred requests and group tallies i
     try std.testing.expectEqualDeep(group_key, system.group_requests.items[0].key);
 
     // The next step folds the repeats into the live entries and solves both.
-    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
-    try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests);
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
+    // Exactly the two live entries were admitted and solved; no repeat queued again.
+    try std.testing.expectEqual(@as(usize, 2), system.solve_results.items.len);
     try std.testing.expectEqual(@as(usize, 0), system.pending.len);
     try std.testing.expect(solvedLastStep(&system, cellWorld(12, 12)));
     try std.testing.expect(solvedLastStep(&system, cellWorld(9, 3)));

@@ -1022,14 +1022,16 @@ fn runLongPathAttempt(io: std.Io, threads: *ThreadSystem, system: *PathfindingSy
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
     if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
     if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
-    if (stats.solve_admissions != 1 or stats.escalated_solves != @intFromBool(tier != 0)) return error.LongPathNotOneSolve;
+    if (stats.perf.solve_admissions != 1 or stats.perf.escalated_solves != @intFromBool(tier != 0)) return error.LongPathNotOneSolve;
     const corridor = if (tier == 0) &system.scratch_slots.items[0].corridor else &system.tier1_scratch.items[0].corridor;
     const abstract = &corridor.abstract;
     // A search that reached its goal leaves its corridor; a saturated one leaves it empty, or
     // cut at the corridor limit.
     const found = abstract.corridor.items.len != 0 and abstract.corridor.items.len < abstract.corridor_limit;
     const cells = if (found) corridor.stitched.items.len else 0;
-    const segments = stats.max_stitch_segments_observed;
+    const segments = stats.perf.max_stitch_segments_observed;
+    // The segment cap bounds every stitch's local searches.
+    if (segments > system.capacity.max_stitch_segments) return error.StitchSegmentsPastCap;
     const outcome: LongPathOutcome = if (stats.perf.available_results == 1 or stats.perf.partial_results == 1) published: {
         // Every layout's route leaves its start's chunk, so the solve ran the abstract search.
         if (!found or stats.perf.abstract_solves != 1) return error.LongPathSolvedOffCorridor;
@@ -1162,10 +1164,10 @@ fn runLongPathWalk(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, s
         walk.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
         if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
         if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
-        walk.solves += stats.solve_admissions;
+        walk.solves += stats.perf.solve_admissions;
         walk.partial_results += stats.perf.partial_results;
         walk.full_results += stats.perf.available_results - stats.perf.cache_hits;
-        walk.escalations += stats.escalated_solves;
+        walk.escalations += stats.perf.escalated_solves;
     }
     if (!std.meta.eql(grid.worldToCellClamped(position), goal_cell)) return error.LongPathWalkStalled;
     return walk;
@@ -1260,9 +1262,9 @@ fn runLongPathHops(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, s
             chain.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
             if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
             if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
-            if (stats.solve_admissions != 1 or stats.perf.cache_hits != 0) return error.LongPathNotOneSolve;
+            if (stats.perf.solve_admissions != 1 or stats.perf.cache_hits != 0) return error.LongPathNotOneSolve;
             chain.solves += 1;
-            chain.escalations += stats.escalated_solves;
+            chain.escalations += stats.perf.escalated_solves;
             if (stats.perf.available_results == 1) break .arrived;
             if (stats.perf.partial_results == 1) {
                 if (attempt == 1 and !corridorEndsAtGoal(system, tier1_abstract.corridor.items, hop)) chain.least_hops += 1;
@@ -1567,7 +1569,7 @@ fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_syste
     if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
     if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
     std.debug.assert(stats.perf.available_results <= count);
-    if (unsolved_routes == .fail and (stats.perf.available_results != count or stats.pending_requests != 0)) return error.RouteUnsolved;
+    if (unsolved_routes == .fail and (stats.perf.available_results != count or stats.perf.pending_requests != 0)) return error.RouteUnsolved;
     return stats;
 }
 

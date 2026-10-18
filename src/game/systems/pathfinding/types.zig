@@ -539,36 +539,6 @@ pub const PathfindingConfig = struct {
 };
 
 pub const PathfindingStats = struct {
-    accepted_requests: usize = 0,
-    pending_requests: usize = 0,
-    // Pending requests admitted to this step's solve batch.
-    solve_admissions: usize = 0,
-    // Solve-window entries past the admission limit, left pending.
-    admission_deferred_requests: usize = 0,
-    // Result-cache entries a full cache's claims evicted.
-    cache_evictions: usize = 0,
-    // Group fields a new goal took over from a goal no longer requested above the
-    // threshold.
-    group_field_evictions: usize = 0,
-    // Tier-1 (escalated) solve attempts admitted into this step's solve batch, and
-    // tier-1-ready requests that were NOT admitted because max_escalated_solves_per_step
-    // was already reached this step (they simply wait for a later step).
-    escalated_solves: usize = 0,
-    escalated_deferred: usize = 0,
-    // Accepted requests whose goal cell was blocked (their live goal is its projection).
-    goal_projected: usize = 0,
-    group_fields_built: usize = 0,
-    group_field_reuses: usize = 0,
-    group_field_rebuild_throttled: usize = 0,
-    // Diagnostic only: the most per-segment local A* searches any single stitchCorridor
-    // call needed this step, aggregated across workers in finishUpdate (see
-    // SearchScratch.max_stitch_segments_used). Lets a live perf capture distinguish "the
-    // fixed max_stitch_segments cap is what's bounding solve cost" (this stays pinned at
-    // or near the cap every spike) from "some other cost dominates" (this stays low).
-    max_stitch_segments_observed: usize = 0,
-    // Diagnostic only: distinct group keys tallied this step; held near or above
-    // max_group_fields it shows goals waiting for a field slot.
-    distinct_group_keys: usize = 0,
     solve_batch: BatchStats = .{},
     // Request classification (`path_intake`); inline stages report `ran_inline`.
     intake_batch: BatchStats = .{},
@@ -589,6 +559,35 @@ pub const PathfindingStats = struct {
     /// Diagnostic counts, kept only with `runtime_perf_log.enabled` and zero-sized without
     /// it; `SimulationPipelineStats.recordTo` logs the request and result counts.
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        // Intake: requests accepted into pending (those whose goal cell was blocked, so their
+        // live goal is its projection, in `goal_projected`), and the pending queue's length
+        // after the step.
+        accepted_requests: usize = 0,
+        goal_projected: usize = 0,
+        pending_requests: usize = 0,
+        // Pending requests admitted to this step's solve batch, and solve-window entries past
+        // the admission limit, left pending.
+        solve_admissions: usize = 0,
+        admission_deferred_requests: usize = 0,
+        // Tier-1 (escalated) solves admitted this step, and tier-1-ready requests left
+        // pending because `max_escalated_solves_per_step` was reached.
+        escalated_solves: usize = 0,
+        escalated_deferred: usize = 0,
+        // Result-cache entries a full cache's claims evicted.
+        cache_evictions: usize = 0,
+        // Group fields: builds begun, ready-or-building fields reused by their goal, rekeys a
+        // build in progress or the rebuild throttle held back, fields a new goal took over
+        // from a goal no longer requested above the threshold, and the distinct group keys
+        // tallied (held near or above max_group_fields, goals wait for a field slot).
+        group_fields_built: usize = 0,
+        group_field_reuses: usize = 0,
+        group_field_rebuild_throttled: usize = 0,
+        group_field_evictions: usize = 0,
+        distinct_group_keys: usize = 0,
+        // The most per-segment local searches one stitched corridor needed this step, the
+        // workers' high-waters merged in finishUpdate (`SearchScratch.perf`); at most
+        // `max_stitch_segments`.
+        max_stitch_segments_observed: usize = 0,
         // Intake: requests answered without a new pending entry (a group field sample, a
         // cache hit, or a key already pending), dropped (an out-of-range level, the pending
         // cap, the release-build intake clamp, a resize), served from the cache, and served
@@ -661,7 +660,9 @@ pub const GroupRequestTally = struct {
 /// expired result to remove. Classified against step-start state only; the main-thread
 /// merge resolves expiry, in-step duplicates, and the pending cap in request order.
 pub const IntakeRecord = struct {
-    entity: EntityId,
+    // Aligned so `intake_range_alignment_items` records fill whole cache lines with or
+    // without the perf fields.
+    entity: EntityId align(intake_record_alignment),
     key: PathQueryKey,
     start_level: u16,
     start: GridCell,
@@ -670,14 +671,14 @@ pub const IntakeRecord = struct {
     // Not served by a group field, a cache, or a reach answer, and not pending at step
     // start.
     candidate: bool,
-    // The goal cell was blocked: its live goal is its projection.
-    projected: bool,
     perf: Perf = .{},
 
     /// Kept only with `runtime_perf_log.enabled`: later candidate requests for the same key
-    /// in this range, folded into this record and counted by the merge.
+    /// in this range, folded into this record and counted by the merge, and whether the goal
+    /// cell was blocked (its live goal is its projection).
     pub const Perf = if (runtime_perf_log.enabled) struct {
         repeats: usize = 0,
+        projected: bool = false,
     } else struct {};
 };
 
@@ -746,6 +747,9 @@ pub fn RecentKeys(comptime Key: type, comptime Entry: type) type {
 /// Intake range alignment: a multiple of the SIMD lane count at which every range's
 /// record and group-key windows start on a cache line.
 pub const intake_range_alignment_items: usize = 2 * simd.lane_count;
+// The `IntakeRecord` alignment at which `intake_range_alignment_items` records fill whole
+// thread-shared cache lines.
+const intake_record_alignment = @max(@alignOf(EntityId), thread_shared_record_alignment / intake_range_alignment_items);
 
 comptime {
     std.debug.assert(intake_range_alignment_items % simd.lane_count == 0);

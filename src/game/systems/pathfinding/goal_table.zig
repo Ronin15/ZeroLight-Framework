@@ -545,8 +545,8 @@ test "a nav batch, an apply of edits, or a rebuild invalidates the goal table, a
         }
         try std.testing.expectEqual(@as(?u32, null), system.goals.lookup(ref));
         const grid = system.graph.grid(0).?;
+        // The table misses the key, so the live goal is the projection computed now.
         const live = system.liveGoal(if (change[2] == 2) system.graph.keyForWorld(0, intents[0].goal, .default).? else key, grid);
-        try std.testing.expect(live.fallback);
         try std.testing.expectEqual(grid.projectToNearestOpen(.{ .x = 5, .y = 5 }, default_goal_projection_radius), live.cell);
         try std.testing.expectEqual(@as(?usize, @as(usize, change[1]) * 10 + change[0]), live.cell);
     }
@@ -566,6 +566,5 @@ test "an empty goal table that reserved no slots misses every lookup, and the li
     try std.testing.expectEqual(@as(?u32, null), system.goals.lookup(ref));
     const grid = system.graph.grid(0).?;
     const live = system.liveGoal(system.graph.keyForWorld(0, cellPosition(.{ .x = 3, .y = 3 }), .default).?, grid);
-    try std.testing.expect(live.fallback);
     try std.testing.expectEqual(grid.projectToNearestOpen(.{ .x = 3, .y = 3 }, default_goal_projection_radius), live.cell);
 }

@@ -227,7 +227,7 @@ fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
     if (stats.perf.available_results != 0) return error.PocketGoalReached;
     if (stats.perf.dropped_requests != 0 or stats.perf.start_invalid_dropped != 0) return error.PocketRequestDropped;
-    if (stats.perf.solved_requests != 0 or stats.accepted_requests != 0 or stats.perf.cache_hits != 0) return error.PocketSearched;
+    if (stats.perf.solved_requests != 0 or stats.perf.accepted_requests != 0 or stats.perf.cache_hits != 0) return error.PocketSearched;
     if (stats.perf.unavailable_results != count) return error.PocketNotAnsweredAtIntake;
     return .{ .elapsed_ns = elapsed_ns, .stats = stats };
 }
@@ -575,7 +575,7 @@ fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixtur
     var elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
     if (stats.perf.available_results != 0) return error.NegativeBurstGoalReached;
     if (stats.perf.dropped_requests != 0 or stats.perf.start_invalid_dropped != 0) return error.NegativeBurstRequestDropped;
-    if (stats.perf.unavailable_results != count or stats.pending_requests != 0) return error.NegativeBurstUnanswered;
+    if (stats.perf.unavailable_results != count or stats.perf.pending_requests != 0) return error.NegativeBurstUnanswered;
     if (stats.perf.solved_requests != 0) return error.NegativeBurstSearched;
     const status_start_ns = suite.nowNs(io);
     const all_unavailable = unavailableCount(fixture) == count;

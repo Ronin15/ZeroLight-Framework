@@ -161,7 +161,7 @@ pub fn claimPublish(self: *PathfindingSystem, stats: *PathfindingStats) void {
             .deferred => continue,
         }
     }
-    stats.solve_admissions = self.solve_indices.items.len;
+    if (comptime runtime_perf_log.enabled) stats.perf.solve_admissions = self.solve_indices.items.len;
 }
 
 /// `publish_copy`: each range copies its claimed results' paths into their stripes or
@@ -455,8 +455,7 @@ test "solve results land at their solve ordinal and publish in pending order" {
 
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const stats = try updatePathfindingInline(&system, &empty, 8, .{});
-    try std.testing.expectEqual(@as(usize, 1), stats.escalated_deferred);
+    _ = try updatePathfindingInline(&system, &empty, 8, .{});
     try std.testing.expectEqualSlices(usize, &.{ 0, 2, 3 }, system.solve_indices.items);
     try std.testing.expectEqual(@as(usize, 3), system.solve_results.items.len);
     const stride = system.stripe_words;
@@ -474,6 +473,7 @@ test "solve results land at their solve ordinal and publish in pending order" {
     }
     try std.testing.expectEqual(@as(usize, 1), system.pending.len);
     try std.testing.expectEqualDeep(keys[1], system.pending.at(0).key);
+    try std.testing.expectEqual(@as(u8, 1), system.pending.at(0).tier);
 }
 
 test "pathfinding result publish after its reserve allocates nothing (FailingAllocator)" {
@@ -571,8 +571,7 @@ test "pathfinding a publish reserve out of memory claims nothing, leaves pending
     // With memory back, the next step publishes the same requests without new intake.
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const retry = try updatePathfindingInline(&system, &empty, 8, .{});
-    try std.testing.expectEqual(@as(usize, 0), retry.accepted_requests);
+    _ = try updatePathfindingInline(&system, &empty, 8, .{});
     try expectGoalsSolved(&system, &(goals ++ [_]math.Vec2{aged_goal}));
     try std.testing.expectEqual(@as(usize, 0), system.pending.len);
     try std.testing.expect(system.completed.long_block_count >= goals.len);
@@ -653,7 +652,7 @@ test "re-putting a key replaces its registrations" {
     try std.testing.expectEqual(@as(usize, 2), registrations);
 }
 
-test "threaded publish equals serial across range sizes and worker counts (cache bytes, per-shard lists, stats), and publish_copy and registry_flush run on workers" {
+test "threaded publish equals serial across range sizes and worker counts (cache bytes and per-shard lists), and publish_copy and registry_flush run on workers" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -671,7 +670,7 @@ test "threaded publish equals serial across range sizes and worker counts (cache
         const route = registryRoute(index, 24);
         try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
     }
-    const serial_stats = try updatePathfindingInline(&serial, &stream, 64, .{});
+    _ = try updatePathfindingInline(&serial, &stream, 64, .{});
     try expectRoutesSolved(&serial, 24, 0, 48);
     try std.testing.expect(serial.completed.long_block_count != 0);
     try expectRegistryMatchesCache(&serial);
@@ -685,7 +684,6 @@ test "threaded publish equals serial across range sizes and worker counts (cache
             const stats = try threaded.update(&stream, 64, &threads, .{ .adaptive = false, .items_per_range = items_per_range });
             try expectSameCache(&serial, &threaded);
             try expectSameRegistry(&serial, &threaded);
-            try std.testing.expectEqual(serial_stats.cache_evictions, stats.cache_evictions);
             if (items_per_range == 1) {
                 try std.testing.expect(!stats.registry_flush_batch.ran_inline and stats.registry_flush_batch.range_count > 1);
             }

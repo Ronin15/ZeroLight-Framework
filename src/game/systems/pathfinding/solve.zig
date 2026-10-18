@@ -354,11 +354,11 @@ fn stitchCorridor(
 }
 
 // Counts one segment search against `segment_cap`, recording the participant's per-step
-// high-water; false when the cap is spent.
+// high-water with perf counters; false when the cap is spent.
 fn countSegment(scratch: *SearchScratch, segments_used: *usize, segment_cap: usize) bool {
     if (segments_used.* >= segment_cap) return false;
     segments_used.* += 1;
-    scratch.max_stitch_segments_used = @max(scratch.max_stitch_segments_used, segments_used.*);
+    if (comptime runtime_perf_log.enabled) scratch.perf.max_stitch_segments_used = @max(scratch.perf.max_stitch_segments_used, segments_used.*);
     return true;
 }
 

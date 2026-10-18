@@ -1467,17 +1467,6 @@ pub fn shrinkFixture(data: *const DataSystem, fixture: *const RegistryWorld, req
 /// The agent count the request-side stage tests pass to `update`.
 pub const intake_test_agents: usize = 40;
 
-/// Two updates' request-side stats match, field by field.
-pub fn expectRequestStatsEqual(expected: PathfindingStats, actual: PathfindingStats) !void {
-    inline for (.{
-        "accepted_requests",     "pending_requests",              "goal_projected",  "group_fields_built",
-        "group_field_reuses",    "group_field_rebuild_throttled", "cache_evictions", "distinct_group_keys",
-        "group_field_evictions",
-    }) |name| {
-        try std.testing.expectEqual(@field(expected, name), @field(actual, name));
-    }
-}
-
 /// Same pending queue, group tallies, and cached result slots.
 pub fn expectRequestStateEqual(expected: *const PathfindingSystem, actual: *const PathfindingSystem) !void {
     try expectQueuesEqual(expected, actual);

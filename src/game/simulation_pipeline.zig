@@ -624,18 +624,18 @@ pub const SimulationPipelineStats = struct {
         perf.recordTiming(.steering_directions, steering_stats.directions_ns);
         perf.recordTiming(.steering_grid, steering_stats.grid_ns);
 
-        perf.recordMetric(.path_accepted_requests, metric(pathfinding_stats.accepted_requests));
-        perf.recordMetric(.path_pending_requests, metric(pathfinding_stats.pending_requests));
-        perf.recordMetric(.path_solve_admissions, metric(pathfinding_stats.solve_admissions));
-        perf.recordMetric(.path_admission_deferred_requests, metric(pathfinding_stats.admission_deferred_requests));
-        perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.cache_evictions));
-        perf.recordMetric(.path_escalated_solves, metric(pathfinding_stats.escalated_solves));
-        perf.recordMetric(.path_escalated_deferred, metric(pathfinding_stats.escalated_deferred));
-        perf.recordMetric(.path_goal_projected, metric(pathfinding_stats.goal_projected));
-        perf.recordMetric(.path_group_fields_built, metric(pathfinding_stats.group_fields_built));
-        perf.recordMetric(.path_group_field_reuses, metric(pathfinding_stats.group_field_reuses));
-        perf.recordMetric(.path_group_field_rebuild_throttled, metric(pathfinding_stats.group_field_rebuild_throttled));
         if (comptime runtime_perf_log.enabled) {
+            perf.recordMetric(.path_accepted_requests, metric(pathfinding_stats.perf.accepted_requests));
+            perf.recordMetric(.path_pending_requests, metric(pathfinding_stats.perf.pending_requests));
+            perf.recordMetric(.path_solve_admissions, metric(pathfinding_stats.perf.solve_admissions));
+            perf.recordMetric(.path_admission_deferred_requests, metric(pathfinding_stats.perf.admission_deferred_requests));
+            perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.perf.cache_evictions));
+            perf.recordMetric(.path_escalated_solves, metric(pathfinding_stats.perf.escalated_solves));
+            perf.recordMetric(.path_escalated_deferred, metric(pathfinding_stats.perf.escalated_deferred));
+            perf.recordMetric(.path_goal_projected, metric(pathfinding_stats.perf.goal_projected));
+            perf.recordMetric(.path_group_fields_built, metric(pathfinding_stats.perf.group_fields_built));
+            perf.recordMetric(.path_group_field_reuses, metric(pathfinding_stats.perf.group_field_reuses));
+            perf.recordMetric(.path_group_field_rebuild_throttled, metric(pathfinding_stats.perf.group_field_rebuild_throttled));
             perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.perf.duplicate_requests));
             perf.recordMetric(.path_solved_requests, metric(pathfinding_stats.perf.solved_requests));
             perf.recordMetric(.path_available_results, metric(pathfinding_stats.perf.available_results));
@@ -645,10 +645,10 @@ pub const SimulationPipelineStats = struct {
             perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.perf.cache_hits));
             perf.recordMetric(.path_budget_exhausted, metric(pathfinding_stats.perf.budget_exhausted));
             perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.perf.group_field_samples));
+            perf.recordMetricMax(.path_max_stitch_segments, metric(pathfinding_stats.perf.max_stitch_segments_observed));
+            perf.recordMetricMax(.path_max_distinct_group_keys, metric(pathfinding_stats.perf.distinct_group_keys));
+            perf.recordMetric(.path_group_field_evictions, metric(pathfinding_stats.perf.group_field_evictions));
         }
-        perf.recordMetricMax(.path_max_stitch_segments, metric(pathfinding_stats.max_stitch_segments_observed));
-        perf.recordMetricMax(.path_max_distinct_group_keys, metric(pathfinding_stats.distinct_group_keys));
-        perf.recordMetric(.path_group_field_evictions, metric(pathfinding_stats.group_field_evictions));
         perf.recordBatch(.path_solve, pathfinding_stats.solve_batch);
         perf.recordBatch(.path_intake, pathfinding_stats.intake_batch);
         perf.recordBatch(.path_registry_flush, pathfinding_stats.registry_flush_batch);
@@ -5683,8 +5683,6 @@ test "a pipeline built over steering agents sizes pathfinding for them, so its f
     const intake_stats = try first;
     try std.testing.expect(!intake_stats.intake_batch.ran_inline);
     try std.testing.expect(intake_stats.intake_batch.range_count > 1);
-    try std.testing.expectEqual(@as(usize, agent_count), intake_stats.accepted_requests);
-    try std.testing.expectEqual(@as(usize, agent_count), intake_stats.pending_requests);
     // Every request's distinct goal is pending: none dropped.
     try std.testing.expectEqual(@as(usize, agent_count), system.pending.len);
     try std.testing.expectEqual(@as(u64, 0), intake_stats.resize_ns);

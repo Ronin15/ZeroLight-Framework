@@ -10,6 +10,7 @@
 const std = @import("std");
 const math = @import("../../../core/math.zig");
 const simd = @import("../../../core/simd.zig");
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const types = @import("types.zig");
@@ -380,7 +381,7 @@ fn CacheCore(comptime Extra: type) type {
             }
             const victim = self.next_evict;
             self.next_evict = (self.next_evict + 1) % physical;
-            stats.cache_evictions += 1;
+            if (comptime runtime_perf_log.enabled) stats.perf.cache_evictions += 1;
             self.removeAt(victim);
         }
 
@@ -1446,7 +1447,7 @@ test "pathfinding result cache stores a long path whole in a long block and neve
     try std.testing.expectEqual(@as(usize, 1), try cache.reserveLongBlocks(std.testing.allocator, 1));
     try std.testing.expectEqual(@as(usize, 1) << cache.long_page_shift, cache.long_block_count);
     for (0..4) |index| putTestEntry(&cache, index, 0, &stats);
-    try std.testing.expectEqual(@as(usize, 0), stats.cache_evictions);
+    try std.testing.expectEqual(@as(usize, 4), cache.count());
     for (0..4) |index| try expectTestEntry(&cache, index);
     try expectResultCacheConsistent(&cache);
     const free_after_put = cache.free_long_blocks.items.len;
@@ -1494,9 +1495,12 @@ test "pathfinding result cache long pool never passes the page of the entry limi
     cache.core.finishOwnerLog(std.testing.allocator);
     cache.core.beginPublish();
     for ([_]usize{ 9, 11, 13 }) |index| claimTestEntry(&cache, index, 1, &stats);
-    try std.testing.expectEqual(@as(usize, 3), stats.cache_evictions);
     for ([_]usize{ 9, 11, 13 }) |index| try expectTestEntry(&cache, index);
     try std.testing.expectEqual(@as(usize, 4), cache.count());
+    // Each claim evicted one earlier long entry.
+    var kept: usize = 0;
+    for ([_]usize{ 1, 3, 5, 7 }) |index| kept += @intFromBool(cache.slotIndex(testGoalKey(index)) != null);
+    try std.testing.expectEqual(@as(usize, 1), kept);
     try std.testing.expectEqual(@as(usize, 4), cache.long_block_count);
     try std.testing.expectEqual(@as(usize, 0), cache.free_long_blocks.items.len);
     try expectResultCacheConsistent(&cache);
@@ -1734,7 +1738,9 @@ test "pathfinding result cache full-cache put stays reachable when the evicted v
 
     const new_key = testGoalKey(taken[4]);
     testPut(&cache, new_key, &.{2}, &.{}, 0, 0, &stats);
-    try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
+    // A was evicted.
+    try std.testing.expect(cache.slotIndex(testGoalKey(taken[0])) == null);
+    try std.testing.expectEqual(@as(usize, 4), cache.count());
     try std.testing.expect(cache.slotIndex(new_key) != null);
 
     // A re-put updates the one slot holding the key, never a duplicate.
@@ -1772,7 +1778,6 @@ test "pathfinding a payload claimed this publish is never chosen as the victim" 
     testClaimAndCopy(&cache, testGoalKey(taken[8]), &.{5}, &.{}, 0, 1, &stats);
     try std.testing.expectEqual(@as(usize, 1), cache.slotIndex(testGoalKey(taken[8])).?);
     testClaimAndCopy(&cache, testGoalKey(taken[9]), &.{6}, &.{}, 0, 1, &stats);
-    try std.testing.expectEqual(@as(usize, 2), stats.cache_evictions);
     try std.testing.expect(cache.find(testGoalKey(taken[8])) != null);
     try std.testing.expect(cache.find(testGoalKey(taken[9])) != null);
     try std.testing.expect(cache.find(testGoalKey(taken[0])) == null);
@@ -2067,7 +2072,6 @@ test "pathfinding result cache evicts deterministically and stores paths" {
     testPut(&cache, testGoalKey(1), &.{ 0, 1, 2 }, &.{}, 0, 0, &stats);
     try std.testing.expect(cache.find(testGoalKey(1)) != null);
     testPut(&cache, testGoalKey(2), &.{ 3, 4 }, &.{}, 0, 0, &stats);
-    try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
     try std.testing.expect(cache.find(testGoalKey(1)) == null);
     const slot = cache.slotIndex(testGoalKey(2)).?;
     const stored = cache.pathSlice(slot, cache.resultAt(slot).path_len);
@@ -2094,7 +2098,6 @@ test "pathfinding result cache stays correct at full logical occupancy" {
     // One more insert past logical capacity evicts exactly one victim; every other key
     // stays resolvable.
     testPut(&cache, testGoalKey(capacity), &.{99}, &.{}, 0, 0, &stats);
-    try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
     try std.testing.expect(cache.find(testGoalKey(capacity)) != null);
     var survivors: usize = 0;
     for (0..capacity) |i| {

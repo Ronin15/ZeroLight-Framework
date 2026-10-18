@@ -741,8 +741,8 @@ test "pathfinding incremental update blocking an off-path cell keeps the cached 
     // The same goal is served from the surviving cache (a hit): nothing re-solved.
     const key = system.graph.keyForWorld(0, goal, .default).?;
     const stored_step = cachedStep(&system, key).?;
-    const after = try solveStep(&system, requester, start, goal);
-    try std.testing.expectEqual(@as(usize, 0), after.accepted_requests);
+    _ = try solveStep(&system, requester, start, goal);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
     try std.testing.expectEqual(stored_step, cachedStep(&system, key).?);
     try std.testing.expectEqual(PathStatus.available, statusOf(&system, start, goal));
     try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 3));
