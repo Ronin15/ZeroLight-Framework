@@ -12,6 +12,7 @@ const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const math = @import("../../../core/math.zig");
 const simd = @import("../../../core/simd.zig");
 const ConstSteeringAgentSlice = @import("../../data_system.zig").ConstSteeringAgentSlice;
@@ -38,7 +39,7 @@ const SpatialCellRange = @import("agent_grid.zig").SpatialCellRange;
 const findCellRange = @import("agent_grid.zig").findCellRange;
 const spatialCell = @import("agent_grid.zig").spatialCell;
 
-const max_agent_candidate_checks: u16 = 64;
+pub const max_agent_candidate_checks: u16 = 64;
 
 // Per-agent obstacle query budgets: the query stops after this many static boxes meeting
 // the query box (each a push candidate), or after `max_obstacle_work` probes and entry
@@ -100,21 +101,25 @@ pub fn writeMovementIntents(
     frame.intents.finishWrite();
     frame.path_requests.finishWrite();
 
-    for (self.movement_tallies.items) |slot| {
-        stats.agent_neighbor_samples += slot.value.agent_samples;
-        stats.obstacle_samples += slot.value.obstacle_samples;
-        stats.agent_candidate_checks += slot.value.agent_checks;
-        stats.obstacle_candidate_checks += slot.value.obstacle_checks;
+    if (comptime runtime_perf_log.enabled) {
+        for (self.movement_tallies.items) |slot| {
+            stats.perf.agent_neighbor_samples += slot.value.agent_samples;
+            stats.perf.obstacle_samples += slot.value.obstacle_samples;
+            stats.perf.agent_candidate_checks += slot.value.agent_checks;
+            stats.perf.obstacle_candidate_checks += slot.value.obstacle_checks;
+        }
     }
     stats.movement_intent_count = count;
 }
 
-pub const MovementTally = struct {
+/// One avoidance range's sample and candidate counts, kept only with
+/// `runtime_perf_log.enabled` (zero-sized otherwise, so its slots hold no storage).
+pub const MovementTally = if (runtime_perf_log.enabled) struct {
     agent_samples: usize = 0,
     obstacle_samples: usize = 0,
     agent_checks: usize = 0,
     obstacle_checks: usize = 0,
-};
+} else struct {};
 
 comptime {
     std.debug.assert(@sizeOf(PaddedSlot(MovementTally)) % thread_shared_record_alignment == 0);
@@ -148,11 +153,16 @@ const SteeringJobContext = struct {
 
 const AvoidanceResult = struct {
     direction: math.Vec2,
+    perf: AvoidancePerf = .{},
+};
+
+// One agent's avoidance samples and candidate checks.
+const AvoidancePerf = if (runtime_perf_log.enabled) struct {
     agent_samples: u16 = 0,
     obstacle_samples: u16 = 0,
     agent_candidate_checks: u16 = 0,
     obstacle_candidate_checks: u16 = 0,
-};
+} else struct {};
 
 // Path requests flagged by the selected intents before selected position `logical`.
 pub fn requestsBefore(windows: []const SelectedWindow, request_prefix: []const u32, selected_count: usize, request_count: usize, logical: usize) usize {
@@ -197,10 +207,12 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
             const result = computeAvoidance(job, index, &obstacle_hits);
             job.work.final_dir_x[index] = result.direction.x;
             job.work.final_dir_y[index] = result.direction.y;
-            tally.agent_samples += result.agent_samples;
-            tally.obstacle_samples += result.obstacle_samples;
-            tally.agent_checks += result.agent_candidate_checks;
-            tally.obstacle_checks += result.obstacle_candidate_checks;
+            if (comptime runtime_perf_log.enabled) {
+                tally.agent_samples += result.perf.agent_samples;
+                tally.obstacle_samples += result.perf.obstacle_samples;
+                tally.agent_checks += result.perf.agent_candidate_checks;
+                tally.obstacle_checks += result.perf.obstacle_candidate_checks;
+            }
             const selected = job.selected[index];
             intents.write(.{ .movement = MovementIntent{
                 .entity = selected.entity,
@@ -251,10 +263,12 @@ fn computeAvoidance(job: *const SteeringJobContext, index: usize, obstacle_hits:
 
     return .{
         .direction = math.normalizeOrZeroFinite(push.ax, push.ay, 0.0001),
-        .agent_samples = sample_count,
-        .obstacle_samples = push.samples,
-        .agent_candidate_checks = agent_candidate_count,
-        .obstacle_candidate_checks = query.entries,
+        .perf = if (comptime runtime_perf_log.enabled) .{
+            .agent_samples = sample_count,
+            .obstacle_samples = push.perf.samples,
+            .agent_candidate_checks = agent_candidate_count,
+            .obstacle_candidate_checks = query.entries,
+        } else .{},
     };
 }
 
@@ -270,12 +284,15 @@ const ObstacleHitScratch = struct {
     }
 };
 
-// The accumulated steering direction and the obstacle pushes added to it.
+// The accumulated steering direction, and the obstacle pushes added to it
+// (`runtime_perf_log.enabled` only).
 const ObstaclePush = struct {
     ax: f32,
     ay: f32,
-    samples: u16 = 0,
+    perf: PushPerf = .{},
 };
+
+const PushPerf = if (runtime_perf_log.enabled) struct { samples: u16 = 0 } else struct {};
 
 // Adds the push of each of the first `count` hit boxes, in hit order, to `push`: four boxes
 // per lane group with a scalar tail. Lanes add in lane order and a lane out of range is
@@ -315,7 +332,7 @@ fn pushObstacles(hits: *const ObstacleHitScratch, count: usize, start_x: f32, st
             if (in_range[lane]) {
                 push.ax += push_x[lane];
                 push.ay += push_y[lane];
-                push.samples += 1;
+                if (comptime runtime_perf_log.enabled) push.perf.samples += 1;
             }
         }
     }
@@ -342,7 +359,7 @@ fn pushObstacleScalar(min_x: f32, min_y: f32, max_x: f32, max_y: f32, start_x: f
         const strength = (1.0 - length_direction.length / radius) * weight;
         push.ax += length_direction.direction.x * strength;
         push.ay += length_direction.direction.y * strength;
-        push.samples += 1;
+        if (comptime runtime_perf_log.enabled) push.perf.samples += 1;
     }
 }
 
@@ -429,6 +446,7 @@ const testColliders = @import("test_support.zig").testColliders;
 const commitStaticsForTest = @import("test_support.zig").commitStaticsForTest;
 const parity_statics = @import("test_support.zig").parity_statics;
 const expectParityStaticsSpread = @import("test_support.zig").expectParityStaticsSpread;
+const expectStaticNearASteeredAgent = @import("test_support.zig").expectStaticNearASteeredAgent;
 
 test "steering applies local agent and static obstacle avoidance" {
     var data = DataSystem.init(std.testing.allocator);
@@ -454,21 +472,22 @@ test "steering applies local agent and static obstacle avoidance" {
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     const movement = frame.intents.mergedItems()[0].movement;
-    try std.testing.expect(stats.agent_neighbor_samples > 0);
-    try std.testing.expect(stats.obstacle_samples > 0);
-    try std.testing.expect(movement.direction_x < 1);
+    // Only the box, at negative y, pushes toward +y, and neither push alone outweighs the
+    // +x direct direction: together they turn it past -x.
+    try std.testing.expect(movement.direction_y > 0);
+    try std.testing.expect(movement.direction_x < 0);
 }
 
 test "steering local agent avoidance ignores XY overlap across different world_levels" {
-    // Two agents fully overlap in XY but sit on different floors. Without a
-    // same-level gate the neighbor would push the steerer; with it, samples
-    // stay zero and the direct direction is unchanged.
+    // Two agents near in XY but on different floors. Without a same-level gate the
+    // neighbor would push the steerer off its +x direction toward -y; with it, the direct
+    // direction is unchanged.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
-    const other = try addSteeredEntity(&data, .{ .x = 20, .y = 0 });
+    const other = try addSteeredEntity(&data, .{ .x = 0, .y = 20 });
     try data.setWorldLevel(agent, 0);
     try data.setWorldLevel(other, 1);
 
@@ -489,9 +508,8 @@ test "steering local agent avoidance ignores XY overlap across different world_l
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     const movement = frame.intents.mergedItems()[0].movement;
-    try std.testing.expectEqual(@as(usize, 0), stats.agent_neighbor_samples);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), movement.direction_x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), movement.direction_y, 0.001);
 }
@@ -524,11 +542,9 @@ test "steering static obstacle avoidance ignores XY overlap across different wor
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const cross_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     const cross = frame.intents.mergedItems()[0].movement;
-    // The other level's lists are never walked.
-    try std.testing.expectEqual(@as(usize, 0), cross_stats.obstacle_candidate_checks);
-    try std.testing.expectEqual(@as(usize, 0), cross_stats.obstacle_samples);
+    // The other level's box does not push.
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), cross.direction_x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), cross.direction_y, 0.001);
 
@@ -536,10 +552,8 @@ test "steering static obstacle avoidance ignores XY overlap across different wor
     try commitStaticsForTest(&frame, &data, &colliders, &.{.{ .set_world_level = .{ .entity = obstacle, .level = 1 } }});
     steering.reactToPostCommitSteeringEvents(&frame);
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const same_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     const same = frame.intents.mergedItems()[0].movement;
-    try std.testing.expectEqual(@as(usize, 1), same_stats.obstacle_candidate_checks);
-    try std.testing.expectEqual(@as(usize, 1), same_stats.obstacle_samples);
     try std.testing.expect(same.direction_x < 1);
 }
 
@@ -581,6 +595,7 @@ test "steering multi-level obstacle gate matches between serial and real threade
     var colliders = try testColliders(&pathfinding, &data, 512, 512, 16);
     defer colliders.deinit();
     try expectParityStaticsSpread(&colliders);
+    try expectStaticNearASteeredAgent(&colliders, &data);
 
     var serial_frame = SimulationFrame.init(std.testing.allocator);
     defer serial_frame.deinit();
@@ -591,10 +606,9 @@ test "steering multi-level obstacle gate matches between serial and real threade
     var serial_system = SteeringSystem.init(std.testing.allocator);
     defer serial_system.deinit();
     try serial_system.reserve(128);
-    const serial_stats = try updateSteeringInline(&serial_system, &data, &serial_frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&serial_system, &data, &serial_frame, &pathfinding, &colliders);
     const serial = serial_frame.intents.mergedItems();
     try std.testing.expect(serial.len > 0);
-    try std.testing.expect(serial_stats.obstacle_samples > 0);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 4,
@@ -623,8 +637,6 @@ test "steering multi-level obstacle gate matches between serial and real threade
             .adaptive = false,
         });
         try std.testing.expect(threaded_stats.batch.active_worker_threads > 0);
-        try std.testing.expectEqual(serial_stats.obstacle_samples, threaded_stats.obstacle_samples);
-        try std.testing.expectEqual(serial_stats.obstacle_candidate_checks, threaded_stats.obstacle_candidate_checks);
         const threaded = threaded_frame.intents.mergedItems();
         try std.testing.expectEqual(serial.len, threaded.len);
         for (serial, threaded) |a, b| {
@@ -660,8 +672,7 @@ test "steering pushes from a static's committed position the step after its move
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const parked_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-    try std.testing.expectEqual(@as(usize, 0), parked_stats.obstacle_samples);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectApproxEqAbs(@as(f32, 0), frame.intents.mergedItems()[0].movement.direction_y, 0.001);
 
     // The commit moves the box above the agent; its previous position stays parked, so
@@ -673,8 +684,7 @@ test "steering pushes from a static's committed position the step after its move
     } }});
     steering.reactToPostCommitSteeringEvents(&frame);
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const moved_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-    try std.testing.expectEqual(@as(usize, 1), moved_stats.obstacle_samples);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     // Pushed away from the box, toward +y.
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_y > 0.05);
 }
@@ -728,12 +738,12 @@ test "steering obstacle pushes equal a scalar push over the query's hits" {
     for (&intents, agents) |*intent, agent| intent.* = .{ .entity = agent, .goal = .{ .x = 999, .y = 0 }, .direct_direction_x = 1 };
     frame.beginStep();
     try appendNavigationIntents(&frame, &intents);
-    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
 
     // The reference: the direct direction plus the scalar push of each hit in query order.
     const view = colliders.view();
     var hits: ObstacleHitScratch = undefined;
-    var samples: usize = 0;
+    var pushes: usize = 0;
     var max_hits: u16 = 0;
     for (frame.intents.mergedItems(), agent_positions) |intent, position| {
         const radius: f32 = 48 + 8;
@@ -741,14 +751,16 @@ test "steering obstacle pushes equal a scalar push over the query's hits" {
         const query = view.queryBox(0, box, .{ .max_hits = max_obstacle_hits, .max_work = max_obstacle_work }, hits.boxHits());
         max_hits = @max(max_hits, query.hits);
         var push = ObstaclePush{ .ax = 1, .ay = 0 };
-        for (0..query.hits) |at| pushObstacleScalar(hits.min_x[at], hits.min_y[at], hits.max_x[at], hits.max_y[at], position.x, position.y, radius, 1.5, &push);
-        samples += push.samples;
+        for (0..query.hits) |at| {
+            const before = push;
+            pushObstacleScalar(hits.min_x[at], hits.min_y[at], hits.max_x[at], hits.max_y[at], position.x, position.y, radius, 1.5, &push);
+            if (push.ax != before.ax or push.ay != before.ay) pushes += 1;
+        }
         const expected = math.normalizeOrZeroFinite(push.ax, push.ay, 0.0001);
         try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(intent.movement.direction_x)));
         try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(intent.movement.direction_y)));
     }
-    try std.testing.expectEqual(samples, stats.obstacle_samples);
-    try std.testing.expect(samples >= agents.len);
+    try std.testing.expect(pushes >= agents.len);
     try std.testing.expect(max_hits > simd.lane_count);
 }
 
@@ -782,64 +794,25 @@ test "steering obstacle SIMD push equals the scalar push" {
         pushObstacles(&hits, count, 0, 0, 10, 1.5, &lanes);
         var scalar = ObstaclePush{ .ax = 0.25, .ay = -0.0 };
         for (0..count) |at| pushObstacleScalar(hits.min_x[at], hits.min_y[at], hits.max_x[at], hits.max_y[at], 0, 0, 10, 1.5, &scalar);
-        try std.testing.expectEqual(scalar.samples, lanes.samples);
         try std.testing.expectEqual(@as(u32, @bitCast(scalar.ax)), @as(u32, @bitCast(lanes.ax)));
         try std.testing.expectEqual(@as(u32, @bitCast(scalar.ay)), @as(u32, @bitCast(lanes.ay)));
     }
-    // The crafted on-radius, sub-epsilon, and centered boxes push nothing.
+    // The crafted on-radius, sub-epsilon, and centered boxes push nothing: the five push
+    // what the off-center holding box and the last box push alone.
     var crafted_push = ObstaclePush{ .ax = 0, .ay = 0 };
     pushObstacles(&hits, crafted.len, 0, 0, 10, 1.5, &crafted_push);
-    try std.testing.expectEqual(@as(u16, 2), crafted_push.samples);
+    var pushing_only = ObstaclePush{ .ax = 0, .ay = 0 };
+    for ([_]usize{ 0, crafted.len - 1 }) |at| pushObstacleScalar(hits.min_x[at], hits.min_y[at], hits.max_x[at], hits.max_y[at], 0, 0, 10, 1.5, &pushing_only);
+    try std.testing.expect(pushing_only.ax != 0 and pushing_only.ay != 0);
+    try std.testing.expectEqual(@as(u32, @bitCast(pushing_only.ax)), @as(u32, @bitCast(crafted_push.ax)));
+    try std.testing.expectEqual(@as(u32, @bitCast(pushing_only.ay)), @as(u32, @bitCast(crafted_push.ay)));
 }
 
 test "steering stops the obstacle walk at the work budget in query order" {
     // Co-located tiny statics in a cell the walk reaches before the one pushing static,
     // none meeting the query box: past the work budget they hide the near static.
-    try std.testing.expectEqual(@as(usize, 0), try obstacleSamplesBehindFarEntries(600));
-    try std.testing.expectEqual(@as(usize, 1), try obstacleSamplesBehindFarEntries(400));
-}
-
-test "steering bounds dense crowd candidate checks" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
-    try data.setSteeringAgent(agent, .{
-        .agent_radius = 8,
-        .waypoint_tolerance = 4,
-        .avoidance_radius = 64,
-        .avoidance_weight = 1.5,
-        .max_neighbor_samples = 256,
-        .stuck_step_threshold = 3,
-        .replan_cooldown_steps = 4,
-        .unavailable_backoff_steps = 12,
-    });
-    for (0..128) |index| {
-        const x: f32 = @floatFromInt(index % 16);
-        const y: f32 = @floatFromInt(index / 16);
-        _ = try addSteeredEntity(&data, .{ .x = 4 + x, .y = y });
-    }
-
-    var pathfinding = PathfindingSystem.init(std.testing.allocator);
-    defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
-    try pathfinding.rebuildStaticNavGrid(&data, 256, 256, 32);
-    var colliders = try testColliders(&pathfinding, &data, 256, 256, 32);
-    defer colliders.deinit();
-
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
-    try frame.reservePathRequests(2, 4);
-    var steering = SteeringSystem.init(std.testing.allocator);
-    defer steering.deinit();
-    try steering.reserve(129);
-
-    frame.beginStep();
-    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-    try std.testing.expect(stats.agent_candidate_checks <= max_agent_candidate_checks);
-    try std.testing.expect(stats.agent_neighbor_samples <= 256);
-    try std.testing.expect(stats.agent_candidate_checks > 0);
+    try std.testing.expect(!try pushedBehindFarEntries(600));
+    try std.testing.expect(try pushedBehindFarEntries(400));
 }
 
 test "steering stops the obstacle walk at the hit cap among dense co-located statics" {
@@ -868,22 +841,27 @@ test "steering stops the obstacle walk at the hit cap among dense co-located sta
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
     const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-    // Every co-located static meets the query box, so each entry read is a hit: the walk
-    // stops at the hit cap after reading `max_obstacle_hits` of the 128 entries.
-    try std.testing.expectEqual(@as(usize, max_obstacle_hits), stats.obstacle_candidate_checks);
-    try std.testing.expect(stats.obstacle_samples <= max_obstacle_hits);
     try std.testing.expectEqual(@as(usize, 1), stats.movement_intent_count);
+    // Every co-located static meets the query box, so each entry read is a hit: the walk
+    // stops at the hit cap, and the direction is the direct one plus `max_obstacle_hits`
+    // of the 128 identical pushes.
+    var reference = ObstaclePush{ .ax = 1, .ay = 0 };
+    for (0..max_obstacle_hits) |_| pushObstacleScalar(8, 8, 16, 16, 0, 0, 48 + 8, 1.5, &reference);
+    const expected = math.normalizeOrZeroFinite(reference.ax, reference.ay, 0.0001);
+    const movement = frame.intents.mergedItems()[0].movement;
+    try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(movement.direction_x)));
+    try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(movement.direction_y)));
 }
 
-// One agent at (300, 300) with a static pushing it from below-right, behind `far_count`
+// One agent at (300, 300) with a static to its right and above it, behind `far_count`
 // co-located one-unit statics just outside its query box in an earlier walked cell.
-// Returns the agent's obstacle pushes.
-fn obstacleSamplesBehindFarEntries(far_count: usize) !usize {
+// Returns whether the static turned the agent off its +x direct direction.
+fn pushedBehindFarEntries(far_count: usize) !bool {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const agent = try addSteeredEntity(&data, .{ .x = 300, .y = 300 });
     for (0..far_count) |_| _ = try addStaticObstacle(&data, .{ .x = 224, .y = 224 }, .{ .x = 1, .y = 1 });
-    _ = try addStaticObstacle(&data, .{ .x = 320, .y = 290 }, .{ .x = 10, .y = 10 });
+    _ = try addStaticObstacle(&data, .{ .x = 320, .y = 280 }, .{ .x = 10, .y = 10 });
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
@@ -900,7 +878,7 @@ fn obstacleSamplesBehindFarEntries(far_count: usize) !usize {
     try steering.reserve(1);
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 999, .y = 300 }, .direct_direction_x = 1 });
-    const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-    try std.testing.expect(stats.obstacle_candidate_checks <= max_obstacle_work);
-    return stats.obstacle_samples;
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
+    // The static's box [320, 330] x [280, 290] pushes from (320, 290): toward -x and +y.
+    return @abs(frame.intents.mergedItems()[0].movement.direction_y) > 0.01;
 }

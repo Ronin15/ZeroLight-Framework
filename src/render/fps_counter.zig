@@ -35,32 +35,17 @@ pub const FpsCounter = struct {
         };
     }
 
-    /// Retires prefix + digit glyphs (idle once if any live). Safe no-op when
-    /// nothing has been prepared. Call before destroying the owning renderer /
-    /// text service so in-flight frames finish sampling prior textures.
+    /// Retires prefix + digit glyphs, idling the GPU once first when any is live so
+    /// in-flight frames finish sampling them. Safe no-op when nothing has been
+    /// prepared. Call before destroying the owning renderer / text service.
     pub fn deinit(self: *FpsCounter, text_service: *TextService, renderer: *Renderer) void {
-        self.releaseGlyphs(text_service, renderer);
+        if (self.anyGlyphValid()) renderer.waitForIdle();
+        self.releaseGlyphs(text_service, @ptrCast(renderer));
     }
 
-    /// Backend-context counterpart for unit tests (`FakeBackend`). Does not idle
-    /// the GPU — production teardown goes through `deinit` / `destroyPreparedTexts`.
-    pub fn deinitWithContext(self: *FpsCounter, text_service: *TextService, backend_context: *anyopaque) void {
-        self.releaseGlyphsWithContext(text_service, backend_context);
-    }
-
-    fn releaseGlyphs(self: *FpsCounter, text_service: *TextService, renderer: *Renderer) void {
-        // destroyPreparedTexts idles once for the whole batch when any glyph is
-        // live — same single-idle pattern as the font/DPI retire path.
-        var glyphs: [11]PreparedText = undefined;
-        glyphs[0] = self.prefix;
-        @memcpy(glyphs[1..], self.digits[0..]);
-        text_service.destroyPreparedTexts(renderer, &glyphs);
-        self.prefix = .invalid;
-        self.digits = @splat(PreparedText.invalid);
-        self.texture_dirty = true;
-    }
-
-    fn releaseGlyphsWithContext(self: *FpsCounter, text_service: *TextService, backend_context: *anyopaque) void {
+    // Releases the glyphs through `backend_context` (a `*Renderer` in production, or a
+    // text `FakeBackend` in unit tests) without idling: the caller has synchronized.
+    fn releaseGlyphs(self: *FpsCounter, text_service: *TextService, backend_context: *anyopaque) void {
         var glyphs: [11]PreparedText = undefined;
         glyphs[0] = self.prefix;
         @memcpy(glyphs[1..], self.digits[0..]);
@@ -201,6 +186,14 @@ pub const FpsCounter = struct {
         }
         return true;
     }
+
+    fn anyGlyphValid(self: *const FpsCounter) bool {
+        if (self.prefix.isValid()) return true;
+        for (self.digits) |digit| {
+            if (digit.isValid()) return true;
+        }
+        return false;
+    }
 };
 
 /// Drawable-space pixel height of the FPS line at a given pixel scale. Public so
@@ -252,7 +245,7 @@ test "prepareGlyphs twice with same keys does not destroy shared live textures" 
         .font = service.defaultFont(),
         .texture_dirty = true,
     };
-    defer fps.deinitWithContext(&service, &fake);
+    defer fps.releaseGlyphs(&service, &fake);
 
     try fps.prepareGlyphs(&service, &fake);
     try std.testing.expect(fps.glyphsValid());
@@ -285,7 +278,7 @@ test "prepareGlyphs with different font retires prior glyphs and keeps cache bou
         .font = service.defaultFont(),
         .texture_dirty = true,
     };
-    defer fps.deinitWithContext(&service, &fake);
+    defer fps.releaseGlyphs(&service, &fake);
 
     try fps.prepareGlyphs(&service, &fake);
     try std.testing.expectEqual(@as(u32, 11), fake.render_count);
@@ -326,7 +319,7 @@ test "prepareGlyphs mid-prepare failure keeps old glyphs and destroys only non-s
         .font = service.defaultFont(),
         .texture_dirty = true,
     };
-    defer fps.deinitWithContext(&service, &fake);
+    defer fps.releaseGlyphs(&service, &fake);
 
     try fps.prepareGlyphs(&service, &fake);
     const old_prefix = fps.prefix;
@@ -365,7 +358,7 @@ test "prepareGlyphs mid-prepare failure keeps old glyphs and destroys only non-s
     try std.testing.expectEqual(@as(u32, 11), text_test_support.countLiveTextEntries(&service));
 }
 
-test "deinit releases prepared glyphs and clears handles" {
+test "teardown releases prepared glyphs and clears handles" {
     const allocator = std.testing.allocator;
     var fake = text_test_support.FakeBackend{};
     var service = try text_test_support.initFakeTextService(allocator, &fake);
@@ -380,9 +373,12 @@ test "deinit releases prepared glyphs and clears handles" {
     try std.testing.expect(fps.glyphsValid());
     try std.testing.expectEqual(@as(u32, 11), text_test_support.countLiveTextEntries(&service));
     try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
+    // Live glyphs: `deinit` idles before releasing them.
+    try std.testing.expect(fps.anyGlyphValid());
 
-    fps.deinitWithContext(&service, &fake);
+    fps.releaseGlyphs(&service, &fake);
 
+    try std.testing.expect(!fps.anyGlyphValid());
     try std.testing.expect(!fps.glyphsValid());
     try std.testing.expect(!fps.prefix.isValid());
     for (fps.digits) |digit| {
@@ -393,7 +389,7 @@ test "deinit releases prepared glyphs and clears handles" {
     try std.testing.expectEqual(@as(u32, 0), text_test_support.countLiveTextEntries(&service));
 }
 
-test "deinit is safe when no glyphs have been prepared" {
+test "teardown is safe when no glyphs have been prepared" {
     const allocator = std.testing.allocator;
     var fake = text_test_support.FakeBackend{};
     var service = try text_test_support.initFakeTextService(allocator, &fake);
@@ -402,7 +398,9 @@ test "deinit is safe when no glyphs have been prepared" {
     var fps = FpsCounter{
         .font = service.defaultFont(),
     };
-    fps.deinitWithContext(&service, &fake);
+    // No live glyph: `deinit` skips the idle.
+    try std.testing.expect(!fps.anyGlyphValid());
+    fps.releaseGlyphs(&service, &fake);
     try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
     try std.testing.expect(!fps.glyphsValid());
 }

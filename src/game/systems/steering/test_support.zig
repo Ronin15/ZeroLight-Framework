@@ -13,6 +13,7 @@ const NavigationIntent = @import("../../simulation.zig").NavigationIntent;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
 const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
+const BoxHits = @import("../static_colliders.zig").BoxHits;
 const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 const SteeringStats = @import("system.zig").SteeringStats;
 const SteeringSystem = @import("system.zig").SteeringSystem;
@@ -125,6 +126,26 @@ pub const parity_statics = [_][2]math.Vec2{
     .{ .{ .x = 200, .y = 60 }, .{ .x = 70, .y = 12 } },
     .{ .{ .x = 180, .y = 90 }, .{ .x = 300, .y = 30 } },
 };
+
+/// Fails unless some steering agent's obstacle query box (its avoidance plus agent radius
+/// about its position, on its level) meets a static: the fixture invariant that a steering
+/// step covers obstacle pushes.
+pub fn expectStaticNearASteeredAgent(colliders: *const StaticColliderSystem, data: *const DataSystem) !void {
+    const view = colliders.view();
+    const agents = data.steeringAgentSliceConst();
+    var min_x: [1]f32 = undefined;
+    var min_y: [1]f32 = undefined;
+    var max_x: [1]f32 = undefined;
+    var max_y: [1]f32 = undefined;
+    const hits = BoxHits{ .min_x = &min_x, .min_y = &min_y, .max_x = &max_x, .max_y = &max_y };
+    for (agents.entities, 0..) |agent, row| {
+        const position = (data.movementBodyConst(agent) orelse continue).position;
+        const radius = agents.avoidance_radii[row] + agents.agent_radii[row];
+        const box = math.Aabb{ .min_x = position.x - radius, .min_y = position.y - radius, .max_x = position.x + radius, .max_y = position.y + radius };
+        if (view.queryBox(data.worldLevelConst(agent) orelse 0, box, .{ .max_hits = 1, .max_work = std.math.maxInt(u16) }, hits).hits > 0) return;
+    }
+    return error.NoStaticNearASteeredAgent;
+}
 
 // The parity statics span at least two query classes and two chunks.
 pub fn expectParityStaticsSpread(colliders: *const StaticColliderSystem) !void {

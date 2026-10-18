@@ -208,26 +208,28 @@ const AiGatherRow = struct {
     interest: RowInterest,
     sep_x: f32,
     sep_y: f32,
-    separation_neighbor_count: u8,
-    separation_candidate_count: u16,
     cohere: RowCohere,
     resolved: RowResolved,
 };
 
 // One range's counts, written once by its job: the gather's kept rows, then the separation
-// job's block fills (`runtime_perf_log.enabled` only).
+// job's perf counts (`runtime_perf_log.enabled` only).
 const AiRangeTally = struct {
     kept: usize = 0,
-    perf: FillPerf = .{},
+    perf: RangePerf = .{},
 };
 
-const FillPerf = if (runtime_perf_log.enabled) struct {
+// A separation range's neighbor-block fills and its separation queries' candidate checks
+// and neighbor samples.
+const RangePerf = if (runtime_perf_log.enabled) struct {
     separation_block_fills: usize = 0,
     cohere_block_fills: usize = 0,
+    separation_candidate_checks: usize = 0,
+    separation_neighbor_samples: usize = 0,
 } else struct {};
 
 pub const separation_radius: f32 = 48.0;
-const max_separation_neighbors: u8 = 32;
+pub const max_separation_neighbors: u8 = 32;
 pub const max_separation_candidate_checks: u16 = 128;
 // Neighbors at or nearer than this squared distance add no separation.
 const separation_min_dist2: f32 = 0.1;
@@ -333,17 +335,18 @@ pub const AiStats = struct {
     entity_count: usize = 0,
     intent_count: usize = 0,
     navigation_intent_count: usize = 0,
-    separation_candidate_checks: usize = 0,
-    separation_neighbor_samples: usize = 0,
     separation_batch: BatchStats = .{},
     intent_batch: BatchStats = .{},
     perf: Perf = .{},
 
     /// Kept only with `runtime_perf_log.enabled`: the separation and cohere neighbor-block
-    /// fills (one per key a range's rows change to) and the gather batch.
+    /// fills (one per key a range's rows change to), the separation queries' candidate
+    /// checks and neighbor samples, and the gather batch.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         separation_block_fills: usize = 0,
         cohere_block_fills: usize = 0,
+        separation_candidate_checks: usize = 0,
+        separation_neighbor_samples: usize = 0,
         gather_batch: BatchStats = .{},
     } else struct {};
 };
@@ -417,7 +420,7 @@ pub const AiSystem = struct {
         try self.prepareRangeTallies(separation_selection.range_count);
         var separation_context = buildAiSeparationContext(gathered, spatial, self.range_tallies.items, config.interest_markers);
         const separation_batch = separation.run(separation_selection, entity_count, ai_range_alignment_items, &separation_context, writeAiSeparationJob);
-        const fills = self.sumBlockFills();
+        const range_perf = self.sumRangePerf();
 
         const intent = Dispatch.init(thread_system, &self.intent_tuner, .{
             .items_per_range = config.intent_items_per_range orelse config.items_per_range,
@@ -448,13 +451,13 @@ pub const AiSystem = struct {
             .entity_count = entity_count,
             .intent_count = entity_count,
             .navigation_intent_count = entity_count,
-            .separation_candidate_checks = if (comptime runtime_perf_log.enabled) sumU16(gathered.items(.separation_candidate_count)) else 0,
-            .separation_neighbor_samples = if (comptime runtime_perf_log.enabled) sumU8(gathered.items(.separation_neighbor_count)) else 0,
             .separation_batch = separation_batch,
             .intent_batch = intent_batch,
             .perf = if (comptime runtime_perf_log.enabled) .{
-                .separation_block_fills = fills.separation_block_fills,
-                .cohere_block_fills = fills.cohere_block_fills,
+                .separation_block_fills = range_perf.separation_block_fills,
+                .cohere_block_fills = range_perf.cohere_block_fills,
+                .separation_candidate_checks = range_perf.separation_candidate_checks,
+                .separation_neighbor_samples = range_perf.separation_neighbor_samples,
                 .gather_batch = gather_batch,
             } else .{},
         };
@@ -494,12 +497,14 @@ pub const AiSystem = struct {
         setSlotCount(AiRangeTally, &self.range_tallies, range_count);
     }
 
-    fn sumBlockFills(self: *const AiSystem) FillPerf {
-        var total = FillPerf{};
+    fn sumRangePerf(self: *const AiSystem) RangePerf {
+        var total = RangePerf{};
         if (comptime runtime_perf_log.enabled) {
             for (self.range_tallies.items) |slot| {
                 total.separation_block_fills += slot.value.perf.separation_block_fills;
                 total.cohere_block_fills += slot.value.perf.cohere_block_fills;
+                total.separation_candidate_checks += slot.value.perf.separation_candidate_checks;
+                total.separation_neighbor_samples += slot.value.perf.separation_neighbor_samples;
             }
         }
         return total;
@@ -529,8 +534,6 @@ pub const AiSystem = struct {
         const gathered = self.rows.slice();
         @memset(gathered.items(.sep_x), 0);
         @memset(gathered.items(.sep_y), 0);
-        @memset(gathered.items(.separation_neighbor_count), 0);
-        @memset(gathered.items(.separation_candidate_count), 0);
         @memset(gathered.items(.cohere), RowCohere{});
     }
 };
@@ -611,8 +614,6 @@ const AiGatherInputs = struct {
             .interest = .{},
             .sep_x = 0,
             .sep_y = 0,
-            .separation_neighbor_count = 0,
-            .separation_candidate_count = 0,
             .cohere = .{},
             .resolved = .{ .goal_x = self.movement.previous_x[mi], .goal_y = self.movement.previous_y[mi] },
         };
@@ -725,8 +726,6 @@ fn buildAiSeparationContext(
         .gains = gathered.items(.gains),
         .sep_x = gathered.items(.sep_x),
         .sep_y = gathered.items(.sep_y),
-        .neighbor_counts = gathered.items(.separation_neighbor_count),
-        .candidate_counts = gathered.items(.separation_candidate_count),
         .cohere = gathered.items(.cohere),
         .interest = gathered.items(.interest),
         .markers = markers,
@@ -773,18 +772,6 @@ fn buildAiJobContext(
         .range_base = range_base,
         .range_count = range_count,
     };
-}
-
-fn sumU8(values: []const u8) usize {
-    var total: usize = 0;
-    for (values) |value| total += value;
-    return total;
-}
-
-fn sumU16(values: []const u16) usize {
-    var total: usize = 0;
-    for (values) |value| total += value;
-    return total;
 }
 
 pub const AiDir = struct { x: f32, y: f32 };
@@ -883,8 +870,6 @@ const AiSeparationContext = struct {
     gains: []const RowGains,
     sep_x: []f32,
     sep_y: []f32,
-    neighbor_counts: []u8,
-    candidate_counts: []u16,
     /// Cohere neighbor-mean output, written by the same job as separation.
     cohere: []RowCohere,
     interest: []RowInterest,
@@ -902,12 +887,15 @@ fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
     std.debug.assert(range.end <= job.pos_x.len);
     var separation_block = SeparationBlock{};
     var cohere_block = CohereBlock{};
+    var range_perf = RangePerf{};
     for (range.start..range.end) |index| {
         const result = computeBoundedSeparation(job, index, &separation_block);
         job.sep_x[index] = result.x;
         job.sep_y[index] = result.y;
-        job.neighbor_counts[index] = result.neighbor_count;
-        job.candidate_counts[index] = result.candidate_count;
+        if (comptime runtime_perf_log.enabled) {
+            range_perf.separation_candidate_checks += result.perf.candidate_checks;
+            range_perf.separation_neighbor_samples += result.perf.neighbor_samples;
+        }
 
         // A zero cohere gain never wins `.cohere` (its score is 0 and a tie loses to
         // `.wander`), so its query is skipped.
@@ -928,15 +916,24 @@ fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
             }
         }
     }
-    if (comptime runtime_perf_log.enabled) job.range_tallies[range.index].value.perf = .{ .separation_block_fills = separation_block.perf.fills, .cohere_block_fills = cohere_block.perf.fills };
+    if (comptime runtime_perf_log.enabled) {
+        range_perf.separation_block_fills = separation_block.perf.fills;
+        range_perf.cohere_block_fills = cohere_block.perf.fills;
+        job.range_tallies[range.index].value.perf = range_perf;
+    }
 }
 
 const SeparationResult = struct {
     x: f32 = 0,
     y: f32 = 0,
-    neighbor_count: u8 = 0,
-    candidate_count: u16 = 0,
+    perf: SeparationPerf = .{},
 };
+
+// One row's separation query's candidate checks and neighbor samples.
+const SeparationPerf = if (runtime_perf_log.enabled) struct {
+    candidate_checks: u16 = 0,
+    neighbor_samples: u8 = 0,
+} else struct {};
 
 // The bounded separation sum of one row's query in lane partials: each lane sums the unit
 // directions away from the neighbors at its lane, past `separation_min_dist2`.
@@ -972,8 +969,7 @@ fn computeBoundedSeparation(job: *const AiSeparationContext, index: usize, block
     return .{
         .x = simd.sumLanesFloat4(acc.x),
         .y = simd.sumLanesFloat4(acc.y),
-        .neighbor_count = acc.neighbor_count,
-        .candidate_count = stats.candidate_checks,
+        .perf = if (comptime runtime_perf_log.enabled) .{ .candidate_checks = stats.candidate_checks, .neighbor_samples = acc.neighbor_count } else .{},
     };
 }
 
@@ -1229,8 +1225,6 @@ fn expectAiGatherColumnsAligned(rows: *const std.MultiArrayList(AiGatherRow)) !v
     try std.testing.expectEqual(count, s.items(.interest).len);
     try std.testing.expectEqual(count, s.items(.sep_x).len);
     try std.testing.expectEqual(count, s.items(.sep_y).len);
-    try std.testing.expectEqual(count, s.items(.separation_neighbor_count).len);
-    try std.testing.expectEqual(count, s.items(.separation_candidate_count).len);
     try std.testing.expectEqual(count, s.items(.cohere).len);
     try std.testing.expectEqual(count, s.items(.resolved).len);
 }
@@ -2688,53 +2682,6 @@ test "rows of one cell fill one separation block, and cohere rows of one cell on
     _ = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), view, &data, &frame, 0.016, .{ .scope_dense_indices = &shuffled });
 }
 
-test "ai spatial separation caps dense neighbor samples" {
-    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-
-    const count = 80;
-    for (0..count) |i| {
-        const entity = try data.createEntity();
-        const position = math.Vec2{
-            .x = @floatFromInt(i % 16),
-            .y = @floatFromInt(i / 16),
-        };
-        try data.setMovementBody(entity, .{
-            .position = position,
-            .previous_position = position,
-            .velocity = .{},
-            .speed = 20,
-        });
-        try data.setAiAgent(entity, .{
-            .active_behavior = .pursue,
-            .wander_amplitude = 0,
-            .gain_pursue = 1,
-        });
-    }
-
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-    try frame.reserveStreams(8, 0, count, 0, 0, 0);
-
-    var spatial_sys = try testSpatialIndex(&data);
-    defer spatial_sys.deinit();
-
-    var ai_sys = AiSystem.init(std.testing.allocator);
-    defer ai_sys.deinit();
-    frame.beginStep();
-    const stats = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
-        .intent_seed = 1,
-        .focus_target = .{ .x = 100, .y = 100 },
-    });
-
-    try std.testing.expectEqual(@as(usize, count), stats.intent_count);
-    const gathered = ai_sys.rows.slice();
-    const neighbor_samples = sumU8(gathered.items(.separation_neighbor_count));
-    try std.testing.expect(neighbor_samples <= count * @as(usize, max_separation_neighbors));
-    try std.testing.expect(sumU16(gathered.items(.separation_candidate_count)) <= count * @as(usize, max_separation_candidate_checks));
-    try std.testing.expect(neighbor_samples > 0);
-}
-
 test "ai spatial separation finds neighbors past the grid edge at negative coordinates" {
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2781,9 +2728,14 @@ test "ai spatial separation finds neighbors past the grid edge at negative coord
     });
 
     try std.testing.expectEqual(@as(usize, 2), stats.intent_count);
+    // Each row separates from the other, 18.4 units away: the unit direction away from it.
     const gathered = ai_sys.rows.slice();
-    try std.testing.expectEqual(@as(usize, 2), sumU16(gathered.items(.separation_candidate_count)));
-    try std.testing.expectEqual(@as(usize, 2), sumU8(gathered.items(.separation_neighbor_count)));
+    const away_len = @sqrt(@as(f32, 14 * 14 + 12 * 12));
+    for (gathered.items(.entity), gathered.items(.sep_x), gathered.items(.sep_y)) |entity, sep_x, sep_y| {
+        const sign: f32 = if (entity.eql(first)) -1 else 1;
+        try std.testing.expectApproxEqAbs(sign * 14 / away_len, sep_x, 1e-4);
+        try std.testing.expectApproxEqAbs(sign * 12 / away_len, sep_y, 1e-4);
+    }
 }
 
 test "think rows skip themselves and find halo neighbors" {
@@ -2827,12 +2779,11 @@ test "think rows skip themselves and find halo neighbors" {
     const gathered = ai_sys.rows.slice();
     try std.testing.expectEqual(a.index, gathered.items(.entity)[0].index);
     try std.testing.expectEqual(c.index, gathered.items(.entity)[1].index);
-    // Each thinker checks the two others and separates from B alone.
-    try std.testing.expectEqual(@as(usize, 4), sumU16(gathered.items(.separation_candidate_count)));
-    try std.testing.expectEqual(@as(usize, 2), sumU8(gathered.items(.separation_neighbor_count)));
-    try std.testing.expectEqual(@as(u8, 1), gathered.items(.separation_neighbor_count)[0]);
-    try std.testing.expectEqual(@as(u8, 1), gathered.items(.separation_neighbor_count)[1]);
-    // Cohere reaches B (40 away) and the other thinker (80 away).
+    // Each thinker separates from B alone: A away from it toward -x, C toward +x.
+    try std.testing.expectApproxEqAbs(@as(f32, -1), gathered.items(.sep_x)[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), gathered.items(.sep_x)[1], 1e-4);
+    for (gathered.items(.sep_y)) |sep_y| try std.testing.expectApproxEqAbs(@as(f32, 0), sep_y, 1e-4);
+    // Cohere reaches B (40 away) and the other thinker (80 away), never itself.
     for (gathered.items(.cohere)) |cohere| {
         try std.testing.expectEqual(@as(u32, 2), cohere.count);
     }
@@ -2841,24 +2792,25 @@ test "think rows skip themselves and find halo neighbors" {
 }
 
 test "separation and cohere read only the row's level, and cohere only friendly rows" {
-    // A thinker on level 2, a friendly and a hostile 20 units away on its level, and a
-    // friendly on each of levels 0, 1, and 3 at the thinker's xy offset by 10.
+    // A thinker on level 2, a friendly 20 units along +x and a hostile 20 units along -y
+    // on its level, and a friendly on each of levels 0, 1, and 3 at the thinker's xy
+    // offset by 10 along +x.
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const Body = struct {
-        fn add(store: *DataSystem, x: f32, level: u16, faction: Faction, gain_cohere: f32) !EntityId {
+        fn add(store: *DataSystem, x: f32, y: f32, level: u16, faction: Faction, gain_cohere: f32) !EntityId {
             const entity = try store.createEntity();
-            try store.setMovementBody(entity, .{ .position = .{ .x = x, .y = 0 }, .previous_position = .{ .x = x, .y = 0 }, .velocity = .{}, .speed = 20 });
+            try store.setMovementBody(entity, .{ .position = .{ .x = x, .y = y }, .previous_position = .{ .x = x, .y = y }, .velocity = .{}, .speed = 20 });
             try store.setAiAgent(entity, .{ .active_behavior = .wander, .gain_cohere = gain_cohere });
             try store.setFaction(entity, faction);
             try store.setWorldLevel(entity, level);
             return entity;
         }
     };
-    _ = try Body.add(&data, 0, 2, .player, 1.0);
-    _ = try Body.add(&data, 20, 2, .ally, 0);
-    _ = try Body.add(&data, -20, 2, .hostile, 0);
-    for ([_]u16{ 0, 1, 3 }) |level| _ = try Body.add(&data, 10, level, .ally, 0);
+    _ = try Body.add(&data, 0, 0, 2, .player, 1.0);
+    _ = try Body.add(&data, 20, 0, 2, .ally, 0);
+    _ = try Body.add(&data, 0, -20, 2, .hostile, 0);
+    for ([_]u16{ 0, 1, 3 }) |level| _ = try Body.add(&data, 10, 0, level, .ally, 0);
 
     var spatial_sys = try testSpatialIndex(&data);
     defer spatial_sys.deinit();
@@ -2869,12 +2821,15 @@ test "separation and cohere read only the row's level, and cohere only friendly 
     var separation_block = SeparationBlock{};
     var cohere_block = CohereBlock{};
 
+    // Away from the same-level friendly (-x) and hostile (+y); an other-level friendly
+    // would add another -x.
     const separation = computeBoundedSeparation(&context, 0, &separation_block);
-    try std.testing.expectEqual(@as(u16, 2), separation.candidate_count);
-    try std.testing.expectEqual(@as(u8, 2), separation.neighbor_count);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), separation.x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), separation.y, 1e-4);
     const cohere = computeCohereNeighbors(&context, 0, &cohere_block);
     try std.testing.expectEqual(@as(u32, 1), cohere.count);
     try std.testing.expectEqual(@as(f32, 20), cohere.mean_x);
+    try std.testing.expectEqual(@as(f32, 0), cohere.mean_y);
 }
 
 // A row's separation from its neighbors visited in `order`, each at its lane, summed in
@@ -2883,17 +2838,18 @@ const LaneSeparation = struct {
     acc_x: [simd.lane_count]f32 = @splat(0),
     acc_y: [simd.lane_count]f32 = @splat(0),
     lane_terms: [simd.lane_count]u8 = @splat(0),
-    result: SeparationResult = .{},
+    candidate_count: u16 = 0,
+    neighbor_count: u8 = 0,
     done: bool = false,
 
     // Visits neighbor `j` at `lane`, or nothing once the query has ended.
     fn visit(self: *LaneSeparation, pos_x: []const f32, pos_y: []const f32, index: usize, j: usize, lane: usize) void {
         if (self.done) return;
-        if (self.result.candidate_count >= max_separation_candidate_checks) {
+        if (self.candidate_count >= max_separation_candidate_checks) {
             self.done = true;
             return;
         }
-        self.result.candidate_count += 1;
+        self.candidate_count += 1;
         const dx = pos_x[index] - pos_x[j];
         const dy = pos_y[index] - pos_y[j];
         const dist2 = dx * dx + dy * dy;
@@ -2902,21 +2858,22 @@ const LaneSeparation = struct {
             self.acc_x[lane] += dir.x;
             self.acc_y[lane] += dir.y;
             self.lane_terms[lane] += 1;
-            self.result.neighbor_count += 1;
-            if (self.result.neighbor_count >= max_separation_neighbors) self.done = true;
+            self.neighbor_count += 1;
+            if (self.neighbor_count >= max_separation_neighbors) self.done = true;
         }
     }
 
-    fn finish(self: *LaneSeparation) SeparationResult {
-        self.result.x = simd.sumLanesScalar(self.acc_x);
-        self.result.y = simd.sumLanesScalar(self.acc_y);
-        return self.result;
+    fn finish(self: *LaneSeparation) ReferenceSeparation {
+        return .{ .x = simd.sumLanesScalar(self.acc_x), .y = simd.sumLanesScalar(self.acc_y), .neighbor_count = self.neighbor_count };
     }
 };
 
+// An oracle's separation sum and the neighbors it summed.
+const ReferenceSeparation = struct { x: f32, y: f32, neighbor_count: u8 };
+
 // Reference for a single populated cell: one stream in index order, so neighbor `j`'s lane
 // is its rank in it, self included, mod 4.
-fn bruteForceSeparation(pos_x: []const f32, pos_y: []const f32, index: usize) SeparationResult {
+fn bruteForceSeparation(pos_x: []const f32, pos_y: []const f32, index: usize) ReferenceSeparation {
     var lanes = LaneSeparation{};
     for (0..pos_x.len) |j| {
         if (j == index) continue;
@@ -2964,11 +2921,9 @@ test "ai computeBoundedSeparation matches a one-cell lane-order reference bit-fo
     for (0..count) |i| {
         const ported = computeBoundedSeparation(&context, i, &separation_block);
         const reference = bruteForceSeparation(pos_x, pos_y, i);
-        try std.testing.expectEqual(reference.candidate_count, ported.candidate_count);
-        try std.testing.expectEqual(reference.neighbor_count, ported.neighbor_count);
         try std.testing.expectEqual(reference.x, ported.x);
         try std.testing.expectEqual(reference.y, ported.y);
-        if (ported.neighbor_count == max_separation_neighbors) capped += 1;
+        if (reference.neighbor_count == max_separation_neighbors) capped += 1;
     }
     try std.testing.expect(capped > 0);
 }
@@ -2980,7 +2935,7 @@ const test_separation_scan_radius: i32 = @intFromFloat(@ceil(separation_radius /
 // Reconstructs the index's order from raw positions: with one faction, one level, and one
 // chunk it is (cell_y, cell_x, index), one stream whose lanes count every in-box entry, self
 // included. `max_lane_terms` is the most terms one lane summed.
-fn cellScanOrderedSeparation(pos_x: []const f32, pos_y: []const f32, index: usize, max_lane_terms: *u8) SeparationResult {
+fn cellScanOrderedSeparation(pos_x: []const f32, pos_y: []const f32, index: usize, max_lane_terms: *u8) ReferenceSeparation {
     const cellOf = struct {
         fn compute(x: f32, y: f32) [2]i32 {
             return .{
@@ -3068,8 +3023,6 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered lane oracle across
     for (0..count) |i| {
         const ported = computeBoundedSeparation(&context, i, &separation_block);
         const reference = cellScanOrderedSeparation(pos_x, pos_y, i, &max_lane_terms);
-        try std.testing.expectEqual(reference.candidate_count, ported.candidate_count);
-        try std.testing.expectEqual(reference.neighbor_count, ported.neighbor_count);
         try std.testing.expectEqual(reference.x, ported.x);
         try std.testing.expectEqual(reference.y, ported.y);
     }

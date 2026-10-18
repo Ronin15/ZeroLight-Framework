@@ -273,8 +273,8 @@ pub fn runLosDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     if (stats.status == .skipped) return stats;
     // The extra tiles change no count.
     const plain = try untimedCounts(allocator, io, item_count);
-    std.debug.assert(stats.sample_count == plain.sensed_count and stats.candidate_pairs == plain.los_checks);
-    std.debug.assert(stats.deferred_count == plain.los_blocked and stats.output_count == plain.nearest_threat_found_count);
+    std.debug.assert(stats.sample_count == plain.perf.sensed_count and stats.candidate_pairs == plain.perf.los_checks);
+    std.debug.assert(stats.deferred_count == plain.perf.los_blocked and stats.output_count == plain.perf.nearest_threat_found_count);
     return stats;
 }
 
@@ -307,7 +307,7 @@ pub fn runCellOrderedCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     if (stats.status == .skipped) return stats;
     // The same pairs: the same counts as the default order.
     const plain = try untimedCounts(allocator, io, item_count);
-    std.debug.assert(stats.sample_count == plain.sensed_count and stats.output_count == plain.nearest_threat_found_count);
+    std.debug.assert(stats.sample_count == plain.perf.sensed_count and stats.output_count == plain.perf.nearest_threat_found_count);
     return stats;
 }
 
@@ -420,10 +420,10 @@ fn runCaseImpl(
     std.debug.assert(last_stats.perf.block_fills <= observerCellRuns(&fixture.data, &system, spatial_view) + last_stats.batch.range_count);
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
-    stats.output_count = last_stats.nearest_threat_found_count;
-    stats.candidate_pairs = last_stats.los_checks;
-    stats.sample_count = last_stats.sensed_count;
-    stats.deferred_count = last_stats.los_blocked;
+    stats.output_count = last_stats.perf.nearest_threat_found_count;
+    stats.candidate_pairs = last_stats.perf.los_checks;
+    stats.sample_count = last_stats.perf.sensed_count;
+    stats.deferred_count = last_stats.perf.los_blocked;
     stats.fallback_deferred_count = events.stats.entity_perceived + events.stats.entity_lost;
     stats.cache_evictions = events.stats.dropped;
     stats.neighbor_block_fills = last_stats.perf.block_fills;
@@ -597,16 +597,16 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.batch);
     }
     std.debug.assert(last_stats.observer_count == crowd_observers);
-    std.debug.assert(last_stats.nearest_threat_found_count == crowd_observers);
-    std.debug.assert(last_stats.sensed_count == crowd_observers);
-    std.debug.assert(last_stats.candidate_checks <= crowd_observers * crowd_max_checks_per_observer);
+    std.debug.assert(last_stats.perf.nearest_threat_found_count == crowd_observers);
+    std.debug.assert(last_stats.perf.sensed_count == crowd_observers);
+    std.debug.assert(last_stats.perf.candidate_checks <= crowd_observers * crowd_max_checks_per_observer);
 
     var stats = accumulator.finish();
     stats.items_per_second = suite.itemsPerSecond(last_stats.observer_count, stats.mean_ns);
     stats.deferred_count = last_stats.observer_count;
-    stats.output_count = last_stats.nearest_threat_found_count;
-    stats.sample_count = last_stats.sensed_count;
-    stats.candidate_pairs = last_stats.candidate_checks;
+    stats.output_count = last_stats.perf.nearest_threat_found_count;
+    stats.sample_count = last_stats.perf.sensed_count;
+    stats.candidate_pairs = last_stats.perf.candidate_checks;
     stats.neighbor_block_fills = last_stats.perf.block_fills;
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.compute_tuner), settled_before_measurement);

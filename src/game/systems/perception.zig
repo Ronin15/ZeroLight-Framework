@@ -127,48 +127,43 @@ pub const PerceptionConfig = struct {
 
 pub const PerceptionStats = struct {
     observer_count: usize = 0,
-    // FOV-surviving hostile candidates summed across every observer this step
-    // (post range/FOV gate, pre-LOS) — a selectivity signal for how much the
-    // spatial-index + FOV filter narrows the candidate population before the
-    // LOS raycast has to run at all.
-    sensed_count: usize = 0,
-    // Observers whose `target_visible` resolved true this step (LOS actually
-    // confirmed a nearest threat), summed across every range.
-    nearest_threat_found_count: usize = 0,
-    // `hasLineOfSight` call count and how many of those returned blocked,
-    // summed across every range — see the per-range accumulation note on
-    // `PerceptionRangeStats`. These make the LOS volume visible to
-    // `src/benchmarks/perception.zig` rather than hide it inside aggregate
-    // step timing.
-    los_checks: usize = 0,
-    los_blocked: usize = 0,
-    // Total spatial-index candidate checks across every observer this step: hostile
-    // rows on the observer's level inside its query box (mirrors
-    // `ai_separation_candidate_checks`), the query's own traversal cost before the
-    // radius and FOV tests that `sensed_count` follows.
-    candidate_checks: usize = 0,
     batch: BatchStats = .{},
     perf: Perf = .{},
 
-    /// Kept only with `runtime_perf_log.enabled`: the neighbor-block fills (one per (row
-    /// group, scan box) a range walks) and the gather batch.
+    /// Kept only with `runtime_perf_log.enabled`, each summed over every observer this step:
+    /// - `sensed_count`: FOV-surviving hostile candidates (post range/FOV gate, pre-LOS),
+    ///   how much the index and FOV filter narrow the candidates before any LOS raycast;
+    /// - `nearest_threat_found_count`: observers whose LOS confirmed a nearest threat;
+    /// - `los_checks` / `los_blocked`: `hasLineOfSight` calls and those that returned
+    ///   blocked;
+    /// - `candidate_checks`: index candidate checks (hostile rows on the observer's level
+    ///   inside its query box), the query's traversal cost before the radius and FOV tests;
+    /// - `block_fills`: neighbor-block fills (one per (row group, scan box) a range walks);
+    /// - `gather_batch`: the gather's batch.
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        sensed_count: usize = 0,
+        nearest_threat_found_count: usize = 0,
+        los_checks: usize = 0,
+        los_blocked: usize = 0,
+        candidate_checks: usize = 0,
         block_fills: usize = 0,
         gather_batch: BatchStats = .{},
     } else struct {};
 };
 
-// A range's neighbor-block fills, kept only with `runtime_perf_log.enabled`.
-const RangePerf = if (runtime_perf_log.enabled) struct { block_fills: usize = 0 } else struct {};
-
-// One range's counters and transition-event count: one padded slot per range, written once.
-const PerceptionRangeStats = struct {
+// A range's `PerceptionStats.Perf` counts, kept only with `runtime_perf_log.enabled`.
+const RangePerf = if (runtime_perf_log.enabled) struct {
     sensed_count: usize = 0,
     nearest_threat_found: usize = 0,
     los_checks: usize = 0,
     los_blocked: usize = 0,
-    // `PerceptionStats.candidate_checks` over this range's observers.
     candidate_checks: usize = 0,
+    block_fills: usize = 0,
+} else struct {};
+
+// One range's perf counts, kept rows, and transition-event count: one padded slot per range,
+// written once.
+const PerceptionRangeStats = struct {
     perf: RangePerf = .{},
     // The gather's kept rows in this range's window.
     kept: usize = 0,
@@ -277,13 +272,16 @@ pub const PerceptionSystem = struct {
         try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
         return .{
             .observer_count = observer_count,
-            .sensed_count = totals.sensed_count,
-            .nearest_threat_found_count = totals.nearest_threat_found,
-            .los_checks = totals.los_checks,
-            .los_blocked = totals.los_blocked,
-            .candidate_checks = totals.candidate_checks,
             .batch = batch,
-            .perf = if (comptime runtime_perf_log.enabled) .{ .block_fills = totals.perf.block_fills, .gather_batch = gather_batch } else .{},
+            .perf = if (comptime runtime_perf_log.enabled) .{
+                .sensed_count = totals.perf.sensed_count,
+                .nearest_threat_found_count = totals.perf.nearest_threat_found,
+                .los_checks = totals.perf.los_checks,
+                .los_blocked = totals.perf.los_blocked,
+                .candidate_checks = totals.perf.candidate_checks,
+                .block_fills = totals.perf.block_fills,
+                .gather_batch = gather_batch,
+            } else .{},
         };
     }
 
@@ -369,12 +367,14 @@ pub const PerceptionSystem = struct {
     fn sumRangeStats(self: *const PerceptionSystem, range_count: usize) PerceptionRangeStats {
         var totals = PerceptionRangeStats{};
         for (self.range_stats.items[0..range_count]) |slot| {
-            totals.sensed_count += slot.value.sensed_count;
-            totals.nearest_threat_found += slot.value.nearest_threat_found;
-            totals.los_checks += slot.value.los_checks;
-            totals.los_blocked += slot.value.los_blocked;
-            totals.candidate_checks += slot.value.candidate_checks;
-            if (comptime runtime_perf_log.enabled) totals.perf.block_fills += slot.value.perf.block_fills;
+            if (comptime runtime_perf_log.enabled) {
+                totals.perf.sensed_count += slot.value.perf.sensed_count;
+                totals.perf.nearest_threat_found += slot.value.perf.nearest_threat_found;
+                totals.perf.los_checks += slot.value.perf.los_checks;
+                totals.perf.los_blocked += slot.value.perf.los_blocked;
+                totals.perf.candidate_checks += slot.value.perf.candidate_checks;
+                totals.perf.block_fills += slot.value.perf.block_fills;
+            }
             totals.transition_events += slot.value.transition_events;
         }
         return totals;
@@ -870,7 +870,7 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, block: *PerceptionBlock
         .factions = hostile,
         .self = job.entities[i],
     }, &visitor);
-    range_stats.candidate_checks += query_stats.candidate_checks;
+    if (comptime runtime_perf_log.enabled) range_stats.perf.candidate_checks += query_stats.candidate_checks;
 
     if (job.player_candidate) |player| {
         if (player.level == observer_level and hostile.contains(player.faction)) {
@@ -894,7 +894,7 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, block: *PerceptionBlock
         .player_candidate = job.player_candidate,
     };
     insertionSort(usize, survivors[0..survivor_count], sort_ctx, survivorLessThan);
-    range_stats.sensed_count += survivor_count;
+    if (comptime runtime_perf_log.enabled) range_stats.perf.sensed_count += survivor_count;
 
     var target_visible = false;
     var nearest_threat = EntityId.invalid;
@@ -908,7 +908,7 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, block: *PerceptionBlock
     for (survivors[0..survivor_count]) |slot| {
         const tx = ox + scratch.to_x[slot];
         const ty = oy + scratch.to_y[slot];
-        range_stats.los_checks += 1;
+        if (comptime runtime_perf_log.enabled) range_stats.perf.los_checks += 1;
         if (hasLineOfSight(job.world, observer_level, ox, oy, tx, ty)) {
             target_visible = true;
             nearest_threat = resolveCandidate(sort_ctx, slot);
@@ -917,9 +917,11 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, block: *PerceptionBlock
             last_seen_y = ty;
             break;
         }
-        range_stats.los_blocked += 1;
+        if (comptime runtime_perf_log.enabled) range_stats.perf.los_blocked += 1;
     }
-    if (target_visible) range_stats.nearest_threat_found += 1;
+    if (comptime runtime_perf_log.enabled) {
+        if (target_visible) range_stats.perf.nearest_threat_found += 1;
+    }
 
     const dense_index = job.perception_dense_index[i];
     job.perception_slice.target_visible[dense_index] = target_visible;
@@ -1437,9 +1439,9 @@ test "stance gating: only hostile candidates ever become nearest_threat" {
     try testing.expectEqual(threat.index, perception.nearest_threat.index);
 }
 
-test "candidate_checks counts only hostile rows on the observer's level" {
-    // The observer is on level 2: two hostiles at shared xy on level 0 must not count, the
-    // one on level 2 must.
+test "an observer on an upper level perceives the same-level hostile, not the bystanders or the hostiles below" {
+    // The observer is on level 2: two hostiles at shared xy on level 0 must not be its
+    // threat, the one on level 2 must.
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     const observer = try addObserver(&data, 0, 0, 10, 0, .player, .{});
@@ -1461,11 +1463,8 @@ test "candidate_checks counts only hostile rows on the observer's level" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
-    // The neutral, the ally, and the level-0 hostiles cost no check.
-    try testing.expectEqual(@as(usize, 1), stats.candidate_checks);
-    try testing.expectEqual(@as(usize, 1), stats.sensed_count);
     const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(same_level.index, perception.nearest_threat.index);
@@ -1576,8 +1575,8 @@ test "an observer behind 256 allies finds the hostile past them" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
-    try testing.expectEqual(@as(usize, 1), stats.candidate_checks);
+    // The allies cost no check: past the budget, the hostile is still reached.
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(hostile.index, perception.nearest_threat.index);
@@ -1603,9 +1602,8 @@ test "an observer under hostiles stacked on other levels finds the farther same-
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
-    try testing.expectEqual(@as(usize, 1), stats.candidate_checks);
-    try testing.expectEqual(@as(usize, 1), stats.sensed_count);
+    // The stacked hostiles cost no check: past the budget, the same-level one is still reached.
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(same_level.index, perception.nearest_threat.index);
@@ -1626,13 +1624,14 @@ test "a hostile player on another level never enters an observer's candidates" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    // Squarely ahead and in range, one level down.
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    // Squarely ahead and in range, one level down, with a clear line on the observer's
+    // level: a candidate would be seen.
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .player_candidate = .{ .entity = player, .pos_x = 20, .pos_y = 0, .faction = .player, .level = 1 },
     });
-    try testing.expectEqual(@as(usize, 0), stats.sensed_count);
-    try testing.expectEqual(@as(usize, 0), stats.los_checks);
-    try testing.expect(!data_test_support.aiPerception(&data, observer).?.target_visible);
+    const perception = data_test_support.aiPerception(&data, observer).?;
+    try testing.expect(!perception.target_visible);
+    try testing.expect(!perception.nearest_threat.isValid());
 }
 
 test "hearing detects an in-range same-level stimulus" {
@@ -2258,11 +2257,10 @@ test "a hostile player on the observer's nonzero level becomes nearest_threat" {
     defer events.deinit();
 
     const player = try data.createEntity();
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .player_candidate = .{ .entity = player, .pos_x = 20, .pos_y = 0, .faction = .player, .level = 2 },
     });
 
-    try testing.expectEqual(@as(usize, 1), stats.sensed_count);
     const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(player.index, perception.nearest_threat.index);

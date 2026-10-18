@@ -121,14 +121,18 @@ pub const PlaneEntrySystem = struct {
     reserved_items: usize = 0,
     config: PlaneEntryConfig = .{},
     tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    // The gather's last batch, kept only with `runtime_perf_log.enabled`.
+    /// Set by the first gather whose AI rows exceeded the reservation and grew the windows
+    /// on the main thread before dispatch, which warns once: the population seam's reserve
+    /// is short of the live AI rows.
+    windows_growth_logged: bool = false,
+    // The gather's last batch and the gathers that grew the windows, kept only with
+    // `runtime_perf_log.enabled`.
     perf: Perf = .{},
-    /// Telemetry: gathers whose AI rows exceeded the reservation and grew the windows
-    /// on the main thread before dispatch. Nonzero means the population seam's reserve
-    /// is short of the live AI rows; the first warns once.
-    windows_grown: u64 = 0,
 
-    pub const Perf = if (runtime_perf_log.enabled) struct { last_batch: BatchStats = .{} } else struct {};
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        last_batch: BatchStats = .{},
+        window_grows: u64 = 0,
+    } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) PlaneEntrySystem {
         return .{ .allocator = allocator };
@@ -229,13 +233,13 @@ pub const PlaneEntrySystem = struct {
         self.reserved_items = target;
         std.debug.assert(self.entries.capacity >= self.reserved_items);
         std.debug.assert(self.tallies.capacity >= maxRangeCount(self.reserved_items, plane_entry_range_alignment_items));
-        self.windows_grown += 1;
-        if (comptime logging.enabled(.warn)) {
-            if (self.windows_grown == 1) logging.game.warn(
-                "plane entry gather: {d} AI rows exceeded the reserved windows; grew to {d} (reservation short of the live population)",
-                .{ needed, target },
-            );
-        }
+        if (comptime runtime_perf_log.enabled) self.perf.window_grows += 1;
+        if (self.windows_growth_logged) return;
+        self.windows_growth_logged = true;
+        if (comptime logging.enabled(.warn)) logging.game.warn(
+            "plane entry gather: {d} AI rows exceeded the reserved windows; grew to {d} (reservation short of the live population)",
+            .{ needed, target },
+        );
     }
 };
 
@@ -872,7 +876,7 @@ test "warmed plane entry gather allocates nothing on real workers (FailingAlloca
         try std.testing.expectEqualSlices(PlaneEntry, want, entries);
     }
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(u64, 0), system.windows_grown);
+    try std.testing.expect(!system.windows_growth_logged);
 }
 
 test "plane entry gather past its reservation grows once before dispatch; OOM returns before any write" {
@@ -901,7 +905,8 @@ test "plane entry gather past its reservation grows once before dispatch; OOM re
     system.allocator = failing.allocator();
     try std.testing.expectError(error.OutOfMemory, system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), &threads));
     system.allocator = allocator;
-    try std.testing.expectEqual(@as(u64, 0), system.windows_grown);
+    try std.testing.expect(!system.windows_growth_logged);
+    try std.testing.expect(population > system.reserved_items);
     try std.testing.expectEqual(@as(usize, 0), system.entries.items.len);
     try std.testing.expectEqual(landing_before, fixture.world.denseTile(floor1, 4, 0));
     for (fixture.agents.items, 0..) |npc, index| {
@@ -909,10 +914,13 @@ test "plane entry gather past its reservation grows once before dispatch; OOM re
     }
 
     const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), &threads);
-    try std.testing.expectEqual(@as(u64, 1), system.windows_grown);
+    try std.testing.expect(system.windows_growth_logged);
     try std.testing.expect(system.reserved_items >= population);
     try std.testing.expectEqualSlices(PlaneEntry, want, entries);
-    // A second gather of the same rows fits the grown windows.
+    // A second gather of the same rows fits the grown windows: it allocates nothing.
+    var refit = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = refit.allocator();
+    defer system.allocator = allocator;
     _ = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), &threads);
-    try std.testing.expectEqual(@as(u64, 1), system.windows_grown);
+    try std.testing.expectEqual(@as(usize, 0), refit.allocations);
 }

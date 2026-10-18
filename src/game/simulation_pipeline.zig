@@ -540,19 +540,17 @@ pub const SimulationPipelineStats = struct {
     destructibles_destroyed: usize = 0,
     /// Destructible entities hit but not destroyed this step.
     destructibles_hit: usize = 0,
-    /// Plane-traversal landing-carve scratch growths this step (reservation short of the
-    /// live population; zero in steady state).
-    dig_plane_scratch_grown: usize = 0,
-    /// Plane-entry gather window growths this step (reservation short of the live AI
-    /// rows; zero in steady state).
-    plane_entry_windows_grown: usize = 0,
     perf: Perf = .{},
 
     /// Kept only with `runtime_perf_log.enabled`: the think-set compaction
-    /// (`ai_cognition_order`) and the plane stage's NPC cell-entry gather.
+    /// (`ai_cognition_order`), the plane stage's NPC cell-entry gather, and this step's
+    /// plane-traversal scratch and plane-entry window growths past their reservations
+    /// (the reservation short of the live population; zero in steady state).
     pub const Perf = if (runtime_perf_log.enabled) struct {
         cognition: BatchStats = .{},
         plane_entry: BatchStats = .{},
+        dig_plane_scratch_grows: usize = 0,
+        plane_entry_window_grows: usize = 0,
     } else struct {};
 
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
@@ -583,18 +581,22 @@ pub const SimulationPipelineStats = struct {
         perf.recordBatch(.spatial_index_build, spatial_index_stats.sort_batch);
 
         perf.recordMetric(.perception_observers, metric(perception_stats.observer_count));
-        perf.recordMetric(.perception_sensed, metric(perception_stats.sensed_count));
-        perf.recordMetric(.perception_los_checks, metric(perception_stats.los_checks));
-        perf.recordMetric(.perception_los_blocked, metric(perception_stats.los_blocked));
-        perf.recordMetric(.perception_nearest_threat_found, metric(perception_stats.nearest_threat_found_count));
-        perf.recordMetric(.perception_candidate_checks, metric(perception_stats.candidate_checks));
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordMetric(.perception_sensed, metric(perception_stats.perf.sensed_count));
+            perf.recordMetric(.perception_los_checks, metric(perception_stats.perf.los_checks));
+            perf.recordMetric(.perception_los_blocked, metric(perception_stats.perf.los_blocked));
+            perf.recordMetric(.perception_nearest_threat_found, metric(perception_stats.perf.nearest_threat_found_count));
+            perf.recordMetric(.perception_candidate_checks, metric(perception_stats.perf.candidate_checks));
+        }
         perf.recordBatch(.perception, perception_stats.batch);
 
         perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
         perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));
         perf.recordMetric(.ai_navigation_intents, metric(ai_stats.navigation_intent_count));
-        perf.recordMetric(.ai_separation_candidate_checks, metric(ai_stats.separation_candidate_checks));
-        perf.recordMetric(.ai_separation_neighbor_samples, metric(ai_stats.separation_neighbor_samples));
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordMetric(.ai_separation_candidate_checks, metric(ai_stats.perf.separation_candidate_checks));
+            perf.recordMetric(.ai_separation_neighbor_samples, metric(ai_stats.perf.separation_neighbor_samples));
+        }
         perf.recordBatch(.ai_separation, ai_stats.separation_batch);
         perf.recordBatch(.ai_intent, ai_stats.intent_batch);
 
@@ -608,10 +610,12 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.steering_replan_cooldowns, metric(steering_stats.replan_cooldown_count));
         perf.recordMetric(.steering_unavailable_backoffs, metric(steering_stats.unavailable_backoff_count));
         perf.recordMetric(.steering_stuck_replans, metric(steering_stats.stuck_replan_count));
-        perf.recordMetric(.steering_agent_neighbor_samples, metric(steering_stats.agent_neighbor_samples));
-        perf.recordMetric(.steering_obstacle_samples, metric(steering_stats.obstacle_samples));
-        perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.agent_candidate_checks));
-        perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.obstacle_candidate_checks));
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordMetric(.steering_agent_neighbor_samples, metric(steering_stats.perf.agent_neighbor_samples));
+            perf.recordMetric(.steering_obstacle_samples, metric(steering_stats.perf.obstacle_samples));
+            perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.perf.agent_candidate_checks));
+            perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.perf.obstacle_candidate_checks));
+        }
         perf.recordBatch(.steering, steering_stats.batch);
         perf.recordTiming(.steering_select, steering_stats.select_ns);
         perf.recordTiming(.steering_snapshot, steering_stats.snapshot_ns);
@@ -678,8 +682,10 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.action_intents_dropped, metric(self.action_intents_dropped));
         perf.recordMetric(.destructibles_destroyed, metric(self.destructibles_destroyed));
         perf.recordMetric(.destructibles_hit, metric(self.destructibles_hit));
-        perf.recordMetric(.dig_plane_scratch_grown, metric(self.dig_plane_scratch_grown));
-        perf.recordMetric(.plane_entry_windows_grown, metric(self.plane_entry_windows_grown));
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordMetric(.dig_plane_scratch_grown, metric(self.perf.dig_plane_scratch_grows));
+            perf.recordMetric(.plane_entry_windows_grown, metric(self.perf.plane_entry_window_grows));
+        }
     }
 };
 
@@ -1231,8 +1237,6 @@ pub const SimulationPipeline = struct {
         stimuli_sticky_dropped: usize = 0,
         stimuli_promoted: usize = 0,
         action_intents_dropped: usize = 0,
-        dig_plane_scratch_grown: usize = 0,
-        plane_entry_windows_grown: usize = 0,
         perf: SimulationPipelineStats.Perf = .{},
         cognition_region: ?ActiveRegion = null,
         stagger_step: u8 = 0,
@@ -1296,8 +1300,6 @@ pub const SimulationPipeline = struct {
                 .action_intents_dropped = self.action_intents_dropped,
                 .destructibles_destroyed = self.destructible.destroyed,
                 .destructibles_hit = self.destructible.hits,
-                .dig_plane_scratch_grown = self.dig_plane_scratch_grown,
-                .plane_entry_windows_grown = self.plane_entry_windows_grown,
                 .perf = self.perf,
             };
         }
@@ -1605,12 +1607,14 @@ pub const SimulationPipeline = struct {
     /// standing over a hole (`runPlaneTraversal`).
     fn stagePlaneTraversal(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
-        const grown_before = self.dig.plane_scratch_grown;
-        const windows_grown_before = self.plane_entry.windows_grown;
+        const scratch_grows_before = if (comptime runtime_perf_log.enabled) self.dig.perf.plane_scratch_grows else 0;
+        const window_grows_before = if (comptime runtime_perf_log.enabled) self.plane_entry.perf.window_grows else 0;
         try runPlaneTraversal(&self.plane_entry, &self.dig, &self.pathfinding, context.world, context.data, context.player, context.frame, context.thread_system);
-        if (comptime runtime_perf_log.enabled) step.perf.plane_entry = self.plane_entry.perf.last_batch;
-        step.plane_entry_windows_grown = @intCast(self.plane_entry.windows_grown - windows_grown_before);
-        step.dig_plane_scratch_grown = @intCast(self.dig.plane_scratch_grown - grown_before);
+        if (comptime runtime_perf_log.enabled) {
+            step.perf.plane_entry = self.plane_entry.perf.last_batch;
+            step.perf.plane_entry_window_grows = @intCast(self.plane_entry.perf.window_grows - window_grows_before);
+            step.perf.dig_plane_scratch_grows = @intCast(self.dig.perf.plane_scratch_grows - scratch_grows_before);
+        }
     }
 
     /// Recompute each body's chunk from its settled position. Consumers are tier
@@ -5227,8 +5231,8 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     if (prove_zero_alloc) swap.install(targets, .uniform(failing.allocator()));
     const result = pipeline.update(context);
     if (prove_zero_alloc) swap.restore(targets);
-    const fall_stats = try result;
-    try std.testing.expectEqual(@as(usize, 0), fall_stats.plane_entry_windows_grown);
+    _ = try result;
+    try std.testing.expect(!pipeline.plane_entry.windows_growth_logged);
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
@@ -5242,8 +5246,8 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
         try std.testing.expect(!denseTileBlocksMovement(&world, floor1, cell.x, cell.y));
         out.positions[index] = .{ position.x, position.y };
     }
-    try std.testing.expectEqual(@as(u64, 0), pipeline.dig.plane_scratch_grown);
-    try std.testing.expectEqual(@as(u64, 0), pipeline.plane_entry.windows_grown);
+    try std.testing.expect(!pipeline.dig.plane_scratch_growth_logged);
+    try std.testing.expect(!pipeline.plane_entry.windows_growth_logged);
     return out;
 }
 
@@ -5906,9 +5910,9 @@ test "a plane traversal past a failed population seam reserves its nav record fr
         .sim_view = fullWorldSimView(&fixture.world),
     });
     try fixture.pipeline.stagePlaneTraversal(&step);
-    // The gather's windows were short of the AI rows too: grown once on main, then dispatched.
-    try std.testing.expectEqual(@as(u64, 1), fixture.pipeline.plane_entry.windows_grown);
-    try std.testing.expectEqual(@as(usize, 1), step.plane_entry_windows_grown);
+    // The gather's windows were short of the AI rows too: grown on main, then dispatched.
+    try std.testing.expect(fixture.pipeline.plane_entry.windows_growth_logged);
+    try std.testing.expect(fixture.pipeline.plane_entry.reserved_items >= npc_count);
     try std.testing.expectEqual(npc_count, fixture.frame.events.stats.world_tile_changed);
     try std.testing.expectEqual(@as(usize, 1), fixture.frame.events.range_stats.items.len);
     for (landings.items) |cell| try std.testing.expect(!denseTileBlocksMovement(&fixture.world, floor1, cell.x, cell.y));

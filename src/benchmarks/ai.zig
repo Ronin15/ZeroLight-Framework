@@ -5,10 +5,11 @@
 //! - `ai`: the per-step AI decision (gather, separation, cohere, arbitration, intents) over
 //!   a fixed-density grid, with the shared index and the think set (every agent, in the
 //!   index's cell-major order, as production orders it) built untimed. Pass shape: time
-//!   linear in agents; separation checks per agent at most `max_separation_candidate_checks`;
-//!   neighbor-block fills at most the rows' cell runs plus the ranges, per query kind; the
-//!   tuned case within spread of the best control; the main thread's time (the gather's
-//!   window merge) flat per agent. Asserts check the check and fill bounds.
+//!   linear in agents; separation checks per agent at most `max_separation_candidate_checks`
+//!   and neighbor samples at most `max_separation_neighbors`; neighbor-block fills at most
+//!   the rows' cell runs plus the ranges, per query kind; the tuned case within spread of
+//!   the best control; the main thread's time (the gather's window merge) flat per agent.
+//!   Asserts check the check, sample, and fill bounds.
 //! - `ai-cell-ordered`: the same agents created in the think set's order, so every per-row
 //!   store read and write (`ai_agent_hot` by AI index) ascends. Pass shape: `ai` within
 //!   spread of it, the scattered-write control; asserts check the think set ascends.
@@ -30,6 +31,7 @@ const AiStats = @import("../game/systems/ai.zig").AiStats;
 const AiSystem = @import("../game/systems/ai.zig").AiSystem;
 const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
 const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
+const max_separation_neighbors = @import("../game/systems/ai.zig").max_separation_neighbors;
 const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
@@ -259,14 +261,15 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
 
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
-    std.debug.assert(last_ai_stats.separation_candidate_checks <= last_ai_stats.entity_count * max_separation_candidate_checks);
+    std.debug.assert(last_ai_stats.perf.separation_candidate_checks <= last_ai_stats.entity_count * max_separation_candidate_checks);
+    std.debug.assert(last_ai_stats.perf.separation_neighbor_samples <= last_ai_stats.entity_count * max_separation_neighbors);
     // A fill per key a range's rows change to: at most the rows' cell runs plus the ranges.
     const ranges = last_ai_stats.separation_batch.range_count;
     std.debug.assert(last_ai_stats.perf.separation_block_fills <= cellRuns(fixture, spatial_view, think_set, false) + ranges);
     std.debug.assert(last_ai_stats.perf.cohere_block_fills <= cellRuns(fixture, spatial_view, think_set, true) + ranges);
     stats.neighbor_block_fills = last_ai_stats.perf.separation_block_fills;
     stats.secondary_neighbor_block_fills = last_ai_stats.perf.cohere_block_fills;
-    stats.candidate_pairs = last_ai_stats.separation_candidate_checks;
+    stats.candidate_pairs = last_ai_stats.perf.separation_candidate_checks;
     stats.output_count = last_ai_stats.intent_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(last_ai_stats.intent_batch);
     stats.splice_batch = suite.batchSummaryFromBatch(last_ai_stats.perf.gather_batch);

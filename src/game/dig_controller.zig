@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const logging = @import("../core/logging.zig");
 const math = @import("../core/math.zig");
 const InputState = @import("../app/input.zig").InputState;
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
@@ -117,8 +118,8 @@ pub const DigController = struct {
     /// (`plane_carves`) and grouped by chunk for the batched write (`plane_carve_next`,
     /// `plane_carve_writes`, `plane_carve_chunks`), and the carves' tile changes
     /// (`plane_tile_changes`). `reservePlaneTraversalStage` grows them before anything is
-    /// written when a step's entries exceed the reservation, counting it in
-    /// `plane_scratch_grown`; after that the step only appends into reserved capacity.
+    /// written when a step's entries exceed the reservation (`growPlaneScratch`); after
+    /// that the step only appends into reserved capacity.
     plane_moves: std.ArrayList(PlaneMove) = .empty,
     /// The landing cells this step's falls carve, keyed `(level, cell)`. Reserved with
     /// the lists above, so a step allocates nothing; a step clears it in O(1), so its
@@ -137,13 +138,17 @@ pub const DigController = struct {
     /// list's capacity, which `ensureTotalCapacity` rounds past it.
     plane_scratch_reserved: usize = 0,
     scratch_allocator: ?std.mem.Allocator = null,
-    /// Telemetry: plane-traversal steps whose possible traversals (the player's cell
-    /// entry and the gathered entries) exceeded `plane_scratch_reserved` (perf metric
-    /// `dig_plane_scratch_grown`), whether or not the scratch's rounded-up capacity
-    /// absorbed it; the stage grows the scratch first when it did not. Nonzero means the
-    /// `.plane_traversal` reservation is short of the live population; the first such
-    /// step warns once.
-    plane_scratch_grown: u64 = 0,
+    /// Set by the first plane-traversal step whose possible traversals (the player's cell
+    /// entry and the gathered entries) exceeded `plane_scratch_reserved`, whether or not
+    /// the scratch's rounded-up capacity absorbed them (the stage grows the scratch first
+    /// when it did not), which warns once: the `.plane_traversal` reservation is short of
+    /// the live population.
+    plane_scratch_growth_logged: bool = false,
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: the steps whose possible traversals
+    /// exceeded `plane_scratch_reserved` (perf metric `dig_plane_scratch_grown`).
+    pub const Perf = if (runtime_perf_log.enabled) struct { plane_scratch_grows: u64 = 0 } else struct {};
 
     pub fn init(config: DigConfig) DigController {
         return .{ .ramp_tile = config.ramp_tile, .tunnel_tile = config.tunnel_tile };
@@ -285,8 +290,7 @@ pub const DigController = struct {
     }
 
     /// Grow-only re-reserve from the pipeline's population seam, using the
-    /// allocator `reservePlaneScratch` set. Not a shortfall: `plane_scratch_grown` is
-    /// not counted.
+    /// allocator `reservePlaneScratch` set. Not a shortfall: neither counted nor warned.
     pub fn ensurePlaneScratchReserve(self: *DigController, capacity: usize) error{ OutOfMemory, PlaneScratchUnreserved }!void {
         const allocator = self.scratch_allocator orelse return error.PlaneScratchUnreserved;
         try self.reservePlaneLists(allocator, capacity);
@@ -313,13 +317,13 @@ pub const DigController = struct {
         @branchHint(.cold);
         const allocator = self.scratch_allocator orelse return error.PlaneScratchUnreserved;
         try self.reservePlaneLists(allocator, needed);
-        self.plane_scratch_grown += 1;
-        if (comptime logging.enabled(.warn)) {
-            if (self.plane_scratch_grown == 1) logging.game.warn(
-                "plane traversal: {d} possible traversals exceeded the reserved scratch; grew to {d} (reservation short of the live population)",
-                .{ needed, self.plane_moves.capacity },
-            );
-        }
+        if (comptime runtime_perf_log.enabled) self.perf.plane_scratch_grows += 1;
+        if (self.plane_scratch_growth_logged) return;
+        self.plane_scratch_growth_logged = true;
+        if (comptime logging.enabled(.warn)) logging.game.warn(
+            "plane traversal: {d} possible traversals exceeded the reserved scratch; grew to {d} (reservation short of the live population)",
+            .{ needed, self.plane_moves.capacity },
+        );
     }
 
     pub fn deinit(self: *DigController) void {
@@ -910,9 +914,9 @@ test "plane traversal grows an under-reserved scratch before any carve and match
         try std.testing.expect(!denseTileBlocksMovement(&tw.world, floor1, 4, 3));
         try std.testing.expect(!denseTileBlocksMovement(&tw.world, floor1, 6, 3));
     }
-    try std.testing.expectEqual(@as(u64, 1), dig_short.plane_scratch_grown);
+    try std.testing.expect(dig_short.plane_scratch_growth_logged);
     try std.testing.expect(dig_short.plane_tile_changes.capacity >= 2);
-    try std.testing.expectEqual(@as(u64, 0), dig_reserved.plane_scratch_grown);
+    try std.testing.expect(!dig_reserved.plane_scratch_growth_logged);
 
     // Same published changes, same order ((4,3) then (6,3)).
     var short_buf: [4]WorldTileChangedEvent = undefined;
@@ -928,7 +932,7 @@ test "plane traversal grows an under-reserved scratch before any carve and match
     try std.testing.expectEqual(@as(usize, 2), frame_reserved.events.stats.world_tile_changed);
 }
 
-test "plane traversal counts carves past the reservation even inside the scratch's slack" {
+test "plane traversal warns of carves past the reservation even inside the scratch's slack" {
     var tw: TestWorld = undefined;
     try tw.init(.right, 0);
     defer tw.deinit();
@@ -950,9 +954,9 @@ test "plane traversal counts carves past the reservation even inside the scratch
 
     try testPlaneTraversalStage(&dig, &tw.world, &tw.data, &tw.player, &frame);
 
-    // Two carves against a reservation of 1: drift, counted though nothing grew.
+    // Two carves against a reservation of 1: drift, warned though nothing grew.
     try std.testing.expectEqual(capacity_before, dig.plane_tile_changes.capacity);
-    try std.testing.expectEqual(@as(u64, 1), dig.plane_scratch_grown);
+    try std.testing.expect(dig.plane_scratch_growth_logged);
     try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
 }
 
@@ -1000,7 +1004,7 @@ test "plane traversal within the scratch reserve is allocation-free (FailingAllo
     try testPlaneTraversalStage(&dig, &tw.world, &tw.data, &tw.player, &frame);
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(u64, 0), dig.plane_scratch_grown);
+    try std.testing.expect(!dig.plane_scratch_growth_logged);
     try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
 }
 

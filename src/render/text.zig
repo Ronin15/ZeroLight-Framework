@@ -5,7 +5,7 @@
 //! Asset-backed SDL_ttf service for cached UI and debug text.
 //! Text rendering is synchronous on cache misses. Cache entries are
 //! reference-counted: each successful `prepareText*` retains the entry, and
-//! `destroyPreparedTexts` releases one retain. GPU textures free only when the
+//! `destroyPreparedTextsWithContext` releases one retain. GPU textures free only when the
 //! retain count reaches zero, so multi-owner glyph sets (e.g. FPS overlay and
 //! AI debug digits sharing the same cache keys) stay valid when one owner
 //! retires after a font/DPI change. Callers that re-prepare a fixed glyph set
@@ -258,26 +258,12 @@ pub const TextService = struct {
         return self.prepareText(renderer, TextRequest.init(text, self.defaultFont(), color));
     }
 
-    /// Retires the cache entries backing `prepared` texts and invalidates each
-    /// handle in place. Safe no-op for already-invalid entries. Use when a fixed
-    /// glyph set is re-prepared after a font/DPI change so prior textures do not
-    /// accumulate for the app lifetime. One GPU idle covers the whole batch;
-    /// individual releases then use the assume-idle destroy path.
-    pub fn destroyPreparedTexts(self: *TextService, renderer: *Renderer, prepared: []PreparedText) void {
-        var any_valid = false;
-        for (prepared) |entry| {
-            if (entry.isValid()) {
-                any_valid = true;
-                break;
-            }
-        }
-        if (any_valid) renderer.waitForIdle();
-        self.destroyPreparedTextsWithContext(@ptrCast(renderer), prepared);
-    }
-
-    /// Backend-context counterpart to `destroyPreparedTexts`. Does not idle the
-    /// GPU — caller must have synchronized already when releasing live textures
-    /// (the public `destroyPreparedTexts` path does this once for the batch).
+    /// Releases one retain of the cache entry backing each of `prepared` through
+    /// `backend_context` (a `*Renderer`, or a test backend) and invalidates each handle in
+    /// place. Safe no-op for already-invalid entries. Use when a fixed glyph set is
+    /// re-prepared after a font/DPI change or retired, so prior textures do not accumulate
+    /// for the app lifetime. Does not idle the GPU: a caller releasing live textures idles
+    /// once for the batch first, and each release takes the assume-idle destroy path.
     pub fn destroyPreparedTextsWithContext(self: *TextService, backend_context: *anyopaque, prepared: []PreparedText) void {
         for (prepared) |*entry| {
             if (!entry.isValid()) continue;
@@ -604,7 +590,7 @@ const TextEntrySlot = struct {
     height: u32 = 0,
     generation: u32 = 1,
     /// Live `PreparedText` holders that prepared this entry (create or cache hit).
-    /// `destroyPreparedTexts` decrements; GPU free only at zero. Teardown forces free.
+    /// `destroyPreparedTextsWithContext` decrements; GPU free only at zero. Teardown forces free.
     retain_count: u32 = 0,
     alive: bool = false,
     next_free: ?u32 = null,
@@ -698,9 +684,8 @@ fn createTextureFromTextSurface(renderer: *Renderer, surface: *c.SDL_Surface) !T
 
 fn rendererDestroyTexture(context: *anyopaque, texture: TextureId) void {
     const renderer: *Renderer = @ptrCast(@alignCast(context));
-    // TextService bulk paths (`deinit`, `destroyPreparedTexts`) idle once before
-    // releasing; mid-prepare errdefer textures were never submitted. Never re-idle
-    // per texture here.
+    // Callers idle once before a bulk release (service teardown, a glyph set's retire);
+    // mid-prepare errdefer textures were never submitted. Never re-idle per texture here.
     renderer.destroyTextureAssumeIdle(texture);
 }
 
@@ -855,7 +840,7 @@ test "prepared text cache keys include style changes" {
     try std.testing.expectEqual(@as(u32, 2), fake.render_count);
 }
 
-test "destroyPreparedTexts retires cache entries so re-prepare does not grow unboundedly" {
+test "releasing prepared texts retires cache entries so re-prepare does not grow unboundedly" {
     var fake = FakeBackend{};
     var service = try initFakeTextService(std.testing.allocator, &fake);
     defer service.deinitWithContext(&fake);

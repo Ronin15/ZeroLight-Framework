@@ -23,7 +23,8 @@
 //! judged against its controls; `steering-static-change` flat in statics;
 //! `steering-static-dense` linear in statics per chunk, and the `interleaved` and `churned`
 //! layouts' time per agent within spread of `chunk_ordered` at the same count. Asserts
-//! check that every agent writes a movement intent, that the static groups sample statics,
+//! check that every agent writes a movement intent, that the agent groups' avoidance checks
+//! stay within each agent's candidate budget, that the static groups sample statics,
 //! and that `steering-static-dense` repeats its first step's obstacle visits and samples
 //! and, when churned, that every destroy and recreate commits and syncs.
 //!
@@ -52,6 +53,7 @@ const StaticColliderSystem = @import("../game/systems/static_colliders.zig").Sta
 const SteeringStats = @import("../game/systems/steering/system.zig").SteeringStats;
 const SteeringSystem = @import("../game/systems/steering/system.zig").SteeringSystem;
 const steering_range_alignment_items = @import("../game/systems/steering/system.zig").steering_range_alignment_items;
+const max_agent_candidate_checks = @import("../game/systems/steering/avoidance.zig").max_agent_candidate_checks;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
@@ -228,9 +230,11 @@ fn runLayoutCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Option
     var fixture = try createFixture(allocator, item_count, layout);
     defer fixture.deinit(allocator);
     const measured = try measureCase(allocator, io, options, case, item_count, &fixture, &fixture, prepareOnce, runOnce);
+    // Each agent's avoidance stops at its candidate budget.
+    if (measured.last.perf.agent_candidate_checks > measured.last.selected_intent_count * max_agent_candidate_checks) return error.AgentChecksPastBudget;
     var stats = measured.stats;
-    stats.candidate_pairs = measured.last.agent_candidate_checks + measured.last.obstacle_candidate_checks;
-    stats.sample_count = measured.last.agent_neighbor_samples + measured.last.obstacle_samples;
+    stats.candidate_pairs = measured.last.perf.agent_candidate_checks + measured.last.perf.obstacle_candidate_checks;
+    stats.sample_count = measured.last.perf.agent_neighbor_samples + measured.last.perf.obstacle_samples;
     return stats;
 }
 
@@ -560,8 +564,8 @@ fn runStaticChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     fixtures.setSpliceTuners(&fixture.steering.colliders, case);
     const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering, &fixture, prepareStaticChange, staticChangeOnce);
     var stats = measured.stats;
-    stats.candidate_pairs = measured.last.obstacle_candidate_checks;
-    stats.sample_count = measured.last.obstacle_samples;
+    stats.candidate_pairs = measured.last.perf.obstacle_candidate_checks;
+    stats.sample_count = measured.last.perf.obstacle_samples;
     return stats;
 }
 
@@ -583,7 +587,7 @@ fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thre
 
     const stats = try steeringStep(system, &fixture.steering, thread_system, case);
     if (stats.movement_intent_count != fixture.steering.agents.items.len) return error.AgentIntentMissing;
-    if (stats.obstacle_samples == 0) return error.NearStaticsUnsampled;
+    if (stats.perf.obstacle_samples == 0) return error.NearStaticsUnsampled;
     return stats;
 }
 
@@ -773,8 +777,8 @@ fn runStaticDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     defer fixture.deinit(allocator);
     const measured = try measureCase(allocator, io, options, case, code.statics_per_chunk, &fixture.steering, &fixture, prepareStaticDense, staticDenseOnce);
     var stats = measured.stats;
-    stats.candidate_pairs = measured.last.obstacle_candidate_checks;
-    stats.sample_count = measured.last.obstacle_samples;
+    stats.candidate_pairs = measured.last.perf.obstacle_candidate_checks;
+    stats.sample_count = measured.last.perf.obstacle_samples;
     // The header names the config; throughput stays per static per chunk.
     stats.item_count = item_count;
     return stats;
@@ -788,15 +792,15 @@ fn prepareStaticDense(fixture: *StaticDenseFixture) !void {
 fn staticDenseOnce(system: *SteeringSystem, fixture: *StaticDenseFixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     const stats = try steeringStep(system, &fixture.steering, thread_system, case);
     if (stats.movement_intent_count != fixture.steering.agents.items.len) return error.AgentIntentMissing;
-    if (stats.obstacle_samples == 0) return error.StaticsUnsampled;
-    if (stats.obstacle_samples > stats.obstacle_candidate_checks) return error.SamplesExceedVisits;
+    if (stats.perf.obstacle_samples == 0) return error.StaticsUnsampled;
+    if (stats.perf.obstacle_samples > stats.perf.obstacle_candidate_checks) return error.SamplesExceedVisits;
     if (fixture.first_visits) |first_visits| {
-        if (stats.obstacle_candidate_checks != first_visits or stats.obstacle_samples != fixture.first_samples) {
+        if (stats.perf.obstacle_candidate_checks != first_visits or stats.perf.obstacle_samples != fixture.first_samples) {
             return error.ObstacleWorkloadDrifted;
         }
     } else {
-        fixture.first_visits = stats.obstacle_candidate_checks;
-        fixture.first_samples = stats.obstacle_samples;
+        fixture.first_visits = stats.perf.obstacle_candidate_checks;
+        fixture.first_samples = stats.perf.obstacle_samples;
     }
     return stats;
 }

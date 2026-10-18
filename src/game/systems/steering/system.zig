@@ -109,11 +109,6 @@ pub const SteeringStats = struct {
     replan_cooldown_count: usize = 0,
     unavailable_backoff_count: usize = 0,
     stuck_replan_count: usize = 0,
-    agent_neighbor_samples: usize = 0,
-    obstacle_samples: usize = 0,
-    agent_candidate_checks: usize = 0,
-    /// Static-collider query entries read.
-    obstacle_candidate_checks: usize = 0,
     /// The avoidance pass.
     batch: BatchStats = .{},
     // Wall time (ns) of the prepare stages, inline or dispatched: selection, the agents stage
@@ -124,10 +119,15 @@ pub const SteeringStats = struct {
     grid_ns: u64 = 0,
     perf: Perf = .{},
 
-    /// The prepare stages' batches, kept only with `runtime_perf_log.enabled`. The claim and
-    /// grid sort batches hold zero items on the serial path, where selection and the grid run
-    /// their single pass.
+    /// Kept only with `runtime_perf_log.enabled`: the avoidance pass's agent and obstacle
+    /// samples and candidate checks (`obstacle_candidate_checks` counts static-collider query
+    /// entries read), and the prepare stages' batches. The claim and grid sort batches hold
+    /// zero items on the serial path, where selection and the grid run their single pass.
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        agent_neighbor_samples: usize = 0,
+        obstacle_samples: usize = 0,
+        agent_candidate_checks: usize = 0,
+        obstacle_candidate_checks: usize = 0,
         agents_batch: BatchStats = .{},
         select_resolve_batch: BatchStats = .{},
         select_claim_batch: BatchStats = .{},
@@ -754,6 +754,7 @@ const testColliders = @import("test_support.zig").testColliders;
 const commitStaticsForTest = @import("test_support.zig").commitStaticsForTest;
 const parity_statics = @import("test_support.zig").parity_statics;
 const expectParityStaticsSpread = @import("test_support.zig").expectParityStaticsSpread;
+const expectStaticNearASteeredAgent = @import("test_support.zig").expectStaticNearASteeredAgent;
 
 fn expectAgentSnapshotColumnsAligned(rows: *const std.MultiArrayList(AgentSnapshotRow)) !void {
     const count = rows.len;
@@ -897,6 +898,7 @@ test "steering serial and real threaded workers produce identical movement inten
     var colliders = try testColliders(&pathfinding, &data, 512, 512, 16);
     defer colliders.deinit();
     try expectParityStaticsSpread(&colliders);
+    try expectStaticNearASteeredAgent(&colliders, &data);
 
     var serial_frame = SimulationFrame.init(std.testing.allocator);
     defer serial_frame.deinit();
@@ -907,9 +909,8 @@ test "steering serial and real threaded workers produce identical movement inten
     var serial_system = SteeringSystem.init(std.testing.allocator);
     defer serial_system.deinit();
     try serial_system.reserve(128);
-    const serial_stats = try updateSteeringInline(&serial_system, &data, &serial_frame, &pathfinding, &colliders);
+    _ = try updateSteeringInline(&serial_system, &data, &serial_frame, &pathfinding, &colliders);
     const serial = serial_frame.intents.mergedItems();
-    try std.testing.expect(serial_stats.obstacle_samples > 0);
 
     var threaded_frame = SimulationFrame.init(std.testing.allocator);
     defer threaded_frame.deinit();
@@ -934,8 +935,6 @@ test "steering serial and real threaded workers produce identical movement inten
     const threaded = threaded_frame.intents.mergedItems();
 
     try std.testing.expect(threaded_stats.batch.active_worker_threads > 0);
-    try std.testing.expectEqual(serial_stats.obstacle_samples, threaded_stats.obstacle_samples);
-    try std.testing.expectEqual(serial_stats.obstacle_candidate_checks, threaded_stats.obstacle_candidate_checks);
     try std.testing.expectEqual(serial.len, threaded.len);
     for (serial, threaded) |a, b| {
         try std.testing.expectEqual(a.movement.entity.index, b.movement.entity.index);
@@ -1085,7 +1084,8 @@ test "steering update is allocation-free after reserves from the first step" {
     const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(usize, 1), stats.movement_intent_count);
-    try std.testing.expect(stats.obstacle_samples > 0);
+    // Neither the neighbor's push nor the static's alone outweighs the +x direct direction.
+    try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x < 0);
 
     // A churn step within the reserve: the first agent goes (its steering row takes the
     // last one's) and a new agent comes, so the rekey both moves and defaults rows.
@@ -1128,6 +1128,7 @@ test "steering threaded multi-worker update is allocation-free after reserves fr
     try pathfinding.rebuildStaticNavGrid(&data, 512, 512, 16);
     var colliders = try testColliders(&pathfinding, &data, 512, 512, 16);
     defer colliders.deinit();
+    try expectStaticNearASteeredAgent(&colliders, &data);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -1184,7 +1185,6 @@ test "steering threaded multi-worker update is allocation-free after reserves fr
         const stats = try steering.update(&data, &frame, &threads, &pathfinding, &colliders, cfg);
         try expectEveryStageThreaded(stats);
         try std.testing.expectEqual(agents.len, stats.movement_intent_count);
-        try std.testing.expect(stats.obstacle_samples > 0);
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     }
 
