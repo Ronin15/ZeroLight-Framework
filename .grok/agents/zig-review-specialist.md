@@ -47,9 +47,21 @@ finding whose fix the review can state as one local change routes to
 zig-specialist with that call, and only one whose fix is an open choice
 routes to design.
 
+## Read set
+
+Review the diff. Start with `git diff` of the files the brief names, then the
+declarations that diff changes and their call sites. Every step below applies
+to that diff.
+
+Do not read a rule file end to end, and do not grep the tree for a pattern the
+diff does not contain. Read a rule section only when the diff touches what that
+section guards. Read `ThreadSystem`, an event budget, or a reserve seam only
+when a finding would depend on it. Unchanged code in a touched file is in
+scope only where the diff relies on it.
+
 ## Procedure
 
-1. **Scale Pass**, for each operation the change adds or touches, against
+1. **Scale Pass**, for each operation the diff adds or changes, against
    `engine-design.md` § Target scale and § Cost model, `threading.md`
    § What runs where, and `budgets-capacities.md`: work or memory that follows
    level size, depth, world count, or total links/cells instead of what
@@ -73,20 +85,21 @@ routes to design.
    Each claimed order is measured by a scaling bench at three or more sizes
    (`tests-benchmarks.md`) or marked derived; a flat-cost claim for a local
    change with no such bench is a finding.
-2. **Rule pass**: check the change against each loaded rule file.
+2. **Rule pass**: judge the diff against the loaded rules. A rule the diff
+   does not touch is one line in the report, not a search.
    **Std usage** (`zig-style.md` std-first), every review: list each
-   container, heap, bitset, sort, search, hash, or parse that the change adds
-   or that sits in a touched file, and check it against the installed 0.17
-   `lib/std`. A hand-rolled duplicate of a std API with no reason stated at
-   the site is a finding; so is a plan that never checked std for what it
-   adds.
-3. **Contract pass**: the contracts described by the doc that owns the
-   touched area (`AGENTS.md` § Rules And Docs). Never recommend moving
-   ownership against `docs/architecture.md`; name the conflict as an owner
-   question instead. Read the code each claim in a change or report rests on.
-   Before reporting a missing guard or a sizing problem, read the owning system
-   (`ThreadSystem` tuning, event budgets, reserve seams); a guarantee by
-   construction or a precondition assert the rules allow is not a finding.
+   container, heap, bitset, sort, search, hash, or parse that the diff adds
+   or changes, and check it against the installed 0.17 `lib/std`. A
+   hand-rolled duplicate of a std API with no reason stated at the site is a
+   finding; so is a plan that never checked std for what it adds.
+3. **Contract pass**: the section of the owning doc that covers the diff
+   (`AGENTS.md` § Rules And Docs). Never recommend moving ownership against
+   `docs/architecture.md`; name the conflict as an owner question instead.
+   Read the code a report claim rests on when that claim is about behavior
+   the diff can break. Before reporting a missing guard or a sizing problem,
+   read the owning system (`ThreadSystem` tuning, event budgets, reserve
+   seams); a guarantee by construction or a precondition assert the rules
+   allow is not a finding.
 4. **Tests**: for a weak test, name the untested contract and a narrow
    scenario that would expose a regression. For each new test, name the
    mutation it catches, from the code; one that would pass with the change
