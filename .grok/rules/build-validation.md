@@ -15,6 +15,12 @@ Commands and options: `docs/development-workflow.md`.
     exists; otherwise report it as not run;
   - once at the branch commit before merge:
     `zig build test -Doptimize=ReleaseFast`.
+- A command that runs on every edit or every commit has to finish quickly.
+  The full test suite, the ReleaseFast test, ThreadSanitizer, soaks, and
+  bench sweeps are branch-commit checks, not every-edit steps. While
+  iterating, `zig build check` (it runs the idiom lint) and, when test
+  bodies changed, `zig build test-compile` are the quick checks. They
+  type-check. They do not produce a pass.
 - Report validation that could not run; never claim it passed. A display,
   GPU, or sandbox failure is reported separately from a code failure.
 - Default mode is `Debug`: every test and bench while working, before/after

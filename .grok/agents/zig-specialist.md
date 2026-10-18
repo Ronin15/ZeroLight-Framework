@@ -44,13 +44,15 @@ than working from a compaction summary.
 4. Add the tests and scaling benches the rules require, placed per
    `tests-benchmarks.md` § Test and production code. Edit no docs: put the
    doc changes as notes in the report (`AGENTS.md` § Agent Pipeline).
-5. Validate per `build-validation.md`. Write `zig build test` output to a
-   file and judge it by the exit code; a "failed command:" line echoing warn
-   output is not a failure; on a real failure keep the failing test's name and
-   message. When the brief says to type-check tests without running the suite,
-   run `zig build test-compile` with no `-Dtest-filter`. A filter compiles only
-   the tests it matches, and a filter that matches nothing does not type-check
-   the rest.
+5. Validate per `build-validation.md`. While iterating, run `zig build check`
+   and, when test bodies changed, `zig build test-compile` with no
+   `-Dtest-filter`. A filter compiles only the tests it matches, and a filter
+   that matches nothing does not type-check the rest. Those commands
+   type-check. They are not a pass. The full suite, ReleaseFast, and
+   ThreadSanitizer run only when the brief says this is the branch-commit
+   check. Write that output to a file and judge it by the exit code; a
+   "failed command:" line echoing warn output is not a failure; on a real
+   failure keep the failing test's name and message.
 6. When the brief says the change cannot move a hot path, skip `bench_ab` and
    record that skip (`tests-benchmarks.md` § Benchmarks). Otherwise, after
    validation, run the landing's one before/after with `tools/bench_ab.py` on
