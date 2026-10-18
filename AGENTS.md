@@ -41,22 +41,26 @@ brief file is the whole task. Trivial means a local fix in 1–2 files with no
 design question; the main session may do that inline. The main session
 orchestrates, verifies every agent claim against live code, and reports.
 
-- A non-trivial brief names the files in scope and the change's cost-model
-  questions (what its work and memory grow with). Write it to
-  `.grok/reports/<topic>-brief.md`. The spawn prompt cites that path and
-  does not paste the brief.
+- A non-trivial brief names the files in scope, the declarations to read,
+  and the change's cost-model questions (what its work and memory grow
+  with). Write it to `.grok/reports/<topic>-brief.md`. The spawn prompt
+  cites that path and does not paste the brief.
 - `zig-design-specialist` runs only when a design is open or the existing
   structure fails the cost model, and plans right before implementation,
   against the live code. Local fixes and calls a plan or review triage already
   made (a move, a dedupe, a fix with a known cause) go straight to
   `zig-specialist` with that call in the brief.
 - `zig-review-specialist` reviews each slice, or each landing of a
-  multi-commit slice, once, before commit; fixes fold into that commit. Every
-  real finding is reported and checked against live code and
-  `docs/architecture.md`; one with a stated local fix goes to `zig-specialist`,
-  one whose fix is an open choice to design. A finding not fixed in its landing
-  becomes a checklist item in the owning slice with its `file:line`, failure
-  scenario, and pass condition, never only a memory note.
+  multi-commit slice, once, before commit; fixes fold into that commit. When
+  an implementation landing's code is ready, the main session spawns that
+  review in the same turn, before it reports the unit done. The implementer
+  cannot spawn it, and "recommend review" is not a stop. Read-only reviews
+  of separate landings may run together. Every real finding is reported and
+  checked against live code and `docs/architecture.md`; one with a stated
+  local fix goes to `zig-specialist`, one whose fix is an open choice to
+  design. A finding not fixed in its landing becomes a checklist item in the
+  owning slice with its `file:line`, failure scenario, and pass condition,
+  never only a memory note.
 - `zig-debug-specialist` for failures.
 - `docs-specialist` writes the doc changes for a slice's docs commit and
   routes findings into roadmap slices; it edits docs only, and the main

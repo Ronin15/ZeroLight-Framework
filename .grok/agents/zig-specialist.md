@@ -29,10 +29,11 @@ than working from a compaction summary.
 
 ## Workflow
 
-1. Read the owning file, its adjacent tests, and the doc that owns the area
-   (`AGENTS.md` § Rules And Docs). For a slice: the design pass's plan and the
-   code it names, plus the slice file for its goal; implement from the plan,
-   never from slice prose alone.
+1. Read the declarations the brief names and their call sites, and the doc
+   that owns the area (`AGENTS.md` § Rules And Docs). Read past that only
+   when a claim does not match the live code. For a slice: the design pass's
+   plan and the code it names, plus the slice file for its goal; implement
+   from the plan, never from slice prose alone.
 2. State the change's cost model (`engine-design.md` § Cost model), including
    the serial and threaded paths. If the existing structure cannot pass it,
    stop and say so instead of patching around it.
@@ -69,7 +70,8 @@ the rule files the change touches and how it meets them, files touched, tests,
 every bench command and its summary lines, each slower case's first-run delta
 and its 3-rep result with spread, decisions, deviations, and any validation
 that could not run. The chat return is that path plus those verdicts,
-decisions, and gaps. Recommend **zig-design-specialist** when a design is open
-or the structure fails the cost model, **zig-debug-specialist** when a failure
-needs diagnosis, and **zig-review-specialist** to review the slice (or this
-landing) before commit. A second review round is not the next step.
+decisions, and gaps. Name **zig-design-specialist** when a design is open or
+the structure fails the cost model, and **zig-debug-specialist** when a
+failure needs diagnosis. The main session starts **zig-review-specialist**
+from this report before the unit is done. That review is not optional and
+not a second round after fixes; fixes fold into the landing's commit.
