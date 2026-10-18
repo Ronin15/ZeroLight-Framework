@@ -6,6 +6,7 @@
 //! Tier/chunk scoping drives cognition-stage gating by camera halo, stagger cadence, and tier commands.
 
 const std = @import("std");
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 
 /// Steps between cognition-stage runs for a single entity. AI and steering run
 /// once every cognition_stagger_n fixed steps per entity, rotating by stagger_phase.
@@ -178,10 +179,14 @@ pub const SimulationScopeStats = struct {
     collision_response_stage_entities: usize = 0,
     ai_stage_entities: usize = 0,
     steering_stage_entities: usize = 0,
-    /// Cognition entities inside the halo that were skipped by stagger this step.
-    stagger_skips: usize = 0,
-    /// Entities excluded from cognition because their chunk is outside the halo.
-    chunk_filtered_entities: usize = 0,
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: indexed halo entities the stagger skipped
+    /// this step, and cognition entities excluded because their chunk is outside the halo.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        stagger_skips: usize = 0,
+        chunk_filtered_entities: usize = 0,
+    } else struct {};
 };
 
 /// Transient fixed-step scope. active_region is the cognition halo (camera visible

@@ -193,8 +193,14 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         main_total += elapsed_ns -| offMainNs(result.batch);
         std.debug.assert(std.mem.eql(u32, serial_think, result.cognition));
         think_rows = result.cognition.len;
-        // Every indexed row thinks or is skipped, once.
-        std.debug.assert(think_rows + scope.stagger_skips == indexed);
+        // Every indexed row thinks or is skipped, once, and each range scans exactly its own
+        // cell-major positions.
+        std.debug.assert(think_rows + scope.perf.stagger_skips == indexed);
+        std.debug.assert(result.batch.range_count == scope.range_tallies.items.len);
+        for (scope.range_tallies.items, 0..) |slot, range_index| {
+            const range_start = range_index * result.batch.items_per_range;
+            std.debug.assert(slot.tally.count + slot.tally.perf.stagger_skips == @min(result.batch.items_per_range, indexed - range_start));
+        }
     }
 
     var stats = accumulator.finish();

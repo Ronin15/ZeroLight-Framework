@@ -574,8 +574,10 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.scope_collision_response_stage_entities, metric(scope_stats.collision_response_stage_entities));
         perf.recordMetric(.scope_ai_stage_entities, metric(scope_stats.ai_stage_entities));
         perf.recordMetric(.scope_steering_stage_entities, metric(scope_stats.steering_stage_entities));
-        perf.recordMetric(.scope_stagger_skips, metric(scope_stats.stagger_skips));
-        perf.recordMetric(.scope_chunk_filtered_entities, metric(scope_stats.chunk_filtered_entities));
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordMetric(.scope_stagger_skips, metric(scope_stats.perf.stagger_skips));
+            perf.recordMetric(.scope_chunk_filtered_entities, metric(scope_stats.perf.chunk_filtered_entities));
+        }
 
         // The sort is the build's cost driver; the bucket and link stages stay bench-only.
         perf.recordBatch(.spatial_index_build, spatial_index_stats.sort_batch);
@@ -604,13 +606,13 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.steering_selected_intents, metric(steering_stats.selected_intent_count));
         perf.recordMetric(.steering_movement_intents, metric(steering_stats.movement_intent_count));
         perf.recordMetric(.steering_path_requests, metric(steering_stats.path_request_count));
-        perf.recordMetric(.steering_paths_available, metric(steering_stats.path_available_count));
-        perf.recordMetric(.steering_paths_pending, metric(steering_stats.path_pending_count));
-        perf.recordMetric(.steering_paths_unavailable, metric(steering_stats.path_unavailable_count));
-        perf.recordMetric(.steering_replan_cooldowns, metric(steering_stats.replan_cooldown_count));
-        perf.recordMetric(.steering_unavailable_backoffs, metric(steering_stats.unavailable_backoff_count));
-        perf.recordMetric(.steering_stuck_replans, metric(steering_stats.stuck_replan_count));
         if (comptime runtime_perf_log.enabled) {
+            perf.recordMetric(.steering_paths_available, metric(steering_stats.perf.path_available_count));
+            perf.recordMetric(.steering_paths_pending, metric(steering_stats.perf.path_pending_count));
+            perf.recordMetric(.steering_paths_unavailable, metric(steering_stats.perf.path_unavailable_count));
+            perf.recordMetric(.steering_replan_cooldowns, metric(steering_stats.perf.replan_cooldown_count));
+            perf.recordMetric(.steering_unavailable_backoffs, metric(steering_stats.perf.unavailable_backoff_count));
+            perf.recordMetric(.steering_stuck_replans, metric(steering_stats.perf.stuck_replan_count));
             perf.recordMetric(.steering_agent_neighbor_samples, metric(steering_stats.perf.agent_neighbor_samples));
             perf.recordMetric(.steering_obstacle_samples, metric(steering_stats.perf.obstacle_samples));
             perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.perf.agent_candidate_checks));
@@ -1668,8 +1670,10 @@ pub const SimulationPipeline = struct {
         // are zero-velocity no-ops), so its stage entity count is the full-active
         // default set above — there is no movement scope filter to narrow it.
         if (collision_scope_indices) |idx| stats.collision_stage_entities = idx.len;
-        stats.stagger_skips = self.scope.stagger_skips;
-        stats.chunk_filtered_entities = self.scope.chunk_filtered_entities;
+        if (comptime runtime_perf_log.enabled) stats.perf = .{
+            .stagger_skips = self.scope.perf.stagger_skips,
+            .chunk_filtered_entities = self.scope.perf.chunk_filtered_entities,
+        };
         return .{ .active_region = cognition_region, .stats = stats };
     }
 };
@@ -6434,7 +6438,13 @@ test "a crowd pursuing a blocked goal whose projection is sealed reads it unavai
     try std.testing.expectEqual(@as(usize, crowd), frame.navigation_intents.mergedItems().len);
     try std.testing.expectEqual(@as(usize, crowd), stats.path_goals.blocked);
     try std.testing.expectEqual(@as(usize, 1), stats.path_goals.distinct);
-    try std.testing.expectEqual(@as(usize, crowd), stats.steering.path_unavailable_count);
     try std.testing.expectEqual(@as(usize, 0), stats.steering.path_request_count);
+    // Every agent read its goal unavailable: each entered its backoff and none requested.
+    const runtime = pipeline.steering.runtime_rows.slice();
+    try std.testing.expectEqual(@as(usize, crowd), runtime.len);
+    for (runtime.items(.unavailable_backoff), runtime.items(.replan_cooldown)) |backoff, cooldown| {
+        try std.testing.expectEqual(@as(u16, 12), backoff);
+        try std.testing.expectEqual(@as(u16, 0), cooldown);
+    }
     try std.testing.expectEqual(@as(usize, 0), stats.pathfinding.goal_fallbacks + stats.pathfinding.accepted_requests);
 }

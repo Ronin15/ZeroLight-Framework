@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const simd = @import("../../core/simd.zig");
 const math = @import("../../core/math.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
@@ -117,10 +118,15 @@ pub const SimulationScopeSystem = struct {
     ai_gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     cognition_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     tier_policy_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    /// Indexed halo entities whose stagger_phase did not match this step.
-    stagger_skips: usize,
-    /// Entities excluded from cognition because their chunk is outside the halo.
-    chunk_filtered_entities: usize,
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: the last think set's indexed halo entities
+    /// whose stagger_phase did not match its step, and the last AI gather's cognition
+    /// entities excluded because their chunk is outside the halo.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        stagger_skips: usize = 0,
+        chunk_filtered_entities: usize = 0,
+    } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) SimulationScopeSystem {
         return .{
@@ -131,8 +137,6 @@ pub const SimulationScopeSystem = struct {
             .ai_gather_tuner = AdaptiveWorkTuner.init(.{}),
             .cognition_tuner = AdaptiveWorkTuner.init(.{}),
             .tier_policy_tuner = AdaptiveWorkTuner.init(.{}),
-            .stagger_skips = 0,
-            .chunk_filtered_entities = 0,
         };
     }
 
@@ -160,8 +164,7 @@ pub const SimulationScopeSystem = struct {
     /// Increment the step counter. Call once at the top of each fixed step.
     pub fn advanceStep(self: *SimulationScopeSystem) void {
         self.step_count += 1;
-        self.stagger_skips = 0;
-        self.chunk_filtered_entities = 0;
+        self.perf = .{};
     }
 
     /// Current stagger slot: entities whose stagger_phase matches this value run AI/steering.
@@ -278,8 +281,7 @@ pub const SimulationScopeSystem = struct {
     ) !AiPopulationGatherResult {
         const ai = data.aiAgentSliceConst();
         const n = ai.entities.len;
-        self.stagger_skips = 0;
-        self.chunk_filtered_entities = 0;
+        self.perf = .{};
         if (n == 0) {
             self.ai_halo_indices.clearRetainingCapacity();
             return .{ .halo = self.ai_halo_indices.items };
@@ -311,7 +313,7 @@ pub const SimulationScopeSystem = struct {
             .selected_profile = selection.profile,
         });
         const merged = compactIndexWindows(&self.ai_halo_indices, self.range_tallies.items, selection.items_per_range);
-        self.chunk_filtered_entities = merged.chunk_filtered;
+        if (comptime runtime_perf_log.enabled) self.perf.chunk_filtered_entities = merged.perf.chunk_filtered;
         return .{ .halo = self.ai_halo_indices.items, .batch = batch };
     }
 
@@ -319,7 +321,7 @@ pub const SimulationScopeSystem = struct {
     /// whose cognition phase (`cognition_phase`, written by the index build) is this step,
     /// all of them when `apply_stagger` is false, in the index's cell-major order. Runs on
     /// workers under `cognition_tuner` over the cell-major positions, so one chunk's entries
-    /// split across ranges like any others. `stagger_skips` counts the rest. Allocates only
+    /// split across ranges like any others. `perf.stagger_skips` counts the rest. Allocates only
     /// past `reserve`'s capacity, on the calling thread before dispatch.
     pub fn compactCognition(
         self: *SimulationScopeSystem,
@@ -330,7 +332,7 @@ pub const SimulationScopeSystem = struct {
         config: ScopeConfig,
     ) !CognitionResult {
         const entry_count = index.entryCount();
-        self.stagger_skips = 0;
+        if (comptime runtime_perf_log.enabled) self.perf.stagger_skips = 0;
         if (entry_count == 0) {
             self.ai_cognition_indices.clearRetainingCapacity();
             return .{ .cognition = self.ai_cognition_indices.items };
@@ -350,7 +352,8 @@ pub const SimulationScopeSystem = struct {
             .adaptive_tuner = selection.active_tuner,
             .selected_profile = selection.profile,
         });
-        self.stagger_skips = compactIndexWindows(&self.ai_cognition_indices, self.range_tallies.items, selection.items_per_range).stagger_skips;
+        const merged = compactIndexWindows(&self.ai_cognition_indices, self.range_tallies.items, selection.items_per_range);
+        if (comptime runtime_perf_log.enabled) self.perf.stagger_skips = merged.perf.stagger_skips;
         return .{ .cognition = self.ai_cognition_indices.items, .batch = batch };
     }
 
@@ -456,8 +459,7 @@ pub const SimulationScopeSystem = struct {
 
 const IndexMergeResult = struct {
     any_excluded: bool = false,
-    chunk_filtered: usize = 0,
-    stagger_skips: usize = 0,
+    perf: GatherPerf = .{},
 };
 
 // ---- Per-range windows and tallies ------------------------------------------
@@ -468,16 +470,21 @@ const IndexMergeResult = struct {
 const IndexList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
 const CommandList = std.array_list.Aligned(StructuralCommand, .fromByteUnits(thread_shared_record_alignment));
 
-/// One range's output count and diagnostics, written once by the range's job.
+/// One range's output count and perf counts, written once by the range's job.
 const GatherTally = struct {
     count: usize = 0,
     // Movement/collision null decision: set when any scanned row was excluded.
     any_excluded: bool = false,
-    // AI diagnostics accumulated per range, summed on compaction.
-    chunk_filtered: usize = 0,
-    // A think-set range's indexed rows off this step's phase.
-    stagger_skips: usize = 0,
+    perf: GatherPerf = .{},
 };
+
+// A range's `SimulationScopeSystem.Perf` counts, kept only with `runtime_perf_log.enabled`:
+// an AI gather range's rows outside the halo and a think-set range's indexed rows off this
+// step's phase, summed on compaction.
+const GatherPerf = if (runtime_perf_log.enabled) struct {
+    chunk_filtered: usize = 0,
+    stagger_skips: usize = 0,
+} else struct {};
 
 const GatherTallySlot = struct {
     // Padding keeps concurrently written tallies off shared cache lines.
@@ -502,8 +509,10 @@ fn compactIndexWindows(list: *IndexList, tallies: []const GatherTallySlot, items
     for (tallies, 0..) |*slot, range_index| {
         const tally = slot.tally;
         if (tally.any_excluded) result.any_excluded = true;
-        result.chunk_filtered += tally.chunk_filtered;
-        result.stagger_skips += tally.stagger_skips;
+        if (comptime runtime_perf_log.enabled) {
+            result.perf.chunk_filtered += tally.perf.chunk_filtered;
+            result.perf.stagger_skips += tally.perf.stagger_skips;
+        }
         const src = range_index * items_per_range;
         std.debug.assert(dst <= src);
         if (dst != src and tally.count != 0) {
@@ -697,7 +706,7 @@ fn aiGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         }
         if (job.cognition_region) |region| {
             if (!region.containsChunk(.{ .x = scope.chunk_x[di], .y = scope.chunk_y[di] })) {
-                tally.chunk_filtered += 1;
+                if (comptime runtime_perf_log.enabled) tally.perf.chunk_filtered += 1;
                 continue;
             }
         }
@@ -733,8 +742,8 @@ fn cognitionJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             if (!job.apply_stagger or phase == job.stagger_step or phase == every_cognition_phase) {
                 window[tally.count] = ai_index;
                 tally.count += 1;
-            } else {
-                tally.stagger_skips += 1;
+            } else if (comptime runtime_perf_log.enabled) {
+                tally.perf.stagger_skips += 1;
             }
         }
     }
@@ -837,8 +846,8 @@ test "SimulationScopeSystem AI gather filters halo and stagger" {
     try std.testing.expectEqual(@as(usize, 1), pops.halo.len);
     try std.testing.expectEqual(@as(usize, 1), cognition.len);
     try std.testing.expectEqual(pops.halo[0], cognition[0]);
-    try std.testing.expectEqual(@as(usize, 1), sys.chunk_filtered_entities);
-    try std.testing.expectEqual(@as(usize, 0), sys.stagger_skips);
+    // The halo row is the in-halo agent: the out-of-halo one was filtered.
+    try std.testing.expect(data.aiAgentSliceConst().entities[pops.halo[0]].eql(inside));
 }
 
 test "SimulationScopeSystem AI stagger skips wrong phase" {
@@ -865,7 +874,6 @@ test "SimulationScopeSystem AI stagger skips wrong phase" {
     const cognition = try testThinkSet(&sys, &index, 1, true);
     try std.testing.expectEqual(@as(usize, 1), pops.halo.len);
     try std.testing.expectEqual(@as(usize, 0), cognition.len);
-    try std.testing.expectEqual(@as(usize, 1), sys.stagger_skips);
 }
 
 test "SimulationScopeSystem always_active bypasses halo and stagger" {
@@ -893,8 +901,6 @@ test "SimulationScopeSystem always_active bypasses halo and stagger" {
     const cognition = try testThinkSet(&sys, &index, 0, true);
     try std.testing.expectEqual(@as(usize, 1), pops.halo.len);
     try std.testing.expectEqual(@as(usize, 1), cognition.len);
-    try std.testing.expectEqual(@as(usize, 0), sys.chunk_filtered_entities);
-    try std.testing.expectEqual(@as(usize, 0), sys.stagger_skips);
 }
 
 test "AI halo includes off-phase agents; cognition excludes them" {
@@ -931,8 +937,6 @@ test "AI halo includes off-phase agents; cognition excludes them" {
     try std.testing.expectEqual(@as(usize, 2), pops.halo.len);
     try std.testing.expectEqual(@as(usize, 1), cognition.len);
     try std.testing.expectEqual(@as(u32, 0), cognition[0]);
-    try std.testing.expectEqual(@as(usize, 1), sys.stagger_skips);
-    try std.testing.expectEqual(@as(usize, 0), sys.chunk_filtered_entities);
 }
 
 test "null cognition region keeps halo identical to cognition with no stagger" {
@@ -967,8 +971,6 @@ test "null cognition region keeps halo identical to cognition with no stagger" {
     const cognition = try testThinkSet(&sys, &index, 0, false);
     try std.testing.expectEqual(@as(usize, 2), pops.halo.len);
     try std.testing.expectEqualSlices(u32, pops.halo, cognition);
-    try std.testing.expectEqual(@as(usize, 0), sys.stagger_skips);
-    try std.testing.expectEqual(@as(usize, 0), sys.chunk_filtered_entities);
 }
 
 test "think budget is one stagger slot of an in-halo four-phase set" {
@@ -998,7 +1000,6 @@ test "think budget is one stagger slot of an in-halo four-phase set" {
     try std.testing.expectEqual(@as(usize, 4), pops.halo.len);
     try std.testing.expectEqual(@as(usize, 1), cognition.len);
     try std.testing.expectEqual(@as(u32, 2), cognition[0]);
-    try std.testing.expectEqual(@as(usize, 3), sys.stagger_skips);
 }
 
 test "tier policy assigns all four LOD tiers by distance band" {
@@ -1298,8 +1299,9 @@ test "scoped AI emits navigation intents only for in-halo, on-phase agents" {
     // Halo keeps the in-halo off-phase agent; cognition is the on-phase subset.
     try std.testing.expectEqual(@as(usize, 2), pops.halo.len);
     try std.testing.expectEqual(@as(usize, 1), cognition.len);
-    try std.testing.expectEqual(@as(usize, 1), sys.chunk_filtered_entities);
-    try std.testing.expectEqual(@as(usize, 1), sys.stagger_skips);
+    const ai_entities = data.aiAgentSliceConst().entities;
+    for (pops.halo) |row| try std.testing.expect(!ai_entities[row].eql(out_of_halo));
+    try std.testing.expect(ai_entities[cognition[0]].eql(selected));
 
     var frame = SimulationFrame.init(allocator);
     defer frame.deinit();
@@ -1417,7 +1419,7 @@ fn fillParityPopulation(data: *DataSystem, count: usize) !void {
     }
 }
 
-test "threaded ai gather matches serial including diagnostics" {
+test "threaded ai gather and think set match serial" {
     if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
@@ -1440,7 +1442,6 @@ test "threaded ai gather matches serial including diagnostics" {
     const threaded = try threaded_sys.gatherAiPopulations(&data, region, &threads, fixed);
     try std.testing.expect(!threaded.batch.ran_inline);
     try std.testing.expectEqualSlices(u32, serial.halo, threaded.halo);
-    try std.testing.expectEqual(serial_sys.chunk_filtered_entities, threaded_sys.chunk_filtered_entities);
 
     var index = try testHaloIndex(&data, serial.halo);
     defer index.deinit();
@@ -1449,7 +1450,6 @@ test "threaded ai gather matches serial including diagnostics" {
     const threaded_think = try threaded_sys.compactCognition(&view, 0, true, &threads, fixed);
     try std.testing.expect(serial_think.cognition.len > 0);
     try std.testing.expectEqualSlices(u32, serial_think.cognition, threaded_think.cognition);
-    try std.testing.expectEqual(serial_sys.stagger_skips, threaded_sys.stagger_skips);
 }
 
 test "threaded tier policy matches serial" {
@@ -1532,18 +1532,16 @@ test "real worker threads match serial across every scope pass" {
     const col_threaded = (try threaded_sys.gatherCollisionBoundsIndices(&data, &threads, fixed)).indices.?;
     try std.testing.expectEqualSlices(u32, col_serial, col_threaded);
 
-    // AI gather (with diagnostics), then the think set over its index.
+    // AI gather, then the think set over its index.
     const ai_serial = try gatherAiInline(&serial_sys, &data, region);
     const ai_threaded = try threaded_sys.gatherAiPopulations(&data, region, &threads, fixed);
     try std.testing.expectEqualSlices(u32, ai_serial.halo, ai_threaded.halo);
-    try std.testing.expectEqual(serial_sys.chunk_filtered_entities, threaded_sys.chunk_filtered_entities);
     var index = try testHaloIndex(&data, ai_serial.halo);
     defer index.deinit();
     const view = index.view();
     const think_serial = try compactCognitionInline(&serial_sys, &view, 0, true);
     const think_threaded = try threaded_sys.compactCognition(&view, 0, true, &threads, fixed);
     try std.testing.expectEqualSlices(u32, think_serial.cognition, think_threaded.cognition);
-    try std.testing.expectEqual(serial_sys.stagger_skips, threaded_sys.stagger_skips);
 
     // Tier policy (variable-output producer, dense output).
     var visible = region;
@@ -1727,7 +1725,6 @@ test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges
 
         const ai_result = try sys.gatherAiPopulations(&data, ai_region, &threads, config);
         try std.testing.expectEqualSlices(u32, ai_serial.halo, ai_result.halo);
-        try std.testing.expectEqual(serial_sys.chunk_filtered_entities, sys.chunk_filtered_entities);
         try std.testing.expectEqualSlices(u32, think_serial.cognition, (try sys.compactCognition(&view, 0, true, &threads, config)).cognition);
 
         stream.clearRetainingCapacity();
@@ -1912,28 +1909,15 @@ test "the think set is the halo's phase set in the index's cell-major order, ser
             try std.testing.expect(expected.items.len > 0);
             const serial = try compactCognitionInline(&serial_sys, &view, stagger_step, apply_stagger);
             try std.testing.expectEqualSlices(u32, expected.items, serial.cognition);
-            try std.testing.expectEqual(halo.items.len - expected.items.len, serial_sys.stagger_skips);
             if (!apply_stagger) try std.testing.expectEqual(halo.items.len, serial.cognition.len);
             for (1..5) |workers| {
                 for ([_]usize{ 16, 48, 256 }) |items_per_range| {
                     const threaded = try threaded_sys.compactCognition(&view, stagger_step, apply_stagger, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = workers, .adaptive = false });
                     try std.testing.expect(!threaded.batch.ran_inline);
                     try std.testing.expectEqualSlices(u32, expected.items, threaded.cognition);
-                    try std.testing.expectEqual(serial_sys.stagger_skips, threaded_sys.stagger_skips);
                 }
             }
         }
-    }
-}
-
-// Each range of a think-set batch over `entry_count` index entries scanned exactly its own
-// cell-major positions: kept plus skipped equals its range length.
-fn expectRangesScanTheirEntries(sys: *const SimulationScopeSystem, batch: BatchStats, entry_count: usize) !void {
-    try std.testing.expectEqual(batch.range_count, sys.range_tallies.items.len);
-    for (sys.range_tallies.items, 0..) |slot, range_index| {
-        const start = range_index * batch.items_per_range;
-        const range_len = @min(batch.items_per_range, entry_count - start);
-        try std.testing.expectEqual(range_len, slot.tally.count + slot.tally.stagger_skips);
     }
 }
 
@@ -1965,15 +1949,12 @@ test "a one-chunk crowd's think set splits across ranges and workers, equal to t
             try bruteForceThinkSet(&data, view, halo, stagger_step, apply_stagger, &expected);
             const serial = try compactCognitionInline(&serial_sys, &view, stagger_step, apply_stagger);
             try std.testing.expectEqualSlices(u32, expected.items, serial.cognition);
-            try std.testing.expectEqual(halo.len - expected.items.len, serial_sys.stagger_skips);
             for (1..5) |workers| {
                 for ([_]usize{ 16, 48, 256 }) |items_per_range| {
                     const threaded = try threaded_sys.compactCognition(&view, stagger_step, apply_stagger, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = workers, .adaptive = false });
                     try std.testing.expect(!threaded.batch.ran_inline);
                     try std.testing.expectEqual(@divCeil(halo.len, items_per_range), threaded.batch.range_count);
-                    try expectRangesScanTheirEntries(&threaded_sys, threaded.batch, halo.len);
                     try std.testing.expectEqualSlices(u32, expected.items, threaded.cognition);
-                    try std.testing.expectEqual(serial_sys.stagger_skips, threaded_sys.stagger_skips);
                 }
             }
         }

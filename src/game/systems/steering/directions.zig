@@ -107,12 +107,14 @@ pub fn prepareDirections(
         });
         selected_count += tally.count;
         request_count += tally.requests;
-        stats.path_available_count += tally.available;
-        stats.path_pending_count += tally.pending;
-        stats.path_unavailable_count += tally.unavailable;
-        stats.replan_cooldown_count += tally.cooldowns;
-        stats.unavailable_backoff_count += tally.backoffs;
-        stats.stuck_replan_count += tally.stuck_replans;
+        if (comptime runtime_perf_log.enabled) {
+            stats.perf.path_available_count += tally.perf.available;
+            stats.perf.path_pending_count += tally.perf.pending;
+            stats.perf.path_unavailable_count += tally.perf.unavailable;
+            stats.perf.replan_cooldown_count += tally.perf.cooldowns;
+            stats.perf.unavailable_backoff_count += tally.perf.backoffs;
+            stats.perf.stuck_replan_count += tally.perf.stuck_replans;
+        }
     }
     stats.selected_intent_count = selected_count;
     stats.path_request_count = request_count;
@@ -130,13 +132,18 @@ pub const SelectedWindow = struct {
 pub const DirectionsTally = struct {
     count: usize = 0,
     requests: usize = 0,
+    perf: DirectionsPerf = .{},
+};
+
+// A range's `SteeringStats.Perf` path-status counts, kept only with `runtime_perf_log.enabled`.
+const DirectionsPerf = if (runtime_perf_log.enabled) struct {
     available: usize = 0,
     pending: usize = 0,
     unavailable: usize = 0,
     cooldowns: usize = 0,
     backoffs: usize = 0,
     stuck_replans: usize = 0,
-};
+} else struct {};
 
 comptime {
     std.debug.assert(@sizeOf(PaddedSlot(DirectionsTally)) % thread_shared_record_alignment == 0);
@@ -224,8 +231,8 @@ fn directionsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 
         var state = runtime.get(row);
         var emit_request = false;
-        const path_dir = directionFromPathStatus(job.pathfinding, intent, start, start_level, agent, &state, &tally, &emit_request);
-        updateProgress(&state, path_dir.progress_distance, agent, path_dir.status_allows_replan, &tally, &emit_request);
+        const path_dir = directionFromPathStatus(job.pathfinding, intent, start, start_level, agent, &state, &tally.perf, &emit_request);
+        updateProgress(&state, path_dir.progress_distance, agent, path_dir.status_allows_replan, &tally.perf, &emit_request);
         runtime.set(row, state);
 
         job.selected[slot] = .{ .entity = intent.entity, .intent = intent };
@@ -375,7 +382,7 @@ fn directionFromPathStatus(
     start_level: u16,
     steering_agent: SteeringAgentView,
     runtime: *RuntimeRow,
-    tally: *DirectionsTally,
+    perf: *DirectionsPerf,
     emit_request: *bool,
 ) PathDirection {
     // Missing paths request work, pending paths hold direction, unavailable
@@ -386,7 +393,7 @@ fn directionFromPathStatus(
     const view = pathfinding.statusForWorld(start_level, start, intent.goal_level, intent.goal, intent.agent_class, &runtime.waypoint_hint);
     switch (view.status) {
         .available => {
-            tally.available += 1;
+            if (comptime runtime_perf_log.enabled) perf.available += 1;
             return followWaypoint(view.next_waypoint, start, intent.goal, steering_agent.waypoint_tolerance, goal_distance);
         },
         .partial => {
@@ -394,8 +401,8 @@ fn directionFromPathStatus(
                 if (runtime.replan_cooldown == 0 and runtime.unavailable_backoff == 0) {
                     emit_request.* = true;
                     runtime.replan_cooldown = steering_agent.replan_cooldown_steps;
-                } else {
-                    tally.cooldowns += 1;
+                } else if (comptime runtime_perf_log.enabled) {
+                    perf.cooldowns += 1;
                 }
                 // At the end: the path goes no further, so wait for the next hop without a
                 // stuck replan.
@@ -408,21 +415,21 @@ fn directionFromPathStatus(
             if (runtime.replan_cooldown == 0 and runtime.unavailable_backoff == 0) {
                 emit_request.* = true;
                 runtime.replan_cooldown = steering_agent.replan_cooldown_steps;
-            } else {
-                tally.cooldowns += 1;
+            } else if (comptime runtime_perf_log.enabled) {
+                perf.cooldowns += 1;
             }
             return .{ .status_allows_replan = true, .progress_distance = goal_distance };
         },
         .pending => {
-            tally.pending += 1;
+            if (comptime runtime_perf_log.enabled) perf.pending += 1;
             return .{ .progress_distance = goal_distance };
         },
         .unavailable => {
-            tally.unavailable += 1;
+            if (comptime runtime_perf_log.enabled) perf.unavailable += 1;
             if (runtime.unavailable_backoff == 0) {
                 runtime.unavailable_backoff = steering_agent.unavailable_backoff_steps;
-            } else {
-                tally.backoffs += 1;
+            } else if (comptime runtime_perf_log.enabled) {
+                perf.backoffs += 1;
             }
             return .{ .progress_distance = goal_distance };
         },
@@ -447,7 +454,7 @@ fn updateProgress(
     progress_distance: f32,
     steering_agent: SteeringAgentView,
     status_allows_replan: bool,
-    tally: *DirectionsTally,
+    perf: *DirectionsPerf,
     emit_request: *bool,
 ) void {
     // Stuck detection watches distance to the active steering target (next
@@ -471,7 +478,7 @@ fn updateProgress(
         runtime.replan_cooldown = steering_agent.replan_cooldown_steps;
         if (!emit_request.*) {
             emit_request.* = true;
-            tally.stuck_replans += 1;
+            if (comptime runtime_perf_log.enabled) perf.stuck_replans += 1;
         }
     }
 }
@@ -511,6 +518,12 @@ const addStaticObstacle = @import("test_support.zig").addStaticObstacle;
 const appendNavigationIntent = @import("test_support.zig").appendNavigationIntent;
 const appendNavigationIntents = @import("test_support.zig").appendNavigationIntents;
 const testColliders = @import("test_support.zig").testColliders;
+const PathStatus = @import("../pathfinding/types.zig").PathStatus;
+
+// The level-0 default-class path status from `at` toward `goal`.
+fn expectPathStatus(pathfinding: *const PathfindingSystem, at: math.Vec2, goal: math.Vec2, expected: PathStatus) !void {
+    try std.testing.expectEqual(expected, pathfinding.statusForWorld(0, at, 0, goal, .default, null).status);
+}
 
 test "steering requests missing paths then follows available path results" {
     var data = DataSystem.init(std.testing.allocator);
@@ -544,8 +557,8 @@ test "steering requests missing paths then follows available path results" {
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 0, .direct_direction_y = 1 });
     const available_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-    try std.testing.expectEqual(@as(usize, 1), available_stats.path_available_count);
     try std.testing.expectEqual(@as(usize, 0), available_stats.path_request_count);
+    try expectPathStatus(&pathfinding, .{ .x = 0, .y = 0 }, .{ .x = 96, .y = 0 }, .available);
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
 }
 
@@ -598,7 +611,7 @@ test "steering follows a partial path, requests the next hop inside its end wind
         frame.beginStep();
         try appendNavigationIntent(&frame, intent);
         const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-        try std.testing.expectEqual(@as(usize, 0), stats.path_available_count + stats.path_pending_count + stats.path_unavailable_count);
+        try expectPathStatus(&pathfinding, position, goal, .partial);
         try std.testing.expectEqual(@as(usize, 0), stats.path_request_count);
         try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
     }
@@ -620,8 +633,7 @@ test "steering follows a partial path, requests the next hop inside its end wind
         frame.beginStep();
         try appendNavigationIntent(&frame, intent);
         const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-        try std.testing.expectEqual(@as(usize, 0), stats.path_available_count + stats.path_pending_count + stats.path_unavailable_count);
-        try std.testing.expectEqual(@as(usize, 0), stats.stuck_replan_count);
+        try expectPathStatus(&pathfinding, end, goal, .partial);
         if (stats.path_request_count == 0) continue;
         try std.testing.expectEqual(@as(usize, 1), stats.path_request_count);
         try std.testing.expectEqual(@as(usize, agent_view.replan_cooldown_steps), step - last_request);
@@ -629,17 +641,20 @@ test "steering follows a partial path, requests the next hop inside its end wind
         requests += 1;
     }
     try std.testing.expectEqual(held_steps / agent_view.replan_cooldown_steps, requests);
+    // No stuck replan while held: one would zero the agent's stuck count, which instead
+    // grew every held step after the first.
+    try std.testing.expect(steering.runtime_rows.items(.stuck_steps)[0] >= held_steps - 1);
 
     // The direction itself: a held agent has none and allows no replan; one outside the window
     // follows the path and requests nothing.
     var held = RuntimeRow{ .entity = agent };
-    var tally = DirectionsTally{};
+    var perf = DirectionsPerf{};
     var emit = false;
-    const at_end = directionFromPathStatus(&pathfinding, intent, end, 0, agent_view, &held, &tally, &emit);
+    const at_end = directionFromPathStatus(&pathfinding, intent, end, 0, agent_view, &held, &perf, &emit);
     try std.testing.expect(!at_end.has_direction and !at_end.status_allows_replan and emit);
     var following = RuntimeRow{ .entity = agent };
     emit = false;
-    const at_start = directionFromPathStatus(&pathfinding, intent, start, 0, agent_view, &following, &tally, &emit);
+    const at_start = directionFromPathStatus(&pathfinding, intent, start, 0, agent_view, &following, &perf, &emit);
     try std.testing.expect(at_start.has_direction and at_start.status_allows_replan and !emit);
     try std.testing.expect(at_start.direction.x > 0);
 
@@ -651,7 +666,7 @@ test "steering follows a partial path, requests the next hop inside its end wind
     frame.beginStep();
     try appendNavigationIntent(&frame, intent);
     const next_hop = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-    try std.testing.expectEqual(@as(usize, 0), next_hop.path_available_count + next_hop.path_pending_count + next_hop.path_unavailable_count);
+    try expectPathStatus(&pathfinding, end, goal, .partial);
     try std.testing.expectEqual(@as(usize, 0), next_hop.path_request_count);
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
 }
@@ -808,8 +823,9 @@ test "steering missing path requests respect replan cooldown" {
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
     const second = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 0), second.path_request_count);
-    try std.testing.expectEqual(@as(usize, 1), second.replan_cooldown_count);
     try std.testing.expectEqual(@as(usize, 0), frame.path_requests.mergedItems().len);
+    // Held by the cooldown the first request set (4 steps), ticked once, not re-armed.
+    try std.testing.expectEqual(@as(u16, 3), steering.runtime_rows.items(.replan_cooldown)[0]);
 }
 
 test "steering reads an unreachable goal unavailable from status on the first step and backs off on the next, never requesting" {
@@ -840,16 +856,18 @@ test "steering reads an unreachable goal unavailable from status on the first st
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 144, .y = 0 }, .direct_direction_x = 1 });
     const first = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-    try std.testing.expectEqual(@as(usize, 1), first.path_unavailable_count);
     try std.testing.expectEqual(@as(usize, 0), first.path_request_count);
-    try std.testing.expectEqual(@as(usize, 0), first.unavailable_backoff_count);
+    // Unavailable enters the agent's 12-step backoff.
+    try std.testing.expectEqual(@as(u16, 12), steering.runtime_rows.items(.unavailable_backoff)[0]);
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 144, .y = 0 }, .direct_direction_x = 1 });
     const second = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-    try std.testing.expectEqual(@as(usize, 1), second.path_unavailable_count);
-    try std.testing.expectEqual(@as(usize, 1), second.unavailable_backoff_count);
     try std.testing.expectEqual(@as(usize, 0), second.path_request_count);
+    // Still unavailable and inside the backoff: ticked once, not re-entered.
+    try expectPathStatus(&pathfinding, .{ .x = 0, .y = 0 }, .{ .x = 144, .y = 0 }, .unavailable);
+    try std.testing.expectEqual(@as(u16, 11), steering.runtime_rows.items(.unavailable_backoff)[0]);
+    try std.testing.expectEqual(@as(u16, 0), steering.runtime_rows.items(.replan_cooldown)[0]);
 }
 
 test "steering reads a goal its start cannot reach unavailable from status every step and never requests it" {
@@ -879,8 +897,10 @@ test "steering reads a goal its start cannot reach unavailable from status every
         frame.beginStep();
         try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 128, .y = 0 }, .direct_direction_x = 1 });
         const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-        try std.testing.expectEqual(@as(usize, 1), stats.path_unavailable_count);
         try std.testing.expectEqual(@as(usize, 0), stats.path_request_count);
+        // Read unavailable every step: always in backoff, never in a request's cooldown.
+        try std.testing.expect(steering.runtime_rows.items(.unavailable_backoff)[0] > 0);
+        try std.testing.expectEqual(@as(u16, 0), steering.runtime_rows.items(.replan_cooldown)[0]);
         const solve = try updatePathfindingInline(&pathfinding, &frame.path_requests, 1, .{});
         try std.testing.expectEqual(@as(usize, 0), solve.solved_requests + solve.accepted_requests);
     }

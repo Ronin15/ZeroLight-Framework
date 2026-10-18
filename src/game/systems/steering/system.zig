@@ -103,12 +103,6 @@ pub const SteeringStats = struct {
     selected_intent_count: usize = 0,
     movement_intent_count: usize = 0,
     path_request_count: usize = 0,
-    path_available_count: usize = 0,
-    path_pending_count: usize = 0,
-    path_unavailable_count: usize = 0,
-    replan_cooldown_count: usize = 0,
-    unavailable_backoff_count: usize = 0,
-    stuck_replan_count: usize = 0,
     /// The avoidance pass.
     batch: BatchStats = .{},
     // Wall time (ns) of the prepare stages, inline or dispatched: selection, the agents stage
@@ -119,11 +113,19 @@ pub const SteeringStats = struct {
     grid_ns: u64 = 0,
     perf: Perf = .{},
 
-    /// Kept only with `runtime_perf_log.enabled`: the avoidance pass's agent and obstacle
-    /// samples and candidate checks (`obstacle_candidate_checks` counts static-collider query
-    /// entries read), and the prepare stages' batches. The claim and grid sort batches hold
+    /// Kept only with `runtime_perf_log.enabled`: `directions`' path-status counts (selected
+    /// intents served available, pending, unavailable; held by replan cooldown or unavailable
+    /// backoff; stuck replans), the avoidance pass's agent and obstacle samples and candidate
+    /// checks (`obstacle_candidate_checks` counts static-collider query entries read), and
+    /// the prepare stages' batches. The claim and grid sort batches hold
     /// zero items on the serial path, where selection and the grid run their single pass.
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        path_available_count: usize = 0,
+        path_pending_count: usize = 0,
+        path_unavailable_count: usize = 0,
+        replan_cooldown_count: usize = 0,
+        unavailable_backoff_count: usize = 0,
+        stuck_replan_count: usize = 0,
         agent_neighbor_samples: usize = 0,
         obstacle_samples: usize = 0,
         agent_candidate_checks: usize = 0,
@@ -1260,7 +1262,7 @@ test "steering threaded prepare equals serial across range splits and worker cou
     try runParityScenario(null, .{}, &serial);
     // The scenario covers requests, served paths, duplicate intents, and churn.
     try std.testing.expect(serial.requests.items.len > 0);
-    try std.testing.expect(serial.stats.items[1].path_available_count > 0);
+    try std.testing.expect(serial.available.items[1] > 0);
     for (serial.stats.items) |stats| try std.testing.expect(stats.selected_intent_count < stats.navigation_intent_count);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -1383,14 +1385,17 @@ fn behaviorStats(stats: SteeringStats) SteeringStats {
     return behavior;
 }
 
-// Every step's movement intents, path requests, stats, and runtime rows.
+// Every step's movement intents, path requests, stats, and runtime rows, and per step the
+// intents whose path the step reads available.
 const ParityTrace = struct {
     movements: std.ArrayList(MovementIntent) = .empty,
     requests: std.ArrayList(PathRequest) = .empty,
     stats: std.ArrayList(SteeringStats) = .empty,
     runtime: std.ArrayList(RuntimeRow) = .empty,
+    available: std.ArrayList(usize) = .empty,
 
     fn deinit(self: *ParityTrace) void {
+        self.available.deinit(std.testing.allocator);
         self.runtime.deinit(std.testing.allocator);
         self.stats.deinit(std.testing.allocator);
         self.requests.deinit(std.testing.allocator);
@@ -1496,6 +1501,18 @@ const parity_step_count: usize = 3;
 // `parity_step_count` steering steps over the parity crowd among the parity statics, with agents
 // destroyed and created between steps and each step's path requests served before the
 // next. A fixed range size of one alignment unit asserts every stage threaded.
+// The intents with a movement body whose path from that body's position reads available.
+fn countAvailablePaths(data: *const DataSystem, pathfinding: *const PathfindingSystem, intents: []const NavigationIntent) usize {
+    const movement = data.movementBodySliceConst();
+    var available: usize = 0;
+    for (intents) |intent| {
+        const body = data.movementBodyDenseIndex(intent.entity) orelse continue;
+        const start = math.Vec2{ .x = movement.previous_x[body], .y = movement.previous_y[body] };
+        if (pathfinding.statusForWorld(0, start, intent.goal_level, intent.goal, intent.agent_class, null).status == .available) available += 1;
+    }
+    return available;
+}
+
 fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trace: *ParityTrace) !void {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1538,6 +1555,7 @@ fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trac
             system.invalidateSteeringMovementIndexCache();
         }
         try buildParityIntents(&intents, agents.items, bodiless, bystander, stale, step_index);
+        try trace.available.append(std.testing.allocator, countAvailablePaths(&data, &pathfinding, intents.items));
         frame.beginStep();
         try appendNavigationIntents(&frame, intents.items);
         const stats = if (thread_system) |threads|

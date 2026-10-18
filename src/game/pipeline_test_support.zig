@@ -101,7 +101,7 @@ const scope_render_test_steps = 4;
 const ScopeRenderTraceStep = struct {
     cognition_region: ?ActiveRegion,
     ai_entity_count: usize,
-    stagger_skips: usize,
+    halo_entity_count: usize,
     tier_commands: [scope_render_test_agent_count + 1]?StructuralCommand,
 };
 
@@ -199,7 +199,7 @@ pub fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
         out.* = .{
             .cognition_region = stats.scope.active_region,
             .ai_entity_count = stats.ai.entity_count,
-            .stagger_skips = stats.scope.stats.stagger_skips,
+            .halo_entity_count = pipeline.scope.ai_halo_indices.items.len,
             .tier_commands = @splat(null),
         };
         const commands = frame.structural_commands.mergedItems();
@@ -224,7 +224,8 @@ pub fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
     const expected_cognition = world.cognitionRegionForWorldRect(sim_view, sim_view_overscan_chunks, cognition_halo_chunks).?;
     for (trace.steps) |step| {
         try std.testing.expectEqual(@as(?ActiveRegion, expected_cognition), step.cognition_region);
-        try std.testing.expect(step.stagger_skips > 0);
+        // Stagger gating: some halo agent is off this step's phase and does not think.
+        try std.testing.expect(step.ai_entity_count < step.halo_entity_count);
         const promote = (step.tier_commands[0] orelse return error.TestExpectedTierCommand).set_simulation_tier;
         try std.testing.expectEqual(agents[2], promote.entity);
         try std.testing.expectEqual(SimulationTier.cognition, promote.tier);
