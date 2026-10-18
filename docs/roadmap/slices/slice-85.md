@@ -141,6 +141,21 @@ keeps the apply local.
       movement-intent write), `systems/movement.zig`, `systems/particle.zig`,
       and the `data_system/movement.zig` and `data_system/agents.zig` stores.
       Each finding becomes an item here.
+- [ ] `buildAgentGridDirect` (`steering/agent_grid.zig:38-59`) is a separate
+      no-worker entry from `buildAgentGrid` (`.claude/rules/tests-benchmarks.md`
+      § Test and production code, point 1). If this slice keeps the grid it is
+      deleted; the grid itself goes with the first item. Deleting it makes the
+      one-band fast path (`steering/avoidance.zig:389`) dead, and
+      `src/benchmarks/steering.zig:262` (`largestGridBand`) counts bands from
+      the one-band form; both move to the banded form. Deleting it adds a
+      constant band search per avoidance cell lookup. Pass: that cost checked
+      by `steering` at three sizes, inline and threaded, same mode.
+- [ ] A no-worker serial branch in steering selection
+      (`steering/selection.zig:52`, the `orelse` of `withWorkers` calling
+      `resolveAndClaim` once;
+      `.claude/rules/tests-benchmarks.md` § Test and production code, point
+      1). Pass: removed after a cost check that the stage run inline does no
+      worse (`steering`, same mode).
 - [ ] Tests: steering output on today's fixtures unchanged, or changed only by
       a stated order; serial == threaded; allocation-free warmed step.
 - [ ] Docs: `docs/architecture.md` steering;

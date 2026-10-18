@@ -38,3 +38,9 @@ density.
 Known costs inside the band: the full agent snapshot each cognition step
 (~0.33 ms) and the avoidance batch (~0.40 ms; [Slice 85](slices/slice-85.md)).
 
+- [ ] **Perception tail.** Stage avg ~0.16 ms, max ~2.4 ms (earlier
+      ReleaseSafe dump). A later single demo run showing max 0.549 ms does
+      not close it: demo perf logs are never acceptance
+      (`.claude/rules/tests-benchmarks.md`). Awaits a benchmark: a denser
+      observer case in the `perception` groups before touching the gather;
+      the FOV runs in the query's lanes (Slice 84). (`perception.zig`)

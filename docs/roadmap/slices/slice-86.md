@@ -178,6 +178,33 @@ order stay deterministic for the order-sensitive consumers.
       `max_bands` comment states they already are); `collision-response-stage`
       shows apply items per range tracking intents at 1,024, 4,096, and 16,384;
       serial == threaded across range sizes.
+- [ ] Collision's banded fill and sort fails the cost model when it runs
+      inline, and production runs it inline whenever the tuner keeps collision
+      inline. Failure: the banded path (`sortJob` -> `EntryWriter.finishBand`)
+      concatenates the first, second, and spilled runs per band and runs one
+      `pdq`, O(E log(E/64)) on an already-settled order, where `buildDirect`
+      (`collision.zig:726-731`) sorts the three runs separately and merges them
+      (`mergeIntoSorted`, `:731-732`), O(E) on a warm order
+      (`.claude/rules/engine-design.md` § Cost model). Measured (scratch
+      comparison count, not a bench group): 14 / 17 / 21 comparisons per item
+      at n = 4K / 32K / 256K, against a flat 2 for the merge. Pass: each band
+      sorts each run and merges them (a merge buffer with its reserve and a
+      `FailingAllocator` proof), measured by the collision bench groups at warm
+      shapes, serial and threaded.
+- [ ] After the item above, collision has one path
+      (`.claude/rules/tests-benchmarks.md` § Test and production code, point
+      1). Delete `updateDirect` (`collision.zig:628`), `buildDirect` (`:704`),
+      `buildBroadphaseCandidatesDirect` (`:1045`), the no-worker branch in
+      `update` (`:587-588`), and the test helper `buildForTest` (`:1697`, which
+      calls `buildDirect`; its callers at `:2031`, `:2388`, `:3101` move to the
+      one path). Pass: no `*Direct` collision entry remains; the collision
+      benches and tests run the production path.
+- [ ] `CollisionResponseSystem.run` has a separate no-worker serial path
+      (`collision_response.zig:270`, the `else` of `withWorkers`;
+      `.claude/rules/tests-benchmarks.md` § Test and production code, point
+      1). Pass: it is removed after a cost check that the stage run inline
+      does no worse (`collision-response-stage`, serial and inline, same
+      mode).
 - [ ] Benches at the worst-case shapes (thin, tall, deep, dense), with the
       shape asserts landing with each fix (`.claude/rules/tests-benchmarks.md`).
 - [ ] Tests: identical contacts and order across worker counts; cross-level,
