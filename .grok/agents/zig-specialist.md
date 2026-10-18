@@ -46,7 +46,10 @@ than working from a compaction summary.
 5. Validate per `build-validation.md`. Write `zig build test` output to a
    file and judge it by the exit code; a "failed command:" line echoing warn
    output is not a failure; on a real failure keep the failing test's name and
-   message.
+   message. When the brief says to type-check tests without running the suite,
+   run `zig build test-compile` with no `-Dtest-filter`. A filter compiles only
+   the tests it matches, and a filter that matches nothing does not type-check
+   the rest.
 6. When the brief says the change cannot move a hot path, skip `bench_ab` and
    record that skip (`tests-benchmarks.md` § Benchmarks). Otherwise, after
    validation, run the landing's one before/after with `tools/bench_ab.py` on
