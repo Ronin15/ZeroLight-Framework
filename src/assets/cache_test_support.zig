@@ -24,7 +24,6 @@ pub const FakeBackend = struct {
 
     pub fn backend() TextureBackend {
         return .{
-            .upload_image = uploadImage,
             .upload_images_batch = uploadImagesBatch,
             .destroy_texture = destroyTexture,
         };

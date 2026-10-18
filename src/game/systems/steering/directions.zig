@@ -7,6 +7,7 @@
 //! `prepareDirections`.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
@@ -88,7 +89,8 @@ pub fn prepareDirections(
     setSlotCount(DirectionsTally, &self.directions_tallies, selection.range_count);
     job.items_per_range = selection.items_per_range;
     job.tallies = self.directions_tallies.items;
-    stats.directions_batch = directions.run(selection, intent_count, steering_range_alignment_items, &job, directionsJob);
+    const directions_batch = directions.run(selection, intent_count, steering_range_alignment_items, &job, directionsJob);
+    if (comptime runtime_perf_log.enabled) stats.perf.directions_batch = directions_batch;
     const range_count = selection.range_count;
 
     self.selected_windows.clearRetainingCapacity();

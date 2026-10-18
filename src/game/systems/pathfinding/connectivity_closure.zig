@@ -35,7 +35,8 @@ const no_link_endpoint = @import("../../world/terrain.zig").no_link_endpoint;
 const ChunkGeometry = @import("../../world/terrain.zig").ChunkGeometry;
 const types = @import("types.zig");
 const NavUpdateStats = types.NavUpdateStats;
-const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
+const StageTimer = runtime_perf_log.StageTimer;
 const listBytesBound = @import("nav_graph.zig").listBytesBound;
 const rowsBytesBound = @import("nav_graph.zig").rowsBytesBound;
 const simd = @import("../../../core/simd.zig");
@@ -424,21 +425,25 @@ pub fn boundCap(terms: usize) error{OutOfMemory}!u32 {
     return @intCast(cap);
 }
 
-/// Counters of one batch's closure stages.
+/// Counters of one batch's closure stages; `perf` is kept only with `runtime_perf_log.enabled`.
 pub const ClosureCounters = struct {
-    touched: usize = 0,
     links: usize = 0,
-    terms_new: usize = 0,
-    terms_left: usize = 0,
-    a_rows: usize = 0,
-    rounds: usize = 0,
-    words_written: usize = 0,
-    shrinks: usize = 0,
-    // Tail words the relocated pieces' blocks took.
-    tail_words: usize = 0,
-    // Blocks allocated (a world build's exact blocks) and freed (retired or relocated).
-    block_allocs: usize = 0,
-    block_frees: usize = 0,
+    perf: Perf = .{},
+
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        touched: usize = 0,
+        terms_new: usize = 0,
+        terms_left: usize = 0,
+        a_rows: usize = 0,
+        rounds: usize = 0,
+        words_written: usize = 0,
+        shrinks: usize = 0,
+        // Tail words the relocated pieces' blocks took.
+        tail_words: usize = 0,
+        // Blocks allocated (a world build's exact blocks) and freed (retired or relocated).
+        block_allocs: usize = 0,
+        block_frees: usize = 0,
+    } else struct {};
 };
 
 /// The per-world one-way closure: the registry of world links, the terminals (roots holding
@@ -502,11 +507,17 @@ pub const Closure = struct {
     round_items: std.ArrayList(RowsItem) = .empty,
     // Usize: a batch's round items sum spans over every SCC and may pass u32.
     round_starts: std.ArrayList(usize) = .empty,
-    // Stage shapes of the most recent batch (stats and benches).
-    last_resolve_batch: BatchStats = .{},
-    last_mask_batch: BatchStats = .{},
-    last_plan_batch: BatchStats = .{},
+    // Stage shape of the most recent batch's rows, its rounds folded into one.
     last_rows_batch: BatchStats = .{},
+    // The most recent batch's resolve, mask, and plan stage shapes, kept only with
+    // `runtime_perf_log.enabled`.
+    perf: Perf = .{},
+
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        last_resolve_batch: BatchStats = .{},
+        last_mask_batch: BatchStats = .{},
+        last_plan_batch: BatchStats = .{},
+    } else struct {};
 
     pub fn deinit(self: *Closure, allocator: std.mem.Allocator) void {
         // A resident's block lies in the tail; every other live block is its own allocation.
@@ -734,7 +745,7 @@ pub fn buildClosure(self: *Connectivity, allocator: std.mem.Allocator, levels: B
     resolveLinks(self, levels, world, threads.resolve, stats);
     const merge_timer = StageTimer.begin();
     mergeResolved(self, &counters);
-    stats.main.closure_ns += merge_timer.lap();
+    stats.addMain(.closure_ns, merge_timer.lap());
     // Every piece is new and takes its exact block, at the build seam.
     const pieces = closure.pieces.slice();
     const blocks = pieces.items(.block);
@@ -744,7 +755,7 @@ pub fn buildClosure(self: *Connectivity, allocator: std.mem.Allocator, levels: B
         block.* = try allocator.alignedAlloc(u32, .@"64", blockWords(k_cap));
         allocated += 1;
     }
-    counters.block_allocs += allocated;
+    if (comptime runtime_perf_log.enabled) counters.perf.block_allocs += allocated;
     finishClosure(self, allocator, threads, true, &counters, stats);
     return counters;
 }
@@ -792,7 +803,7 @@ pub fn prepareClosure(
     // touches any block.
     try landResidents(self, allocator, threads.land, stats);
     var section = StageTimer.begin();
-    defer stats.main.reserve_ns += section.lap();
+    defer stats.addMain(.reserve_ns, section.lap());
     const closure = &self.closure;
     advanceStamp(self);
     const scan = closure.oneway.len != 0;
@@ -850,10 +861,10 @@ pub fn prepareClosure(
             .hcomps = closure.cand_hcomps.items,
             .tallies = closure.cand_tallies.items,
         };
-        stats.main.reserve_ns += section.lap();
+        stats.addMain(.reserve_ns, section.lap());
         const batch = runStage(threads.candidates, keys.len, 1, &job, &job.range_count, candidateJob);
         section = StageTimer.begin();
-        accumulateBatch(&stats.conn_closure_candidates_batch, batch);
+        if (comptime runtime_perf_log.enabled) accumulateBatch(&stats.perf.conn_closure_candidates_batch, batch);
         stats.addStageTime(batch);
         // Distinct candidates move to the front in first-sight order; a write never
         // passes the entry being read.
@@ -996,7 +1007,7 @@ pub fn landResidents(self: *Connectivity, allocator: std.mem.Allocator, threads:
     const residents = closure.residents.items;
     if (residents.len == 0) return;
     var section = StageTimer.begin();
-    defer stats.main.reserve_ns += section.lap();
+    defer stats.addMain(.reserve_ns, section.lap());
     const blocks = closure.hcomp.block;
     var allocated: usize = 0;
     errdefer for (residents[0..allocated]) |*resident| {
@@ -1010,17 +1021,19 @@ pub fn landResidents(self: *Connectivity, allocator: std.mem.Allocator, threads:
     const lines = closure.tail.items.len / span_words;
     std.debug.assert(closure.tail.items.len % span_words == 0 and residents[0].src == 0);
     var job = LandJob{ .blocks = residents, .src = closure.tail.items };
-    stats.main.reserve_ns += section.lap();
+    stats.addMain(.reserve_ns, section.lap());
     const batch = runStage(threads, lines, 1, &job, &job.range_count, landJob);
     section = StageTimer.begin();
-    accumulateBatch(&stats.conn_closure_land_batch, batch);
+    if (comptime runtime_perf_log.enabled) accumulateBatch(&stats.perf.conn_closure_land_batch, batch);
     stats.addStageTime(batch);
     for (residents) |*resident| {
         blocks[resident.hcomp] = resident.dst;
         resident.dst = &.{};
     }
-    stats.closure_block_allocs += residents.len;
-    stats.closure_landed_words += closure.tail.items.len;
+    if (comptime runtime_perf_log.enabled) {
+        stats.perf.closure_block_allocs += residents.len;
+        stats.perf.closure_landed_words += closure.tail.items.len;
+    }
     closure.residents.clearRetainingCapacity();
     closure.tail.items.len = 0;
 }
@@ -1040,18 +1053,16 @@ pub fn updateClosure(self: *Connectivity, allocator: std.mem.Allocator, levels: 
     var counters = ClosureCounters{};
     const touch_timer = StageTimer.begin();
     touchClosure(self, levels, key_count);
-    stats.main.closure_ns += touch_timer.lap();
+    stats.addMain(.closure_ns, touch_timer.lap());
     if (self.closure.resolve_items.items.len == 0) {
-        self.closure.last_resolve_batch = .{};
-        self.closure.last_mask_batch = .{};
-        self.closure.last_plan_batch = .{};
+        if (comptime runtime_perf_log.enabled) self.closure.perf = .{};
         self.closure.last_rows_batch = .{};
         return counters;
     }
     resolveLinks(self, levels, world, threads.resolve, stats);
     const merge_timer = StageTimer.begin();
     mergeResolved(self, &counters);
-    stats.main.closure_ns += merge_timer.lap();
+    stats.addMain(.closure_ns, merge_timer.lap());
     finishClosure(self, allocator, threads, false, &counters, stats);
     return counters;
 }
@@ -1153,8 +1164,9 @@ fn resolveLinks(self: *Connectivity, levels: BatchLevels, world: ?*const WorldSy
         .outs = closure.resolve_out.items,
         .comp_root = self.comp_root,
     };
-    closure.last_resolve_batch = runStage(threads, count, 1, &job, &job.range_count, resolveJob);
-    stats.addStageTime(closure.last_resolve_batch);
+    const batch = runStage(threads, count, 1, &job, &job.range_count, resolveJob);
+    if (comptime runtime_perf_log.enabled) closure.perf.last_resolve_batch = batch;
+    stats.addStageTime(batch);
 }
 
 // The terminal of live root `root`, a new one popped when it holds none.
@@ -1175,7 +1187,7 @@ fn termOfRoot(self: *Connectivity, root: u32, counters: *ClosureCounters) u32 {
     closure.term.index[term] = no_index;
     closure.term.slot[term] = no_slot;
     self.root_term[root] = term;
-    counters.terms_new += 1;
+    if (comptime runtime_perf_log.enabled) counters.perf.terms_new += 1;
     return term;
 }
 
@@ -1262,7 +1274,7 @@ fn mergeResolved(self: *Connectivity, counters: *ClosureCounters) void {
     const slots = SlotColumns.of(closure.slots.slice());
     var slot_count: u32 = 0;
     var live_edges: usize = 0;
-    counters.touched = closure.touched.len;
+    if (comptime runtime_perf_log.enabled) counters.perf.touched = closure.touched.len;
     counters.links = items.len;
 
     // Adoption, in link order: a root holding no terminal at an end of a link live before
@@ -1386,7 +1398,7 @@ fn mergeResolved(self: *Connectivity, counters: *ClosureCounters) void {
         const holder = pieces.inherit[heir];
         if (holder == no_slot or heir_count > touched.heir_count[holder]) pieces.inherit[heir] = @intCast(touch);
     }
-    counters.terms_left = closure.leaving.items.len;
+    if (comptime runtime_perf_log.enabled) counters.perf.terms_left = closure.leaving.items.len;
     for (0..piece_count) |piece| {
         const touch = pieces.inherit[piece];
         if (touch == no_slot) continue;
@@ -1451,7 +1463,7 @@ fn mergeResolved(self: *Connectivity, counters: *ClosureCounters) void {
         pieces.relocated[piece] = true;
         if (pieces.compact[piece]) {
             pieces.k_cap[piece] = compactCap(pieces.k_high[piece]);
-            counters.shrinks += 1;
+            if (comptime runtime_perf_log.enabled) counters.perf.shrinks += 1;
         } else {
             // At most 2^31: the prepare bounded the largest block (`boundCap`).
             pieces.k_cap[piece] = @intCast(std.math.ceilPowerOfTwoAssert(usize, @max(1, pieces.k_high[piece])));
@@ -1494,8 +1506,9 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
         .s_count = touched.s_count,
         .a_flag = slots.a_flag,
     };
-    closure.last_mask_batch = runStage(threads.mask, closure.mask_items.items.len, 1, &mask, &mask.range_count, maskJob);
-    stats.addStageTime(closure.last_mask_batch);
+    const mask_batch = runStage(threads.mask, closure.mask_items.items.len, 1, &mask, &mask.range_count, maskJob);
+    if (comptime runtime_perf_log.enabled) closure.perf.last_mask_batch = mask_batch;
+    stats.addStageTime(mask_batch);
     var section = StageTimer.begin();
 
     // A lists per piece, in slot order.
@@ -1520,7 +1533,7 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
         apos.slot[position] = @intCast(slot);
         slots.a_pos[slot] = position;
     }
-    counters.a_rows = a_total;
+    if (comptime runtime_perf_log.enabled) counters.perf.a_rows = a_total;
 
     // Plan.
     var plan = SccPlanJob{
@@ -1530,9 +1543,10 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
         .targets = closure.targets.items,
         .apos = apos,
     };
-    stats.main.closure_ns += section.lap();
-    closure.last_plan_batch = runStage(threads.plan, closure.plan_items.items.len, 1, &plan, &plan.range_count, sccPlanJob);
-    stats.addStageTime(closure.last_plan_batch);
+    stats.addMain(.closure_ns, section.lap());
+    const plan_batch = runStage(threads.plan, closure.plan_items.items.len, 1, &plan, &plan.range_count, sccPlanJob);
+    if (comptime runtime_perf_log.enabled) closure.perf.last_plan_batch = plan_batch;
+    stats.addStageTime(plan_batch);
     section = StageTimer.begin();
 
     // Blocks, then the round-0 copy and zero spans, then the round lists.
@@ -1571,10 +1585,10 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
     if (closure.copy_items.items.len + round_total == 0) {
         closure.last_rows_batch = .{};
         commitClosure(self, allocator, slots, pieces, touched, preset, counters);
-        stats.main.closure_ns += section.lap();
+        stats.addMain(.closure_ns, section.lap());
         return;
     }
-    stats.main.closure_ns += section.lap();
+    stats.addMain(.closure_ns, section.lap());
     var dispatch = RoundDispatch.begin(threads.rows, closure.copy_items.items.len + round_total);
     if (closure.copy_items.items.len != 0) {
         var copy = CopyJob{ .items = closure.copy_items.items };
@@ -1593,15 +1607,17 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
         dispatch.run(round_slice.len, &rows, &rows.range_count, rowsJob);
     }
     closure.last_rows_batch = dispatch.finish(closure.copy_items.items.len + round_total);
-    stats.off_main_stage_ns += dispatch.off_main_ns;
-    stats.inline_stage_ns += dispatch.inline_ns;
     section = StageTimer.begin();
-    counters.rounds = rounds + @intFromBool(closure.copy_items.items.len != 0);
-    for (closure.copy_items.items) |item| counters.words_written += item.dst.len;
-    for (closure.plan_items.items) |piece| counters.words_written += @as(usize, pieces.a_count[piece]) * rowWords(pieces.k_cap[piece]);
+    if (comptime runtime_perf_log.enabled) {
+        stats.perf.off_main_stage_ns += dispatch.off_main_ns;
+        stats.perf.inline_stage_ns += dispatch.inline_ns;
+        counters.perf.rounds = rounds + @intFromBool(closure.copy_items.items.len != 0);
+        for (closure.copy_items.items) |item| counters.perf.words_written += item.dst.len;
+        for (closure.plan_items.items) |piece| counters.perf.words_written += @as(usize, pieces.a_count[piece]) * rowWords(pieces.k_cap[piece]);
+    }
 
     commitClosure(self, allocator, slots, pieces, touched, preset, counters);
-    stats.main.closure_ns += section.lap();
+    stats.addMain(.closure_ns, section.lap());
 }
 
 // Block assignment and round-0 spans, in piece order: a relocated piece takes its preset
@@ -1624,7 +1640,7 @@ fn assignBlocks(self: *Connectivity, slots: SlotColumns, pieces: PieceColumns, t
             closure.tail.items.len = offset + words;
             // Blocks span whole 16-word lines, so each starts 64-byte aligned in the tail.
             pieces.block[piece] = @alignCast(closure.tail.items[offset..][0..words]);
-            counters.tail_words += words;
+            if (comptime runtime_perf_log.enabled) counters.perf.tail_words += words;
         }
         closure.live_words += words;
         const block = pieces.block[piece];
@@ -1718,7 +1734,7 @@ fn commitClosure(self: *Connectivity, allocator: std.mem.Allocator, slots: SlotC
         if (kept_by != no_piece) continue;
         closure.live_words -= blockWords(hcomp.k_cap[id]);
         allocator.free(hcomp.block[id]);
-        counters.block_frees += 1;
+        if (comptime runtime_perf_log.enabled) counters.perf.block_frees += 1;
         const stamp = hcomp.stamp[id];
         closure.hcomps.set(id, emptyHComp());
         hcomp.stamp[id] = stamp;
@@ -1737,7 +1753,7 @@ fn commitClosure(self: *Connectivity, allocator: std.mem.Allocator, slots: SlotC
                 @memcpy(pieces.block[piece][map_start..][0..k_high], indexMap(hcomp, id)[0..k_high]);
             }
             allocator.free(hcomp.block[id]);
-            counters.block_frees += 1;
+            if (comptime runtime_perf_log.enabled) counters.perf.block_frees += 1;
         }
         if (pieces.relocated[piece] and !preset) {
             std.debug.assert(pieces.block[piece].ptr == closure.tail.items[tail_offset..].ptr);
@@ -2440,7 +2456,6 @@ const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const TileId = @import("../../world/system.zig").TileId;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
-const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const no_colliders = &test_support.no_colliders;
 const reach = @import("connectivity.zig").reach;
 const StagingSizes = @import("connectivity.zig").StagingSizes;
@@ -2519,6 +2534,7 @@ test "a world build with one-way links frees its closure staging when it ends" {
 }
 
 test "a one-way world's single dig stays allocation-free after its closure staging is released" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -2530,7 +2546,7 @@ test "a one-way world's single dig stays allocation-free after its closure stagi
     // The dig and its refill, each one chunk, set the closure floor.
     try setRoom(&fixture, &system, chunks, 0, 5, fixture.tree);
     const dug = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expect(dug.closure_links != 0);
+    try std.testing.expect(dug.perf.closure_links != 0);
     try setRoom(&fixture, &system, chunks, 0, 5, fixture.grass);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     // A dense change through the chain grows the closure staging; two quiet windows free it.
@@ -2600,17 +2616,17 @@ fn latticeWall(chunks: u16, index: usize) [2]u16 {
 // words.
 fn expectWithinBounds(closure: *const Closure, stats: NavUpdateStats) !void {
     const t = std.testing;
-    try t.expect(stats.closure_tail_used <= stats.closure_tail_bound);
+    try t.expect(stats.perf.closure_tail_used <= stats.perf.closure_tail_bound);
     try t.expectEqual(@as(usize, 0), closure.residents.items.len);
     try t.expectEqual(@as(usize, 0), closure.tail.items.len);
-    if (stats.closure_links == 0 or stats.levels_built != 0) return;
+    if (stats.perf.closure_links == 0 or stats.levels_built != 0) return;
     const limits = closure.limits;
-    try t.expect(stats.closure_terms_new <= limits.n_gross);
+    try t.expect(stats.perf.closure_terms_new <= limits.n_gross);
     try t.expect(closure.slots.len <= limits.k_c + limits.n_net);
     try t.expect(closure.slots.len <= limits.k_b and closure.pieces.len <= limits.pieces);
     try t.expect(closure.resolve_items.items.len <= limits.e_t and closure.loose.items.len <= limits.loose);
     try t.expect(closure.copy_items.items.len <= limits.copy_items and closure.round_items.items.len <= limits.round_items);
-    try t.expect(stats.closure_tail_used <= limits.tail_words);
+    try t.expect(stats.perf.closure_tail_used <= limits.tail_words);
     const pieces = closure.pieces.slice();
     for (pieces.items(.relocated), pieces.items(.k_cap)) |relocated, k_cap| {
         if (relocated) try t.expect(k_cap <= limits.q_max);
@@ -2625,6 +2641,7 @@ fn applyWithinBounds(fixture: *TestWorld, system: *PathfindingSystem) !NavUpdate
 }
 
 test "the closure equals a full recompute after one-way adds, endpoint toggles, B-merges and splits, a component falling apart, and level appends and replaces" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 6;
     var fixture = try latticeWorld(chunks, 2);
     defer fixture.deinit();
@@ -2680,6 +2697,7 @@ test "the closure equals a full recompute after one-way adds, endpoint toggles, 
 }
 
 test "two hundred seeded random steps of one-way links, endpoint toggles, and wall digs and fills match a full recompute after each" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var prng = std.Random.DefaultPrng.init(0x1b1b);
     const random = prng.random();
     const chunks: u16 = 4;
@@ -2746,6 +2764,7 @@ fn roomTerm(system: *const PathfindingSystem, fixture: *const TestWorld, chunks:
 }
 
 test "reopening a chain's head recomputes only the head's row; every other row stays bitwise" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -2760,16 +2779,17 @@ test "reopening a chain's head recomputes only the head's row; every other row s
     try setRoom(&fixture, &system, chunks, 0, 1, fixture.tree);
     const closed = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     // The head left: its only out-edge's source; no other row reaches it.
-    try std.testing.expectEqual(@as(usize, 0), closed.closure_a_rows);
-    try std.testing.expectEqual(@as(usize, 1), closed.closure_terms_left);
+    try std.testing.expectEqual(@as(usize, 0), closed.perf.closure_a_rows);
+    try std.testing.expectEqual(@as(usize, 1), closed.perf.closure_terms_left);
     try setRoom(&fixture, &system, chunks, 0, 1, fixture.grass);
     const opened = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), opened.closure_a_rows);
+    try std.testing.expectEqual(@as(usize, 1), opened.perf.closure_a_rows);
     for (2..8) |index| try std.testing.expectEqualSlices(u32, &before[index], termRow(closure, roomTerm(&system, &fixture, chunks, 0, index)));
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "a batch where one terminal leaves and another joins a full block reuses the freed index: the block keeps its capacity, words, and allocation" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -2788,18 +2808,19 @@ test "a batch where one terminal leaves and another joins a full block reuses th
     try setRoom(&fixture, &system, chunks, 0, 7, fixture.tree);
     try addOneWay(&fixture, 0, latticeRoom(chunks, 6), 0, latticeRoom(chunks, 20));
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expect(stats.closure_terms_left != 0);
-    try std.testing.expectEqual(stats.closure_terms_left, stats.closure_terms_new);
+    try std.testing.expect(stats.perf.closure_terms_left != 0);
+    try std.testing.expectEqual(stats.perf.closure_terms_left, stats.perf.closure_terms_new);
     try std.testing.expectEqual(id, closure.term.hcomp[head]);
     try std.testing.expectEqual(@as(u32, 8), closure.hcomp.k_cap[id]);
     try std.testing.expectEqual(@as(u32, 8), closure.hcomp.k_high[id]);
     try std.testing.expectEqual(live_words, closure.live_words);
     try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
-    try std.testing.expectEqual(@as(usize, 0), stats.closure_block_allocs + stats.closure_block_frees);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.closure_block_allocs + stats.perf.closure_block_frees);
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "a dig touching no one-way system runs no closure item and writes no block word; a world without one-way links skips the candidate scan" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -2815,13 +2836,13 @@ test "a dig touching no one-way system runs no closure item and writes no block 
     const wall = latticeWall(chunks, 60);
     try fixture.setCell(&system, 0, wall[0], wall[1], fixture.grass);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expect(stats.conn_closure_candidates_batch.item_count != 0);
-    try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_resolve_batch.item_count);
-    try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_mask_batch.item_count);
-    try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_plan_batch.item_count);
+    try std.testing.expect(stats.perf.conn_closure_candidates_batch.item_count != 0);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.conn_closure_resolve_batch.item_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.conn_closure_mask_batch.item_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.conn_closure_plan_batch.item_count);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_rows_batch.item_count);
-    try std.testing.expectEqual(@as(usize, 0), stats.closure_words_written);
-    try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_land_batch.item_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.closure_words_written);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.conn_closure_land_batch.item_count);
     try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
     try std.testing.expectEqualSlices(u32, words, closure.hcomp.block[id]);
     try fixture.expectMatchesRebuild(&system);
@@ -2832,7 +2853,7 @@ test "a dig touching no one-way system runs no closure item and writes no block 
     defer plain_system.deinit();
     try plain.setCell(&plain_system, 0, wall[0], wall[1], plain.grass);
     const plain_stats = try plain_system.applyBufferedNavUpdates(no_colliders, &plain.world, null);
-    try std.testing.expectEqual(@as(usize, 0), plain_stats.conn_closure_candidates_batch.item_count);
+    try std.testing.expectEqual(@as(usize, 0), plain_stats.perf.conn_closure_candidates_batch.item_count);
     try std.testing.expect(!plain_system.graph.connectivity.closure.active);
 }
 
@@ -2877,12 +2898,12 @@ const ClosureStagesOnWorkers = struct {
     land: bool = false,
 
     fn add(self: *ClosureStagesOnWorkers, stats: NavUpdateStats) void {
-        self.candidates = self.candidates or onWorkers(stats.conn_closure_candidates_batch);
-        self.resolve = self.resolve or onWorkers(stats.conn_closure_resolve_batch);
-        self.mask = self.mask or onWorkers(stats.conn_closure_mask_batch);
-        self.plan = self.plan or onWorkers(stats.conn_closure_plan_batch);
+        self.candidates = self.candidates or onWorkers(stats.perf.conn_closure_candidates_batch);
+        self.resolve = self.resolve or onWorkers(stats.perf.conn_closure_resolve_batch);
+        self.mask = self.mask or onWorkers(stats.perf.conn_closure_mask_batch);
+        self.plan = self.plan or onWorkers(stats.perf.conn_closure_plan_batch);
         self.rows = self.rows or onWorkers(stats.conn_closure_rows_batch);
-        self.land = self.land or onWorkers(stats.conn_closure_land_batch);
+        self.land = self.land or onWorkers(stats.perf.conn_closure_land_batch);
     }
 
     fn onWorkers(batch: BatchStats) bool {
@@ -2891,6 +2912,7 @@ const ClosureStagesOnWorkers = struct {
 };
 
 test "threaded closure stages equal the inline ones word for word across worker counts and range sizes, and each runs on workers" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 8;
     for ([_]usize{ 1, 2, 4 }) |workers| {
@@ -2936,13 +2958,13 @@ test "threaded closure stages equal the inline ones word for word across worker 
                 try expectWithinBounds(&inline_system.graph.connectivity.closure, serial);
                 try expectWithinBounds(&threaded.graph.connectivity.closure, stats);
                 on_workers.add(stats);
-                landed += stats.closure_landed_words;
-                try std.testing.expectEqual(serial.closure_shrinks, stats.closure_shrinks);
-                try std.testing.expectEqual(serial.closure_landed_words, stats.closure_landed_words);
+                landed += stats.perf.closure_landed_words;
+                try std.testing.expectEqual(serial.perf.closure_shrinks, stats.perf.closure_shrinks);
+                try std.testing.expectEqual(serial.perf.closure_landed_words, stats.perf.closure_landed_words);
                 if (step == 4) {
-                    try std.testing.expectEqual(@as(usize, 1), stats.closure_shrinks);
+                    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_shrinks);
                     if (workers == 4 and items_per_range == 1) {
-                        try std.testing.expect(ClosureStagesOnWorkers.onWorkers(stats.conn_closure_plan_batch));
+                        try std.testing.expect(ClosureStagesOnWorkers.onWorkers(stats.perf.conn_closure_plan_batch));
                         try std.testing.expect(ClosureStagesOnWorkers.onWorkers(stats.conn_closure_rows_batch));
                     }
                 }
@@ -2959,6 +2981,7 @@ test "threaded closure stages equal the inline ones word for word across worker 
 }
 
 test "a one-way toggle and a terminal root split prepared with the real allocator commit on a multi-worker ThreadSystem without allocating" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
@@ -2988,8 +3011,8 @@ test "a one-way toggle and a terminal root split prepared with the real allocato
     system.graph.landClosure(nav_threads, &stats);
     system.nav_marks.clearRetainingCapacity();
     try std.testing.expect(batch.changed);
-    try std.testing.expect(stats.closure_terms_new != 0 and stats.closure_a_rows != 0);
-    try std.testing.expect(!stats.conn_closure_resolve_batch.ran_inline and !stats.conn_closure_mask_batch.ran_inline);
+    try std.testing.expect(stats.perf.closure_terms_new != 0 and stats.perf.closure_a_rows != 0);
+    try std.testing.expect(!stats.perf.conn_closure_resolve_batch.ran_inline and !stats.perf.conn_closure_mask_batch.ran_inline);
     try expectWithinBounds(&system.graph.connectivity.closure, stats);
     try fixture.expectMatchesRebuild(&system);
 }
@@ -3047,6 +3070,7 @@ fn roomHComp(system: *const PathfindingSystem, fixture: *const TestWorld, chunks
 }
 
 test "a one-way system that loses most of its terminals narrows its block and frees the old one in the same batch; a far dig allocates and frees no block" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3056,10 +3080,10 @@ test "a one-way system that loses most of its terminals narrows its block and fr
     const closure = &system.graph.connectivity.closure;
     try std.testing.expectEqual(@as(u32, 128), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, narrow_tail)]);
     const cut = try narrowChain(&fixture, &system, fixture.tree);
-    try std.testing.expectEqual(@as(usize, 1), cut.closure_shrinks);
-    try std.testing.expectEqual(@as(usize, 1), cut.closure_block_frees);
-    try std.testing.expectEqual(@as(usize, 1), cut.closure_block_allocs);
-    try std.testing.expectEqual(blockWords(64), cut.closure_landed_words);
+    try std.testing.expectEqual(@as(usize, 1), cut.perf.closure_shrinks);
+    try std.testing.expectEqual(@as(usize, 1), cut.perf.closure_block_frees);
+    try std.testing.expectEqual(@as(usize, 1), cut.perf.closure_block_allocs);
+    try std.testing.expectEqual(blockWords(64), cut.perf.closure_landed_words);
     const id = roomHComp(&system, &fixture, chunks, narrow_tail);
     try std.testing.expectEqual(@as(u32, 64), closure.hcomp.k_cap[id]);
     try std.testing.expectEqual(@as(u32, 28), closure.hcomp.k_high[id]);
@@ -3071,18 +3095,19 @@ test "a one-way system that loses most of its terminals narrows its block and fr
     const wall = latticeWall(chunks, 40);
     try fixture.setCell(&system, 0, wall[0], wall[1], fixture.grass);
     const far = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 0), far.closure_links);
-    try std.testing.expectEqual(@as(usize, 0), far.closure_block_allocs + far.closure_block_frees + far.closure_landed_words);
+    try std.testing.expectEqual(@as(usize, 0), far.perf.closure_links);
+    try std.testing.expectEqual(@as(usize, 0), far.perf.closure_block_allocs + far.perf.closure_block_frees + far.perf.closure_landed_words);
     try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
     try std.testing.expectEqual(blockWords(64), closure.live_words);
     // A tail toggle writes rows two words wide.
     try setRoom(&fixture, &system, chunks, 0, narrow_tail, fixture.tree);
     const toggle = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expect(toggle.closure_words_written <= (toggle.closure_a_rows + toggle.closure_terms_left + toggle.closure_terms_new) * 2);
+    try std.testing.expect(toggle.perf.closure_words_written <= (toggle.perf.closure_a_rows + toggle.perf.closure_terms_left + toggle.perf.closure_terms_new) * 2);
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "a system at its narrowed size neither narrows nor grows under toggles, and regrowing then narrowing again returns its block and words" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3100,8 +3125,8 @@ test "a system at its narrowed size neither narrows nor grows under toggles, and
     for (0..8) |toggle| {
         try setRoom(&fixture, &system, chunks, 0, narrow_tail, if (toggle % 2 == 0) fixture.tree else fixture.grass);
         const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-        try std.testing.expectEqual(@as(usize, 0), stats.closure_shrinks);
-        try std.testing.expectEqual(@as(usize, 0), stats.closure_block_allocs + stats.closure_block_frees);
+        try std.testing.expectEqual(@as(usize, 0), stats.perf.closure_shrinks);
+        try std.testing.expectEqual(@as(usize, 0), stats.perf.closure_block_allocs + stats.perf.closure_block_frees);
         try std.testing.expectEqual(narrowed[0], closure.hcomp.k_cap[id]);
         try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
     }
@@ -3113,18 +3138,19 @@ test "a system at its narrowed size neither narrows nor grows under toggles, and
     // Closed again with the second system: one narrowing, the same block size and words.
     for (0..4) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.tree);
     const again = try narrowChain(&fixture, &system, fixture.tree);
-    try std.testing.expectEqual(@as(usize, 1), again.closure_shrinks);
+    try std.testing.expectEqual(@as(usize, 1), again.perf.closure_shrinks);
     const regrown = roomHComp(&system, &fixture, chunks, narrow_tail);
     try std.testing.expectEqual(narrowed[0], closure.hcomp.k_cap[regrown]);
     try std.testing.expectEqual(narrowed[1], closure.hcomp.k_high[regrown]);
     try std.testing.expectEqual(@as(usize, 1), test_support.closureHcompCount(closure));
     try std.testing.expectEqual(narrowed[2] - blockWords(4), closure.live_words);
     // The narrowing freed the regrown block and the closed system's in its own batch.
-    try std.testing.expectEqual(@as(usize, 2), again.closure_block_frees);
+    try std.testing.expectEqual(@as(usize, 2), again.perf.closure_block_frees);
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "the heir of a component that falls into five pieces narrows; the other pieces take blocks sized to their terminals" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3134,7 +3160,7 @@ test "the heir of a component that falls into five pieces narrows; the other pie
     const closure = &system.graph.connectivity.closure;
     for ([_]usize{ 25, 50, 75, 100 }) |cut| try setRoom(&fixture, &system, chunks, 0, narrow_first + cut, fixture.tree);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), stats.closure_shrinks);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_shrinks);
     try std.testing.expectEqual(@as(usize, 5), test_support.closureHcompCount(closure));
     try std.testing.expectEqual(@as(u32, 64), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, narrow_tail)]);
     for ([_]usize{ 0, 26, 51, 76 }) |first| try std.testing.expectEqual(@as(u32, 32), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, narrow_first + first)]);
@@ -3143,6 +3169,7 @@ test "the heir of a component that falls into five pieces narrows; the other pie
 }
 
 test "a block narrowing prepared with the real allocator commits on a multi-worker ThreadSystem without allocating" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
@@ -3166,8 +3193,8 @@ test "a block narrowing prepared with the real allocator commits on a multi-work
     system.graph.allocator = original;
     system.nav_marks.clearRetainingCapacity();
     try std.testing.expect(!failing.has_induced_failure);
-    try std.testing.expectEqual(@as(usize, 1), stats.closure_shrinks);
-    try std.testing.expectEqual(@as(usize, 1), stats.closure_block_frees);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_shrinks);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_block_frees);
     try std.testing.expect(!stats.conn_closure_rows_batch.ran_inline);
     // The narrowed block waits in the tail, readable, until the reaction's landing.
     const closure = &system.graph.connectivity.closure;
@@ -3175,7 +3202,7 @@ test "a block narrowing prepared with the real allocator commits on a multi-work
     try fixture.expectMatchesRebuild(&system);
     system.graph.landClosure(nav_threads, &stats);
     try std.testing.expectEqual(@as(usize, 0), closure.residents.items.len);
-    try std.testing.expectEqual(blockWords(64), stats.closure_landed_words);
+    try std.testing.expectEqual(blockWords(64), stats.perf.closure_landed_words);
     try expectWithinBounds(closure, stats);
     try fixture.expectMatchesRebuild(&system);
 }
@@ -3213,6 +3240,7 @@ const BlockSnapshot = struct {
 };
 
 test "changes in one one-way system never move or write another system's block" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3240,13 +3268,14 @@ test "changes in one one-way system never move or write another system's block" 
             else => for (narrow_first..narrow_first + 128) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.grass),
         }
         const stats = try applyWithinBounds(&fixture, &system);
-        try std.testing.expect(stats.closure_links != 0);
+        try std.testing.expect(stats.perf.closure_links != 0);
         for (others, &snapshots) |room, *snapshot| try snapshot.*.?.expectUnchanged(&system, &fixture, chunks, room);
     }
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "retiring or narrowing a system frees its old block in the same batch; live words and bytes follow" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3262,9 +3291,9 @@ test "retiring or narrowing a system frees its old block in the same batch; live
     var live_words = closure.live_words;
     var bytes = closure.bytes();
     const cut = try narrowChain(&fixture, &system, fixture.tree);
-    try std.testing.expectEqual(@as(usize, 1), cut.closure_shrinks);
-    try std.testing.expectEqual(@as(usize, 1), cut.closure_block_frees);
-    try std.testing.expectEqual(@as(usize, 1), cut.closure_block_allocs);
+    try std.testing.expectEqual(@as(usize, 1), cut.perf.closure_shrinks);
+    try std.testing.expectEqual(@as(usize, 1), cut.perf.closure_block_frees);
+    try std.testing.expectEqual(@as(usize, 1), cut.perf.closure_block_allocs);
     const narrowed = blockWords(128) - blockWords(64);
     try std.testing.expectEqual(live_words - narrowed, closure.live_words);
     try std.testing.expectEqual(bytes - narrowed * @sizeOf(u32), closure.bytes());
@@ -3274,8 +3303,8 @@ test "retiring or narrowing a system frees its old block in the same batch; live
     bytes = closure.bytes();
     for (0..4) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.tree);
     const retired = try applyWithinBounds(&fixture, &system);
-    try std.testing.expectEqual(@as(usize, 1), retired.closure_block_frees);
-    try std.testing.expectEqual(@as(usize, 0), retired.closure_block_allocs + retired.closure_landed_words);
+    try std.testing.expectEqual(@as(usize, 1), retired.perf.closure_block_frees);
+    try std.testing.expectEqual(@as(usize, 0), retired.perf.closure_block_allocs + retired.perf.closure_landed_words);
     try std.testing.expectEqual(@as(u32, 0), closure.hcomp.k_cap[small]);
     try std.testing.expectEqual(@as(usize, 0), closure.hcomp.block[small].len);
     try std.testing.expectEqual(live_words - blockWords(4), closure.live_words);
@@ -3284,6 +3313,7 @@ test "retiring or narrowing a system frees its old block in the same batch; live
 }
 
 test "a relocating batch lands its pieces in the same nav reaction on workers: the tail and residents are empty after it, and the land stage ran on workers" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 16;
     const rooms: usize = 256;
@@ -3309,16 +3339,17 @@ test "a relocating batch lands its pieces in the same nav reaction on workers: t
     // One new system of 256: its block, 144 lines, lands on workers in this reaction.
     try std.testing.expectEqual(@as(usize, 1), test_support.closureHcompCount(closure));
     try std.testing.expectEqual(@as(u32, rooms), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, 0)]);
-    const land = stats.conn_closure_land_batch;
+    const land = stats.perf.conn_closure_land_batch;
     try std.testing.expectEqual(blockWords(rooms) / span_words, land.item_count);
     try std.testing.expect(!land.ran_inline and land.worker_thread_ranges != 0);
-    try std.testing.expectEqual(blockWords(rooms), stats.closure_landed_words);
-    try std.testing.expectEqual(@as(usize, 1), stats.closure_block_allocs);
+    try std.testing.expectEqual(blockWords(rooms), stats.perf.closure_landed_words);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_block_allocs);
     try expectWithinBounds(closure, stats);
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "a relocating batch committed under a failing allocator on a multi-worker ThreadSystem leaves its pieces resident; a failed landing defers with the closure intact; a prepare under failure returns OutOfMemory with state intact; disarmed, it lands and matches the rebuild" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
@@ -3348,7 +3379,7 @@ test "a relocating batch committed under a failing allocator on a multi-worker T
     system.graph.allocator = failing.allocator();
     _ = system.graph.commitMarks(prepared, no_colliders.view(), nav_threads, &stats);
     try std.testing.expect(!failing.has_induced_failure);
-    try std.testing.expectEqual(@as(usize, 1), stats.closure_shrinks);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_shrinks);
     try std.testing.expect(!stats.conn_closure_rows_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 1), closure.residents.items.len);
     try fixture.expectMatchesRebuild(&system);
@@ -3357,8 +3388,8 @@ test "a relocating batch committed under a failing allocator on a multi-worker T
     system.graph.allocator = original;
     system.nav_marks.clearRetainingCapacity();
     try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(@as(usize, 1), stats.closure_land_deferrals);
-    try std.testing.expectEqual(@as(usize, 0), stats.closure_landed_words);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_land_deferrals);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.closure_landed_words);
     try std.testing.expectEqual(@as(usize, 1), closure.residents.items.len);
     try std.testing.expectEqual(blockWords(64), closure.tail.items.len);
     try fixture.expectMatchesRebuild(&system);
@@ -3382,8 +3413,8 @@ test "a relocating batch committed under a failing allocator on a multi-worker T
     try std.testing.expect(system.hasPendingNavUpdates(&fixture.world));
     // Disarmed: the prepare lands the block, then the batch runs.
     const retried = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    try std.testing.expectEqual(blockWords(64), retried.closure_landed_words);
-    try std.testing.expectEqual(@as(usize, 1), retried.closure_block_allocs);
+    try std.testing.expectEqual(blockWords(64), retried.perf.closure_landed_words);
+    try std.testing.expectEqual(@as(usize, 1), retried.perf.closure_block_allocs);
     try expectWithinBounds(closure, retried);
     try fixture.expectMatchesRebuild(&system);
 }
@@ -3402,11 +3433,12 @@ fn deferNarrowingLanding(fixture: *TestWorld, system: *PathfindingSystem) !void 
     system.graph.landClosure(null, &stats);
     system.graph.allocator = original;
     try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(@as(usize, 1), stats.closure_land_deferrals);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_land_deferrals);
     try std.testing.expectEqual(@as(usize, 1), system.graph.connectivity.closure.residents.items.len);
 }
 
 test "release windows closing while a landing is deferred keep the tail and its blocks; the next batch lands them" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3431,12 +3463,13 @@ test "release windows closing while a landing is deferred keep the tail and its 
     // Each step closes a window, which resets the batch limits `expectWithinBounds` reads.
     try setRoom(&fixture, &system, chunks, 0, narrow_tail, fixture.tree);
     const landed = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(blockWords(64), landed.closure_landed_words);
+    try std.testing.expectEqual(blockWords(64), landed.perf.closure_landed_words);
     try std.testing.expect(closure.residents.items.len == 0 and closure.tail.items.len == 0);
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "a world destroyed while a landing is deferred frees every block once" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var fixture = try latticeWorld(8, 1);
     defer fixture.deinit();
     try addChain(&fixture, 8, 0, narrow_first, 128);
@@ -3448,6 +3481,7 @@ test "a world destroyed while a landing is deferred frees every block once" {
 }
 
 test "a landing failing after its first allocation frees what it allocated, keeps every block in the tail, and lands all on retry" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3464,7 +3498,7 @@ test "a landing failing after its first allocation frees what it allocated, keep
     const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, null, &stats)).?;
     _ = system.graph.commitMarks(prepared, no_colliders.view(), null, &stats);
     system.nav_marks.clearRetainingCapacity();
-    try std.testing.expectEqual(@as(usize, 2), stats.closure_shrinks);
+    try std.testing.expectEqual(@as(usize, 2), stats.perf.closure_shrinks);
     try std.testing.expectEqual(@as(usize, 2), closure.residents.items.len);
     try std.testing.expectEqual(2 * blockWords(32), closure.tail.items.len);
     // The second destination fails: the first is freed, and both blocks stay in the tail.
@@ -3476,7 +3510,7 @@ test "a landing failing after its first allocation frees what it allocated, keep
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, 1), failing.allocations);
     try std.testing.expectEqual(@as(usize, 1), failing.deallocations);
-    try std.testing.expectEqual(@as(usize, 1), stats.closure_land_deferrals);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_land_deferrals);
     try std.testing.expectEqual(@as(usize, 2), closure.residents.items.len);
     const tail_start = @intFromPtr(closure.tail.items.ptr);
     for (closure.residents.items) |resident| {
@@ -3488,8 +3522,8 @@ test "a landing failing after its first allocation frees what it allocated, keep
     stats = .{};
     system.graph.landClosure(null, &stats);
     try std.testing.expectEqual(@as(usize, 0), closure.residents.items.len);
-    try std.testing.expectEqual(@as(usize, 2), stats.closure_block_allocs);
-    try std.testing.expectEqual(2 * blockWords(32), stats.closure_landed_words);
+    try std.testing.expectEqual(@as(usize, 2), stats.perf.closure_block_allocs);
+    try std.testing.expectEqual(2 * blockWords(32), stats.perf.closure_landed_words);
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -3525,6 +3559,7 @@ const FailOnceAllocator = struct {
 };
 
 test "a nav update failing after a level build left blocks in the tail lands them on its error path, or counts the deferral when that landing fails too" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     for ([_]bool{ false, true }) |landing_fails| {
         var fixture = try TestWorld.init(6, 1);
         defer fixture.deinit();
@@ -3558,7 +3593,7 @@ test "a nav update failing after a level build left blocks in the tail lands the
         try std.testing.expectError(error.OutOfMemory, result);
         try std.testing.expectEqual(@as(usize, 3), system.graph.levelCount());
         try std.testing.expectEqual(@as(usize, @intFromBool(landing_fails)), closure.residents.items.len);
-        try std.testing.expectEqual(@as(u64, @intFromBool(landing_fails)), system.graph.land_deferrals);
+        try std.testing.expectEqual(@as(u64, @intFromBool(landing_fails)), system.graph.perf.land_deferrals);
         try std.testing.expect(reach(&system.graph, 1, fixture.cell(2, 2), 2, fixture.cell(9, 9)) == .reaches);
         // The retry builds the level, landing any block first.
         _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
@@ -3570,6 +3605,7 @@ test "a nav update failing after a level build left blocks in the tail lands the
 }
 
 test "an index-map entry is live only at its own index: a free link naming a live terminal of the same component at another index reads as free" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3604,6 +3640,7 @@ test "an index-map entry is live only at its own index: a free link naming a liv
 }
 
 test "reopening a closed chain in one batch counts each room's cell once: n_net equals its rooms, and the tail stays within the bound" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     const rooms: usize = 8;
     var fixture = try latticeWorld(chunks, 1);
@@ -3619,12 +3656,13 @@ test "reopening a closed chain in one batch counts each room's cell once: n_net 
     const stats = try applyWithinBounds(&fixture, &system);
     try std.testing.expectEqual(rooms, closure.limits.n_net);
     try std.testing.expectEqual(rooms, closure.limits.n_gross);
-    try std.testing.expectEqual(rooms, stats.closure_terms_new);
+    try std.testing.expectEqual(rooms, stats.perf.closure_terms_new);
     try std.testing.expectEqual(@as(u32, rooms), roomBlockCap(&system, &fixture, chunks, 0));
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "an index-map entry is live by back-pointer: a free link equal to a live terminal id of another component reads as free, and term ids are bounded by no_term" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3673,6 +3711,7 @@ test "an index-map entry is live by back-pointer: a free link equal to a live te
 }
 
 test "a fill splitting one terminal root holding sixteen one-way endpoints in far chunks yields sixteen terminals within the prepared reserve and its bound" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const tunnels: u16 = 16;
     var fixture = try TestWorld.init(2 * tunnels, 2);
     defer fixture.deinit();
@@ -3701,8 +3740,8 @@ test "a fill splitting one terminal root holding sixteen one-way endpoints in fa
     // back, the rest pop new ones, and none leaves. The tunnels' mouths are the seed edges
     // whose kept far end held the terminal: the bound counts each.
     try std.testing.expectEqual(@as(usize, tunnels + 1), test_support.closureTermCount(system.graph.connectivity.closure));
-    try std.testing.expectEqual(@as(usize, tunnels - 1), stats.closure_terms_new);
-    try std.testing.expectEqual(@as(usize, 0), stats.closure_terms_left);
+    try std.testing.expectEqual(@as(usize, tunnels - 1), stats.perf.closure_terms_new);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.closure_terms_left);
     try std.testing.expectEqual(@as(usize, tunnels), system.graph.connectivity.closure.limits.n_net);
     try expectWithinBounds(&system.graph.connectivity.closure, stats);
     try fixture.expectMatchesRebuild(&system);
@@ -3765,6 +3804,7 @@ test "a one-way link between unbuilt levels commits without allocating, stays de
 }
 
 test "the post-commit nav reaction runs the closure resolve and rows on workers and records the rows as nav_closure" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
@@ -3784,7 +3824,7 @@ test "the post-commit nav reaction runs the closure resolve and rows on workers 
     try setRoom(&fixture, &system, chunks, 0, 79, fixture.tree);
     frame.beginStep();
     const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, &threads);
-    try std.testing.expect(!stats.conn_closure_resolve_batch.ran_inline and stats.conn_closure_resolve_batch.worker_thread_ranges != 0);
+    try std.testing.expect(!stats.perf.conn_closure_resolve_batch.ran_inline and stats.perf.conn_closure_resolve_batch.worker_thread_ranges != 0);
     try std.testing.expect(!stats.conn_closure_rows_batch.ran_inline and stats.conn_closure_rows_batch.worker_thread_ranges != 0);
     if (runtime_perf_log.enabled) {
         var perf = runtime_perf_log.RuntimePerfLog.init(0);
@@ -3859,13 +3899,14 @@ fn runCappedNavScenario(scenario: CappedNavScenario, threads: *ThreadSystem, cap
     try fixture.expectMatchesRebuild(&system);
     return .{
         .stats = stats,
-        .plan_batch = stats.plan_batch,
-        .patch_batch = stats.patch_batch,
-        .mark_batch = system.last_mark_batch,
+        .plan_batch = stats.perf.plan_batch,
+        .patch_batch = stats.perf.patch_batch,
+        .mark_batch = system.perf.last_mark_batch,
     };
 }
 
 test "a nav worker cap of zero keeps every graph, connectivity, and closure stage inline on a multi-worker ThreadSystem and changes no result" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
@@ -3898,6 +3939,7 @@ test "a nav worker cap of zero keeps every graph, connectivity, and closure stag
 }
 
 test "a merge and a split of terminal roots far from every endpoint join and part their one-way systems" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var fixture = try TestWorld.init(8, 2);
     defer fixture.deinit();
     // Both levels halved by a solid chunk column; each level-0 half reaches the level-1 half
@@ -3911,14 +3953,14 @@ test "a merge and a split of terminal roots far from every endpoint join and par
     // A gap in level 0's wall, its patch keys far from every endpoint, merges the halves.
     try fixture.setChunk(&system, 0, 4, 4, fixture.grass);
     const merged = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), merged.conn_merges);
+    try std.testing.expectEqual(@as(usize, 1), merged.perf.conn_merges);
     try std.testing.expectEqual(@as(usize, 1), test_support.closureHcompCount(system.graph.connectivity.closure));
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 1, fixture.cell(29, 29)) == .reaches);
     try fixture.expectMatchesRebuild(&system);
     // Refilled: the root splits and so does the system.
     try fixture.setChunk(&system, 0, 4, 4, fixture.tree);
     const split = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), split.conn_splits);
+    try std.testing.expectEqual(@as(usize, 1), split.perf.conn_splits);
     try std.testing.expectEqual(@as(usize, 2), test_support.closureHcompCount(system.graph.connectivity.closure));
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 1, fixture.cell(29, 29)) != .reaches);
     try fixture.expectMatchesRebuild(&system);
@@ -3942,6 +3984,7 @@ fn roomBlockCap(system: *const PathfindingSystem, fixture: *const TestWorld, chu
 }
 
 test "a dig merging a terminal room into a larger terminal-less region keeps its terminal" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3957,8 +4000,8 @@ test "a dig merging a terminal room into a larger terminal-less region keeps its
     try std.testing.expectEqual(@as(usize, 0), closure.term_free.items.len);
     try setWall(&fixture, &system, chunks, 1, fixture.grass);
     const stats = try applyWithinBounds(&fixture, &system);
-    try std.testing.expectEqual(@as(usize, 0), stats.closure_terms_new);
-    try std.testing.expectEqual(@as(usize, 0), stats.closure_terms_left);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.closure_terms_new);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.closure_terms_left);
     // Room 1's new node joined the region's root, which took the terminal its old root freed.
     try std.testing.expectEqual(term, roomTerm(&system, &fixture, chunks, 0, 1));
     try std.testing.expectEqual(term, roomTerm(&system, &fixture, chunks, 0, 6));
@@ -3966,6 +4009,7 @@ test "a dig merging a terminal room into a larger terminal-less region keeps its
 }
 
 test "a toggle in a chunk of terminal rooms creates and frees only the toggled room's terminal" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3980,15 +4024,16 @@ test "a toggle in a chunk of terminal rooms creates and frees only the toggled r
     for ([_]TileId{ fixture.tree, fixture.grass }, [_][2]usize{ .{ 0, 1 }, .{ 1, 0 } }) |tile, churn| {
         try setRoom(&fixture, &system, chunks, 0, 63, tile);
         const stats = try applyWithinBounds(&fixture, &system);
-        try std.testing.expectEqual(churn[0], stats.closure_terms_new);
-        try std.testing.expectEqual(churn[1], stats.closure_terms_left);
+        try std.testing.expectEqual(churn[0], stats.perf.closure_terms_new);
+        try std.testing.expectEqual(churn[1], stats.perf.closure_terms_left);
         for ([_]usize{ 46, 47, 62 }, neighbours) |room, term| try std.testing.expectEqual(term, roomTerm(&system, &fixture, chunks, 0, room));
-        try std.testing.expectEqual(@as(usize, 0), stats.closure_shrinks);
+        try std.testing.expectEqual(@as(usize, 0), stats.perf.closure_shrinks);
         try fixture.expectMatchesRebuild(&system);
     }
 }
 
 test "a tail toggle at a full block bounds its slots by the block and its pops, its links by the chain and its dead link, and its widest block at half" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -4017,6 +4062,7 @@ test "a tail toggle at a full block bounds its slots by the block and its pops, 
 }
 
 test "a one-way chain cut to a few rooms, reopened, and toggled stays within the reachability and nav storage bounds" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 8;
     const rooms: usize = 64;
     var fixture = try latticeWorld(chunks, 1);
@@ -4075,6 +4121,7 @@ test "a one-way chain cut to a few rooms, reopened, and toggled stays within the
 }
 
 test "a fill splitting a one-chunk room holding two endpoint cells yields two terminals within the bound" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -4091,13 +4138,14 @@ test "a fill splitting a one-chunk room holding two endpoint cells yields two te
     try setWall(&fixture, &system, chunks, 0, fixture.tree);
     const stats = try applyWithinBounds(&fixture, &system);
     try std.testing.expectEqual(@as(usize, 9), test_support.closureTermCount(closure));
-    try std.testing.expectEqual(@as(usize, 1), stats.closure_terms_new);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_terms_new);
     try std.testing.expectEqual(@as(usize, 1), closure.limits.n_net);
     try std.testing.expectEqual(@as(u32, 16), roomBlockCap(&system, &fixture, chunks, 2));
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "a fill splitting a room across a chunk border, both chunks changed, yields two terminals within the bound" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -4115,12 +4163,13 @@ test "a fill splitting a room across a chunk border, both chunks changed, yields
     for (1..3) |index| try setWall(&fixture, &system, chunks, index, fixture.tree);
     const stats = try applyWithinBounds(&fixture, &system);
     try std.testing.expectEqual(@as(usize, 9), test_support.closureTermCount(closure));
-    try std.testing.expectEqual(@as(usize, 1), stats.closure_terms_new);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_terms_new);
     try std.testing.expectEqual(@as(u32, 16), roomBlockCap(&system, &fixture, chunks, 4));
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "opening the closed end of a dead link adds two terminals when its far room holds none and one when it holds a terminal" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     {
         var fixture = try latticeWorld(chunks, 1);
@@ -4137,7 +4186,7 @@ test "opening the closed end of a dead link adds two terminals when its far room
         try setRoom(&fixture, &system, chunks, 0, 0, fixture.grass);
         const stats = try applyWithinBounds(&fixture, &system);
         try std.testing.expectEqual(@as(usize, 2), closure.limits.n_net);
-        try std.testing.expectEqual(@as(usize, 2), stats.closure_terms_new);
+        try std.testing.expectEqual(@as(usize, 2), stats.perf.closure_terms_new);
         try std.testing.expectEqual(@as(u32, 2), roomBlockCap(&system, &fixture, chunks, 0));
         try fixture.expectMatchesRebuild(&system);
     }
@@ -4156,13 +4205,14 @@ test "opening the closed end of a dead link adds two terminals when its far room
         const stats = try applyWithinBounds(&fixture, &system);
         try std.testing.expectEqual(@as(usize, 1), closure.limits.n_net);
         try std.testing.expectEqual(@as(usize, 4), closure.limits.q_max);
-        try std.testing.expectEqual(@as(usize, 1), stats.closure_terms_new);
+        try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_terms_new);
         try std.testing.expectEqual(@as(u32, 8), roomBlockCap(&system, &fixture, chunks, 16));
         try fixture.expectMatchesRebuild(&system);
     }
 }
 
 test "a dig merging rooms of two full one-way systems grows one block within the bound of their merged group" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -4185,6 +4235,7 @@ test "a dig merging rooms of two full one-way systems grows one block within the
 }
 
 test "a fill in a chunk holding rooms of two one-way systems bounds each system alone" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -4204,6 +4255,7 @@ test "a fill in a chunk holding rooms of two one-way systems bounds each system 
 }
 
 test "cutting a full chain of 128 to 28 bounds the batch by its terminals and links alone" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -4221,6 +4273,7 @@ test "cutting a full chain of 128 to 28 bounds the batch by its terminals and li
 }
 
 test "a dead link with both ends in a batch's keys is taken loose once" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -4236,7 +4289,7 @@ test "a dead link with both ends in a batch's keys is taken loose once" {
     const stats = try applyWithinBounds(&fixture, &system);
     try std.testing.expectEqual(@as(usize, 1), closure.limits.loose);
     try std.testing.expectEqual(@as(usize, 1), closure.limits.e_t);
-    try std.testing.expectEqual(@as(usize, 1), stats.closure_links);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.closure_links);
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -4253,6 +4306,7 @@ test "a world build of disjoint one-way links reserves one H-component id per li
 }
 
 test "a closure batch reaching an exhausted terminal id pool fails as OutOfMemory without asking the allocator, keeps the closure and its change pending, and the retry equals a rebuild" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();

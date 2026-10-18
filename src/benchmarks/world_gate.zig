@@ -49,9 +49,11 @@ const Fixture = struct {
 
 // The gated level's floor alternates walkable and solid tiles in a checkerboard.
 fn buildWorld(allocator: std.mem.Allocator, io: std.Io) !WorldSystem {
-    var world = try fixtures.buildBandedWorld(allocator, io, gate_level_side, gate_level + 1, "grass", "grass");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    const meta = &tileset;
+    var world = try fixtures.buildBandedWorld(allocator, meta, gate_level_side, gate_level + 1, "grass", "grass");
     errdefer world.deinit();
-    const meta = world.tilesetMeta().?;
     const solid = try world.requireTileByName(meta, "dirt");
     const walkable = try world.requireTileByName(meta, "grass");
     const floor = world.denseFloorLayerForLevel(gate_level) orelse return error.InvalidWorldLevel;

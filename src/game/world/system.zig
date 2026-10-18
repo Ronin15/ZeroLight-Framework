@@ -5,12 +5,13 @@
 //! State-owned SoA world/tile storage and render preparation.
 //! Persistent world data stores stable tile IDs, level/chunk metadata, and
 //! gameplay tile flags. Dense tiles, composed movement-blocked bits, and link
-//! endpoints are stored per chunk (`terrain.zig`) behind the accessors here. Atlas source rectangles are resolved from `tileset_meta`
-//! once at build time and cached into per-tile `catalog_source_x/y/w/h` columns,
+//! endpoints are stored per chunk (`terrain.zig`) behind the accessors here. Atlas source rectangles are resolved from the tileset
+//! metadata once at build time and cached into per-tile `catalog_source_x/y/w/h` columns,
 //! so hot-path `sourceRect` lookups never re-touch tileset metadata at runtime.
 //! Renderer handles stay outside this owner.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const math = @import("../../core/math.zig");
 const RuntimeAssets = @import("../../assets/runtime_assets.zig").RuntimeAssets;
 const WorldTilesetMeta = @import("../../assets/world_tileset_meta.zig").WorldTilesetMeta;
@@ -203,16 +204,10 @@ pub const WorldSystem = struct {
     // through `appendLevelBaseZ`, and no chunk storage exists before it.
     chunk_geom: ChunkGeometry = no_level_chunk_geom,
 
-    /// Borrowed atlas metadata used for `sourceRect` lookups. Satisfied by
-    /// `RuntimeAssets.worldTilesetMeta()` for production startup, or by
-    /// `adoptTilesetMeta` for standalone tests/tools that construct a world
-    /// without a long-lived runtime catalog.
-    tileset_meta: ?*const WorldTilesetMeta = null,
-    owned_tileset_meta: ?WorldTilesetMeta = null,
     catalog_valid: std.ArrayList(bool) = .empty,
     catalog_flags: std.ArrayList(TileFlags) = .empty,
     // O(1) source-rect cache, indexed like catalog_valid/catalog_flags. Avoids a
-    // per-tile hash-map lookup into tileset_meta on the per-frame sparse-tile
+    // per-tile hash-map lookup into the tileset metadata on the per-frame sparse-tile
     // render path.
     catalog_source_x: std.ArrayList(f32) = .empty,
     catalog_source_y: std.ArrayList(f32) = .empty,
@@ -249,18 +244,14 @@ pub const WorldSystem = struct {
     edit_level_tails: std.ArrayList(u32) = .empty,
     edit_chunk_heads: []u32 = &.{},
     edit_chunk_tails: []u32 = &.{},
-    // The batched edit's per-stage tuners and last batches (`applyDenseCellWrites`).
+    // The batched edit's per-stage tuners (`applyDenseCellWrites`).
     terrain_edit_plan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     terrain_edit_write_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    last_terrain_edit_plan_batch: BatchStats = .{},
-    last_terrain_edit_write_batch: BatchStats = .{},
-    // Telemetry: reserves that grew a dense block or composed-bits pool. Pools grow
-    // geometrically at their reserve seams; the first growth logs once.
-    terrain_pool_grows: u64 = 0,
+    // Pools grow geometrically at their reserve seams; the first growth logs once.
     terrain_pool_growth_logged: bool = false,
-    // Telemetry: reserves that grew the batched edit's scratch; the first logs once.
-    dense_edit_scratch_grows: u64 = 0,
+    // The first growth of the batched edit's scratch logs once.
     dense_edit_scratch_growth_logged: bool = false,
+    perf: Perf = .{},
     // Mirror of the renderer-owned GPU tile store holding the render window's dense
     // layers by chunk; `syncDenseTileStore` uploads what changed. Edits hold no GPU
     // memory: a change on a resident layer sets the layer's `render_changed` and
@@ -340,24 +331,8 @@ pub const WorldSystem = struct {
 
     pub const initDemoFromMetaWithChunkSize = world_worldgen.initDemoFromMetaWithChunkSize;
 
-    /// Transfers standalone tileset metadata ownership into this world so
-    /// `sourceRect` lookups remain valid after the caller's local `meta` ends.
-    /// Does not cache a self-pointer: `WorldSystem` is moved by value; read
-    /// via `tilesetMeta()`.
-    pub fn adoptTilesetMeta(self: *WorldSystem, meta: WorldTilesetMeta) void {
-        if (self.owned_tileset_meta) |*owned| owned.deinit();
-        self.owned_tileset_meta = meta;
-    }
-
-    /// Resolves the tileset metadata to read, preferring an owned value (safe
-    /// across moves of `WorldSystem`) over a borrowed pointer set by `buildCatalog`.
-    pub fn tilesetMeta(self: *const WorldSystem) ?*const WorldTilesetMeta {
-        return if (self.owned_tileset_meta) |*m| m else self.tileset_meta;
-    }
-
     /// Prefer `initDemo` with `RuntimeAssets` so tileset metadata is not parsed
-    /// again at world construction. Call `adoptTilesetMeta` when the caller's
-    /// `meta` would not outlive the returned world.
+    /// again at world construction. `meta` is read only during construction.
     pub fn initDemoFromMetaWithUnderground(
         allocator: std.mem.Allocator,
         meta: *const WorldTilesetMeta,
@@ -369,6 +344,14 @@ pub const WorldSystem = struct {
         try world.addUndergroundLevels(meta);
         return world;
     }
+
+    /// Kept only with `runtime_perf_log.enabled`: the batched edit's last plan and write
+    /// batches, and the reserves that grew a dense block or composed-bits pool.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        last_terrain_edit_plan_batch: BatchStats = .{},
+        last_terrain_edit_write_batch: BatchStats = .{},
+        terrain_pool_grows: u64 = 0,
+    } else struct {};
 
     pub fn deinit(self: *WorldSystem) void {
         self.sparse_window.deinit(self.allocator);
@@ -399,9 +382,6 @@ pub const WorldSystem = struct {
         self.catalog_source_x.deinit(self.allocator);
         self.catalog_flags.deinit(self.allocator);
         self.catalog_valid.deinit(self.allocator);
-        if (self.owned_tileset_meta) |*meta| meta.deinit();
-        self.owned_tileset_meta = null;
-        self.tileset_meta = null;
         self.interest_markers.deinit(self.allocator);
         self.* = undefined;
     }
@@ -931,10 +911,8 @@ pub const WorldSystem = struct {
     pub const clearCellBlocking = world_edit.clearCellBlocking;
 
     /// Builds the tile catalog of a directly constructed world, before its first
-    /// level. Borrows `meta` for `sourceRect` lookups. Production paths keep metadata
-    /// alive via `RuntimeAssets`; standalone callers must call `adoptTilesetMeta`.
+    /// level. Reads `meta` only here: `sourceRect` reads the catalog's cached rects.
     pub fn buildCatalog(self: *WorldSystem, meta: *const WorldTilesetMeta) !void {
-        self.tileset_meta = meta;
         const count = catalogCapacity(meta);
         try self.catalog_valid.ensureTotalCapacity(self.allocator, count);
         try self.catalog_flags.ensureTotalCapacity(self.allocator, count);
@@ -1669,36 +1647,6 @@ test "a rect ending exactly on a tile edge at large pixel coordinates excludes t
     const tiny = world.chunkRegionForWorldRect(.{ .x = 33_280, .y = 0, .w = 0.001, .h = 0.001 }, 0).?;
     try std.testing.expectEqual(ChunkCoord{ .x = 65, .y = 0 }, tiny.min);
     try std.testing.expectEqual(ChunkCoord{ .x = 66, .y = 1 }, tiny.max_exclusive);
-}
-
-fn moveWorldByValue(world: WorldSystem) WorldSystem {
-    return world;
-}
-
-test "tilesetMeta resolves correctly after WorldSystem is moved by value" {
-    const meta = try testWorldMeta();
-    const expected_tile_size = meta.tileSize();
-
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 4,
-        .height = 4,
-        .tile_size = expected_tile_size,
-        .chunk_size_tiles = 2,
-    };
-    world.adoptTilesetMeta(meta);
-
-    var moved = moveWorldByValue(world);
-    defer moved.deinit();
-
-    const resolved = moved.tilesetMeta() orelse return error.TestExpectedTilesetMeta;
-    try std.testing.expectEqual(expected_tile_size, resolved.tileSize());
-    // `world` (the pre-move original) stays alive for this whole test, so a
-    // value-only comparison would still pass against the pre-fix behavior of
-    // caching `&world.owned_tileset_meta` at adopt time: that stale pointer
-    // still reads correct bytes since `world` was never freed. Assert pointer
-    // identity against `moved`'s own field to actually discriminate the fix.
-    try std.testing.expect(resolved == &moved.owned_tileset_meta.?);
 }
 
 test "levelChunkBlockedBits holds a mixed chunk's cells and nothing for uniform chunks" {

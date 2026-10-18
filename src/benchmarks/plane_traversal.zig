@@ -25,6 +25,7 @@
 //! share, and its time per entry.
 
 const std = @import("std");
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
@@ -193,9 +194,11 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, wo
     const faller_count = workload.fallerCount(agent_count);
     std.debug.assert(faller_count <= agent_count);
     const layout = Layout.of(workload.worldSide(faller_count), faller_count);
-    var world = try fixtures.buildBandedWorld(allocator, io, layout.side, level_count, "grass", "dirt");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    const meta = &tileset;
+    var world = try fixtures.buildBandedWorld(allocator, meta, layout.side, level_count, "grass", "dirt");
     errdefer world.deinit();
-    const meta = world.tilesetMeta().?;
     const dirt = try world.requireTileByName(meta, "dirt");
     const dig_config = try DigConfig.fromMeta(meta);
     // The landing level's extra walkable bands and sparse tiles, every chunk alike.
@@ -344,13 +347,13 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         const start_ns = suite.nowNs(io);
         entries = try runStage(&fixture, thread_ptr);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        const gather = plane_entry.last_batch;
-        std.debug.assert(!expect_dispatch or (gather.range_count > 1 and !gather.ran_inline));
+        const gather = suite.perfBatch(plane_entry.perf, "last_batch");
+        if (comptime runtime_perf_log.enabled) std.debug.assert(!expect_dispatch or (gather.range_count > 1 and !gather.ran_inline));
         accumulator.record(elapsed_ns, gather);
         // Main is everything but the stages that ran on workers: the gather, the carve
         // batch's plan and write stages, and the nav mark stage.
         var off_main: u64 = 0;
-        for ([_]@TypeOf(gather){ gather, fixture.world.last_terrain_edit_plan_batch, fixture.world.last_terrain_edit_write_batch, fixture.nav.last_mark_batch }) |batch| {
+        for ([_]@TypeOf(gather){ gather, suite.perfBatch(fixture.world.perf, "last_terrain_edit_plan_batch"), suite.perfBatch(fixture.world.perf, "last_terrain_edit_write_batch"), suite.perfBatch(fixture.nav.perf, "last_mark_batch") }) |batch| {
             if (!batch.ran_inline) off_main += batch.batch_duration_ns;
         }
         main_total += elapsed_ns -| off_main;

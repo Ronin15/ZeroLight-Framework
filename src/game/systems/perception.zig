@@ -22,6 +22,7 @@
 //! distinct scan box.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const math = @import("../../core/math.zig");
 const logging = @import("../../core/logging.zig");
 const simd = @import("../../core/simd.zig");
@@ -146,11 +147,19 @@ pub const PerceptionStats = struct {
     // `ai_separation_candidate_checks`), the query's own traversal cost before the
     // radius and FOV tests that `sensed_count` follows.
     candidate_checks: usize = 0,
-    /// Neighbor-block fills, one per (row group, scan box) a range walks.
-    block_fills: usize = 0,
-    gather_batch: BatchStats = .{},
     batch: BatchStats = .{},
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: the neighbor-block fills (one per (row
+    /// group, scan box) a range walks) and the gather batch.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        block_fills: usize = 0,
+        gather_batch: BatchStats = .{},
+    } else struct {};
 };
+
+// A range's neighbor-block fills, kept only with `runtime_perf_log.enabled`.
+const RangePerf = if (runtime_perf_log.enabled) struct { block_fills: usize = 0 } else struct {};
 
 // One range's counters and transition-event count: one padded slot per range, written once.
 const PerceptionRangeStats = struct {
@@ -160,7 +169,7 @@ const PerceptionRangeStats = struct {
     los_blocked: usize = 0,
     // `PerceptionStats.candidate_checks` over this range's observers.
     candidate_checks: usize = 0,
-    block_fills: usize = 0,
+    perf: RangePerf = .{},
     // The gather's kept rows in this range's window.
     kept: usize = 0,
     // Uncapped `entity_lost` + `entity_perceived` events this range's rows
@@ -249,7 +258,7 @@ pub const PerceptionSystem = struct {
         const perception_slice = data.perceptionSlice();
         const gather_batch = try self.gatherPerceptionData(.{ .ai_agents = ai_agents, .movement = movement, .data = data, .perception_slice = perception_slice, .scope_dense_indices = config.scope_dense_indices, .cell_size = spatial.cell_size }, thread_system, config);
         const observer_count = self.rows.len;
-        if (observer_count == 0) return .{ .gather_batch = gather_batch };
+        if (observer_count == 0) return .{ .perf = if (comptime runtime_perf_log.enabled) .{ .gather_batch = gather_batch } else .{} };
 
         const compute = Dispatch.init(thread_system, &self.compute_tuner, .{
             .items_per_range = config.items_per_range,
@@ -273,9 +282,8 @@ pub const PerceptionSystem = struct {
             .los_checks = totals.los_checks,
             .los_blocked = totals.los_blocked,
             .candidate_checks = totals.candidate_checks,
-            .block_fills = totals.block_fills,
-            .gather_batch = gather_batch,
             .batch = batch,
+            .perf = if (comptime runtime_perf_log.enabled) .{ .block_fills = totals.perf.block_fills, .gather_batch = gather_batch } else .{},
         };
     }
 
@@ -366,7 +374,7 @@ pub const PerceptionSystem = struct {
             totals.los_checks += slot.value.los_checks;
             totals.los_blocked += slot.value.los_blocked;
             totals.candidate_checks += slot.value.candidate_checks;
-            totals.block_fills += slot.value.block_fills;
+            if (comptime runtime_perf_log.enabled) totals.perf.block_fills += slot.value.perf.block_fills;
             totals.transition_events += slot.value.transition_events;
         }
         return totals;
@@ -595,7 +603,7 @@ fn computePerceptionRange(job: *PerceptionJobContext, range: ParallelRange) void
         group_start = group_end;
         group_key = next_key;
     }
-    range_stats.block_fills = block.fills;
+    if (comptime runtime_perf_log.enabled) range_stats.perf.block_fills = block.perf.fills;
     for (range.start..range.end) |i| {
         range_stats.transition_events += transitionEventCount(
             reconstructEntityId(job.prev_nearest_threat_index[i], job.prev_nearest_threat_generation[i]),
@@ -1522,6 +1530,7 @@ test "an observer past 16 hostiles caps its candidates before its FOV: the first
 }
 
 test "observers with interleaved vision boxes in one cell each read their own box" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     // Six observers in one cell facing +x, vision ranges by slot: three scan boxes
@@ -1544,7 +1553,7 @@ test "observers with interleaved vision boxes in one cell each read their own bo
     const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expectEqual(ranges.len, stats.observer_count);
     // One block fill per distinct box of the one row group.
-    try testing.expectEqual(@as(usize, 3), stats.block_fills);
+    try testing.expectEqual(@as(usize, 3), stats.perf.block_fills);
     for (observers, ranges) |observer, range| {
         const perception = data_test_support.aiPerception(&data, observer).?;
         try testing.expectEqual(range == 200, perception.target_visible);
@@ -2566,6 +2575,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
 }
 
 test "serial and threaded PerceptionSystem updates route through identical math" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var serial_data = DataSystem.init(testing.allocator);
@@ -2616,7 +2626,7 @@ test "serial and threaded PerceptionSystem updates route through identical math"
         .adaptive = false,
         .stimuli = &stimuli,
     });
-    try testing.expect(!threaded_stats.gather_batch.ran_inline and !threaded_stats.batch.ran_inline);
+    try testing.expect(!threaded_stats.perf.gather_batch.ran_inline and !threaded_stats.batch.ran_inline);
     // The windowed gather keeps the serial gather's rows, hostiles skipped, in row order.
     try testing.expectEqual(@as(usize, 40), threaded_sys.rows.len);
     try testing.expectEqual(serial_sys.rows.len, threaded_sys.rows.len);
@@ -2763,6 +2773,7 @@ test "PerceptionSystem think-set gather over a halo index has no steady-state al
 }
 
 test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Nothing partition-sized is left to reserve, so `reserve`
@@ -2826,7 +2837,7 @@ test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item
         try testing.expectEqual(rangeCount(observer_total, items), stats.batch.range_count);
         try testing.expect(!stats.batch.ran_inline);
         // The gather over every agent (hostiles skipped) ran on workers too.
-        try testing.expect(!stats.gather_batch.ran_inline);
+        try testing.expect(!stats.perf.gather_batch.ran_inline);
         try testing.expect(stats.batch.active_worker_threads > 0);
         if (step == 0) try testing.expectEqual(observer_total, events.stats.entity_perceived);
     }

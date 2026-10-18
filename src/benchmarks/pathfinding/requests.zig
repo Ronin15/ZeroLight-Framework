@@ -409,7 +409,7 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
         accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solve_batch);
-        if (last_stats.group_field_begin_batch.item_count != 0 or last_stats.group_fields_built != 0) return error.SharedGoalBeganField;
+        if (suite.perfBatch(last_stats.perf, "group_field_begin_batch").item_count != 0 or last_stats.group_fields_built != 0) return error.SharedGoalBeganField;
     }
     if (last_stats.solve_admissions != 1) return error.SharedGoalNotOneSolve;
     var stats = accumulator.finish();
@@ -1081,7 +1081,7 @@ fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Opt
             const stats = try runColdOnce(&system, &stream, thread_ptr, case, agent_count, agent_count, agent_count);
             const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
             if (!measured) continue;
-            accumulator.record(elapsed_ns, stats.group_field_batch);
+            accumulator.record(elapsed_ns, suite.perfBatch(stats.perf, "group_field_batch"));
             stage_report.add(elapsed_ns, stats);
             built_total += stats.group_fields_built;
             samples_total += stats.group_field_samples;
@@ -1167,8 +1167,8 @@ fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOut
         const start_ns = suite.nowNs(io);
         const stats = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
         elapsed_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
-        if (stats.group_field_begin_batch.item_count > batch.item_count) batch = stats.group_field_begin_batch;
-        if (stats.group_field_batch.item_count > batch.item_count) batch = stats.group_field_batch;
+        if (suite.perfBatch(stats.perf, "group_field_begin_batch").item_count > batch.item_count) batch = suite.perfBatch(stats.perf, "group_field_begin_batch");
+        if (suite.perfBatch(stats.perf, "group_field_batch").item_count > batch.item_count) batch = suite.perfBatch(stats.perf, "group_field_batch");
         var ready: usize = 0;
         for (system.group_fields.items) |field| ready += @intFromBool(field.state == .ready);
         if (ready == group_field_tunnel_fields) return .{ .elapsed_ns = elapsed_ns, .batch = batch };

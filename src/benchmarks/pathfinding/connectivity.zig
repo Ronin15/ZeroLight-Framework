@@ -8,6 +8,7 @@
 //! bytes against its charge (`nav_size.checkNavBytes`).
 
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const offMainNs = @import("../../app/thread_system.zig").offMainNs;
@@ -193,16 +194,19 @@ const ToggleChecks = struct {
 // candidates' block words plus 32 words per terminal it could number (a small piece's
 // 16-word block).
 fn checkOnewayReserve(stats: NavUpdateStats) !void {
-    const slack = 32 * stats.closure_kb;
-    if (stats.closure_tail_bound > 2 * stats.closure_candidate_words + slack) return error.ConnectivityOnewayReserveRatio;
+    if (comptime !runtime_perf_log.enabled) return;
+    const slack = 32 * stats.perf.closure_kb;
+    if (stats.perf.closure_tail_bound > 2 * stats.perf.closure_candidate_words + slack) return error.ConnectivityOnewayReserveRatio;
 }
 
 // Fails when a toggle reaction relocated, landed, allocated, or freed a block, or grew or
 // released the batch tail (its capacity left `tail_capacity`): a toggle in place touches only
 // its own system's rows.
 fn checkOnewayIsolated(fixture: *const ReactFixture, stats: NavUpdateStats, tail_capacity: usize) !void {
-    if (stats.closure_landed_words != 0 or stats.closure_tail_used != 0) return error.ConnectivityOnewayBallastLanded;
-    if (stats.closure_block_allocs != 0 or stats.closure_block_frees != 0) return error.ConnectivityOnewayBallastBlocks;
+    if (comptime runtime_perf_log.enabled) {
+        if (stats.perf.closure_landed_words != 0 or stats.perf.closure_tail_used != 0) return error.ConnectivityOnewayBallastLanded;
+        if (stats.perf.closure_block_allocs != 0 or stats.perf.closure_block_frees != 0) return error.ConnectivityOnewayBallastBlocks;
+    }
     if (fixture.system.graph.connectivity.closure.tail.capacity != tail_capacity) return error.ConnectivityOnewayBallastTail;
 }
 
@@ -213,11 +217,12 @@ fn runToggle(io: std.Io, fixture: *ReactFixture, cells: []const CellCoord, threa
     const change = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
     if (checks.isolated) try checkOnewayIsolated(fixture, change.stats, tail_capacity);
     const stats = change.stats;
+    const perf = stats.perf;
     const change_stages = [toggle_stage_count]BatchStats{
-        stats.plan_batch,                    stats.remask_batch,               stats.patch_batch,
-        stats.conn_seed_batch,               stats.conn_gather_batch,          stats.conn_flood_batch,
-        stats.conn_closure_candidates_batch, stats.conn_closure_resolve_batch, stats.conn_closure_mask_batch,
-        stats.conn_closure_plan_batch,       stats.conn_closure_rows_batch,    stats.conn_closure_land_batch,
+        suite.perfBatch(perf, "plan_batch"),                    stats.remask_batch,                                  suite.perfBatch(perf, "patch_batch"),
+        suite.perfBatch(perf, "conn_seed_batch"),               suite.perfBatch(perf, "conn_gather_batch"),          stats.conn_flood_batch,
+        suite.perfBatch(perf, "conn_closure_candidates_batch"), suite.perfBatch(perf, "conn_closure_resolve_batch"), suite.perfBatch(perf, "conn_closure_mask_batch"),
+        suite.perfBatch(perf, "conn_closure_plan_batch"),       stats.conn_closure_rows_batch,                       suite.perfBatch(perf, "conn_closure_land_batch"),
     };
     const revert = revert: {
         fixtures.swapNavTuners(&fixture.system, revert_tuners);
@@ -226,7 +231,9 @@ fn runToggle(io: std.Io, fixture: *ReactFixture, cells: []const CellCoord, threa
     };
     if (checks.isolated) try checkOnewayIsolated(fixture, revert.stats, tail_capacity);
     // A toggle and its revert never resize a one-way block.
-    if (checks.fixed_blocks and (change.stats.closure_shrinks != 0 or revert.stats.closure_shrinks != 0)) return error.ConnectivityOnewayShrinkFlip;
+    if (comptime runtime_perf_log.enabled) {
+        if (checks.fixed_blocks and (change.stats.perf.closure_shrinks != 0 or revert.stats.perf.closure_shrinks != 0)) return error.ConnectivityOnewayShrinkFlip;
+    }
     if (checks.reserve_ratio) {
         try checkOnewayReserve(change.stats);
         try checkOnewayReserve(revert.stats);
@@ -267,20 +274,24 @@ const ToggleReport = struct {
         self.samples += 1;
         self.change_ns += sample.change.elapsed_ns;
         self.revert_ns += sample.revert.elapsed_ns;
-        self.main_ns += (sample.change.elapsed_ns -| change.off_main_stage_ns) + (sample.revert.elapsed_ns -| revert.off_main_stage_ns);
-        self.nav_main.add(sample.change.elapsed_ns -| change.off_main_stage_ns, change);
-        self.nav_main.add(sample.revert.elapsed_ns -| revert.off_main_stage_ns, revert);
+        const change_off_main_ns = if (comptime runtime_perf_log.enabled) change.perf.off_main_stage_ns else 0;
+        const revert_off_main_ns = if (comptime runtime_perf_log.enabled) revert.perf.off_main_stage_ns else 0;
+        self.main_ns += (sample.change.elapsed_ns -| change_off_main_ns) + (sample.revert.elapsed_ns -| revert_off_main_ns);
+        self.nav_main.add(sample.change.elapsed_ns -| change_off_main_ns, change);
+        self.nav_main.add(sample.revert.elapsed_ns -| revert_off_main_ns, revert);
         self.nav_main.endSample();
         self.shapes.add(sample.change_stages);
         self.last_change = change;
-        self.revert_flood_nodes = revert.conn_flood_nodes;
-        self.closure_shrinks += change.closure_shrinks + revert.closure_shrinks;
-        self.closure_block_allocs += change.closure_block_allocs + revert.closure_block_allocs;
-        self.closure_block_frees += change.closure_block_frees + revert.closure_block_frees;
-        self.closure_landed_words += change.closure_landed_words + revert.closure_landed_words;
         self.closure_rows_off_main_ns += offMainNs(change.conn_closure_rows_batch);
-        if (self.samples == 1 or @max(change.closure_tail_bound, revert.closure_tail_bound) > self.reserve.closure_tail_bound) {
-            self.reserve = if (revert.closure_tail_bound > change.closure_tail_bound) revert else change;
+        if (comptime runtime_perf_log.enabled) {
+            self.revert_flood_nodes = revert.perf.conn_flood_nodes;
+            self.closure_shrinks += change.perf.closure_shrinks + revert.perf.closure_shrinks;
+            self.closure_block_allocs += change.perf.closure_block_allocs + revert.perf.closure_block_allocs;
+            self.closure_block_frees += change.perf.closure_block_frees + revert.perf.closure_block_frees;
+            self.closure_landed_words += change.perf.closure_landed_words + revert.perf.closure_landed_words;
+            if (self.samples == 1 or @max(change.perf.closure_tail_bound, revert.perf.closure_tail_bound) > self.reserve.perf.closure_tail_bound) {
+                self.reserve = if (revert.perf.closure_tail_bound > change.perf.closure_tail_bound) revert else change;
+            }
         }
     }
 
@@ -301,10 +312,12 @@ const ToggleReport = struct {
         conn.closure_block_frees = self.closure_block_frees;
         conn.closure_landed_words = self.closure_landed_words;
         conn.closure_rows_off_main_ns = if (self.samples == 0) 0 else self.closure_rows_off_main_ns / self.samples;
-        conn.closure_tail_bound = self.reserve.closure_tail_bound;
-        conn.closure_tail_used = self.reserve.closure_tail_used;
-        conn.closure_candidate_words = self.reserve.closure_candidate_words;
-        conn.closure_kb = self.reserve.closure_kb;
+        if (comptime runtime_perf_log.enabled) {
+            conn.closure_tail_bound = self.reserve.perf.closure_tail_bound;
+            conn.closure_tail_used = self.reserve.perf.closure_tail_used;
+            conn.closure_candidate_words = self.reserve.perf.closure_candidate_words;
+            conn.closure_kb = self.reserve.perf.closure_kb;
+        }
         stats.nav_conn = conn;
     }
 
@@ -779,14 +792,15 @@ const OnewayBallast = struct {
     // it, when the block holds no more than twice the live words it left, or when the nav
     // holds more bytes than charged.
     fn retire(self: *OnewayBallast, io: std.Io, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !void {
+        if (comptime !runtime_perf_log.enabled) return error.ConnectivityOnewayNeedsPerfLog;
         self.reopen = try untimedReaction(io, fixture, self.cells, fixture.open.walkable, thread_system);
         const reopen = self.reopen.stats;
-        if (reopen.closure_tail_used != self.block_words or reopen.closure_landed_words != self.block_words or reopen.closure_block_allocs != 1) return error.ConnectivityOnewayBallastLanding;
+        if (reopen.perf.closure_tail_used != self.block_words or reopen.perf.closure_landed_words != self.block_words or reopen.perf.closure_block_allocs != 1) return error.ConnectivityOnewayBallastLanding;
         try self.closeAll(io, fixture, thread_system);
         self.retires += 1;
-        const retired_words = reopen.closure_live_words -| self.close.stats.closure_live_words;
-        if (self.close.stats.closure_block_frees != 1 or retired_words != self.block_words) return error.ConnectivityOnewayBallastFree;
-        if (retired_words <= 2 * self.close.stats.closure_live_words) return error.ConnectivityOnewayBallastTooSmall;
+        const retired_words = reopen.perf.closure_live_words -| self.close.stats.perf.closure_live_words;
+        if (self.close.stats.perf.closure_block_frees != 1 or retired_words != self.block_words) return error.ConnectivityOnewayBallastFree;
+        if (retired_words <= 2 * self.close.stats.perf.closure_live_words) return error.ConnectivityOnewayBallastTooSmall;
         try nav_size.checkNavBytes(connectivity_oneway_group.name, self.item_count, self.size_config, &fixture.system);
     }
 
@@ -805,14 +819,15 @@ const OnewayBallast = struct {
 
     // Adds a timed sample's block reaction, which ran right after the last retire.
     fn addSample(self: *OnewayBallast, sample: ToggleSample) void {
+        if (comptime !runtime_perf_log.enabled) return;
         const change = sample.change.stats;
         self.samples += 1;
         self.close_ns += sample.change.elapsed_ns;
-        self.reserve_ns += change.main.reserve_ns;
-        inline for (.{ change.conn_closure_candidates_batch, change.conn_closure_resolve_batch, change.conn_closure_mask_batch, change.conn_closure_plan_batch, change.conn_closure_rows_batch }) |batch| {
+        self.reserve_ns += change.perf.main.reserve_ns;
+        inline for (.{ suite.perfBatch(change.perf, "conn_closure_candidates_batch"), suite.perfBatch(change.perf, "conn_closure_resolve_batch"), suite.perfBatch(change.perf, "conn_closure_mask_batch"), suite.perfBatch(change.perf, "conn_closure_plan_batch"), change.conn_closure_rows_batch }) |batch| {
             self.closure_stages_ns += batch.batch_duration_ns;
         }
-        self.land_ns += change.conn_closure_land_batch.batch_duration_ns;
+        self.land_ns += suite.perfBatch(change.perf, "conn_closure_land_batch").batch_duration_ns;
     }
 
     // The last retire: the reopen's landing (its shape, time, and words) and its tail bound
@@ -820,13 +835,14 @@ const OnewayBallast = struct {
     // freed; then the timed block reactions' split (the rest is everything outside the
     // reserve, closure, and landing). Printed under --details.
     fn write(self: OnewayBallast, details: *suite.DetailLines) void {
+        if (comptime !runtime_perf_log.enabled) return;
         if (self.retires == 0) return;
         const reopen = self.reopen.stats;
         const close = self.close.stats;
         var land_shape = suite.StageShapes(1){};
-        land_shape.add(.{reopen.conn_closure_land_batch});
+        land_shape.add(.{suite.perfBatch(reopen.perf, "conn_closure_land_batch")});
         var land_buffer: [48]u8 = undefined;
-        const land = reopen.conn_closure_land_batch;
+        const land = suite.perfBatch(reopen.perf, "conn_closure_land_batch");
         details.print("ballast rooms={} block_words={} retires={} reopen={}us reopen_land={s} reopen_land_ns={} landed_words={} tail_bound={} tail_used={} tail_ratio={d:.2} close={}us close_closure_main={}ns freed_words={} left_live_words={}\n", .{
             self.cells.len,
             self.block_words,
@@ -834,14 +850,14 @@ const OnewayBallast = struct {
             self.reopen.elapsed_ns / std.time.ns_per_us,
             land_shape.label(0, &land_buffer),
             land.batch_duration_ns,
-            reopen.closure_landed_words,
-            reopen.closure_tail_bound,
-            reopen.closure_tail_used,
-            if (reopen.closure_tail_used == 0) 0.0 else @as(f64, @floatFromInt(reopen.closure_tail_bound)) / @as(f64, @floatFromInt(reopen.closure_tail_used)),
+            reopen.perf.closure_landed_words,
+            reopen.perf.closure_tail_bound,
+            reopen.perf.closure_tail_used,
+            if (reopen.perf.closure_tail_used == 0) 0.0 else @as(f64, @floatFromInt(reopen.perf.closure_tail_bound)) / @as(f64, @floatFromInt(reopen.perf.closure_tail_used)),
             self.close.elapsed_ns / std.time.ns_per_us,
-            close.main.closure_ns,
-            reopen.closure_live_words -| close.closure_live_words,
-            close.closure_live_words,
+            close.perf.main.closure_ns,
+            reopen.perf.closure_live_words -| close.perf.closure_live_words,
+            close.perf.closure_live_words,
         });
         if (self.samples == 0) return;
         const samples: u128 = self.samples;
@@ -971,11 +987,15 @@ fn cutOnewayChain(allocator: std.mem.Allocator, io: std.Io, fixture: *ReactFixtu
     }
     try fixture.changed.ensureTotalCapacity(allocator, cells.len);
     const cut = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
-    if (cut.stats.closure_shrinks != 1) return error.ConnectivityOnewayCutNoShrink;
+    if (comptime runtime_perf_log.enabled) {
+        if (cut.stats.perf.closure_shrinks != 1) return error.ConnectivityOnewayCutNoShrink;
+    }
     try checkOnewayReserve(cut.stats);
 }
 
 fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    // Its pass shape reads the closure's diagnostic counters, kept only with the perf log.
+    if (comptime !runtime_perf_log.enabled) return error.ConnectivityOnewayNeedsPerfLog;
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try OnewayConfig.decode(item_count);
     var threads = try fixtures.initCaseThreads(allocator, io, case);

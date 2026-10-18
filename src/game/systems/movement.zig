@@ -4,6 +4,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const data = @import("../data_system.zig");
 const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
@@ -32,7 +33,10 @@ pub const MovementStats = struct {
 
 pub const MovementIntentStats = struct {
     intent_count: usize = 0,
-    batch: BatchStats = .{},
+    perf: Perf = .{},
+
+    /// The apply batch, kept only with `runtime_perf_log.enabled`.
+    pub const Perf = if (runtime_perf_log.enabled) struct { batch: BatchStats = .{} } else struct {};
 };
 
 pub const MovementSystem = struct {
@@ -88,7 +92,7 @@ pub const MovementSystem = struct {
         const batch = apply.run(selection, intents.len, data.movement_range_alignment_items, &context, applyIntentsJob);
         return .{
             .intent_count = intents.len,
-            .batch = batch,
+            .perf = if (comptime runtime_perf_log.enabled) .{ .batch = batch } else .{},
         };
     }
 };

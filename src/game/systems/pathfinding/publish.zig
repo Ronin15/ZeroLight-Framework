@@ -10,6 +10,7 @@
 //! calls them directly.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
@@ -43,11 +44,12 @@ pub const PublishBand = struct {
     counts: [flush_pair_count]u32 align(thread_shared_record_alignment) = @splat(0),
 };
 
-/// One `registry_flush` pair's entries removed and added, padded to its own cache line.
-pub const FlushTally = struct {
+/// One `registry_flush` pair's entries removed and added, padded to its own cache line; kept
+/// only with `runtime_perf_log.enabled` (`PathfindingStats.Perf`), zero-sized without it.
+pub const FlushTally = if (runtime_perf_log.enabled) struct {
     removed: usize align(thread_shared_record_alignment) = 0,
     added: usize = 0,
-};
+} else struct {};
 
 comptime {
     std.debug.assert(@sizeOf(PublishBand) % thread_shared_record_alignment == 0);
@@ -138,8 +140,10 @@ pub fn claimPublish(self: *PathfindingSystem, stats: *PathfindingStats) void {
                 }
                 stats.solved_requests += 1;
                 if (result == .partial) stats.partial_results += 1 else stats.available_results += 1;
-                if (solved.via_abstract) stats.abstract_solves += 1;
-                if (solved.cross_level) stats.cross_level_solves += 1;
+                if (comptime runtime_perf_log.enabled) {
+                    if (solved.via_abstract) stats.perf.abstract_solves += 1;
+                    if (solved.cross_level) stats.perf.cross_level_solves += 1;
+                }
             },
             // Answered without a search and never cached: dropped in
             // compactPendingAfterSolve.
@@ -150,7 +154,7 @@ pub fn claimPublish(self: *PathfindingSystem, stats: *PathfindingStats) void {
             // Start-side failure: dropped in compactPendingAfterSolve, never cached; the
             // next status query falls through to `.missing`.
             .start_invalid => {
-                stats.start_invalid_dropped += 1;
+                if (comptime runtime_perf_log.enabled) stats.perf.start_invalid_dropped += 1;
             },
             .deferred => continue,
         }
@@ -249,10 +253,12 @@ pub fn flushRegistry(self: *PathfindingSystem, dispatch: ?Dispatch, stats: ?*Pat
             .unit_starts = unit_starts,
         };
         batch = runShaped(flush_dispatch, shape, units, 1, &job, registryFlushJob);
-        if (stats) |step| {
-            for (self.flush_tallies) |tally| {
-                step.registrations_removed += tally.removed;
-                step.registrations_added += tally.added;
+        if (comptime runtime_perf_log.enabled) {
+            if (stats) |step| {
+                for (self.flush_tallies) |tally| {
+                    step.perf.registrations_removed += tally.removed;
+                    step.perf.registrations_added += tally.added;
+                }
             }
         }
     }
@@ -355,17 +361,20 @@ fn registryFlushJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
         for (job.ops) |op| {
             // Most owners hold runs in few shards.
             if (!map.holdsOwner(op.old)) continue;
-            if (op.new == no_owner) removed += map.removeOwner(op.old) else map.renameOwner(op.old, op.new);
+            if (op.new == no_owner) {
+                const count = map.removeOwner(op.old);
+                if (comptime runtime_perf_log.enabled) removed += count;
+            } else map.renameOwner(op.old, op.new);
         }
         var added: usize = 0;
         for (system.publish_bands.items[0..job.publish_ranges], system.publish_range_bases.items[0..job.publish_ranges]) |band, base| {
             var start = base;
             for (band.counts[0..pair]) |pair_count| start += pair_count;
             map.addAll(system.reg_buckets.items[start..][0..band.counts[pair]]);
-            added += band.counts[pair];
+            if (comptime runtime_perf_log.enabled) added += band.counts[pair];
         }
         if (job.truncate) map.installTruncate();
-        system.flush_tallies[pair] = .{ .removed = removed, .added = added };
+        if (comptime runtime_perf_log.enabled) system.flush_tallies[pair] = .{ .removed = removed, .added = added };
     }
 }
 
@@ -558,6 +567,7 @@ test "pathfinding a publish reserve out of memory claims nothing, leaves pending
 }
 
 test "the path registry holds every run of every published path, and the incremental registry equals one rebuilt from the live cache after victims, TTL expiry, evictions, re-puts, and a shrink with renames" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -585,7 +595,7 @@ test "the path registry holds every run of every published path, and the increme
     // Evictions: a dig across the middle of the map.
     try setRegistryCells(&system, &fixture, &.{ .{ 11, 11 }, .{ 12, 11 }, .{ 12, 12 } }, fixture.tree);
     const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expect(reaction.evicted_results != 0);
+    try std.testing.expect(reaction.perf.evicted_results != 0);
     try expectRegistryMatchesCache(&system);
 
     // A re-put: the same key published with a different path.
@@ -629,6 +639,7 @@ test "re-putting a key replaces its registrations" {
 }
 
 test "threaded publish equals serial across range sizes and worker counts (cache bytes, per-shard lists, stats), and publish_copy and registry_flush run on workers" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -648,7 +659,7 @@ test "threaded publish equals serial across range sizes and worker counts (cache
     }
     const serial_stats = try updatePathfindingInline(&serial, &stream, 64, .{});
     try std.testing.expectEqual(@as(usize, 48), serial_stats.available_results);
-    try std.testing.expect(serial_stats.registrations_added > 48);
+    try std.testing.expect(serial_stats.perf.registrations_added > 48);
     try std.testing.expect(serial.completed.long_block_count != 0);
     try expectRegistryMatchesCache(&serial);
     for ([_]usize{ 1, 3 }) |workers| {
@@ -662,11 +673,11 @@ test "threaded publish equals serial across range sizes and worker counts (cache
             try expectSameCache(&serial, &threaded);
             try expectSameRegistry(&serial, &threaded);
             try std.testing.expectEqual(serial_stats.available_results, stats.available_results);
-            try std.testing.expectEqual(serial_stats.registrations_added, stats.registrations_added);
-            try std.testing.expectEqual(serial_stats.registrations_removed, stats.registrations_removed);
+            try std.testing.expectEqual(serial_stats.perf.registrations_added, stats.perf.registrations_added);
+            try std.testing.expectEqual(serial_stats.perf.registrations_removed, stats.perf.registrations_removed);
             try std.testing.expectEqual(serial_stats.cache_evictions, stats.cache_evictions);
             if (items_per_range == 1) {
-                try std.testing.expect(!stats.publish_copy_batch.ran_inline and stats.publish_copy_batch.range_count > 1);
+                try std.testing.expect(!stats.perf.publish_copy_batch.ran_inline and stats.perf.publish_copy_batch.range_count > 1);
                 try std.testing.expect(!stats.registry_flush_batch.ran_inline and stats.registry_flush_batch.range_count > 1);
             }
         }
@@ -674,6 +685,7 @@ test "threaded publish equals serial across range sizes and worker counts (cache
 }
 
 test "publish after its reserve allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -704,8 +716,8 @@ test "publish after its reserve allocates nothing on a multi-worker ThreadSystem
     const published = try stats;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(usize, 48), published.available_results);
-    try std.testing.expect(!published.publish_copy_batch.ran_inline and !published.registry_flush_batch.ran_inline);
-    const units = flushUnits(0, published.registrations_added);
+    try std.testing.expect(!published.perf.publish_copy_batch.ran_inline and !published.registry_flush_batch.ran_inline);
+    const units = flushUnits(0, published.perf.registrations_added);
     try std.testing.expectEqual(units, published.registry_flush_batch.item_count);
     try std.testing.expectEqual(units, published.registry_flush_batch.range_count);
     try expectRegistryMatchesCache(&system);

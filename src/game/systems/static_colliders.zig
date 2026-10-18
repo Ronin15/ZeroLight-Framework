@@ -16,6 +16,7 @@
 //! `ColliderView`.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
 const logging = @import("../../core/logging.zig");
@@ -512,12 +513,12 @@ pub const StaticColliderSystem = struct {
     anchor_clears: std.ArrayList(u64) = .empty,
     // The chunk and query lists' splice stages: each its own tuner, sharing the range
     // controls (production runs adaptive; benches pin a fixed partition), and their last
-    // batch shapes.
+    // batch shapes (the query lists' only with `runtime_perf_log.enabled`).
     splice_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     query_splice_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     splice_controls: StageControls = .{},
     last_splice_batch: BatchStats = .{},
-    last_query_splice_batch: BatchStats = .{},
+    perf: Perf = .{},
     // Column views refreshed whenever the row pool grows.
     row_entity: []EntityId = &.{},
     row_level: []u16 = &.{},
@@ -535,6 +536,8 @@ pub const StaticColliderSystem = struct {
     /// Telemetry: anchor-block pool and anchor-edit scratch growths, logged once.
     anchor_grows: u64 = 0,
     anchor_growth_logged: bool = false,
+
+    pub const Perf = if (runtime_perf_log.enabled) struct { last_query_splice_batch: BatchStats = .{} } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) StaticColliderSystem {
         return .{
@@ -908,7 +911,7 @@ pub const StaticColliderSystem = struct {
     pub fn sync(self: *StaticColliderSystem, data: *const DataSystem, thread_system: ?*ThreadSystem) error{OutOfMemory}!void {
         self.changes.clearRetainingCapacity();
         self.last_splice_batch = .{};
-        self.last_query_splice_batch = .{};
+        if (comptime runtime_perf_log.enabled) self.perf.last_query_splice_batch = .{};
         const pending = self.pending_dirty.items;
         if (pending.len == 0) return;
         const geometry = self.geometry.?;
@@ -1021,7 +1024,8 @@ pub const StaticColliderSystem = struct {
         }
         // Query lists first: the anchor edits read their emptiness, and run while the chunk
         // tier still holds every key a block can sit on (its commit drops emptied keys).
-        self.last_query_splice_batch = self.query_lists.commitBatch(self.spliceThreads(thread_system, &self.query_splice_tuner));
+        const query_splice_batch = self.query_lists.commitBatch(self.spliceThreads(thread_system, &self.query_splice_tuner));
+        if (comptime runtime_perf_log.enabled) self.perf.last_query_splice_batch = query_splice_batch;
         self.applyAnchorEdits();
         self.last_splice_batch = self.chunk_lists.commitBatch(self.spliceThreads(thread_system, &self.splice_tuner));
         self.refreshQueryClassMask();
@@ -1536,7 +1540,7 @@ fn expectSyncOutOfMemorySafe(thread_system: ?*ThreadSystem) !void {
         fixture.colliders.query_lists.allocator = std.testing.allocator;
         if (result) |_| {
             try std.testing.expect(!failing.has_induced_failure);
-            if (thread_system != null) try std.testing.expect(!fixture.colliders.last_splice_batch.ran_inline and !fixture.colliders.last_query_splice_batch.ran_inline);
+            if (comptime runtime_perf_log.enabled) if (thread_system != null) try std.testing.expect(!fixture.colliders.last_splice_batch.ran_inline and !fixture.colliders.perf.last_query_splice_batch.ran_inline);
             // The swept sync grew the anchor-block pool.
             try std.testing.expect(fixture.colliders.anchor_blocks.items.len > blocks_before);
             var after = try fixture.rebuilt();
@@ -1652,6 +1656,7 @@ fn denseMixedCommands(random: std.Random, data: *const DataSystem, live: []const
 }
 
 test "a dense mixed collider sync lists every chunk in entity order, threaded equal to serial and to a rebuild" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
@@ -1683,7 +1688,7 @@ test "a dense mixed collider sync lists every chunk in entity order, threaded eq
         try expectSameRows(&serial.colliders, &rebuilt, 3);
         const batch = threaded.colliders.last_splice_batch;
         if (!batch.ran_inline and batch.range_count > 1) threaded_ranges += 1;
-        const query_batch = threaded.colliders.last_query_splice_batch;
+        const query_batch = threaded.colliders.perf.last_query_splice_batch;
         if (!query_batch.ran_inline and query_batch.range_count > 1) threaded_query_ranges += 1;
     }
     try std.testing.expect(threaded_ranges != 0);
@@ -1691,6 +1696,7 @@ test "a dense mixed collider sync lists every chunk in entity order, threaded eq
 }
 
 test "a splice worker cap of zero keeps both splice stages inline on a multi-worker ThreadSystem and lists the same chunks" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
@@ -1722,14 +1728,14 @@ test "a splice worker cap of zero keeps both splice stages inline on a multi-wor
         try expectIdenticalLayout(&uncapped.colliders, &capped.colliders, 3);
         for ([_][2]BatchStats{
             .{ uncapped.colliders.last_splice_batch, capped.colliders.last_splice_batch },
-            .{ uncapped.colliders.last_query_splice_batch, capped.colliders.last_query_splice_batch },
+            .{ uncapped.colliders.perf.last_query_splice_batch, capped.colliders.perf.last_query_splice_batch },
         }) |pair| {
             try std.testing.expectEqual(pair[0].item_count, pair[1].item_count);
             try std.testing.expect(pair[1].ran_inline and pair[1].active_worker_threads == 0);
         }
         const batch = uncapped.colliders.last_splice_batch;
         if (!batch.ran_inline and batch.worker_thread_ranges != 0) threaded_ranges += 1;
-        const query_batch = uncapped.colliders.last_query_splice_batch;
+        const query_batch = uncapped.colliders.perf.last_query_splice_batch;
         if (!query_batch.ran_inline and query_batch.worker_thread_ranges != 0) threaded_query_ranges += 1;
     }
     try std.testing.expect(threaded_ranges != 0);
@@ -1830,6 +1836,7 @@ test "a destroy-heavy sync grows no rows" {
 }
 
 test "a threaded sync after its reserves allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
@@ -1875,7 +1882,7 @@ test "a threaded sync after its reserves allocates nothing on a multi-worker Thr
         fixture.colliders.capture(&fixture.frame);
         try fixture.colliders.sync(&fixture.data, &threads);
         try std.testing.expect(!fixture.colliders.last_splice_batch.ran_inline and fixture.colliders.last_splice_batch.range_count > 1);
-        try std.testing.expect(!fixture.colliders.last_query_splice_batch.ran_inline and fixture.colliders.last_query_splice_batch.range_count > 1);
+        try std.testing.expect(!fixture.colliders.perf.last_query_splice_batch.ran_inline and fixture.colliders.perf.last_query_splice_batch.range_count > 1);
         // Every static's anchor moved: 48 sets and 48 clears ran.
         try std.testing.expectEqual(@as(usize, 48), fixture.colliders.anchor_sets.items.len);
         try std.testing.expectEqual(@as(usize, 48), fixture.colliders.anchor_clears.items.len);
@@ -2280,6 +2287,7 @@ test "a row whose extent equals its class edge is reached from a box touching it
 }
 
 test "a move across a tile inside its chunks touches only the query tier" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
     // A one-tile static in chunk 0, moved one tile over inside the chunk, then inside its
@@ -2291,7 +2299,7 @@ test "a move across a tile inside its chunks touches only the query tier" {
     const heads_before = fixture.colliders.chunk_lists.head(chunkKey(0, 0));
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(entity, .{ .x = 72, .y = 40 })});
     try std.testing.expectEqual(@as(usize, 0), fixture.colliders.last_splice_batch.item_count);
-    try std.testing.expectEqual(@as(usize, 1), fixture.colliders.last_query_splice_batch.item_count);
+    try std.testing.expectEqual(@as(usize, 1), fixture.colliders.perf.last_query_splice_batch.item_count);
     try std.testing.expectEqual(heads_before, fixture.colliders.chunk_lists.head(chunkKey(0, 0)));
     // The chunk keeps its block, the bit moved one cell over.
     try std.testing.expectEqual(block, fixture.colliders.chunk_lists.value(chunkKey(0, 0)));
@@ -2301,7 +2309,7 @@ test "a move across a tile inside its chunks touches only the query tier" {
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(entity, .{ .x = 73, .y = 41 })});
     try std.testing.expectEqual(@as(usize, 0), fixture.colliders.last_splice_batch.item_count);
-    try std.testing.expectEqual(@as(usize, 0), fixture.colliders.last_query_splice_batch.item_count);
+    try std.testing.expectEqual(@as(usize, 0), fixture.colliders.perf.last_query_splice_batch.item_count);
 }
 
 test "the class mask clears when its last row leaves the class" {

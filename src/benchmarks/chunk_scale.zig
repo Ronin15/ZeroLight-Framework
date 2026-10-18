@@ -71,6 +71,7 @@
 //!     warmup included, so A/B runs use the same `--warmup` and `--iterations`.
 
 const std = @import("std");
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -570,6 +571,7 @@ const Fixture = struct {
     dirt: TileId,
     tunnel: TileId,
     ramp: TileId,
+    dig: DigConfig,
     // A blocking sparse prop.
     prop: TileId,
     side: u16,
@@ -687,14 +689,16 @@ const Fixture = struct {
 
 // A walkable surface over `levels - 1` solid levels, each one uniform dense band.
 fn buildFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16) !Fixture {
-    var world = try fixtures.buildBandedWorld(allocator, io, side, levels, "grass", "dirt");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    const meta = &tileset;
+    var world = try fixtures.buildBandedWorld(allocator, meta, side, levels, "grass", "dirt");
     errdefer world.deinit();
-    const meta = world.tilesetMeta().?;
     const dirt = try world.requireTileByName(meta, "dirt");
     const tunnel = try world.requireTileByName(meta, "cave_0");
-    const ramp = (try DigConfig.fromMeta(meta)).ramp_tile;
+    const dig = try DigConfig.fromMeta(meta);
     const prop = try world.requireTileByName(meta, "deco_0");
-    return .{ .world = world, .dirt = dirt, .tunnel = tunnel, .ramp = ramp, .prop = prop, .side = side, .levels = levels };
+    return .{ .world = world, .dirt = dirt, .tunnel = tunnel, .ramp = dig.ramp_tile, .dig = dig, .prop = prop, .side = side, .levels = levels };
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, shape: CaseShape) !suite.RunStats {
@@ -803,7 +807,7 @@ fn runControllerDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     std.debug.assert(code.levels >= cave_in_levels + 1 and code.level_side >= 256);
     var fixture = try buildFixture(allocator, io, code.level_side, code.levels);
     defer fixture.deinit();
-    var controller = DigController.init(try DigConfig.fromMeta(fixture.world.tilesetMeta().?));
+    var controller = DigController.init(fixture.dig);
     defer controller.deinit();
     var driver = try DigDriver.init(allocator, fixture.levels - 1);
     defer driver.deinit();
@@ -1143,14 +1147,14 @@ const BatchTiming = struct {
     forward_write: BatchStats = .{},
 
     fn add(self: *BatchTiming, world: *const WorldSystem) void {
-        for ([_]BatchStats{ world.last_terrain_edit_plan_batch, world.last_terrain_edit_write_batch }) |batch| self.off_main_ns += offMainNs(batch);
-        self.plan_ns += world.last_terrain_edit_plan_batch.batch_duration_ns;
-        self.write_ns += world.last_terrain_edit_write_batch.batch_duration_ns;
+        for ([_]BatchStats{ suite.perfBatch(world.perf, "last_terrain_edit_plan_batch"), suite.perfBatch(world.perf, "last_terrain_edit_write_batch") }) |batch| self.off_main_ns += offMainNs(batch);
+        self.plan_ns += suite.perfBatch(world.perf, "last_terrain_edit_plan_batch").batch_duration_ns;
+        self.write_ns += suite.perfBatch(world.perf, "last_terrain_edit_write_batch").batch_duration_ns;
     }
 
     fn captureForward(self: *BatchTiming, world: *const WorldSystem) void {
-        self.forward_plan = world.last_terrain_edit_plan_batch;
-        self.forward_write = world.last_terrain_edit_write_batch;
+        self.forward_plan = suite.perfBatch(world.perf, "last_terrain_edit_plan_batch");
+        self.forward_write = suite.perfBatch(world.perf, "last_terrain_edit_write_batch");
     }
 };
 
@@ -1408,7 +1412,7 @@ const NavFixture = struct {
     // writers' mark stage, which ran inside their writes.
     fn react(self: *NavFixture, frame: *SimulationFrame) !NavUpdateStats {
         const pathfinding = &self.pipeline.pathfinding;
-        const mark_ns = pathfinding.pending_mark_off_main_ns + pathfinding.pending_mark_inline_ns + pathfinding.pending_mark_main_ns;
+        const mark_ns = if (comptime runtime_perf_log.enabled) pathfinding.perf.mark_off_main_ns + pathfinding.perf.mark_inline_ns + pathfinding.perf.mark_main_ns else 0;
         const start_ns = suite.nowNs(self.io);
         const stats = try pathfinding.reactToPostCommitNavEvents(frame, &self.pipeline.static_colliders, &self.base.world, self.threads);
         self.last_reaction_ns = mark_ns + suite.elapsedNs(start_ns, suite.nowNs(self.io));
@@ -1421,7 +1425,8 @@ const NavFixture = struct {
     // The most recent reaction's main-thread split: its wall time outside worker dispatches.
     fn lastNavMain(self: *const NavFixture) suite.NavMainSummary {
         var summary = suite.NavMainSummary{};
-        summary.add(self.last_reaction_ns -| self.last_stats.off_main_stage_ns, self.last_stats);
+        const off_main_ns = if (comptime runtime_perf_log.enabled) self.last_stats.perf.off_main_stage_ns else 0;
+        summary.add(self.last_reaction_ns -| off_main_ns, self.last_stats);
         summary.endSample();
         return summary;
     }
@@ -1484,7 +1489,7 @@ fn navFixtureOver(allocator: std.mem.Allocator, io: std.Io, fixture: Fixture, ca
         .pathfinding = capacity,
         .navigation_world = &base.world,
         .nav_build_thread_system = thread_system,
-        .dig = try DigConfig.fromMeta(base.world.tilesetMeta().?),
+        .dig = base.dig,
     });
     return .{ .base = base, .pipeline = pipeline, .io = io };
 }
@@ -1572,8 +1577,8 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.nav_conn = suite.navConnSummary(timed_stats, fixtures.floodTunerWorkersOf(tuners, case));
     stats.nav_main = timed_main;
     stats.batch = suite.batchSummaryFromBatch(timed_stats.remask_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(timed_stats.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(timed_stats.patch_batch);
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(suite.perfBatch(timed_stats.perf, "plan_batch"));
+    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(timed_stats.perf, "patch_batch"));
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(tuners.nav.getPtrConst(.remask)), remask_settled);
         stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(tuners.nav.getPtrConst(.patch)), patch_settled);
@@ -1662,12 +1667,13 @@ fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, frame: *
         nav.noteFlood(reverting);
         if (!reverting) {
             timing.forward = nav_stats;
-            timing.forward_mark = nav.pipeline.pathfinding.last_mark_batch;
+            timing.forward_mark = suite.perfBatch(nav.pipeline.pathfinding.perf, "last_mark_batch");
         }
         timing.nav_ns += nav_elapsed_ns;
         timing.elapsed_ns += nav_elapsed_ns;
-        timing.nav_off_main_ns += nav_stats.off_main_stage_ns;
-        timing.nav_main.add(nav_elapsed_ns -| nav_stats.off_main_stage_ns, nav_stats);
+        const nav_off_main_ns = if (comptime runtime_perf_log.enabled) nav_stats.perf.off_main_stage_ns else 0;
+        timing.nav_off_main_ns += nav_off_main_ns;
+        timing.nav_main.add(nav_elapsed_ns -| nav_off_main_ns, nav_stats);
     }
     return edit.forward.items.len + edit.back.items.len;
 }
@@ -1882,8 +1888,10 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         forward_mark = timing.forward_mark;
         nav_main.merge(timing.nav_main);
         nav_main.endSample();
-        if (enclose) |config| {
-            if (forward.conn_splits != config.pockets()) return error.NavEnclosePocketsNotSplit;
+        if (comptime runtime_perf_log.enabled) {
+            if (enclose) |config| {
+                if (forward.perf.conn_splits != config.pockets()) return error.NavEnclosePocketsNotSplit;
+            }
         }
         const elapsed_ns = timing.elapsed_ns;
         accumulator.record(elapsed_ns, forward.remask_batch);
@@ -1902,8 +1910,8 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     stats.nav_main = nav_main;
     stats.batch = suite.batchSummaryFromBatch(forward.remask_batch);
     stats.nav_mark_batch = suite.batchSummaryFromBatch(forward_mark);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(forward.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(forward.patch_batch);
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(suite.perfBatch(forward.perf, "plan_batch"));
+    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(forward.perf, "patch_batch"));
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         stats.terrain_edit_phases = .{

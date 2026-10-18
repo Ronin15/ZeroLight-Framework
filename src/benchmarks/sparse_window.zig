@@ -170,13 +170,11 @@ const Fixture = struct {
     }
 };
 
-// The world adopts the tileset metadata, so its lookups read the owned copy and
-// never the local `buildCatalog` borrowed.
+// The world reads the tileset metadata only while it builds; `sourceRect` reads its catalog.
 fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, sparse_count: usize) !void {
     std.debug.assert(sparse_count >= window_tile_count);
     var meta = try fixtures.loadTilesetMeta(allocator, io);
-    var meta_owned = true;
-    defer if (meta_owned) meta.deinit();
+    defer meta.deinit();
     fixture.* = .{
         .world = .{
             .allocator = allocator,
@@ -200,8 +198,6 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, spar
     for (0..world_levels) |level_index| {
         _ = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
     }
-    world.adoptTilesetMeta(meta);
-    meta_owned = false;
 
     for (0..window_tile_count) |index| {
         const x = window_block_x + @as(u16, @intCast(index % window_block_edge));

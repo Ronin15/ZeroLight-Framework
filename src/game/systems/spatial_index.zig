@@ -18,6 +18,7 @@
 //! identical for any partition of the build.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const pdqSort = @import("../../core/sort.zig").pdq;
@@ -203,9 +204,14 @@ pub const NeighborQuery = struct {
 pub const SpatialIndexStats = struct {
     /// Entries built: the population's slots with a movement body.
     entity_count: usize = 0,
-    bucket_batch: BatchStats = .{},
     sort_batch: BatchStats = .{},
-    link_batch: BatchStats = .{},
+    perf: Perf = .{},
+
+    /// The bucket and link batches, kept only with `runtime_perf_log.enabled`.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        bucket_batch: BatchStats = .{},
+        link_batch: BatchStats = .{},
+    } else struct {};
 };
 
 comptime {
@@ -685,6 +691,9 @@ const BoxRuns = struct {
     }
 };
 
+/// A neighbor block's fill count, kept only with `runtime_perf_log.enabled`.
+pub const BlockPerf = if (runtime_perf_log.enabled) struct { fills: u32 = 0 } else struct {};
+
 /// One query key's neighborhood: the entries its scan visits, in scan order, filled on
 /// demand up to `capacity` and shared by consecutive queries with that key. Valid for one
 /// view; lives on its user's stack. Positions past `len` hold finite stale values.
@@ -706,8 +715,8 @@ pub fn NeighborBlock(comptime block_capacity: u16) type {
         key: BlockKey = no_key,
         runs: BoxRuns = .{},
         exhausted: bool = true,
-        /// Key changes: the fills its users paid.
-        fills: u32 = 0,
+        /// Key changes: the fills its users paid (`runtime_perf_log.enabled` only).
+        perf: BlockPerf = .{},
 
         fn reset(self: *Self, view: *const SpatialIndexView, key: BlockKey) void {
             const box = QueryBox.ofKey(view, key);
@@ -717,7 +726,7 @@ pub fn NeighborBlock(comptime block_capacity: u16) type {
             self.own_end = 0;
             self.runs = .init(view, box);
             self.exhausted = box.empty;
-            self.fills += 1;
+            if (comptime runtime_perf_log.enabled) self.perf.fills += 1;
         }
 
         // Copies whole runs until `target` positions are held, the box ends, or the block is
@@ -1113,9 +1122,11 @@ pub const SpatialIndexSystem = struct {
         if (tallies[0].cell_count != 0) linkBand(&link, 0);
         return .{
             .entity_count = entry_count,
-            .bucket_batch = inlineBatch(slot_count, spatial_index_range_alignment_items),
             .sort_batch = inlineBatch(entry_count, spatial_index_range_alignment_items),
-            .link_batch = inlineBatch(tallies[0].cell_count, spatial_index_range_alignment_items),
+            .perf = if (comptime runtime_perf_log.enabled) .{
+                .bucket_batch = inlineBatch(slot_count, spatial_index_range_alignment_items),
+                .link_batch = inlineBatch(tallies[0].cell_count, spatial_index_range_alignment_items),
+            } else .{},
         };
     }
 
@@ -1140,7 +1151,8 @@ pub const SpatialIndexSystem = struct {
             .band_offsets = self.band_offsets.items,
         };
         var stats = SpatialIndexStats{};
-        stats.bucket_batch = stages.bucket.run(bucket_selection, slot_count, spatial_index_range_alignment_items, &bucket, bucketJob);
+        const bucket_batch = stages.bucket.run(bucket_selection, slot_count, spatial_index_range_alignment_items, &bucket, bucketJob);
+        if (comptime runtime_perf_log.enabled) stats.perf.bucket_batch = bucket_batch;
 
         // Each band's keys start after every range's keys of the earlier bands.
         var band_start: [band_count + 1]u32 = @splat(0);
@@ -1166,7 +1178,8 @@ pub const SpatialIndexSystem = struct {
         for (&tallies, self.band_tallies.items) |*tally, slot| tally.* = slot.value;
         const link_selection = stages.link.select(cellTotal(tallies), spatial_index_range_alignment_items);
         var link = try self.prepareLink(band_start, tallies, link_selection.range_count);
-        stats.link_batch = stages.link.run(link_selection, link.cell_prefix[band_count], spatial_index_range_alignment_items, &link, linkJob);
+        const link_batch = stages.link.run(link_selection, link.cell_prefix[band_count], spatial_index_range_alignment_items, &link, linkJob);
+        if (comptime runtime_perf_log.enabled) stats.perf.link_batch = link_batch;
         return stats;
     }
 
@@ -2116,6 +2129,7 @@ fn testStages(threads: *ThreadSystem, tuners: *[3]AdaptiveWorkTuner, workers: us
 }
 
 test "serial and threaded index builds match across layouts, splitters, range sizes, and worker counts" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3, .items_per_range = 16 });
@@ -2149,7 +2163,7 @@ test "serial and threaded index builds match across layouts, splitters, range si
                     for ([_]usize{ 16, 1024 }) |link_items| {
                         _ = try system.beginBuild(population, layout_geometry, config);
                         const stats = try system.buildBanded(&data, population, testStages(&threads, &tuners, workers, bucket_items, sort_items, link_items), chooseSplitters(&data, population, system.grid));
-                        try testing.expect(!stats.bucket_batch.ran_inline);
+                        try testing.expect(!stats.perf.bucket_batch.ran_inline);
                         try expectIndexMatches(&system, &reference, &reference_system);
                     }
                 }
@@ -2161,18 +2175,18 @@ test "serial and threaded index builds match across layouts, splitters, range si
         for (std.meta.tags(TestSplitters)) |set| {
             _ = try system.beginBuild(population, layout_geometry, config);
             const stats = try system.buildBanded(&data, population, stages, testSplitters(set, reference.cell_keys.items));
-            try testing.expect(!stats.bucket_batch.ran_inline and !stats.sort_batch.ran_inline);
+            try testing.expect(!stats.perf.bucket_batch.ran_inline and !stats.sort_batch.ran_inline);
             try expectIndexMatches(&system, &reference, &reference_system);
         }
 
         // The production build, and a config that allows no worker builds serially.
         const threaded = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .items_per_range = 16, .max_worker_threads = 3, .adaptive = false });
-        try testing.expect(!threaded.bucket_batch.ran_inline and !threaded.sort_batch.ran_inline);
+        try testing.expect(!threaded.perf.bucket_batch.ran_inline and !threaded.sort_batch.ran_inline);
         // The link stage partitions the cells: one range of them may run inline.
-        try testing.expect(reference.cell_keys.items.len <= 16 or !threaded.link_batch.ran_inline);
+        try testing.expect(reference.cell_keys.items.len <= 16 or !threaded.perf.link_batch.ran_inline);
         try expectIndexMatches(&system, &reference, &reference_system);
         const serial = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .max_worker_threads = 0 });
-        try testing.expect(serial.bucket_batch.ran_inline and serial.sort_batch.ran_inline and serial.link_batch.ran_inline);
+        try testing.expect(serial.perf.bucket_batch.ran_inline and serial.sort_batch.ran_inline and serial.perf.link_batch.ran_inline);
         try expectIndexMatches(&system, &reference, &reference_system);
     }
 }
@@ -3016,6 +3030,7 @@ test "a block query visits its key's scan-order stream over every layout, budget
 }
 
 test "a reused block gives bit-identical visits to a fresh block, and a key change resets it" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     try fillBruteForceLayout(&data);
@@ -3040,7 +3055,7 @@ test "a reused block gives bit-identical visits to a fresh block, and a key chan
         try fresh_visits.expectEqual(&reused_visits);
     }
     // One fill per key change: dense, other, dense, other.
-    try testing.expectEqual(@as(u32, 4), block.fills);
+    try testing.expectEqual(@as(u32, 4), block.perf.fills);
 }
 
 test "a block at capacity ends at the budget" {
@@ -3352,6 +3367,7 @@ test "the index builds correctly above a small reserved capacity" {
 }
 
 test "after reserve and reserveGeometry, threaded builds at 2 and 4 partitions per stage, a serial build, and queries allocate nothing" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // No warm build: the reserves alone cover every partition the tuners can pick.
     if (builtin.single_threaded) return error.SkipZigTest;
 
@@ -3387,8 +3403,8 @@ test "after reserve and reserveGeometry, threaded builds at 2 and 4 partitions p
     for ([_]usize{ 32, 16 }) |items_per_range| {
         const stats = try system.build(&data, population, geometry, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
         try testing.expectEqual(population_count, stats.entity_count);
-        try testing.expect(!stats.bucket_batch.ran_inline and !stats.sort_batch.ran_inline and !stats.link_batch.ran_inline);
-        for ([_]BatchStats{ stats.bucket_batch, stats.sort_batch, stats.link_batch }) |batch| {
+        try testing.expect(!stats.perf.bucket_batch.ran_inline and !stats.sort_batch.ran_inline and !stats.perf.link_batch.ran_inline);
+        for ([_]BatchStats{ stats.perf.bucket_batch, stats.sort_batch, stats.perf.link_batch }) |batch| {
             try testing.expectEqual(population_count / items_per_range, batch.range_count);
         }
         try testing.expectEqualSlices(u32, reference.view().entity_index, system.view().entity_index);

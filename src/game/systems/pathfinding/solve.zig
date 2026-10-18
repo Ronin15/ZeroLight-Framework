@@ -8,6 +8,7 @@
 //! NavGraph's grids and chunk records; they stay free functions to keep that wiring flat.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const simd = @import("../../../core/simd.zig");
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
@@ -231,8 +232,10 @@ fn solveAbstract(
     var least_expanded: LeastExpanded = undefined;
     const least: ?*LeastExpanded = if (request.tier == 0) null else &least_expanded;
     const searched = abstractCorridor(graph, abstract, start_grid, goal_grid, request.start_level, request.key.goal_level, start_index, goal_index, abstract_node_cap, &heuristic, least);
-    scratch.crossing_boxes_settled += abstract.crossing.settles;
-    scratch.crossing_budget_frozen += @intFromBool(abstract.crossing.frozen);
+    if (comptime runtime_perf_log.enabled) {
+        scratch.perf.crossing_boxes_settled += abstract.crossing.settles;
+        scratch.perf.crossing_budget_frozen += @intFromBool(abstract.crossing.frozen);
+    }
     const to_goal = searched == .found;
     const corridor = switch (searched) {
         .found, .toward => |c| c,

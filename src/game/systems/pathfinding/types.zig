@@ -278,8 +278,8 @@ pub const NavMark = struct {
 
 /// Main-thread wall time of one nav reaction's ordered sections, in ns, summed over its level
 /// builds and marks batch. No section spans a stage job, dispatched or inline, so the reaction's
-/// main time minus their sum and its inline stage time is untimed glue. Zero in ReleaseFast and
-/// ReleaseSmall (`StageTimer`). Diagnostic only.
+/// main time minus their sum and its inline stage time is untimed glue. Diagnostic only
+/// (`NavUpdateStats.Perf`).
 pub const NavMainPhases = struct {
     // The terrain records' event check and `nav_mark`'s profile select, tally reset, and
     // window append.
@@ -319,93 +319,107 @@ pub const NavUpdateStats = struct {
     levels_built: usize = 0,
     // Records the marks batch left holding portals.
     records_patched: usize = 0,
-    // Remask, patch, mark, and eviction dispatch time that ran on workers; inline stages
-    // add nothing. Diagnostic only.
-    off_main_stage_ns: u64 = 0,
-    // The same stages' time run inline on the main thread. Diagnostic only.
-    inline_stage_ns: u64 = 0,
-    // The graph's stages of the level builds and the marks batch, summed: the key plan
-    // (marks batches only), the chunk remask, and the record patch.
-    plan_batch: BatchStats = .{},
+    // The chunk remask, the connectivity flood (every round folded into one), the one-way
+    // closure's rows (rounds folded into one), and the eviction halo walk, summed over the
+    // level builds and the marks batch.
     remask_batch: BatchStats = .{},
-    patch_batch: BatchStats = .{},
-    // Path eviction: the pre-commit bound count over the changed keys, the halo walk over
-    // their registrations, and the registry flush of the removals.
-    evict_count_batch: BatchStats = .{},
-    evict_batch: BatchStats = .{},
-    evict_flush_batch: BatchStats = .{},
-    // Registry entries the halo walk visited, the cached results it evicted, and the group
-    // fields a changed cell next to a costed cell dropped.
-    evict_entries_visited: usize = 0,
-    evicted_results: usize = 0,
-    dropped_fields: usize = 0,
-    // The connectivity stages of the level builds and the marks batch, summed: the seed over
-    // changed keys, the gather over patch keys and new links, and the flood over its searches
-    // (every round folded into one).
-    conn_seed_batch: BatchStats = .{},
-    conn_gather_batch: BatchStats = .{},
     conn_flood_batch: BatchStats = .{},
-    // The fewest and most searches any flood round dispatched (both zero with no round), and
-    // the flood rounds' dispatch time on workers. Diagnostic only.
-    conn_round_items_min: usize = 0,
-    conn_round_items_max: usize = 0,
-    conn_flood_off_main_ns: u64 = 0,
-    // Active sets the flood rounds' builds walked on the main thread. Diagnostic only.
-    conn_build_visits: usize = 0,
-    // Across level builds and the marks batch: connectivity root-groups united, flood families
-    // and rounds, nodes the floods expanded, components a flood split off, and roots merged
-    // into another.
-    conn_groups: usize = 0,
-    conn_families: usize = 0,
-    conn_rounds: usize = 0,
-    conn_flood_nodes: usize = 0,
-    conn_splits: usize = 0,
-    conn_merges: usize = 0,
-    // The one-way closure's stages across level builds and the marks batch: the candidate
-    // scan (prepare), link resolve, row mask, SCC plan, and rows (rounds folded into one),
-    // and the landing of relocated blocks (the reaction's end, or a retry at a prepare).
-    conn_closure_candidates_batch: BatchStats = .{},
-    conn_closure_land_batch: BatchStats = .{},
-    conn_closure_resolve_batch: BatchStats = .{},
-    conn_closure_mask_batch: BatchStats = .{},
-    conn_closure_plan_batch: BatchStats = .{},
     conn_closure_rows_batch: BatchStats = .{},
-    // The closure's components touched, links resolved, terminals new and left, rows
-    // recomputed (|A|), row rounds (round 0 included), block words written, blocks narrowed,
-    // blocks allocated and freed, words landed, and landings deferred by `OutOfMemory`,
-    // summed; and the live block words and the batch tail's capacity after the last batch.
-    closure_touched: usize = 0,
-    closure_links: usize = 0,
-    closure_terms_new: usize = 0,
-    closure_terms_left: usize = 0,
-    closure_a_rows: usize = 0,
-    closure_rounds: usize = 0,
-    closure_words_written: usize = 0,
-    closure_shrinks: usize = 0,
-    closure_block_allocs: usize = 0,
-    closure_block_frees: usize = 0,
-    closure_landed_words: usize = 0,
-    closure_land_deferrals: usize = 0,
-    closure_live_words: usize = 0,
-    closure_tail_capacity: usize = 0,
-    // Each the most over the update's closure batches: the tail words a batch's bound
-    // reserved and its relocated blocks took, its candidate components' block words, and the
-    // terminals it could number.
-    closure_tail_bound: usize = 0,
-    closure_tail_used: usize = 0,
-    closure_candidate_words: usize = 0,
-    closure_kb: usize = 0,
-    // The reaction's main-thread sections, the terrain records' `nav_mark` folded in.
-    main: NavMainPhases = .{},
+    evict_batch: BatchStats = .{},
+    perf: Perf = .{},
+
+    /// The diagnostics `recordTo` does not read: kept only with `runtime_perf_log.enabled`,
+    /// zero-sized without it, so every write and read sits under that comptime gate.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        // Remask, patch, mark, and eviction dispatch time that ran on workers; inline stages
+        // add nothing.
+        off_main_stage_ns: u64 = 0,
+        // The same stages' time run inline on the main thread.
+        inline_stage_ns: u64 = 0,
+        // The key plan (marks batches only) and the record patch, summed.
+        plan_batch: BatchStats = .{},
+        patch_batch: BatchStats = .{},
+        // Path eviction: the pre-commit bound count over the changed keys and the registry
+        // flush of the removals.
+        evict_count_batch: BatchStats = .{},
+        evict_flush_batch: BatchStats = .{},
+        // Registry entries the halo walk visited, the cached results it evicted, and the group
+        // fields a changed cell next to a costed cell dropped.
+        evict_entries_visited: usize = 0,
+        evicted_results: usize = 0,
+        dropped_fields: usize = 0,
+        // The connectivity seed over changed keys and gather over patch keys and new links.
+        conn_seed_batch: BatchStats = .{},
+        conn_gather_batch: BatchStats = .{},
+        // The fewest and most searches any flood round dispatched (both zero with no round),
+        // and the flood rounds' dispatch time on workers.
+        conn_round_items_min: usize = 0,
+        conn_round_items_max: usize = 0,
+        conn_flood_off_main_ns: u64 = 0,
+        // Active sets the flood rounds' builds walked on the main thread.
+        conn_build_visits: usize = 0,
+        // Across level builds and the marks batch: connectivity root-groups united, flood
+        // families and rounds, nodes the floods expanded, components a flood split off, and
+        // roots merged into another.
+        conn_groups: usize = 0,
+        conn_families: usize = 0,
+        conn_rounds: usize = 0,
+        conn_flood_nodes: usize = 0,
+        conn_splits: usize = 0,
+        conn_merges: usize = 0,
+        // The one-way closure's candidate scan (prepare), link resolve, row mask, and SCC
+        // plan, and the landing of relocated blocks (the reaction's end, or a retry at a
+        // prepare).
+        conn_closure_candidates_batch: BatchStats = .{},
+        conn_closure_land_batch: BatchStats = .{},
+        conn_closure_resolve_batch: BatchStats = .{},
+        conn_closure_mask_batch: BatchStats = .{},
+        conn_closure_plan_batch: BatchStats = .{},
+        // The closure's components touched, links resolved, terminals new and left, rows
+        // recomputed (|A|), row rounds (round 0 included), block words written, blocks
+        // narrowed, blocks allocated and freed, words landed, and landings deferred by
+        // `OutOfMemory`, summed; and the live block words and the batch tail's capacity after
+        // the last batch.
+        closure_touched: usize = 0,
+        closure_links: usize = 0,
+        closure_terms_new: usize = 0,
+        closure_terms_left: usize = 0,
+        closure_a_rows: usize = 0,
+        closure_rounds: usize = 0,
+        closure_words_written: usize = 0,
+        closure_shrinks: usize = 0,
+        closure_block_allocs: usize = 0,
+        closure_block_frees: usize = 0,
+        closure_landed_words: usize = 0,
+        closure_land_deferrals: usize = 0,
+        closure_live_words: usize = 0,
+        closure_tail_capacity: usize = 0,
+        // Each the most over the update's closure batches: the tail words a batch's bound
+        // reserved and its relocated blocks took, its candidate components' block words, and
+        // the terminals it could number.
+        closure_tail_bound: usize = 0,
+        closure_tail_used: usize = 0,
+        closure_candidate_words: usize = 0,
+        closure_kb: usize = 0,
+        // The reaction's main-thread sections, the terrain records' `nav_mark` folded in.
+        main: NavMainPhases = .{},
+    } else struct {};
 
     /// Adds a stage batch's time: to `inline_stage_ns` when it ran inline, else to
     /// `off_main_stage_ns`.
     pub fn addStageTime(self: *NavUpdateStats, batch: BatchStats) void {
-        if (batch.ran_inline) {
-            self.inline_stage_ns += batch.batch_duration_ns;
-        } else {
-            self.off_main_stage_ns += batch.batch_duration_ns;
+        if (comptime runtime_perf_log.enabled) {
+            if (batch.ran_inline) {
+                self.perf.inline_stage_ns += batch.batch_duration_ns;
+            } else {
+                self.perf.off_main_stage_ns += batch.batch_duration_ns;
+            }
         }
+    }
+
+    /// Adds `ns` to one main-thread section.
+    pub fn addMain(self: *NavUpdateStats, comptime section: std.meta.FieldEnum(NavMainPhases), ns: u64) void {
+        if (comptime runtime_perf_log.enabled) @field(self.perf.main, @tagName(section)) += ns;
     }
 
     pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
@@ -430,14 +444,16 @@ test "nav update stats record the remask, the connectivity flood, the closure ro
     var perf = runtime_perf_log.RuntimePerfLog.init(0);
     const stats = NavUpdateStats{
         .remask_batch = .{ .item_count = 5 },
-        .conn_seed_batch = .{ .item_count = 7 },
-        .conn_gather_batch = .{ .item_count = 8 },
         .conn_flood_batch = .{ .item_count = 6 },
-        .conn_closure_resolve_batch = .{ .item_count = 10 },
         .conn_closure_rows_batch = .{ .item_count = 9 },
-        .evict_count_batch = .{ .item_count = 2 },
         .evict_batch = .{ .item_count = 3 },
-        .evict_flush_batch = .{ .item_count = 4 },
+        .perf = .{
+            .conn_seed_batch = .{ .item_count = 7 },
+            .conn_gather_batch = .{ .item_count = 8 },
+            .conn_closure_resolve_batch = .{ .item_count = 10 },
+            .evict_count_batch = .{ .item_count = 2 },
+            .evict_flush_batch = .{ .item_count = 4 },
+        },
     };
     stats.recordTo(runtime_perf_log.Context.bind(&perf));
     const remask = perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_remask)];
@@ -580,12 +596,6 @@ pub const PathfindingStats = struct {
     // was already reached this step (they simply wait for a later step).
     escalated_solves: usize = 0,
     escalated_deferred: usize = 0,
-    // A tier-1 attempt that still exhausted its (fixed) budget: dropped from pending, so
-    // the next query falls through to `.missing` (retryable later) rather than a false
-    // `.unavailable`. See compactPendingAfterSolve.
-    escalated_dropped: usize = 0,
-    // Start-side solve failures dropped from pending (see PathSolveResult.start_invalid).
-    start_invalid_dropped: usize = 0,
     // Intake requests whose blocked goal the step's goal table did not hold, so intake
     // projected it itself.
     goal_fallbacks: usize = 0,
@@ -595,38 +605,22 @@ pub const PathfindingStats = struct {
     group_field_reuses: usize = 0,
     group_field_rebuild_throttled: usize = 0,
     group_field_samples: usize = 0,
-    // Abstract-tier and cross-level routing counters.
-    abstract_solves: usize = 0,
-    cross_level_solves: usize = 0,
     // Diagnostic only: the most per-segment local A* searches any single stitchCorridor
     // call needed this step, aggregated across workers in finishUpdate (see
     // SearchScratch.max_stitch_segments_used). Lets a live perf capture distinguish "the
     // fixed max_stitch_segments cap is what's bounding solve cost" (this stays pinned at
     // or near the cap every spike) from "some other cost dominates" (this stays low).
     max_stitch_segments_observed: usize = 0,
-    // Diagnostic only: crossing boxes the cross-level heuristic settled over this step's
-    // solves, and the solves whose crossing search its budget froze, summed across workers in
-    // finishUpdate (SearchScratch.crossing_boxes_settled).
-    crossing_boxes_settled: usize = 0,
-    crossing_budget_frozen: usize = 0,
     // Diagnostic only: distinct group keys tallied this step; held near or above
     // max_group_fields it shows goals waiting for a field slot.
     distinct_group_keys: usize = 0,
     solve_batch: BatchStats = .{},
-    // Request classification (`path_intake`) and the group-field advance and begin
-    // passes (`group_field_expand`); inline stages report `ran_inline`.
+    // Request classification (`path_intake`); inline stages report `ran_inline`.
     intake_batch: BatchStats = .{},
-    group_field_batch: BatchStats = .{},
-    group_field_begin_batch: BatchStats = .{},
-    // The publish byte copy and registration bucketing (`publish_copy`), the path
-    // registry's owner ops and adds (`registry_flush`), and a shrink's byte moves
+    // The path registry's owner ops and adds (`registry_flush`) and a shrink's byte moves
     // (`resize_copy`).
-    publish_copy_batch: BatchStats = .{},
     registry_flush_batch: BatchStats = .{},
     resize_copy_batch: BatchStats = .{},
-    // Path registry entries added and removed by this update's flush.
-    registrations_added: usize = 0,
-    registrations_removed: usize = 0,
     // Per-phase update timings (ns); zero when perf logging is disabled. Recorded
     // as pathfinding_* sub-stage timers that break down pipeline_pathfinding.
     accept_ns: u64 = 0,
@@ -635,6 +629,34 @@ pub const PathfindingStats = struct {
     publish_ns: u64 = 0,
     // The safe point's elastic resize (a grow or a shrink); zero on a step without one.
     resize_ns: u64 = 0,
+    perf: Perf = .{},
+
+    /// The counters `SimulationPipelineStats.recordTo` does not read: kept only with
+    /// `runtime_perf_log.enabled`, zero-sized without it.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        // A tier-1 attempt that still exhausted its (fixed) budget: dropped from pending, so
+        // the next query falls through to `.missing` (retryable later) rather than a false
+        // `.unavailable`. See compactPendingAfterSolve.
+        escalated_dropped: usize = 0,
+        // Start-side solve failures dropped from pending (see PathSolveResult.start_invalid).
+        start_invalid_dropped: usize = 0,
+        // Abstract-tier and cross-level routing counters.
+        abstract_solves: usize = 0,
+        cross_level_solves: usize = 0,
+        // Crossing boxes the cross-level heuristic settled over this step's solves, and the
+        // solves whose crossing search its budget froze, summed across workers in
+        // finishUpdate (`SearchScratch.perf`).
+        crossing_boxes_settled: usize = 0,
+        crossing_budget_frozen: usize = 0,
+        // The group-field advance and begin passes (`group_field_expand`) and the publish
+        // byte copy and registration bucketing (`publish_copy`).
+        group_field_batch: BatchStats = .{},
+        group_field_begin_batch: BatchStats = .{},
+        publish_copy_batch: BatchStats = .{},
+        // Path registry entries added and removed by this update's flush.
+        registrations_added: usize = 0,
+        registrations_removed: usize = 0,
+    } else struct {};
 };
 
 /// One step's goal resolve (`PathfindingSystem.resolveGoals`): the intents scanned, those
@@ -644,8 +666,13 @@ pub const GoalResolveStats = struct {
     intents: usize = 0,
     blocked: usize = 0,
     distinct: usize = 0,
-    scan_batch: BatchStats = .{},
-    project_batch: BatchStats = .{},
+    perf: Perf = .{},
+
+    /// The scan and project stage batches, kept only with `runtime_perf_log.enabled`.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        scan_batch: BatchStats = .{},
+        project_batch: BatchStats = .{},
+    } else struct {};
 };
 
 // A distinct group goal and how many agents declared it this step; the count
@@ -896,15 +923,17 @@ pub const RegRecord = struct {
 
 /// Per changed key of an eviction, at its index in the batch's changed keys. Its hit window
 /// at `base` holds its path hits (`bound` at most), then its group-field hits (one slot per
-/// field). `visited` counts the path registry entries walked. `owned` holds the registered
-/// halo keys it owns (bit `(dy + 1) * 3 + (dx + 1)`).
+/// field). `owned` holds the registered halo keys it owns (bit `(dy + 1) * 3 + (dx + 1)`).
+/// `perf.visited` counts the path registry entries walked (`runtime_perf_log.enabled` only).
 pub const EvictItem = struct {
     bound: u32 = 0,
     base: u32 = 0,
     hits: u32 = 0,
-    visited: u32 = 0,
     field_hits: u32 = 0,
     owned: u16 = 0,
+    perf: Perf = .{},
+
+    pub const Perf = if (runtime_perf_log.enabled) struct { visited: u32 = 0 } else struct {};
 };
 
 /// Eviction range alignment: every range's items start on a cache line.
@@ -915,7 +944,7 @@ pub const hit_window_alignment_items: usize = thread_shared_record_alignment / @
 
 comptime {
     std.debug.assert(@sizeOf(RegRecord) == 16);
-    std.debug.assert(@sizeOf(EvictItem) == 24);
+    std.debug.assert(@sizeOf(EvictItem) == if (runtime_perf_log.enabled) 24 else 20);
     std.debug.assert((@sizeOf(EvictItem) * evict_range_alignment_items) % thread_shared_record_alignment == 0);
 }
 

@@ -25,7 +25,9 @@ reviewer diligence:
    what is referenced, so an unused declaration builds clean and goes stale.
 9. No test- or bench-only `pub` API in production code: every `pub` decl in a
    production file is referenced by production code (outside `test` blocks,
-   `*test_support.zig`, `src/benchmarks/`, and the test/bench/smoke roots).
+   file-scope test helpers (named `*ForTest` / `*WithTestBackend`, or using
+   `std.testing`), `*test_support.zig`, `src/benchmarks/`, and the
+   test/bench/smoke roots).
    Every hit is removed from production; no annotation exempts one.
 
 Scans every `src/**/*.zig` file plus `build.zig`. Rules in SRC_ONLY_PATTERNS
@@ -362,29 +364,53 @@ def is_production(path: Path) -> bool:
     )
 
 
-def production_lines(path: Path) -> list[str]:
-    """Code lines outside `test` blocks, literals blanked and comments removed."""
-    out: list[str] = []
+TOP_LEVEL_FN = re.compile(r"^(?:pub\s+)?(?:inline\s+|export\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+TEST_HELPER_NAME = re.compile(r"(?:ForTest|WithTestBackend)$")
+
+
+def production_lines(path: Path) -> tuple[list[str], list[str]]:
+    """Code lines outside `test` blocks, literals blanked and comments removed: every such
+    line (for declarations), and those outside test helpers too (for references). A test
+    helper is a file-scope function named `*ForTest` / `*WithTestBackend` or whose body uses
+    `std.testing`: only tests reach it, so its references are test code."""
+    raw_lines = path.read_text(encoding="utf-8").splitlines()
+    decls: list[str] = []
     in_test = False
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    for raw in raw_lines:
         if TEST_DECL.match(raw):
             in_test = True
         elif raw.startswith("}") and in_test:
             in_test = False
-            out.append("")
+            decls.append("")
             continue
         code = strip_line_comment(blank_literals(raw))
         quoted = " ".join(a or b for a, b in QUOTED_DECL_REF.findall(raw))
-        out.append("" if in_test else f"{code} {quoted}")
-    return out
+        decls.append("" if in_test else f"{code} {quoted}")
+    refs = list(decls)
+    index = 0
+    while index < len(raw_lines):
+        fn = TOP_LEVEL_FN.match(raw_lines[index])
+        if not fn or raw_lines[index].rstrip().endswith("}"):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(raw_lines) and not raw_lines[end].startswith("}"):
+            end += 1
+        body = decls[index : end + 1]
+        if TEST_HELPER_NAME.search(fn.group(1)) or any("std.testing" in line for line in body):
+            for line in range(index, min(end + 1, len(refs))):
+                refs[line] = ""
+        index = end + 1
+    return decls, refs
 
 
 def lint_test_only_api(files: list[Path]) -> list[tuple[str, int, str, str]]:
     prod = [path for path in files if is_production(path)]
-    lines = {path: production_lines(path) for path in prod}
+    scanned = {path: production_lines(path) for path in prod}
+    lines = {path: decls for path, (decls, _) in scanned.items()}
     counts: dict[str, int] = {}
-    for code_lines in lines.values():
-        for code in code_lines:
+    for _, ref_lines in scanned.values():
+        for code in ref_lines:
             for word in WORD.findall(code):
                 counts[word] = counts.get(word, 0) + 1
     issues: list[tuple[str, int, str, str]] = []
@@ -396,8 +422,9 @@ def lint_test_only_api(files: list[Path]) -> list[tuple[str, int, str, str]]:
             if not decl or decl.group(1) in PUB_ENTRY_NAMES:
                 continue
             name = decl.group(1)
-            # The declaration line itself spells the name once.
-            if counts.get(name, 0) > len(WORD.findall(code)) - len([w for w in WORD.findall(code) if w != name]):
+            # The declaration line itself spells the name once, unless it sits in a test helper.
+            own = len([w for w in WORD.findall(code) if w == name]) if scanned[path][1][index] else 0
+            if counts.get(name, 0) > own:
                 continue
             here = raw_lines[index]
             issues.append(

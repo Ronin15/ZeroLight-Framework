@@ -36,7 +36,7 @@ pub const no_entry: u32 = std.math.maxInt(u32);
 pub const no_value: u32 = std.math.maxInt(u32);
 // No valid key sets both of bits 62-63, so all-ones marks an empty table slot.
 const empty_key: u64 = std.math.maxInt(u64);
-const min_slot_count: usize = 16;
+pub const min_slot_count: usize = 16;
 // `slot_touch` value of a slot no batch has touched since the table was built.
 const untouched: u32 = std.math.maxInt(u32);
 
@@ -192,7 +192,7 @@ pub fn bitSetBytesFor(bits: usize) usize {
     return (OrderedIndexSet.maskCount(bits) + 1) * @sizeOf(OrderedIndexSet.Word);
 }
 
-const Entry = struct {
+pub const Entry = struct {
     key: u64,
     owner: u32,
     order: u32,
@@ -307,22 +307,6 @@ pub const ChunkListMap = struct {
             self.splice_records.capacity * @sizeOf(SpliceRecord) + self.emptied_keys.capacity * @sizeOf(u64);
         if (self.owner_heads_replacement) |replacement| bytes += replacement.capacity * @sizeOf(u32);
         return bytes;
-    }
-
-    /// An over-estimate of `residentBytes` summed over `maps` maps grown through `reserve`
-    /// alone (no batch scratch, no owner-head truncate pending), each reserved for owner ids
-    /// below `owners`, whose own peak reserves, summed over the maps, never pass `keys` keys
-    /// and `entries` entries. A map's slots hold its keys at load 1/2 or more, so under four
-    /// slots per key; its entry pool grows to at least double past its need, and std's
-    /// growth past that. Saturates.
-    pub fn pooledStorageBytesBound(maps: usize, keys: usize, entries: usize, owners: usize) usize {
-        const Entries = std.MultiArrayList(Entry);
-        const Ids = std.ArrayList(u32);
-        const slots = maps *| min_slot_count +| 4 *| keys;
-        const pool = Entries.growCapacity(2 *| entries) +| maps *| Entries.growCapacity(0);
-        const free_ids = Ids.growCapacity(pool) +| maps *| Ids.growCapacity(0);
-        return slots *| bytes_per_key_slot +| Entries.capacityInBytes(pool) +| free_ids *| @sizeOf(u32) +|
-            maps *| Ids.growCapacity(owners) *| @sizeOf(u32);
     }
 
     pub fn deinit(self: *ChunkListMap) void {
@@ -1087,7 +1071,7 @@ test "maps grown through reserve stay within the pooled bound of their summed pe
     for (&maps) |*map| resident += map.residentBytes();
     var peak_sum: usize = 0;
     for (peaks) |peak| peak_sum += peak;
-    try std.testing.expect(resident <= ChunkListMap.pooledStorageBytesBound(maps.len, peak_sum, peak_sum, 64));
+    try std.testing.expect(resident <= @import("chunk_list_map_test_support.zig").pooledStorageBytesBound(maps.len, peak_sum, peak_sum, 64));
 }
 
 test "chunk keys are distinct and never set both bits 62-63" {

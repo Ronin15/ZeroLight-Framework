@@ -589,11 +589,10 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
 
-    var world = try fixtures.buildBandedWorld(allocator, io, fields.level_side, fields.levels, "grass", "grass");
-    const dig_config = DigConfig.fromMeta(world.tilesetMeta().?) catch |err| {
-        world.deinit();
-        return err;
-    };
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    const dig_config = try DigConfig.fromMeta(&tileset);
+    var world = try fixtures.buildBandedWorld(allocator, &tileset, fields.level_side, fields.levels, "grass", "grass");
     const world_px = world.worldWidthPixels();
     const state = try allocator.create(GameDemoState);
     defer allocator.destroy(state);

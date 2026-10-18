@@ -457,7 +457,7 @@ const StaticMover = struct {
     }
 
     fn spliceOffMainNs(self: *const StaticMover) u64 {
-        return offMainNs(self.colliders.last_splice_batch) + offMainNs(self.colliders.last_query_splice_batch);
+        return offMainNs(self.colliders.last_splice_batch) + offMainNs(suite.perfBatch(self.colliders.perf, "last_query_splice_batch"));
     }
 };
 
@@ -493,7 +493,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_collision_stats.broadphase_batch);
         const mover_off_main_ns = if (mover) |static_mover| static_mover.spliceOffMainNs() else 0;
-        const off_main_ns = offMainNs(last_collision_stats.fill_batch) + offMainNs(last_collision_stats.sort_batch) +
+        const off_main_ns = offMainNs(suite.perfBatch(last_collision_stats.perf, "fill_batch")) + offMainNs(suite.perfBatch(last_collision_stats.perf, "sort_batch")) +
             offMainNs(last_collision_stats.broadphase_batch) + offMainNs(last_collision_stats.narrowphase_batch);
         main_total += elapsed_ns -| off_main_ns -| mover_off_main_ns;
     }
@@ -501,12 +501,12 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.collision_stages = .{
-        .fill = suite.batchSummaryFromBatch(last_collision_stats.fill_batch),
-        .sort = suite.batchSummaryFromBatch(last_collision_stats.sort_batch),
+        .fill = suite.batchSummaryFromBatch(suite.perfBatch(last_collision_stats.perf, "fill_batch")),
+        .sort = suite.batchSummaryFromBatch(suite.perfBatch(last_collision_stats.perf, "sort_batch")),
         .fill_tuning = if (case.adaptive) suite.workTuningSummary(suite.tunerReport(&system.fill_tuner), fill_settled_before_measurement) else null,
         .sort_tuning = if (case.adaptive) suite.workTuningSummary(suite.tunerReport(&system.sort_tuner), sort_settled_before_measurement) else null,
         .entries = last_collision_stats.entry_count,
-        .visits = last_collision_stats.broadphase_visits,
+        .visits = if (comptime runtime_perf_log.enabled) last_collision_stats.perf.broadphase_visits else 0,
     };
     stats.sample_count = item_count;
     stats.candidate_pairs = last_collision_stats.candidate_pair_count;

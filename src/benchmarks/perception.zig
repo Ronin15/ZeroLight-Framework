@@ -31,6 +31,7 @@
 //!   `sensed=`, `block_fills=`, and `checks_per_observer=`.
 
 const std = @import("std");
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
@@ -183,11 +184,13 @@ fn createFixtureInOrder(allocator: std.mem.Allocator, io: std.Io, count: usize, 
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
-    var world = try fixtures.buildBandedWorld(allocator, io, world_tiles_side, 1, "grass", "grass");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    var world = try fixtures.buildBandedWorld(allocator, &tileset, world_tiles_side, 1, "grass", "grass");
     errdefer world.deinit();
     const tile_size = world.tile_size;
-    const tree = try world.requireTileByName(world.tilesetMeta().?, "tree_0");
-    const deco = try world.requireTileByName(world.tilesetMeta().?, "deco_0");
+    const tree = try world.requireTileByName(&tileset, "tree_0");
+    const deco = try world.requireTileByName(&tileset, "deco_0");
 
     const observer_offset_x = tile_size * observer_offset_tile_fraction;
     const pair_count = count / 2;
@@ -222,10 +225,12 @@ fn createDecorrelatedFixture(allocator: std.mem.Allocator, io: std.Io, count: us
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
-    var world = try fixtures.buildBandedWorld(allocator, io, world_tiles_side, 1, "grass", "grass");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    var world = try fixtures.buildBandedWorld(allocator, &tileset, world_tiles_side, 1, "grass", "grass");
     errdefer world.deinit();
     const tile_size = world.tile_size;
-    const tree = try world.requireTileByName(world.tilesetMeta().?, "tree_0");
+    const tree = try world.requireTileByName(&tileset, "tree_0");
 
     const observer_offset_x = tile_size * observer_offset_tile_fraction;
     const pair_count = count / 2;
@@ -409,10 +414,10 @@ fn runCaseImpl(
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_stats.batch);
-        main_total += elapsed_ns -| (offMainNs(last_stats.gather_batch) + offMainNs(last_stats.batch));
+        main_total += elapsed_ns -| (offMainNs(suite.perfBatch(last_stats.perf, "gather_batch")) + offMainNs(last_stats.batch));
     }
 
-    std.debug.assert(last_stats.block_fills <= observerCellRuns(&fixture.data, &system, spatial_view) + last_stats.batch.range_count);
+    if (comptime runtime_perf_log.enabled) std.debug.assert(last_stats.perf.block_fills <= observerCellRuns(&fixture.data, &system, spatial_view) + last_stats.batch.range_count);
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.output_count = last_stats.nearest_threat_found_count;
@@ -421,8 +426,8 @@ fn runCaseImpl(
     stats.deferred_count = last_stats.los_blocked;
     stats.fallback_deferred_count = events.stats.entity_perceived + events.stats.entity_lost;
     stats.cache_evictions = events.stats.dropped;
-    stats.neighbor_block_fills = last_stats.block_fills;
-    stats.splice_batch = suite.batchSummaryFromBatch(last_stats.gather_batch);
+    if (comptime runtime_perf_log.enabled) stats.neighbor_block_fills = last_stats.perf.block_fills;
+    stats.splice_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "gather_batch"));
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.compute_tuner), settled_before_measurement);
     }
@@ -505,11 +510,10 @@ fn createCrowdFixture(allocator: std.mem.Allocator, io: std.Io, variant: CrowdVa
         .allies => 1,
         .levels => @intCast(axis),
     };
-    var meta = try fixtures.loadTilesetMeta(allocator, io);
-    const tile_size = meta.tileSize();
-    meta.deinit();
-    const side_tiles: u16 = @intFromFloat(@ceil(side_px / tile_size));
-    var world = try fixtures.buildBandedWorld(allocator, io, side_tiles, levels, "grass", "grass");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    const side_tiles: u16 = @intFromFloat(@ceil(side_px / tileset.tileSize()));
+    var world = try fixtures.buildBandedWorld(allocator, &tileset, side_tiles, levels, "grass", "grass");
     errdefer world.deinit();
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
@@ -603,7 +607,7 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.output_count = last_stats.nearest_threat_found_count;
     stats.sample_count = last_stats.sensed_count;
     stats.candidate_pairs = last_stats.candidate_checks;
-    stats.neighbor_block_fills = last_stats.block_fills;
+    if (comptime runtime_perf_log.enabled) stats.neighbor_block_fills = last_stats.perf.block_fills;
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.compute_tuner), settled_before_measurement);
     }

@@ -8,6 +8,7 @@
 //! bytes against its charge (`nav_size.checkNavBytes`).
 
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const offMainNs = @import("../../app/thread_system.zig").offMainNs;
@@ -242,7 +243,9 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         const reaction = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_ptr);
         evicted = result_count - fixture.cachedCount();
         // The reaction evicted exactly the results the cache lost.
-        if (reaction.stats.evicted_results != evicted) return error.EvictCountMismatch;
+        if (comptime runtime_perf_log.enabled) {
+            if (reaction.stats.perf.evicted_results != evicted) return error.EvictCountMismatch;
+        }
         last_stats = reaction.stats;
         accumulator.record(reaction.elapsed_ns, reaction.stats.remask_batch);
         report.add(reaction);
@@ -261,7 +264,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     // Registry entries the reaction's eviction visited per second.
     stats.items_per_second = suite.itemsPerSecond(report.visited, stats.mean_ns);
     stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.patch_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "patch_batch"));
     return stats;
 }
 

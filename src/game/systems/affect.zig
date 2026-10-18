@@ -22,6 +22,7 @@
 //! scratch or sort.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const math = @import("../../core/math.zig");
 const logging = @import("../../core/logging.zig");
 const simd = @import("../../core/simd.zig");
@@ -85,7 +86,10 @@ pub const AffectConfig = struct {
 };
 
 pub const AffectStats = struct {
-    batch: BatchStats = .{},
+    perf: Perf = .{},
+
+    /// The stage batch, kept only with `runtime_perf_log.enabled`.
+    pub const Perf = if (runtime_perf_log.enabled) struct { batch: BatchStats = .{} } else struct {};
 };
 
 // Packed, contiguous per-row gather scratch (mirrors PerceptionGatherRow):
@@ -199,7 +203,7 @@ pub const AffectSystem = struct {
         const batch = compute.run(selection, count, affect_range_alignment_items, &job, affectRangeJob);
 
         try self.emitCrossingEvents(events, config.max_events_per_step);
-        return .{ .batch = batch };
+        return .{ .perf = if (comptime runtime_perf_log.enabled) .{ .batch = batch } else .{} };
     }
 
     fn buildJobContext(self: *AffectSystem, data: *DataSystem, range_count: usize) AffectJobContext {
@@ -1153,6 +1157,7 @@ test "serial has no steady-state allocation after warmup (FailingAllocator)" {
 }
 
 test "after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // The only reserved store is the gather rows (crossing bits
@@ -1208,8 +1213,8 @@ test "after reserve alone, threaded updates at 64- then 16-item ranges allocate 
             .adaptive = false,
         });
         try testing.expectEqual(row_total, sys.rows.len);
-        try testing.expectEqual(rangeCount(row_total, items), stats.batch.range_count);
-        try testing.expect(!stats.batch.ran_inline);
+        try testing.expectEqual(rangeCount(row_total, items), stats.perf.batch.range_count);
+        try testing.expect(!stats.perf.batch.ran_inline);
         if (step == 0) try testing.expectEqual(row_total, events.stats.affect_threshold_crossed);
     }
     try testing.expectEqual(@as(usize, 0), failing.allocations);

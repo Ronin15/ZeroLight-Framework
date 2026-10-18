@@ -12,6 +12,7 @@ const PathfindingCapacity = @import("../game/systems/pathfinding/types.zig").Pat
 const NavGraph = @import("../game/systems/pathfinding/nav_graph.zig").NavGraph;
 const GroupField = @import("../game/systems/pathfinding/group_field.zig").GroupField;
 const PathfindingSystem = @import("../game/systems/pathfinding/system.zig").PathfindingSystem;
+const pathfinding_test_support = @import("../game/systems/pathfinding/test_support.zig");
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 
 const mib: usize = 1024 * 1024;
@@ -95,15 +96,15 @@ pub fn navSizeCapacity(config: NavSizeConfig) PathfindingCapacity {
 
 // `navStorageBytes` by what reports it at run time: the graph (`NavGraph.residentBytes`),
 // the group fields (`GroupField.residentBytes`), and the request side's parts
-// (`PathfindingSystem.requestResidentBytes`).
+// (`test_support.requestResidentBytes`).
 const NavStorageParts = struct {
     graph: usize,
     group_fields: usize,
-    request: PathfindingSystem.RequestStorage,
+    request: pathfinding_test_support.RequestStorage,
 
     fn total(self: NavStorageParts) usize {
         var bytes = self.graph +| self.group_fields;
-        inline for (@typeInfo(PathfindingSystem.RequestStorage).@"struct".field_names) |name| bytes +|= @field(self.request, name);
+        inline for (@typeInfo(pathfinding_test_support.RequestStorage).@"struct".field_names) |name| bytes +|= @field(self.request, name);
         return bytes;
     }
 };
@@ -111,7 +112,7 @@ const NavStorageParts = struct {
 // An over-estimate of the bytes the per-chunk nav takes for `config` at its agent-budget
 // ceiling, from the production bounds: the graph (`NavGraph.storageBytesBound`), group
 // fields (`GroupField.storageBytesBound`), and the request side
-// (`PathfindingSystem.requestStorageBytesBound`). Search scratch and group fields are sized
+// (`test_support.requestStorageBytesBound`). Search scratch and group fields are sized
 // by their node and cell budgets, never by level cells.
 fn navStorageBytes(config: NavSizeConfig) usize {
     return navStorageParts(config).total();
@@ -137,7 +138,7 @@ fn navStorageParts(config: NavSizeConfig) NavStorageParts {
     return .{
         .graph = graph,
         .group_fields = config.group_fields *| GroupField.storageBytesBound(capacity.group_field_max_cells, chunks),
-        .request = PathfindingSystem.requestStorageBytesBound(capacity, .{
+        .request = pathfinding_test_support.requestStorageBytesBound(capacity, .{
             .long_results = config.long_results,
             .runs_per_result = config.runs_per_result,
             .chunks = chunks *| levels,
@@ -154,11 +155,11 @@ pub fn checkNavBytes(group_name: []const u8, item_count: usize, config: NavSizeC
     const parts = navStorageParts(config);
     var field_bytes: usize = 0;
     for (system.group_fields.items) |*field| field_bytes += field.residentBytes();
-    const resident = system.requestResidentBytes();
+    const resident = pathfinding_test_support.requestResidentBytes(system);
     var past = false;
     past = reportPart(group_name, item_count, "graph", system.graph.residentBytes(), parts.graph) or past;
     past = reportPart(group_name, item_count, "group fields", field_bytes, parts.group_fields) or past;
-    inline for (@typeInfo(PathfindingSystem.RequestStorage).@"struct".field_names) |name| {
+    inline for (@typeInfo(pathfinding_test_support.RequestStorage).@"struct".field_names) |name| {
         past = reportPart(group_name, item_count, name, @field(resident, name), @field(parts.request, name)) or past;
     }
     if (past) return error.NavBytesPastEstimate;
@@ -243,7 +244,7 @@ test "nav storage charges the request side's production bound at the config's sh
     var past_all = base;
     past_all.long_results = 1000;
     for ([_]NavSizeConfig{ base, inline_only, one_long, past_all }) |config| {
-        const expected = PathfindingSystem.requestStorageBytesBound(navSizeCapacity(config), .{
+        const expected = pathfinding_test_support.requestStorageBytesBound(navSizeCapacity(config), .{
             .long_results = config.long_results,
             .runs_per_result = config.runs_per_result,
             .chunks = 256,

@@ -7,6 +7,7 @@
 //! queries. Free functions over `*SteeringSystem`; its step calls `buildAgentGrid`.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const BatchSelection = @import("../../../app/thread_system.zig").BatchSelection;
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
@@ -36,7 +37,7 @@ const ConstAgentSnapshotSlice = @import("system.zig").ConstAgentSnapshotSlice;
 pub fn buildAgentGrid(self: *SteeringSystem, threads: StageThreads, stats: *SteeringStats) void {
     const stage = StageThreads.withWorkers(threads) orelse {
         buildAgentGridDirect(self);
-        stats.grid_bucket_batch = inlineBatch(self.agent_snapshot_rows.len, steering_range_alignment_items);
+        if (comptime runtime_perf_log.enabled) stats.perf.grid_bucket_batch = inlineBatch(self.agent_snapshot_rows.len, steering_range_alignment_items);
         return;
     };
     const splitters = chooseGridSplitters(self.agentSnapshotSliceConst(), self.spatial_cell_size);
@@ -79,7 +80,8 @@ fn buildAgentGridBanded(self: *SteeringSystem, stage: StageThreads, selection: B
         .items_per_range = selection.items_per_range,
         .band_rows = self.band_rows.items,
     };
-    stats.grid_bucket_batch = stage.stage(&self.grid_bucket_tuner).run(selection, agent_count, steering_range_alignment_items, &bucket, bucketJob);
+    const bucket_batch = stage.stage(&self.grid_bucket_tuner).run(selection, agent_count, steering_range_alignment_items, &bucket, bucketJob);
+    if (comptime runtime_perf_log.enabled) stats.perf.grid_bucket_batch = bucket_batch;
 
     // Each band's slice starts after every range's entries of the earlier bands.
     var band_start: [max_bands + 1]usize = @splat(0);
@@ -102,7 +104,8 @@ fn buildAgentGridBanded(self: *SteeringSystem, stage: StageThreads, selection: B
         .tallies = self.grid_sort_tallies.items,
         .range_count = sort_selection.range_count,
     };
-    stats.grid_sort_batch = sort_stage.run(sort_selection, max_bands, 1, &sort, sortJob);
+    const sort_batch = sort_stage.run(sort_selection, max_bands, 1, &sort, sortJob);
+    if (comptime runtime_perf_log.enabled) stats.perf.grid_sort_batch = sort_batch;
 
     self.agent_cell_entries.items.len = band_start[max_bands];
     for (&self.agent_grid.bands, self.grid_sort_tallies.items, band_start[0..max_bands]) |*band, slot, band_entry_start| {
@@ -364,6 +367,7 @@ const ensureStepCapacity = @import("system.zig").ensureStepCapacity;
 const AgentSnapshotRow = @import("system.zig").AgentSnapshotRow;
 
 test "steering banded agent grid gives every cell the same entries as one band" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
@@ -386,31 +390,31 @@ test "steering banded agent grid gives every cell the same entries as one band" 
         // Both stages inline in their ranges on the main thread.
         const inline_selection = inline_ranges.stage(&system.grid_bucket_tuner).select(system.agent_snapshot_rows.len, steering_range_alignment_items);
         buildAgentGridBanded(&system, inline_ranges, inline_selection, chooseGridSplitters(system.agentSnapshotSliceConst(), system.spatial_cell_size), &stats);
-        try std.testing.expect(stats.grid_bucket_batch.ran_inline and stats.grid_bucket_batch.range_count > 1);
-        try std.testing.expect(stats.grid_sort_batch.ran_inline);
-        try std.testing.expectEqual(max_bands, stats.grid_sort_batch.item_count);
+        try std.testing.expect(stats.perf.grid_bucket_batch.ran_inline and stats.perf.grid_bucket_batch.range_count > 1);
+        try std.testing.expect(stats.perf.grid_sort_batch.ran_inline);
+        try std.testing.expectEqual(max_bands, stats.perf.grid_sort_batch.item_count);
         try expectGridMatches(&system, &reference);
 
         // A config that allows no worker builds the serial grid.
         stats = .{};
         buildAgentGrid(&system, inline_ranges, &stats);
         try std.testing.expectEqual(@as(usize, 0), system.agent_grid.splitter_count);
-        try std.testing.expectEqual(@as(usize, 0), stats.grid_sort_batch.item_count);
+        try std.testing.expectEqual(@as(usize, 0), stats.perf.grid_sort_batch.item_count);
         try expectGridMatches(&system, &reference);
 
         // Explicit splitter sets over the same bucket ranges.
         const selection = threaded.stage(&system.grid_bucket_tuner).select(system.agent_snapshot_rows.len, steering_range_alignment_items);
         for (std.meta.tags(GridTestSplitters)) |set| {
             buildAgentGridBanded(&system, threaded, selection, gridTestSplitters(set, reference.ranges.items), &stats);
-            try std.testing.expect(!stats.grid_bucket_batch.ran_inline);
-            try std.testing.expectEqual(max_bands, stats.grid_sort_batch.item_count);
+            try std.testing.expect(!stats.perf.grid_bucket_batch.ran_inline);
+            try std.testing.expectEqual(max_bands, stats.perf.grid_sort_batch.item_count);
             try expectGridMatches(&system, &reference);
         }
 
         // The production splitters.
         buildAgentGrid(&system, threaded, &stats);
-        try std.testing.expect(!stats.grid_bucket_batch.ran_inline and !stats.grid_sort_batch.ran_inline);
-        try std.testing.expectEqual(max_bands, stats.grid_sort_batch.item_count);
+        try std.testing.expect(!stats.perf.grid_bucket_batch.ran_inline and !stats.perf.grid_sort_batch.ran_inline);
+        try std.testing.expectEqual(max_bands, stats.perf.grid_sort_batch.item_count);
         try expectGridMatches(&system, &reference);
     }
 }

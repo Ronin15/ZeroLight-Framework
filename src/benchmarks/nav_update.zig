@@ -30,6 +30,7 @@
 //! remask, and patch shapes.
 
 const std = @import("std");
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -121,10 +122,12 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, participant_count: usi
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
     // Three walkable levels; the dig happens on level 1's obstacle band.
-    var world = try fixtures.buildBandedWorld(allocator, io, world_tiles, 3, "grass", "grass");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    var world = try fixtures.buildBandedWorld(allocator, &tileset, world_tiles, 3, "grass", "grass");
     errdefer world.deinit();
-    const grass = try world.requireTileByName(world.tilesetMeta().?, "grass");
-    const tree = try world.requireTileByName(world.tilesetMeta().?, "tree_0");
+    const grass = try world.requireTileByName(&tileset, "grass");
+    const tree = try world.requireTileByName(&tileset, "tree_0");
     const obstacle_layer = try world.addDenseLayer(1, 0, .obstacle, grass);
 
     var colliders = StaticColliderSystem.init(allocator);
@@ -260,8 +263,8 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // The stages the opening update ran (the reported tuners' set), so a threaded row the
     // tuner kept inline reads inline.
     stats.batch = suite.batchSummaryFromBatch(fixture.open_stats.remask_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.open_stats.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.open_stats.patch_batch);
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(suite.perfBatch(fixture.open_stats.perf, "plan_batch"));
+    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(fixture.open_stats.perf, "patch_batch"));
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.remask)), remask_settled);
         stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.patch)), patch_settled);
@@ -398,7 +401,9 @@ fn initStaticMoveFixture(allocator: std.mem.Allocator, io: std.Io, other_statics
     try addOtherStatics(allocator, &data, other_statics);
     try addDynamicBodies(&data, dynamic_bodies);
 
-    var world = try fixtures.buildBandedWorld(allocator, io, world_tiles, 1, "grass", "grass");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    var world = try fixtures.buildBandedWorld(allocator, &tileset, world_tiles, 1, "grass", "grass");
     errdefer world.deinit();
 
     var colliders = StaticColliderSystem.init(allocator);
@@ -453,9 +458,9 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     // One move per iteration.
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
     stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
-    stats.nav_mark_batch = suite.batchSummaryFromBatch(fixture.system.last_mark_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.patch_batch);
+    stats.nav_mark_batch = suite.batchSummaryFromBatch(suite.perfBatch(fixture.system.perf, "last_mark_batch"));
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "plan_batch"));
+    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "patch_batch"));
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.remask)), remask_settled);
         stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.patch)), patch_settled);
@@ -598,14 +603,14 @@ const StaticDenseFixture = struct {
         if (recreated_at != self.recreated.items.len) return error.StaticRecreatesMissing;
         self.shifted = !self.shifted;
         const splice = self.colliders.last_splice_batch;
-        const query_splice = self.colliders.last_query_splice_batch;
+        const query_splice = suite.perfBatch(self.colliders.perf, "last_query_splice_batch");
         const splice_off_main_ns = offMainNs(splice) + offMainNs(query_splice);
         return .{
             .ns = suite.elapsedNs(start_ns, end_ns),
             .commit_ns = suite.elapsedNs(start_ns, sync_start_ns),
             .sync_ns = suite.elapsedNs(sync_start_ns, nav_start_ns),
             .nav_ns = suite.elapsedNs(nav_start_ns, end_ns),
-            .off_main_ns = stats.off_main_stage_ns + splice_off_main_ns,
+            .off_main_ns = splice_off_main_ns + if (comptime runtime_perf_log.enabled) stats.perf.off_main_stage_ns else 0,
             .stats = stats,
         };
     }
@@ -688,7 +693,9 @@ fn initStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, change_count
     }
 
     // Layout widths are a few chunks: within a level side.
-    var world = try fixtures.buildBandedWorld(allocator, io, @intCast(layout.chunks_x * nav_chunk_tiles), 1, "grass", "grass");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    var world = try fixtures.buildBandedWorld(allocator, &tileset, @intCast(layout.chunks_x * nav_chunk_tiles), 1, "grass", "grass");
     errdefer world.deinit();
 
     var colliders = StaticColliderSystem.init(allocator);
@@ -764,10 +771,10 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.candidate_pairs = static_colliders_test_support.liveRowCount(fixture.colliders);
     stats.items_per_second = suite.itemsPerSecond(change_count, stats.mean_ns);
     stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.patch_batch);
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "plan_batch"));
+    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "patch_batch"));
     stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_splice_batch);
-    stats.query_splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_query_splice_batch);
+    stats.query_splice_batch = suite.batchSummaryFromBatch(suite.perfBatch(fixture.colliders.perf, "last_query_splice_batch"));
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         // Plan: the commit; write: the collider sync and record; nav: the reaction.

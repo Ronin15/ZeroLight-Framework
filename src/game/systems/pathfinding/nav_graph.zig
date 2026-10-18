@@ -50,7 +50,8 @@ const PathQueryKey = types.PathQueryKey;
 const NavMark = types.NavMark;
 const NavSpan = types.NavSpan;
 const NavUpdateStats = types.NavUpdateStats;
-const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
+const StageTimer = runtime_perf_log.StageTimer;
 const connectivity = @import("connectivity.zig");
 const Connectivity = @import("connectivity.zig").Connectivity;
 const ConnectivityCounters = @import("connectivity.zig").ConnectivityCounters;
@@ -746,53 +747,56 @@ fn patchJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 }
 
 // Folds one batch's connectivity counters and stage shapes into `stats`: level builds and the
-// marks batch sum.
+// marks batch sum. Only the perf log's flood batch folds without `runtime_perf_log.enabled`.
 fn addConnectivityStats(stats: *NavUpdateStats, conn: *const Connectivity, counters: ConnectivityCounters) void {
-    stats.conn_groups += counters.groups;
-    stats.conn_families += counters.families;
-    stats.conn_rounds += counters.rounds;
-    stats.conn_build_visits += counters.build_visits;
-    stats.conn_flood_nodes += counters.flood_nodes;
-    stats.conn_splits += counters.splits;
-    stats.conn_merges += counters.merges;
-    if (counters.rounds != 0) {
-        stats.conn_round_items_min = if (stats.conn_round_items_max == 0) counters.round_items_min else @min(stats.conn_round_items_min, counters.round_items_min);
-        stats.conn_round_items_max = @max(stats.conn_round_items_max, counters.round_items_max);
-    }
-    stats.conn_flood_off_main_ns += counters.flood_off_main_ns;
-    accumulateBatch(&stats.conn_seed_batch, conn.last_seed_batch);
-    accumulateBatch(&stats.conn_gather_batch, conn.last_gather_batch);
     accumulateBatch(&stats.conn_flood_batch, conn.last_flood_batch);
     addClosureStats(stats, conn, counters.closure);
+    if (comptime !runtime_perf_log.enabled) return;
+    stats.perf.conn_groups += counters.perf.groups;
+    stats.perf.conn_families += counters.families;
+    stats.perf.conn_rounds += counters.perf.rounds;
+    stats.perf.conn_build_visits += counters.perf.build_visits;
+    stats.perf.conn_flood_nodes += counters.perf.flood_nodes;
+    stats.perf.conn_splits += counters.perf.splits;
+    stats.perf.conn_merges += counters.perf.merges;
+    if (counters.perf.rounds != 0) {
+        stats.perf.conn_round_items_min = if (stats.perf.conn_round_items_max == 0) counters.perf.round_items_min else @min(stats.perf.conn_round_items_min, counters.perf.round_items_min);
+        stats.perf.conn_round_items_max = @max(stats.perf.conn_round_items_max, counters.perf.round_items_max);
+    }
+    stats.perf.conn_flood_off_main_ns += counters.perf.flood_off_main_ns;
+    accumulateBatch(&stats.perf.conn_seed_batch, conn.perf.last_seed_batch);
+    accumulateBatch(&stats.perf.conn_gather_batch, conn.perf.last_gather_batch);
 }
 
 // Folds one batch's closure counters and commit-side stage shapes into `stats`; the
-// candidates and the landing fold where they run.
+// candidates and the landing fold where they run. Only the perf log's rows batch folds
+// without `runtime_perf_log.enabled`.
 fn addClosureStats(stats: *NavUpdateStats, conn: *const Connectivity, counters: ClosureCounters) void {
-    stats.closure_touched += counters.touched;
-    stats.closure_links += counters.links;
-    stats.closure_terms_new += counters.terms_new;
-    stats.closure_terms_left += counters.terms_left;
-    stats.closure_a_rows += counters.a_rows;
-    stats.closure_rounds += counters.rounds;
-    stats.closure_words_written += counters.words_written;
-    stats.closure_shrinks += counters.shrinks;
-    stats.closure_block_allocs += counters.block_allocs;
-    stats.closure_block_frees += counters.block_frees;
-    stats.closure_live_words = conn.closure.live_words;
-    stats.closure_tail_capacity = conn.closure.tail.capacity;
+    if (counters.links != 0) accumulateBatch(&stats.conn_closure_rows_batch, conn.closure.last_rows_batch);
+    if (comptime !runtime_perf_log.enabled) return;
+    stats.perf.closure_touched += counters.perf.touched;
+    stats.perf.closure_links += counters.links;
+    stats.perf.closure_terms_new += counters.perf.terms_new;
+    stats.perf.closure_terms_left += counters.perf.terms_left;
+    stats.perf.closure_a_rows += counters.perf.a_rows;
+    stats.perf.closure_rounds += counters.perf.rounds;
+    stats.perf.closure_words_written += counters.perf.words_written;
+    stats.perf.closure_shrinks += counters.perf.shrinks;
+    stats.perf.closure_block_allocs += counters.perf.block_allocs;
+    stats.perf.closure_block_frees += counters.perf.block_frees;
+    stats.perf.closure_live_words = conn.closure.live_words;
+    stats.perf.closure_tail_capacity = conn.closure.tail.capacity;
     if (conn.closure.active) {
         const limits = conn.closure.limits;
-        stats.closure_tail_bound = @max(stats.closure_tail_bound, limits.tail_words);
-        stats.closure_tail_used = @max(stats.closure_tail_used, counters.tail_words);
-        stats.closure_candidate_words = @max(stats.closure_candidate_words, limits.candidate_words);
-        stats.closure_kb = @max(stats.closure_kb, limits.k_b);
+        stats.perf.closure_tail_bound = @max(stats.perf.closure_tail_bound, limits.tail_words);
+        stats.perf.closure_tail_used = @max(stats.perf.closure_tail_used, counters.perf.tail_words);
+        stats.perf.closure_candidate_words = @max(stats.perf.closure_candidate_words, limits.candidate_words);
+        stats.perf.closure_kb = @max(stats.perf.closure_kb, limits.k_b);
     }
     if (counters.links == 0) return;
-    accumulateBatch(&stats.conn_closure_resolve_batch, conn.closure.last_resolve_batch);
-    accumulateBatch(&stats.conn_closure_mask_batch, conn.closure.last_mask_batch);
-    accumulateBatch(&stats.conn_closure_plan_batch, conn.closure.last_plan_batch);
-    accumulateBatch(&stats.conn_closure_rows_batch, conn.closure.last_rows_batch);
+    accumulateBatch(&stats.perf.conn_closure_resolve_batch, conn.closure.perf.last_resolve_batch);
+    accumulateBatch(&stats.perf.conn_closure_mask_batch, conn.closure.perf.last_mask_batch);
+    accumulateBatch(&stats.perf.conn_closure_plan_batch, conn.closure.perf.last_plan_batch);
 }
 
 /// A marks batch between `NavGraph.prepareMarks` and its commit or abort.
@@ -921,10 +925,12 @@ pub const NavGraph = struct {
     /// (one count per list or pool that grew). The first logs once.
     pool_grows: u64 = 0,
     pool_growth_logged: bool = false,
-    /// Telemetry: closure landings `landClosure` deferred by `OutOfMemory`, across updates
-    /// (failed ones too); the first logs once.
-    land_deferrals: u64 = 0,
+    /// Telemetry, kept only with `runtime_perf_log.enabled`: closure landings `landClosure`
+    /// deferred by `OutOfMemory`, across updates (failed ones too). The first logs once.
+    perf: Perf = .{},
     land_deferral_logged: bool = false,
+
+    pub const Perf = if (runtime_perf_log.enabled) struct { land_deferrals: u64 = 0 } else struct {};
 
     pub fn deinit(self: *NavGraph) void {
         self.connectivity.deinit(self.allocator);
@@ -1173,7 +1179,7 @@ pub const NavGraph = struct {
         fresh.pool_grows = self.pool_grows + fresh.pool_grows;
         // The fresh levels' builds already logged their growth; the swap keeps that.
         fresh.pool_growth_logged = self.pool_growth_logged or fresh.pool_growth_logged;
-        fresh.land_deferrals = self.land_deferrals;
+        fresh.perf = self.perf;
         fresh.land_deferral_logged = self.land_deferral_logged;
         self.deinit();
         self.* = fresh;
@@ -1205,7 +1211,7 @@ pub const NavGraph = struct {
         fresh_graph.plan = try .init(self.allocator, chunk_count);
         // The fresh level's directories and plan sets, sized to its chunks: one growth.
         self.pool_grows += 1;
-        stats.main.reserve_ns += section.lap();
+        stats.addMain(.reserve_ns, section.lap());
 
         // Plan: every chunk of the level, in order. A build has no dirty keys; their list
         // holds one changed chunk's, as every key list does once the build releases them.
@@ -1221,7 +1227,7 @@ pub const NavGraph = struct {
             self.changed_keys.items[chunk] = key;
             self.patch_keys.items[chunk] = key;
         }
-        stats.main.plan_ns += section.lap();
+        stats.addMain(.plan_ns, section.lap());
         // Reserve.
         section = StageTimer.begin();
         const appending = @as(usize, level_index) == self.levels.items.len;
@@ -1239,13 +1245,13 @@ pub const NavGraph = struct {
         try self.planPatchInfo(world);
         try self.reserveCellBlocks(levels, world, colliders);
         try self.reserveRecords(levels);
-        stats.main.reserve_ns += section.lap();
+        stats.addMain(.reserve_ns, section.lap());
 
         // Commit into the fresh storage.
         self.remaskKeys(levels, colliders, world, null, stageThreads(threads, .remask), stats);
         section = StageTimer.begin();
         self.claimRecords(levels);
-        stats.main.commit_ns += section.lap();
+        stats.addMain(.commit_ns, section.lap());
         self.patchKeys(levels, world, stageThreads(threads, .patch), stats);
         // Connectivity: reserves first, so an error leaves every other level as it was.
         const old_levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
@@ -1280,7 +1286,7 @@ pub const NavGraph = struct {
             self.levels.items[level_index] = fresh_grid;
             self.level_graphs.items[level_index] = fresh_graph;
         }
-        stats.main.commit_ns += section.lap();
+        stats.addMain(.commit_ns, section.lap());
         stats.levels_built += 1;
         self.logPoolGrowth();
     }
@@ -1389,7 +1395,7 @@ pub const NavGraph = struct {
             try self.planPatchInfo(prepared.world);
             try self.reserveCellBlocks(levels, prepared.world, colliders);
             try self.reserveRecords(levels);
-            stats.main.reserve_ns += section.lap();
+            stats.addMain(.reserve_ns, section.lap());
             try self.connectivity.prepareMarks(
                 self.allocator,
                 levels,
@@ -1407,7 +1413,7 @@ pub const NavGraph = struct {
         }
         // The one-way registry rows the commit appends for the new links.
         try self.connectivity.reserveRegistry(self.allocator, new_links, &self.pool_grows);
-        stats.main.reserve_ns += section.lap();
+        stats.addMain(.reserve_ns, section.lap());
         self.staging_window.endBatch(self.changed_keys.items.len <= 1);
         self.batch_prepared = true;
         return prepared;
@@ -1433,20 +1439,20 @@ pub const NavGraph = struct {
         self.foldNewLinks(new_links);
         self.links_applied += prepared.new_link_count;
         self.connectivity.appendRegistry(new_links);
-        stats.main.commit_ns += section.lap();
+        stats.addMain(.commit_ns, section.lap());
         if (self.patch_keys.items.len == 0) return .{ .changed = false, .dirty_keys = &.{}, .changed_keys = &.{}, .changed_masks = &.{} };
         const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
         std.debug.assert(self.changed_masks.items.len == self.changed_keys.items.len);
         self.remaskKeys(levels, colliders, prepared.world, self.changed_masks.items, stageThreads(threads, .remask), stats);
         section = StageTimer.begin();
         self.claimRecords(levels);
-        stats.main.commit_ns += section.lap();
+        stats.addMain(.commit_ns, section.lap());
         self.patchKeys(levels, prepared.world, stageThreads(threads, .patch), stats);
         const counters = self.connectivity.commitMarks(self.allocator, levels, prepared.world, self.patch_keys.items, new_links, stageThreads(threads, .conn_gather), stageThreads(threads, .conn_flood), closureThreads(threads), stats);
         addConnectivityStats(stats, &self.connectivity, counters);
         section = StageTimer.begin();
         stats.records_patched += self.releaseRecords(levels);
-        stats.main.commit_ns += section.lap();
+        stats.addMain(.commit_ns, section.lap());
         stats.dirty_chunks += self.changed_keys.items.len;
         stats.chunks_patched += self.patch_keys.items.len;
         stats.incremental_rebuilds = 1;
@@ -1469,13 +1475,15 @@ pub const NavGraph = struct {
     /// the batch tail (`Connectivity.landResidents`, threaded per line), once at the end of a
     /// nav update, on its error path too, so the tail is empty after every update whose landing
     /// succeeds. Never fails: on `OutOfMemory` the blocks stay valid in the tail,
-    /// `closure_land_deferrals` and `land_deferrals` count it (the first logs once), and the
+    /// `closure_land_deferrals` and `perf.land_deferrals` count it (the first logs once), and the
     /// next prepare retries the landing, failing as an ordinary `OutOfMemory` with the graph
     /// intact. Main work O(1) per block.
     pub fn landClosure(self: *NavGraph, threads: ?NavUpdateThreads, stats: *NavUpdateStats) void {
         self.connectivity.landResidents(self.allocator, stageThreads(threads, .conn_closure_land), stats) catch {
-            stats.closure_land_deferrals += 1;
-            self.land_deferrals += 1;
+            if (comptime runtime_perf_log.enabled) {
+                stats.perf.closure_land_deferrals += 1;
+                self.perf.land_deferrals += 1;
+            }
             if (self.land_deferral_logged) return;
             self.land_deferral_logged = true;
             if (comptime logging.enabled(.warn))
@@ -1608,13 +1616,13 @@ pub const NavGraph = struct {
             .staging = staging,
             .tallies = self.plan_tallies.items,
         };
-        stats.main.plan_ns += section.lap();
+        stats.addMain(.plan_ns, section.lap());
         const batch = runShaped(threads, selection, item_count, 1, &job, planJob);
         stats.addStageTime(batch);
-        accumulateBatch(&stats.plan_batch, batch);
+        if (comptime runtime_perf_log.enabled) accumulateBatch(&stats.perf.plan_batch, batch);
 
         section = StageTimer.begin();
-        defer stats.main.plan_ns += section.lap();
+        defer stats.addMain(.plan_ns, section.lap());
         if (selection.range_count > 1) return self.mergePlanWindows();
         // One range: its windows start at 0 and hold the sorted unique keys.
         const counts = self.plan_tallies.items[0].counts;
@@ -1866,7 +1874,7 @@ pub const NavGraph = struct {
             .deltas = self.remask_deltas.items,
             .masks = masks,
         };
-        stats.main.commit_ns += section.lap();
+        stats.addMain(.commit_ns, section.lap());
         const batch = runStage(threads, keys.len, 1, &job, &job.range_count, remaskJob);
         stats.addStageTime(batch);
         accumulateBatch(&stats.remask_batch, batch);
@@ -1878,7 +1886,7 @@ pub const NavGraph = struct {
             std.debug.assert(count >= 0);
             level_grid.blocked_count = @intCast(@max(count, 0));
         }
-        stats.main.commit_ns += section.lap();
+        stats.addMain(.commit_ns, section.lap());
     }
 
     // Claims a record for every patch key that may hold portals and has none, and a link
@@ -1900,7 +1908,7 @@ pub const NavGraph = struct {
         var job = PatchJob{ .graph = self, .levels = levels, .world = world, .keys = self.patch_keys.items, .infos = self.patch_info.items };
         const batch = runStage(threads, self.patch_keys.items.len, 1, &job, &job.range_count, patchJob);
         stats.addStageTime(batch);
-        accumulateBatch(&stats.patch_batch, batch);
+        if (comptime runtime_perf_log.enabled) accumulateBatch(&stats.perf.patch_batch, batch);
     }
 
     // Releases the records the patch left without portals and the link slots left empty, in
@@ -2248,6 +2256,7 @@ test "incremental nav update remask matches the composed world mask across level
 }
 
 test "threaded initial nav build matches a serial build across levels" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // A build given a thread system dispatches its remask and patch stages through it;
     // pinned to a fixed one-chunk partition here so the stages really fan out.
     if (@import("builtin").single_threaded) return error.SkipZigTest;
@@ -2274,7 +2283,7 @@ test "threaded initial nav build matches a serial build across levels" {
     threaded.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     const build_stats = try threaded.graph.rebuild(no_colliders.view(), .{ .world = &world }, .{ .thread_system = &threads, .tuners = &threaded.tuners.nav, .controls = threaded.nav_controls });
     try std.testing.expect(!build_stats.remask_batch.ran_inline);
-    try std.testing.expect(!build_stats.patch_batch.ran_inline);
+    try std.testing.expect(!build_stats.perf.patch_batch.ran_inline);
 
     var serial = PathfindingSystem.init(std.testing.allocator);
     defer serial.deinit();
@@ -2633,6 +2642,7 @@ test "incremental nav update across distant chunks in one batch matches a full r
 }
 
 test "incremental nav update forced-parallel remask and patch match a serial full rebuild" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // The adaptive tuner usually runs a small dig inline, so the threaded remask/patch branches go
     // unexercised. This pins both: forcing adaptive=false with items_per_range=1 over a multi-chunk
     // dig drives the parallel path (asserted via ran_inline == false for BOTH stages), and the
@@ -2678,7 +2688,7 @@ test "incremental nav update forced-parallel remask and patch match a serial ful
 
     // Both stages must have actually threaded, not fallen back to the inline slot-0 path.
     try std.testing.expect(!stats.remask_batch.ran_inline);
-    try std.testing.expect(!stats.patch_batch.ran_inline);
+    try std.testing.expect(!stats.perf.patch_batch.ran_inline);
 
     var rebuilt = PathfindingSystem.init(std.testing.allocator);
     defer rebuilt.deinit();
@@ -3060,6 +3070,7 @@ test "a static obstacle commit and its nav reaction are allocation-free at stead
 }
 
 test "remask and patch after reserve allocate nothing on a multi-worker ThreadSystem (FailingAllocator)" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // The remask's cell blocks and the patch's records and link slots are reserved on the
     // main thread before dispatch; workers only fill what was claimed. This proves it on a
     // real multi-worker ThreadSystem, with a static collider listed in a remasked chunk.
@@ -3120,7 +3131,7 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
         try std.testing.expectEqual(@as(usize, 1), warm_stats.incremental_rebuilds);
         // The warmup itself must have threaded, so the proof below runs the same dispatch.
         try std.testing.expect(!warm_stats.remask_batch.ran_inline);
-        try std.testing.expect(!warm_stats.patch_batch.ran_inline);
+        try std.testing.expect(!warm_stats.perf.patch_batch.ran_inline);
     }
 
     const original = system.allocator;
@@ -3135,9 +3146,9 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     // The stages threaded under the failing allocator and allocated nothing.
     try std.testing.expect(!stats.remask_batch.ran_inline);
-    try std.testing.expect(!stats.patch_batch.ran_inline);
-    try std.testing.expect(!stats.conn_seed_batch.ran_inline);
-    try std.testing.expect(!stats.conn_gather_batch.ran_inline);
+    try std.testing.expect(!stats.perf.patch_batch.ran_inline);
+    try std.testing.expect(!stats.perf.conn_seed_batch.ran_inline);
+    try std.testing.expect(!stats.perf.conn_gather_batch.ran_inline);
 
     system.graph.allocator = original;
     system.allocator = original;
@@ -3461,6 +3472,7 @@ test "a nav-record reserve OOM before a cave-in or explosion dense write leaves 
 }
 
 test "one chunk's change leaves every other chunk's record, connectivity nodes, and one-way terminals and rows untouched" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -3490,8 +3502,8 @@ test "one chunk's change leaves every other chunk's record, connectivity nodes, 
     const changed = (try fixture.world.setDenseTile(fixture.obstacle[0], 5, 5, fixture.tree)).?;
     const stats = try test_support.applyTileChange(&system, no_colliders, &fixture.world, changed);
     try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
-    try std.testing.expectEqual(@as(usize, 0), stats.conn_flood_nodes);
-    try std.testing.expectEqual(@as(usize, 0), stats.closure_links);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.conn_flood_nodes);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.closure_links);
     const closure_words_after = try test_support.dupeClosureBlocks(std.testing.allocator, &system.graph);
     defer std.testing.allocator.free(closure_words_after);
     try std.testing.expectEqualSlices(u32, closure_words_before, closure_words_after);
@@ -4188,6 +4200,7 @@ test "an all-solid level holds no records; an open level one per chunk" {
 }
 
 test "the threaded key plan equals the inline plan for marks across many chunks and levels" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4239,7 +4252,7 @@ test "the threaded key plan equals the inline plan for marks across many chunks 
         const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
         // Merged from several ranges that ran on workers.
         try std.testing.expect(system.graph.plan_tallies.items.len > 1);
-        try std.testing.expect(!stats.plan_batch.ran_inline);
+        try std.testing.expect(!stats.perf.plan_batch.ran_inline);
         try std.testing.expect(system.graph.plan_levels.isEmpty());
         try std.testing.expectEqualSlices(u64, systems[0].graph.changed_keys.items, system.graph.changed_keys.items);
         try std.testing.expectEqualSlices(u64, systems[0].graph.patch_keys.items, system.graph.patch_keys.items);
@@ -4316,6 +4329,7 @@ test "the threaded plan merge equals the sorted unique keys of every stream for 
 }
 
 test "the threaded key plan equals the inline plan on 65 levels across the plan level set's word boundary" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4370,7 +4384,7 @@ test "the threaded key plan equals the inline plan on 65 levels across the plan 
         for (systems[1..]) |*system| {
             const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
             try std.testing.expect(system.graph.plan_tallies.items.len > 1);
-            try std.testing.expect(!stats.plan_batch.ran_inline);
+            try std.testing.expect(!stats.perf.plan_batch.ran_inline);
             try std.testing.expect(system.graph.plan_levels.isEmpty());
             try std.testing.expectEqualSlices(u64, inline_graph.changed_keys.items, system.graph.changed_keys.items);
             try std.testing.expectEqualSlices(u64, inline_graph.dirty_keys.items, system.graph.dirty_keys.items);
@@ -4533,6 +4547,7 @@ test "the key plan equals the plan by definition for multi-chunk marks at level 
 }
 
 test "a step's stats fold the plan, remask, and patch stages of its level build and its marks batch" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4548,7 +4563,7 @@ test "a step's stats fold the plan, remask, and patch stages of its level build 
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     const chunks = system.graph.chunkCount();
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
-    try std.testing.expectEqual(@as(usize, 1), stats.plan_batch.item_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.plan_batch.item_count);
     try std.testing.expectEqual(chunks + stats.dirty_chunks, stats.remask_batch.item_count);
-    try std.testing.expectEqual(chunks + stats.chunks_patched, stats.patch_batch.item_count);
+    try std.testing.expectEqual(chunks + stats.chunks_patched, stats.perf.patch_batch.item_count);
 }

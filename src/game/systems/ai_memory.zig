@@ -25,6 +25,7 @@
 //!    familiarity rises by `ai_memory_familiarity_gain_rate` (clamped).
 
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const logging = @import("../../core/logging.zig");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
@@ -112,12 +113,16 @@ pub const AiMemoryConfig = struct {
 };
 
 pub const AiMemoryStats = struct {
-    /// The decay stage.
-    batch: BatchStats = .{},
-    /// The think-row to memory-row translate, the member order, and the visibility pass.
-    gather_batch: BatchStats = .{},
-    order_batch: BatchStats = .{},
-    visible_batch: BatchStats = .{},
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: the decay stage, and the think-row to
+    /// memory-row translate, the member order, and the visibility pass.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        batch: BatchStats = .{},
+        gather_batch: BatchStats = .{},
+        order_batch: BatchStats = .{},
+        visible_batch: BatchStats = .{},
+    } else struct {};
 };
 
 pub const AiMemorySystem = struct {
@@ -213,12 +218,14 @@ pub const AiMemorySystem = struct {
             self.think_rows.items.len = think_count;
             self.think_perception_rows.items.len = think_count;
             var translate = TranslateJob{ .think = think, .entities = ai_agents.entities, .data = data, .out = self.think_rows.items, .out_perception = self.think_perception_rows.items };
-            stats.gather_batch = runStage(threads.stage(&self.gather_tuner), think_count, ai_memory_range_alignment_items, &translate, &translate.range_count, translateJob);
+            const gather_batch = runStage(threads.stage(&self.gather_tuner), think_count, ai_memory_range_alignment_items, &translate, &translate.range_count, translateJob);
+            if (comptime runtime_perf_log.enabled) stats.perf.gather_batch = gather_batch;
 
             const members = self.mark(row_count);
             if (members != 0) {
                 self.collectTouchedWords(row_count);
-                stats.order_batch = self.orderMembers(row_count, threads.stage(&self.order_tuner));
+                const order_batch = self.orderMembers(row_count, threads.stage(&self.order_tuner));
+                if (comptime runtime_perf_log.enabled) stats.perf.order_batch = order_batch;
                 std.debug.assert(self.memory_dense_indices.items.len == members and self.perception_dense_indices.items.len == members);
                 self.unmark();
             }
@@ -226,13 +233,15 @@ pub const AiMemorySystem = struct {
             var decay = AiMemoryDecayContext{ .slice = memory_slice, .indices = self.memory_dense_indices.items };
             // Range alignment 1: the indexed gather/scatter path processes each row
             // independently of any contiguous-range shape.
-            stats.batch = runStage(threads.stage(&self.decay_tuner), members, 1, &decay, &decay.range_count, aiMemoryDecayJob);
+            const decay_batch = runStage(threads.stage(&self.decay_tuner), members, 1, &decay, &decay.range_count, aiMemoryDecayJob);
+            if (comptime runtime_perf_log.enabled) stats.perf.batch = decay_batch;
         }
 
         refreshFromEvents(data, &memory_slice, perception_slice, frame);
 
         var visible = VisibleJob{ .memory = memory_slice, .perception = perception_slice, .rows = self.memory_dense_indices.items, .perception_rows = self.perception_dense_indices.items };
-        stats.visible_batch = runStage(threads.stage(&self.visible_tuner), visible.rows.len, 1, &visible, &visible.range_count, visibleJob);
+        const visible_batch = runStage(threads.stage(&self.visible_tuner), visible.rows.len, 1, &visible, &visible.range_count, visibleJob);
+        if (comptime runtime_perf_log.enabled) stats.perf.visible_batch = visible_batch;
         return stats;
     }
 
@@ -1103,13 +1112,14 @@ fn shuffledThinkRows(rows: []u32) void {
 }
 
 fn expectFourStagesOnWorkers(stats: AiMemoryStats) !void {
-    for ([_]BatchStats{ stats.gather_batch, stats.order_batch, stats.batch, stats.visible_batch }) |batch| {
+    for ([_]BatchStats{ stats.perf.gather_batch, stats.perf.order_batch, stats.perf.batch, stats.perf.visible_batch }) |batch| {
         try testing.expect(!batch.ran_inline);
         try testing.expect(batch.active_worker_threads > 0);
     }
 }
 
 test "AiMemorySystem threaded update has no steady-state allocation after warmup (FailingAllocator)" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Two order ranges of touched row words, so every stage runs on workers.
@@ -1350,6 +1360,7 @@ test "AiMemorySystem results are bit-identical for any think-set order" {
 }
 
 test "AiMemorySystem serial equals threaded across range sizes and worker counts" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var think: [order_fixture_agents]u32 = undefined;
@@ -1381,8 +1392,8 @@ test "AiMemorySystem serial equals threaded across range sizes and worker counts
             try expectSameMemory(&serial.data, &fixture.data);
             try expectMasksClear(&sys);
             if (threads.workerThreadCount() == 0 or items_per_range > 2) continue;
-            try testing.expect(got.last.order_batch.item_count > 2);
-            for ([_]BatchStats{ got.last.gather_batch, got.last.order_batch, got.last.batch, got.last.visible_batch }) |batch| {
+            try testing.expect(got.last.perf.order_batch.item_count > 2);
+            for ([_]BatchStats{ got.last.perf.gather_batch, got.last.perf.order_batch, got.last.perf.batch, got.last.perf.visible_batch }) |batch| {
                 try testing.expect(batch.range_count > 1);
                 try testing.expect(!batch.ran_inline);
             }

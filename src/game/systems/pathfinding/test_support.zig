@@ -30,6 +30,42 @@ const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
 const WorldTileChangedEvent = @import("../../simulation.zig").WorldTileChangedEvent;
 const NavUpdateStats = @import("types.zig").NavUpdateStats;
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
+const SearchScratch = @import("scratch.zig").SearchScratch;
+const Tier1Scratch = @import("scratch.zig").Tier1Scratch;
+const CorridorScratch = @import("scratch.zig").CorridorScratch;
+const ResultCache = @import("caches.zig").ResultCache;
+const KeySet = @import("caches.zig").KeySet;
+const GroupKeyMap = @import("caches.zig").GroupKeyMap;
+const GoalTable = @import("goal_table.zig").GoalTable;
+const GroupField = @import("group_field.zig").GroupField;
+const IntakeRecordList = @import("intake.zig").IntakeRecordList;
+const GroupKeyCountList = @import("intake.zig").GroupKeyCountList;
+const IntakeTallyList = @import("intake.zig").IntakeTallyList;
+const RegRecordList = @import("publish.zig").RegRecordList;
+const PublishBandList = @import("publish.zig").PublishBandList;
+const PublishBand = @import("publish.zig").PublishBand;
+const NavMarkList = @import("nav_reaction.zig").NavMarkList;
+const NavMarkTallyList = @import("nav_reaction.zig").NavMarkTallyList;
+const NavMarkTally = @import("nav_reaction.zig").NavMarkTally;
+const nav_mark_range_alignment_items = @import("nav_reaction.zig").nav_mark_range_alignment_items;
+const EvictItemList = @import("eviction.zig").EvictItemList;
+const HitList = @import("eviction.zig").HitList;
+const listBytesBound = @import("nav_graph.zig").listBytesBound;
+const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
+const RegRecord = types.RegRecord;
+const PathSolveResult = types.PathSolveResult;
+const GroupRequestTally = types.GroupRequestTally;
+const PendingRequest = types.PendingRequest;
+const NavMark = types.NavMark;
+const EvictItem = types.EvictItem;
+const IntakeRecord = types.IntakeRecord;
+const GroupKeyCount = types.GroupKeyCount;
+const IntakeTally = types.IntakeTally;
+const registry_shard_count = types.registry_shard_count;
+const reg_window_alignment_items = types.reg_window_alignment_items;
+const hit_window_alignment_items = types.hit_window_alignment_items;
+const intake_range_alignment_items = types.intake_range_alignment_items;
+const pooledStorageBytesBound = @import("../chunk_list_map_test_support.zig").pooledStorageBytesBound;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const ChunkPortals = @import("nav_graph.zig").ChunkPortals;
 const LabelSet = @import("nav_graph.zig").LabelSet;
@@ -56,7 +92,6 @@ const solve = @import("solve.zig");
 const PathQueryKey = @import("types.zig").PathQueryKey;
 const PathfindingStats = @import("types.zig").PathfindingStats;
 const PathfindingConfig = @import("types.zig").PathfindingConfig;
-const registry_shard_count = @import("types.zig").registry_shard_count;
 const registryShard = @import("types.zig").registryShard;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
 const no_entry = @import("../chunk_list_map.zig").no_entry;
@@ -1515,4 +1550,121 @@ pub fn solveStep(system: *PathfindingSystem, requester: EntityId, start: math.Ve
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
     return updatePathfindingInline(system, &stream, 8, .{});
+}
+
+// ---- Request-side byte accounting -------------------------------------------------------
+
+/// The request side's storage by part: per-participant search scratch, the tier-1
+/// corridor pool, the result cache with the solve slots' path stripes and records, the
+/// path registry with its registration windows, the goal table, the request queues and
+/// per-step lists (pending queue and keys, intake staging, solve slots, group tallies and
+/// field headers, publish windows, resize snapshots), and the nav change scratch (marks
+/// and their staging, the eviction scratch). With the graph and the group fields' pools,
+/// every allocation the system owns.
+pub const RequestStorage = struct {
+    search: usize = 0,
+    tier1: usize = 0,
+    results: usize = 0,
+    registry: usize = 0,
+    goals: usize = 0,
+    queues: usize = 0,
+    change_scratch: usize = 0,
+};
+
+/// What sizes the request side for `requestStorageBytesBound`, beyond its capacity.
+pub const RequestShape = struct {
+    /// The most cached results whose path outgrows the inline stripe at once.
+    long_results: usize = std.math.maxInt(usize),
+    /// The most registry runs (chunk-local stretches of a stored path) one result holds;
+    /// null is one per stored cell, the most a plain or stitched path holds.
+    runs_per_result: ?usize = null,
+    /// Chunks over every level: a registry key is a chunk, so keys never pass it.
+    chunks: usize = std.math.maxInt(usize),
+    /// The most nav marks recorded between two nav batches (a terrain record's events or
+    /// two per static change), and the most chunk keys one batch changes.
+    marks: usize = 0,
+    batch_keys: usize = 0,
+};
+
+/// `RequestStorage` held now (allocated capacity). O(participants + shards + the result
+/// cache's pages).
+pub fn requestResidentBytes(system: *const PathfindingSystem) RequestStorage {
+    var storage = RequestStorage{
+        .search = system.scratch_slots.capacity * @sizeOf(SearchScratch),
+        .tier1 = system.tier1_scratch.capacity * @sizeOf(Tier1Scratch),
+        .results = system.completed.residentBytes() + system.worker_path_pool.capacity * @sizeOf(u32) +
+            system.worker_run_starts.capacity * @sizeOf(u16) + system.solved_paths.capacity * @sizeOf(PathfindingSystem.SolvedPath) +
+            system.publish_records.capacity * @sizeOf(?ResultCache.Claimed),
+        .registry = system.reg_buckets.capacity * @sizeOf(RegRecord),
+        .goals = system.goals.residentBytes(),
+        .queues = system.pending.buffer.len * @sizeOf(PendingRequest) + system.pending_keys.residentBytes() +
+            system.intake_records.capacity * @sizeOf(IntakeRecord) + system.intake_group_counts.capacity * @sizeOf(GroupKeyCount) +
+            system.intake_tallies.capacity * @sizeOf(IntakeTally) + system.solve_results.capacity * @sizeOf(PathSolveResult) +
+            system.solve_indices.capacity * @sizeOf(usize) + system.solve_tier1_slot.capacity * @sizeOf(u32) +
+            system.group_fields.capacity * @sizeOf(GroupField) + system.group_field_keys.residentBytes() +
+            system.group_field_slots.capacity * @sizeOf(usize) + system.group_requests.capacity * @sizeOf(GroupRequestTally) +
+            system.group_key_map.residentBytes() + system.publish_range_bases.capacity * @sizeOf(usize) +
+            system.publish_bands.capacity * @sizeOf(PublishBand) + system.rotate_back_scratch.capacity * @sizeOf(PendingRequest) +
+            system.resize_pending_snapshot.capacity * @sizeOf(PendingRequest) + system.resize_group_snapshot.capacity * @sizeOf(GroupRequestTally),
+        .change_scratch = system.nav_marks.capacity * @sizeOf(NavMark) + system.nav_mark_staging.capacity * @sizeOf(NavMark) +
+            system.nav_mark_tallies.capacity * @sizeOf(NavMarkTally) + system.evict_items.capacity * @sizeOf(EvictItem) +
+            system.evict_hits.capacity * @sizeOf(u32),
+    };
+    for (system.scratch_slots.items) |*scratch| storage.search += scratch.residentBytes();
+    for (system.tier1_scratch.items) |*entry| storage.tier1 += entry.corridor.residentBytes();
+    for (&system.path_index) |*shard| storage.registry += shard.residentBytes();
+    return storage;
+}
+
+/// An over-estimate of `requestResidentBytes` for a system never reserved past
+/// `capacity` (its pools at the limits of `max_agent_budget` agents), whose results and
+/// nav changes fit `shape`, and whose goal table grew from one intent per agent. Search
+/// scratch and the tier-1 pool follow the node budgets, never level cells. The registry
+/// is charged its shards' summed peaks at their pooled share: one key hash spreads any
+/// workload's runs over the shards alike, so the shards peak together. Saturates.
+pub fn requestStorageBytesBound(capacity: PathfindingCapacity, shape: RequestShape) RequestStorage {
+    const limits = PathfindingSystem.deriveLimits(capacity, capacity.max_agent_budget);
+    const participants = @max(@as(usize, 1), capacity.worker_participant_count);
+    const tier0_abstract_nodes = @min(capacity.tier0_abstract_node_cap, capacity.max_abstract_nodes);
+    const tier0_stitched_cells = @min(capacity.tier0_stitched_cell_cap, capacity.max_stitched_path_cells);
+    const stripe_words = types.resultBlockWords(capacity.max_explored_nodes, capacity.max_stitched_path_cells);
+    const solves = limits.solves_per_step;
+    const frames = limits.frame_requests;
+    const pool_words = solves *| stripe_words;
+    // A stored path holds at most one run per cell, plain or stitched.
+    const runs_per_result = shape.runs_per_result orelse @max(capacity.max_stored_path_cells, capacity.max_stitched_path_cells);
+    // A step registers at most its solves' runs, on top of the live results' runs; a
+    // shard reserves table room for each, its live keys aside.
+    const step_runs = solves *| runs_per_result;
+    const live_runs = limits.cached_results *| runs_per_result +| step_runs;
+    const windows = step_runs +| (reg_window_alignment_items - 1) *| maxRangeCount(solves, 1);
+    const marks = @max(frames, shape.marks);
+    // Per changed key, its halos' registrations (each halo owned by one key) and a slot per
+    // group field, each range's window on a line.
+    const hits = live_runs +| shape.batch_keys *| (capacity.max_group_fields +| hit_window_alignment_items);
+    return .{
+        .search = listBytesBound(SearchScratch, participants) +|
+            participants *| SearchScratch.storageBytesBound(capacity.max_explored_nodes, tier0_abstract_nodes, tier0_stitched_cells),
+        .tier1 = listBytesBound(Tier1Scratch, capacity.max_escalated_solves_per_step) +|
+            capacity.max_escalated_solves_per_step *| CorridorScratch.storageBytesBound(capacity.max_abstract_nodes, capacity.max_stitched_path_cells),
+        .results = ResultCache.storageBytesBound(limits.cached_results, capacity.max_stored_path_cells, stripe_words, shape.long_results) +|
+            listBytesBound(u32, pool_words) +| listBytesBound(u16, pool_words) +| listBytesBound(PathfindingSystem.SolvedPath, solves) +|
+            listBytesBound(?ResultCache.Claimed, solves),
+        .registry = pooledStorageBytesBound(registry_shard_count, @min(live_runs, shape.chunks +| step_runs), live_runs, limits.cached_results) +|
+            RegRecordList.growCapacity(windows) *| @sizeOf(RegRecord),
+        // A resolve past the limit doubles it, so one intent per agent reserves at most twice that.
+        .goals = GoalTable.storageBytesBound(2 *| limits.pending_requests),
+        .queues = limits.pending_requests *| @sizeOf(PendingRequest) +| KeySet.storageBytesBound(limits.pending_requests) +|
+            IntakeRecordList.growCapacity(frames) *| @sizeOf(IntakeRecord) +| GroupKeyCountList.growCapacity(frames) *| @sizeOf(GroupKeyCount) +|
+            IntakeTallyList.growCapacity(maxRangeCount(frames, intake_range_alignment_items)) *| @sizeOf(IntakeTally) +|
+            listBytesBound(PathSolveResult, solves) +| listBytesBound(usize, solves) +| listBytesBound(u32, solves) +|
+            listBytesBound(GroupField, capacity.max_group_fields) +| GroupKeyMap.storageBytesBound(capacity.max_group_fields) +|
+            listBytesBound(usize, capacity.max_group_fields) +| listBytesBound(GroupRequestTally, solves) +|
+            GroupKeyMap.storageBytesBound(solves) +| listBytesBound(usize, maxRangeCount(solves, 1)) +|
+            PublishBandList.growCapacity(maxRangeCount(solves, 1)) *| @sizeOf(PublishBand) +| listBytesBound(PendingRequest, solves) +|
+            listBytesBound(PendingRequest, limits.pending_requests) +| listBytesBound(GroupRequestTally, solves),
+        .change_scratch = listBytesBound(NavMark, marks) +| NavMarkList.growCapacity(marks) *| @sizeOf(NavMark) +|
+            NavMarkTallyList.growCapacity(maxRangeCount(marks, nav_mark_range_alignment_items)) *| @sizeOf(NavMarkTally) +|
+            EvictItemList.growCapacity(shape.batch_keys) *| @sizeOf(EvictItem) +| HitList.growCapacity(hits) *| @sizeOf(u32),
+    };
 }

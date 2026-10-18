@@ -7,6 +7,7 @@
 //! `*SteeringSystem`; its step calls `selectIntents`.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const BandPartition = @import("../../../app/thread_system.zig").BandPartition;
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
@@ -50,7 +51,7 @@ pub fn selectIntents(
     const claims = claimColumns(self.claims.slice());
     const stage = StageThreads.withWorkers(threads) orelse {
         resolveAndClaim(data, intents, 0, intent_count, intent_rows.items(.steering), intent_rows.items(.movement), claims, self.claim_stamp);
-        stats.select_resolve_batch = inlineBatch(intent_count, steering_range_alignment_items);
+        if (comptime runtime_perf_log.enabled) stats.perf.select_resolve_batch = inlineBatch(intent_count, steering_range_alignment_items);
         return;
     };
     const resolve_stage = stage.stage(&self.select_resolve_tuner);
@@ -69,7 +70,8 @@ pub fn selectIntents(
         .items_per_range = selection.items_per_range,
         .band_rows = self.band_rows.items,
     };
-    stats.select_resolve_batch = resolve_stage.run(selection, intent_count, steering_range_alignment_items, &resolve, resolveJob);
+    const resolve_batch = resolve_stage.run(selection, intent_count, steering_range_alignment_items, &resolve, resolveJob);
+    if (comptime runtime_perf_log.enabled) stats.perf.select_resolve_batch = resolve_batch;
 
     // A fixed shape (an explicit range size) claims one band per range.
     var claim_stage = stage.stage(&self.select_claim_tuner);
@@ -86,7 +88,8 @@ pub fn selectIntents(
         .stamp = self.claim_stamp,
         .range_count = claim_selection.range_count,
     };
-    stats.select_claim_batch = claim_stage.run(claim_selection, bands.band_count, 1, &claim, claimJob);
+    const claim_batch = claim_stage.run(claim_selection, bands.band_count, 1, &claim, claimJob);
+    if (comptime runtime_perf_log.enabled) stats.perf.select_claim_batch = claim_batch;
 }
 
 // An intent's dense indices; `no_row` when its entity is not a steering agent with a body.
@@ -289,6 +292,7 @@ test "steering keeps highest priority navigation intent with stable tie order" {
 }
 
 test "steering threaded arbitration keeps the first appearance and the best intent across ranges" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -412,6 +416,7 @@ test "steering claims stay correct across the claim stamp wrap" {
 }
 
 test "steering claim band count does not follow the resolve partition" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -457,9 +462,9 @@ test "steering claim band count does not follow the resolve partition" {
         else
             try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
         if (items_per_range) |range_items| {
-            try std.testing.expectEqual(@divCeil(intents.len, range_items), stats.select_resolve_batch.range_count);
+            try std.testing.expectEqual(@divCeil(intents.len, range_items), stats.perf.select_resolve_batch.range_count);
             // Three 16-row claim blocks over 40 steering rows, whatever the resolve ranges.
-            try std.testing.expectEqual(@as(usize, 3), stats.select_claim_batch.item_count);
+            try std.testing.expectEqual(@as(usize, 3), stats.perf.select_claim_batch.item_count);
         }
         try std.testing.expectEqual(@as(usize, 40), stats.selected_intent_count);
         for (output, frame.intents.mergedItems()) |*slot, merged| slot.* = merged.movement;

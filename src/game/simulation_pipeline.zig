@@ -509,8 +509,6 @@ fn simViewRegion(context: SimulationPipelineUpdateContext) ?ActiveRegion {
 pub const SimulationPipelineStats = struct {
     scope: SimulationScope = .{},
     spatial_index: SpatialIndexStats = .{},
-    /// The think-set compaction (`ai_cognition_order`).
-    cognition: BatchStats = .{},
     perception: PerceptionStats = .{},
     ai_memory: AiMemoryStats = .{},
     affect: AffectStats = .{},
@@ -522,8 +520,6 @@ pub const SimulationPipelineStats = struct {
     apply_intents: MovementIntentStats = .{},
     movement: MovementStats = .{},
     chunk_derive: BatchStats = .{},
-    /// The plane stage's NPC cell-entry gather.
-    plane_entry: BatchStats = .{},
     collision: CollisionStats = .{},
     collision_response: CollisionResponseStats = .{},
     /// Live-bus stimuli dropped this step (promote and footstep optional
@@ -550,6 +546,14 @@ pub const SimulationPipelineStats = struct {
     /// Plane-entry gather window growths this step (reservation short of the live AI
     /// rows; zero in steady state).
     plane_entry_windows_grown: usize = 0,
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: the think-set compaction
+    /// (`ai_cognition_order`) and the plane stage's NPC cell-entry gather.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        cognition: BatchStats = .{},
+        plane_entry: BatchStats = .{},
+    } else struct {};
 
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
         const scope_stats = self.scope.stats;
@@ -1232,13 +1236,13 @@ pub const SimulationPipeline = struct {
         action_intents_dropped: usize = 0,
         dig_plane_scratch_grown: usize = 0,
         plane_entry_windows_grown: usize = 0,
+        perf: SimulationPipelineStats.Perf = .{},
         cognition_region: ?ActiveRegion = null,
         stagger_step: u8 = 0,
         ai_halo_indices: []const u32 = &[_]u32{},
         ai_cognition_indices: []const u32 = &[_]u32{},
         collision_scope_indices: ?[]const u32 = null,
         spatial_index: SpatialIndexStats = .{},
-        cognition: BatchStats = .{},
         perception: PerceptionStats = .{},
         ai_memory: AiMemoryStats = .{},
         affect: AffectStats = .{},
@@ -1249,7 +1253,6 @@ pub const SimulationPipeline = struct {
         apply_intents: MovementIntentStats = .{},
         movement: MovementStats = .{},
         chunk_derive: BatchStats = .{},
-        plane_entry: BatchStats = .{},
         collision: CollisionStats = .{},
         collision_response: CollisionResponseStats = .{},
         destructible: DestructibleProcessStats = .{},
@@ -1276,7 +1279,6 @@ pub const SimulationPipeline = struct {
             return .{
                 .scope = scope,
                 .spatial_index = self.spatial_index,
-                .cognition = self.cognition,
                 .perception = self.perception,
                 .ai_memory = self.ai_memory,
                 .affect = self.affect,
@@ -1287,7 +1289,6 @@ pub const SimulationPipeline = struct {
                 .apply_intents = self.apply_intents,
                 .movement = self.movement,
                 .chunk_derive = self.chunk_derive,
-                .plane_entry = self.plane_entry,
                 .collision = self.collision,
                 .collision_response = self.collision_response,
                 .stimuli_live_dropped = self.stimuli_live_dropped,
@@ -1300,6 +1301,7 @@ pub const SimulationPipeline = struct {
                 .destructibles_hit = self.destructible.hits,
                 .dig_plane_scratch_grown = self.dig_plane_scratch_grown,
                 .plane_entry_windows_grown = self.plane_entry_windows_grown,
+                .perf = self.perf,
             };
         }
     };
@@ -1412,7 +1414,7 @@ pub const SimulationPipeline = struct {
         const index = self.spatial_index.view();
         const result = try self.scope.compactCognition(&index, step.stagger_step, step.cognition_region != null, context.thread_system, .{});
         step.ai_cognition_indices = result.cognition;
-        step.cognition = result.batch;
+        if (comptime runtime_perf_log.enabled) step.perf.cognition = result.batch;
     }
 
     /// Perception: hostile candidates within vision/FOV/line-of-sight
@@ -1609,7 +1611,7 @@ pub const SimulationPipeline = struct {
         const grown_before = self.dig.plane_scratch_grown;
         const windows_grown_before = self.plane_entry.windows_grown;
         try runPlaneTraversal(&self.plane_entry, &self.dig, &self.pathfinding, context.world, context.data, context.player, context.frame, context.thread_system);
-        step.plane_entry = self.plane_entry.last_batch;
+        if (comptime runtime_perf_log.enabled) step.perf.plane_entry = self.plane_entry.perf.last_batch;
         step.plane_entry_windows_grown = @intCast(self.plane_entry.windows_grown - windows_grown_before);
         step.dig_plane_scratch_grown = @intCast(self.dig.plane_scratch_grown - grown_before);
     }
@@ -1674,6 +1676,7 @@ pub const SimulationPipeline = struct {
 const StageTimer = @import("../app/runtime_perf_log.zig").StageTimer;
 
 const data_test_support = @import("data_system/test_support.zig");
+const pathfinding_test_support = @import("systems/pathfinding/test_support.zig");
 
 const static_colliders_test_support = @import("systems/static_colliders_test_support.zig");
 
@@ -5228,8 +5231,10 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     const fall_stats = try result;
     if (max_worker_threads > 0) {
         // The 24 AI rows' cell-entry gather ran on the pinned partition.
-        try std.testing.expect(!fall_stats.plane_entry.ran_inline);
-        try std.testing.expectEqual(rangeCount(24, 16), fall_stats.plane_entry.range_count);
+        if (comptime runtime_perf_log.enabled) {
+            try std.testing.expect(!fall_stats.perf.plane_entry.ran_inline);
+            try std.testing.expectEqual(rangeCount(24, 16), fall_stats.perf.plane_entry.range_count);
+        }
     }
     try std.testing.expectEqual(@as(usize, 0), fall_stats.plane_entry_windows_grown);
 
@@ -5405,6 +5410,7 @@ test "the AI movement intent apply runs on workers in the pipeline, allocation-f
 }
 
 test "production steps on workers record nothing into the thread system's shared tuner" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -5463,23 +5469,23 @@ test "production steps on workers record nothing into the thread system's shared
     frame.beginStep();
     const stats = try pipeline.update(context);
     const stage_batches = [_]BatchStats{
-        stats.spatial_index.bucket_batch,
+        stats.spatial_index.perf.bucket_batch,
         stats.spatial_index.sort_batch,
-        stats.spatial_index.link_batch,
-        stats.cognition,
-        stats.perception.gather_batch,
+        stats.spatial_index.perf.link_batch,
+        stats.perf.cognition,
+        stats.perception.perf.gather_batch,
         stats.perception.batch,
-        stats.ai_memory.gather_batch,
+        stats.ai_memory.perf.gather_batch,
         // The order stage's items are touched row words: one range at this population,
         // inline by construction. `ai_memory.zig` proves it on workers.
-        stats.ai_memory.batch,
-        stats.ai_memory.visible_batch,
-        stats.affect.batch,
-        stats.ai.gather_batch,
+        stats.ai_memory.perf.batch,
+        stats.ai_memory.perf.visible_batch,
+        stats.affect.perf.batch,
+        stats.ai.perf.gather_batch,
         stats.ai.separation_batch,
         stats.ai.intent_batch,
-        stats.steering.agents_batch,
-        stats.apply_intents.batch,
+        stats.steering.perf.agents_batch,
+        stats.apply_intents.perf.batch,
         stats.movement.batch,
         stats.chunk_derive,
         stats.collision.broadphase_batch,
@@ -5649,7 +5655,7 @@ test "a pipeline built over steering agents sizes pathfinding for them, so its f
     try std.testing.expect(system.coversAgentCount(agent_count));
     try std.testing.expect(system.effective_agent_capacity >= agent_count);
     const capacity_at_init = system.effective_agent_capacity;
-    const bytes_at_init = system.requestResidentBytes();
+    const bytes_at_init = pathfinding_test_support.requestResidentBytes(system);
 
     // One distinct goal per agent, so intake keeps every request.
     var requests: [agent_count]PathRequest = undefined;
@@ -5701,7 +5707,7 @@ test "a pipeline built over steering agents sizes pathfinding for them, so its f
     const solve_stats = try system.update(&stream, agent_count, &threads, .{ .adaptive = false, .items_per_range = 8 });
     try std.testing.expectEqual(@as(usize, agent_count), solve_stats.available_results);
     try std.testing.expectEqual(capacity_at_init, system.effective_agent_capacity);
-    const bytes_after = system.requestResidentBytes();
+    const bytes_after = pathfinding_test_support.requestResidentBytes(system);
     try std.testing.expectEqual(bytes_at_init.queues, bytes_after.queues);
     try std.testing.expectEqual(bytes_at_init.search, bytes_after.search);
     try std.testing.expectEqual(bytes_at_init.tier1, bytes_after.tier1);
@@ -5849,6 +5855,7 @@ test "a nav-mark reserve OOM before plane traversal leaves world and nav intact 
 }
 
 test "a plane traversal past a failed population seam reserves its nav record from its carves and the seam then matches a rebuild" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: NavSeamFixture = undefined;
     try fixture.init(.{
@@ -5922,7 +5929,7 @@ test "a plane traversal past a failed population seam reserves its nav record fr
         .sim_view = fullWorldSimView(&fixture.world),
     });
     try fixture.pipeline.stagePlaneTraversal(&step);
-    try std.testing.expect(pathfinding.last_mark_batch.range_count >= 2 and !pathfinding.last_mark_batch.ran_inline);
+    try std.testing.expect(pathfinding.perf.last_mark_batch.range_count >= 2 and !pathfinding.perf.last_mark_batch.ran_inline);
     // The gather's windows were short of the AI rows too: grown once on main, then dispatched.
     try std.testing.expectEqual(@as(u64, 1), fixture.pipeline.plane_entry.windows_grown);
     try std.testing.expectEqual(@as(usize, 1), step.plane_entry_windows_grown);
@@ -6221,7 +6228,7 @@ test "a static move's collider splice reaches the perf log, and a seam with no s
     try pipeline.syncStaticColliders(&data, null);
     const splice = pipeline.static_colliders.last_splice_batch;
     try std.testing.expect(splice.item_count > 0);
-    try std.testing.expect(splice.item_count != pipeline.static_colliders.last_query_splice_batch.item_count);
+    try std.testing.expect(splice.item_count != pipeline.static_colliders.perf.last_query_splice_batch.item_count);
     pipeline.recordStaticColliderSyncTo(runtime_perf_log.Context.bind(&perf));
     try std.testing.expectEqual(@as(u64, 1), perf.batches[splice_stage].calls);
     try std.testing.expectEqual(@as(u64, splice.item_count), perf.batches[splice_stage].items);

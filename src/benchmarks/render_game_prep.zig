@@ -466,7 +466,9 @@ fn initFixture(
         fixture.particles.deinit();
         fixture.data.deinit();
     }
-    fixture.world = try fixtures.buildBandedWorld(allocator, io, world_tiles, 1, "grass", "grass");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    fixture.world = try fixtures.buildBandedWorld(allocator, &tileset, world_tiles, 1, "grass", "grass");
     errdefer fixture.world.deinit();
 
     fixture.static_group_count = benchStaticGroups(tile_texture, fixture_config, &fixture.static_groups);
@@ -484,7 +486,7 @@ fn initFixture(
         _ = try fixture.world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
     }
 
-    const deco = try fixture.world.requireTileByName(fixture.world.tilesetMeta().?, "deco_0");
+    const deco = try fixture.world.requireTileByName(&tileset, "deco_0");
     // Sparse tiles sit on the player's level so both variants draw them: sparse
     // tiles draw only on the render window's levels.
     const level: u16 = fixture_config.player_level;
@@ -742,7 +744,9 @@ fn addOffviewRow(fixture: *OffviewFixture, position: math.Vec2) !EntityId {
 fn initOffviewFixture(allocator: std.mem.Allocator, io: std.Io) !OffviewFixture {
     var particles = try ParticleSystem.init(allocator, .{ .capacity = offview_particles });
     errdefer particles.deinit();
-    const world = try fixtures.buildBandedWorld(allocator, io, offview_level_side, 1, "grass", "grass");
+    var tileset = try fixtures.loadTilesetMeta(allocator, io);
+    defer tileset.deinit();
+    const world = try fixtures.buildBandedWorld(allocator, &tileset, offview_level_side, 1, "grass", "grass");
     return .{
         .data = DataSystem.init(allocator),
         .particles = particles,

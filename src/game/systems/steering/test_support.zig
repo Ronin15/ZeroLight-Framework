@@ -27,7 +27,7 @@ pub fn updateSteeringInline(steering: *SteeringSystem, data: *const DataSystem, 
 }
 
 pub fn expectEveryStageThreaded(stats: SteeringStats) !void {
-    for ([_]BatchStats{ stats.agents_batch, stats.select_resolve_batch, stats.select_claim_batch, stats.directions_batch, stats.grid_bucket_batch, stats.grid_sort_batch, stats.batch }) |batch| {
+    for ([_]BatchStats{ stats.perf.agents_batch, stats.perf.select_resolve_batch, stats.perf.select_claim_batch, stats.perf.directions_batch, stats.perf.grid_bucket_batch, stats.perf.grid_sort_batch, stats.batch }) |batch| {
         try std.testing.expect(!batch.ran_inline);
         try std.testing.expect(batch.active_worker_threads > 0);
     }

@@ -6,6 +6,7 @@
 //! routes, long paths, and link folding.
 
 const std = @import("std");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
@@ -1021,7 +1022,7 @@ fn runLongPathAttempt(io: std.Io, threads: *ThreadSystem, system: *PathfindingSy
     });
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
     if (stats.unavailable_results != 0) return error.RouteUnavailable;
-    if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
+    if (runtime_perf_log.enabled and stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
     if (stats.solve_admissions != 1 or stats.escalated_solves != @intFromBool(tier != 0)) return error.LongPathNotOneSolve;
     const corridor = if (tier == 0) &system.scratch_slots.items[0].corridor else &system.tier1_scratch.items[0].corridor;
     const abstract = &corridor.abstract;
@@ -1032,7 +1033,7 @@ fn runLongPathAttempt(io: std.Io, threads: *ThreadSystem, system: *PathfindingSy
     const segments = stats.max_stitch_segments_observed;
     const outcome: LongPathOutcome = if (stats.available_results == 1 or stats.partial_results == 1) published: {
         // Every layout's route leaves its start's chunk, so the solve ran the abstract search.
-        if (stats.abstract_solves != 1 or !found) return error.LongPathSolvedOffCorridor;
+        if (!found or (runtime_perf_log.enabled and stats.perf.abstract_solves != 1)) return error.LongPathSolvedOffCorridor;
         if (stats.partial_results == 0) break :published .available;
         break :published if (corridorEndsAtGoal(system, abstract.corridor.items, request)) .partial else .abstract_partial;
     } else if (stats.budget_exhausted != 1)
@@ -1161,7 +1162,7 @@ fn runLongPathWalk(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, s
         walk.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
         walk.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
         if (stats.unavailable_results != 0) return error.RouteUnavailable;
-        if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
+        if (runtime_perf_log.enabled and stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
         walk.solves += stats.solve_admissions;
         walk.partial_results += stats.partial_results;
         walk.full_results += stats.available_results - stats.cache_hits;
@@ -1259,7 +1260,7 @@ fn runLongPathHops(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, s
             try fixtures.writeRequests(stream, &.{});
             chain.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
             if (stats.unavailable_results != 0) return error.RouteUnavailable;
-            if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
+            if (runtime_perf_log.enabled and stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
             if (stats.solve_admissions != 1 or stats.cache_hits != 0) return error.LongPathNotOneSolve;
             chain.solves += 1;
             chain.escalations += stats.escalated_solves;
@@ -1268,7 +1269,8 @@ fn runLongPathHops(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, s
                 if (attempt == 1 and !corridorEndsAtGoal(system, tier1_abstract.corridor.items, hop)) chain.least_hops += 1;
                 break .partial;
             }
-            if (stats.escalated_dropped == 1) break .dropped;
+            // Neither arrived nor partial, and no longer pending: the tier-1 attempt dropped it.
+            if (system.pending.len == 0) break .dropped;
             if (attempt == 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.LongPathNotEscalated;
         } else return error.LongPathStillPending;
         switch (ended) {
@@ -1564,7 +1566,7 @@ fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_syste
     const count = route_request_count;
     const stats = try runColdOnce(system, &fixture.requests, thread_system, case, count, count, count);
     if (stats.unavailable_results != 0) return error.RouteUnavailable;
-    if (stats.start_invalid_dropped != 0) return error.RouteStartInvalid;
+    if (runtime_perf_log.enabled and stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
     std.debug.assert(stats.available_results <= count);
     if (unsolved_routes == .fail and (stats.available_results != count or stats.pending_requests != 0)) return error.RouteUnsolved;
     return stats;
@@ -1673,8 +1675,9 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     for (0..options.iterations) |_| {
         const sample = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
         batch += 1;
-        accumulator.record(sample.reaction.elapsed_ns, sample.reaction.stats.patch_batch);
-        report.add(sample, sample.reaction.stats.plan_batch, sample.reaction.stats.patch_batch, fixture.open.world.levelLinks().len);
+        const patch = suite.perfBatch(sample.reaction.stats.perf, "patch_batch");
+        accumulator.record(sample.reaction.elapsed_ns, patch);
+        report.add(sample, suite.perfBatch(sample.reaction.stats.perf, "plan_batch"), patch, fixture.open.world.levelLinks().len);
     }
     const pads_held = fixture.open.world.levelLinks().len;
     if (pads_held != peak_pads) return error.LinkFoldDrift;
@@ -1796,7 +1799,7 @@ const LinkFoldReport = struct {
     pads_held: usize = 0,
 
     fn add(self: *LinkFoldReport, sample: LinkFoldSample, plan: BatchStats, patch: BatchStats, pads_held: usize) void {
-        self.stages.add(sample.reaction, .{ plan, patch, sample.reaction.stats.conn_gather_batch });
+        self.stages.add(sample.reaction, .{ plan, patch, suite.perfBatch(sample.reaction.stats.perf, "conn_gather_batch") });
         self.chunks_patched = sample.reaction.stats.chunks_patched;
         self.touched_chunks += sample.touched_chunks;
         self.touched_endpoints += sample.touched_endpoints;

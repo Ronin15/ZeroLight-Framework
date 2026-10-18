@@ -400,8 +400,10 @@ pub const NavMainSummary = struct {
     /// Adds one reaction: its main time and its stats' inline stage time and sections.
     pub fn add(self: *NavMainSummary, main_ns: u64, stats: NavUpdateStats) void {
         self.main_ns += main_ns;
-        self.inline_ns += stats.inline_stage_ns;
-        addSections(&self.sections, stats.main);
+        if (comptime diagnostics_enabled) {
+            self.inline_ns += stats.perf.inline_stage_ns;
+            addSections(&self.sections, stats.perf.main);
+        }
     }
 
     /// Adds `other`'s reactions, its samples not counted.
@@ -420,6 +422,12 @@ pub const NavMainSummary = struct {
         inline for (@typeInfo(NavMainPhases).@"struct".field_names) |name| @field(total, name) += @field(phases, name);
     }
 };
+
+/// A stats struct's gated `perf` batch `field`, or an empty batch where
+/// `runtime_perf_log.enabled` is off (those builds keep no stage diagnostics).
+pub fn perfBatch(perf: anytype, comptime field: []const u8) BatchStats {
+    return if (comptime diagnostics_enabled) @field(perf, field) else .{};
+}
 
 pub fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
     return .{
@@ -1454,49 +1462,52 @@ fn writeNavConn(writer: *std.Io.Writer, summary: ?NavConnSummary) std.Io.Writer.
 /// One nav reaction's connectivity and closure summary from its stats, with the flood
 /// tuner's workers when the case runs it adaptive (null otherwise; zero is inline).
 pub fn navConnSummary(stats: NavUpdateStats, flood_tuner_workers: ?usize) NavConnSummary {
-    return .{
-        .seed = batchSummaryFromBatch(stats.conn_seed_batch),
-        .gather = batchSummaryFromBatch(stats.conn_gather_batch),
+    var summary = NavConnSummary{
         .flood = batchSummaryFromBatch(stats.conn_flood_batch),
-        .families = stats.conn_families,
-        .rounds = stats.conn_rounds,
-        .round_items_min = stats.conn_round_items_min,
-        .round_items_max = stats.conn_round_items_max,
-        .build_visits = stats.conn_build_visits,
-        .flood_nodes = stats.conn_flood_nodes,
-        .groups = stats.conn_groups,
-        .splits = stats.conn_splits,
-        .merges = stats.conn_merges,
-        .flood_off_main_ns = stats.conn_flood_off_main_ns,
         .flood_tuner_workers = flood_tuner_workers,
         .chunks_patched = stats.chunks_patched,
         .records_patched = stats.records_patched,
-        .candidates = batchSummaryFromBatch(stats.conn_closure_candidates_batch),
-        .closure_resolve = batchSummaryFromBatch(stats.conn_closure_resolve_batch),
-        .closure_mask = batchSummaryFromBatch(stats.conn_closure_mask_batch),
-        .closure_plan = batchSummaryFromBatch(stats.conn_closure_plan_batch),
         .closure_rows = batchSummaryFromBatch(stats.conn_closure_rows_batch),
-        .closure_land = batchSummaryFromBatch(stats.conn_closure_land_batch),
-        .closure_touched = stats.closure_touched,
-        .closure_links = stats.closure_links,
-        .closure_terms_new = stats.closure_terms_new,
-        .closure_terms_left = stats.closure_terms_left,
-        .closure_a_rows = stats.closure_a_rows,
-        .closure_rounds = stats.closure_rounds,
-        .closure_words_written = stats.closure_words_written,
-        .closure_shrinks = stats.closure_shrinks,
-        .closure_block_allocs = stats.closure_block_allocs,
-        .closure_block_frees = stats.closure_block_frees,
-        .closure_landed_words = stats.closure_landed_words,
-        .closure_land_deferrals = stats.closure_land_deferrals,
-        .closure_live_words = stats.closure_live_words,
-        .closure_tail_capacity = stats.closure_tail_capacity,
         .closure_rows_off_main_ns = if (stats.conn_closure_rows_batch.ran_inline) 0 else stats.conn_closure_rows_batch.batch_duration_ns,
-        .closure_tail_bound = stats.closure_tail_bound,
-        .closure_tail_used = stats.closure_tail_used,
-        .closure_candidate_words = stats.closure_candidate_words,
-        .closure_kb = stats.closure_kb,
     };
+    if (comptime diagnostics_enabled) {
+        summary.seed = batchSummaryFromBatch(stats.perf.conn_seed_batch);
+        summary.gather = batchSummaryFromBatch(stats.perf.conn_gather_batch);
+        summary.families = stats.perf.conn_families;
+        summary.rounds = stats.perf.conn_rounds;
+        summary.round_items_min = stats.perf.conn_round_items_min;
+        summary.round_items_max = stats.perf.conn_round_items_max;
+        summary.build_visits = stats.perf.conn_build_visits;
+        summary.flood_nodes = stats.perf.conn_flood_nodes;
+        summary.groups = stats.perf.conn_groups;
+        summary.splits = stats.perf.conn_splits;
+        summary.merges = stats.perf.conn_merges;
+        summary.flood_off_main_ns = stats.perf.conn_flood_off_main_ns;
+        summary.candidates = batchSummaryFromBatch(stats.perf.conn_closure_candidates_batch);
+        summary.closure_resolve = batchSummaryFromBatch(stats.perf.conn_closure_resolve_batch);
+        summary.closure_mask = batchSummaryFromBatch(stats.perf.conn_closure_mask_batch);
+        summary.closure_plan = batchSummaryFromBatch(stats.perf.conn_closure_plan_batch);
+        summary.closure_land = batchSummaryFromBatch(stats.perf.conn_closure_land_batch);
+        summary.closure_touched = stats.perf.closure_touched;
+        summary.closure_links = stats.perf.closure_links;
+        summary.closure_terms_new = stats.perf.closure_terms_new;
+        summary.closure_terms_left = stats.perf.closure_terms_left;
+        summary.closure_a_rows = stats.perf.closure_a_rows;
+        summary.closure_rounds = stats.perf.closure_rounds;
+        summary.closure_words_written = stats.perf.closure_words_written;
+        summary.closure_shrinks = stats.perf.closure_shrinks;
+        summary.closure_block_allocs = stats.perf.closure_block_allocs;
+        summary.closure_block_frees = stats.perf.closure_block_frees;
+        summary.closure_landed_words = stats.perf.closure_landed_words;
+        summary.closure_land_deferrals = stats.perf.closure_land_deferrals;
+        summary.closure_live_words = stats.perf.closure_live_words;
+        summary.closure_tail_capacity = stats.perf.closure_tail_capacity;
+        summary.closure_tail_bound = stats.perf.closure_tail_bound;
+        summary.closure_tail_used = stats.perf.closure_tail_used;
+        summary.closure_candidate_words = stats.perf.closure_candidate_words;
+        summary.closure_kb = stats.perf.closure_kb;
+    }
+    return summary;
 }
 
 /// Steering's prepare stage shapes, in stage order; `-` for a stage that did not run (the

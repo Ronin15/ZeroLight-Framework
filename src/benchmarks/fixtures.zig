@@ -194,12 +194,8 @@ pub fn loadTilesetMeta(allocator: std.mem.Allocator, io: std.Io) !world_tileset_
 
 /// The bench world fixture: `levels` square levels of `side`² tiles in default chunks,
 /// each one uniform dense floor band (level `i` owns layer `i`), the tile named `surface`
-/// on level 0 and `below` under it. The world owns its tileset metadata
-/// (`tilesetMeta()`) for further tile lookups.
-pub fn buildBandedWorld(allocator: std.mem.Allocator, io: std.Io, side: u16, levels: u16, surface: []const u8, below: []const u8) !WorldSystem {
-    var meta = try loadTilesetMeta(allocator, io);
-    var meta_owned = true;
-    defer if (meta_owned) meta.deinit();
+/// on level 0 and `below` under it. Reads `meta` only while it builds.
+pub fn buildBandedWorld(allocator: std.mem.Allocator, meta: *const world_tileset_meta.WorldTilesetMeta, side: u16, levels: u16, surface: []const u8, below: []const u8) !WorldSystem {
     var world = WorldSystem{
         .allocator = allocator,
         .width = side,
@@ -208,16 +204,14 @@ pub fn buildBandedWorld(allocator: std.mem.Allocator, io: std.Io, side: u16, lev
         .chunk_size_tiles = default_chunk_size_tiles,
     };
     errdefer world.deinit();
-    try world.buildCatalog(&meta);
-    const surface_tile = try world.requireTileByName(&meta, surface);
-    const below_tile = try world.requireTileByName(&meta, below);
+    try world.buildCatalog(meta);
+    const surface_tile = try world.requireTileByName(meta, surface);
+    const below_tile = try world.requireTileByName(meta, below);
     for (0..levels) |level_index| {
         const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
         const layer = try world.addDenseLayer(level, 0, .floor, if (level_index == 0) surface_tile else below_tile);
         std.debug.assert(layer == level);
     }
-    world.adoptTilesetMeta(meta);
-    meta_owned = false;
     return world;
 }
 

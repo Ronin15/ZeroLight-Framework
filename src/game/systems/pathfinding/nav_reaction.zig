@@ -22,7 +22,8 @@ const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
 const stageShape = @import("../../../app/thread_system.zig").stageShape;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
-const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
+const StageTimer = runtime_perf_log.StageTimer;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 const EntityTemplate = @import("../../data_system.zig").EntityTemplate;
@@ -174,7 +175,7 @@ pub fn reserveTerrainNavRecord(self: *PathfindingSystem, event_bound: usize) err
 /// main work is O(1) per mark.
 pub fn recordTerrainNavEvents(self: *PathfindingSystem, events: []const SimulationEvent, world: *const WorldSystem, thread_system: ?*ThreadSystem) void {
     if (events.len == 0) return;
-    self.pending_mark_off_main_ns += markNavEvents(self, events, world, thread_system);
+    markNavEvents(self, events, world, thread_system);
 }
 
 // Appends each change's old and new cell spans into reserved mark capacity.
@@ -264,7 +265,7 @@ pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const Stati
                 // of its fields is known good.
                 const evict_timer = StageTimer.begin();
                 eviction.evictLevel(self, level, &stats);
-                stats.main.evict_ns += evict_timer.lap();
+                stats.addMain(.evict_ns, evict_timer.lap());
             }
             self.graph.built_world_revision = world.contentRevision();
             // One flush unlinks every rebuilt level's evictions, so the marks batch's
@@ -299,23 +300,29 @@ pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const Stati
 /// `colliders` synced this step's commit. A failed apply keeps the marks and gaps for the
 /// next step.
 pub fn reactToPostCommitNavEvents(self: *PathfindingSystem, frame: *SimulationFrame, colliders: *const StaticColliderSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) (NavApplyError || error{EventCapacityExceeded})!NavUpdateStats {
-    const mark_off_main_ns = self.pending_mark_off_main_ns;
-    const mark_inline_ns = self.pending_mark_inline_ns;
-    const mark_main_ns = self.pending_mark_main_ns;
-    self.pending_mark_off_main_ns = 0;
-    self.pending_mark_inline_ns = 0;
-    self.pending_mark_main_ns = 0;
+    // The terrain records' mark time since the last reaction folds into this one's stats.
+    var marks = NavUpdateStats{};
+    if (comptime runtime_perf_log.enabled) {
+        marks.perf.off_main_stage_ns = self.perf.mark_off_main_ns;
+        marks.perf.inline_stage_ns = self.perf.mark_inline_ns;
+        marks.perf.main.mark_ns = self.perf.mark_main_ns;
+        self.perf.mark_off_main_ns = 0;
+        self.perf.mark_inline_ns = 0;
+        self.perf.mark_main_ns = 0;
+    }
     if (!hasPendingNavUpdates(self, world)) {
         // A quiet step still counts toward the batch staging's release windows.
         self.graph.tickStagingStep(self.capacity.capacity_shrink_window);
         self.graph.finishStagingStep();
-        return .{ .off_main_stage_ns = mark_off_main_ns, .inline_stage_ns = mark_inline_ns, .main = .{ .mark_ns = mark_main_ns } };
+        return marks;
     }
     try frame.events.ensureCanAppend(1);
     var stats = try applyBufferedNavUpdates(self, colliders, world, thread_system);
-    stats.off_main_stage_ns += mark_off_main_ns;
-    stats.inline_stage_ns += mark_inline_ns;
-    stats.main.mark_ns += mark_main_ns;
+    if (comptime runtime_perf_log.enabled) {
+        stats.perf.off_main_stage_ns += marks.perf.off_main_stage_ns;
+        stats.perf.inline_stage_ns += marks.perf.inline_stage_ns;
+        stats.perf.main.mark_ns += marks.perf.main.mark_ns;
+    }
     if (stats.incremental_rebuilds == 0 and stats.levels_built == 0) return stats;
     try frame.events.appendRequired(.{
         .stage = .domain_reaction,
@@ -329,11 +336,11 @@ pub fn reactToPostCommitNavEvents(self: *PathfindingSystem, frame: *SimulationFr
 // a thread system or when the tuner keeps the stage inline) writes its events' marks into
 // its staging window, merging consecutive tile boxes of one (level, chunk), and the main
 // thread appends the windows in range order with the same merge, so the marks are equal
-// for any partition. Main work is O(marks after the merge). Returns the stage's off-main
-// time.
-fn markNavEvents(self: *PathfindingSystem, events: []const SimulationEvent, world: *const WorldSystem, thread_system: ?*ThreadSystem) u64 {
-    self.last_mark_batch = .{};
-    if (events.len == 0) return 0;
+// for any partition. Main work is O(marks after the merge). With `runtime_perf_log.enabled`
+// its times add to the pending mark times the next reaction folds in.
+fn markNavEvents(self: *PathfindingSystem, events: []const SimulationEvent, world: *const WorldSystem, thread_system: ?*ThreadSystem) void {
+    if (comptime runtime_perf_log.enabled) self.perf.last_mark_batch = .{};
+    if (events.len == 0) return;
     std.debug.assert(self.nav_marks.capacity - self.nav_marks.items.len >= events.len);
     var section = StageTimer.begin();
     const dispatch = navDispatch(self, thread_system, &self.tuners.nav_mark);
@@ -351,20 +358,22 @@ fn markNavEvents(self: *PathfindingSystem, events: []const SimulationEvent, worl
         .staging = self.nav_mark_staging.items,
         .tallies = self.nav_mark_tallies.items,
     };
-    self.pending_mark_main_ns += section.lap();
+    if (comptime runtime_perf_log.enabled) self.perf.mark_main_ns += section.lap();
     const batch = runShaped(dispatch, shape, events.len, nav_mark_range_alignment_items, &job, navMarkJob);
     section = StageTimer.begin();
-    self.last_mark_batch = batch;
+    if (comptime runtime_perf_log.enabled) self.perf.last_mark_batch = batch;
     for (self.nav_mark_tallies.items, 0..) |tally, range_index| {
         const window_start = range_index * shape.items_per_range;
         for (self.nav_mark_staging.items[window_start .. window_start + tally.count]) |mark| appendEventMark(self, mark);
     }
-    self.pending_mark_main_ns += section.lap();
-    if (batch.ran_inline) {
-        self.pending_mark_inline_ns += batch.batch_duration_ns;
-        return 0;
+    if (comptime runtime_perf_log.enabled) {
+        self.perf.mark_main_ns += section.lap();
+        if (batch.ran_inline) {
+            self.perf.mark_inline_ns += batch.batch_duration_ns;
+        } else {
+            self.perf.mark_off_main_ns += batch.batch_duration_ns;
+        }
     }
-    return batch.batch_duration_ns;
 }
 
 // Appends one event's mark into reserved capacity, merging a tile box into the previous
@@ -1227,6 +1236,7 @@ test "pathfinding incremental update is allocation-free at steady state (within 
 }
 
 test "pathfinding threaded incremental nav update is allocation-free at steady state" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // The serial allocation-free tests above only cover the inline stages. Only
     // applyBufferedNavUpdates/reactToPostCommitNavEvents with a real ThreadSystem drive the
     // plan, remask, and patch jobs, the remask indexing a per-participant scratch slot. Five
@@ -1292,8 +1302,8 @@ test "pathfinding threaded incremental nav update is allocation-free at steady s
     // otherwise this would silently retest the already-covered serial path. A plan over
     // several ranges merges through the plan order set into its reserved key lists.
     try std.testing.expect(!stats.remask_batch.ran_inline);
-    try std.testing.expect(!stats.patch_batch.ran_inline);
-    try std.testing.expect(!stats.plan_batch.ran_inline);
+    try std.testing.expect(!stats.perf.patch_batch.ran_inline);
+    try std.testing.expect(!stats.perf.plan_batch.ran_inline);
     try std.testing.expect(system.graph.plan_tallies.items.len > 1);
 
     for (cells) |cell| {
@@ -1360,6 +1370,7 @@ test "a fully walled level opened past its prior records grows at the reserve an
 }
 
 test "pathfinding incremental update flips cross-level link liveness when the endpoint cell changes" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1424,7 +1435,7 @@ test "pathfinding incremental update flips cross-level link liveness when the en
     });
     const open_stats = try updatePathfindingInline(&system, &open_stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), open_stats.available_results);
-    try std.testing.expectEqual(@as(usize, 1), open_stats.cross_level_solves);
+    try std.testing.expectEqual(@as(usize, 1), open_stats.perf.cross_level_solves);
 }
 
 test "a static mark record after its reserve allocates nothing (FailingAllocator)" {
@@ -1514,6 +1525,7 @@ test "threaded nav mark interpretation equals serial for a dense multi-chunk edi
 }
 
 test "a terrain nav record after its reserve allocates nothing inline and on a multi-worker ThreadSystem, threaded equal to inline; an out-of-memory reserve records no mark (FailingAllocator)" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1537,7 +1549,7 @@ test "a terrain nav record after its reserve allocates nothing inline and on a m
     inline_system.recordTerrainNavEvents(events.items, &world, null);
     inline_system.allocator = std.testing.allocator;
     try std.testing.expect(!inline_failing.has_induced_failure);
-    try std.testing.expect(inline_system.last_mark_batch.ran_inline);
+    try std.testing.expect(inline_system.perf.last_mark_batch.ran_inline);
 
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
@@ -1559,7 +1571,7 @@ test "a terrain nav record after its reserve allocates nothing inline and on a m
     system.recordTerrainNavEvents(events.items, &world, &threads);
     system.allocator = std.testing.allocator;
     try std.testing.expect(!steady.has_induced_failure);
-    try std.testing.expect(system.last_mark_batch.range_count > 1 and !system.last_mark_batch.ran_inline);
+    try std.testing.expect(system.perf.last_mark_batch.range_count > 1 and !system.perf.last_mark_batch.ran_inline);
     try std.testing.expectEqual(inline_system.nav_marks.items.len, system.nav_marks.items.len);
     for (inline_system.nav_marks.items, system.nav_marks.items) |a, b| try std.testing.expectEqual(a, b);
 }

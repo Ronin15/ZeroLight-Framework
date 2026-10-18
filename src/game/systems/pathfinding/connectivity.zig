@@ -46,7 +46,8 @@ const maxChunkLabels = @import("nav_grid.zig").maxChunkLabels;
 const ChunkGeometry = @import("../../world/terrain.zig").ChunkGeometry;
 const types = @import("types.zig");
 const NavUpdateStats = types.NavUpdateStats;
-const StageTimer = @import("../../../app/runtime_perf_log.zig").StageTimer;
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
+const StageTimer = runtime_perf_log.StageTimer;
 const listBytesBound = @import("nav_graph.zig").listBytesBound;
 const rowsBytesBound = @import("nav_graph.zig").rowsBytesBound;
 
@@ -288,13 +289,15 @@ const FloodItem = struct {
 
 // What a search wrote: its proposal count, the prefix of proposals it expanded itself (or
 // passed over as foreign), the first queue node it did not expand (`no_key` when it took the
-// whole queue), and the nodes it expanded.
+// whole queue), and (`perf`, only with `runtime_perf_log.enabled`) the nodes it expanded.
 const FloodOut = struct {
     written: u32,
     expanded: u32,
     resume_key: u64,
     resume_row: u32,
-    expansions: u32,
+    perf: Perf,
+
+    const Perf = if (runtime_perf_log.enabled) struct { expansions: u32 } else struct {};
 };
 
 // A node a search reached that its set did not hold when the round was built; `foreign` when
@@ -582,19 +585,23 @@ pub fn growPool(
 /// Counters of one batch's connectivity stages, for stats and benches. `round_items_min` and
 /// `round_items_max` span the flood's rounds (both zero with no round); `build_visits` counts
 /// the active sets the main thread's round builds walked; `flood_off_main_ns` is the rounds'
-/// dispatch time on workers.
+/// dispatch time on workers. `perf` is kept only with `runtime_perf_log.enabled`.
 pub const ConnectivityCounters = struct {
-    groups: usize = 0,
     families: usize = 0,
-    rounds: usize = 0,
-    build_visits: usize = 0,
-    flood_nodes: usize = 0,
-    splits: usize = 0,
-    merges: usize = 0,
-    round_items_min: usize = 0,
-    round_items_max: usize = 0,
-    flood_off_main_ns: u64 = 0,
     closure: ClosureCounters = .{},
+    perf: Perf = .{},
+
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        groups: usize = 0,
+        rounds: usize = 0,
+        build_visits: usize = 0,
+        flood_nodes: usize = 0,
+        splits: usize = 0,
+        merges: usize = 0,
+        round_items_min: usize = 0,
+        round_items_max: usize = 0,
+        flood_off_main_ns: u64 = 0,
+    } else struct {};
 };
 
 /// The element columns of one merge, taken once with the staging at its limit.
@@ -957,11 +964,16 @@ pub const Connectivity = struct {
     endpoint_links_seen: usize = 0,
     // The staging's release window over marks batches.
     staging_window: types.StagingWindow(StagingGroup) = .{},
-    // Batch shapes of the most recent batch's seed and gather stages and its flood's rounds
-    // folded into one (stats and benches).
-    last_seed_batch: BatchStats = .{},
-    last_gather_batch: BatchStats = .{},
+    // Batch shape of the most recent batch's flood, its rounds folded into one.
     last_flood_batch: BatchStats = .{},
+    // The most recent batch's seed and gather stage shapes, kept only with
+    // `runtime_perf_log.enabled`.
+    perf: Perf = .{},
+
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        last_seed_batch: BatchStats = .{},
+        last_gather_batch: BatchStats = .{},
+    } else struct {};
 
     pub fn deinit(self: *Connectivity, allocator: std.mem.Allocator) void {
         self.closure.deinit(allocator);
@@ -1347,15 +1359,16 @@ pub const Connectivity = struct {
             .counts = self.seed_counts.items,
             .edges = self.seed_edges.items,
         };
-        stats.main.reserve_ns += section.lap();
-        self.last_seed_batch = runStage(threads, changed_keys.len, 1, &job, &job.range_count, seedJob);
-        stats.addStageTime(self.last_seed_batch);
+        stats.addMain(.reserve_ns, section.lap());
+        const seed_batch = runStage(threads, changed_keys.len, 1, &job, &job.range_count, seedJob);
+        if (comptime runtime_perf_log.enabled) self.perf.last_seed_batch = seed_batch;
+        stats.addStageTime(seed_batch);
 
         // The closure reads the seed windows' counts and the graph before the change.
         section = StageTimer.begin();
         const new_oneway = connectivity_closure.countOneWay(new_links);
         self.closure.active = self.closure.oneway.len != 0 or new_oneway != 0;
-        stats.main.reserve_ns += section.lap();
+        stats.addMain(.reserve_ns, section.lap());
         if (self.closure.active) _ = try connectivity_closure.prepareClosure(self, allocator, levels, world, patch_keys, true, self.patch_changed.items, new_oneway, new_link_count, closure_threads, pool_grows, stats);
         window.endBatch(changed_keys.len <= 1);
     }
@@ -1380,11 +1393,12 @@ pub const Connectivity = struct {
         stats: *NavUpdateStats,
     ) ConnectivityCounters {
         var gather = self.gatherJobFor(levels, world, patch_keys, new_links);
-        self.last_gather_batch = runStage(gather_threads, patch_keys.len + new_links.len, 1, &gather, &gather.range_count, gatherJob);
-        stats.addStageTime(self.last_gather_batch);
+        const gather_batch = runStage(gather_threads, patch_keys.len + new_links.len, 1, &gather, &gather.range_count, gatherJob);
+        if (comptime runtime_perf_log.enabled) self.perf.last_gather_batch = gather_batch;
+        stats.addStageTime(gather_batch);
         const merge_timer = StageTimer.begin();
         self.mergeBatch(levels, patch_keys, true, patch_keys.len + new_links.len, null);
-        stats.main.conn_merge_ns += merge_timer.lap();
+        stats.addMain(.conn_merge_ns, merge_timer.lap());
         var counters = self.settleAndFlood(levels, world, flood_threads, stats);
         if (self.closure.active) counters.closure = connectivity_closure.updateClosure(self, allocator, levels, world, patch_keys.len, closure_threads, stats);
         return counters;
@@ -1476,7 +1490,7 @@ pub const Connectivity = struct {
             self.noteLinks(world);
             try self.reserveFlood(allocator, level_graph.border_stride, participantCount(flood_threads), pool_grows);
         }
-        stats.main.reserve_ns += section.lap();
+        stats.addMain(.reserve_ns, section.lap());
 
         if (seeding) {
             var seed = SeedJob{
@@ -1489,21 +1503,23 @@ pub const Connectivity = struct {
                 .counts = self.seed_counts.items,
                 .edges = self.seed_edges.items,
             };
-            self.last_seed_batch = runStage(seed_threads, keys.len, 1, &seed, &seed.range_count, seedJob);
-            stats.addStageTime(self.last_seed_batch);
+            const seed_batch = runStage(seed_threads, keys.len, 1, &seed, &seed.range_count, seedJob);
+            if (comptime runtime_perf_log.enabled) self.perf.last_seed_batch = seed_batch;
+            stats.addStageTime(seed_batch);
         } else {
-            self.last_seed_batch = .{};
+            if (comptime runtime_perf_log.enabled) self.perf.last_seed_batch = .{};
         }
         // The closure's reserves, before any connectivity changes: the candidates read the
         // replaced level's old nodes and every key's link partners on the other levels.
         self.closure.active = self.closure.oneway.len != 0;
         if (self.closure.active) _ = try connectivity_closure.prepareClosure(self, allocator, old_levels, world, keys, seeding, null, 0, 0, closure_threads, pool_grows, stats);
         var gather = self.gatherJobFor(levels, world, keys, &.{});
-        self.last_gather_batch = runStage(gather_threads, keys.len, 1, &gather, &gather.range_count, gatherJob);
-        stats.addStageTime(self.last_gather_batch);
+        const gather_batch = runStage(gather_threads, keys.len, 1, &gather, &gather.range_count, gatherJob);
+        if (comptime runtime_perf_log.enabled) self.perf.last_gather_batch = gather_batch;
+        stats.addStageTime(gather_batch);
         section = StageTimer.begin();
         self.mergeBatch(levels, keys, false, keys.len, replaced);
-        stats.main.conn_merge_ns += section.lap();
+        stats.addMain(.conn_merge_ns, section.lap());
         var counters = self.settleAndFlood(levels, world, flood_threads, stats);
         if (self.closure.active) counters.closure = connectivity_closure.updateClosure(self, allocator, levels, world, keys.len, closure_threads, stats);
         return counters;
@@ -1722,11 +1738,11 @@ pub const Connectivity = struct {
         self.settle(views);
         self.openSets(views);
         self.last_flood_batch = .{};
-        stats.main.conn_layout_ns += section.lap();
+        stats.addMain(.conn_layout_ns, section.lap());
         if (counters.families != 0) self.runFlood(views, threads, &counters, stats);
         section = StageTimer.begin();
         self.finish(views, &counters);
-        stats.main.conn_layout_ns += section.lap();
+        stats.addMain(.conn_layout_ns, section.lap());
         return counters;
     }
 
@@ -1838,7 +1854,7 @@ pub const Connectivity = struct {
         self.sets.len = set_total;
         self.families.len = family_total;
         self.groups.len = group_total;
-        counters.groups = group_total;
+        if (comptime runtime_perf_log.enabled) counters.perf.groups = group_total;
         counters.families = family_total;
 
         // Each unit's elements, in element order.
@@ -2120,7 +2136,7 @@ pub const Connectivity = struct {
                         var reached = true;
                         var scan = families.set_head[family];
                         while (scan != no_set) : (scan = sets.next_active[scan]) {
-                            counters.build_visits += 1;
+                            if (comptime runtime_perf_log.enabled) counters.perf.build_visits += 1;
                             smallest = @min(smallest, sets.claimed[scan]);
                             reached = reached and sets.claimed[scan] >= families.target[family];
                         }
@@ -2133,7 +2149,7 @@ pub const Connectivity = struct {
                         var window_need: usize = 0;
                         var pending = families.pass_next[family];
                         while (pending != no_set) : (pending = sets.next_active[pending]) {
-                            counters.build_visits += 1;
+                            if (comptime runtime_perf_log.enabled) counters.perf.build_visits += 1;
                             if (sets.claimed[pending] < target) window_need += @min(target - sets.claimed[pending], budget_limit) + slack;
                             if (window_total + window_need > self.flood_window_limit) break :build;
                         }
@@ -2142,7 +2158,7 @@ pub const Connectivity = struct {
                     const items_before = self.flood_items.items.len;
                     var set = families.pass_next[family];
                     while (set != no_set) : (set = sets.next_active[set]) {
-                        counters.build_visits += 1;
+                        if (comptime runtime_perf_log.enabled) counters.perf.build_visits += 1;
                         std.debug.assert(sets.active[set]);
                         const claimed = sets.claimed[set];
                         if (claimed >= target) continue;
@@ -2197,13 +2213,13 @@ pub const Connectivity = struct {
                 .comp_set = self.comp_set,
                 .set_parent = sets.parent,
             };
-            stats.main.flood_ns += section.lap();
+            stats.addMain(.flood_ns, section.lap());
             dispatch.run(item_count, &job, &job.range_count, floodJob);
             section = StageTimer.begin();
 
             // Merge, in item order.
             for (self.flood_items.items, self.flood_outs.items) |item, out| {
-                counters.flood_nodes += out.expansions;
+                if (comptime runtime_perf_log.enabled) counters.perf.flood_nodes += out.perf.expansions;
                 var mine = findRoot(sets.parent, item.set);
                 if (out.resume_key != no_key) spliceQueue(views, mine, out.resume_key, out.resume_row, item.tail_key, item.tail_row);
                 for (self.proposals.items[item.window_start..][0..out.written], 0..) |proposal, index| {
@@ -2231,17 +2247,19 @@ pub const Connectivity = struct {
                 families.active[family] -= 1;
                 if (families.active[family] == 1) live -= 1;
                 self.attach(sets.fresh_root[set], sets.comp_head[set], sets.comp_tail[set], sets.comp_count[set]);
-                counters.splits += 1;
+                if (comptime runtime_perf_log.enabled) counters.perf.splits += 1;
             }
         }
-        counters.rounds = round;
-        counters.round_items_min = dispatch.round_items_min;
-        counters.round_items_max = dispatch.round_items_max;
-        counters.flood_off_main_ns = dispatch.off_main_ns;
         self.last_flood_batch = dispatch.finish(self.sets.len);
-        stats.off_main_stage_ns += dispatch.off_main_ns;
-        stats.inline_stage_ns += dispatch.inline_ns;
-        stats.main.flood_ns += section.lap();
+        if (comptime runtime_perf_log.enabled) {
+            counters.perf.rounds = round;
+            counters.perf.round_items_min = dispatch.round_items_min;
+            counters.perf.round_items_max = dispatch.round_items_max;
+            counters.perf.flood_off_main_ns = dispatch.off_main_ns;
+            stats.perf.off_main_stage_ns += dispatch.off_main_ns;
+            stats.perf.inline_stage_ns += dispatch.inline_ns;
+        }
+        stats.addMain(.flood_ns, section.lap());
     }
 
     // Appends the linked queue segment from (`head_key`, `head_row`) to (`tail_key`,
@@ -2300,7 +2318,7 @@ pub const Connectivity = struct {
                 for (roots) |root| {
                     if (root == largest or self.root_members[root] == 0) continue;
                     self.moveRoot(root, largest);
-                    counters.merges += 1;
+                    if (comptime runtime_perf_log.enabled) counters.perf.merges += 1;
                 }
             }
             for (self.group_sets.items[groups.set_start[group]..][0..groups.set_count[group]]) |set| {
@@ -2752,7 +2770,7 @@ fn floodJob(context: *anyopaque, range: ParallelRange, worker: WorkerId) void {
         var expansions: u32 = 0;
         while (key != no_key and visitor.written < item.budget) {
             forEachEdge(job.levels, job.world, nodeKeyLevel(key), nodeKeyChunk(key), nodeKeyLabel(key), .mirrors_and_links, &visitor);
-            expansions += 1;
+            if (comptime runtime_perf_log.enabled) expansions += 1;
             if (key == item.tail_key and row == item.tail_row) {
                 key = no_key;
                 break;
@@ -2769,7 +2787,7 @@ fn floodJob(context: *anyopaque, range: ParallelRange, worker: WorkerId) void {
                 const proposal = visitor.window[expanded];
                 if (proposal.foreign) continue;
                 forEachEdge(job.levels, job.world, nodeKeyLevel(proposal.key), nodeKeyChunk(proposal.key), nodeKeyLabel(proposal.key), .mirrors_and_links, &visitor);
-                expansions += 1;
+                if (comptime runtime_perf_log.enabled) expansions += 1;
             }
         }
         out.* = .{
@@ -2777,7 +2795,7 @@ fn floodJob(context: *anyopaque, range: ParallelRange, worker: WorkerId) void {
             .expanded = @intCast(expanded),
             .resume_key = key,
             .resume_row = row,
-            .expansions = expansions,
+            .perf = if (comptime runtime_perf_log.enabled) .{ .expansions = expansions } else .{},
         };
     }
 }
@@ -2791,7 +2809,6 @@ const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const TileId = @import("../../world/system.zig").TileId;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
-const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const no_colliders = &test_support.no_colliders;
 const boundCap = @import("connectivity_closure.zig").boundCap;
 const TestWorld = test_support.TestWorld;
@@ -2820,6 +2837,7 @@ fn buildRoom(fixture: *TestWorld, edge: u16) !void {
 }
 
 test "enclosing a room splits off exactly the room, floods only on its scale, and reopening merges it back" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     for ([_]u16{ 1, 2, 4 }) |edge| {
         var flood_nodes: [2]usize = undefined;
         for ([_]u16{ 16, 32 }, 0..) |side, run| {
@@ -2837,19 +2855,19 @@ test "enclosing a room splits off exactly the room, floods only on its scale, an
             const enclosed = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
             // A one-chunk room loses its only portal: no node is left to split off.
             const split: usize = if (edge > 1) 1 else 0;
-            try std.testing.expectEqual(split, enclosed.conn_splits);
+            try std.testing.expectEqual(split, enclosed.perf.conn_splits);
             try std.testing.expect(reach(&system.graph, 0, inside, 0, outside) != .reaches);
             try std.testing.expectEqual(roots + split, system.graph.connectivity.rootCount());
             // The outside side searches up to the room side's claims plus half again, so the
             // flood stays within a constant of the room.
             const room_nodes = @as(usize, edge) * edge;
-            try std.testing.expect(enclosed.conn_flood_nodes <= 3 * room_nodes + 2);
-            flood_nodes[run] = enclosed.conn_flood_nodes;
+            try std.testing.expect(enclosed.perf.conn_flood_nodes <= 3 * room_nodes + 2);
+            flood_nodes[run] = enclosed.perf.conn_flood_nodes;
             try fixture.expectMatchesRebuild(&system);
 
             try fixture.setChunk(&system, 0, edge, edge / 2, fixture.grass);
             const opened = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-            try std.testing.expectEqual(@as(usize, 0), opened.conn_flood_nodes);
+            try std.testing.expectEqual(@as(usize, 0), opened.perf.conn_flood_nodes);
             try std.testing.expect(reach(&system.graph, 0, inside, 0, outside) == .reaches);
             try std.testing.expectEqual(roots, system.graph.connectivity.rootCount());
             try fixture.expectMatchesRebuild(&system);
@@ -2860,6 +2878,7 @@ test "enclosing a room splits off exactly the room, floods only on its scale, an
 }
 
 test "cutting a ring floods around the ring until both sides meet and splits nothing" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     for ([_]u16{ 1, 2, 4 }) |edge| {
         const span = edge + 2;
         var fixture = try TestWorld.init(span + 3, 1);
@@ -2875,13 +2894,13 @@ test "cutting a ring floods around the ring until both sides meet and splits not
         const roots = system.graph.connectivity.rootCount();
         try fixture.setChunk(&system, 0, 0, span / 2, fixture.tree);
         const cut = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-        try std.testing.expectEqual(@as(usize, 0), cut.conn_splits);
-        try std.testing.expect(cut.conn_flood_nodes > 0);
+        try std.testing.expectEqual(@as(usize, 0), cut.perf.conn_splits);
+        try std.testing.expect(cut.perf.conn_flood_nodes > 0);
         // Both sides run around the ring until they meet, each at most half again the other's
         // claims, plus one node's slack.
         const ring: usize = 4 * (@as(usize, span) - 1);
         const slack = system.graph.levelGraph(0).?.border_stride;
-        try std.testing.expect(cut.conn_flood_nodes <= ring * 3 / 2 + slack);
+        try std.testing.expect(cut.perf.conn_flood_nodes <= ring * 3 / 2 + slack);
         try std.testing.expectEqual(roots, system.graph.connectivity.rootCount());
         try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(1, @as(usize, span - 1) * test_chunk + 1)) == .reaches);
         try fixture.expectMatchesRebuild(&system);
@@ -2905,6 +2924,7 @@ fn snapshotComps(graph: *const NavGraph, changed: []const u32, comps: *std.AutoH
 }
 
 test "an opening dig floods nothing and moves no node outside its chunk to another comp" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var fixture = try TestWorld.init(6, 1);
     defer fixture.deinit();
     // A wall column through chunk column 2, then a dig through its middle chunk joins the
@@ -2921,9 +2941,9 @@ test "an opening dig floods nothing and moves no node outside its chunk to anoth
     try snapshotComps(&system.graph, &.{gap_chunk}, &before);
     try fixture.setChunk(&system, 0, 2, 3, fixture.grass);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 0), stats.conn_flood_nodes);
-    try std.testing.expectEqual(@as(usize, 0), stats.conn_splits);
-    try std.testing.expectEqual(@as(usize, 1), stats.conn_merges);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.conn_flood_nodes);
+    try std.testing.expectEqual(@as(usize, 0), stats.perf.conn_splits);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.conn_merges);
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 20)) == .reaches);
     try snapshotComps(&system.graph, &.{gap_chunk}, &after);
     try std.testing.expectEqual(before.count(), after.count());
@@ -2933,6 +2953,7 @@ test "an opening dig floods nothing and moves no node outside its chunk to anoth
 }
 
 test "a dense change across four levels, its reopening, and an explosion opening match a full rebuild" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var fixture = try TestWorld.init(6, 4);
     defer fixture.deinit();
     // A wall band on every level, so the region's fill and clear split and merge.
@@ -2951,11 +2972,12 @@ test "a dense change across four levels, its reopening, and an explosion opening
         for (0..24) |y| for (6..20) |x| try fixture.setCell(&system, @intCast(level), @intCast(x), @intCast(y), fixture.grass);
     }
     const opened = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 0), opened.conn_flood_nodes);
+    try std.testing.expectEqual(@as(usize, 0), opened.perf.conn_flood_nodes);
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "a new two-way link joins two components; a one-way link joins none but reaches forward only; blocking and reopening an endpoint splits and rejoins" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var fixture = try TestWorld.init(4, 2);
     defer fixture.deinit();
     var system = try fixture.build(test_support.abstractCapacity());
@@ -2974,14 +2996,14 @@ test "a new two-way link joins two components; a one-way link joins none but rea
     // Two-way: one edge, a root merge.
     try fixture.world.addLevelLink(.{ .kind = .stair, .level_a = 0, .cell_a = .{ .x = 5, .y = 6 }, .level_b = 1, .cell_b = .{ .x = 10, .y = 2 }, .traversal_cost = 1, .bidirectional = true });
     const linked = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), linked.conn_merges);
+    try std.testing.expectEqual(@as(usize, 1), linked.perf.conn_merges);
     try std.testing.expect(reach(&system.graph, 0, top, 1, bottom) == .reaches);
     try std.testing.expect(reach(&system.graph, 1, bottom, 0, top) == .reaches);
     try fixture.expectMatchesRebuild(&system);
     // Blocking the level-1 endpoint cuts the only connection.
     try fixture.setCell(&system, 1, 10, 2, fixture.tree);
     const blocked = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), blocked.conn_splits);
+    try std.testing.expectEqual(@as(usize, 1), blocked.perf.conn_splits);
     // The one-way link still reaches forward; nothing reaches back.
     try std.testing.expect(reach(&system.graph, 0, top, 1, bottom) == .reaches);
     try std.testing.expect(reach(&system.graph, 1, bottom, 0, top) != .reaches);
@@ -3017,6 +3039,7 @@ test "a level added with a link to it while a dig closes the link's old-level en
 }
 
 test "replacing a level that held the only link between two halves of another splits them" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var fixture = try TestWorld.init(6, 2);
     defer fixture.deinit();
     for (0..6) |cy| try fixture.setChunk(null, 0, 2, @intCast(cy), fixture.tree);
@@ -3029,9 +3052,9 @@ test "replacing a level that held the only link between two halves of another sp
     _ = try fixture.world.addDenseLayer(1, 0, .obstacle, fixture.tree);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
-    try std.testing.expectEqual(@as(usize, 1), stats.conn_splits);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.conn_splits);
     // The level build's flood reaches the stats and the perf log.
-    try std.testing.expect(stats.conn_flood_batch.item_count != 0 and stats.conn_rounds != 0);
+    try std.testing.expect(stats.conn_flood_batch.item_count != 0 and stats.perf.conn_rounds != 0);
     if (runtime_perf_log.enabled) {
         var perf = runtime_perf_log.RuntimePerfLog.init(0);
         stats.recordTo(runtime_perf_log.Context.bind(&perf));
@@ -3253,6 +3276,7 @@ fn writeParityStep(run: *TestWorld, systems: []const *PathfindingSystem, tile: T
 }
 
 test "threaded connectivity stages equal the inline ones column for column across worker counts and range sizes" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     for ([_]usize{ 1, 2, 4 }) |workers| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
@@ -3272,15 +3296,15 @@ test "threaded connectivity stages equal the inline ones column for column acros
             threaded.nav_controls = .{ .adaptive = false, .items_per_range = items_per_range };
             // The world build runs the stages threaded over every chunk of each level.
             try threaded.rebuildStaticNavGridWithWorld(&run.data, &run.world, &threads);
-            try std.testing.expect(!threaded.graph.connectivity.last_gather_batch.ran_inline);
+            try std.testing.expect(!threaded.graph.connectivity.perf.last_gather_batch.ran_inline);
             try expectSameColumns(&inline_system.graph, &threaded.graph);
             var flooded_on_workers = false;
             for ([_]TileId{ run.tree, run.grass, run.tree }) |tile| {
                 try writeParityStep(&run, &.{ &inline_system, &threaded }, tile);
                 _ = try inline_system.applyBufferedNavUpdates(no_colliders, &run.world, null);
                 const stats = try threaded.applyBufferedNavUpdates(no_colliders, &run.world, &threads);
-                try std.testing.expect(!stats.conn_seed_batch.ran_inline and !stats.conn_gather_batch.ran_inline);
-                if (stats.conn_splits != 0 and !stats.conn_flood_batch.ran_inline) flooded_on_workers = true;
+                try std.testing.expect(!stats.perf.conn_seed_batch.ran_inline and !stats.perf.conn_gather_batch.ran_inline);
+                if (stats.perf.conn_splits != 0 and !stats.conn_flood_batch.ran_inline) flooded_on_workers = true;
                 try expectSameColumns(&inline_system.graph, &threaded.graph);
                 try run.expectMatchesRebuild(&threaded);
             }
@@ -3291,6 +3315,7 @@ test "threaded connectivity stages equal the inline ones column for column acros
 }
 
 test "an enclosing batch reserved with the real allocator commits on a multi-worker ThreadSystem without allocating" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture = try TestWorld.init(10, 1);
     defer fixture.deinit();
@@ -3312,14 +3337,15 @@ test "an enclosing batch reserved with the real allocator commits on a multi-wor
     system.graph.allocator = original;
     system.nav_marks.clearRetainingCapacity();
     try std.testing.expect(batch.changed);
-    try std.testing.expectEqual(@as(usize, 2), stats.conn_splits);
-    try std.testing.expect(!stats.conn_seed_batch.ran_inline);
-    try std.testing.expect(!stats.conn_gather_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 2), stats.perf.conn_splits);
+    try std.testing.expect(!stats.perf.conn_seed_batch.ran_inline);
+    try std.testing.expect(!stats.perf.conn_gather_batch.ran_inline);
     try std.testing.expect(!stats.conn_flood_batch.ran_inline);
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "the post-commit nav reaction runs the connectivity stages on workers and records the flood as nav_connect" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture = try TestWorld.init(10, 1);
     defer fixture.deinit();
@@ -3336,11 +3362,11 @@ test "the post-commit nav reaction runs the connectivity stages on workers and r
     try toggleRooms(&fixture, &system, fixture.tree);
     frame.beginStep();
     const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, &threads);
-    try std.testing.expectEqual(@as(usize, 2), stats.conn_splits);
+    try std.testing.expectEqual(@as(usize, 2), stats.perf.conn_splits);
     // A search expands at least one node.
-    try std.testing.expect(stats.conn_flood_batch.item_count != 0 and stats.conn_flood_batch.item_count <= stats.conn_flood_nodes);
+    try std.testing.expect(stats.conn_flood_batch.item_count != 0 and stats.conn_flood_batch.item_count <= stats.perf.conn_flood_nodes);
     try std.testing.expect(!stats.conn_flood_batch.ran_inline and stats.conn_flood_batch.worker_thread_ranges != 0);
-    try std.testing.expect(!stats.conn_seed_batch.ran_inline and !stats.conn_gather_batch.ran_inline);
+    try std.testing.expect(!stats.perf.conn_seed_batch.ran_inline and !stats.perf.conn_gather_batch.ran_inline);
     if (runtime_perf_log.enabled) {
         var perf = runtime_perf_log.RuntimePerfLog.init(0);
         stats.recordTo(runtime_perf_log.Context.bind(&perf));
@@ -3398,12 +3424,13 @@ fn encloseFloodNodes(side: u16, case: EncloseCase) !usize {
         },
     }
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, if (case == .both) 2 else 1), stats.conn_splits);
+    try std.testing.expectEqual(@as(usize, if (case == .both) 2 else 1), stats.perf.conn_splits);
     try fixture.expectMatchesRebuild(&system);
-    return stats.conn_flood_nodes;
+    return stats.perf.conn_flood_nodes;
 }
 
 test "removals in one component flood only their own sides: two enclosures sum, a far fill and a walled neighbour label add nothing, all flat in level side" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var alone: ?[2]usize = null;
     for ([_]u16{ 16, 32, 64 }) |side| {
         const room_a = try encloseFloodNodes(side, .room_a);
@@ -3438,14 +3465,15 @@ fn ringCutTwice(side: u16, edge: u16) !usize {
     try fixture.setChunk(&system, 0, 0, span / 2, fixture.tree);
     try fixture.setChunk(&system, 0, span - 1, span / 2, fixture.tree);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), stats.conn_splits);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.conn_splits);
     try std.testing.expectEqual(roots + 1, system.graph.connectivity.rootCount());
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(1, @as(usize, span - 1) * test_chunk + 1)) != .reaches);
     try fixture.expectMatchesRebuild(&system);
-    return stats.conn_flood_nodes;
+    return stats.perf.conn_flood_nodes;
 }
 
 test "two cuts of one ring part its arcs, their floods meeting as one family, bounded by the smaller arc and flat in level side" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const edge: u16 = 4;
     // Each arc holds the ring's chunks but the two cut ones, halved.
     const arc: usize = (4 * (@as(usize, edge) + 1) - 2) / 2;
@@ -3468,6 +3496,7 @@ fn enclosePockets(fixture: *TestWorld, systems: []const *PathfindingSystem, gaps
 }
 
 test "enclosing eight pockets of one component in one batch floods on workers, several searches per round, and equals the inline run" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4, .items_per_range = 1 });
     defer threads.deinit();
@@ -3490,10 +3519,10 @@ test "enclosing eight pockets of one component in one batch floods on workers, s
         try enclosePockets(&fixture, &.{ &inline_system, &threaded }, gaps[0..count]);
         const serial = try inline_system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
         const stats = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-        try std.testing.expectEqual(count, stats.conn_splits);
-        try std.testing.expectEqual(serial.conn_flood_nodes, stats.conn_flood_nodes);
+        try std.testing.expectEqual(count, stats.perf.conn_splits);
+        try std.testing.expectEqual(serial.perf.conn_flood_nodes, stats.perf.conn_flood_nodes);
         try std.testing.expect(!stats.conn_flood_batch.ran_inline);
-        try std.testing.expect(stats.conn_flood_batch.item_count > stats.conn_rounds);
+        try std.testing.expect(stats.conn_flood_batch.item_count > stats.perf.conn_rounds);
         try std.testing.expect(stats.conn_flood_batch.worker_thread_ranges != 0);
         try expectSameColumns(&inline_system.graph, &threaded.graph);
         try fixture.expectMatchesRebuild(&threaded);
@@ -3501,6 +3530,7 @@ test "enclosing eight pockets of one component in one batch floods on workers, s
 }
 
 test "threaded floods equal inline ones column for column when families meet and rounds are narrow" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     for ([_]usize{ 1, 4 }) |workers| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
@@ -3539,9 +3569,9 @@ test "threaded floods equal inline ones column for column when families meet and
                     }
                     const serial = try inline_system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
                     const stats = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-                    try std.testing.expectEqual(serial.conn_rounds, stats.conn_rounds);
-                    try std.testing.expectEqual(serial.conn_flood_nodes, stats.conn_flood_nodes);
-                    if (tile == fixture.tree and narrow) try std.testing.expect(stats.conn_rounds > 3);
+                    try std.testing.expectEqual(serial.perf.conn_rounds, stats.perf.conn_rounds);
+                    try std.testing.expectEqual(serial.perf.conn_flood_nodes, stats.perf.conn_flood_nodes);
+                    if (tile == fixture.tree and narrow) try std.testing.expect(stats.perf.conn_rounds > 3);
                     try expectSameColumns(&inline_system.graph, &threaded.graph);
                     try fixture.expectMatchesRebuild(&threaded);
                 }
@@ -3592,6 +3622,7 @@ test "a dense batch's staging frees down within two release windows of one-chunk
 }
 
 test "a step that frees a dense batch's staging commits its batch on a multi-worker ThreadSystem without allocating, then releases" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture = try TestWorld.init(16, 1);
     defer fixture.deinit();
@@ -3623,7 +3654,7 @@ test "a step that frees a dense batch's staging commits its batch on a multi-wor
     system.graph.allocator = original;
     system.nav_marks.clearRetainingCapacity();
     try std.testing.expect(batch.changed);
-    try std.testing.expect(!stats.conn_gather_batch.ran_inline);
+    try std.testing.expect(!stats.perf.conn_gather_batch.ran_inline);
     // The release runs at the step's end, after the commit.
     try std.testing.expectEqual(held, conn.stagingBytes());
     system.graph.finishStagingStep();
@@ -3734,6 +3765,7 @@ test "element maps hold their limit at their load, find every key, and a merge m
 }
 
 test "a level build's staging frees at the end of its step, and a one-chunk batch then prepares without allocating" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var fixture = try TestWorld.init(16, 2);
     defer fixture.deinit();
     try buildRoom(&fixture, 3);
@@ -3766,7 +3798,7 @@ test "a level build's staging frees at the end of its step, and a one-chunk batc
     const batch = system.graph.commitMarks((try prepared).?, no_colliders.view(), null, &stats);
     system.nav_marks.clearRetainingCapacity();
     try std.testing.expect(batch.changed);
-    try std.testing.expectEqual(@as(usize, 1), stats.conn_splits);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.conn_splits);
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -3817,12 +3849,13 @@ fn tunnelFloodNodes(side: u16, length: u16) !usize {
     defer system.deinit();
     try fixture.setChunk(&system, 0, 1, row, fixture.tree);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), stats.conn_splits);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.conn_splits);
     try fixture.expectMatchesRebuild(&system);
-    return stats.conn_flood_nodes;
+    return stats.perf.conn_flood_nodes;
 }
 
 test "enclosing a thin tunnel off an open level floods on the tunnel's scale, flat in level side" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     for ([_]u16{ 8, 16, 32 }) |length| {
         const near = try tunnelFloodNodes(length + 8, length);
         const far = try tunnelFloodNodes(2 * length + 16, length);
@@ -3841,12 +3874,13 @@ fn encloseRoomSystem(fixture: *TestWorld, edge: u16, budget_cap: u32) !struct { 
     system.graph.connectivity.flood_budget_cap = budget_cap;
     try fixture.setChunk(&system, 0, edge + 2, 2 + edge / 2, fixture.tree);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), stats.conn_splits);
+    try std.testing.expectEqual(@as(usize, 1), stats.perf.conn_splits);
     try fixture.expectMatchesRebuild(&system);
     return .{ .system = system, .stats = stats };
 }
 
 test "enclosing a room floods within a constant of the room, flat in level side" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const edge: u16 = 8;
     var first: ?usize = null;
     for ([_]u16{ 32, 64, 128 }) |side| {
@@ -3855,7 +3889,7 @@ test "enclosing a room floods within a constant of the room, flat in level side"
         _ = try ringedRoom(&fixture, 1, 1, edge);
         var enclosed = try encloseRoomSystem(&fixture, edge, default_flood_budget_cap);
         defer enclosed.system.deinit();
-        const flood = enclosed.stats.conn_flood_nodes;
+        const flood = enclosed.stats.perf.conn_flood_nodes;
         // One node per room chunk.
         try std.testing.expect(2 * flood <= 5 * @as(usize, edge) * edge);
         if (first) |nodes| try std.testing.expectEqual(nodes, flood) else first = flood;
@@ -3863,6 +3897,7 @@ test "enclosing a room floods within a constant of the room, flat in level side"
 }
 
 test "a flood whose items stop at four proposals takes more rounds and partitions as the default one does" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const edge: u16 = 8;
     var fixture = try TestWorld.init(32, 1);
     defer fixture.deinit();
@@ -3872,8 +3907,8 @@ test "a flood whose items stop at four proposals takes more rounds and partition
     try fixture.setChunk(null, 0, edge + 2, 2 + edge / 2, fixture.grass);
     var narrow = try encloseRoomSystem(&fixture, edge, 4);
     defer narrow.system.deinit();
-    try std.testing.expect(narrow.stats.conn_rounds > wide.stats.conn_rounds);
-    try std.testing.expect(narrow.stats.conn_round_items_max <= 2);
+    try std.testing.expect(narrow.stats.perf.conn_rounds > wide.stats.perf.conn_rounds);
+    try std.testing.expect(narrow.stats.perf.conn_round_items_max <= 2);
     try test_support.expectSameConnectivityPartition(&narrow.system.graph, &wide.system.graph);
 }
 
@@ -3884,6 +3919,7 @@ fn narrowFloodWindow(system: *PathfindingSystem) void {
 }
 
 test "a hub family wider than one round walks each active set once per pass, not once per round" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     const tunnels: u16 = 16;
     for ([_]bool{ false, true }) |joined| {
         var fixture = try TestWorld.init(2 * tunnels, 1);
@@ -3897,24 +3933,25 @@ test "a hub family wider than one round walks each active set once per pass, not
             if (narrow) narrowFloodWindow(&system);
             try setHubCorridor(&fixture, &system, tunnels, fixture.tree);
             run.* = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-            try std.testing.expectEqual(@as(usize, 1), run.conn_families);
-            try std.testing.expectEqual(components - 1, run.conn_splits);
+            try std.testing.expectEqual(@as(usize, 1), run.perf.conn_families);
+            try std.testing.expectEqual(components - 1, run.perf.conn_splits);
             try fixture.expectMatchesRebuild(&system);
             try setHubCorridor(&fixture, null, tunnels, fixture.grass);
         }
         const wide = runs[0];
         const narrow = runs[1];
         // Every wide round serves the whole family at first; a narrow one a few of its sets.
-        try std.testing.expectEqual(@as(usize, tunnels), wide.conn_round_items_max);
-        try std.testing.expect(4 * narrow.conn_round_items_max <= tunnels);
-        try std.testing.expect(narrow.conn_rounds >= 4 * wide.conn_rounds);
+        try std.testing.expectEqual(@as(usize, tunnels), wide.perf.conn_round_items_max);
+        try std.testing.expect(4 * narrow.perf.conn_round_items_max <= tunnels);
+        try std.testing.expect(narrow.perf.conn_rounds >= 4 * wide.perf.conn_rounds);
         // Spreading a pass over rounds adds about one resumed set per round, never a walk of
         // the family per round.
-        try std.testing.expect(narrow.conn_build_visits <= 2 * wide.conn_build_visits);
+        try std.testing.expect(narrow.perf.conn_build_visits <= 2 * wide.perf.conn_build_visits);
     }
 }
 
 test "a flooding reaction reaches its adaptive tuner as one sample at the batch's set count and selected profile" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4 });
     defer threads.deinit();
@@ -3941,13 +3978,13 @@ test "a flooding reaction reaches its adaptive tuner as one sample at the batch'
         var before = tuner.*;
         try setHubCorridor(&fixture, &system, tunnels, fixture.tree);
         const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-        try std.testing.expectEqual(@as(usize, tunnels - 1), stats.conn_splits);
+        try std.testing.expectEqual(@as(usize, tunnels - 1), stats.perf.conn_splits);
         const set_count = system.graph.connectivity.sets.len;
         const selected = threads.selectBatchProfile(&before, .{ .item_count = set_count }).profile;
         try std.testing.expectEqual(settled, selected.worker_threads != 0);
         // Several rounds, one record.
-        try std.testing.expect(stats.conn_rounds > 1);
-        if (settled) try std.testing.expect(stats.conn_round_items_max <= selected.items_per_range);
+        try std.testing.expect(stats.perf.conn_rounds > 1);
+        if (settled) try std.testing.expect(stats.perf.conn_round_items_max <= selected.items_per_range);
         try std.testing.expectEqual(@as(usize, 1), tuner.sample_count);
         try std.testing.expectEqual(set_count, tuner.learned_item_count);
         // The sample carries the selected profile, not the rounds' shape, ...

@@ -1225,10 +1225,10 @@ fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: SpriteAssetId, 
 
 fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
     const asset_store = AssetStore.init(allocator, std.testing.io, "assets");
-    const meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    var world = try WorldSystem.initDemoFromMetaWithUnderground(allocator, &meta, demo_test_viewport_width, demo_test_viewport_height);
-    world.adoptTilesetMeta(meta);
-    const dig_config = try DigConfig.fromMeta(world.tilesetMeta().?);
+    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    const world = try WorldSystem.initDemoFromMetaWithUnderground(allocator, &meta, demo_test_viewport_width, demo_test_viewport_height);
+    const dig_config = try DigConfig.fromMeta(&meta);
     return try GameDemoState.initWithWorld(
         allocator,
         demo_test_viewport_width,
@@ -1408,10 +1408,10 @@ test "demo spawns atlas-backed moving actors (non-compact world)" {
     // <=16 threshold, exercising the non-compact spawn branch.
     const world_dimension_px: f32 = 544;
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    const meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    var world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &meta, world_dimension_px, world_dimension_px);
-    world.adoptTilesetMeta(meta);
-    const dig_config = try DigConfig.fromMeta(world.tilesetMeta().?);
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    const world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &meta, world_dimension_px, world_dimension_px);
+    const dig_config = try DigConfig.fromMeta(&meta);
     var demo = try GameDemoState.initWithWorld(
         std.testing.allocator,
         world_dimension_px,
@@ -1506,10 +1506,10 @@ test "procedural demo uses large world bounds and interpolated follow camera" {
     const large_bounds_height: f32 = 4096;
 
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    const meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    var world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &meta, demo_test_viewport_width, demo_test_viewport_height);
-    world.adoptTilesetMeta(meta);
-    const dig_config = try DigConfig.fromMeta(world.tilesetMeta().?);
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    const world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &meta, demo_test_viewport_width, demo_test_viewport_height);
+    const dig_config = try DigConfig.fromMeta(&meta);
     var demo = try GameDemoState.initWithWorld(
         std.testing.allocator,
         demo_test_viewport_width,
@@ -1645,6 +1645,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 }
 
 test "a demo ramp dig is routable from both levels the next step" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
     defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
@@ -1682,7 +1683,7 @@ test "a demo ramp dig is routable from both levels the next step" {
     try appendPathRequest(&stream, .{ .entity = demo.player.entity, .start_level = 0, .goal_level = 1, .start = center(0, 4), .goal = center(4, 2) });
     const stats = try @import("systems/pathfinding/test_support.zig").updatePathfindingInline(&demo.pipeline.pathfinding, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 2), stats.available_results);
-    try std.testing.expectEqual(@as(usize, 2), stats.cross_level_solves);
+    try std.testing.expectEqual(@as(usize, 2), stats.perf.cross_level_solves);
 
     // The link still climbs planes via the world tier.
     placePlayerInCell(&demo, 5, 2);

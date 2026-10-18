@@ -17,6 +17,7 @@
 //! `world_obstacle_changed`) for the post-commit nav re-mask.
 
 const std = @import("std");
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const builtin = @import("builtin");
 const logging = @import("../core/logging.zig");
 const math = @import("../core/math.zig");
@@ -799,13 +800,6 @@ const TestWorld = struct {
     }
 };
 
-test "dig test world reads the fixture's own tileset meta" {
-    var tw: TestWorld = undefined;
-    try tw.init(.right, 0);
-    defer tw.deinit();
-    try std.testing.expect(tw.world.tilesetMeta().? == &tw.meta);
-}
-
 test "DigController plane scratch reserved-then-push is allocation-free (FailingAllocator)" {
     var dig = DigController.init(.{});
     defer dig.deinit();
@@ -1288,8 +1282,8 @@ fn runCrossChunkFalls(meta: *const world_tileset_meta.WorldTilesetMeta, threads:
     try std.testing.expectEqual(holes.len, reservation.carves);
     try std.testing.expectEqual(holes.len, reservation.carve_chunks.len);
     try dig.commitPlaneTraversalStage(&world, &data, &player, &frame, reservation, threads);
-    if (threads != null) {
-        for ([_]@TypeOf(world.last_terrain_edit_plan_batch){ world.last_terrain_edit_plan_batch, world.last_terrain_edit_write_batch }) |batch| {
+    if (runtime_perf_log.enabled and threads != null) {
+        for ([_]@TypeOf(world.perf.last_terrain_edit_plan_batch){ world.perf.last_terrain_edit_plan_batch, world.perf.last_terrain_edit_write_batch }) |batch| {
             try std.testing.expect(!batch.ran_inline and batch.range_count > 1);
         }
     }

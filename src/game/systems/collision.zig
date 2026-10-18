@@ -345,12 +345,8 @@ pub const CollisionStats = struct {
     entry_count: usize = 0,
     contact_count: usize = 0,
     candidate_pair_count: usize = 0,
-    /// Sweep lane groups, and entries the sweep tested against an earlier entry of its run
-    /// inside that entry's x span. Counted only with `runtime_perf_log.enabled`, else 0.
+    /// Sweep lane groups. Counted only with `runtime_perf_log.enabled`, else 0.
     broadphase_simd_groups: usize = 0,
-    broadphase_visits: usize = 0,
-    fill_batch: BatchStats = .{},
-    sort_batch: BatchStats = .{},
     broadphase_batch: BatchStats = .{},
     narrowphase_batch: BatchStats = .{},
     /// This step outgrew the reserved pair bound, so a main-thread grow path ran: the
@@ -358,6 +354,15 @@ pub const CollisionStats = struct {
     /// range held more than `broadphase_pairs_per_item` pairs per entry its slot was
     /// reserved for (the slot grew and the broadphase replayed).
     pair_bound_exceeded: bool = false,
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: the entries the sweep tested against an
+    /// earlier entry of its run inside that entry's x span, and the fill and sort batches.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        broadphase_visits: usize = 0,
+        fill_batch: BatchStats = .{},
+        sort_batch: BatchStats = .{},
+    } else struct {};
 };
 
 const CandidatePair = struct {
@@ -370,13 +375,13 @@ const BroadphaseRangeBuffer = struct {
     pairs: std.ArrayList(CandidatePair) = .empty,
     required_capacity: usize = 0,
     simd_groups: usize = 0,
-    visits: usize = 0,
+    perf: SweepPerf = .{},
 
     fn clearRetainingCapacity(self: *BroadphaseRangeBuffer) void {
         self.pairs.clearRetainingCapacity();
         self.required_capacity = 0;
         self.simd_groups = 0;
-        self.visits = 0;
+        self.perf = .{};
     }
 
     fn appendCandidateAssumeCapacity(self: *BroadphaseRangeBuffer, pair: CandidatePair) void {
@@ -467,24 +472,29 @@ pub const CollisionSystem = struct {
     /// 0 until `reserve` runs. Telemetry compares against this logical limit, never a
     /// list's `.capacity`, which `ensureTotalCapacity` rounds past it.
     reserved_pair_bound: usize = 0,
-    /// Telemetry: reserved steps that outgrew the pair bound (perf metric
-    /// `collision_pair_bound_exceeded`), counted once per step. Either the candidate pairs
-    /// exceeded `reserved_pair_bound`, so the merged candidates, the narrowphase staging,
-    /// the contact stream and the response reserves (all sized to that bound under the
-    /// pipeline) grew, or a range's pairs outgrew its broadphase slot, so the slot grew
-    /// and the broadphase replayed. Every grow path runs on the main thread between
-    /// batches; the contacts are identical either way. Warns once.
-    pair_bound_overflows: u64 = 0,
     /// The entry bound `reserve` declared (`entries_per_body` per body, grow-only); 0 until
     /// `reserve` runs.
     reserved_entry_bound: usize = 0,
-    /// Telemetry: reserved steps whose entries exceeded `reserved_entry_bound` (the keys and
-    /// entries grew the first time) or whose fill spilled past a range's spill slot (the slot
-    /// grew and the fill replayed), counted once per step. Grow paths run on the main thread
-    /// between batches; the contacts are identical either way. Warns once.
-    entry_bound_overflows: u64 = 0,
     pair_bound_warned: bool = false,
     entry_bound_warned: bool = false,
+    perf: Perf = .{},
+
+    /// Telemetry, kept only with `runtime_perf_log.enabled`. Every grow path it counts runs on
+    /// the main thread between batches; the contacts are identical either way, and each
+    /// warns once.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        /// Reserved steps that outgrew the pair bound (perf metric
+        /// `collision_pair_bound_exceeded`), counted once per step. Either the candidate
+        /// pairs exceeded `reserved_pair_bound`, so the merged candidates, the narrowphase
+        /// staging, the contact stream and the response reserves (all sized to that bound
+        /// under the pipeline) grew, or a range's pairs outgrew its broadphase slot, so the
+        /// slot grew and the broadphase replayed.
+        pair_bound_overflows: u64 = 0,
+        /// Reserved steps whose entries exceeded `reserved_entry_bound` (the keys and entries
+        /// grew the first time) or whose fill spilled past a range's spill slot (the slot
+        /// grew and the fill replayed), counted once per step.
+        entry_bound_overflows: u64 = 0,
+    } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) CollisionSystem {
         return .{ .allocator = allocator };
@@ -523,8 +533,7 @@ pub const CollisionSystem = struct {
     /// the merged candidates, the narrowphase staging (at most one contact per candidate
     /// pair, one window per range), and its tallies hold the pair bound over the body
     /// capacity (`broadphasePairBound`). A denser or taller scene, in total or inside one
-    /// range, takes the counted grow paths (`pair_bound_overflows`,
-    /// `entry_bound_overflows`).
+    /// range, takes the counted grow paths (`Perf`).
     pub fn reserve(self: *CollisionSystem, body_capacity: usize) !void {
         if (body_capacity == 0) return;
         // The u32 slots, sources, and pair indices are exhausted only past maxInt(u32)
@@ -591,7 +600,7 @@ pub const CollisionSystem = struct {
         if (broadphase_selection.active_tuner) |tuner| tuner.record(broadphase.batch);
         stats.broadphase_batch = broadphase.batch;
         stats.broadphase_simd_groups = broadphase.simd_groups;
-        stats.broadphase_visits = broadphase.visits;
+        if (comptime runtime_perf_log.enabled) stats.perf.broadphase_visits = broadphase.perf.visits;
         const candidate_pair_count = self.candidate_pairs.items.len;
         stats.candidate_pair_count = candidate_pair_count;
         if (candidate_pair_count == 0) {
@@ -632,7 +641,7 @@ pub const CollisionSystem = struct {
         const broadphase = try self.buildBroadphaseCandidatesDirect(stats.entry_count);
         stats.broadphase_batch = inlineBatch(stats.entry_count, collision_range_alignment_items);
         stats.broadphase_simd_groups = broadphase.simd_groups;
-        stats.broadphase_visits = broadphase.visits;
+        if (comptime runtime_perf_log.enabled) stats.perf.broadphase_visits = broadphase.perf.visits;
         const candidate_pair_count = self.candidate_pairs.items.len;
         stats.candidate_pair_count = candidate_pair_count;
         if (candidate_pair_count == 0) {
@@ -711,7 +720,7 @@ pub const CollisionSystem = struct {
         const seconds = self.second_scratch.items[0..counts.seconds];
         const head_count = counts.firsts + counts.seconds;
         const entry_count = head_count + spill.raw.items.len;
-        stats.fill_batch = inlineBatch(input_count, collision_range_alignment_items);
+        if (comptime runtime_perf_log.enabled) stats.perf.fill_batch = inlineBatch(input_count, collision_range_alignment_items);
         pdqSort(SortEntry, self.keys.items[0..counts.firsts], {}, entryLessThan);
         pdqSort(SortEntry, seconds, {}, entryLessThan);
         pdqSort(SortEntry, spill.raw.items, {}, entryLessThan);
@@ -720,7 +729,7 @@ pub const CollisionSystem = struct {
         mergeIntoSorted(self.keys.items[0..head_count], counts.firsts, seconds);
         mergeIntoSorted(self.keys.items[0..entry_count], head_count, spill.raw.items);
         if (entry_count != 0) self.entryWriter().writeSorted(0, @intCast(entry_count), 0);
-        stats.sort_batch = inlineBatch(entry_count, collision_range_alignment_items);
+        if (comptime runtime_perf_log.enabled) stats.perf.sort_batch = inlineBatch(entry_count, collision_range_alignment_items);
         return self.finishBuild(input_count, counts.firsts, entry_count, fill_grew, stats);
     }
 
@@ -776,7 +785,7 @@ pub const CollisionSystem = struct {
                 continue;
             }
             if (fill_selection.active_tuner) |tuner| tuner.record(batch);
-            stats.fill_batch = batch;
+            if (comptime runtime_perf_log.enabled) stats.perf.fill_batch = batch;
             break;
         }
 
@@ -795,7 +804,8 @@ pub const CollisionSystem = struct {
                 .writer = self.entryWriter(),
                 .range_count = sort_selection.range_count,
             };
-            stats.sort_batch = sort_stage.run(sort_selection, entry_count, collision_range_alignment_items, &sort_job, sortJob);
+            const sort_batch = sort_stage.run(sort_selection, entry_count, collision_range_alignment_items, &sort_job, sortJob);
+            if (comptime runtime_perf_log.enabled) stats.perf.sort_batch = sort_batch;
         }
         return self.finishBuild(input_count, first_count, entry_count, fill_grew, stats);
     }
@@ -942,7 +952,7 @@ pub const CollisionSystem = struct {
     /// within the bound that `reserve` sizes the collision stores to never outgrows a
     /// stream reserved to it. Past it, the streams grow on the main thread
     /// (`RangeOutputStream.prefix`, the response's intent ensure), counted in
-    /// `pair_bound_overflows`; this is not a drop ceiling (`SimulationEvents` is the
+    /// `perf.pair_bound_overflows`; this is not a drop ceiling (`SimulationEvents` is the
     /// stream that drops).
     pub fn estimateContactCapacity(body_capacity: usize) usize {
         return broadphasePairBound(body_capacity);
@@ -961,7 +971,7 @@ pub const CollisionSystem = struct {
 
     fn notePairBoundOverflow(self: *CollisionSystem, candidate_pair_count: usize) void {
         @branchHint(.cold);
-        self.pair_bound_overflows += 1;
+        if (comptime runtime_perf_log.enabled) self.perf.pair_bound_overflows += 1;
         if (self.pair_bound_warned) return;
         self.pair_bound_warned = true;
         if (comptime logging.enabled(.warn)) logging.game.warn(
@@ -982,7 +992,7 @@ pub const CollisionSystem = struct {
     // slots are never reserved), so it logs at info; entries past the reserved bound warn.
     fn noteEntryBoundOverflow(self: *CollisionSystem, entry_count: usize, fill_grew: bool) void {
         @branchHint(.cold);
-        self.entry_bound_overflows += 1;
+        if (comptime runtime_perf_log.enabled) self.perf.entry_bound_overflows += 1;
         if (self.entry_bound_warned) return;
         self.entry_bound_warned = true;
         if (entry_count > self.reserved_entry_bound) {
@@ -1044,7 +1054,7 @@ pub const CollisionSystem = struct {
                 grew = true;
                 continue;
             }
-            return .{ .simd_groups = buffer.simd_groups, .visits = buffer.visits, .grew = grew };
+            return .{ .simd_groups = buffer.simd_groups, .perf = buffer.perf, .grew = grew };
         }
     }
 
@@ -1087,7 +1097,7 @@ pub const CollisionSystem = struct {
             result.batch = batch;
             for (self.broadphase_ranges.items[0..selection.range_count]) |*slot| {
                 result.simd_groups += slot.buffer.simd_groups;
-                result.visits += slot.buffer.visits;
+                if (comptime runtime_perf_log.enabled) result.perf.visits += slot.buffer.perf.visits;
             }
             try self.mergeBroadphaseRangeBuffers(selection.range_count);
             return result;
@@ -1432,9 +1442,13 @@ fn mergeIntoSorted(keys: []SortEntry, head_len: usize, tail: []const SortEntry) 
 
 // ---- Broadphase -----------------------------------------------------------------------
 
+// The sweep's visits (`CollisionStats.Perf.perf.broadphase_visits`), kept only with
+// `runtime_perf_log.enabled`.
+const SweepPerf = if (runtime_perf_log.enabled) struct { visits: usize = 0 } else struct {};
+
 const BroadphaseBuildResult = struct {
     simd_groups: usize = 0,
-    visits: usize = 0,
+    perf: SweepPerf = .{},
     batch: BatchStats = .{},
     /// A range slot (or the serial candidate list) allocated in-stage: an unreserved slot
     /// warmed, or a slot grew and the broadphase replayed.
@@ -1477,7 +1491,7 @@ fn sweepEntries(entries: ConstEntryColumns, start: usize, end: usize, buffer: *B
             if (active == 0) break;
             if (comptime runtime_perf_log.enabled) {
                 buffer.simd_groups += 1;
-                buffer.visits += @popCount(active);
+                buffer.perf.visits += @popCount(active);
             }
             const overlap_y = simd.greaterThanFloat4Bits(max_y, simd.loadFloat4(entries.min_y[candidate..])) &
                 simd.greaterThanFloat4Bits(simd.loadFloat4(entries.max_y[candidate..]), min_y);
@@ -1956,6 +1970,7 @@ test "serial contacts equal a brute-force same-level reference in every field an
 }
 
 test "threaded contacts equal the reference across range sizes and worker counts" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1972,12 +1987,13 @@ test "threaded contacts equal the reference across range sizes and worker counts
         var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
         defer contacts.deinit();
         const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = workers, .adaptive = false });
-        try std.testing.expect(stats.fill_batch.range_count > 1 and stats.sort_batch.range_count > 1);
+        try std.testing.expect(stats.perf.fill_batch.range_count > 1 and stats.perf.sort_batch.range_count > 1);
         try expectSameContacts(expected, contacts.mergedItems());
     };
 }
 
 test "fill, sort, broadphase, and narrowphase run on workers" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1991,7 +2007,7 @@ test "fill, sort, broadphase, and narrowphase run on workers" {
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = collision_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
-    for ([_]BatchStats{ stats.fill_batch, stats.sort_batch, stats.broadphase_batch, stats.narrowphase_batch }) |batch| {
+    for ([_]BatchStats{ stats.perf.fill_batch, stats.perf.sort_batch, stats.broadphase_batch, stats.narrowphase_batch }) |batch| {
         try std.testing.expect(!batch.ran_inline);
         try std.testing.expect(batch.active_worker_threads > 0);
     }
@@ -2083,6 +2099,7 @@ test "warm and cold steps write identical contacts" {
 }
 
 test "a fill range past its spill slot replays to the reference contacts, counted once" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     // 64 bodies at a 64-body reserve (128-entry bound), four fill ranges of 16. The last 16
     // bodies span three strips each: their third copies spill to slot 3, which `reserve`
@@ -2103,10 +2120,10 @@ test "a fill range past its spill slot replays to the reference contacts, counte
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
-    try std.testing.expectEqual(@as(usize, 4), stats.fill_batch.range_count);
+    try std.testing.expectEqual(@as(usize, 4), stats.perf.fill_batch.range_count);
     try std.testing.expectEqual(@as(usize, 96), stats.entry_count);
     try std.testing.expect(stats.entry_count <= system.reserved_entry_bound);
-    try std.testing.expectEqual(@as(u64, 1), system.entry_bound_overflows);
+    try std.testing.expectEqual(@as(u64, 1), system.perf.entry_bound_overflows);
     try expectSameContacts(expected, contacts.mergedItems());
 }
 
@@ -2131,6 +2148,7 @@ test "a serial fill past its spill slot replays to the reference contacts" {
 }
 
 test "threaded contacts at a non-default strip height equal its reference" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2149,11 +2167,12 @@ test "threaded contacts at a non-default strip height equal its reference" {
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = collision_range_alignment_items, .max_worker_threads = 2, .adaptive = false, .strips = strips });
-    try std.testing.expect(!stats.fill_batch.ran_inline);
+    try std.testing.expect(!stats.perf.fill_batch.ran_inline);
     try expectSameContacts(expected, contacts.mergedItems());
 }
 
 test "after a spill slot grows, later multi-worker steps allocate nothing" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     // Tall bodies spill past their second strip. The first steps grow the spill slots (the
     // cold order, then the warm one); a step at the same warm order reuses them.
@@ -2178,7 +2197,7 @@ test "after a spill slot grows, later multi-worker steps allocate nothing" {
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const config: CollisionConfig = .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false };
     for (0..2) |_| _ = try system.update(&data, &contacts, &threads, config);
-    try std.testing.expect(system.entry_bound_overflows >= 1);
+    try std.testing.expect(system.perf.entry_bound_overflows >= 1);
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -2189,15 +2208,16 @@ test "after a spill slot grows, later multi-worker steps allocate nothing" {
         system.allocator = original_system_allocator;
         contacts.allocator = original_contacts_allocator;
     }
-    const overflows = system.entry_bound_overflows;
+    const overflows = system.perf.entry_bound_overflows;
     const stats = try system.update(&data, &contacts, &threads, config);
-    try std.testing.expect(!stats.fill_batch.ran_inline);
-    try std.testing.expectEqual(overflows, system.entry_bound_overflows);
+    try std.testing.expect(!stats.perf.fill_batch.ran_inline);
+    try std.testing.expectEqual(overflows, system.perf.entry_bound_overflows);
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
     try expectSameContacts(expected, contacts.mergedItems());
 }
 
 test "after reserve, a multi-worker step over bodies on two strips allocates nothing" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     // An 8 x 8 grid (pitch 6, size 8) whose lower rows cross the strip edge at 32: within
     // one extra copy per body and four pairs per entry.
@@ -2234,13 +2254,13 @@ test "after reserve, a multi-worker step over bodies on two strips allocates not
     for (0..2) |_| {
         const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
         try std.testing.expect(stats.entry_count > body_count);
-        for ([_]BatchStats{ stats.fill_batch, stats.sort_batch, stats.broadphase_batch, stats.narrowphase_batch }) |batch| {
+        for ([_]BatchStats{ stats.perf.fill_batch, stats.perf.sort_batch, stats.broadphase_batch, stats.narrowphase_batch }) |batch| {
             try std.testing.expect(!batch.ran_inline);
         }
         try std.testing.expect(!stats.pair_bound_exceeded);
         try expectSameContacts(expected, contacts.mergedItems());
     }
-    try std.testing.expectEqual(@as(u64, 0), system.entry_bound_overflows);
+    try std.testing.expectEqual(@as(u64, 0), system.perf.entry_bound_overflows);
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
 }
 
@@ -2289,6 +2309,7 @@ test "threaded collision matches serial contact order" {
 }
 
 test "threaded collision records one sample into each stage tuner and none into the shared tuner" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -2308,7 +2329,7 @@ test "threaded collision records one sample into each stage tuner and none into 
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const stats = try system.update(&data, &contacts, &threads, .{});
-    try std.testing.expectEqual(@as(usize, 64), stats.fill_batch.item_count);
+    try std.testing.expectEqual(@as(usize, 64), stats.perf.fill_batch.item_count);
     try std.testing.expectEqual(@as(usize, 64), stats.broadphase_batch.item_count);
     try std.testing.expect(stats.narrowphase_batch.item_count > 0);
     for ([_]*const AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner }) |tuner| {
@@ -2761,6 +2782,7 @@ test "after reserve, ~2 pairs per body on the multi-worker path allocate nothing
 }
 
 test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body allocate nothing" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // 96 bodies in a row (spacing 10, 45 wide, inside one strip): each overlaps its next
     // four, so every range except the last holds exactly `broadphase_pairs_per_item` pairs
     // per item (374 pairs, 3.9 per body). A 2-range partition puts 48 entries (192 pairs) in
@@ -2809,11 +2831,12 @@ test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body
         try std.testing.expect(!stats.pair_bound_exceeded);
         try expectSameContactPairs(reference_contacts.mergedItems(), contacts.mergedItems());
     }
-    try std.testing.expectEqual(@as(u64, 0), system.pair_bound_overflows);
+    try std.testing.expectEqual(@as(u64, 0), system.perf.pair_bound_overflows);
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
 }
 
 test "a broadphase slot replay within the total pair bound is counted" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // 64 bodies at a 64-body reserve (256-pair bound, 128-entry bound), four broadphase
     // ranges of 16 entries: slot 2 holds 4 * ceil(128 / 3) = 172 pairs. Ranges 0 and 1 are
     // 32 isolated bodies; range 2 is 16 wide bodies that all overlap (120 pairs) and the four
@@ -2856,16 +2879,17 @@ test "a broadphase slot replay within the total pair bound is counted" {
     try std.testing.expect(!replayed.broadphase_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 4), replayed.broadphase_batch.range_count);
     try std.testing.expect(replayed.pair_bound_exceeded);
-    try std.testing.expectEqual(@as(u64, 1), system.pair_bound_overflows);
+    try std.testing.expectEqual(@as(u64, 1), system.perf.pair_bound_overflows);
     try expectSameContacts(reference_contacts.mergedItems(), contacts.mergedItems());
 
     const settled = try system.update(&data, &contacts, &threads, config);
     try std.testing.expect(!settled.pair_bound_exceeded);
-    try std.testing.expectEqual(@as(u64, 1), system.pair_bound_overflows);
+    try std.testing.expectEqual(@as(u64, 1), system.perf.pair_bound_overflows);
     try expectSameContacts(reference_contacts.mergedItems(), contacts.mergedItems());
 }
 
 test "candidate pairs past the reserved pair bound are counted, even inside the physical slack" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // `reserve(4)` declares a 16-pair bound. 8 overlapping bodies make 28 pairs: inside
     // `candidate_pairs`' rounded-up capacity, past the bound. Each such step counts once,
     // on the serial and the `update` path, and the contacts match an unreserved run (the
@@ -2883,7 +2907,7 @@ test "candidate pairs past the reserved pair bound are counted, even inside the 
     const reference_stats = try updateInline(&reference, &data, &reference_contacts);
     try std.testing.expectEqual(@as(usize, 28), reference_stats.candidate_pair_count);
     try std.testing.expect(!reference_stats.pair_bound_exceeded);
-    try std.testing.expectEqual(@as(u64, 0), reference.pair_bound_overflows);
+    try std.testing.expectEqual(@as(u64, 0), reference.perf.pair_bound_overflows);
     const expected = reference_contacts.mergedItems();
 
     var system = CollisionSystem.init(std.testing.allocator);
@@ -2902,7 +2926,7 @@ test "candidate pairs past the reserved pair bound are counted, even inside the 
         else
             try system.update(&data, &contacts, &threads, .{});
         try std.testing.expect(stats.pair_bound_exceeded);
-        try std.testing.expectEqual(@as(u64, step + 1), system.pair_bound_overflows);
+        try std.testing.expectEqual(@as(u64, step + 1), system.perf.pair_bound_overflows);
         try expectSameContactPairs(expected, contacts.mergedItems());
     }
 
@@ -2911,10 +2935,11 @@ test "candidate pairs past the reserved pair bound are counted, even inside the 
     try std.testing.expectEqual(@as(usize, 32), system.reserved_pair_bound);
     const covered = try updateInline(&system, &data, &contacts);
     try std.testing.expect(!covered.pair_bound_exceeded);
-    try std.testing.expectEqual(@as(u64, 2), system.pair_bound_overflows);
+    try std.testing.expectEqual(@as(u64, 2), system.perf.pair_bound_overflows);
 }
 
 test "candidate pairs past the reserved pair bound are counted once per step on the multi-worker path" {
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // `reserve(32)` declares a 128-pair bound. 32 bodies each overlapping their next
     // five make 145 pairs, over broadphase ranges of 16: past the bound every step, counted
     // once per step. Contacts match the serial run both times.
@@ -2948,7 +2973,7 @@ test "candidate pairs past the reserved pair bound are counted once per step on 
         try std.testing.expect(!stats.broadphase_batch.ran_inline);
         try std.testing.expect(!stats.narrowphase_batch.ran_inline);
         try std.testing.expect(stats.pair_bound_exceeded);
-        try std.testing.expectEqual(@as(u64, step + 1), system.pair_bound_overflows);
+        try std.testing.expectEqual(@as(u64, step + 1), system.perf.pair_bound_overflows);
         try expectSameContactPairs(reference_contacts.mergedItems(), contacts.mergedItems());
     }
 }
