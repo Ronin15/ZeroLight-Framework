@@ -164,9 +164,9 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         system.link_tuner = suite.adaptiveTunerForCase(case, spatial_index_range_alignment_items).?;
     }
 
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next((system.bucket_tuner.phase == .settled) and (system.sort_tuner.phase == .settled) and (system.link_tuner.phase == .settled))) _ = try runOnce(&system, data, geometry, thread_ptr, case);
@@ -202,10 +202,10 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     return .{ .stats = stats, .directory_bytes = spatial_index_test_support.directoryBytes(&system) };
 }
 
-fn runOnce(system: *SpatialIndexSystem, data: *const DataSystem, geometry: IndexGeometry, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SpatialIndexStats {
+fn runOnce(system: *SpatialIndexSystem, data: *const DataSystem, geometry: IndexGeometry, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SpatialIndexStats {
     const population = IndexPopulation{ .entities = data.aiAgentSliceConst().entities };
 
-    return try system.build(data, population, geometry, thread_system.?, .{
+    return try system.build(data, population, geometry, thread_system, .{
         .items_per_range = case.stageItemsPerRange(spatial_index_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,

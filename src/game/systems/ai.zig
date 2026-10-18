@@ -2424,7 +2424,7 @@ test "ai gather direct table and separation blend produce correct order + dirs (
     frame.phase = .finished;
 }
 
-test "ai serial and threaded (0 workers) produce identical intents with separation + seek_target" {
+test "ai serial and threaded produce identical intents with separation + seek_target" {
     if (builtin.single_threaded) return error.SkipZigTest;
     // Two DataSystems: arbitration write-back mutates sticky columns, so serial
     // and threaded must start from identical unmutated state.
@@ -2440,7 +2440,9 @@ test "ai serial and threaded (0 workers) produce identical intents with separati
         const e1 = try data.createEntity();
         try data.setMovementBody(e1, .{ .position = .{ .x = 55, .y = 58 }, .previous_position = .{ .x = 55, .y = 58 }, .velocity = .{}, .speed = 35 });
         try data.setAiAgent(e1, .{ .active_behavior = .wander, .wander_amplitude = 12, .gain_pursue = 0.4 });
+        try addParityFillers(data, parity_filler_count);
     }
+    const agent_count = 2 + parity_filler_count;
 
     var serial_spatial = try testSpatialIndex(&serial_data);
     defer serial_spatial.deinit();
@@ -2451,29 +2453,56 @@ test "ai serial and threaded (0 workers) produce identical intents with separati
 
     var serial_frame = SimulationFrame.init(std.testing.allocator);
     defer serial_frame.deinit();
-    try serial_frame.reserveStreams(1, 0, 3, 0, 0, 0);
+    try serial_frame.reserveStreams(8, 0, agent_count, 0, 0, 0);
     serial_frame.beginStep();
     var serial_ai = AiSystem.init(std.testing.allocator);
     defer serial_ai.deinit();
     _ = try updateInline(&serial_ai, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, cfg);
     const serial = serial_frame.navigation_intents.mergedItems();
-    try std.testing.expectEqual(@as(usize, 2), serial.len);
+    try std.testing.expect(serial.len >= 2);
 
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var threaded_frame = SimulationFrame.init(std.testing.allocator);
     defer threaded_frame.deinit();
-    try threaded_frame.reserveStreams(1, 0, 3, 0, 0, 0);
+    try threaded_frame.reserveStreams(8, 0, agent_count, 0, 0, 0);
     threaded_frame.beginStep();
     var threaded_ai = AiSystem.init(std.testing.allocator);
     defer threaded_ai.deinit();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer threads.deinit();
-    _ = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, cfg);
+    var threaded_cfg = cfg;
+    threaded_cfg.items_per_range = ai_range_alignment_items;
+    threaded_cfg.max_worker_threads = 2;
+    threaded_cfg.adaptive = false;
+    const threaded_stats = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, threaded_cfg);
+    try std.testing.expect(!threaded_stats.gather_batch.ran_inline);
+    try std.testing.expect(!threaded_stats.separation_batch.ran_inline);
+    try std.testing.expect(!threaded_stats.intent_batch.ran_inline);
     const thr = threaded_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(serial.len, thr.len);
     try std.testing.expectEqual(serial[0].direct_direction_x, thr[0].direct_direction_x);
     try std.testing.expectEqual(serial[0].direct_direction_y, thr[0].direct_direction_y);
     try std.testing.expectEqual(serial[1].direct_direction_x, thr[1].direct_direction_x);
     try std.testing.expectEqual(serial[1].direct_direction_y, thr[1].direct_direction_y);
+    for (serial, thr) |a, b| {
+        try std.testing.expectEqual(a.entity.index, b.entity.index);
+        try std.testing.expectEqual(a.direct_direction_x, b.direct_direction_x);
+        try std.testing.expectEqual(a.direct_direction_y, b.direct_direction_y);
+    }
+}
+
+// Wandering AI agents with bodies far from a parity test's subject agents, so the fixture
+// spans more than one aligned AI range and the threaded side runs on workers.
+const parity_filler_count: usize = 3 * ai_range_alignment_items;
+
+fn addParityFillers(data: *DataSystem, count: usize) !void {
+    for (0..count) |i| {
+        const x: f32 = 1200 + @as(f32, @floatFromInt(i % 8)) * 40;
+        const y: f32 = 1200 + @as(f32, @floatFromInt(i / 8)) * 40;
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = x, .y = y }, .previous_position = .{ .x = x, .y = y }, .velocity = .{}, .speed = 20 });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = @floatFromInt(i % 7) });
+    }
 }
 
 // 128 allies at a 9 x 7 pitch: about four per index cell, every third with cohere gain, and
@@ -3328,7 +3357,7 @@ test "ai memory override does not apply while perception still reports the targe
     try std.testing.expectEqual(@as(f32, 0), intents[0].direct_direction_y);
 }
 
-test "ai serial and threaded (0 workers) agree on a memory-overridden seek target" {
+test "ai serial and threaded agree on a memory-overridden seek target" {
     if (builtin.single_threaded) return error.SkipZigTest;
     // Two DataSystems: arbitration write-back mutates sticky columns.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -3348,7 +3377,9 @@ test "ai serial and threaded (0 workers) agree on a memory-overridden seek targe
             .last_known_y = 100,
             .staleness = 10,
         });
+        try addParityFillers(data, parity_filler_count);
     }
+    const agent_count = 1 + parity_filler_count;
 
     var serial_spatial = try testSpatialIndex(&serial_data);
     defer serial_spatial.deinit();
@@ -3359,7 +3390,7 @@ test "ai serial and threaded (0 workers) agree on a memory-overridden seek targe
     defer serial_ai.deinit();
     var serial_frame = SimulationFrame.init(std.testing.allocator);
     defer serial_frame.deinit();
-    try serial_frame.reserveStreams(1, 0, 2, 0, 0, 0);
+    try serial_frame.reserveStreams(8, 0, agent_count, 0, 0, 0);
     serial_frame.beginStep();
     _ = try updateInline(&serial_ai, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, .{
         .intent_seed = 1,
@@ -3368,24 +3399,36 @@ test "ai serial and threaded (0 workers) agree on a memory-overridden seek targe
         .memory_slice = serial_data.aiMemorySliceConst(),
     });
     const serial = serial_frame.navigation_intents.mergedItems();
-    try std.testing.expectEqual(@as(usize, 1), serial.len);
+    try std.testing.expect(serial.len >= 1);
 
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var threaded_ai = AiSystem.init(std.testing.allocator);
     defer threaded_ai.deinit();
     var threaded_frame = SimulationFrame.init(std.testing.allocator);
     defer threaded_frame.deinit();
-    try threaded_frame.reserveStreams(1, 0, 2, 0, 0, 0);
+    try threaded_frame.reserveStreams(8, 0, agent_count, 0, 0, 0);
     threaded_frame.beginStep();
-    _ = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, .{
+    const threaded_stats = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, .{
         .intent_seed = 1,
         .focus_target = .{ .x = 100, .y = 0 },
         .perception_slice = threaded_data.aiPerceptionSliceConst(),
         .memory_slice = threaded_data.aiMemorySliceConst(),
+        .items_per_range = ai_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
     });
+    try std.testing.expect(!threaded_stats.gather_batch.ran_inline);
+    try std.testing.expect(!threaded_stats.separation_batch.ran_inline);
+    try std.testing.expect(!threaded_stats.intent_batch.ran_inline);
     const threaded = threaded_frame.navigation_intents.mergedItems();
-    try std.testing.expectEqual(@as(usize, 1), threaded.len);
+    try std.testing.expectEqual(serial.len, threaded.len);
+    for (serial, threaded) |a, b| {
+        try std.testing.expectEqual(a.entity.index, b.entity.index);
+        try std.testing.expectEqual(a.goal.x, b.goal.x);
+        try std.testing.expectEqual(a.goal.y, b.goal.y);
+    }
 
     try std.testing.expectEqual(serial[0].goal.x, threaded[0].goal.x);
     try std.testing.expectEqual(serial[0].goal.y, threaded[0].goal.y);
@@ -3527,7 +3570,7 @@ test "invalid pursue goal writes wander active_behavior so fatigue does not trea
     try std.testing.expectEqual(@as(u16, 0), agent.commitment_remaining);
 }
 
-test "arbitration serial and threaded (0 workers) parity across perception + memory + affect signals" {
+test "arbitration serial and threaded parity across perception + memory + affect signals" {
     if (builtin.single_threaded) return error.SkipZigTest;
     // Two DataSystems: arbitration write-back mutates sticky columns.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -3535,8 +3578,10 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
     var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer threaded_data.deinit();
 
+    // More agents than one aligned range, so the threaded side splits them across workers.
+    const agent_count: usize = 3 * ai_range_alignment_items;
     inline for (.{ &serial_data, &threaded_data }) |data| {
-        for (0..12) |i| {
+        for (0..agent_count) |i| {
             const x: f32 = @floatFromInt(i * 6);
             const entity = try data.createEntity();
             try data.setMovementBody(entity, .{ .position = .{ .x = x, .y = 0 }, .previous_position = .{ .x = x, .y = 0 }, .velocity = .{}, .speed = 30 });
@@ -3582,7 +3627,7 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
     defer serial_ai.deinit();
     var serial_frame = SimulationFrame.init(std.testing.allocator);
     defer serial_frame.deinit();
-    try serial_frame.reserveStreams(4, 0, 12, 0, 0, 0);
+    try serial_frame.reserveStreams(8, 0, agent_count, 0, 0, 0);
     serial_frame.beginStep();
     _ = try updateInline(&serial_ai, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, .{
         .intent_seed = 0x51de51de,
@@ -3593,24 +3638,31 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
         .interest_markers = &markers,
     });
     const serial = serial_frame.navigation_intents.mergedItems();
-    try std.testing.expectEqual(@as(usize, 12), serial.len);
+    try std.testing.expectEqual(agent_count, serial.len);
 
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     var threaded_ai = AiSystem.init(std.testing.allocator);
     defer threaded_ai.deinit();
     var threaded_frame = SimulationFrame.init(std.testing.allocator);
     defer threaded_frame.deinit();
-    try threaded_frame.reserveStreams(4, 0, 12, 0, 0, 0);
+    try threaded_frame.reserveStreams(8, 0, agent_count, 0, 0, 0);
     threaded_frame.beginStep();
-    _ = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, .{
+    const threaded_stats = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, .{
         .intent_seed = 0x51de51de,
         .step = 3,
         .perception_slice = threaded_data.aiPerceptionSliceConst(),
         .memory_slice = threaded_data.aiMemorySliceConst(),
         .affect_slice = threaded_data.aiAffectSliceConst(),
         .interest_markers = &markers,
+        .items_per_range = ai_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
     });
+    try std.testing.expect(!threaded_stats.gather_batch.ran_inline);
+    try std.testing.expect(!threaded_stats.separation_batch.ran_inline);
+    try std.testing.expect(!threaded_stats.intent_batch.ran_inline);
     const threaded = threaded_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(serial.len, threaded.len);
 

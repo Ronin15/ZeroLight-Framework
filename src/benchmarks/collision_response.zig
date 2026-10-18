@@ -190,10 +190,10 @@ fn buildStageFixture(allocator: std.mem.Allocator, contact_count: usize) !StageF
 fn stageRunOnce(
     system: *CollisionResponseSystem,
     fixture: *StageFixture,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) !CollisionResponseStats {
-    const stats = try system.update(&fixture.data, &fixture.frame, fixture.observer, thread_system.?, .{
+    const stats = try system.update(&fixture.data, &fixture.frame, fixture.observer, thread_system, .{
         .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -216,9 +216,9 @@ fn stageTunersSettled(system: *const CollisionResponseSystem) bool {
 fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
     var fixture = try buildStageFixture(allocator, item_count);
     defer fixture.deinit(allocator);
@@ -233,10 +233,7 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     }
 
     // A fixed threaded case with more than one range of contacts dispatches the gather.
-    const expect_dispatch = if (thread_ptr) |thread_system|
-        !case.adaptive and thread_system.workerThreadCount() > 0 and item_count > case.fixedItemsPerRange(movement_range_alignment_items)
-    else
-        false;
+    const expect_dispatch = !case.adaptive and thread_ptr.workerThreadCount() > 0 and item_count > case.fixedItemsPerRange(movement_range_alignment_items);
 
     var warm = suite.Warmup.init(options, case, 1);
     while (warm.next(stageTunersSettled(&system))) {

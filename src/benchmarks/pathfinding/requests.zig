@@ -10,7 +10,6 @@ const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
-const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const math = @import("../../core/math.zig");
 const DataSystem = @import("../../game/data_system.zig").DataSystem;
 const EntityId = @import("../../game/data_system.zig").EntityId;
@@ -384,9 +383,9 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 // step is one solve. Items/s is requests answered, not solves.
 fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     // The field threshold above every sharer count (the agent ceiling clamps it), so the
     // timed step is the fold alone, never a group-field begin.
     var capacity = requestCapacity(item_count + 1, fixtures.participantCount(thread_ptr));
@@ -444,9 +443,9 @@ const hard_fallback_admissions: usize = 128;
 
 fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     var fixture = try initRequestFixture(allocator, io, workload, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
@@ -514,9 +513,9 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     // The refill step solves one ceiling; a full-ceiling drain step needs another behind it.
     if (item_count < 2 * default_max_solves_per_frame) return error.DrainQueueBelowTwoCeilings;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     var fixture = try initRequestFixture(allocator, io, .unique_open, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
@@ -567,14 +566,14 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
 // Clears the runtime state and accepts every distinct goal in one step, which also solves
 // the first ceiling; the queue carries the rest.
-fn refillDrainQueue(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !void {
+fn refillDrainQueue(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !void {
     system.clearRuntimeState();
     _ = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
 }
 
 // Steps until every request is a cache hit and, for an adaptive case, the intake tuner has
 // settled (bounded), so the timed steps are the hit path only.
-fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !void {
+fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !void {
     const fill_limit = @divCeil(item_count, default_max_solves_per_frame) + 2;
     const settle_limit = fill_limit + suite.adaptiveSettleIterationLimit(options);
     var steps: usize = 0;
@@ -609,33 +608,29 @@ fn queryJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void
     }
 }
 
-fn runQueries(ctx: *QueryContext, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, item_count: usize) BatchStats {
-    if (thread_system) |ts| {
-        return ts.parallelForWithOptions(item_count, ctx, queryJob, .{
-            .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
-            .max_worker_threads = case.maxWorkerThreads(),
-            .range_alignment_items = pathfinding_range_alignment_items,
-            .adaptive = case.adaptive,
-        });
-    }
-    queryJob(@ptrCast(ctx), .{ .start = 0, .end = item_count }, WorkerId.main);
-    return inlineBatch(item_count, pathfinding_range_alignment_items);
+fn runQueries(ctx: *QueryContext, thread_system: *ThreadSystem, case: suite.BenchmarkCase, item_count: usize) BatchStats {
+    return thread_system.parallelForWithOptions(item_count, ctx, queryJob, .{
+        .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
+        .max_worker_threads = case.maxWorkerThreads(),
+        .range_alignment_items = pathfinding_range_alignment_items,
+        .adaptive = case.adaptive,
+    });
 }
 
 // Per-agent statusForWorld against a warm cache: each agent queries from the midpoint of
 // its own cached path, so the waypoint scan has a deep match to find.
 fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     var fixture = try initRequestFixture(allocator, io, .unique_open, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
 
     // Warm: the per-step solve ceiling caps each step, so enough steps drain the queue.
     const warm_steps = item_count / default_max_solves_per_frame + 4;
-    for (0..warm_steps) |_| _ = try system.update(&fixture.requests, item_count, thread_ptr.?, .{});
+    for (0..warm_steps) |_| _ = try system.update(&fixture.requests, item_count, thread_ptr, .{});
 
     const starts = try allocator.alloc(math.Vec2, item_count);
     defer allocator.free(starts);
@@ -717,9 +712,9 @@ fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const side = std.math.cast(u16, item_count) orelse return error.EscalatedDetourSideTooWide;
     if (side % default_chunk_size_tiles != 0 or side < 4 * default_chunk_size_tiles) return error.EscalatedDetourSideNotChunked;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const open = try buildDetourWorld(allocator, io, side);
     var request = [_]PathRequest{.{
         .entity = undefined,
@@ -761,7 +756,7 @@ fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: sui
 
 // The untimed setup step: submits the request on cleared state and exhausts its first
 // attempt, leaving it pending at tier 1.
-fn promoteDetour(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !void {
+fn promoteDetour(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase) !void {
     system.clearRuntimeState();
     const stats = try runColdOnce(system, requests, thread_system, case, 1, 1, 1);
     if (stats.budget_exhausted != 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.EscalatedDetourNotPromoted;
@@ -861,9 +856,9 @@ fn packCapacity(agent_count: usize, participant_count: usize) PathfindingCapacit
 // the same pack and every member samples the field.
 fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit(allocator);
     const system = &fixture.system;
@@ -927,9 +922,9 @@ const MovingTotals = struct {
 fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     // Fixed cycle counts: --warmup and --iterations do not apply.
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit(allocator);
     const system = &fixture.system;
@@ -968,9 +963,9 @@ fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io: std
     // Fixed cycle counts: --warmup and --iterations do not apply.
     _ = options;
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit(allocator);
     const system = &fixture.system;
@@ -1051,9 +1046,9 @@ fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Opt
     const packs = item_count;
     if (packs == 0 or group_field_pack_side / packs < group_field_pack_band_min) return error.GroupFieldPacksTooMany;
     const agent_count = packs * group_field_pack_agents;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
     var open = try buildOpenWorld(allocator, io, group_field_pack_side, 1);
     defer open.world.deinit();
@@ -1164,7 +1159,7 @@ fn tunnelRequests(open: *const OpenWorld, requests: []PathRequest) void {
 }
 
 // Rebuilds the four fields from scratch (pools kept) until all are ready; times the steps.
-fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !struct { elapsed_ns: u64, batch: BatchStats } {
+fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !struct { elapsed_ns: u64, batch: BatchStats } {
     system.clearRuntimeState();
     var elapsed_ns: u64 = 0;
     var batch = BatchStats{};
@@ -1184,9 +1179,9 @@ fn buildTunnelFields(io: std.Io, system: *PathfindingSystem, requests: *RangeOut
 fn runGroupFieldTunnelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const agent_count = group_field_tunnel_fields * group_field_tunnel_agents;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
     var open = try buildOpenWorld(allocator, io, group_field_tunnel_side, 1);
     var open_owned = true;

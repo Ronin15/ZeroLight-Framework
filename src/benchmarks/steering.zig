@@ -278,7 +278,7 @@ fn measureCase(
     steering: *const Fixture,
     context: anytype,
     comptime prepare: fn (@TypeOf(context)) anyerror!void,
-    comptime step: fn (*SteeringSystem, @TypeOf(context), ?*ThreadSystem, suite.BenchmarkCase) anyerror!SteeringStats,
+    comptime step: fn (*SteeringSystem, @TypeOf(context), *ThreadSystem, suite.BenchmarkCase) anyerror!SteeringStats,
 ) !MeasuredCase {
     var system = SteeringSystem.init(allocator);
     defer system.deinit();
@@ -295,9 +295,9 @@ fn measureCase(
         system.grid_sort_tuner = suite.adaptiveTunerForPartition(case, 1, 1).?;
     }
 
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
     var last_stats = SteeringStats{};
     var warm = suite.Warmup.init(options, case, 0);
@@ -346,15 +346,15 @@ fn prepareOnce(fixture: *Fixture) !void {
 }
 
 // One steering step; fails when an agent writes no movement intent.
-fn runOnce(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
+fn runOnce(system: *SteeringSystem, fixture: *Fixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     const stats = try steeringStep(system, fixture, thread_system, case);
     if (stats.movement_intent_count != fixture.agents.items.len) return error.AgentIntentMissing;
     return stats;
 }
 
 // The steering update for `case` over the step's navigation intents.
-fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
-    return try system.update(&fixture.data, &fixture.frame, thread_system.?, &fixture.pathfinding, &fixture.colliders, .{
+fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
+    return try system.update(&fixture.data, &fixture.frame, thread_system, &fixture.pathfinding, &fixture.colliders, .{
         .items_per_range = case.stageItemsPerRange(steering_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -568,7 +568,7 @@ fn prepareStaticChange(fixture: *StaticChangeFixture) !void {
 // One step: the mover's set_movement_body through the commit seam (collider reserve, budgeted
 // commit, capture, and sync with its splice stages on the case's threads, then the steering
 // post-commit reaction), then the steering update.
-fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
+fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     const frame = &fixture.steering.frame;
     const colliders = &fixture.steering.colliders;
     const seam = fixtures.CommitSeam{ .colliders = colliders, .steering = system, .structural_headroom = fixtures.StaticMove.structural_headroom };
@@ -777,7 +777,7 @@ fn prepareStaticDense(fixture: *StaticDenseFixture) !void {
 }
 
 // One steering step; fails when the obstacle workload is empty or differs from the first step's.
-fn staticDenseOnce(system: *SteeringSystem, fixture: *StaticDenseFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
+fn staticDenseOnce(system: *SteeringSystem, fixture: *StaticDenseFixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     const stats = try steeringStep(system, &fixture.steering, thread_system, case);
     if (stats.movement_intent_count != fixture.steering.agents.items.len) return error.AgentIntentMissing;
     if (stats.obstacle_samples == 0) return error.StaticsUnsampled;

@@ -133,7 +133,8 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var dispatches: usize = 0;
     var warm = suite.Warmup.custom(case, options.warmup_iterations, suite.adaptiveSettleIterationLimit(options));
     while (warm.next(case.adaptive and tunerSettled(thread_ptr.?, &fixed_tuner))) {
-        _ = dispatchOnce(&context, thread_ptr, &fixed_tuner, case);
+        // No dispatch here is ever forced inline (a nested or foreign-thread call).
+        std.debug.assert(!dispatchOnce(&context, thread_ptr, &fixed_tuner, case).forced_inline);
         dispatches += 1;
     }
     const settled_before_measurement = case.adaptive and tunerSettled(thread_ptr.?, &fixed_tuner);
@@ -146,6 +147,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         dispatches += 1;
         std.debug.assert(batch.item_count == item_count);
         std.debug.assert(batch.main_thread_ranges + batch.worker_thread_ranges == batch.range_count);
+        std.debug.assert(!batch.forced_inline);
         if (thread_ptr) |thread_system| {
             assertThreadedShape(batch, thread_system);
             if (!case.adaptive) assertFixedShape(batch, thread_system, case);
@@ -154,7 +156,6 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     }
 
     for (items) |item| std.debug.assert(item == dispatches);
-    if (thread_ptr) |thread_system| std.debug.assert(!thread_system.shared.control.forced_inline_warned.load(.monotonic));
     var stats = accumulator.finish();
     stats.output_count = item_count;
     if (case.adaptive) {

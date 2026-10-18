@@ -66,19 +66,19 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         particles.adaptive_tuner = tuner;
     }
 
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(particles.adaptive_tuner.phase == .settled)) {
-        _ = runOnce(&particles, if (threads) |*thread_system| thread_system else null, case);
+        _ = runOnce(&particles, &threads, case);
     }
     const settled_before_measurement = if (case.adaptive) (particles.adaptive_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = runOnce(&particles, if (threads) |*thread_system| thread_system else null, case);
+        const batch = runOnce(&particles, &threads, case);
         const end_ns = suite.nowNs(io);
         std.debug.assert(batch.item_count == item_count);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
@@ -92,8 +92,8 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     return stats;
 }
 
-fn runOnce(particles: *ParticleSystem, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) BatchStats {
-    return particles.update(thread_system.?, delta_seconds, .{
+fn runOnce(particles: *ParticleSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) BatchStats {
+    return particles.update(thread_system, delta_seconds, .{
         .items_per_range = case.stageItemsPerRange(particle_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,

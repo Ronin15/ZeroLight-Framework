@@ -4504,6 +4504,8 @@ const TunerSnapshot = struct {
     learned_item_count: usize,
     shifted_batch_count: usize,
     skip_next_record: bool,
+    probe_window_count: DiagnosticCount,
+    demotion_count: DiagnosticCount,
 
     fn of(tuner: *const AdaptiveWorkTuner) TunerSnapshot {
         return .{
@@ -4522,6 +4524,8 @@ const TunerSnapshot = struct {
             .learned_item_count = tuner.learned_item_count,
             .shifted_batch_count = tuner.shifted_batch_count,
             .skip_next_record = tuner.skip_next_record,
+            .probe_window_count = tuner.probe_window_count,
+            .demotion_count = tuner.demotion_count,
         };
     }
 };

@@ -60,8 +60,8 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var data = try createFixture(allocator, item_count);
     defer data.deinit();
 
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
 
     var system = MovementSystem.init();
     if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
@@ -70,14 +70,14 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(system.adaptive_tuner.phase == .settled)) {
-        _ = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
+        _ = runOnce(&system, &data, &threads, case);
     }
     const settled_before_measurement = if (case.adaptive) (system.adaptive_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
+        const batch = runOnce(&system, &data, &threads, case);
         const end_ns = suite.nowNs(io);
         std.debug.assert(batch.item_count == item_count);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
@@ -93,12 +93,12 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 fn runOnce(
     system: *MovementSystem,
     data: *DataSystem,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) BatchStats {
     var slice = data.movementBodySlice();
 
-    const stats = system.update(&slice, thread_system.?, delta_seconds, .{
+    const stats = system.update(&slice, thread_system, delta_seconds, .{
         .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -211,10 +211,10 @@ fn countAppliedRows(data: *const DataSystem) usize {
 fn applyIntentsOnce(
     system: *MovementSystem,
     fixture: *ApplyIntentsFixture,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) BatchStats {
-    const stats = system.applyIntents(&fixture.data, &fixture.frame, thread_system.?, .{
+    const stats = system.applyIntents(&fixture.data, &fixture.frame, thread_system, .{
         .items_per_range = case.stageItemsPerRange(movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -233,9 +233,9 @@ fn runApplyIntentsSortedCase(allocator: std.mem.Allocator, io: std.Io, options: 
 fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, order_kind: IntentOrder) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
     var fixture = try buildApplyIntentsFixture(allocator, item_count, order_kind);
     defer fixture.deinit();
@@ -245,10 +245,7 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     }
 
     // A fixed threaded case with more than one range of intents dispatches the apply.
-    const expect_dispatch = if (thread_ptr) |thread_system|
-        !case.adaptive and thread_system.workerThreadCount() > 0 and item_count > case.fixedItemsPerRange(movement_range_alignment_items)
-    else
-        false;
+    const expect_dispatch = !case.adaptive and thread_ptr.workerThreadCount() > 0 and item_count > case.fixedItemsPerRange(movement_range_alignment_items);
 
     var warm = suite.Warmup.init(options, case, 1);
     while (warm.next(system.apply_intents_tuner.phase == .settled)) {

@@ -151,9 +151,9 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     defer scope.deinit();
     try scope.reserve(fields.agents);
     if (suite.adaptiveTunerForCase(case, scope_range_alignment_items)) |tuner| scope.cognition_tuner = tuner;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
     // Positions never change, so the halo's index is built once, untimed and inline.
     var setup_threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
@@ -206,8 +206,8 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     return stats;
 }
 
-fn runCognitionOnce(scope: *SimulationScopeSystem, view: *const SpatialIndexView, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !CognitionResult {
-    return scope.compactCognition(view, 0, true, thread_system.?, scopeConfig(case));
+fn runCognitionOnce(scope: *SimulationScopeSystem, view: *const SpatialIndexView, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !CognitionResult {
+    return scope.compactCognition(view, 0, true, thread_system, scopeConfig(case));
 }
 
 // `candidate_pairs` holds the indexed rows and `output_count` the rows that think; `main` is

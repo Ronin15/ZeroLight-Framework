@@ -162,12 +162,12 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         system.visible_tuner = suite.adaptiveTunerForCase(case, 1).?;
     }
 
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(tunersSettled(&system))) {
-        _ = try runOnce(&system, &fixture, run, if (threads) |*thread_system| thread_system else null, case);
+        _ = try runOnce(&system, &fixture, run, &threads, case);
     }
     const settled_before_measurement = if (case.adaptive) tunersSettled(&system) else false;
 
@@ -176,7 +176,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        last_stats = try runOnce(&system, &fixture, run, if (threads) |*thread_system| thread_system else null, case);
+        last_stats = try runOnce(&system, &fixture, run, &threads, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_stats.batch);
@@ -213,12 +213,12 @@ const Run = struct {
     touched_words: usize,
 };
 
-fn runOnce(system: *AiMemorySystem, fixture: *Fixture, run: Run, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !AiMemoryStats {
+fn runOnce(system: *AiMemorySystem, fixture: *Fixture, run: Run, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !AiMemoryStats {
     fixture.frame.beginStep();
     const ai_slice = fixture.data.aiAgentSliceConst();
     try injectPerceivedEvents(&fixture.frame, ai_slice, run.event_rows, fixture.target);
 
-    return try system.update(ai_slice, &fixture.data, &fixture.frame, thread_system.?, .{
+    return try system.update(ai_slice, &fixture.data, &fixture.frame, thread_system, .{
         .items_per_range = case.stageItemsPerRange(ai_memory_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,

@@ -470,9 +470,9 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var contacts = RangeOutputStream(CollisionContact).init(allocator);
     defer contacts.deinit();
 
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(stageTunersSettled(&system))) {
@@ -537,12 +537,12 @@ fn runOnce(
     data: *DataSystem,
     mover: ?*StaticMover,
     contacts: *RangeOutputStream(CollisionContact),
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) !CollisionStats {
     if (mover) |static_mover| try static_mover.moveAndSync(data, if (case.usesThreadSystem()) thread_system else null);
 
-    return try system.update(data, contacts, thread_system.?, .{
+    return try system.update(data, contacts, thread_system, .{
         .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,

@@ -49,8 +49,8 @@ pub fn coldSettleLimit(options: suite.Options) usize {
     return @min(suite.adaptiveSettleIterationLimit(options), cold_settle_cap);
 }
 
-pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
-    return try system.update(requests, agent_count, thread_system.?, .{
+pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
+    return try system.update(requests, agent_count, thread_system, .{
         .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -279,7 +279,7 @@ pub const ReactFixture = struct {
 
     // Requests every result in batches the intake admits and drains each batch, until
     // every result is cached. Untimed.
-    pub fn fillCache(self: *ReactFixture, case: suite.BenchmarkCase, thread_system: ?*ThreadSystem) !void {
+    pub fn fillCache(self: *ReactFixture, case: suite.BenchmarkCase, thread_system: *ThreadSystem) !void {
         var start: usize = 0;
         while (start < self.requests.len) : (start += self.agent_count) {
             const end = @min(start + self.agent_count, self.requests.len);

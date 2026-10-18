@@ -189,9 +189,9 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const result_count = code.cached_results;
     const region_edge = std.math.cast(u16, std.math.sqrt(region_chunks)) orelse return error.EvictRegionTooLarge;
     if (@as(usize, region_edge) * region_edge != region_chunks) return error.EvictRegionNotSquare;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = nav_size.NavSizeConfig{
         .side = short_route_side,
@@ -303,7 +303,7 @@ const RegistryChurn = struct {
 
     // Untimed churn rounds; `fixture.changed` was reserved for the region, which holds every
     // candidate.
-    fn run(self: *RegistryChurn, io: std.Io, fixture: *ReactFixture, case: suite.BenchmarkCase, thread_system: ?*ThreadSystem) !void {
+    fn run(self: *RegistryChurn, io: std.Io, fixture: *ReactFixture, case: suite.BenchmarkCase, thread_system: *ThreadSystem) !void {
         std.debug.assert(fixture.changed.capacity >= churn_cells_per_round);
         for (0..churn_rounds) |_| {
             self.prng.random().shuffle(CellCoord, self.candidates);
@@ -326,9 +326,9 @@ const ElasticRamp = struct {
 
 fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = nav_size.NavSizeConfig{
         .side = short_route_side,
@@ -380,7 +380,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
 
 // One ramp from the reserved floor: resets the system to its reserve (untimed), then
 // steps until every agent's result is cached. Times the pathfinding updates only.
-fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSystem, capacity: PathfindingCapacity, stream: *RangeOutputStream(PathRequest), requests: []const PathRequest, thread_system: ?*ThreadSystem) !ElasticRamp {
+fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSystem, capacity: PathfindingCapacity, stream: *RangeOutputStream(PathRequest), requests: []const PathRequest, thread_system: *ThreadSystem) !ElasticRamp {
     try system.reserve(capacity);
     system.clearRuntimeState();
     const agent_total = requests.len;
@@ -469,9 +469,9 @@ const ShrinkReport = struct {
 fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     if (item_count / elastic_shrink_divisor < min_capacity_floor) return error.ElasticShrinkBelowCapacityFloor;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = nav_size.NavSizeConfig{
         .side = short_route_side,
@@ -540,7 +540,7 @@ fn runElasticShrink(
     stream: *RangeOutputStream(PathRequest),
     requests: []const PathRequest,
     cached: *std.ArrayList(CachedPayload),
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
 ) !ElasticShrink {
     _ = try runElasticRamp(io, case, system, capacity, stream, requests, thread_system);
     if (system.low_load_steps != 0) return error.ElasticShrinkRampLeftLowLoad;
@@ -593,7 +593,7 @@ fn runElasticShrink(
 }
 
 // One step of the held agents, which must be served by cache hits alone.
-fn runHeldStep(system: *PathfindingSystem, stream: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !PathfindingStats {
+fn runHeldStep(system: *PathfindingSystem, stream: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !PathfindingStats {
     const stats = try runColdOnce(system, stream, thread_system, case, agent_count, agent_count, agent_count);
     if (stats.cache_hits != agent_count or stats.solved_requests != 0) return error.ElasticShrinkHeldResultLost;
     return stats;

@@ -300,9 +300,9 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     const side = code.level_side;
     const levels = code.levels;
     if (levels != 1 or side < 256) return error.LevelSizeBadConfig;
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     var size_config = routeSizeConfig(side, levels, 0, participant_count);
 
@@ -403,9 +403,9 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     const levels = config.levels;
     const teleport_count = config.teleports;
 
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const link_count: usize = levels - 1 + if (teleport_count != 0) teleport_count else @intFromBool(teleport);
     var size_config = routeSizeConfig(side, levels, link_count, participant_count);
@@ -492,9 +492,9 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     const levels = code.levels;
     if (levels <= shaft_goal_level or side < 256) return error.CrossLevelShaftBadConfig;
 
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     // Ramps join levels 1..levels-1; one teleport leaves level 0.
     const link_count: usize = levels - 2 + 1;
@@ -1560,7 +1560,7 @@ const UnsolvedRoutes = enum {
 
 // One cold pathfinding step of the fixture's requests. Every fixture route exists and
 // starts on an open cell, so an unavailable answer or an invalid start is a fixture fault.
-fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, unsolved_routes: UnsolvedRoutes) !PathfindingStats {
+fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase, unsolved_routes: UnsolvedRoutes) !PathfindingStats {
     const count = route_request_count;
     const stats = try runColdOnce(system, &fixture.requests, thread_system, case, count, count, count);
     if (stats.unavailable_results != 0) return error.RouteUnavailable;
@@ -1572,7 +1572,7 @@ fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_syste
 
 // Times one cold pathfinding step of the fixture's requests per iteration (runtime
 // state cleared, untimed, before each).
-fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *RouteFixture, thread_system: ?*ThreadSystem, unsolved_routes: UnsolvedRoutes) !suite.RunStats {
+fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *RouteFixture, thread_system: *ThreadSystem, unsolved_routes: UnsolvedRoutes) !suite.RunStats {
     const system = &fixture.system;
     setPathStageTuners(system, case);
     var warm = suite.Warmup.custom(case, options.warmup_iterations, coldSettleLimit(options));
@@ -1643,9 +1643,9 @@ const LinkFoldConfig = struct {
 fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try LinkFoldConfig.decode(item_count);
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     // Every sample adds a batch, so the size check holds at the most pads the run holds.
     const samples = options.warmup_iterations + options.iterations;

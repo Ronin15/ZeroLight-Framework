@@ -49,10 +49,14 @@ pub fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.Ben
 }
 
 /// The case's thread system for a stage that requires one: the engine's default config at
-/// the case's worker count, with no workers for the serial case.
+/// the case's worker count. The serial case has no workers and one range per stage (its
+/// stages pass no range size), the shape production takes below the tuner's gate; the
+/// size is `maxInt(u32)`, as the tests' inline helpers use, since the dispatch aligns it
+/// forward.
 pub fn initRequiredCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !ThreadSystem {
     var config = ThreadSystemConfig{};
     config.max_worker_threads = case.maxWorkerThreads();
+    if (!case.usesThreadSystem()) config.items_per_range = std.math.maxInt(u32);
     return ThreadSystem.init(allocator, io, config);
 }
 

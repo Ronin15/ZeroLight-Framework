@@ -84,9 +84,9 @@ pub const negative_burst_group = suite.BenchmarkGroup{
 };
 
 // The case's goal resolve over `intents`, as the pipeline's `path_goal_resolve` stage.
-fn runResolveGoals(system: *PathfindingSystem, intents: []const PathRequest, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !GoalResolveStats {
+fn runResolveGoals(system: *PathfindingSystem, intents: []const PathRequest, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !GoalResolveStats {
     if (!case.usesThreadSystem()) return system.resolveGoals(PathRequest, intents, null, .{});
-    return system.resolveGoals(PathRequest, intents, thread_system.?, .{
+    return system.resolveGoals(PathRequest, intents, thread_system, .{
         .items_per_range = case.stageItemsPerRange(goal_scan_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -220,7 +220,7 @@ const PocketStep = struct {
 
 // Times one update of every request; intake must answer every one unavailable from reach,
 // with no solve and nothing cached.
-fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !PocketStep {
+fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, thread_system: *ThreadSystem) !PocketStep {
     try fixtures.writeRequests(&fixture.stream, fixture.requests);
     const count = fixture.requests.len;
     const start_ns = suite.nowNs(io);
@@ -237,9 +237,9 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const side = negative_steady_side;
     try checkPocketLayout(allocator, side, item_count, item_count);
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = pocketSizeConfig(side, participant_count, item_count);
     try nav_size.checkNavSize(negative_steady_group.name, item_count, case, size_config);
@@ -306,7 +306,7 @@ const NegativeDig = struct {
     cell: CellCoord,
     blocked: bool = false,
 
-    fn step(self: *NegativeDig, io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !struct { reaction: Reaction, update: PocketStep } {
+    fn step(self: *NegativeDig, io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, thread_system: *ThreadSystem) !struct { reaction: Reaction, update: PocketStep } {
         self.blocked = !self.blocked;
         const tile = if (self.blocked) fixture.open.blocking else fixture.open.walkable;
         const reaction = try fixture.changeAndReact(io, &.{self.cell}, tile, thread_system);
@@ -322,9 +322,9 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     const requester_count: usize = code.requests;
     if (requester_count == 0) return error.NegativeDigNoRequests;
     try checkPocketLayout(allocator, side, requester_count, requester_count);
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = pocketSizeConfig(side, participant_count, requester_count);
     try nav_size.checkNavSize(negative_dig_group.name, item_count, case, size_config);
@@ -564,7 +564,7 @@ const BurstOutcome = struct {
 // resolves every intent each step) and the step that submits them. Intake answers every
 // request unavailable from reach on that step, with no search and nothing pending, and every
 // status reads unavailable after it.
-fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !BurstOutcome {
+fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixture: *ReactFixture, thread_system: *ThreadSystem) !BurstOutcome {
     const count = fixture.requests.len;
     fixture.system.clearRuntimeState();
     try fixtures.writeRequests(&fixture.stream, fixture.requests);
@@ -590,9 +590,9 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try BurstConfig.decode(item_count);
     try checkBurstLayout(config);
-    var threads: ?ThreadSystem = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const size_config = burstSizeConfig(participant_count, config.requests);
     try nav_size.checkNavSize(negative_burst_group.name, item_count, case, size_config);
