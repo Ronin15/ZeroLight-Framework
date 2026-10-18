@@ -77,8 +77,10 @@ orchestrates, verifies every agent claim against live code, and reports.
   behavior, rule edits, a major redesign, a `ThreadSystem`/tuner redesign, and
   anything that doesn't make sense go to the owner. No model/effort overrides
   unless the owner asks.
-- Implementation agents run sequentially in the main tree; parallelize only
-  read-only work, and let read-only agents finish. One commit per logical
+- When work splits into independent read-only pieces, spawn those agents
+  together in the same turn and wait for all of them. Implementation agents
+  stay sequential in the main tree. Let every read-only agent finish before
+  using its result. One commit per logical
   change with review fixes folded in; no per-finding commits, worktrees, or
   merge commits. Never commit known-broken or unfinished code; the owner
   pushes.
