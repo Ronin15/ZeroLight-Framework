@@ -225,10 +225,10 @@ fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture
     const start_ns = suite.nowNs(io);
     const stats = try runColdOnce(&fixture.system, &fixture.stream, thread_system, case, count, count, count);
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-    if (stats.available_results != 0) return error.PocketGoalReached;
-    if (stats.dropped_requests != 0 or stats.perf.start_invalid_dropped != 0) return error.PocketRequestDropped;
-    if (stats.solved_requests != 0 or stats.accepted_requests != 0 or stats.cache_hits != 0) return error.PocketSearched;
-    if (stats.unavailable_results != count) return error.PocketNotAnsweredAtIntake;
+    if (stats.perf.available_results != 0) return error.PocketGoalReached;
+    if (stats.perf.dropped_requests != 0 or stats.perf.start_invalid_dropped != 0) return error.PocketRequestDropped;
+    if (stats.perf.solved_requests != 0 or stats.accepted_requests != 0 or stats.perf.cache_hits != 0) return error.PocketSearched;
+    if (stats.perf.unavailable_results != count) return error.PocketNotAnsweredAtIntake;
     return .{ .elapsed_ns = elapsed_ns, .stats = stats };
 }
 
@@ -265,7 +265,7 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     try nav_size.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     stage_report.write(&stats.details);
-    stats.output_count = last_stats.unavailable_results;
+    stats.output_count = last_stats.perf.unavailable_results;
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&fixture.system.tuners.intake), settled_before_measurement);
     return stats;
 }
@@ -573,18 +573,18 @@ fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixtur
     const resolve = try runResolveGoals(&fixture.system, fixture.requests, thread_system, case);
     const stats = try runColdOnce(&fixture.system, &fixture.stream, thread_system, case, count, count, count);
     var elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-    if (stats.available_results != 0) return error.NegativeBurstGoalReached;
-    if (stats.dropped_requests != 0 or stats.perf.start_invalid_dropped != 0) return error.NegativeBurstRequestDropped;
-    if (stats.unavailable_results != count or stats.pending_requests != 0) return error.NegativeBurstUnanswered;
-    if (stats.solved_requests != 0) return error.NegativeBurstSearched;
+    if (stats.perf.available_results != 0) return error.NegativeBurstGoalReached;
+    if (stats.perf.dropped_requests != 0 or stats.perf.start_invalid_dropped != 0) return error.NegativeBurstRequestDropped;
+    if (stats.perf.unavailable_results != count or stats.pending_requests != 0) return error.NegativeBurstUnanswered;
+    if (stats.perf.solved_requests != 0) return error.NegativeBurstSearched;
     const status_start_ns = suite.nowNs(io);
     const all_unavailable = unavailableCount(fixture) == count;
     if (variant == .blocked_crowd) elapsed_ns += suite.elapsedNs(status_start_ns, suite.nowNs(io));
     if (!all_unavailable) return error.NegativeBurstStatusNotUnavailable;
     // One projection per distinct blocked goal, shared: four for the blocked crowd.
     const expected_projections: usize = if (variant == .blocked_crowd) burst_pockets else 0;
-    if (resolve.distinct != expected_projections or stats.goal_fallbacks != 0) return error.NegativeBurstProjectionsNotShared;
-    return .{ .elapsed_ns = elapsed_ns, .unavailable = stats.unavailable_results, .projections = resolve.distinct, .stats = stats, .resolve = resolve };
+    if (resolve.distinct != expected_projections or stats.perf.goal_fallbacks != 0) return error.NegativeBurstProjectionsNotShared;
+    return .{ .elapsed_ns = elapsed_ns, .unavailable = stats.perf.unavailable_results, .projections = resolve.distinct, .stats = stats, .resolve = resolve };
 }
 
 fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {

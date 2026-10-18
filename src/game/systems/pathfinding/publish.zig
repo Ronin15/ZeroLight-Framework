@@ -138,18 +138,20 @@ pub fn claimPublish(self: *PathfindingSystem, stats: *PathfindingStats) void {
                 if (self.completed.canStore()) {
                     record.* = self.completed.claim(key, solved.len, solved.stitched_len, solved.path_level, solved.end, solved.goal_cell, self.step_counter, stats);
                 }
-                stats.solved_requests += 1;
-                if (result == .partial) stats.partial_results += 1 else stats.available_results += 1;
                 if (comptime runtime_perf_log.enabled) {
+                    stats.perf.solved_requests += 1;
+                    if (result == .partial) stats.perf.partial_results += 1 else stats.perf.available_results += 1;
                     if (solved.via_abstract) stats.perf.abstract_solves += 1;
                     if (solved.cross_level) stats.perf.cross_level_solves += 1;
                 }
             },
             // Answered without a search and never cached: dropped in
             // compactPendingAfterSolve.
-            .unavailable => stats.unavailable_results += 1,
-            .budget_exhausted => {
-                stats.budget_exhausted += 1;
+            .unavailable => if (comptime runtime_perf_log.enabled) {
+                stats.perf.unavailable_results += 1;
+            },
+            .budget_exhausted => if (comptime runtime_perf_log.enabled) {
+                stats.perf.budget_exhausted += 1;
             },
             // Start-side failure: dropped in compactPendingAfterSolve, never cached; the
             // next status query falls through to `.missing`.
@@ -402,6 +404,7 @@ const appendPathRequest = test_support.appendPathRequest;
 const baselineCapacity = test_support.baselineCapacity;
 const cachedPathCells = test_support.cachedPathCells;
 const cellWorld = test_support.cellWorld;
+const expectGoalsSolved = test_support.expectGoalsSolved;
 const expectRegistryMatchesCache = test_support.expectRegistryMatchesCache;
 const expectSameCache = test_support.expectSameCache;
 const expectSameRegistry = test_support.expectSameRegistry;
@@ -419,6 +422,15 @@ const setSystemAllocators = test_support.setSystemAllocators;
 const shrinkFixture = test_support.shrinkFixture;
 const solveIndividualGoals = test_support.solveIndividualGoals;
 const solveRegistryRoutes = test_support.solveRegistryRoutes;
+const cachedStep = test_support.cachedStep;
+
+// The last update published routes `[first, first + count)` of a registry world `side` tiles
+// a side.
+fn expectRoutesSolved(system: *const PathfindingSystem, side: u16, first: usize, count: usize) !void {
+    for (first..first + count) |index| {
+        try std.testing.expectEqual(@as(?u32, system.step_counter), cachedStep(system, registryRouteKey(system, index, side)));
+    }
+}
 
 test "solve results land at their solve ordinal and publish in pending order" {
     var data = DataSystem.init(std.testing.allocator);
@@ -478,7 +490,8 @@ test "pathfinding result publish after its reserve allocates nothing (FailingAll
     const goals = [_]math.Vec2{ cellWorld(6, 1), cellWorld(6, 9), cellWorld(12, 4), cellWorld(3, 13) };
 
     // Warm: the first publish grows the long pool at its reserve.
-    try std.testing.expectEqual(goals.len, (try solveIndividualGoals(&system, requester, &goals, 8)).available_results);
+    _ = try solveIndividualGoals(&system, requester, &goals, 8);
+    try expectGoalsSolved(&system, &goals);
     try std.testing.expect(system.completed.long_block_count >= goals.len);
     try std.testing.expect(system.long_block_growth.logged);
     const long_blocks = system.completed.long_block_count;
@@ -492,8 +505,8 @@ test "pathfinding result publish after its reserve allocates nothing (FailingAll
         system.allocator = original;
         system.graph.allocator = original;
     }
-    const stats = try solveIndividualGoals(&system, requester, &goals, 8);
-    try std.testing.expectEqual(goals.len, stats.available_results);
+    _ = try solveIndividualGoals(&system, requester, &goals, 8);
+    try expectGoalsSolved(&system, &goals);
     try std.testing.expectEqual(long_blocks, system.completed.long_block_count);
     for (goals) |goal| {
         var cells = try cachedPathCells(&system, goal);
@@ -522,10 +535,12 @@ test "pathfinding a publish reserve out of memory claims nothing, leaves pending
     // The result is published again and aged past the TTL, so the failing step's intake
     // removes it and logs its retire.
     const aged_goal = cellWorld(1, 2);
-    try std.testing.expectEqual(@as(usize, 1), (try solveIndividualGoals(&system, requester, &.{aged_goal}, 8)).available_results);
+    _ = try solveIndividualGoals(&system, requester, &.{aged_goal}, 8);
+    try expectGoalsSolved(&system, &.{aged_goal});
     clearCompleted(&system);
     try std.testing.expectEqual(@as(usize, 0), system.completed.long_block_count);
-    try std.testing.expectEqual(@as(usize, 1), (try solveIndividualGoals(&system, requester, &.{aged_goal}, 8)).available_results);
+    _ = try solveIndividualGoals(&system, requester, &.{aged_goal}, 8);
+    try expectGoalsSolved(&system, &.{aged_goal});
     const aged_owner = test_support.cacheOwnerOf(system.completed.core, system.graph.keyForWorld(0, aged_goal, .default).?).?;
     system.completed.core.records.items[aged_owner].stamp -%= types.default_cache_ttl_steps + 1;
     var aged_registrations: usize = 0;
@@ -558,7 +573,7 @@ test "pathfinding a publish reserve out of memory claims nothing, leaves pending
     defer empty.deinit();
     const retry = try updatePathfindingInline(&system, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), retry.accepted_requests);
-    try std.testing.expectEqual(goals.len + 1, retry.available_results);
+    try expectGoalsSolved(&system, &(goals ++ [_]math.Vec2{aged_goal}));
     try std.testing.expectEqual(@as(usize, 0), system.pending.len);
     try std.testing.expect(system.completed.long_block_count >= goals.len);
     for (goals) |goal| {
@@ -657,7 +672,7 @@ test "threaded publish equals serial across range sizes and worker counts (cache
         try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
     }
     const serial_stats = try updatePathfindingInline(&serial, &stream, 64, .{});
-    try std.testing.expectEqual(@as(usize, 48), serial_stats.available_results);
+    try expectRoutesSolved(&serial, 24, 0, 48);
     try std.testing.expect(serial.completed.long_block_count != 0);
     try expectRegistryMatchesCache(&serial);
     for ([_]usize{ 1, 3 }) |workers| {
@@ -670,7 +685,6 @@ test "threaded publish equals serial across range sizes and worker counts (cache
             const stats = try threaded.update(&stream, 64, &threads, .{ .adaptive = false, .items_per_range = items_per_range });
             try expectSameCache(&serial, &threaded);
             try expectSameRegistry(&serial, &threaded);
-            try std.testing.expectEqual(serial_stats.available_results, stats.available_results);
             try std.testing.expectEqual(serial_stats.cache_evictions, stats.cache_evictions);
             if (items_per_range == 1) {
                 try std.testing.expect(!stats.registry_flush_batch.ran_inline and stats.registry_flush_batch.range_count > 1);
@@ -709,7 +723,7 @@ test "publish after its reserve allocates nothing on a multi-worker ThreadSystem
     setSystemAllocators(&system, std.testing.allocator);
     const published = try stats;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(usize, 48), published.available_results);
+    try expectRoutesSolved(&system, 24, 0, 48);
     // One unit per shard and per registration added: each published path adds at least one.
     const units = published.registry_flush_batch.item_count;
     try std.testing.expect(units >= flushUnits(0, 48));

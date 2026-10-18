@@ -1682,8 +1682,9 @@ test "a demo ramp dig is routable from both levels the next step" {
     }.of;
     try appendPathRequest(&stream, .{ .entity = demo.player.entity, .start_level = 1, .goal_level = 0, .start = center(4, 2), .goal = center(0, 4) });
     try appendPathRequest(&stream, .{ .entity = demo.player.entity, .start_level = 0, .goal_level = 1, .start = center(0, 4), .goal = center(4, 2) });
-    const stats = try @import("systems/pathfinding/test_support.zig").updatePathfindingInline(&demo.pipeline.pathfinding, &stream, 8, .{});
-    try std.testing.expectEqual(@as(usize, 2), stats.available_results);
+    _ = try @import("systems/pathfinding/test_support.zig").updatePathfindingInline(&demo.pipeline.pathfinding, &stream, 8, .{});
+    try std.testing.expect(demo.pipeline.pathfinding.statusForWorld(1, center(4, 2), 0, center(0, 4), .default, null).status == .available);
+    try std.testing.expect(demo.pipeline.pathfinding.statusForWorld(0, center(0, 4), 1, center(4, 2), .default, null).status == .available);
 
     // The link still climbs planes via the world tier.
     placePlayerInCell(&demo, 5, 2);

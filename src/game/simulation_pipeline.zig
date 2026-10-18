@@ -625,25 +625,27 @@ pub const SimulationPipelineStats = struct {
         perf.recordTiming(.steering_grid, steering_stats.grid_ns);
 
         perf.recordMetric(.path_accepted_requests, metric(pathfinding_stats.accepted_requests));
-        perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.duplicate_requests));
         perf.recordMetric(.path_pending_requests, metric(pathfinding_stats.pending_requests));
-        perf.recordMetric(.path_solved_requests, metric(pathfinding_stats.solved_requests));
         perf.recordMetric(.path_solve_admissions, metric(pathfinding_stats.solve_admissions));
-        perf.recordMetric(.path_available_results, metric(pathfinding_stats.available_results));
-        perf.recordMetric(.path_partial_results, metric(pathfinding_stats.partial_results));
-        perf.recordMetric(.path_unavailable_results, metric(pathfinding_stats.unavailable_results));
-        perf.recordMetric(.path_dropped_requests, metric(pathfinding_stats.dropped_requests));
         perf.recordMetric(.path_admission_deferred_requests, metric(pathfinding_stats.admission_deferred_requests));
-        perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.cache_hits));
         perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.cache_evictions));
-        perf.recordMetric(.path_budget_exhausted, metric(pathfinding_stats.budget_exhausted));
         perf.recordMetric(.path_escalated_solves, metric(pathfinding_stats.escalated_solves));
         perf.recordMetric(.path_escalated_deferred, metric(pathfinding_stats.escalated_deferred));
         perf.recordMetric(.path_goal_projected, metric(pathfinding_stats.goal_projected));
         perf.recordMetric(.path_group_fields_built, metric(pathfinding_stats.group_fields_built));
         perf.recordMetric(.path_group_field_reuses, metric(pathfinding_stats.group_field_reuses));
         perf.recordMetric(.path_group_field_rebuild_throttled, metric(pathfinding_stats.group_field_rebuild_throttled));
-        perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.group_field_samples));
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.perf.duplicate_requests));
+            perf.recordMetric(.path_solved_requests, metric(pathfinding_stats.perf.solved_requests));
+            perf.recordMetric(.path_available_results, metric(pathfinding_stats.perf.available_results));
+            perf.recordMetric(.path_partial_results, metric(pathfinding_stats.perf.partial_results));
+            perf.recordMetric(.path_unavailable_results, metric(pathfinding_stats.perf.unavailable_results));
+            perf.recordMetric(.path_dropped_requests, metric(pathfinding_stats.perf.dropped_requests));
+            perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.perf.cache_hits));
+            perf.recordMetric(.path_budget_exhausted, metric(pathfinding_stats.perf.budget_exhausted));
+            perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.perf.group_field_samples));
+        }
         perf.recordMetricMax(.path_max_stitch_segments, metric(pathfinding_stats.max_stitch_segments_observed));
         perf.recordMetricMax(.path_max_distinct_group_keys, metric(pathfinding_stats.distinct_group_keys));
         perf.recordMetric(.path_group_field_evictions, metric(pathfinding_stats.group_field_evictions));
@@ -5683,15 +5685,18 @@ test "a pipeline built over steering agents sizes pathfinding for them, so its f
     try std.testing.expect(intake_stats.intake_batch.range_count > 1);
     try std.testing.expectEqual(@as(usize, agent_count), intake_stats.accepted_requests);
     try std.testing.expectEqual(@as(usize, agent_count), intake_stats.pending_requests);
-    try std.testing.expectEqual(@as(usize, 0), intake_stats.dropped_requests);
+    // Every request's distinct goal is pending: none dropped.
+    try std.testing.expectEqual(@as(usize, agent_count), system.pending.len);
     try std.testing.expectEqual(@as(u64, 0), intake_stats.resize_ns);
     try std.testing.expectEqual(capacity_at_init, system.effective_agent_capacity);
 
     // The first solving update: only path content grows (registry runs and long blocks);
     // every elastic pool keeps its init size.
     stream.clearRetainingCapacity();
-    const solve_stats = try system.update(&stream, agent_count, &threads, .{ .adaptive = false, .items_per_range = 8 });
-    try std.testing.expectEqual(@as(usize, agent_count), solve_stats.available_results);
+    _ = try system.update(&stream, agent_count, &threads, .{ .adaptive = false, .items_per_range = 8 });
+    // Every pending request solved and cached.
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+    try std.testing.expectEqual(@as(usize, agent_count), system.completed.count());
     try std.testing.expectEqual(capacity_at_init, system.effective_agent_capacity);
     const bytes_after = pathfinding_test_support.requestResidentBytes(system);
     try std.testing.expectEqual(bytes_at_init.queues, bytes_after.queues);
@@ -6446,5 +6451,5 @@ test "a crowd pursuing a blocked goal whose projection is sealed reads it unavai
         try std.testing.expectEqual(@as(u16, 12), backoff);
         try std.testing.expectEqual(@as(u16, 0), cooldown);
     }
-    try std.testing.expectEqual(@as(usize, 0), stats.pathfinding.goal_fallbacks + stats.pathfinding.accepted_requests);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.pathfinding.pending.len);
 }

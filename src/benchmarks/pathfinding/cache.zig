@@ -400,10 +400,10 @@ fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSys
         const step_stats = try runColdOnce(system, stream, thread_system, case, live, live, live);
         ramp.elapsed_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
         // Every goal is reachable, so each solve caches one result.
-        if (step_stats.unavailable_results != 0) return error.ElasticRampUnreachableGoal;
-        ramp.solves += step_stats.solved_requests;
+        if (step_stats.perf.unavailable_results != 0) return error.ElasticRampUnreachableGoal;
+        ramp.solves += step_stats.perf.solved_requests;
         if (step_stats.solve_batch.item_count > ramp.busiest_solve_batch.item_count) ramp.busiest_solve_batch = step_stats.solve_batch;
-        if (live == agent_total and step_stats.cache_hits == agent_total) return ramp;
+        if (live == agent_total and step_stats.perf.cache_hits == agent_total) return ramp;
     }
     return error.ElasticRampStalled;
 }
@@ -602,6 +602,6 @@ fn runElasticShrink(
 // One step of the held agents, which must be served by cache hits alone.
 fn runHeldStep(system: *PathfindingSystem, stream: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !PathfindingStats {
     const stats = try runColdOnce(system, stream, thread_system, case, agent_count, agent_count, agent_count);
-    if (stats.cache_hits != agent_count or stats.solved_requests != 0) return error.ElasticShrinkHeldResultLost;
+    if (stats.perf.cache_hits != agent_count or stats.perf.solved_requests != 0) return error.ElasticShrinkHeldResultLost;
     return stats;
 }

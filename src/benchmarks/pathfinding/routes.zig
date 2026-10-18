@@ -1020,7 +1020,7 @@ fn runLongPathAttempt(io: std.Io, threads: *ThreadSystem, system: *PathfindingSy
         .max_solve_admissions_per_step = agent_count,
     });
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-    if (stats.unavailable_results != 0) return error.RouteUnavailable;
+    if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
     if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
     if (stats.solve_admissions != 1 or stats.escalated_solves != @intFromBool(tier != 0)) return error.LongPathNotOneSolve;
     const corridor = if (tier == 0) &system.scratch_slots.items[0].corridor else &system.tier1_scratch.items[0].corridor;
@@ -1030,12 +1030,12 @@ fn runLongPathAttempt(io: std.Io, threads: *ThreadSystem, system: *PathfindingSy
     const found = abstract.corridor.items.len != 0 and abstract.corridor.items.len < abstract.corridor_limit;
     const cells = if (found) corridor.stitched.items.len else 0;
     const segments = stats.max_stitch_segments_observed;
-    const outcome: LongPathOutcome = if (stats.available_results == 1 or stats.partial_results == 1) published: {
+    const outcome: LongPathOutcome = if (stats.perf.available_results == 1 or stats.perf.partial_results == 1) published: {
         // Every layout's route leaves its start's chunk, so the solve ran the abstract search.
         if (!found or stats.perf.abstract_solves != 1) return error.LongPathSolvedOffCorridor;
-        if (stats.partial_results == 0) break :published .available;
+        if (stats.perf.partial_results == 0) break :published .available;
         break :published if (corridorEndsAtGoal(system, abstract.corridor.items, request)) .partial else .abstract_partial;
-    } else if (stats.budget_exhausted != 1)
+    } else if (stats.perf.budget_exhausted != 1)
         return error.LongPathUnexpectedOutcome
     else if (!found)
         .abstract_saturated
@@ -1160,11 +1160,11 @@ fn runLongPathWalk(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, s
         const stats = try system.update(stream, 1, threads, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
         walk.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
         walk.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
-        if (stats.unavailable_results != 0) return error.RouteUnavailable;
+        if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
         if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
         walk.solves += stats.solve_admissions;
-        walk.partial_results += stats.partial_results;
-        walk.full_results += stats.available_results - stats.cache_hits;
+        walk.partial_results += stats.perf.partial_results;
+        walk.full_results += stats.perf.available_results - stats.perf.cache_hits;
         walk.escalations += stats.escalated_solves;
     }
     if (!std.meta.eql(grid.worldToCellClamped(position), goal_cell)) return error.LongPathWalkStalled;
@@ -1258,13 +1258,13 @@ fn runLongPathHops(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, s
             chain.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
             try fixtures.writeRequests(stream, &.{});
             chain.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
-            if (stats.unavailable_results != 0) return error.RouteUnavailable;
+            if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
             if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
-            if (stats.solve_admissions != 1 or stats.cache_hits != 0) return error.LongPathNotOneSolve;
+            if (stats.solve_admissions != 1 or stats.perf.cache_hits != 0) return error.LongPathNotOneSolve;
             chain.solves += 1;
             chain.escalations += stats.escalated_solves;
-            if (stats.available_results == 1) break .arrived;
-            if (stats.partial_results == 1) {
+            if (stats.perf.available_results == 1) break .arrived;
+            if (stats.perf.partial_results == 1) {
                 if (attempt == 1 and !corridorEndsAtGoal(system, tier1_abstract.corridor.items, hop)) chain.least_hops += 1;
                 break .partial;
             }
@@ -1564,10 +1564,10 @@ const UnsolvedRoutes = enum {
 fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase, unsolved_routes: UnsolvedRoutes) !PathfindingStats {
     const count = route_request_count;
     const stats = try runColdOnce(system, &fixture.requests, thread_system, case, count, count, count);
-    if (stats.unavailable_results != 0) return error.RouteUnavailable;
+    if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
     if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
-    std.debug.assert(stats.available_results <= count);
-    if (unsolved_routes == .fail and (stats.available_results != count or stats.pending_requests != 0)) return error.RouteUnsolved;
+    std.debug.assert(stats.perf.available_results <= count);
+    if (unsolved_routes == .fail and (stats.perf.available_results != count or stats.pending_requests != 0)) return error.RouteUnsolved;
     return stats;
 }
 
@@ -1596,10 +1596,10 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
         stage_report.add(elapsed_ns, last_stats);
         abstract_nodes = lastAbstractNodesUsed(system);
     }
-    if (unsolved_routes == .count) stage_report.routes = .{ .solved = last_stats.available_results, .unsolved = route_request_count - last_stats.available_results };
+    if (unsolved_routes == .count) stage_report.routes = .{ .solved = last_stats.perf.available_results, .unsolved = route_request_count - last_stats.perf.available_results };
     var stats = accumulator.finish();
     stage_report.write(&stats.details);
-    stats.output_count = last_stats.available_results;
+    stats.output_count = last_stats.perf.available_results;
     stats.candidate_pairs = abstract_nodes;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), settled);

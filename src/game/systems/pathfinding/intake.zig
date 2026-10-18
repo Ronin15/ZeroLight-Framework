@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const simd = @import("../../../core/simd.zig");
+const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
@@ -63,7 +64,7 @@ pub fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest, g
     // a release-build memory guard only: once the pools cover the gates it never drops.
     std.debug.assert(requests.len <= gates.frame_requests);
     const item_count = @min(requests.len, self.limits.frame_requests);
-    stats.dropped_requests += requests.len - item_count;
+    if (comptime runtime_perf_log.enabled) stats.perf.dropped_requests += requests.len - item_count;
     if (item_count == 0) return stats;
     const dispatch = threads.stage(&self.tuners.intake);
     const shape = stageShape(dispatch, item_count, intake_range_alignment_items);
@@ -160,7 +161,7 @@ fn classifyIntakeRange(self: *const PathfindingSystem, requests: []const PathReq
             // rejects the same condition as unavailable, so a clamped solve could
             // never be read back by its requester.
             if (request.goal_level >= level_count or request.start_level >= level_count) {
-                tally.dropped_requests += 1;
+                if (comptime runtime_perf_log.enabled) tally.perf.dropped_requests += 1;
                 continue;
             }
             const key = PathQueryKey{
@@ -179,14 +180,18 @@ fn classifyIntakeRange(self: *const PathfindingSystem, requests: []const PathReq
                     tally.group_key_count += 1;
                 }
                 if (request.start_level == request.goal_level and groupFieldServes(self, key, goal_grid, start_cell)) {
-                    tally.group_field_samples += 1;
-                    tally.duplicate_requests += 1;
+                    if (comptime runtime_perf_log.enabled) {
+                        tally.perf.group_field_samples += 1;
+                        tally.perf.duplicate_requests += 1;
+                    }
                     continue;
                 }
             }
             const cached = self.completed.lookup(key, self.step_counter, types.default_cache_ttl_steps);
             const answer = intakeAnswer(self, key, request.start_level, start_cell, goal_grid, cached);
-            if (answer.fallback) tally.goal_fallbacks += 1;
+            if (comptime runtime_perf_log.enabled) {
+                if (answer.fallback) tally.perf.goal_fallbacks += 1;
+            }
             var record = IntakeRecord{
                 .entity = request.entity,
                 .key = key,
@@ -197,18 +202,21 @@ fn classifyIntakeRange(self: *const PathfindingSystem, requests: []const PathReq
                 .expired = cached != null and !cached.?.fresh,
                 .candidate = false,
                 .projected = answer.projected,
-                .repeats = 0,
             };
             switch (answer.kind) {
-                .unavailable => tally.unavailable_results += 1,
+                .unavailable => if (comptime runtime_perf_log.enabled) {
+                    tally.perf.unavailable_results += 1;
+                },
                 .hit => {
-                    tally.duplicate_requests += 1;
-                    tally.cache_hits += 1;
-                    tally.available_results += 1;
+                    if (comptime runtime_perf_log.enabled) {
+                        tally.perf.duplicate_requests += 1;
+                        tally.perf.cache_hits += 1;
+                        tally.perf.available_results += 1;
+                    }
                     continue;
                 },
                 .candidate => if (self.pending_keys.contains(key)) {
-                    tally.duplicate_requests += 1;
+                    if (comptime runtime_perf_log.enabled) tally.perf.duplicate_requests += 1;
                 } else {
                     record.candidate = true;
                 },
@@ -220,7 +228,9 @@ fn classifyIntakeRange(self: *const PathfindingSystem, requests: []const PathReq
             // could not), which takes a record of its own.
             if (recent_records.find(key)) |entry| {
                 if (record_window[entry].candidate) {
-                    if (record.candidate) record_window[entry].repeats += 1;
+                    if (comptime runtime_perf_log.enabled) {
+                        if (record.candidate) record_window[entry].perf.repeats += 1;
+                    }
                     continue;
                 }
                 if (!record.candidate) continue;
@@ -243,13 +253,15 @@ fn mergeIntake(self: *PathfindingSystem, items_per_range: usize, gates: StepGate
         for (self.intake_records.items[window_start..][0..tally.record_count]) |record| {
             mergeIntakeRecord(self, record, gates.pending_requests, stats);
         }
-        stats.dropped_requests += tally.dropped_requests;
-        stats.duplicate_requests += tally.duplicate_requests;
-        stats.cache_hits += tally.cache_hits;
-        stats.available_results += tally.available_results;
-        stats.unavailable_results += tally.unavailable_results;
-        stats.group_field_samples += tally.group_field_samples;
-        stats.goal_fallbacks += tally.goal_fallbacks;
+        if (comptime runtime_perf_log.enabled) {
+            stats.perf.dropped_requests += tally.perf.dropped_requests;
+            stats.perf.duplicate_requests += tally.perf.duplicate_requests;
+            stats.perf.cache_hits += tally.perf.cache_hits;
+            stats.perf.available_results += tally.perf.available_results;
+            stats.perf.unavailable_results += tally.perf.unavailable_results;
+            stats.perf.group_field_samples += tally.perf.group_field_samples;
+            stats.perf.goal_fallbacks += tally.perf.goal_fallbacks;
+        }
     }
 }
 
@@ -265,16 +277,16 @@ fn mergeIntakeRecord(self: *PathfindingSystem, record: IntakeRecord, pending_gat
     // Repeats follow their first occurrence: pending cannot shrink during intake, so a
     // repeat after an accept or a duplicate is a duplicate and after a drop is a drop.
     if (self.pending_keys.contains(record.key)) {
-        stats.duplicate_requests += 1 + record.repeats;
+        if (comptime runtime_perf_log.enabled) stats.perf.duplicate_requests += 1 + record.perf.repeats;
         return;
     }
     if (self.pending.len >= pending_gate) {
-        stats.dropped_requests += 1 + record.repeats;
+        if (comptime runtime_perf_log.enabled) stats.perf.dropped_requests += 1 + record.perf.repeats;
         return;
     }
     // The pool and the key set hold the gate (asserted in `beginUpdate`).
     std.debug.assert(self.pending.len < self.limits.pending_requests);
-    stats.duplicate_requests += record.repeats;
+    if (comptime runtime_perf_log.enabled) stats.perf.duplicate_requests += record.perf.repeats;
     self.pending.pushBackAssumeCapacity(.{
         .entity = record.entity,
         .key = record.key,
@@ -353,6 +365,8 @@ const expectRequestStateEqual = test_support.expectRequestStateEqual;
 const expectRequestStatsEqual = test_support.expectRequestStatsEqual;
 const intake_test_agents = test_support.intake_test_agents;
 const publishTestPath = test_support.publishTestPath;
+const statusOf = test_support.statusOf;
+const PathStatus = @import("types.zig").PathStatus;
 
 test "pathfinding group tally refuses over-cap distinct keys without desyncing the map" {
     var system = PathfindingSystem.init(std.testing.allocator);
@@ -536,25 +550,42 @@ test "threaded request intake equals serial intake across range sizes and worker
     defer serial.deinit();
     _ = try serial.resolveGoals(PathRequest, table_requests, &serial_threads, .{});
     const serial_stats = try updatePathfindingInline(&serial, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
-    // The scenario reaches every class: two sealed requests, the expired sealed one, and two
-    // sealed blocked ones read unavailable from reach, never pending.
-    try std.testing.expectEqual(@as(usize, 2), serial_stats.group_field_samples);
-    try std.testing.expectEqual(@as(usize, 2), serial_stats.available_results);
-    try std.testing.expectEqual(@as(usize, 5), serial_stats.unavailable_results);
-    try std.testing.expectEqual(@as(usize, 2), serial_stats.goal_fallbacks);
     try std.testing.expectEqual(@as(usize, 1), serial_stats.goal_projected);
-    try std.testing.expect(serial_stats.dropped_requests > 1);
     try std.testing.expectEqual(intake_test_agents, serial.pending.len);
     const key = struct {
         fn of(s: *const PathfindingSystem, goal: math.Vec2) PathQueryKey {
             return s.graph.keyForWorld(0, goal, .default).?;
         }
     }.of;
+    // The scenario reaches every class. The two field requests (from cells (3, 2) and
+    // (0, 2)) read the ready field, and the two hits their fresh path without queuing.
+    for ([_]math.Vec2{ cellWorld(3, 2), cellWorld(0, 2) }) |start| {
+        const view = serial.statusForWorld(0, start, 0, IntakeGoals.field, .default, null);
+        try std.testing.expectEqual(PathStatus.available, view.status);
+        try std.testing.expectEqual(@as(usize, 2), view.path_len);
+    }
+    try std.testing.expectEqual(PathStatus.available, statusOf(&serial, cellWorld(0, 2), IntakeGoals.hit));
+    try std.testing.expect(!serial.pending_keys.contains(key(&serial, IntakeGoals.hit)));
+    // Two sealed requests, the expired sealed one, and two sealed blocked ones read
+    // unavailable from reach, never pending.
+    for ([_]math.Vec2{ IntakeGoals.sealed, IntakeGoals.expired_sealed, IntakeGoals.sealed_blocked }) |goal| {
+        try std.testing.expectEqual(PathStatus.unavailable, statusOf(&serial, cellWorld(0, 2), goal));
+        try std.testing.expect(!serial.pending_keys.contains(key(&serial, goal)));
+    }
+    // The table holds the blocked goal; the sealed blocked one's projection is computed.
+    const goal_grid = serial.graph.grid(0).?;
+    try std.testing.expect(!serial.liveGoal(key(&serial, IntakeGoals.blocked), goal_grid).fallback);
+    try std.testing.expect(serial.liveGoal(key(&serial, IntakeGoals.sealed_blocked), goal_grid).fallback);
+    // Pending filled to its gate: distinct goals past it were dropped, not queued.
+    var dropped_goals: usize = 0;
+    for (0..20) |index| {
+        if (index == 4 or index == 18) continue;
+        if (!serial.pending_keys.contains(key(&serial, IntakeGoals.distinct(index)))) dropped_goals += 1;
+    }
+    try std.testing.expect(dropped_goals > 1);
     try std.testing.expect(serial.completed.slotIndex(key(&serial, IntakeGoals.expired)) == null);
     try std.testing.expect(serial.completed.slotIndex(key(&serial, IntakeGoals.expired_sealed)) == null);
     try std.testing.expect(serial.completed.slotIndex(key(&serial, IntakeGoals.prefilled(0))) == null);
-    try std.testing.expect(!serial.pending_keys.contains(key(&serial, IntakeGoals.sealed)));
-    try std.testing.expect(!serial.pending_keys.contains(key(&serial, IntakeGoals.sealed_blocked)));
     // The blocked goal's fresh path ends off its projection: kept, not served, and the key
     // went pending for the solve whose publish replaces it.
     try std.testing.expect(serial.completed.slotIndex(key(&serial, IntakeGoals.blocked)) != null);
@@ -620,12 +651,17 @@ test "threaded intake folds a new goal's repeats per range and equals serial whe
         var serial = try repeatsTestSystem(&data, 1, prefill);
         defer serial.deinit();
         const serial_stats = try updatePathfindingInline(&serial, &repeated, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
+        // Every repeat folds into the goal's one candidate: queued once, or dropped whole
+        // when pending is full.
+        const repeated_key = serial.graph.keyForWorld(0, cellWorld(9, 9), .default).?;
         if (pending_full) {
-            try std.testing.expectEqual(intake_test_agents, serial_stats.dropped_requests);
             try std.testing.expectEqual(@as(usize, 0), serial_stats.accepted_requests);
+            try std.testing.expectEqual(intake_test_agents, serial.pending.len);
+            try std.testing.expect(!serial.pending_keys.contains(repeated_key));
         } else {
             try std.testing.expectEqual(@as(usize, 1), serial_stats.accepted_requests);
-            try std.testing.expectEqual(intake_test_agents - 1, serial_stats.duplicate_requests);
+            try std.testing.expectEqual(@as(usize, 1), serial.pending.len);
+            try std.testing.expectEqualDeep(repeated_key, serial.pending.at(0).key);
         }
 
         var threaded = try repeatsTestSystem(&data, threads.participantSlotCount(), prefill);

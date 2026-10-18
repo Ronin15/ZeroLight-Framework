@@ -122,6 +122,7 @@ const publish = @import("publish.zig");
 const solve = @import("solve.zig");
 const PathQueryKey = @import("types.zig").PathQueryKey;
 const PathfindingStats = @import("types.zig").PathfindingStats;
+const PathStatus = @import("types.zig").PathStatus;
 const PathfindingConfig = @import("types.zig").PathfindingConfig;
 const registryShard = @import("types.zig").registryShard;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
@@ -1184,6 +1185,15 @@ pub fn solveIndividualGoals(system: *PathfindingSystem, requester: EntityId, goa
     return updatePathfindingInline(system, &stream, agent_count, .{});
 }
 
+/// The last update published every goal's level-0 result, and each reads available from
+/// cellWorld(1, 2), the start `solveIndividualGoals` requests from.
+pub fn expectGoalsSolved(system: *const PathfindingSystem, goals: []const math.Vec2) !void {
+    for (goals) |goal| {
+        try std.testing.expect(solvedLastStep(system, goal));
+        try std.testing.expectEqual(PathStatus.available, statusOf(system, cellWorld(1, 2), goal));
+    }
+}
+
 /// The stored cells of `goal`'s cached plain path, copied out.
 pub fn cachedPathCells(system: *const PathfindingSystem, goal: math.Vec2) !std.ArrayList(u32) {
     const key = system.graph.keyForWorld(0, goal, .default).?;
@@ -1192,6 +1202,26 @@ pub fn cachedPathCells(system: *const PathfindingSystem, goal: math.Vec2) !std.A
     errdefer cells.deinit(std.testing.allocator);
     try cells.appendSlice(std.testing.allocator, system.completed.pathSlice(slot, system.completed.resultAt(slot).path_len));
     return cells;
+}
+
+/// Level-0 `start`'s path status toward level-0 `goal` for the default agent class.
+pub fn statusOf(system: *const PathfindingSystem, start: math.Vec2, goal: math.Vec2) PathStatus {
+    return system.statusForWorld(0, start, 0, goal, .default, null).status;
+}
+
+/// The step `key`'s cached result was stored at (its solve's publish); null when none is
+/// cached. A cache hit leaves it as it was.
+pub fn cachedStep(system: *const PathfindingSystem, key: PathQueryKey) ?u32 {
+    const slot = system.completed.slotIndex(key) orelse return null;
+    return system.completed.core.records.items[system.completed.core.slots.items[slot].payload_index].stamp;
+}
+
+/// Whether the last update's publish stored the result for `goal`'s level-0 default-class
+/// key: a solve, never a cache hit.
+pub fn solvedLastStep(system: *const PathfindingSystem, goal: math.Vec2) bool {
+    const key = system.graph.keyForWorld(0, goal, .default) orelse return false;
+    const stored_step = cachedStep(system, key) orelse return false;
+    return stored_step == system.step_counter;
 }
 
 /// A world `side` tiles a side in 4-tile chunks, open grass, with an obstacle layer to flip.
@@ -1440,10 +1470,9 @@ pub const intake_test_agents: usize = 40;
 /// Two updates' request-side stats match, field by field.
 pub fn expectRequestStatsEqual(expected: PathfindingStats, actual: PathfindingStats) !void {
     inline for (.{
-        "accepted_requests", "duplicate_requests",  "pending_requests",    "dropped_requests",
-        "cache_hits",        "available_results",   "unavailable_results", "group_field_samples",
-        "goal_projected",    "group_fields_built",  "group_field_reuses",  "group_field_rebuild_throttled",
-        "cache_evictions",   "distinct_group_keys", "goal_fallbacks",      "group_field_evictions",
+        "accepted_requests",     "pending_requests",              "goal_projected",  "group_fields_built",
+        "group_field_reuses",    "group_field_rebuild_throttled", "cache_evictions", "distinct_group_keys",
+        "group_field_evictions",
     }) |name| {
         try std.testing.expectEqual(@field(expected, name), @field(actual, name));
     }

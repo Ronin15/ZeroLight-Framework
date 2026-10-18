@@ -544,6 +544,9 @@ const requireTestTile = @import("test_support.zig").requireTestTile;
 const tileCenter = @import("test_support.zig").tileCenter;
 const buildCorridorWorld = @import("test_support.zig").buildCorridorWorld;
 const solveStep = @import("test_support.zig").solveStep;
+const statusOf = test_support.statusOf;
+const cachedStep = test_support.cachedStep;
+const solvedLastStep = test_support.solvedLastStep;
 const navMarkTestEvents = @import("test_support.zig").navMarkTestEvents;
 const no_colliders = &test_support.no_colliders;
 
@@ -568,8 +571,8 @@ test "pathfinding incremental update reroutes when a corridor gap is flipped to 
 
     const start = tileCenter(1, 5);
     const goal = tileCenter(9, 5);
-    const before = try solveStep(&system, requester, start, goal);
-    try std.testing.expectEqual(@as(usize, 1), before.available_results);
+    _ = try solveStep(&system, requester, start, goal);
+    try std.testing.expect(solvedLastStep(&system, goal));
     const view_before = system.statusForWorld(0, start, 0, goal, .default, null);
     try std.testing.expectEqual(PathStatus.available, view_before.status);
 
@@ -599,8 +602,8 @@ test "pathfinding incremental update reroutes when a corridor gap is flipped to 
 
     // Next solve produces a DIFFERENT path that avoids the now-blocked gap and routes
     // through the other one.
-    const after = try solveStep(&system, requester, start, goal);
-    try std.testing.expectEqual(@as(usize, 1), after.available_results);
+    _ = try solveStep(&system, requester, start, goal);
+    try std.testing.expect(solvedLastStep(&system, goal));
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default, null).status);
     try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, used_row));
     try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, other_row));
@@ -649,7 +652,8 @@ test "pathfinding incremental update disconnects a goal when the last gap is clo
 
     const start = tileCenter(1, 5);
     const goal = tileCenter(9, 5);
-    try std.testing.expectEqual(@as(usize, 1), (try solveStep(&system, requester, start, goal)).available_results);
+    _ = try solveStep(&system, requester, start, goal);
+    try std.testing.expectEqual(PathStatus.available, statusOf(&system, start, goal));
 
     const changed = (try world.setDenseTile(built.wall_layer, 5, 3, tree)) orelse return error.TestExpectedEqual;
     const nav_stats = try test_support.applyTileChange(&system, no_colliders, &world, changed);
@@ -658,9 +662,10 @@ test "pathfinding incremental update disconnects a goal when the last gap is clo
     // The cached path crossed the now-closed gap (5,3), so it was evicted, and reach answers
     // the re-request unavailable, not a stale cached available, with no solve.
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, start, 0, goal, .default, null).status);
-    const after = try solveStep(&system, requester, start, goal);
-    try std.testing.expectEqual(@as(usize, 1), after.unavailable_results);
-    try std.testing.expectEqual(@as(usize, 0), after.solved_requests);
+    _ = try solveStep(&system, requester, start, goal);
+    try std.testing.expectEqual(PathStatus.unavailable, statusOf(&system, start, goal));
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+    try std.testing.expect(system.completed.slotIndex(system.graph.keyForWorld(0, goal, .default).?) == null);
 }
 
 test "pathfinding incremental update retains a still-valid cached path when an off-path tile is unblocked" {
@@ -683,7 +688,8 @@ test "pathfinding incremental update retains a still-valid cached path when an o
 
     const start = tileCenter(1, 5);
     const goal = tileCenter(9, 5);
-    try std.testing.expectEqual(@as(usize, 1), (try solveStep(&system, requester, start, goal)).available_results);
+    _ = try solveStep(&system, requester, start, goal);
+    try std.testing.expectEqual(PathStatus.available, statusOf(&system, start, goal));
     // Path crosses only at row 9 (the near gap is closed).
     try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 9));
     try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, 3));
@@ -720,7 +726,8 @@ test "pathfinding incremental update blocking an off-path cell keeps the cached 
 
     const start = tileCenter(1, 5);
     const goal = tileCenter(9, 5);
-    try std.testing.expectEqual(@as(usize, 1), (try solveStep(&system, requester, start, goal)).available_results);
+    _ = try solveStep(&system, requester, start, goal);
+    try std.testing.expectEqual(PathStatus.available, statusOf(&system, start, goal));
     // The cached route crosses the row-3 gap and never visits the far corner (9,11).
     try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 3));
     try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 9, 11));
@@ -732,9 +739,12 @@ test "pathfinding incremental update blocking an off-path cell keeps the cached 
     try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
 
     // The same goal is served from the surviving cache (a hit): nothing re-solved.
+    const key = system.graph.keyForWorld(0, goal, .default).?;
+    const stored_step = cachedStep(&system, key).?;
     const after = try solveStep(&system, requester, start, goal);
     try std.testing.expectEqual(@as(usize, 0), after.accepted_requests);
-    try std.testing.expectEqual(@as(usize, 1), after.cache_hits);
+    try std.testing.expectEqual(stored_step, cachedStep(&system, key).?);
+    try std.testing.expectEqual(PathStatus.available, statusOf(&system, start, goal));
     try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 3));
 }
 
@@ -1417,7 +1427,9 @@ test "pathfinding incremental update flips cross-level link liveness when the en
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    try std.testing.expectEqual(@as(usize, 1), (try updatePathfindingInline(&system, &blocked_stream, 8, .{})).unavailable_results);
+    _ = try updatePathfindingInline(&system, &blocked_stream, 8, .{});
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null).status);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
 
     // Open the endpoint cell (2,2) on level 1 via the world tile API + incremental update:
     // the endpoint's record gains the link, so the same cross-level goal is now reachable.
@@ -1437,8 +1449,8 @@ test "pathfinding incremental update flips cross-level link liveness when the en
         .start = .{ .x = 16, .y = 16 },
         .goal = .{ .x = 304, .y = 304 },
     });
-    const open_stats = try updatePathfindingInline(&system, &open_stream, 8, .{});
-    try std.testing.expectEqual(@as(usize, 1), open_stats.available_results);
+    _ = try updatePathfindingInline(&system, &open_stream, 8, .{});
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null).status);
 }
 
 test "a static mark record after its reserve allocates nothing (FailingAllocator)" {

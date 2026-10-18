@@ -540,40 +540,26 @@ pub const PathfindingConfig = struct {
 
 pub const PathfindingStats = struct {
     accepted_requests: usize = 0,
-    duplicate_requests: usize = 0,
     pending_requests: usize = 0,
-    solved_requests: usize = 0,
     // Pending requests admitted to this step's solve batch.
     solve_admissions: usize = 0,
-    available_results: usize = 0,
-    unavailable_results: usize = 0,
-    // Published results that end short of their goal (`PathSolveResult.partial`).
-    partial_results: usize = 0,
-    dropped_requests: usize = 0,
     // Solve-window entries past the admission limit, left pending.
     admission_deferred_requests: usize = 0,
-    cache_hits: usize = 0,
     // Result-cache entries a full cache's claims evicted.
     cache_evictions: usize = 0,
     // Group fields a new goal took over from a goal no longer requested above the
     // threshold.
     group_field_evictions: usize = 0,
-    // Solver and flow-field counters.
-    budget_exhausted: usize = 0,
     // Tier-1 (escalated) solve attempts admitted into this step's solve batch, and
     // tier-1-ready requests that were NOT admitted because max_escalated_solves_per_step
     // was already reached this step (they simply wait for a later step).
     escalated_solves: usize = 0,
     escalated_deferred: usize = 0,
-    // Intake requests whose blocked goal the step's goal table did not hold, so intake
-    // projected it itself.
-    goal_fallbacks: usize = 0,
     // Accepted requests whose goal cell was blocked (their live goal is its projection).
     goal_projected: usize = 0,
     group_fields_built: usize = 0,
     group_field_reuses: usize = 0,
     group_field_rebuild_throttled: usize = 0,
-    group_field_samples: usize = 0,
     // Diagnostic only: the most per-segment local A* searches any single stitchCorridor
     // call needed this step, aggregated across workers in finishUpdate (see
     // SearchScratch.max_stitch_segments_used). Lets a live perf capture distinguish "the
@@ -600,9 +586,28 @@ pub const PathfindingStats = struct {
     resize_ns: u64 = 0,
     perf: Perf = .{},
 
-    /// The counters `SimulationPipelineStats.recordTo` does not read: kept only with
-    /// `runtime_perf_log.enabled`, zero-sized without it.
+    /// Diagnostic counts, kept only with `runtime_perf_log.enabled` and zero-sized without
+    /// it; `SimulationPipelineStats.recordTo` logs the request and result counts.
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        // Intake: requests answered without a new pending entry (a group field sample, a
+        // cache hit, or a key already pending), dropped (an out-of-range level, the pending
+        // cap, the release-build intake clamp, a resize), served from the cache, and served
+        // by a group field sample; requests whose blocked goal the step's goal table did not
+        // hold, so intake projected it itself.
+        duplicate_requests: usize = 0,
+        dropped_requests: usize = 0,
+        cache_hits: usize = 0,
+        group_field_samples: usize = 0,
+        goal_fallbacks: usize = 0,
+        // Results: this step's published solves (`solved_requests`), split into available
+        // (with intake's cache hits) and partial (ending short of the goal:
+        // `PathSolveResult.partial`); unavailable answers at intake and at solve; and solves
+        // that exhausted their budget.
+        solved_requests: usize = 0,
+        available_results: usize = 0,
+        partial_results: usize = 0,
+        unavailable_results: usize = 0,
+        budget_exhausted: usize = 0,
         // A tier-1 attempt that still exhausted its (fixed) budget: dropped from pending, so
         // the next query falls through to `.missing` (retryable later) rather than a false
         // `.unavailable`. See compactPendingAfterSolve.
@@ -667,8 +672,13 @@ pub const IntakeRecord = struct {
     candidate: bool,
     // The goal cell was blocked: its live goal is its projection.
     projected: bool,
-    // Later candidate requests for the same key in this range, folded into this record.
-    repeats: usize,
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: later candidate requests for the same key
+    /// in this range, folded into this record and counted by the merge.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        repeats: usize = 0,
+    } else struct {};
 };
 
 /// A group goal key and its request count within one intake range, in the range's
@@ -683,13 +693,19 @@ pub const GroupKeyCount = struct {
 pub const IntakeTally = struct {
     record_count: usize align(thread_shared_record_alignment) = 0,
     group_key_count: usize = 0,
-    dropped_requests: usize = 0,
-    duplicate_requests: usize = 0,
-    cache_hits: usize = 0,
-    available_results: usize = 0,
-    unavailable_results: usize = 0,
-    group_field_samples: usize = 0,
-    goal_fallbacks: usize = 0,
+    perf: Perf = .{},
+
+    /// The range's `PathfindingStats.Perf` intake counts, kept only with
+    /// `runtime_perf_log.enabled`.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        dropped_requests: usize = 0,
+        duplicate_requests: usize = 0,
+        cache_hits: usize = 0,
+        available_results: usize = 0,
+        unavailable_results: usize = 0,
+        group_field_samples: usize = 0,
+        goal_fallbacks: usize = 0,
+    } else struct {};
 };
 
 /// The last `slot_count` keys one range saw, each with the window entry it opened, so a

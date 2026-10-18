@@ -3161,8 +3161,8 @@ fn routes(system: *PathfindingSystem, data: *DataSystem, world: *const WorldSyst
         .start = center(start, tile),
         .goal = center(goal, tile),
     });
-    const stats = try updatePathfindingInline(system, &stream, 8, .{});
-    return stats.available_results == 1;
+    _ = try updatePathfindingInline(system, &stream, 8, .{});
+    return system.statusForWorld(start_level, center(start, tile), goal_level, center(goal, tile), .default, null).status == .available;
 }
 
 // A 12x12 world in 4-tile chunks over two open levels with an obstacle band each.

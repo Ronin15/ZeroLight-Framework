@@ -509,6 +509,7 @@ const WorldSystem = @import("../../world/system.zig").WorldSystem;
 const loadTestWorldMeta = @import("../pathfinding/test_support.zig").loadTestWorldMeta;
 const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
 const updatePathfindingInline = @import("../pathfinding/test_support.zig").updatePathfindingInline;
+const solvedLastStep = @import("../pathfinding/test_support.zig").solvedLastStep;
 const worldColliders = @import("../pathfinding/test_support.zig").worldColliders;
 const requireTestTile = @import("../pathfinding/test_support.zig").requireTestTile;
 const default_cache_ttl_steps = @import("../pathfinding/types.zig").default_cache_ttl_steps;
@@ -594,10 +595,12 @@ test "steering follows a partial path, requests the next hop inside its end wind
     try appendNavigationIntent(&frame, intent);
     try std.testing.expectEqual(@as(usize, 1), (try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders)).path_request_count);
     _ = try updatePathfindingInline(&pathfinding, &frame.path_requests, 1, .{});
-    try std.testing.expectEqual(@as(usize, 1), (try updatePathfindingInline(&pathfinding, &empty, 1, .{})).partial_results);
+    _ = try updatePathfindingInline(&pathfinding, &empty, 1, .{});
+    try std.testing.expect(solvedLastStep(&pathfinding, goal));
     const key = pathfinding.graph.keyForWorld(0, goal, .default).?;
     const slot = pathfinding.completed.freshSlotIndex(key, pathfinding.step_counter, default_cache_ttl_steps).?;
     const result = pathfinding.completed.resultAt(slot);
+    try std.testing.expect(result.isPartial());
     const prefix = pathfinding.completed.stitchedSlice(slot, result.stitched_len);
     const grid = pathfinding.graph.grid(0).?;
     const end = grid.cellCenter(result.end.cell);
@@ -662,7 +665,9 @@ test "steering follows a partial path, requests the next hop inside its end wind
     try std.testing.expectEqual(held_steps, last_request);
     try std.testing.expectEqual(@as(usize, 1), frame.path_requests.mergedItems().len);
     _ = try updatePathfindingInline(&pathfinding, &frame.path_requests, 1, .{});
-    try std.testing.expectEqual(@as(usize, 1), (try updatePathfindingInline(&pathfinding, &empty, 1, .{})).partial_results);
+    _ = try updatePathfindingInline(&pathfinding, &empty, 1, .{});
+    try std.testing.expect(solvedLastStep(&pathfinding, goal));
+    try std.testing.expect(pathfinding.completed.find(key).?.isPartial());
     frame.beginStep();
     try appendNavigationIntent(&frame, intent);
     const next_hop = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
@@ -901,8 +906,8 @@ test "steering reads a goal its start cannot reach unavailable from status every
         // Read unavailable every step: always in backoff, never in a request's cooldown.
         try std.testing.expect(steering.runtime_rows.items(.unavailable_backoff)[0] > 0);
         try std.testing.expectEqual(@as(u16, 0), steering.runtime_rows.items(.replan_cooldown)[0]);
-        const solve = try updatePathfindingInline(&pathfinding, &frame.path_requests, 1, .{});
-        try std.testing.expectEqual(@as(usize, 0), solve.solved_requests + solve.accepted_requests);
+        _ = try updatePathfindingInline(&pathfinding, &frame.path_requests, 1, .{});
+        try std.testing.expectEqual(@as(usize, 0), pathfinding.pending.len + pathfinding.completed.count());
     }
 }
 

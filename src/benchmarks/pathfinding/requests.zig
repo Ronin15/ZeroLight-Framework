@@ -414,8 +414,8 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     }
     if (last_stats.solve_admissions != 1) return error.SharedGoalNotOneSolve;
     var stats = accumulator.finish();
-    stats.output_count = last_stats.available_results + last_stats.unavailable_results + last_stats.duplicate_requests + last_stats.cache_hits;
-    stats.candidate_pairs = last_stats.duplicate_requests + last_stats.cache_hits;
+    stats.output_count = last_stats.perf.available_results + last_stats.perf.unavailable_results + last_stats.perf.duplicate_requests + last_stats.perf.cache_hits;
+    stats.candidate_pairs = last_stats.perf.duplicate_requests + last_stats.perf.cache_hits;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), settled);
     return stats;
@@ -478,11 +478,11 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
     }
     // Every route exists and starts open.
-    if (last_stats.unavailable_results != 0) return error.RouteUnavailable;
+    if (last_stats.perf.unavailable_results != 0) return error.RouteUnavailable;
 
     var stats = accumulator.finish();
     stage_report.write(&stats.details);
-    stats.output_count = last_stats.available_results;
+    stats.output_count = last_stats.perf.available_results;
     stats.deferred_count = last_stats.pending_requests;
     stats.fallback_deferred_count = last_stats.admission_deferred_requests;
     stats.cache_evictions = last_stats.cache_evictions;
@@ -490,9 +490,9 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // at the admission window, published results when cold; the per-step ceiling defers the
     // rest.
     const serviced: usize = switch (mode) {
-        .hot_cache => last_stats.cache_hits,
+        .hot_cache => last_stats.perf.cache_hits,
         .cold_fallback => last_stats.solve_admissions,
-        .cold_solve => last_stats.available_results,
+        .cold_solve => last_stats.perf.available_results,
     };
     stats.candidate_pairs = serviced;
     switch (mode) {
@@ -557,10 +557,10 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     var stats = accumulator.finish();
     stage_report.write(&stats.details);
-    stats.output_count = last_stats.available_results + last_stats.unavailable_results;
-    stats.candidate_pairs = last_stats.solved_requests;
+    stats.output_count = last_stats.perf.available_results + last_stats.perf.unavailable_results;
+    stats.candidate_pairs = last_stats.perf.solved_requests;
     stats.deferred_count = last_stats.pending_requests;
-    stats.items_per_second = suite.itemsPerSecond(last_stats.solved_requests, stats.mean_ns);
+    stats.items_per_second = suite.itemsPerSecond(last_stats.perf.solved_requests, stats.mean_ns);
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), false);
     return stats;
 }
@@ -581,7 +581,7 @@ fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathReq
     while (true) {
         const stats = try runColdOnce(system, requests, thread_system, case, item_count, item_count, item_count);
         steps += 1;
-        const all_hits = stats.cache_hits == item_count;
+        const all_hits = stats.perf.cache_hits == item_count;
         if (!all_hits and steps > fill_limit) return error.HotCacheNotWarm;
         const tuner_ready = !case.adaptive or (system.tuners.intake.phase == .settled) or steps >= settle_limit;
         if (all_hits and tuner_ready) return;
@@ -747,10 +747,10 @@ fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: sui
         accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solve_batch);
     }
     // The fixed tier-1 budget solves the detour; a second exhaustion would drop it.
-    if (last_stats.available_results != 1 or last_stats.escalated_solves != 1) return error.EscalatedDetourUnsolved;
+    if (last_stats.perf.available_results != 1 or last_stats.escalated_solves != 1) return error.EscalatedDetourUnsolved;
     var stats = accumulator.finish();
-    stats.output_count = last_stats.available_results;
-    stats.candidate_pairs = last_stats.solved_requests;
+    stats.output_count = last_stats.perf.available_results;
+    stats.candidate_pairs = last_stats.perf.solved_requests;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
     return stats;
 }
@@ -760,7 +760,7 @@ fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: sui
 fn promoteDetour(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase) !void {
     system.clearRuntimeState();
     const stats = try runColdOnce(system, requests, thread_system, case, 1, 1, 1);
-    if (stats.budget_exhausted != 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.EscalatedDetourNotPromoted;
+    if (stats.perf.budget_exhausted != 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.EscalatedDetourNotPromoted;
 }
 
 // The group-field detour level side: a whole-level field builds within the rebuild throttle
@@ -868,10 +868,10 @@ fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: su
 
     var last_stats = PathfindingStats{};
     var guard: usize = group_field_detour_setup_guard;
-    while (guard > 0 and last_stats.group_field_samples < item_count) : (guard -= 1) {
+    while (guard > 0 and last_stats.perf.group_field_samples < item_count) : (guard -= 1) {
         last_stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
     }
-    if (last_stats.group_field_samples != item_count) return error.GroupFieldNotReady;
+    if (last_stats.perf.group_field_samples != item_count) return error.GroupFieldNotReady;
     for (0..options.warmup_iterations) |_| _ = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -883,13 +883,13 @@ fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: su
         accumulator.record(elapsed_ns, last_stats.solve_batch);
         stage_report.add(elapsed_ns, last_stats);
         // A ready field answers every member: no build, no per-agent solve.
-        if (last_stats.group_fields_built != 0 or last_stats.group_field_samples != item_count) return error.GroupFieldNotSampled;
+        if (last_stats.group_fields_built != 0 or last_stats.perf.group_field_samples != item_count) return error.GroupFieldNotSampled;
     }
 
     var stats = accumulator.finish();
     stage_report.write(&stats.details);
-    stats.output_count = last_stats.duplicate_requests;
-    stats.candidate_pairs = last_stats.group_field_samples;
+    stats.output_count = last_stats.perf.duplicate_requests;
+    stats.candidate_pairs = last_stats.perf.group_field_samples;
     stats.items_per_second = suite.itemsPerSecond(item_count, stats.mean_ns);
     return stats;
 }
@@ -905,7 +905,7 @@ const MovingTotals = struct {
         self.escalated += stats.escalated_solves;
         self.throttled += stats.group_field_rebuild_throttled;
         self.built += stats.group_fields_built;
-        self.samples += stats.group_field_samples;
+        self.samples += stats.perf.group_field_samples;
     }
 
     fn into(self: MovingTotals, stats: *suite.RunStats) void {
@@ -1085,7 +1085,7 @@ fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Opt
             accumulator.record(elapsed_ns, stats.perf.group_field_batch);
             stage_report.add(elapsed_ns, stats);
             built_total += stats.group_fields_built;
-            samples_total += stats.group_field_samples;
+            samples_total += stats.perf.group_field_samples;
         }
     }
     // Every pack's field builds each rekey and is sampled.

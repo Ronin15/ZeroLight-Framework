@@ -127,8 +127,8 @@ pub const StageReport = struct {
         self.publish_ns += stats.publish_ns -| offMainNs(stats.perf.publish_copy_batch);
         self.registrations_added += stats.perf.registrations_added;
         self.registrations_removed += stats.perf.registrations_removed;
-        self.unavailable += stats.unavailable_results;
-        self.goal_fallbacks += stats.goal_fallbacks;
+        self.unavailable += stats.perf.unavailable_results;
+        self.goal_fallbacks += stats.perf.goal_fallbacks;
         self.shapes.add(updateBatches(stats));
     }
 

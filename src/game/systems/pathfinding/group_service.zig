@@ -374,10 +374,17 @@ test "pathfinding group mode builds one shared field sampled by all agents" {
     const second_stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), second_stats.accepted_requests);
     try std.testing.expectEqual(@as(usize, 0), second_stats.group_fields_built);
-    try std.testing.expectEqual(@as(usize, 3), second_stats.group_field_samples);
+    try expectFieldServes(&system, &.{ .{ .x = 8, .y = 8 }, .{ .x = 40, .y = 8 }, .{ .x = 72, .y = 8 } }, goal);
+}
 
-    const view = system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goal, .default, null);
-    try std.testing.expectEqual(PathStatus.available, view.status);
+// Each start on level 0 reads `goal` from its ready group field: a field sample's two-point
+// view, never a cached path.
+fn expectFieldServes(system: *const PathfindingSystem, starts: []const math.Vec2, goal: math.Vec2) !void {
+    for (starts) |start| {
+        const view = system.statusForWorld(0, start, 0, goal, .default, null);
+        try std.testing.expectEqual(PathStatus.available, view.status);
+        try std.testing.expectEqual(@as(usize, 2), view.path_len);
+    }
 }
 
 test "pathfinding warmed group-field request/sample step is allocation-free" {
@@ -414,7 +421,8 @@ test "pathfinding warmed group-field request/sample step is allocation-free" {
     system.allocator = original;
 
     try std.testing.expectEqual(@as(usize, 0), second_stats.group_fields_built);
-    try std.testing.expectEqual(@as(usize, 3), second_stats.group_field_samples);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+    try expectFieldServes(&system, &.{ .{ .x = 8, .y = 8 }, .{ .x = 40, .y = 8 }, .{ .x = 72, .y = 8 } }, goal);
 }
 
 test "pathfinding skips the group flow field below the agent threshold" {
@@ -1093,9 +1101,11 @@ test "a field capped below a 2048-cell level readies within its build steps, and
     try std.testing.expectEqual(@as(usize, 2), near_view.path_len);
     // Further steps sample the field for the near sharer only; the far one keeps its path.
     for (0..3) |_| {
-        const stats = try updatePathfindingInline(&system, &stream, 8, .{});
-        try std.testing.expectEqual(@as(usize, 1), stats.group_field_samples);
-        try std.testing.expect(system.statusForWorld(0, far, 0, goal, .default, null).status != .unavailable);
+        _ = try updatePathfindingInline(&system, &stream, 8, .{});
+        try expectFieldServes(&system, &.{near}, goal);
+        const far_step = system.statusForWorld(0, far, 0, goal, .default, null);
+        try std.testing.expect(far_step.status != .unavailable);
+        try std.testing.expect(far_step.path_len != 2);
     }
     const far_view = system.statusForWorld(0, far, 0, goal, .default, null);
     try std.testing.expectEqual(PathStatus.available, far_view.status);

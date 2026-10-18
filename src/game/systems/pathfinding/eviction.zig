@@ -892,7 +892,8 @@ test "one dig leaves unrelated pending requests, fields, tallies, and paths inta
     defer system.deinit();
     // A path along the top right, and a group field inside the pocket from its own agents.
     const path_goal = tileCenter(28, 2);
-    try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, tileCenter(16, 2), path_goal, .{})).available_results);
+    _ = try solveFrom(&system, requester, tileCenter(16, 2), path_goal, .{});
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, tileCenter(16, 2), 0, path_goal, .default, null).status);
     var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer group.deinit();
     for (0..3) |index| try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = pocketGoal(70 + index), .goal = pocketGoal(33) });
@@ -919,8 +920,9 @@ test "one dig leaves unrelated pending requests, fields, tallies, and paths inta
     // The queued request is solved on the next update.
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    const after = try updatePathfindingInline(&system, &empty, 16, .{});
-    try std.testing.expectEqual(@as(usize, 1), after.available_results);
+    _ = try updatePathfindingInline(&system, &empty, 16, .{});
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+    try std.testing.expect(system.completed.slotIndex(system.graph.keyForWorld(0, queued_goal, .default).?) != null);
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, tileCenter(16, 20), 0, queued_goal, .default, null).status);
 }
 
@@ -1207,9 +1209,12 @@ test "a level rebuilt by a content revision evicts only its own results and fiel
     try std.testing.expectEqual(@as(usize, 2), system.pending.len);
     for (0..system.pending.len) |index| try std.testing.expect(system.pending_keys.contains(system.pending.at(index).key));
     try expectRegistryMatchesCache(&system);
-    const answered = try updatePathfindingInline(&system, &stream, 8, .{});
-    try std.testing.expectEqual(@as(usize, 1), answered.available_results);
-    try std.testing.expectEqual(@as(usize, 1), answered.unavailable_results);
+    _ = try updatePathfindingInline(&system, &stream, 8, .{});
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
+    try std.testing.expect(system.completed.slotIndex(system.graph.keyForWorld(0, cellWorld(10, 3), .default).?) != null);
+    try std.testing.expect(system.completed.slotIndex(system.graph.keyForWorld(1, cellWorld(10, 3), .default).?) == null);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, cellWorld(1, 1), 0, cellWorld(10, 3), .default, null).status);
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(1, cellWorld(1, 1), 1, cellWorld(10, 3), .default, null).status);
 }
 
 // Three open 12x12 floors in 4-tile chunks: stairs link level 0 (10, 10) to level 1 (2, 2)
