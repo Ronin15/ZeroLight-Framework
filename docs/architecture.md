@@ -129,8 +129,7 @@ Designs start here, then read the live structure below (rules:
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
   orchestration, reusable gameplay systems, and full-active scope stats;
-  `src/game/pipeline_test_support.zig` holds its test-only scenario fixtures
-  (fixtures that reach private pipeline code stay in the pipeline file).
+  its test-only scenario fixtures are private in that file.
 - `src/game/simulation_scope.zig` defines simulation tiers, active-region
   scaffolding, per-entity scope metadata types, stagger/halo constants, and scope
   counters.
@@ -240,7 +239,7 @@ Designs start here, then read the live structure below (rules:
 - `src/game/render_depth.zig` defines world depth bands and z-order intent;
   `src/game/render_prep.zig` resolves entities to ordered render-draw records.
 - `src/gpu_smoke.zig` is the GPU smoke executable entry point, while
-  `src/platform/gpu_smoke_impl.zig` owns the display-gated SDL_GPU probe.
+  `src/gpu_smoke_impl.zig` owns the display-gated SDL_GPU probe.
 - `src/platform/sdl.zig` contains shared SDL, SDL_ttf, and SDL_mixer C imports
   plus small SDL wrappers.
 - Sprite and audio startup assets are declared in `src/assets/manifest.zig` and

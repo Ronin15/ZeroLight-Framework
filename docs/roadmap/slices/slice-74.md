@@ -135,11 +135,11 @@ One world per gameplay state; nothing models a set of worlds.
       step, so every world (and any second gameplay state) runs the same
       order. Failure scenario (derived): a stepper that reorders the seam's
       calls desyncs the collider or nav sync. The pipeline test fixture
-      `commitAndSyncLikeDemo` (`pipeline_test_support.zig:535-553`) copies
+      `commitAndSyncLikeDemo` (`src/game/simulation_pipeline.zig:3136-3151`) copies
       the seam step by step, so a reorder of the demo seam leaves every
       growth, OOM, and nav-seam pipeline test passing on the old order. The
       steering fixture `commitStaticsForTest`
-      (`steering/test_support.zig:95-107`) is a second copy (collider
+      (`steering/test_support.zig:102-116`) is a second copy (collider
       reserve, commit, capture, sync), so the multi-level and static-move
       avoidance tests and the steering cache-invalidate test
       (`avoidance.zig:546`, `:680`; `system.zig:879`) also pass on the old

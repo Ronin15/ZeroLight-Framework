@@ -2516,11 +2516,11 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
     defer serial_sys.deinit();
     var serial_events = SimulationEvents.init(testing.allocator);
     defer serial_events.deinit();
-    // No workers with a fixed range size, so the same multi-range compute + row-order emit
-    // is exercised on both sides.
+    // Zero workers are one inline range. The threaded side keeps the fixed multi-range
+    // partition; the cap still keeps row 0's first write.
     var serial_threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0, .items_per_range = range_items });
     defer serial_threads.deinit();
-    const serial_stats = try serial_sys.update(
+    _ = try serial_sys.update(
         serial_data.aiAgentSliceConst(),
         serial_data.movementBodySliceConst(),
         serial_spatial.view(),
@@ -2550,8 +2550,8 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         multi_range_cfg,
     );
 
-    // Both paths: multi-range, cap=1 survivor is A's entity_lost (row 0's first write).
-    try testing.expect(serial_stats.batch.range_count > 1);
+    // Threaded stays a real multi-range partition. Cap=1 survivor is A's entity_lost
+    // (row 0's first write) on both.
     try testing.expect(threaded_stats.batch.range_count > 1);
     try testing.expect(!threaded_stats.batch.ran_inline);
 

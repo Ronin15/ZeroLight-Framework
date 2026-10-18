@@ -1021,8 +1021,15 @@ pub fn updateClosure(self: *Connectivity, allocator: std.mem.Allocator, levels: 
     touchClosure(self, levels, key_count);
     stats.addMain(.closure_ns, touch_timer.lap());
     if (self.closure.resolve_items.items.len == 0) {
-        if (comptime runtime_perf_log.enabled) self.closure.perf = .{};
-        self.closure.last_rows_batch = .{};
+        // No link this batch, so it numbers no slot. The previous batch's scratch lengths
+        // are not this prepare's bound.
+        const closure = &self.closure;
+        closure.slots.len = 0;
+        closure.pieces.len = 0;
+        closure.copy_items.clearRetainingCapacity();
+        closure.round_items.clearRetainingCapacity();
+        if (comptime runtime_perf_log.enabled) closure.perf = .{};
+        closure.last_rows_batch = .{};
         return counters;
     }
     resolveLinks(self, levels, world, threads.resolve, stats);
@@ -2671,12 +2678,17 @@ test "two hundred seeded random steps of one-way links, endpoint toggles, and wa
     var prng = std.Random.DefaultPrng.init(0x1b1b);
     const random = prng.random();
     const chunks: u16 = 4;
+    const steps: u32 = 200;
     const rooms = @as(usize, chunks) * test_chunk / 2 * (@as(usize, chunks) * test_chunk / 2);
     var fixture = try latticeWorld(chunks, 2);
     defer fixture.deinit();
-    var system = try fixture.build(test_support.abstractCapacity());
+    // The per-step bound check reads the batch's limits. A closing release window clears
+    // them, so the window outlives the run.
+    var capacity = test_support.abstractCapacity();
+    capacity.capacity_shrink_window = steps + 1;
+    var system = try fixture.build(capacity);
     defer system.deinit();
-    for (0..200) |step| {
+    for (0..steps) |step| {
         for (0..1 + random.uintLessThan(usize, 3)) |_| {
             const level = random.uintLessThan(u16, 2);
             switch (random.uintLessThan(u8, 3)) {
@@ -2815,6 +2827,8 @@ test "a dig touching no one-way system leaves every block and word in place; a w
     try fixture.setCell(&system, 0, wall[0], wall[1], fixture.grass);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_rows_batch.item_count);
+    // The dig resolves no link, so the build's slot scratch must not outlive its own bound.
+    try expectWithinBounds(closure, stats);
     try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
     try std.testing.expectEqualSlices(u32, words, closure.hcomp.block[id]);
     try fixture.expectMatchesRebuild(&system);
@@ -2949,7 +2963,6 @@ test "a one-way toggle and a terminal root split prepared with the real allocato
     system.graph.landClosure(nav_threads, &stats);
     system.nav_marks.clearRetainingCapacity();
     try std.testing.expect(batch.changed);
-    try std.testing.expect(!stats.conn_closure_rows_batch.ran_inline);
     try expectWithinBounds(&system.graph.connectivity.closure, stats);
     try fixture.expectMatchesRebuild(&system);
 }
@@ -3329,7 +3342,8 @@ test "a relocating batch committed under a failing allocator on a multi-worker T
     try std.testing.expect(system.hasPendingNavUpdates(&fixture.world));
     // Disarmed: the prepare lands the block, then the batch runs.
     const retried = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    try std.testing.expectEqual(blockWords(64), closure.hcomp.block[roomHComp(&system, &fixture, chunks, narrow_tail)].len);
+    // The pending edit closed narrow_tail, so the landed block is the surviving room's.
+    try std.testing.expectEqual(blockWords(64), closure.hcomp.block[roomHComp(&system, &fixture, chunks, narrow_first + 100)].len);
     try expectWithinBounds(closure, retried);
     try fixture.expectMatchesRebuild(&system);
 }

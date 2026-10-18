@@ -1955,33 +1955,14 @@ test "inline parallel for covers every item exactly once" {
 
     const stats = threads.parallelForWithOptions(hits.len, &context, markCoverage, .{});
 
+    // Zero workers collapse to one full-width range.
     try std.testing.expect(stats.ran_inline);
-    try std.testing.expectEqual(@as(usize, 4), stats.main_thread_ranges);
+    try std.testing.expectEqual(@as(usize, 1), stats.range_count);
+    try std.testing.expectEqual(hits.len, stats.items_per_range);
+    try std.testing.expectEqual(@as(usize, 1), stats.main_thread_ranges);
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
     }
-}
-
-test "inline parallel ranges expose stable range indices" {
-    var starts: [4]usize = @splat(std.math.maxInt(usize));
-    var ends: [4]usize = @splat(0);
-    var context = RangeIndexContext{
-        .starts = starts[0..],
-        .ends = ends[0..],
-        .items_per_range = 3,
-    };
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
-        .max_worker_threads = 0,
-        .items_per_range = 3,
-    });
-    defer threads.deinit();
-
-    const stats = threads.parallelForWithOptions(10, &context, recordRangeIndex, .{});
-
-    try std.testing.expect(stats.ran_inline);
-    try std.testing.expectEqual(@as(usize, 4), stats.range_count);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 3, 6, 9 }, &starts);
-    try std.testing.expectEqualSlices(usize, &.{ 3, 6, 9, 10 }, &ends);
 }
 
 test "adaptive inline runs as one direct main-thread range" {

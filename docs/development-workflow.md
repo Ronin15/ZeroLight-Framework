@@ -6,7 +6,7 @@
 zig build           # build and install the app, runtime assets, and shaders
 zig build run       # build, install assets/shaders, and run the app
 zig build dev       # build shaders, install assets, and run the app
-zig build check     # compile the game, GPU smoke, and benchmark executables
+zig build check     # compile the game, GPU smoke, and benchmark executables, and run idiom-lint
 zig build test      # run Zig unit tests (-Dtest-filter=<text> runs only matching tests)
 zig build bench     # run CPU gameplay and render-prep benchmarks
 zig build verify    # run check, test, shader compilation, atlas + idiom lint, fmt check
