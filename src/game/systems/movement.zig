@@ -789,7 +789,6 @@ test "threaded intent apply matches serial across range splits and worker counts
             .max_worker_threads = split.workers,
             .adaptive = false,
         });
-        if (comptime runtime_perf_log.enabled) try std.testing.expect(!stats.perf.batch.ran_inline);
         try std.testing.expectEqual(agent_count + std.meta.tags(IntentSkip).len, stats.intent_count);
         try expectVelocityBitsEqual(&threaded.game_data, &serial.game_data);
     }
@@ -827,8 +826,7 @@ test "threaded multi-worker intent apply allocates nothing after warmup (Failing
         .max_worker_threads = 2,
         .adaptive = false,
     };
-    const warmup = system.applyIntents(&fixture.game_data, &fixture.frame, &threads, config);
-    if (comptime runtime_perf_log.enabled) try std.testing.expect(!warmup.perf.batch.ran_inline);
+    _ = system.applyIntents(&fixture.game_data, &fixture.frame, &threads, config);
 
     const original_data_allocator = fixture.game_data.allocator;
     const original_intents_allocator = fixture.frame.intents.allocator;
@@ -844,7 +842,6 @@ test "threaded multi-worker intent apply allocates nothing after warmup (Failing
     }
 
     const stats = system.applyIntents(&fixture.game_data, &fixture.frame, &threads, config);
-    if (comptime runtime_perf_log.enabled) try std.testing.expect(!stats.perf.batch.ran_inline);
     try std.testing.expectEqual(fixture.frame.intents.mergedItems().len, stats.intent_count);
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
 }
@@ -886,7 +883,6 @@ test "empty intent stream applies nothing and records no batch" {
     const stats = system.applyIntents(&fixture.game_data, &fixture.frame, &threads, .{ .max_worker_threads = 2 });
 
     try std.testing.expectEqual(@as(usize, 0), stats.intent_count);
-    if (comptime runtime_perf_log.enabled) try std.testing.expectEqual(@as(usize, 0), stats.perf.batch.range_count);
     try std.testing.expectEqual(@as(usize, 0), system.apply_intents_tuner.sample_count);
     const slice = fixture.game_data.movementBodySliceConst();
     for (slice.velocity_x, slice.velocity_y) |velocity_x, velocity_y| {

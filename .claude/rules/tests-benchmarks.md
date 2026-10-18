@@ -13,7 +13,8 @@ paths:
   `gpu-smoke`.
 - A fix ships with a test that would fail without it, judged from the code,
   never by revert-and-rerun runs. Never drop a proof test or
-  `FailingAllocator` proof to save time.
+  `FailingAllocator` proof to save time; a work-bound proof moves to its
+  bench group, never away.
 - A threaded stage has a test proving it ran on workers, not inline.
 - Terrain contract tests cover a multi-chunk one-step change and repeated
   dig/fill.
@@ -30,8 +31,14 @@ paths:
   shortcuts, or paths, and production never does work only so it can be
   measured or checked. Tests and benches drive the production functions and
   use private helpers, fixtures, mocks, or real payloads; diagnostic
-  counters production keeps for measurement compile to nothing in shipping
+  counters production keeps for measurement sit behind the comptime
+  perf-log switch, which removes their code and storage from shipping
   builds (`zig-style.md` § Logging).
+- Counters belong to benches, never tests. Tests never read perf counters
+  and never skip: they assert behavior through production's observable
+  results, so every test runs in every build mode. A work bound is proven by
+  a bench pass-shape assert that reads the counters; the bench build always
+  enables the perf-log switch.
 - Tests never time anything and never call `src/benchmarks/` (except the
   shared harness's tests of its own pure utilities); bench-fixture
   correctness relies on internal asserts firing during a real bench run.

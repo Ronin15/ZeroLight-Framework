@@ -567,7 +567,6 @@ test "pathfinding a publish reserve out of memory claims nothing, leaves pending
 }
 
 test "the path registry holds every run of every published path, and the incremental registry equals one rebuilt from the live cache after victims, TTL expiry, evictions, re-puts, and a shrink with renames" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -594,8 +593,7 @@ test "the path registry holds every run of every published path, and the increme
 
     // Evictions: a dig across the middle of the map.
     try setRegistryCells(&system, &fixture, &.{ .{ 11, 11 }, .{ 12, 11 }, .{ 12, 12 } }, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expect(reaction.perf.evicted_results != 0);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try expectRegistryMatchesCache(&system);
 
     // A re-put: the same key published with a different path.
@@ -639,7 +637,6 @@ test "re-putting a key replaces its registrations" {
 }
 
 test "threaded publish equals serial across range sizes and worker counts (cache bytes, per-shard lists, stats), and publish_copy and registry_flush run on workers" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -659,7 +656,6 @@ test "threaded publish equals serial across range sizes and worker counts (cache
     }
     const serial_stats = try updatePathfindingInline(&serial, &stream, 64, .{});
     try std.testing.expectEqual(@as(usize, 48), serial_stats.available_results);
-    try std.testing.expect(serial_stats.perf.registrations_added > 48);
     try std.testing.expect(serial.completed.long_block_count != 0);
     try expectRegistryMatchesCache(&serial);
     for ([_]usize{ 1, 3 }) |workers| {
@@ -673,11 +669,8 @@ test "threaded publish equals serial across range sizes and worker counts (cache
             try expectSameCache(&serial, &threaded);
             try expectSameRegistry(&serial, &threaded);
             try std.testing.expectEqual(serial_stats.available_results, stats.available_results);
-            try std.testing.expectEqual(serial_stats.perf.registrations_added, stats.perf.registrations_added);
-            try std.testing.expectEqual(serial_stats.perf.registrations_removed, stats.perf.registrations_removed);
             try std.testing.expectEqual(serial_stats.cache_evictions, stats.cache_evictions);
             if (items_per_range == 1) {
-                try std.testing.expect(!stats.perf.publish_copy_batch.ran_inline and stats.perf.publish_copy_batch.range_count > 1);
                 try std.testing.expect(!stats.registry_flush_batch.ran_inline and stats.registry_flush_batch.range_count > 1);
             }
         }
@@ -685,7 +678,6 @@ test "threaded publish equals serial across range sizes and worker counts (cache
 }
 
 test "publish after its reserve allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -716,9 +708,9 @@ test "publish after its reserve allocates nothing on a multi-worker ThreadSystem
     const published = try stats;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(usize, 48), published.available_results);
-    try std.testing.expect(!published.perf.publish_copy_batch.ran_inline and !published.registry_flush_batch.ran_inline);
-    const units = flushUnits(0, published.perf.registrations_added);
-    try std.testing.expectEqual(units, published.registry_flush_batch.item_count);
+    // One unit per shard and per registration added: each published path adds at least one.
+    const units = published.registry_flush_batch.item_count;
+    try std.testing.expect(units >= flushUnits(0, 48));
     try std.testing.expectEqual(units, published.registry_flush_batch.range_count);
     try expectRegistryMatchesCache(&system);
 }

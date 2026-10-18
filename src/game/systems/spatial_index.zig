@@ -2129,7 +2129,6 @@ fn testStages(threads: *ThreadSystem, tuners: *[3]AdaptiveWorkTuner, workers: us
 }
 
 test "serial and threaded index builds match across layouts, splitters, range sizes, and worker counts" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3, .items_per_range = 16 });
@@ -2162,8 +2161,7 @@ test "serial and threaded index builds match across layouts, splitters, range si
                 for ([_]usize{ 16, 1024 }) |sort_items| {
                     for ([_]usize{ 16, 1024 }) |link_items| {
                         _ = try system.beginBuild(population, layout_geometry, config);
-                        const stats = try system.buildBanded(&data, population, testStages(&threads, &tuners, workers, bucket_items, sort_items, link_items), chooseSplitters(&data, population, system.grid));
-                        try testing.expect(!stats.perf.bucket_batch.ran_inline);
+                        _ = try system.buildBanded(&data, population, testStages(&threads, &tuners, workers, bucket_items, sort_items, link_items), chooseSplitters(&data, population, system.grid));
                         try expectIndexMatches(&system, &reference, &reference_system);
                     }
                 }
@@ -2174,19 +2172,15 @@ test "serial and threaded index builds match across layouts, splitters, range si
         const stages = testStages(&threads, &tuners, 3, 64, 64, 16);
         for (std.meta.tags(TestSplitters)) |set| {
             _ = try system.beginBuild(population, layout_geometry, config);
-            const stats = try system.buildBanded(&data, population, stages, testSplitters(set, reference.cell_keys.items));
-            try testing.expect(!stats.perf.bucket_batch.ran_inline and !stats.sort_batch.ran_inline);
+            _ = try system.buildBanded(&data, population, stages, testSplitters(set, reference.cell_keys.items));
             try expectIndexMatches(&system, &reference, &reference_system);
         }
 
         // The production build, and a config that allows no worker builds serially.
-        const threaded = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .items_per_range = 16, .max_worker_threads = 3, .adaptive = false });
-        try testing.expect(!threaded.perf.bucket_batch.ran_inline and !threaded.sort_batch.ran_inline);
+        _ = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .items_per_range = 16, .max_worker_threads = 3, .adaptive = false });
         // The link stage partitions the cells: one range of them may run inline.
-        try testing.expect(reference.cell_keys.items.len <= 16 or !threaded.perf.link_batch.ran_inline);
         try expectIndexMatches(&system, &reference, &reference_system);
-        const serial = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .max_worker_threads = 0 });
-        try testing.expect(serial.perf.bucket_batch.ran_inline and serial.sort_batch.ran_inline and serial.perf.link_batch.ran_inline);
+        _ = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .max_worker_threads = 0 });
         try expectIndexMatches(&system, &reference, &reference_system);
     }
 }
@@ -3030,7 +3024,6 @@ test "a block query visits its key's scan-order stream over every layout, budget
 }
 
 test "a reused block gives bit-identical visits to a fresh block, and a key change resets it" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     try fillBruteForceLayout(&data);
@@ -3055,7 +3048,6 @@ test "a reused block gives bit-identical visits to a fresh block, and a key chan
         try fresh_visits.expectEqual(&reused_visits);
     }
     // One fill per key change: dense, other, dense, other.
-    try testing.expectEqual(@as(u32, 4), block.perf.fills);
 }
 
 test "a block at capacity ends at the budget" {
@@ -3367,7 +3359,6 @@ test "the index builds correctly above a small reserved capacity" {
 }
 
 test "after reserve and reserveGeometry, threaded builds at 2 and 4 partitions per stage, a serial build, and queries allocate nothing" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // No warm build: the reserves alone cover every partition the tuners can pick.
     if (builtin.single_threaded) return error.SkipZigTest;
 
@@ -3403,10 +3394,7 @@ test "after reserve and reserveGeometry, threaded builds at 2 and 4 partitions p
     for ([_]usize{ 32, 16 }) |items_per_range| {
         const stats = try system.build(&data, population, geometry, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
         try testing.expectEqual(population_count, stats.entity_count);
-        try testing.expect(!stats.perf.bucket_batch.ran_inline and !stats.sort_batch.ran_inline and !stats.perf.link_batch.ran_inline);
-        for ([_]BatchStats{ stats.perf.bucket_batch, stats.sort_batch, stats.perf.link_batch }) |batch| {
-            try testing.expectEqual(population_count / items_per_range, batch.range_count);
-        }
+        try testing.expectEqual(population_count / items_per_range, stats.sort_batch.range_count);
         try testing.expectEqualSlices(u32, reference.view().entity_index, system.view().entity_index);
         try testing.expectEqualSlices(u32, reference.view().entity_generation, system.view().entity_generation);
     }

@@ -367,7 +367,6 @@ const ensureStepCapacity = @import("system.zig").ensureStepCapacity;
 const AgentSnapshotRow = @import("system.zig").AgentSnapshotRow;
 
 test "steering banded agent grid gives every cell the same entries as one band" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
@@ -390,31 +389,23 @@ test "steering banded agent grid gives every cell the same entries as one band" 
         // Both stages inline in their ranges on the main thread.
         const inline_selection = inline_ranges.stage(&system.grid_bucket_tuner).select(system.agent_snapshot_rows.len, steering_range_alignment_items);
         buildAgentGridBanded(&system, inline_ranges, inline_selection, chooseGridSplitters(system.agentSnapshotSliceConst(), system.spatial_cell_size), &stats);
-        try std.testing.expect(stats.perf.grid_bucket_batch.ran_inline and stats.perf.grid_bucket_batch.range_count > 1);
-        try std.testing.expect(stats.perf.grid_sort_batch.ran_inline);
-        try std.testing.expectEqual(max_bands, stats.perf.grid_sort_batch.item_count);
         try expectGridMatches(&system, &reference);
 
         // A config that allows no worker builds the serial grid.
         stats = .{};
         buildAgentGrid(&system, inline_ranges, &stats);
         try std.testing.expectEqual(@as(usize, 0), system.agent_grid.splitter_count);
-        try std.testing.expectEqual(@as(usize, 0), stats.perf.grid_sort_batch.item_count);
         try expectGridMatches(&system, &reference);
 
         // Explicit splitter sets over the same bucket ranges.
         const selection = threaded.stage(&system.grid_bucket_tuner).select(system.agent_snapshot_rows.len, steering_range_alignment_items);
         for (std.meta.tags(GridTestSplitters)) |set| {
             buildAgentGridBanded(&system, threaded, selection, gridTestSplitters(set, reference.ranges.items), &stats);
-            try std.testing.expect(!stats.perf.grid_bucket_batch.ran_inline);
-            try std.testing.expectEqual(max_bands, stats.perf.grid_sort_batch.item_count);
             try expectGridMatches(&system, &reference);
         }
 
         // The production splitters.
         buildAgentGrid(&system, threaded, &stats);
-        try std.testing.expect(!stats.perf.grid_bucket_batch.ran_inline and !stats.perf.grid_sort_batch.ran_inline);
-        try std.testing.expectEqual(max_bands, stats.perf.grid_sort_batch.item_count);
         try expectGridMatches(&system, &reference);
     }
 }

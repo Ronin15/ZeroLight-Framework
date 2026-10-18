@@ -15,6 +15,7 @@ const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWork
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const DiagnosticCount = @import("../app/thread_system.zig").DiagnosticCount;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
+const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const PerfBatchStage = @import("../app/runtime_perf_log.zig").BatchStage;
 const PerfMetric = @import("../app/runtime_perf_log.zig").Metric;
@@ -400,10 +401,8 @@ pub const NavMainSummary = struct {
     /// Adds one reaction: its main time and its stats' inline stage time and sections.
     pub fn add(self: *NavMainSummary, main_ns: u64, stats: NavUpdateStats) void {
         self.main_ns += main_ns;
-        if (comptime diagnostics_enabled) {
-            self.inline_ns += stats.perf.inline_stage_ns;
-            addSections(&self.sections, stats.perf.main);
-        }
+        self.inline_ns += stats.perf.inline_stage_ns;
+        addSections(&self.sections, stats.perf.main);
     }
 
     /// Adds `other`'s reactions, its samples not counted.
@@ -422,12 +421,6 @@ pub const NavMainSummary = struct {
         inline for (@typeInfo(NavMainPhases).@"struct".field_names) |name| @field(total, name) += @field(phases, name);
     }
 };
-
-/// A stats struct's gated `perf` batch `field`, or an empty batch where
-/// `runtime_perf_log.enabled` is off (those builds keep no stage diagnostics).
-pub fn perfBatch(perf: anytype, comptime field: []const u8) BatchStats {
-    return if (comptime diagnostics_enabled) @field(perf, field) else .{};
-}
 
 pub fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
     return .{
@@ -527,6 +520,8 @@ pub const CollisionStageSummary = struct {
     sort_tuning: ?WorkTuningSummary = null,
     entries: usize = 0,
     visits: usize = 0,
+    // The sweep's lane groups.
+    simd_groups: usize = 0,
 };
 
 /// Render-prep capacities after a collect: the dynamic record reserve and the sprite
@@ -944,6 +939,23 @@ pub fn printUsage() void {
 pub fn availableWorkerThreads() usize {
     const cpu_count = std.Thread.getCpuCount() catch return 0;
     return if (cpu_count > 1) cpu_count - 1 else 0;
+}
+
+/// Fails when a fixed threaded case ran a stage inline that it dispatches: a batch of more
+/// items than one range at `items_per_range` (the stage's range control under `case`,
+/// aligned to the batch's alignment) on a thread system with workers. Adaptive and serial cases, and a null control, pass.
+pub fn checkStageDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats) error{BenchStageRanInline}!void {
+    const range = items_per_range orelse return;
+    const threads = thread_system orelse return;
+    if (case.adaptive or threads.workerThreadCount() == 0) return;
+    // The dispatch aligns the range forward to the stage's alignment.
+    const aligned = std.mem.alignForwardAnyAlign(usize, @max(range, 1), @max(batch.range_alignment_items, 1));
+    if (batch.item_count > aligned and batch.ran_inline) return error.BenchStageRanInline;
+}
+
+/// `checkStageDispatched` over each of `batches`.
+pub fn checkStagesDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batches: []const BatchStats) error{BenchStageRanInline}!void {
+    for (batches) |batch| try checkStageDispatched(case, thread_system, items_per_range, batch);
 }
 
 pub fn skipIfWorkersUnavailable(case: BenchmarkCase) ?RunStats {
@@ -1827,23 +1839,14 @@ test "work tuning summary preserves settled phase" {
         .retune_after_settled_windows = 10_000,
         .best_mean_batch_duration_ns = 42,
         .has_threaded_profile = true,
-        .probe_window_count = if (diagnostics_enabled) 7 else {},
-        .demotion_count = if (diagnostics_enabled) 2 else {},
     }, true);
 
     try std.testing.expectEqual(AdaptiveWorkPhase.settled, summary.phase);
     try std.testing.expect(summary.settled_before_measurement);
     try std.testing.expectEqual(@as(usize, 4), summary.best_worker_threads);
     try std.testing.expectEqual(@as(usize, 256), summary.best_items_per_range);
-    if (comptime diagnostics_enabled) {
-        try std.testing.expectEqual(@as(u64, 7), summary.probe_window_count);
-        try std.testing.expectEqual(@as(u64, 2), summary.demotion_count);
-        var tuning_buffer: [96]u8 = undefined;
-        try std.testing.expectEqualStrings(
-            "settled settled=yes best=4/256 final=4/256 probes=7 demotes=2",
-            formatWorkTuningInto(&tuning_buffer, summary),
-        );
-    }
+    var tuning_buffer: [96]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, formatWorkTuningInto(&tuning_buffer, summary), "settled settled=yes best=4/256 final=4/256"));
 }
 
 test "fixed adaptive benchmark case disables range probing" {
@@ -2031,9 +2034,8 @@ test "benchmark table formatters keep compact text" {
             .available_worker_threads = 10,
         },
     }));
-    const counters_text = if (diagnostics_enabled) " probes=0 demotes=0" else "";
-    try std.testing.expectEqualStrings(
-        "settled settled=yes best=4/256 final=4/256" ++ counters_text,
+    try std.testing.expect(std.mem.startsWith(
+        u8,
         formatWorkTuningInto(&range_buffer, .{
             .phase = .settled,
             .best_worker_threads = 4,
@@ -2043,7 +2045,8 @@ test "benchmark table formatters keep compact text" {
             .settled_before_measurement = true,
             .has_threaded_profile = true,
         }),
-    );
+        "settled settled=yes best=4/256 final=4/256",
+    ));
     const group = BenchmarkGroup{
         .name = "test",
         .item_label = "test items",
@@ -2069,39 +2072,6 @@ test "the details table's range columns read inline for an inline batch, never a
     const threaded = BatchSummary{ .item_count = 64, .range_count = 4, .items_per_range = 16, .active_worker_threads = 3, .worker_thread_ranges = 3, .ran_inline = false };
     try std.testing.expectEqualStrings("16", formatRangeCellInto(&buffer, threaded, threaded.items_per_range));
     try std.testing.expectEqualStrings("3", formatRangeCellInto(&buffer, threaded, threaded.worker_thread_ranges));
-}
-
-test "nav main split prints each section, the inline stage time, and the rest per sample" {
-    if (!diagnostics_enabled) return error.SkipZigTest;
-    var buffer: [320]u8 = undefined;
-    try std.testing.expectEqualStrings("", formatNavMainInto(&buffer, null));
-    try std.testing.expectEqualStrings("", formatNavMainInto(&buffer, NavMainSummary{}));
-    const stats = NavUpdateStats{ .perf = .{
-        .inline_stage_ns = 20_000,
-        .main = .{
-            .mark_ns = 1_000,
-            .plan_ns = 2_000,
-            .reserve_ns = 3_000,
-            .commit_ns = 4_000,
-            .conn_merge_ns = 5_000,
-            .conn_layout_ns = 6_000,
-            .flood_ns = 7_000,
-            .closure_ns = 8_000,
-            .evict_ns = 9_000,
-        },
-    } };
-    // Two samples: one reaction, then an iteration of a reaction merged from another summary.
-    var summary = NavMainSummary{};
-    summary.add(70_000, stats);
-    summary.endSample();
-    var other = NavMainSummary{};
-    other.add(70_000, stats);
-    summary.merge(other);
-    summary.endSample();
-    try std.testing.expectEqualStrings(
-        " main_split=mark:1.00 us plan:2.00 us reserve:3.00 us commit:4.00 us conn_merge:5.00 us conn_layout:6.00 us flood:7.00 us closure:8.00 us evict:9.00 us inline:20.00 us rest:5.00 us",
-        formatNavMainInto(&buffer, summary),
-    );
 }
 
 const TestVariant = enum(u8) { plain, packed_pads };

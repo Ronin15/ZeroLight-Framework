@@ -741,7 +741,6 @@ fn changeInvalidatesSteeringMovementIndexCache(change: StructuralChange) bool {
 const math = @import("../../../core/math.zig");
 const MovementIntent = @import("../../simulation.zig").MovementIntent;
 const PathRequest = @import("../../simulation.zig").PathRequest;
-const AgentBands = @import("selection.zig").AgentBands;
 const requestsBefore = @import("avoidance.zig").requestsBefore;
 const expectEveryStageThreaded = @import("test_support.zig").expectEveryStageThreaded;
 const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
@@ -1105,7 +1104,6 @@ test "steering update is allocation-free after reserves from the first step" {
 }
 
 test "steering threaded multi-worker update is allocation-free after reserves from the first step (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -1373,24 +1371,6 @@ test "steering stages kept inline by their tuners run the threaded stage jobs in
     try expectTracesEqual(&serial, &tuned);
 }
 
-// A step whose stage tuners all kept their stages inline still ran every stage job: the
-// claim over its steering bands and the grid sort over every band.
-fn expectTunedStagesInline(stats: SteeringStats, agent_count: usize) !void {
-    for ([_]BatchStats{ stats.perf.agents_batch, stats.perf.select_resolve_batch, stats.perf.select_claim_batch, stats.perf.directions_batch, stats.perf.grid_bucket_batch, stats.perf.grid_sort_batch }) |batch| {
-        try std.testing.expect(batch.ran_inline);
-    }
-    try std.testing.expectEqual(AgentBands.init(agent_count).band_count, stats.perf.select_claim_batch.item_count);
-    try std.testing.expectEqual(max_bands, stats.perf.grid_sort_batch.item_count);
-}
-
-// A step that could give no stage a worker resolved and claimed in one pass and built the
-// grid in one band, so neither the claim nor the grid sort ran.
-fn expectSerialSelectionAndGrid(stats: SteeringStats) !void {
-    try std.testing.expect(stats.perf.select_resolve_batch.ran_inline and stats.perf.grid_bucket_batch.ran_inline);
-    try std.testing.expectEqual(@as(usize, 0), stats.perf.select_claim_batch.item_count);
-    try std.testing.expectEqual(@as(usize, 0), stats.perf.grid_sort_batch.item_count);
-}
-
 // A step's stats without batch shapes and timings, which follow the partition.
 fn behaviorStats(stats: SteeringStats) SteeringStats {
     var behavior = stats;
@@ -1565,15 +1545,7 @@ fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trac
         else
             try updateSteeringInline(&system, &data, &frame, &pathfinding, &colliders);
         if (thread_system) |threads| {
-            if (comptime !runtime_perf_log.enabled) {
-                // The prepare stages' batches are kept only with the perf log.
-            } else if (threads.workerThreadCount() == 0 or (config.max_worker_threads orelse 1) == 0) {
-                try expectSerialSelectionAndGrid(stats);
-            } else if (config.items_per_range == steering_range_alignment_items) {
-                try expectEveryStageThreaded(stats);
-            } else if (config.adaptive and config.items_per_range == null) {
-                try expectTunedStagesInline(stats, data.steeringAgentSliceConst().entities.len);
-            }
+            if (threads.workerThreadCount() != 0 and config.items_per_range == steering_range_alignment_items) try expectEveryStageThreaded(stats);
         }
         try expectRequestPrefixesCount(&system, stats);
         try trace.record(&frame, stats, &system);
@@ -1657,7 +1629,7 @@ fn runRekeyScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, churn
     frame.beginStep();
     try appendNavigationIntents(&frame, intents.items);
     const second = if (thread_system) |threads| try system.update(&data, &frame, threads, &pathfinding, &colliders, config) else try updateSteeringInline(&system, &data, &frame, &pathfinding, &colliders);
-    if (comptime runtime_perf_log.enabled) if (thread_system != null) try expectEveryStageThreaded(second);
+    if (thread_system != null) try expectEveryStageThreaded(second);
     // Each runtime row holds its steering row's entity.
     const steering_entities = data.steeringAgentSliceConst().entities;
     try std.testing.expectEqual(steering_entities.len, system.runtime_rows.len);

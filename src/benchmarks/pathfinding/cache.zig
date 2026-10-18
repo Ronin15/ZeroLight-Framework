@@ -8,7 +8,6 @@
 //! bytes against its charge (`nav_size.checkNavBytes`).
 
 const std = @import("std");
-const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const offMainNs = @import("../../app/thread_system.zig").offMainNs;
@@ -48,7 +47,9 @@ const chunkCells = @import("nav_fixtures.zig").chunkCells;
 // of short paths (`EvictCode`): the cell turns blocking and the nav reaction runs, eviction
 // included. The dig crosses the same few paths at every count, so it passes when flat in
 // cached results. `outputs` is the results evicted. An untimed reset reopens the cell and
-// re-solves the evicted results. The region configs (4, 16, or 64 chunks at 10,000 results)
+// re-solves the evicted results. Every timed reaction's halo walks visit at most the
+// registrations their keys own, and a fixed threaded case runs each eviction stage of more
+// than one range on workers. The region configs (4, 16, or 64 chunks at 10,000 results)
 // instead fill a chunk-aligned square of that many chunks in one step, crossing the routes of
 // its rows: the dense-change reaction, which passes when linear in the region's chunks and
 // the registrations its eviction visits. The churned config (64 chunks at 10,000 results)
@@ -243,9 +244,12 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         const reaction = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_ptr);
         evicted = result_count - fixture.cachedCount();
         // The reaction evicted exactly the results the cache lost.
-        if (comptime runtime_perf_log.enabled) {
-            if (reaction.stats.perf.evicted_results != evicted) return error.EvictCountMismatch;
+        if (reaction.stats.perf.evicted_results != evicted) return error.EvictCountMismatch;
+        // Each changed key's halo walk visits at most the registrations it owns.
+        for (fixture.system.evict_items.items) |evict_item| {
+            if (evict_item.perf.visited > evict_item.bound) return error.EvictVisitPastHalo;
         }
+        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ reaction.stats.perf.evict_count_batch, reaction.stats.evict_batch, reaction.stats.perf.evict_flush_batch });
         last_stats = reaction.stats;
         accumulator.record(reaction.elapsed_ns, reaction.stats.remask_batch);
         report.add(reaction);
@@ -264,7 +268,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     // Registry entries the reaction's eviction visited per second.
     stats.items_per_second = suite.itemsPerSecond(report.visited, stats.mean_ns);
     stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "patch_batch"));
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
     return stats;
 }
 

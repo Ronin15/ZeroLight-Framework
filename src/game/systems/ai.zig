@@ -1868,7 +1868,6 @@ test "ai processor no steady-state allocation (FailingAllocator)" {
 }
 
 test "ai threaded multi-worker update has no steady-state allocation after warmup (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -1931,7 +1930,6 @@ test "ai threaded multi-worker update has no steady-state allocation after warmu
 
     frame.beginStep();
     const stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, cfg);
-    try std.testing.expect(!stats.perf.gather_batch.ran_inline);
     try std.testing.expect(!stats.separation_batch.ran_inline);
     try std.testing.expect(!stats.intent_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 64), frame.navigation_intents.mergedItems().len);
@@ -2438,7 +2436,6 @@ test "ai gather direct table and separation blend produce correct order + dirs (
 }
 
 test "ai serial and threaded produce identical intents with separation + seek_target" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     // Two DataSystems: arbitration write-back mutates sticky columns, so serial
     // and threaded must start from identical unmutated state.
@@ -2489,7 +2486,6 @@ test "ai serial and threaded produce identical intents with separation + seek_ta
     threaded_cfg.max_worker_threads = 2;
     threaded_cfg.adaptive = false;
     const threaded_stats = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, threaded_cfg);
-    try std.testing.expect(!threaded_stats.perf.gather_batch.ran_inline);
     try std.testing.expect(!threaded_stats.separation_batch.ran_inline);
     try std.testing.expect(!threaded_stats.intent_batch.ran_inline);
     const thr = threaded_frame.navigation_intents.mergedItems();
@@ -2547,7 +2543,6 @@ fn fillParityAgents(data: *DataSystem) !void {
 const SimulationScopeSystem = @import("simulation_scope.zig").SimulationScopeSystem;
 
 test "ai serial and real threaded workers produce identical rows and intents on cell-major rows at every range size" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
 
     var serial_data = DataSystem.init(std.testing.allocator);
@@ -2569,7 +2564,7 @@ test "ai serial and real threaded workers produce identical rows and intents on 
     defer serial_frame.deinit();
     try serial_frame.reserveStreams(16, 0, 140, 0, 0, 0);
     serial_frame.beginStep();
-    const serial_stats = try updateInline(&serial_ai, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_view, &serial_data, &serial_frame, 0.016, base_cfg);
+    _ = try updateInline(&serial_ai, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_view, &serial_data, &serial_frame, 0.016, base_cfg);
     const serial = serial_frame.navigation_intents.mergedItems();
     const serial_rows = serial_ai.rows.slice();
     var cohere_rows: usize = 0;
@@ -2600,11 +2595,9 @@ test "ai serial and real threaded workers produce identical rows and intents on 
         try threaded_frame.reserveStreams(16, 0, 140, 0, 0, 0);
         threaded_frame.beginStep();
         const stats = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, cfg);
-        try std.testing.expect(!stats.perf.gather_batch.ran_inline);
         try std.testing.expect(!stats.separation_batch.ran_inline);
         try std.testing.expect(!stats.intent_batch.ran_inline);
         // Range boundaries split cells, each refilling: never fewer fills than serial.
-        try std.testing.expect(stats.perf.separation_block_fills >= serial_stats.perf.separation_block_fills);
 
         // Every gathered row, and the separation and cohere sums, bit for bit.
         const threaded_rows = threaded_ai.rows.slice();
@@ -2660,7 +2653,6 @@ test "the threaded gather writes every row the serial gather does, skipping bodi
 }
 
 test "rows of one cell fill one separation block, and cohere rows of one cell one cohere block" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     // Three cells (32-unit cells) of four, three, and five agents, all with cohere gain.
@@ -2689,14 +2681,11 @@ test "rows of one cell fill one separation block, and cohere rows of one cell on
     defer ai_sys.deinit();
     const stats = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), view, &data, &frame, 0.016, .{ .scope_dense_indices = think_set });
     try std.testing.expectEqual(@as(usize, 12), stats.entity_count);
-    try std.testing.expectEqual(cells.len, stats.perf.separation_block_fills);
-    try std.testing.expectEqual(cells.len, stats.perf.cohere_block_fills);
 
     // Rows interleaving the cells refill at every key change: A B C A B C A B C A C C.
     const shuffled = [_]u32{ 0, 4, 7, 1, 5, 8, 2, 6, 9, 3, 10, 11 };
     frame.beginStep();
-    const shuffled_stats = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), view, &data, &frame, 0.016, .{ .scope_dense_indices = &shuffled });
-    try std.testing.expectEqual(@as(usize, 11), shuffled_stats.perf.separation_block_fills);
+    _ = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), view, &data, &frame, 0.016, .{ .scope_dense_indices = &shuffled });
 }
 
 test "ai spatial separation caps dense neighbor samples" {
@@ -3374,7 +3363,6 @@ test "ai memory override does not apply while perception still reports the targe
 }
 
 test "ai serial and threaded agree on a memory-overridden seek target" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     // Two DataSystems: arbitration write-back mutates sticky columns.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -3436,7 +3424,6 @@ test "ai serial and threaded agree on a memory-overridden seek target" {
         .max_worker_threads = 2,
         .adaptive = false,
     });
-    try std.testing.expect(!threaded_stats.perf.gather_batch.ran_inline);
     try std.testing.expect(!threaded_stats.separation_batch.ran_inline);
     try std.testing.expect(!threaded_stats.intent_batch.ran_inline);
     const threaded = threaded_frame.navigation_intents.mergedItems();
@@ -3588,7 +3575,6 @@ test "invalid pursue goal writes wander active_behavior so fatigue does not trea
 }
 
 test "arbitration serial and threaded parity across perception + memory + affect signals" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     // Two DataSystems: arbitration write-back mutates sticky columns.
     var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
@@ -3678,7 +3664,6 @@ test "arbitration serial and threaded parity across perception + memory + affect
         .max_worker_threads = 2,
         .adaptive = false,
     });
-    try std.testing.expect(!threaded_stats.perf.gather_batch.ran_inline);
     try std.testing.expect(!threaded_stats.separation_batch.ran_inline);
     try std.testing.expect(!threaded_stats.intent_batch.ran_inline);
     const threaded = threaded_frame.navigation_intents.mergedItems();

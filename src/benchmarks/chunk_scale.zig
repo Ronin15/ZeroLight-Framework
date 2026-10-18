@@ -71,7 +71,6 @@
 //!     warmup included, so A/B runs use the same `--warmup` and `--iterations`.
 
 const std = @import("std");
-const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -1147,14 +1146,14 @@ const BatchTiming = struct {
     forward_write: BatchStats = .{},
 
     fn add(self: *BatchTiming, world: *const WorldSystem) void {
-        for ([_]BatchStats{ suite.perfBatch(world.perf, "last_terrain_edit_plan_batch"), suite.perfBatch(world.perf, "last_terrain_edit_write_batch") }) |batch| self.off_main_ns += offMainNs(batch);
-        self.plan_ns += suite.perfBatch(world.perf, "last_terrain_edit_plan_batch").batch_duration_ns;
-        self.write_ns += suite.perfBatch(world.perf, "last_terrain_edit_write_batch").batch_duration_ns;
+        for ([_]BatchStats{ world.perf.last_terrain_edit_plan_batch, world.perf.last_terrain_edit_write_batch }) |batch| self.off_main_ns += offMainNs(batch);
+        self.plan_ns += world.perf.last_terrain_edit_plan_batch.batch_duration_ns;
+        self.write_ns += world.perf.last_terrain_edit_write_batch.batch_duration_ns;
     }
 
     fn captureForward(self: *BatchTiming, world: *const WorldSystem) void {
-        self.forward_plan = suite.perfBatch(world.perf, "last_terrain_edit_plan_batch");
-        self.forward_write = suite.perfBatch(world.perf, "last_terrain_edit_write_batch");
+        self.forward_plan = world.perf.last_terrain_edit_plan_batch;
+        self.forward_write = world.perf.last_terrain_edit_write_batch;
     }
 };
 
@@ -1272,6 +1271,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         forward_timing = timing;
         accumulator.record(elapsed_ns, timing.forward_write);
+        if (threads) |*thread_system| try suite.checkStagesDispatched(case, thread_system, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, edit_range_alignment_items), &.{ timing.forward_plan, timing.forward_write });
         plan_total += timing.plan_ns;
         write_total += timing.write_ns;
         // Main is everything but the stages that ran on workers.
@@ -1412,7 +1412,7 @@ const NavFixture = struct {
     // writers' mark stage, which ran inside their writes.
     fn react(self: *NavFixture, frame: *SimulationFrame) !NavUpdateStats {
         const pathfinding = &self.pipeline.pathfinding;
-        const mark_ns = if (comptime runtime_perf_log.enabled) pathfinding.perf.mark_off_main_ns + pathfinding.perf.mark_inline_ns + pathfinding.perf.mark_main_ns else 0;
+        const mark_ns = pathfinding.perf.mark_off_main_ns + pathfinding.perf.mark_inline_ns + pathfinding.perf.mark_main_ns;
         const start_ns = suite.nowNs(self.io);
         const stats = try pathfinding.reactToPostCommitNavEvents(frame, &self.pipeline.static_colliders, &self.base.world, self.threads);
         self.last_reaction_ns = mark_ns + suite.elapsedNs(start_ns, suite.nowNs(self.io));
@@ -1425,7 +1425,7 @@ const NavFixture = struct {
     // The most recent reaction's main-thread split: its wall time outside worker dispatches.
     fn lastNavMain(self: *const NavFixture) suite.NavMainSummary {
         var summary = suite.NavMainSummary{};
-        const off_main_ns = if (comptime runtime_perf_log.enabled) self.last_stats.perf.off_main_stage_ns else 0;
+        const off_main_ns = self.last_stats.perf.off_main_stage_ns;
         summary.add(self.last_reaction_ns -| off_main_ns, self.last_stats);
         summary.endSample();
         return summary;
@@ -1577,8 +1577,8 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.nav_conn = suite.navConnSummary(timed_stats, fixtures.floodTunerWorkersOf(tuners, case));
     stats.nav_main = timed_main;
     stats.batch = suite.batchSummaryFromBatch(timed_stats.remask_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(suite.perfBatch(timed_stats.perf, "plan_batch"));
-    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(timed_stats.perf, "patch_batch"));
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(timed_stats.perf.plan_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(timed_stats.perf.patch_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(tuners.nav.getPtrConst(.remask)), remask_settled);
         stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(tuners.nav.getPtrConst(.patch)), patch_settled);
@@ -1667,11 +1667,11 @@ fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, frame: *
         nav.noteFlood(reverting);
         if (!reverting) {
             timing.forward = nav_stats;
-            timing.forward_mark = suite.perfBatch(nav.pipeline.pathfinding.perf, "last_mark_batch");
+            timing.forward_mark = nav.pipeline.pathfinding.perf.last_mark_batch;
         }
         timing.nav_ns += nav_elapsed_ns;
         timing.elapsed_ns += nav_elapsed_ns;
-        const nav_off_main_ns = if (comptime runtime_perf_log.enabled) nav_stats.perf.off_main_stage_ns else 0;
+        const nav_off_main_ns = nav_stats.perf.off_main_stage_ns;
         timing.nav_off_main_ns += nav_off_main_ns;
         timing.nav_main.add(nav_elapsed_ns -| nav_off_main_ns, nav_stats);
     }
@@ -1888,13 +1888,12 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         forward_mark = timing.forward_mark;
         nav_main.merge(timing.nav_main);
         nav_main.endSample();
-        if (comptime runtime_perf_log.enabled) {
-            if (enclose) |config| {
-                if (forward.perf.conn_splits != config.pockets()) return error.NavEnclosePocketsNotSplit;
-            }
+        if (enclose) |config| {
+            if (forward.perf.conn_splits != config.pockets()) return error.NavEnclosePocketsNotSplit;
         }
         const elapsed_ns = timing.elapsed_ns;
         accumulator.record(elapsed_ns, forward.remask_batch);
+        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ forward.perf.plan_batch, forward.remask_batch, forward.perf.patch_batch, forward_mark });
         plan_total += timing.terrain.plan_ns;
         write_total += timing.terrain.write_ns;
         nav_total += timing.nav_ns;
@@ -1910,8 +1909,8 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     stats.nav_main = nav_main;
     stats.batch = suite.batchSummaryFromBatch(forward.remask_batch);
     stats.nav_mark_batch = suite.batchSummaryFromBatch(forward_mark);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(suite.perfBatch(forward.perf, "plan_batch"));
-    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(forward.perf, "patch_batch"));
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(forward.perf.plan_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(forward.perf.patch_batch);
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         stats.terrain_edit_phases = .{

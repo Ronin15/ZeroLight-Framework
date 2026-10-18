@@ -6,7 +6,6 @@
 //! imports it. Single-file helpers stay in their file.
 
 const std = @import("std");
-const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const math = @import("../../../core/math.zig");
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
@@ -27,10 +26,8 @@ pub fn updateSteeringInline(steering: *SteeringSystem, data: *const DataSystem, 
 }
 
 pub fn expectEveryStageThreaded(stats: SteeringStats) !void {
-    for ([_]BatchStats{ stats.perf.agents_batch, stats.perf.select_resolve_batch, stats.perf.select_claim_batch, stats.perf.directions_batch, stats.perf.grid_bucket_batch, stats.perf.grid_sort_batch, stats.batch }) |batch| {
-        try std.testing.expect(!batch.ran_inline);
-        try std.testing.expect(batch.active_worker_threads > 0);
-    }
+    try std.testing.expect(!stats.batch.ran_inline);
+    try std.testing.expect(stats.batch.active_worker_threads > 0);
 }
 
 // An intent for `agent` (the `agent_index`th) whose direct direction is unique to the

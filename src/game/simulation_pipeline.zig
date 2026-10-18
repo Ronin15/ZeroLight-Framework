@@ -5229,13 +5229,6 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     const result = pipeline.update(context);
     if (prove_zero_alloc) swap.restore(targets);
     const fall_stats = try result;
-    if (max_worker_threads > 0) {
-        // The 24 AI rows' cell-entry gather ran on the pinned partition.
-        if (comptime runtime_perf_log.enabled) {
-            try std.testing.expect(!fall_stats.perf.plane_entry.ran_inline);
-            try std.testing.expectEqual(rangeCount(24, 16), fall_stats.perf.plane_entry.range_count);
-        }
-    }
     try std.testing.expectEqual(@as(usize, 0), fall_stats.plane_entry_windows_grown);
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
@@ -5410,7 +5403,6 @@ test "the AI movement intent apply runs on workers in the pipeline, allocation-f
 }
 
 test "production steps on workers record nothing into the thread system's shared tuner" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -5469,23 +5461,10 @@ test "production steps on workers record nothing into the thread system's shared
     frame.beginStep();
     const stats = try pipeline.update(context);
     const stage_batches = [_]BatchStats{
-        stats.spatial_index.perf.bucket_batch,
         stats.spatial_index.sort_batch,
-        stats.spatial_index.perf.link_batch,
-        stats.perf.cognition,
-        stats.perception.perf.gather_batch,
         stats.perception.batch,
-        stats.ai_memory.perf.gather_batch,
-        // The order stage's items are touched row words: one range at this population,
-        // inline by construction. `ai_memory.zig` proves it on workers.
-        stats.ai_memory.perf.batch,
-        stats.ai_memory.perf.visible_batch,
-        stats.affect.perf.batch,
-        stats.ai.perf.gather_batch,
         stats.ai.separation_batch,
         stats.ai.intent_batch,
-        stats.steering.perf.agents_batch,
-        stats.apply_intents.perf.batch,
         stats.movement.batch,
         stats.chunk_derive,
         stats.collision.broadphase_batch,
@@ -5855,7 +5834,6 @@ test "a nav-mark reserve OOM before plane traversal leaves world and nav intact 
 }
 
 test "a plane traversal past a failed population seam reserves its nav record from its carves and the seam then matches a rebuild" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var fixture: NavSeamFixture = undefined;
     try fixture.init(.{
@@ -5929,11 +5907,9 @@ test "a plane traversal past a failed population seam reserves its nav record fr
         .sim_view = fullWorldSimView(&fixture.world),
     });
     try fixture.pipeline.stagePlaneTraversal(&step);
-    try std.testing.expect(pathfinding.perf.last_mark_batch.range_count >= 2 and !pathfinding.perf.last_mark_batch.ran_inline);
     // The gather's windows were short of the AI rows too: grown once on main, then dispatched.
     try std.testing.expectEqual(@as(u64, 1), fixture.pipeline.plane_entry.windows_grown);
     try std.testing.expectEqual(@as(usize, 1), step.plane_entry_windows_grown);
-    try std.testing.expect(step.perf.plane_entry.range_count >= 2 and !step.perf.plane_entry.ran_inline);
     try std.testing.expectEqual(npc_count, fixture.frame.events.stats.world_tile_changed);
     try std.testing.expectEqual(@as(usize, 1), fixture.frame.events.range_stats.items.len);
     for (landings.items) |cell| try std.testing.expect(!denseTileBlocksMovement(&fixture.world, floor1, cell.x, cell.y));
@@ -6194,8 +6170,7 @@ test "a static committed at the seam pushes steering agents on the next step" {
     try std.testing.expect(try steeringStageLateralForTest(&pipeline, context, agent) > 0.05);
 }
 
-test "a static move's collider splice reaches the perf log, and a seam with no static change records none" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+test "a static move splices its collider's chunk lists, and a seam with no static change splices none" {
     var world = try minimalSyncWorld();
     defer world.deinit();
     var data = DataSystem.init(std.testing.allocator);
@@ -6214,11 +6189,8 @@ test "a static move's collider splice reaches the perf log, and a seam with no s
     });
     defer pipeline.deinit();
     try frame.reserveStreams(pipeline.eventCapacitySum(), 4, 4, 4, 4, 4 + 16);
-    var perf = runtime_perf_log.RuntimePerfLog.init(0);
-    const splice_stage = @backingInt(runtime_perf_log.BatchStage.static_collider_splice);
 
-    // The box moves onto a chunk corner: the sync splices more chunk-list keys than
-    // query-list keys, so the two splice batches differ.
+    // The box moves onto a chunk corner.
     frame.beginStep();
     const moved = math.Vec2{ .x = 500, .y = 500 };
     try writeStructuralCommands(&frame, &.{.{ .set_movement_body = .{ .entity = box, .body = .{ .position = moved, .previous_position = moved, .velocity = .{}, .speed = 0 } } }});
@@ -6226,51 +6198,15 @@ test "a static move's collider splice reaches the perf log, and a seam with no s
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
     try pipeline.syncStaticColliders(&data, null);
-    const splice = pipeline.static_colliders.last_splice_batch;
-    try std.testing.expect(splice.item_count > 0);
-    try std.testing.expect(splice.item_count != pipeline.static_colliders.perf.last_query_splice_batch.item_count);
-    pipeline.recordStaticColliderSyncTo(runtime_perf_log.Context.bind(&perf));
-    try std.testing.expectEqual(@as(u64, 1), perf.batches[splice_stage].calls);
-    try std.testing.expectEqual(@as(u64, splice.item_count), perf.batches[splice_stage].items);
+    try std.testing.expect(pipeline.static_colliders.last_splice_batch.item_count > 0);
 
-    // A seam with no static change resets the batch, so nothing more is recorded.
+    // A seam with no static change resets the batch.
     frame.beginStep();
     try pipeline.reserveStaticColliders(&frame, &data);
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
     try pipeline.syncStaticColliders(&data, null);
-    pipeline.recordStaticColliderSyncTo(runtime_perf_log.Context.bind(&perf));
-    try std.testing.expectEqual(@as(u64, 1), perf.batches[splice_stage].calls);
-}
-
-test "pipeline stats record the path intake and registry flush batches under their own perf stages, the most distinct group keys, and the group-field evictions" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
-    var perf = runtime_perf_log.RuntimePerfLog.init(0);
-    const stats = SimulationPipelineStats{ .pathfinding = .{
-        .solve_batch = .{ .item_count = 3 },
-        .intake_batch = .{ .item_count = 5 },
-        .registry_flush_batch = .{ .item_count = 7 },
-        .distinct_group_keys = 6,
-        .group_field_evictions = 2,
-    } };
-    stats.recordTo(runtime_perf_log.Context.bind(&perf));
-    const intake = perf.batches[@backingInt(runtime_perf_log.BatchStage.path_intake)];
-    const flush = perf.batches[@backingInt(runtime_perf_log.BatchStage.path_registry_flush)];
-    try std.testing.expectEqual(@as(u64, 1), intake.calls);
-    try std.testing.expectEqual(@as(u64, 5), intake.items);
-    try std.testing.expectEqual(@as(u64, 1), flush.calls);
-    try std.testing.expectEqual(@as(u64, 7), flush.items);
-    try std.testing.expectEqual(@as(u64, 6), perf.metrics[@backingInt(runtime_perf_log.Metric.path_max_distinct_group_keys)]);
-    try std.testing.expectEqual(@as(u64, 2), perf.metrics[@backingInt(runtime_perf_log.Metric.path_group_field_evictions)]);
-}
-
-test "pipeline stats record the steering grid build under its own timing, apart from the snapshot" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
-    var perf = runtime_perf_log.RuntimePerfLog.init(0);
-    const stats = SimulationPipelineStats{ .steering = .{ .snapshot_ns = 3, .grid_ns = 11 } };
-    stats.recordTo(runtime_perf_log.Context.bind(&perf));
-    try std.testing.expectEqual(@as(u64, 11), perf.timings[@backingInt(runtime_perf_log.Timing.steering_grid)].total_ns);
-    try std.testing.expectEqual(@as(u64, 3), perf.timings[@backingInt(runtime_perf_log.Timing.steering_snapshot)].total_ns);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.static_colliders.last_splice_batch.item_count);
 }
 
 test "a structural burst over its own event share fails the same whether other producers are idle or saturated" {

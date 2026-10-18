@@ -25,7 +25,6 @@
 //! share, and its time per entry.
 
 const std = @import("std");
-const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
@@ -347,13 +346,13 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         const start_ns = suite.nowNs(io);
         entries = try runStage(&fixture, thread_ptr);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        const gather = suite.perfBatch(plane_entry.perf, "last_batch");
-        if (comptime runtime_perf_log.enabled) std.debug.assert(!expect_dispatch or (gather.range_count > 1 and !gather.ran_inline));
+        const gather = plane_entry.perf.last_batch;
+        std.debug.assert(!expect_dispatch or (gather.range_count > 1 and !gather.ran_inline));
         accumulator.record(elapsed_ns, gather);
         // Main is everything but the stages that ran on workers: the gather, the carve
         // batch's plan and write stages, and the nav mark stage.
         var off_main: u64 = 0;
-        for ([_]@TypeOf(gather){ gather, suite.perfBatch(fixture.world.perf, "last_terrain_edit_plan_batch"), suite.perfBatch(fixture.world.perf, "last_terrain_edit_write_batch"), suite.perfBatch(fixture.nav.perf, "last_mark_batch") }) |batch| {
+        for ([_]@TypeOf(gather){ gather, fixture.world.perf.last_terrain_edit_plan_batch, fixture.world.perf.last_terrain_edit_write_batch, fixture.nav.perf.last_mark_batch }) |batch| {
             if (!batch.ran_inline) off_main += batch.batch_duration_ns;
         }
         main_total += elapsed_ns -| off_main;

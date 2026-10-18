@@ -1145,7 +1145,6 @@ const testWorldMeta = @import("test_support.zig").testWorldMeta;
 const testMinimalSurfaceWorld = @import("test_support.zig").testMinimalSurfaceWorld;
 const bruteForceLevelBlocked = @import("test_support.zig").bruteForceLevelBlocked;
 const TerrainTestTiles = @import("test_support.zig").TerrainTestTiles;
-const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const level_z_step = @import("system.zig").level_z_step;
 const world_gpu_tiles = @import("gpu_tiles.zig");
 
@@ -1956,8 +1955,7 @@ test "repeated dig and fill of one cell re-uniforms its block and reuses one poo
     }
 }
 
-test "terrain pool growth is counted at its reserve seam and pool reuse counts nothing" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+test "terrain pools grow at their reserve seam, and pool reuse grows nothing" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     // 32x32 tiles in 4x4 chunks: 64 chunks, more than the pools' first growth holds.
@@ -1973,17 +1971,26 @@ test "terrain pool growth is counted at its reserve seam and pool reuse counts n
     const tiles = try TerrainTestTiles.resolve(&world, &meta);
     const level = try world.addLevel(0);
     const layer = try world.addDenseLayer(level, 0, .floor, tiles.dirt);
-    try std.testing.expectEqual(@as(u64, 0), world.perf.terrain_pool_grows);
     try std.testing.expect(!world.terrain_pool_growth_logged);
+    const Pools = struct {
+        blocks: usize,
+        slots: usize,
+
+        fn of(w: *const WorldSystem, lvl: u16, layer_index: usize) @This() {
+            return .{ .blocks = w.dense_layers.items(.store)[layer_index].fills.capacity, .slots = w.level_terrain.items[lvl].blocked.bits.capacity };
+        }
+    };
+    const empty = Pools.of(&world, level, layer);
 
     // The first carve into the solid level grows the block pool and the bits pool.
     _ = try world.setDenseTile(layer, 1, 1, tiles.cave);
-    try std.testing.expectEqual(@as(u64, 2), world.perf.terrain_pool_grows);
     try std.testing.expect(world.terrain_pool_growth_logged);
+    const first = Pools.of(&world, level, layer);
+    try std.testing.expect(first.blocks > empty.blocks and first.slots > empty.slots);
     // The refill releases both; a carve in another chunk reuses them.
     _ = try world.setDenseTile(layer, 1, 1, tiles.dirt);
     _ = try world.setDenseTile(layer, 5, 5, tiles.cave);
-    try std.testing.expectEqual(@as(u64, 2), world.perf.terrain_pool_grows);
+    try std.testing.expectEqual(first, Pools.of(&world, level, layer));
     // A batched carve into every chunk outgrows both pools: one reserve each.
     var writes: [64]DenseCellWrite = undefined;
     var chunks: [64]DenseChunkWrites = undefined;
@@ -1997,7 +2004,8 @@ test "terrain pool growth is counted at its reserve seam and pool reuse counts n
     defer events.deinit(std.testing.allocator);
     try events.ensureTotalCapacity(std.testing.allocator, writes.len);
     try world.applyDenseCellWrites(&chunks, null, &events);
-    try std.testing.expectEqual(@as(u64, 4), world.perf.terrain_pool_grows);
+    const batched = Pools.of(&world, level, layer);
+    try std.testing.expect(batched.blocks > first.blocks and batched.slots > first.slots);
 }
 
 test "a uniform chunk stays uniform while another chunk on its level is edited" {
@@ -2289,14 +2297,6 @@ fn testEditThreads(world: *WorldSystem, threads: *ThreadSystem) TerrainEditThrea
     };
 }
 
-fn editRanInline(world: *const WorldSystem) bool {
-    return world.perf.last_terrain_edit_plan_batch.ran_inline and world.perf.last_terrain_edit_write_batch.ran_inline;
-}
-
-fn editRanThreaded(world: *const WorldSystem) bool {
-    return !world.perf.last_terrain_edit_plan_batch.ran_inline and !world.perf.last_terrain_edit_write_batch.ran_inline;
-}
-
 // Random writes over every layer and cell, biased toward each layer's fill and
 // with repeats, so chunks split, re-uniform, and take several writes per cell.
 fn randomBatchWrites(random: std.Random, tiles: TerrainTestTiles, out: []DenseCellWrite) []DenseCellWrite {
@@ -2320,7 +2320,6 @@ fn randomBatchWrites(random: std.Random, tiles: TerrainTestTiles, out: []DenseCe
 }
 
 test "a batched dense edit is identical inline and threaded and matches its canonical events" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -2339,7 +2338,6 @@ test "a batched dense edit is identical inline and threaded and matches its cano
     defer threaded_events.deinit(std.testing.allocator);
     var write_buffer: [160]DenseCellWrite = undefined;
     var prng = std.Random.DefaultPrng.init(0x53b_7e44);
-    var threaded_batches: usize = 0;
     for (0..40) |_| {
         const writes = randomBatchWrites(prng.random(), tiles, &write_buffer);
         var batch = try ChunkMajorWrites.init(&serial, writes);
@@ -2350,8 +2348,6 @@ test "a batched dense edit is identical inline and threaded and matches its cano
         try threaded_events.ensureTotalCapacity(std.testing.allocator, writes.len);
         try serial.applyDenseCellWrites(batch.chunks.items, null, &serial_events);
         try threaded.applyDenseCellWrites(batch.chunks.items, testEditThreads(&threaded, &threads), &threaded_events);
-        try std.testing.expect(editRanInline(&serial));
-        if (editRanThreaded(&threaded)) threaded_batches += 1;
 
         const before = reference;
         reference.apply(writes);
@@ -2364,11 +2360,9 @@ test "a batched dense edit is identical inline and threaded and matches its cano
         _ = try testSyncGpuTiles(&threaded, 0);
         _ = try testSyncGpuTiles(&serial, 0);
     }
-    try std.testing.expect(threaded_batches > 0);
 }
 
-test "a terrain edit worker cap of zero keeps the plan and write stages inline on a multi-worker ThreadSystem and writes the same terrain and events" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+test "a terrain edit worker cap of zero on a multi-worker ThreadSystem writes the same terrain and events" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -2387,7 +2381,6 @@ test "a terrain edit worker cap of zero keeps the plan and write stages inline o
     defer capped_events.deinit(std.testing.allocator);
     var write_buffer: [160]DenseCellWrite = undefined;
     var prng = std.Random.DefaultPrng.init(0x53b_7e44);
-    var threaded_batches: usize = 0;
     for (0..40) |_| {
         const writes = randomBatchWrites(prng.random(), tiles, &write_buffer);
         var batch = try ChunkMajorWrites.init(&uncapped, writes);
@@ -2400,21 +2393,9 @@ test "a terrain edit worker cap of zero keeps the plan and write stages inline o
         var capped_threads = testEditThreads(&capped, &threads);
         capped_threads.controls.max_worker_threads = 0;
         try capped.applyDenseCellWrites(batch.chunks.items, capped_threads, &capped_events);
-        for ([_][2]BatchStats{
-            .{ uncapped.perf.last_terrain_edit_plan_batch, capped.perf.last_terrain_edit_plan_batch },
-            .{ uncapped.perf.last_terrain_edit_write_batch, capped.perf.last_terrain_edit_write_batch },
-        }) |pair| {
-            try std.testing.expectEqual(pair[0].item_count, pair[1].item_count);
-            try std.testing.expect(pair[1].ran_inline and pair[1].active_worker_threads == 0);
-        }
-        if (uncapped.perf.last_terrain_edit_plan_batch.worker_thread_ranges != 0 and uncapped.perf.last_terrain_edit_write_batch.worker_thread_ranges != 0) {
-            try std.testing.expect(editRanThreaded(&uncapped));
-            threaded_batches += 1;
-        }
         try std.testing.expectEqualSlices(WorldTileChangedEvent, uncapped_events.items, capped_events.items);
         try expectTerrainBytesEqual(&uncapped, &capped);
     }
-    try std.testing.expect(threaded_batches > 0);
 }
 
 test "a batched dense edit composes the same tiles and blocked cells as single-cell writes" {
@@ -2477,7 +2458,6 @@ fn addRandomSparseTiles(world: *WorldSystem, tiles: TerrainTestTiles, seed: u64,
 }
 
 test "a batched dense edit over many sparse tiles is identical inline, threaded, and as single-cell writes" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -2499,7 +2479,6 @@ test "a batched dense edit over many sparse tiles is identical inline, threaded,
     defer threaded_events.deinit(std.testing.allocator);
     var write_buffer: [160]DenseCellWrite = undefined;
     var prng = std.Random.DefaultPrng.init(0x5ba7_5e01);
-    var threaded_batches: usize = 0;
     for (0..40) |_| {
         const writes = randomBatchWrites(prng.random(), tiles, &write_buffer);
         var batch = try ChunkMajorWrites.init(&serial, writes);
@@ -2511,7 +2490,6 @@ test "a batched dense edit over many sparse tiles is identical inline, threaded,
         try serial.applyDenseCellWrites(batch.chunks.items, null, &serial_events);
         try threaded.applyDenseCellWrites(batch.chunks.items, testEditThreads(&threaded, &threads), &threaded_events);
         for (writes) |write| _ = try writeDenseTileCell(&single, write.layer, write.x, write.y, write.tile);
-        if (editRanThreaded(&threaded)) threaded_batches += 1;
 
         try std.testing.expectEqualSlices(WorldTileChangedEvent, serial_events.items, threaded_events.items);
         try expectTerrainBytesEqual(&serial, &threaded);
@@ -2525,11 +2503,9 @@ test "a batched dense edit over many sparse tiles is identical inline, threaded,
         _ = try testSyncGpuTiles(&serial, 0);
         _ = try testSyncGpuTiles(&single, 0);
     }
-    try std.testing.expect(threaded_batches > 0);
 }
 
 test "a batched dense edit over sparse tiles in short border chunks is identical inline, threaded, and as single-cell writes" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -2567,7 +2543,6 @@ test "a batched dense edit over sparse tiles in short border chunks is identical
     var threaded_events: std.ArrayList(WorldTileChangedEvent) = .empty;
     defer threaded_events.deinit(std.testing.allocator);
     var write_buffer: [160]DenseCellWrite = undefined;
-    var threaded_batches: usize = 0;
     for (0..40) |_| {
         // Random writes over the whole level, biased toward each layer's fill so
         // chunks split and re-uniform.
@@ -2591,7 +2566,6 @@ test "a batched dense edit over sparse tiles in short border chunks is identical
         try serial.applyDenseCellWrites(batch.chunks.items, null, &serial_events);
         try threaded.applyDenseCellWrites(batch.chunks.items, testEditThreads(&threaded, &threads), &threaded_events);
         for (writes) |write| _ = try writeDenseTileCell(&single, write.layer, write.x, write.y, write.tile);
-        if (editRanThreaded(&threaded)) threaded_batches += 1;
 
         try std.testing.expectEqualSlices(WorldTileChangedEvent, serial_events.items, threaded_events.items);
         try expectTerrainBytesEqual(&serial, &threaded);
@@ -2610,11 +2584,9 @@ test "a batched dense edit over sparse tiles in short border chunks is identical
         _ = try testSyncGpuTiles(&serial, 0);
         _ = try testSyncGpuTiles(&single, 0);
     }
-    try std.testing.expect(threaded_batches > 0);
 }
 
 test "a batched dense edit marks resident layers identically inline and threaded and the next sync matches the CPU" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -2636,7 +2608,6 @@ test "a batched dense edit marks resident layers identically inline and threaded
     defer events.deinit(std.testing.allocator);
     var write_buffer: [160]DenseCellWrite = undefined;
     var prng = std.Random.DefaultPrng.init(0x64_9b);
-    var threaded_batches: usize = 0;
     for (0..20) |_| {
         const writes = randomBatchWrites(prng.random(), tiles, &write_buffer);
         var batch = try ChunkMajorWrites.init(&serial, writes);
@@ -2646,7 +2617,6 @@ test "a batched dense edit marks resident layers identically inline and threaded
         try serial.applyDenseCellWrites(batch.chunks.items, null, &events);
         events.clearRetainingCapacity();
         try threaded.applyDenseCellWrites(batch.chunks.items, testEditThreads(&threaded, &threads), &events);
-        if (editRanThreaded(&threaded)) threaded_batches += 1;
         // Marks and flags are part of the compared bytes.
         try expectTerrainBytesEqual(&serial, &threaded);
 
@@ -2660,7 +2630,6 @@ test "a batched dense edit marks resident layers identically inline and threaded
         try expectGpuStoreMatches(&threaded, &threaded_gpu);
         try std.testing.expect(!serial.resident_layers_changed and !threaded.resident_layers_changed);
     }
-    try std.testing.expect(threaded_batches > 0);
 }
 
 test "edits between syncs allocate nothing for the GPU, rendered or not (FailingAllocator)" {
@@ -2803,7 +2772,6 @@ fn batchEditAllocationTest(meta: *const WorldTilesetMeta, threads: *ThreadSystem
     world.allocator = std.testing.allocator;
     if (result) |_| {
         try std.testing.expect(!failing.has_induced_failure);
-        if (comptime runtime_perf_log.enabled) try std.testing.expect(editRanThreaded(&world));
         try expectTerrainMatchesReference(&world, reference.layers);
         return true;
     } else |err| {
@@ -2816,7 +2784,6 @@ fn batchEditAllocationTest(meta: *const WorldTilesetMeta, threads: *ThreadSystem
         try std.testing.expectEqual(@as(usize, 0), events.items.len);
         // The retry succeeds and lands the whole batch.
         try world.applyDenseCellWrites(batch.chunks.items, edit_threads, &events);
-        if (comptime runtime_perf_log.enabled) try std.testing.expect(editRanThreaded(&world));
         try expectTerrainMatchesReference(&world, reference.layers);
         return false;
     }
@@ -2837,7 +2804,6 @@ test "a batched dense edit fails cleanly at every allocation on the multi-worker
 }
 
 test "a warmed batched dense edit allocates nothing (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -2875,7 +2841,6 @@ test "a warmed batched dense edit allocates nothing (FailingAllocator)" {
         events.clearRetainingCapacity();
         try world.applyDenseCellWrites(batch.chunks.items, edit_threads, &events);
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-        try std.testing.expect(editRanThreaded(&world));
         try std.testing.expectEqual(writes.len, events.items.len);
     }
 }
@@ -2942,7 +2907,6 @@ fn randomWideBandWrites(random: std.Random, tiles: TerrainTestTiles, out: []Dens
 }
 
 test "a level grows past 64 bands and a batched edit across all of them is identical inline and threaded and matches single-cell writes" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -2967,7 +2931,6 @@ test "a level grows past 64 bands and a batched edit across all of them is ident
     defer threaded_events.deinit(std.testing.allocator);
     var write_buffer: [200]DenseCellWrite = undefined;
     var prng = std.Random.DefaultPrng.init(0x70_ba5d);
-    var threaded_batches: usize = 0;
     for (0..30) |_| {
         const writes = randomWideBandWrites(prng.random(), tiles, &write_buffer);
         var batch = try ChunkMajorWrites.init(&serial, writes);
@@ -2979,7 +2942,6 @@ test "a level grows past 64 bands and a batched edit across all of them is ident
         try serial.applyDenseCellWrites(batch.chunks.items, null, &serial_events);
         try threaded.applyDenseCellWrites(batch.chunks.items, testEditThreads(&threaded, &threads), &threaded_events);
         for (writes) |write| _ = try writeDenseTileCell(&single, write.layer, write.x, write.y, write.tile);
-        if (editRanThreaded(&threaded)) threaded_batches += 1;
         reference.apply(writes);
 
         try std.testing.expectEqualSlices(WorldTileChangedEvent, serial_events.items, threaded_events.items);
@@ -2992,7 +2954,6 @@ test "a level grows past 64 bands and a batched edit across all of them is ident
         _ = try testSyncGpuTiles(&serial, 0);
         _ = try testSyncGpuTiles(&single, 0);
     }
-    try std.testing.expect(threaded_batches > 0);
 }
 
 test "a multi-level cave-in lands in one batched step and refills to uniform chunks" {
@@ -3099,7 +3060,6 @@ test "a 1x1 border chunk turning uniform at another tile reads back from the GPU
 }
 
 test "a one-chunk batched dense edit runs inline" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -3119,15 +3079,11 @@ test "a one-chunk batched dense edit runs inline" {
     defer events.deinit(std.testing.allocator);
     try events.ensureTotalCapacity(std.testing.allocator, writes.len);
     try world.applyDenseCellWrites(&chunks, testEditThreads(&world, &threads), &events);
-    try std.testing.expect(editRanInline(&world));
-    try std.testing.expectEqual(@as(usize, 1), world.perf.last_terrain_edit_plan_batch.item_count);
-    try std.testing.expectEqual(@as(usize, 1), world.perf.last_terrain_edit_write_batch.item_count);
     try std.testing.expectEqual(@as(usize, 3), events.items.len);
     try std.testing.expect(world.levelBlocksMovement(0, 2, 1));
 }
 
 test "a batched dense edit blocks and reopens a whole short border chunk" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -3164,7 +3120,6 @@ test "a batched dense edit blocks and reopens a whole short border chunk" {
     defer events.deinit(std.testing.allocator);
     try events.ensureTotalCapacity(std.testing.allocator, 5);
     try world.applyDenseCellWrites(&block_chunks, testEditThreads(&world, &threads), &events);
-    try std.testing.expect(editRanThreaded(&world));
     try std.testing.expectEqual(@as(usize, 5), events.items.len);
     // Every in-level cell blocked: the corner's slot went back and it reads BLOCKED.
     try std.testing.expectEqual(ChunkForm.blocked, world.levelChunkBlockedForm(0, corner));

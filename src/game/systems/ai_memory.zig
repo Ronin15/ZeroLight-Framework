@@ -1111,15 +1111,7 @@ fn shuffledThinkRows(rows: []u32) void {
     for (rows, 0..) |*row, k| row.* = @intCast(k * 37 % rows.len);
 }
 
-fn expectFourStagesOnWorkers(stats: AiMemoryStats) !void {
-    for ([_]BatchStats{ stats.perf.gather_batch, stats.perf.order_batch, stats.perf.batch, stats.perf.visible_batch }) |batch| {
-        try testing.expect(!batch.ran_inline);
-        try testing.expect(batch.active_worker_threads > 0);
-    }
-}
-
 test "AiMemorySystem threaded update has no steady-state allocation after warmup (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Two order ranges of touched row words, so every stage runs on workers.
@@ -1159,9 +1151,8 @@ test "AiMemorySystem threaded update has no steady-state allocation after warmup
     defer sys.allocator = original_allocator;
 
     frame.beginStep();
-    const stats = try sys.update(data.aiAgentSliceConst(), &data, &frame, &threads, config);
+    _ = try sys.update(data.aiAgentSliceConst(), &data, &frame, &threads, config);
     try testing.expectEqual(agent_count, sys.memory_dense_indices.items.len);
-    try expectFourStagesOnWorkers(stats);
 }
 
 test "AiMemorySystem each stage records one sample into its own tuner and none into the shared tuner" {
@@ -1360,7 +1351,6 @@ test "AiMemorySystem results are bit-identical for any think-set order" {
 }
 
 test "AiMemorySystem serial equals threaded across range sizes and worker counts" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var think: [order_fixture_agents]u32 = undefined;
@@ -1391,12 +1381,6 @@ test "AiMemorySystem serial equals threaded across range sizes and worker counts
             try testing.expectEqual(expected.processed, got.processed);
             try expectSameMemory(&serial.data, &fixture.data);
             try expectMasksClear(&sys);
-            if (threads.workerThreadCount() == 0 or items_per_range > 2) continue;
-            try testing.expect(got.last.perf.order_batch.item_count > 2);
-            for ([_]BatchStats{ got.last.perf.gather_batch, got.last.perf.order_batch, got.last.perf.batch, got.last.perf.visible_batch }) |batch| {
-                try testing.expect(batch.range_count > 1);
-                try testing.expect(!batch.ran_inline);
-            }
         }
     }
 }

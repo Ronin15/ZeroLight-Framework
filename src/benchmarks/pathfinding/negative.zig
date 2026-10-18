@@ -8,7 +8,6 @@
 //! bytes against its charge (`nav_size.checkNavBytes`).
 
 const std = @import("std");
-const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../../app/thread_system.zig").offMainNs;
 const DataSystem = @import("../../game/data_system.zig").DataSystem;
@@ -228,7 +227,7 @@ fn runPocketUpdate(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture
     const stats = try runColdOnce(&fixture.system, &fixture.stream, thread_system, case, count, count, count);
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
     if (stats.available_results != 0) return error.PocketGoalReached;
-    if (stats.dropped_requests != 0 or (runtime_perf_log.enabled and stats.perf.start_invalid_dropped != 0)) return error.PocketRequestDropped;
+    if (stats.dropped_requests != 0 or stats.perf.start_invalid_dropped != 0) return error.PocketRequestDropped;
     if (stats.solved_requests != 0 or stats.accepted_requests != 0 or stats.cache_hits != 0) return error.PocketSearched;
     if (stats.unavailable_results != count) return error.PocketNotAnsweredAtIntake;
     return .{ .elapsed_ns = elapsed_ns, .stats = stats };
@@ -535,8 +534,8 @@ const ResolveReport = struct {
 
     fn add(self: *ResolveReport, resolve: GoalResolveStats) void {
         self.samples += 1;
-        const scan = suite.perfBatch(resolve.perf, "scan_batch");
-        const project = suite.perfBatch(resolve.perf, "project_batch");
+        const scan = resolve.perf.scan_batch;
+        const project = resolve.perf.project_batch;
         self.shapes.add(.{ scan, project });
         self.off_main_ns += offMainNs(scan) + offMainNs(project);
     }
@@ -576,7 +575,7 @@ fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixtur
     const stats = try runColdOnce(&fixture.system, &fixture.stream, thread_system, case, count, count, count);
     var elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
     if (stats.available_results != 0) return error.NegativeBurstGoalReached;
-    if (stats.dropped_requests != 0 or (runtime_perf_log.enabled and stats.perf.start_invalid_dropped != 0)) return error.NegativeBurstRequestDropped;
+    if (stats.dropped_requests != 0 or stats.perf.start_invalid_dropped != 0) return error.NegativeBurstRequestDropped;
     if (stats.unavailable_results != count or stats.pending_requests != 0) return error.NegativeBurstUnanswered;
     if (stats.solved_requests != 0) return error.NegativeBurstSearched;
     const status_start_ns = suite.nowNs(io);
@@ -618,7 +617,7 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
         const burst = try runBurst(io, case, config.variant, &fixture, thread_ptr);
         resolve_report.add(burst.resolve);
         // The update's stages and main share; the resolve's worker time prints on its own.
-        stage_report.add(burst.elapsed_ns -| (offMainNs(suite.perfBatch(burst.resolve.perf, "scan_batch")) + offMainNs(suite.perfBatch(burst.resolve.perf, "project_batch"))), burst.stats);
+        stage_report.add(burst.elapsed_ns -| (offMainNs(burst.resolve.perf.scan_batch) + offMainNs(burst.resolve.perf.project_batch)), burst.stats);
         accumulator.record(burst.elapsed_ns, burst.stats.intake_batch);
         last = burst;
     }

@@ -30,7 +30,6 @@
 //! remask, and patch shapes.
 
 const std = @import("std");
-const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
@@ -259,12 +258,13 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         const elapsed = try runToggle(&fixture, io, thread_ptr);
         accumulator.record(elapsed / 2, inlineBatch(edited_cells, 1));
     }
+    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ fixture.open_stats.perf.plan_batch, fixture.open_stats.remask_batch, fixture.open_stats.perf.patch_batch });
     var stats = accumulator.finish();
     // The stages the opening update ran (the reported tuners' set), so a threaded row the
     // tuner kept inline reads inline.
     stats.batch = suite.batchSummaryFromBatch(fixture.open_stats.remask_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(suite.perfBatch(fixture.open_stats.perf, "plan_batch"));
-    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(fixture.open_stats.perf, "patch_batch"));
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.open_stats.perf.plan_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.open_stats.perf.patch_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.remask)), remask_settled);
         stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.patch)), patch_settled);
@@ -452,15 +452,16 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
         last_stats = result.stats;
         accumulator.record(result.ns, result.stats.remask_batch);
     }
+    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ last_stats.perf.plan_batch, last_stats.remask_batch, last_stats.perf.patch_batch, fixture.system.perf.last_mark_batch });
     var stats = accumulator.finish();
     stats.output_count = chunks_patched;
     stats.candidate_pairs = fixture.body_count;
     // One move per iteration.
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
     stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
-    stats.nav_mark_batch = suite.batchSummaryFromBatch(suite.perfBatch(fixture.system.perf, "last_mark_batch"));
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "plan_batch"));
-    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "patch_batch"));
+    stats.nav_mark_batch = suite.batchSummaryFromBatch(fixture.system.perf.last_mark_batch);
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.perf.plan_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.remask)), remask_settled);
         stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.patch)), patch_settled);
@@ -603,14 +604,14 @@ const StaticDenseFixture = struct {
         if (recreated_at != self.recreated.items.len) return error.StaticRecreatesMissing;
         self.shifted = !self.shifted;
         const splice = self.colliders.last_splice_batch;
-        const query_splice = suite.perfBatch(self.colliders.perf, "last_query_splice_batch");
+        const query_splice = self.colliders.perf.last_query_splice_batch;
         const splice_off_main_ns = offMainNs(splice) + offMainNs(query_splice);
         return .{
             .ns = suite.elapsedNs(start_ns, end_ns),
             .commit_ns = suite.elapsedNs(start_ns, sync_start_ns),
             .sync_ns = suite.elapsedNs(sync_start_ns, nav_start_ns),
             .nav_ns = suite.elapsedNs(nav_start_ns, end_ns),
-            .off_main_ns = splice_off_main_ns + if (comptime runtime_perf_log.enabled) stats.perf.off_main_stage_ns else 0,
+            .off_main_ns = splice_off_main_ns + stats.perf.off_main_stage_ns,
             .stats = stats,
         };
     }
@@ -766,15 +767,16 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         main_total += result.ns -| result.off_main_ns;
         accumulator.record(result.ns, result.stats.remask_batch);
     }
+    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ last_stats.perf.plan_batch, last_stats.remask_batch, last_stats.perf.patch_batch });
     var stats = accumulator.finish();
     stats.output_count = chunks_patched;
     stats.candidate_pairs = static_colliders_test_support.liveRowCount(fixture.colliders);
     stats.items_per_second = suite.itemsPerSecond(change_count, stats.mean_ns);
     stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "plan_batch"));
-    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "patch_batch"));
+    stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.perf.plan_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
     stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_splice_batch);
-    stats.query_splice_batch = suite.batchSummaryFromBatch(suite.perfBatch(fixture.colliders.perf, "last_query_splice_batch"));
+    stats.query_splice_batch = suite.batchSummaryFromBatch(fixture.colliders.perf.last_query_splice_batch);
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         // Plan: the commit; write: the collider sync and record; nav: the reaction.

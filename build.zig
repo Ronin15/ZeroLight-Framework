@@ -117,6 +117,14 @@ pub fn build(b: *std.Build) void {
     const windows_sdl = configureWindowsSdl(b, target.result, system_sdl, sdl_root);
     const windows_sdl_checks = windowsSdlValidateSteps(windows_sdl);
 
+    // Comptime perf-log switch (`runtime_perf_log.enabled`): the game and the tests follow
+    // the mode (Debug and ReleaseSafe on, ReleaseFast and ReleaseSmall off); benches always
+    // have it, since their pass-shape asserts and main-thread shares read the counters.
+    const perf_counters = switch (optimize) {
+        .debug, .safe => true,
+        .fast, .small => false,
+    };
+
     const buildOptions = b.addOptions();
     buildOptions.addOption([]const u8, "app_name", app_name);
     buildOptions.addOption([]const u8, "window_title", window_title);
@@ -125,6 +133,7 @@ pub fn build(b: *std.Build) void {
     buildOptions.addOption(bool, "debug_overlay", debug_overlay);
     buildOptions.addOption(u8, "log_level", @backingInt(log_level));
     buildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
+    buildOptions.addOption(bool, "perf_counters", perf_counters);
 
     const benchBuildOptions = b.addOptions();
     benchBuildOptions.addOption([]const u8, "app_name", app_name);
@@ -134,6 +143,7 @@ pub fn build(b: *std.Build) void {
     benchBuildOptions.addOption(bool, "debug_overlay", debug_overlay);
     benchBuildOptions.addOption(u8, "log_level", @backingInt(bench_log_level));
     benchBuildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
+    benchBuildOptions.addOption(bool, "perf_counters", true);
 
     const testBuildOptions = b.addOptions();
     testBuildOptions.addOption([]const u8, "app_name", app_name);
@@ -143,6 +153,7 @@ pub fn build(b: *std.Build) void {
     testBuildOptions.addOption(bool, "debug_overlay", debug_overlay);
     testBuildOptions.addOption(u8, "log_level", @backingInt(test_log_level));
     testBuildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
+    testBuildOptions.addOption(bool, "perf_counters", perf_counters);
 
     const fetch_sdl_step = b.step("fetch-sdl", "Fetch pinned Windows SDL packages into zig-pkg/ and validate them");
     if (target.result.os.tag != .windows) {

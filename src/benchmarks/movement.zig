@@ -219,7 +219,7 @@ fn applyIntentsOnce(
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });
-    return suite.perfBatch(stats.perf, "batch");
+    return stats.perf.batch;
 }
 
 fn runApplyIntentsScatteredCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {

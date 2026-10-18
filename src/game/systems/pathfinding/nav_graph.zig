@@ -2256,7 +2256,6 @@ test "incremental nav update remask matches the composed world mask across level
 }
 
 test "threaded initial nav build matches a serial build across levels" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // A build given a thread system dispatches its remask and patch stages through it;
     // pinned to a fixed one-chunk partition here so the stages really fan out.
     if (@import("builtin").single_threaded) return error.SkipZigTest;
@@ -2283,7 +2282,6 @@ test "threaded initial nav build matches a serial build across levels" {
     threaded.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     const build_stats = try threaded.graph.rebuild(no_colliders.view(), .{ .world = &world }, .{ .thread_system = &threads, .tuners = &threaded.tuners.nav, .controls = threaded.nav_controls });
     try std.testing.expect(!build_stats.remask_batch.ran_inline);
-    try std.testing.expect(!build_stats.perf.patch_batch.ran_inline);
 
     var serial = PathfindingSystem.init(std.testing.allocator);
     defer serial.deinit();
@@ -2642,7 +2640,6 @@ test "incremental nav update across distant chunks in one batch matches a full r
 }
 
 test "incremental nav update forced-parallel remask and patch match a serial full rebuild" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // The adaptive tuner usually runs a small dig inline, so the threaded remask/patch branches go
     // unexercised. This pins both: forcing adaptive=false with items_per_range=1 over a multi-chunk
     // dig drives the parallel path (asserted via ran_inline == false for BOTH stages), and the
@@ -2688,7 +2685,6 @@ test "incremental nav update forced-parallel remask and patch match a serial ful
 
     // Both stages must have actually threaded, not fallen back to the inline slot-0 path.
     try std.testing.expect(!stats.remask_batch.ran_inline);
-    try std.testing.expect(!stats.perf.patch_batch.ran_inline);
 
     var rebuilt = PathfindingSystem.init(std.testing.allocator);
     defer rebuilt.deinit();
@@ -3070,7 +3066,6 @@ test "a static obstacle commit and its nav reaction are allocation-free at stead
 }
 
 test "remask and patch after reserve allocate nothing on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // The remask's cell blocks and the patch's records and link slots are reserved on the
     // main thread before dispatch; workers only fill what was claimed. This proves it on a
     // real multi-worker ThreadSystem, with a static collider listed in a remasked chunk.
@@ -3131,7 +3126,6 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
         try std.testing.expectEqual(@as(usize, 1), warm_stats.incremental_rebuilds);
         // The warmup itself must have threaded, so the proof below runs the same dispatch.
         try std.testing.expect(!warm_stats.remask_batch.ran_inline);
-        try std.testing.expect(!warm_stats.perf.patch_batch.ran_inline);
     }
 
     const original = system.allocator;
@@ -3146,9 +3140,6 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     // The stages threaded under the failing allocator and allocated nothing.
     try std.testing.expect(!stats.remask_batch.ran_inline);
-    try std.testing.expect(!stats.perf.patch_batch.ran_inline);
-    try std.testing.expect(!stats.perf.conn_seed_batch.ran_inline);
-    try std.testing.expect(!stats.perf.conn_gather_batch.ran_inline);
 
     system.graph.allocator = original;
     system.allocator = original;
@@ -3472,7 +3463,6 @@ test "a nav-record reserve OOM before a cave-in or explosion dense write leaves 
 }
 
 test "one chunk's change leaves every other chunk's record, connectivity nodes, and one-way terminals and rows untouched" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -3502,8 +3492,6 @@ test "one chunk's change leaves every other chunk's record, connectivity nodes, 
     const changed = (try fixture.world.setDenseTile(fixture.obstacle[0], 5, 5, fixture.tree)).?;
     const stats = try test_support.applyTileChange(&system, no_colliders, &fixture.world, changed);
     try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
-    try std.testing.expectEqual(@as(usize, 0), stats.perf.conn_flood_nodes);
-    try std.testing.expectEqual(@as(usize, 0), stats.perf.closure_links);
     const closure_words_after = try test_support.dupeClosureBlocks(std.testing.allocator, &system.graph);
     defer std.testing.allocator.free(closure_words_after);
     try std.testing.expectEqualSlices(u32, closure_words_before, closure_words_after);
@@ -4200,7 +4188,6 @@ test "an all-solid level holds no records; an open level one per chunk" {
 }
 
 test "the threaded key plan equals the inline plan for marks across many chunks and levels" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4249,10 +4236,9 @@ test "the threaded key plan equals the inline plan for marks across many chunks 
         try std.testing.expectEqualSlices(u64, union_keys.items, graph.dirty_keys.items);
     }
     for (systems[1..]) |*system| {
-        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
         // Merged from several ranges that ran on workers.
         try std.testing.expect(system.graph.plan_tallies.items.len > 1);
-        try std.testing.expect(!stats.perf.plan_batch.ran_inline);
         try std.testing.expect(system.graph.plan_levels.isEmpty());
         try std.testing.expectEqualSlices(u64, systems[0].graph.changed_keys.items, system.graph.changed_keys.items);
         try std.testing.expectEqualSlices(u64, systems[0].graph.patch_keys.items, system.graph.patch_keys.items);
@@ -4329,7 +4315,6 @@ test "the threaded plan merge equals the sorted unique keys of every stream for 
 }
 
 test "the threaded key plan equals the inline plan on 65 levels across the plan level set's word boundary" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4382,9 +4367,8 @@ test "the threaded key plan equals the inline plan on 65 levels across the plan 
         try std.testing.expectEqual(@as(usize, 1), inline_graph.plan_tallies.items.len);
         try std.testing.expect(inline_graph.dirty_keys.items.len > inline_graph.changed_keys.items.len);
         for (systems[1..]) |*system| {
-            const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
+            _ = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
             try std.testing.expect(system.graph.plan_tallies.items.len > 1);
-            try std.testing.expect(!stats.perf.plan_batch.ran_inline);
             try std.testing.expect(system.graph.plan_levels.isEmpty());
             try std.testing.expectEqualSlices(u64, inline_graph.changed_keys.items, system.graph.changed_keys.items);
             try std.testing.expectEqualSlices(u64, inline_graph.dirty_keys.items, system.graph.dirty_keys.items);
@@ -4547,7 +4531,6 @@ test "the key plan equals the plan by definition for multi-chunk marks at level 
 }
 
 test "a step's stats fold the plan, remask, and patch stages of its level build and its marks batch" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4563,7 +4546,5 @@ test "a step's stats fold the plan, remask, and patch stages of its level build 
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     const chunks = system.graph.chunkCount();
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
-    try std.testing.expectEqual(@as(usize, 1), stats.perf.plan_batch.item_count);
     try std.testing.expectEqual(chunks + stats.dirty_chunks, stats.remask_batch.item_count);
-    try std.testing.expectEqual(chunks + stats.chunks_patched, stats.perf.patch_batch.item_count);
 }

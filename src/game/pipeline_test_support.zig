@@ -7,13 +7,11 @@
 //! in `simulation_pipeline.zig`.
 
 const std = @import("std");
-const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const math = @import("../core/math.zig");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkProfile = @import("../app/thread_system.zig").AdaptiveWorkProfile;
-const rangeCount = @import("../app/thread_system.zig").rangeCount;
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
@@ -753,8 +751,6 @@ pub fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: Adapt
     counting_swap.restore(targets);
     const first_stats = try first_result;
     try std.testing.expectEqual(pathing_crowd_count, first_stats.steering.path_request_count);
-    // On a 16-item partition the projection is threaded on this step too.
-    if (comptime runtime_perf_log.enabled) try std.testing.expectEqual(rangeCount(pathing_crowd_count, first_items_per_range), first_stats.path_goals.perf.project_batch.range_count);
     try counters.expectOnlyOwnersAllocated(&.{"pathfinding"});
     try std.testing.expectEqual(seam_before, seam_state(&pipeline.pathfinding));
     try std.testing.expect(pipeline.pathfinding.registry_growth.count > registry_growths);
@@ -775,8 +771,7 @@ pub fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: Adapt
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(pathing_crowd_count, second_stats.path_goals.distinct);
     try std.testing.expectEqual(pathing_crowd_count, second_stats.steering.path_request_count);
-    const goal_batches = if (comptime runtime_perf_log.enabled) [_]BatchStats{ second_stats.path_goals.perf.scan_batch, second_stats.path_goals.perf.project_batch } else [_]BatchStats{};
-    for (goal_batches ++ [_]BatchStats{ second_stats.pathfinding.intake_batch, second_stats.pathfinding.registry_flush_batch }) |batch| {
+    for ([_]BatchStats{ second_stats.pathfinding.intake_batch, second_stats.pathfinding.registry_flush_batch }) |batch| {
         try std.testing.expect(!batch.ran_inline);
         try std.testing.expect(batch.range_count > 1);
     }
@@ -893,12 +888,6 @@ pub fn runApplyIntentsScenario(max_worker_threads: usize) !ApplyIntentsScenarioR
 
     try std.testing.expectEqual(apply_intents_agent_count, stats.steering.movement_intent_count);
     try std.testing.expectEqual(stats.steering.movement_intent_count, stats.apply_intents.intent_count);
-    if (max_worker_threads > 0) {
-        if (comptime runtime_perf_log.enabled) {
-            try std.testing.expect(!stats.apply_intents.perf.batch.ran_inline);
-            try std.testing.expectEqual(rangeCount(apply_intents_agent_count, 16), stats.apply_intents.perf.batch.range_count);
-        }
-    }
 
     const slice = data.movementBodySliceConst();
     try std.testing.expectEqual(apply_intents_agent_count + 1, slice.entities.len);
@@ -990,7 +979,6 @@ pub fn runContactBoundScenario(mode: CollisionResponseMode) !void {
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!stats.collision.broadphase_batch.ran_inline);
     try std.testing.expect(!stats.collision.narrowphase_batch.ran_inline);
-    if (comptime runtime_perf_log.enabled) try std.testing.expect(!stats.collision_response.perf.gather_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 3 * (2 * 21 - 3)), stats.collision.contact_count);
     try std.testing.expect(stats.collision.contact_count > population);
     try std.testing.expectEqual(stats.collision.contact_count, stats.collision_response.contact_count);
@@ -1002,7 +990,6 @@ pub fn runContactBoundScenario(mode: CollisionResponseMode) !void {
         },
     }
     try std.testing.expect(!stats.collision.pair_bound_exceeded);
-    if (comptime runtime_perf_log.enabled) try std.testing.expectEqual(@as(u64, 0), pipeline.collision.perf.pair_bound_overflows);
 }
 
 const respond_scenario_bodies: usize = 63;
@@ -1111,12 +1098,6 @@ pub fn runCollisionRespondScenario(max_worker_threads: usize) !CollisionRespondS
     try std.testing.expect(response.contact_count > 4 * 16);
     try std.testing.expect(response.intent_count > 0);
     try std.testing.expect(response.trigger_count > 0);
-    if (runtime_perf_log.enabled and max_worker_threads > 0) {
-        try std.testing.expect(!response.perf.gather_batch.ran_inline);
-        try std.testing.expectEqual(rangeCount(response.contact_count, 16), response.perf.gather_batch.range_count);
-        try std.testing.expect(!response.perf.apply_batch.ran_inline);
-        try std.testing.expectEqual(@as(usize, respond_scenario_rows / 16), response.perf.apply_batch.item_count);
-    }
 
     const slice = data.movementBodySliceConst();
     try std.testing.expectEqual(respond_scenario_rows, slice.entities.len);

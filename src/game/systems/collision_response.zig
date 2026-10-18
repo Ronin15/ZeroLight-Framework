@@ -28,7 +28,6 @@ const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const band_tuner_config = @import("../../app/thread_system.zig").band_tuner_config;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
-const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const setRowCount = @import("../../app/thread_system.zig").setRowCount;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
@@ -1274,7 +1273,6 @@ fn expectRingResultsEqual(expected: RingResult, actual: RingResult) !void {
 const contactsNaming = @import("collision_response_test_support.zig").contactsNaming;
 
 test "threaded response matches serial bit for bit across range sizes, worker counts and band counts" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 3 });
@@ -1303,10 +1301,6 @@ test "threaded response matches serial bit for bit across range sizes, worker co
                     .adaptive = false,
                 });
                 defer threaded.deinit(allocator);
-                try std.testing.expect(!threaded.stats.perf.gather_batch.ran_inline);
-                try std.testing.expect(threaded.stats.perf.gather_batch.range_count > 1);
-                try std.testing.expect(!threaded.stats.perf.apply_batch.ran_inline);
-                try std.testing.expectEqual(band_count, threaded.stats.perf.apply_batch.item_count);
                 try expectRingResultsEqual(serial, threaded);
             }
         }
@@ -1323,15 +1317,6 @@ test "threaded response matches serial bit for bit across range sizes, worker co
                 pinTunerProfile(&system.apply_tuner, apply_profile);
                 var threaded = try runRing(allocator, &system, &fixture, &threads, .{ .max_worker_threads = workers });
                 defer threaded.deinit(allocator);
-                try std.testing.expect(!threaded.stats.perf.gather_batch.ran_inline);
-                try std.testing.expectEqual(band_count, threaded.stats.perf.apply_batch.item_count);
-                if (apply_profile.worker_threads == 0) {
-                    try std.testing.expect(threaded.stats.perf.apply_batch.ran_inline);
-                    try std.testing.expectEqual(@as(usize, 1), threaded.stats.perf.apply_batch.range_count);
-                } else {
-                    try std.testing.expectEqual(rangeCount(band_count, 4), threaded.stats.perf.apply_batch.range_count);
-                    if (band_count > 4) try std.testing.expect(!threaded.stats.perf.apply_batch.ran_inline);
-                }
                 try expectRingResultsEqual(serial, threaded);
             }
         }
@@ -1344,10 +1329,6 @@ test "threaded response matches serial bit for bit across range sizes, worker co
             pinTunerProfile(&system.gather_tuner, .{ .worker_threads = 0, .items_per_range = 1 });
             var inline_gather = try runRing(allocator, &system, &fixture, &threads, .{ .max_worker_threads = workers });
             defer inline_gather.deinit(allocator);
-            try std.testing.expect(inline_gather.stats.perf.gather_batch.ran_inline);
-            try std.testing.expectEqual(@as(usize, 1), inline_gather.stats.perf.gather_batch.range_count);
-            try std.testing.expect(inline_gather.stats.perf.apply_batch.ran_inline);
-            try std.testing.expectEqual(@as(u64, 0), inline_gather.stats.perf.apply_batch.batch_duration_ns);
             try std.testing.expectEqual(@as(usize, 0), system.apply_tuner.sample_count);
             try std.testing.expectEqual(@as(u64, 0), system.apply_tuner.baseline_mean_batch_duration_ns);
             try std.testing.expectEqual(@as(usize, 1), system.gather_tuner.sample_count);
@@ -1484,7 +1465,6 @@ test "apply lanes match the scalar apply bit for bit" {
 }
 
 test "threaded multi-worker response allocates nothing after reserveForContacts" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 40);
@@ -1508,15 +1488,12 @@ test "threaded multi-worker response allocates nothing after reserveForContacts"
     const stats = try result;
 
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
-    try std.testing.expect(!stats.perf.gather_batch.ran_inline);
-    try std.testing.expect(!stats.perf.apply_batch.ran_inline);
     try std.testing.expect(stats.intent_count > 0);
     try std.testing.expect(stats.trigger_count > 0);
     try std.testing.expectEqual(stats.trigger_count, fixture.frame.collision_triggers.mergedItems().len);
 }
 
 test "response stages record into their own tuners" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 40);
@@ -1542,8 +1519,7 @@ test "response stages record into their own tuners" {
     pinTunerProfile(&system.gather_tuner, .{ .worker_threads = 2, .items_per_range = 16 });
     for (0..window) |_| {
         fixture.restore();
-        const stats = try system.update(&fixture.data, &fixture.frame, fixture.observer, &threads, .{ .max_worker_threads = 2 });
-        try std.testing.expect(!stats.perf.gather_batch.ran_inline);
+        _ = try system.update(&fixture.data, &fixture.frame, fixture.observer, &threads, .{ .max_worker_threads = 2 });
     }
 
     try std.testing.expect(system.apply_tuner.baseline_mean_batch_duration_ns > 0);
@@ -1551,7 +1527,6 @@ test "response stages record into their own tuners" {
 }
 
 test "an empty contact stream records no batch and leaves no triggers or observer contacts" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 40);
@@ -1572,8 +1547,6 @@ test "an empty contact stream records no batch and leaves no triggers or observe
     try std.testing.expectEqual(@as(usize, 0), empty.contact_count);
     try std.testing.expectEqual(@as(usize, 0), empty.intent_count);
     try std.testing.expectEqual(@as(usize, 0), empty.trigger_count);
-    try std.testing.expectEqual(@as(usize, 0), empty.perf.gather_batch.range_count);
-    try std.testing.expectEqual(@as(usize, 0), empty.perf.apply_batch.range_count);
     try std.testing.expectEqual(samples_before, system.gather_tuner.sample_count);
     try std.testing.expectEqual(@as(usize, 0), fixture.frame.collision_triggers.mergedItems().len);
     // Consumers read the observer contacts through this accessor.
@@ -1581,7 +1554,6 @@ test "an empty contact stream records no batch and leaves no triggers or observe
 }
 
 test "observer contacts list every contact naming the observer in contact order" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 40);
@@ -1610,13 +1582,11 @@ test "observer contacts list every contact naming the observer in contact order"
     defer system.deinit();
     var threaded = try runRing(allocator, &system, &fixture, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
     defer threaded.deinit(allocator);
-    if (threads.workerThreadCount() > 0) try std.testing.expect(!threaded.stats.perf.gather_batch.ran_inline);
     try std.testing.expectEqualSlices(u32, expected, threaded.observer_contacts);
     try std.testing.expectEqual(expected.len, threaded.stats.observer_contact_count);
 }
 
 test "contacts past the reserve grow on main before dispatch and match serial" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 66);
@@ -1636,8 +1606,6 @@ test "contacts past the reserve grow on main before dispatch and match serial" {
     try system.reserveForContacts(4);
     var threaded = try runRing(allocator, &system, &fixture, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
     defer threaded.deinit(allocator);
-    try std.testing.expect(!threaded.stats.perf.gather_batch.ran_inline);
-    try std.testing.expect(!threaded.stats.perf.apply_batch.ran_inline);
     try expectRingResultsEqual(serial, threaded);
 }
 

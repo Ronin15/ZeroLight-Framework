@@ -44,7 +44,6 @@ const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
-const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const CollisionStats = @import("../game/systems/collision.zig").CollisionStats;
 const CollisionStrips = @import("../game/systems/collision.zig").CollisionStrips;
@@ -272,8 +271,7 @@ fn runShapeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     std.debug.assert(stats.output_count == shape.contacts());
     const stages = stats.collision_stages.?;
     if (stages.entries > shape.bodies() * denseStripsPerBodyBound()) return error.CollisionEntriesPastStripBound;
-    // The sweep counts its visits only with the perf log.
-    if (runtime_perf_log.enabled and stages.visits > stages.entries * denseVisitsPerEntryBound()) return error.CollisionVisitsPastStripBound;
+    if (stages.visits > stages.entries * denseVisitsPerEntryBound()) return error.CollisionVisitsPastStripBound;
     // The header names the config; throughput stays per body.
     stats.item_count = item_count;
     return stats;
@@ -286,6 +284,8 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     defer data.deinit();
     const stats = try measureCase(allocator, io, options, case, item_count, &data, null);
     if (stats.iterations > 0 and stats.output_count != fixtureContacts(item_count, mode)) return error.CollisionContactCountMismatch;
+    // A dense strip's rows overlap in x past one lane group, so the sweep runs its lanes.
+    if (mode == .dense and stats.iterations > 0 and stats.collision_stages.?.simd_groups == 0) return error.CollisionSweepRanNoLanes;
     return stats;
 }
 
@@ -457,7 +457,7 @@ const StaticMover = struct {
     }
 
     fn spliceOffMainNs(self: *const StaticMover) u64 {
-        return offMainNs(self.colliders.last_splice_batch) + offMainNs(suite.perfBatch(self.colliders.perf, "last_query_splice_batch"));
+        return offMainNs(self.colliders.last_splice_batch) + offMainNs(self.colliders.perf.last_query_splice_batch);
     }
 };
 
@@ -486,27 +486,33 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_collision_stats = CollisionStats{};
     var main_total: u128 = 0;
+    // A warm system grows no slot or bound past its reserve again.
+    const warm_overflows = .{ system.perf.entry_bound_overflows, system.perf.pair_bound_overflows };
+    const stage_range = case.stageItemsPerRange(collision_range_alignment_items);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         last_collision_stats = try runOnce(&system, data, mover, &contacts, thread_ptr, case);
         const end_ns = suite.nowNs(io);
+        try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ last_collision_stats.perf.fill_batch, last_collision_stats.perf.sort_batch, last_collision_stats.broadphase_batch, last_collision_stats.narrowphase_batch });
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_collision_stats.broadphase_batch);
         const mover_off_main_ns = if (mover) |static_mover| static_mover.spliceOffMainNs() else 0;
-        const off_main_ns = offMainNs(suite.perfBatch(last_collision_stats.perf, "fill_batch")) + offMainNs(suite.perfBatch(last_collision_stats.perf, "sort_batch")) +
+        const off_main_ns = offMainNs(last_collision_stats.perf.fill_batch) + offMainNs(last_collision_stats.perf.sort_batch) +
             offMainNs(last_collision_stats.broadphase_batch) + offMainNs(last_collision_stats.narrowphase_batch);
         main_total += elapsed_ns -| off_main_ns -| mover_off_main_ns;
     }
 
+    if (system.perf.entry_bound_overflows != warm_overflows[0] or system.perf.pair_bound_overflows != warm_overflows[1]) return error.CollisionWarmStepOverflowed;
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.collision_stages = .{
-        .fill = suite.batchSummaryFromBatch(suite.perfBatch(last_collision_stats.perf, "fill_batch")),
-        .sort = suite.batchSummaryFromBatch(suite.perfBatch(last_collision_stats.perf, "sort_batch")),
+        .fill = suite.batchSummaryFromBatch(last_collision_stats.perf.fill_batch),
+        .sort = suite.batchSummaryFromBatch(last_collision_stats.perf.sort_batch),
         .fill_tuning = if (case.adaptive) suite.workTuningSummary(suite.tunerReport(&system.fill_tuner), fill_settled_before_measurement) else null,
         .sort_tuning = if (case.adaptive) suite.workTuningSummary(suite.tunerReport(&system.sort_tuner), sort_settled_before_measurement) else null,
         .entries = last_collision_stats.entry_count,
-        .visits = if (comptime runtime_perf_log.enabled) last_collision_stats.perf.broadphase_visits else 0,
+        .visits = last_collision_stats.perf.broadphase_visits,
+        .simd_groups = last_collision_stats.broadphase_simd_groups,
     };
     stats.sample_count = item_count;
     stats.candidate_pairs = last_collision_stats.candidate_pair_count;

@@ -28,7 +28,6 @@
 //!   one cell.
 
 const std = @import("std");
-const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
@@ -187,15 +186,16 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
             .none => {},
             .sort => if (last_stats.sort_batch.ran_inline) return error.SortRanInline,
         };
-        accumulator.record(elapsed_ns, suite.perfBatch(last_stats.perf, "bucket_batch"));
-        main_total += elapsed_ns -| (offMainNs(suite.perfBatch(last_stats.perf, "bucket_batch")) + offMainNs(last_stats.sort_batch) + offMainNs(suite.perfBatch(last_stats.perf, "link_batch")));
+        accumulator.record(elapsed_ns, last_stats.perf.bucket_batch);
+        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(spatial_index_range_alignment_items), &.{ last_stats.perf.bucket_batch, last_stats.sort_batch, last_stats.perf.link_batch });
+        main_total += elapsed_ns -| (offMainNs(last_stats.perf.bucket_batch) + offMainNs(last_stats.sort_batch) + offMainNs(last_stats.perf.link_batch));
     }
 
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.output_count = last_stats.entity_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.sort_batch);
-    stats.splice_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "link_batch"));
+    stats.splice_batch = suite.batchSummaryFromBatch(last_stats.perf.link_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.bucket_tuner), bucket_settled_before_measurement);
         stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.sort_tuner), sort_settled_before_measurement);
@@ -522,10 +522,8 @@ fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     std.debug.assert(std.math.isFinite(totals.dist2_sum));
 
     // One fill per key, as the untimed check counted (fills count only with the perf log).
-    if (comptime runtime_perf_log.enabled) {
-        std.debug.assert(totals.block_fills == ownCellRuns(&system, &fixture, order));
-        if (fields.shape == .dense_cell) std.debug.assert(totals.block_fills == 1);
-    }
+    std.debug.assert(totals.block_fills == ownCellRuns(&system, &fixture, order));
+    if (fields.shape == .dense_cell) std.debug.assert(totals.block_fills == 1);
 
     var stats = accumulator.finish();
     stats.items_per_second = suite.itemsPerSecond(query_count, stats.mean_ns);
@@ -642,7 +640,7 @@ fn checkQueries(system: *const SpatialIndexSystem, fixture: *const Fixture, orde
         const wanted = counts.inBox(own_x, own_y, scan_radius) - self_counted;
         std.debug.assert(query_stats.candidate_checks == @min(wanted, query_check_budget));
     }
-    if (comptime runtime_perf_log.enabled) std.debug.assert(block.perf.fills == ownCellRuns(system, fixture, order));
+    std.debug.assert(block.perf.fills == ownCellRuns(system, fixture, order));
 }
 
 fn runQueries(system: *const SpatialIndexSystem, fixture: *const Fixture, order: []const u32, radius: f32, factions: FactionSet) QueryTotals {
@@ -656,7 +654,7 @@ fn runQueries(system: *const SpatialIndexSystem, fixture: *const Fixture, order:
         totals.visits += visitor.visits;
         totals.dist2_sum += visitor.dist2_sum;
     }
-    if (comptime runtime_perf_log.enabled) totals.block_fills = block.perf.fills;
+    totals.block_fills = block.perf.fills;
     return totals;
 }
 

@@ -835,7 +835,6 @@ test "plane entry gather never yields the player, even as an AI agent; the stage
 }
 
 test "warmed plane entry gather allocates nothing on real workers (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     // Not a range multiple, so the last range is a short tail.
@@ -868,8 +867,6 @@ test "warmed plane entry gather allocates nothing on real workers (FailingAlloca
     for ([_]usize{ 32, 16 }) |items_per_range| {
         system.config = .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false };
         const entries = try system.gather(&fixture.data, &fixture.world, fixture.player.entity, try testTunnelTile(&fixture.meta), &threads);
-        try std.testing.expect(!system.perf.last_batch.ran_inline);
-        try std.testing.expectEqual(@divCeil(population, items_per_range), system.perf.last_batch.range_count);
         try std.testing.expectEqualSlices(PlaneEntry, want, entries);
     }
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);

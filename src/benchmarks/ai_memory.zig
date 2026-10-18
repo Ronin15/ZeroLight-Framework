@@ -24,7 +24,6 @@
 //! `visible=` stage shapes (the decay stage is the row's batch).
 
 const std = @import("std");
-const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const ConstAiAgentSlice = @import("../game/data_system.zig").ConstAiAgentSlice;
@@ -180,25 +179,24 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         last_stats = try runOnce(&system, &fixture, run, &threads, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        accumulator.record(elapsed_ns, suite.perfBatch(last_stats.perf, "batch"));
-        if (comptime runtime_perf_log.enabled) main_total += elapsed_ns -| (offMainNs(suite.perfBatch(last_stats.perf, "gather_batch")) + offMainNs(suite.perfBatch(last_stats.perf, "order_batch")) + offMainNs(suite.perfBatch(last_stats.perf, "batch")) + offMainNs(suite.perfBatch(last_stats.perf, "visible_batch")));
+        accumulator.record(elapsed_ns, last_stats.perf.batch);
+        try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(ai_memory_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.perf.order_batch, last_stats.perf.batch, last_stats.perf.visible_batch });
+        main_total += elapsed_ns -| (offMainNs(last_stats.perf.gather_batch) + offMainNs(last_stats.perf.order_batch) + offMainNs(last_stats.perf.batch) + offMainNs(last_stats.perf.visible_batch));
     }
 
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     const think_count = if (think_set) |rows| rows.len else item_count;
     std.debug.assert(system.memory_dense_indices.items.len == think_count);
-    if (comptime runtime_perf_log.enabled) {
-        std.debug.assert(suite.perfBatch(last_stats.perf, "gather_batch").item_count == think_count);
-        std.debug.assert(suite.perfBatch(last_stats.perf, "batch").item_count == think_count);
-        std.debug.assert(suite.perfBatch(last_stats.perf, "visible_batch").item_count == think_count);
-        std.debug.assert(suite.perfBatch(last_stats.perf, "order_batch").item_count == run.touched_words);
-    }
+    std.debug.assert(last_stats.perf.gather_batch.item_count == think_count);
+    std.debug.assert(last_stats.perf.batch.item_count == think_count);
+    std.debug.assert(last_stats.perf.visible_batch.item_count == think_count);
+    std.debug.assert(last_stats.perf.order_batch.item_count == run.touched_words);
     stats.candidate_pairs = system.memory_dense_indices.items.len;
     stats.output_count = fixture.frame.events.stats.entity_perceived;
-    stats.splice_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "gather_batch"));
-    stats.query_splice_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "order_batch"));
-    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "visible_batch"));
+    stats.splice_batch = suite.batchSummaryFromBatch(last_stats.perf.gather_batch);
+    stats.query_splice_batch = suite.batchSummaryFromBatch(last_stats.perf.order_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.visible_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.decay_tuner), settled_before_measurement);
     }

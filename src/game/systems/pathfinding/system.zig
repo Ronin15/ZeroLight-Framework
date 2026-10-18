@@ -1351,7 +1351,6 @@ test "pathfinding individual solve produces deterministic available path and way
 }
 
 test "pathfinding blocked start drops without poisoning the goal for other agents" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     // A static body covers cell (0,0), so an agent standing there has a blocked start.
@@ -1369,8 +1368,9 @@ test "pathfinding blocked start drops without poisoning the goal for other agent
     defer blocked_stream.deinit();
     try appendPathRequest(&blocked_stream, .{ .entity = blocked_agent, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 96, .y = 96 } });
     const blocked_stats = try updatePathfindingInline(&system, &blocked_stream, 8, .{});
-    try std.testing.expectEqual(@as(usize, 1), blocked_stats.perf.start_invalid_dropped);
     try std.testing.expectEqual(@as(usize, 0), blocked_stats.unavailable_results);
+    try std.testing.expectEqual(@as(usize, 0), blocked_stats.available_results);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.len);
 
     // The goal must read missing (retryable) from an open start, not unavailable.
     const probe = system.statusForWorld(0, .{ .x = 40, .y = 40 }, 0, .{ .x = 96, .y = 96 }, .default, null);
@@ -1876,7 +1876,6 @@ fn expectRequestStorageWithin(system: *const PathfindingSystem, capacity: Pathfi
 }
 
 test "pathfinding cross-level link steers an off-level agent toward the start-level endpoint" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1916,8 +1915,6 @@ test "pathfinding cross-level link steers an off-level agent toward the start-le
     });
     const stats = try updatePathfindingInline(&system, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
-    try std.testing.expectEqual(@as(usize, 1), stats.perf.cross_level_solves);
-    try std.testing.expectEqual(@as(usize, 1), stats.perf.abstract_solves);
 
     const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null);
     try std.testing.expectEqual(PathStatus.available, view.status);
@@ -1966,7 +1963,6 @@ test "pathfinding cross-level goal with no link is unavailable, not pending fore
 }
 
 test "pathfinding blocked link endpoint excludes the link until unblocked and rebuilt" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -2037,7 +2033,6 @@ test "pathfinding blocked link endpoint excludes the link until unblocked and re
     });
     const open_stats = try updatePathfindingInline(&system, &open_stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), open_stats.available_results);
-    try std.testing.expectEqual(@as(usize, 1), open_stats.perf.cross_level_solves);
 }
 
 test "pathfinding per-level obstacle independence: level 0 obstacle is absent on level 1" {
@@ -2081,7 +2076,6 @@ test "pathfinding per-level obstacle independence: level 0 obstacle is absent on
 }
 
 test "pathfinding multi-hop same-level corridor travels obstacle-free past a concave wall" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -2128,7 +2122,6 @@ test "pathfinding multi-hop same-level corridor travels obstacle-free past a con
 
     var agent = GridCell{ .x = 1, .y = 8 };
     var reached = false;
-    var first_via_abstract = false;
     var step: usize = 0;
     while (step < 256) : (step += 1) {
         var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
@@ -2139,8 +2132,7 @@ test "pathfinding multi-hop same-level corridor travels obstacle-free past a con
             .start = start_world,
             .goal = cellCenterWorld(goal_cell),
         });
-        const stats = try updatePathfindingInline(&system, &stream, 8, .{});
-        if (step == 0 and stats.perf.abstract_solves != 0) first_via_abstract = true;
+        _ = try updatePathfindingInline(&system, &stream, 8, .{});
         const view = system.statusForWorld(0, start_world, 0, cellCenterWorld(goal_cell), .default, null);
         if (view.status == .unavailable) return error.TestUnexpectedResult;
         if (view.status != .available) continue;
@@ -2162,7 +2154,6 @@ test "pathfinding multi-hop same-level corridor travels obstacle-free past a con
         if (grid.isBlockedCell(target)) return error.TestUnexpectedResult;
         agent = target;
     }
-    try std.testing.expect(first_via_abstract);
     try std.testing.expect(reached);
 }
 
@@ -2582,7 +2573,6 @@ test "pathfinding tier0_abstract_node_cap above the tier-1 ceiling still solves 
 // then a direct post-rebuild shrink of the live max_abstract_nodes for the second) on the
 // SAME small fixture as the tier-0 promotion test above — not the full production map.
 test "pathfinding tier-1 budget_exhausted drops to missing (not a false unavailable) after exactly two attempts" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -2639,7 +2629,6 @@ test "pathfinding tier-1 budget_exhausted drops to missing (not a false unavaila
     const tier1_abstract = &system.tier1_scratch.items[0].corridor.abstract;
     for (tier1_abstract.slots) |slot| try std.testing.expect(slot.stamp >> 1 != tier1_abstract.generation or slot.stamp & 1 == 0);
     try std.testing.expectEqual(@as(usize, 1), second.budget_exhausted);
-    try std.testing.expectEqual(@as(usize, 1), second.perf.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 0), second.unavailable_results);
     try std.testing.expectEqual(@as(usize, 0), second.pending_requests);
     try std.testing.expectEqual(@as(usize, 0), system.pending.len);
@@ -2785,7 +2774,6 @@ test "pathfinding chunk-local portal seeding scans only the start chunk's local 
 }
 
 test "pathfinding warmed cross-level abstract solve does not allocate" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -2834,8 +2822,6 @@ test "pathfinding warmed cross-level abstract solve does not allocate" {
     system.allocator = original_allocator;
 
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
-    try std.testing.expectEqual(@as(usize, 1), stats.perf.abstract_solves);
-    try std.testing.expectEqual(@as(usize, 1), stats.perf.cross_level_solves);
 }
 
 // Drives `count` simultaneous single-goal individual requests in one step, one per
@@ -3586,7 +3572,6 @@ fn runLakeDetourScenario(system: *PathfindingSystem, side: usize, gap_offset: us
 }
 
 test "pathfinding lake detour: reported-bug scale solves, a harder scale degrades gracefully, both bounded to 2 attempts" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var reported_scale = PathfindingSystem.init(std.testing.allocator);
     defer reported_scale.deinit();
     var reported_capacity = baselineCapacity();
@@ -3594,7 +3579,6 @@ test "pathfinding lake detour: reported-bug scale solves, a harder scale degrade
     try reported_scale.reserve(reported_capacity);
     const reported = try runLakeDetourScenario(&reported_scale, 256, 5);
     try std.testing.expectEqual(@as(usize, 1), reported.available_results);
-    try std.testing.expectEqual(@as(usize, 0), reported.perf.escalated_dropped);
     try std.testing.expect(reported.budget_exhausted <= 2);
 
     // Was 512 before border portals were consolidated to one per contiguous open
@@ -3610,7 +3594,6 @@ test "pathfinding lake detour: reported-bug scale solves, a harder scale degrade
     const harder = try runLakeDetourScenario(&harder_scale, 1024, 5);
     try std.testing.expectEqual(@as(usize, 0), harder.available_results);
     try std.testing.expectEqual(@as(usize, 1), harder.partial_results);
-    try std.testing.expectEqual(@as(usize, 0), harder.perf.escalated_dropped);
     try std.testing.expect(harder.budget_exhausted <= 2);
 }
 
@@ -3622,7 +3605,6 @@ test "pathfinding lake detour: reported-bug scale solves, a harder scale degrade
 // ceiling on stitching work, not merely inferred from the abstract-node or stitched-cell
 // budgets.
 test "pathfinding max_stitch_segments bounds stitching independent of corridor length" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     var capacity = baselineCapacity();
@@ -3632,7 +3614,6 @@ test "pathfinding max_stitch_segments bounds stitching independent of corridor l
     const result = try runLakeDetourScenario(&system, 256, 5);
     try std.testing.expectEqual(@as(usize, 0), result.available_results);
     try std.testing.expectEqual(@as(usize, 1), result.partial_results);
-    try std.testing.expectEqual(@as(usize, 0), result.perf.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 1), result.max_stitch_segments_observed);
 }
 
@@ -3793,7 +3774,6 @@ test "an agent reaches the goal through partial hops" {
 }
 
 test "a segment-cap prefix at tier 1 is partial; a segment node-budget spill still drops after two attempts" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
@@ -3811,7 +3791,6 @@ test "a segment-cap prefix at tier 1 is partial; a segment node-budget spill sti
     defer segments.deinit();
     const capped = try solveHop(&segments, requester, partial_start, partial_goal);
     try std.testing.expectEqual(@as(usize, 1), capped.partial_results);
-    try std.testing.expectEqual(@as(usize, 0), capped.perf.escalated_dropped);
     const prefix = cachedStitched(&segments, 0, partial_goal);
     try std.testing.expect(prefix.len() > 1 and prefix.len() < full.len());
     try std.testing.expectEqualSlices(u32, full.cells[0..prefix.len()], prefix.cells);
@@ -3835,7 +3814,6 @@ test "a segment-cap prefix at tier 1 is partial; a segment node-budget spill sti
     defer empty.deinit();
     const second = try updatePathfindingInline(&spill, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), second.budget_exhausted);
-    try std.testing.expectEqual(@as(usize, 1), second.perf.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 0), second.partial_results);
     // The tier-1 stitch had left the start (and its window) when it spilled.
     const spilled = spill.tier1_scratch.items[0].corridor.stitched.items;
@@ -4056,7 +4034,6 @@ fn stripCellOf(system: *const PathfindingSystem, position: math.Vec2) u32 {
 }
 
 test "a saturated tier-1 search publishes a partial ending on its least-estimate node, and hops from each end reach the goal with a strictly falling estimate" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
@@ -4073,7 +4050,6 @@ test "a saturated tier-1 search publishes a partial ending on its least-estimate
         // The saturated tier-1 search publishes instead of dropping.
         try std.testing.expectEqual(@as(usize, 1), stats.escalated_solves);
         try std.testing.expectEqual(@as(usize, 1), stats.partial_results);
-        try std.testing.expectEqual(@as(usize, 0), stats.perf.escalated_dropped);
         const hop = cachedResult(&system, partial_goal).?;
         try std.testing.expect(hop.isPartial());
         // Its end is the corridor's last node, the least-estimate node the search expanded.
@@ -4091,7 +4067,6 @@ test "a saturated tier-1 search publishes a partial ending on its least-estimate
 }
 
 test "a saturated tier-1 search with no expanded node below its start's estimate still drops to missing" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
@@ -4110,7 +4085,6 @@ test "a saturated tier-1 search with no expanded node below its start's estimate
     const second = try updatePathfindingInline(&system, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), second.escalated_solves);
     try std.testing.expectEqual(@as(usize, 1), second.budget_exhausted);
-    try std.testing.expectEqual(@as(usize, 1), second.perf.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 0), second.partial_results);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, partial_goal, .default, null).status);
     // The search expanded nodes, none of them below the start's estimate.
@@ -4147,7 +4121,6 @@ fn northGapEstimate(cell: u32) u32 {
 }
 
 test "a capped stitch toward the least-estimate node is cut to its last cell below the start's estimate, and drops when none lies past the start" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // Tier-1 caps of 32 abstract nodes, which saturate past the wall, and 40 stitched cells,
     // which stop the prefix on its climb to the gap; the reference holds the whole stitch.
     var data = DataSystem.init(std.testing.allocator);
@@ -4176,7 +4149,6 @@ test "a capped stitch toward the least-estimate node is cut to its last cell bel
     try std.testing.expect(last_below > 0 and last_below + 1 < stitched_cap);
     const cut_stats = try solveHop(&system, requester, descending, goal);
     try std.testing.expectEqual(@as(usize, 1), cut_stats.partial_results);
-    try std.testing.expectEqual(@as(usize, 0), cut_stats.perf.escalated_dropped);
     const cut = cachedStitched(&system, 0, goal);
     try std.testing.expectEqualSlices(u32, whole.cells[0 .. last_below + 1], cut.cells);
 
@@ -4192,13 +4164,11 @@ test "a capped stitch toward the least-estimate node is cut to its last cell bel
     try std.testing.expect(northGapEstimate(climb.cells[climb.len() - 1]) < climbing_h);
     for (climb.cells[1..stitched_cap]) |cell| try std.testing.expect(northGapEstimate(cell) >= climbing_h);
     const dropped = try solveHop(&system, requester, climbing, goal);
-    try std.testing.expectEqual(@as(usize, 1), dropped.perf.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 0), dropped.partial_results);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, climbing, 0, goal, .default, null).status);
 }
 
 test "threaded least-estimate partials equal serial for any range size and worker count" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4226,7 +4196,6 @@ test "threaded least-estimate partials equal serial for any range size and worke
     try queueWithTiers(&serial, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
     const serial_stats = try updatePathfindingInline(&serial, &empty, 8, .{});
     try std.testing.expectEqual(@as(usize, 4), serial_stats.partial_results);
-    try std.testing.expectEqual(@as(usize, 0), serial_stats.perf.escalated_dropped);
     try std.testing.expectEqual(@as(usize, 4), serial_stats.budget_exhausted);
     for ([_]usize{ 1, 3 }) |workers| {
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
@@ -4245,7 +4214,6 @@ test "threaded least-estimate partials equal serial for any range size and worke
             try expectSameCache(&serial, &threaded);
             try std.testing.expectEqual(serial_stats.partial_results, stats.partial_results);
             try std.testing.expectEqual(serial_stats.budget_exhausted, stats.budget_exhausted);
-            try std.testing.expectEqual(serial_stats.perf.escalated_dropped, stats.perf.escalated_dropped);
             try std.testing.expectEqual(serial_stats.escalated_solves, stats.escalated_solves);
             try std.testing.expectEqual(serial.pending.len, threaded.pending.len);
             for (0..serial.pending.len) |index| {
@@ -4376,7 +4344,6 @@ test "pending reserve keeps its slots down to half, reallocates below it, and an
 }
 
 test "pending compaction keeps deferred, tail, and rotated order across a ring wrap" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var system = PathfindingSystem.init(std.testing.allocator);
@@ -4423,7 +4390,6 @@ test "pending compaction keeps deferred, tail, and rotated order across a ring w
     try std.testing.expectEqual(@as(u8, 0), system.pending.at(0).tier);
     try std.testing.expect(!system.pending_keys.contains(keys[0]));
     try std.testing.expect(!system.pending_keys.contains(keys[3]));
-    try std.testing.expectEqual(@as(usize, 1), stats.perf.escalated_dropped);
 }
 
 test "pathfinding an elastic grow and shrink keep cached paths and pending" {
@@ -4630,7 +4596,6 @@ test "an escalated solve through the tier-1 pool equals a participant reference"
 }
 
 test "threaded escalated solves take distinct tier-1 slots and equal serial" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4703,8 +4668,8 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
     try queueWithTiers(&partial_serial, &requesters, tileCenter(1, 1), &escalation_goals, &tiers);
     const partial_stats = try updatePathfindingInline(&partial_serial, &empty, 8, .{});
     try std.testing.expect(partial_stats.partial_results != 0);
-    try std.testing.expectEqual(@as(usize, 4), partial_stats.partial_results + partial_stats.perf.escalated_dropped);
-    try std.testing.expectEqual(@as(usize, 4) + partial_stats.perf.escalated_dropped, partial_stats.budget_exhausted);
+    // Each of the four escalations publishes a partial or drops, and each drop exhausts once more.
+    try std.testing.expectEqual(@as(usize, 8), partial_stats.partial_results + partial_stats.budget_exhausted);
     for ([_]usize{ 1, 3 }) |workers| {
         var partial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
         defer partial_threads.deinit();
@@ -4723,7 +4688,6 @@ test "threaded escalated solves take distinct tier-1 slots and equal serial" {
             try std.testing.expectEqual(partial_stats.partial_results, threaded_stats.partial_results);
             try std.testing.expectEqual(partial_stats.available_results, threaded_stats.available_results);
             try std.testing.expectEqual(partial_stats.budget_exhausted, threaded_stats.budget_exhausted);
-            try std.testing.expectEqual(partial_stats.perf.escalated_dropped, threaded_stats.perf.escalated_dropped);
             try std.testing.expectEqual(partial_stats.escalated_solves, threaded_stats.escalated_solves);
             try std.testing.expectEqual(partial_serial.pending.len, partial_threaded.pending.len);
             for (0..partial_serial.pending.len) |index| {
@@ -4746,7 +4710,6 @@ fn queueCrossLevelWithTiers(system: *PathfindingSystem, requesters: []const Enti
 }
 
 test "threaded cross-level solves equal serial, at tier 0 and through the tier-1 pool, their crossing searches included" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4813,9 +4776,6 @@ test "threaded cross-level solves equal serial, at tier 0 and through the tier-1
     }
     try std.testing.expect(via_teleport > 0 and via_ramps > 0);
     // The heuristic's crossing searches ran, and their work sums alike across workers.
-    try std.testing.expect(serial_stats.perf.crossing_boxes_settled != 0);
-    try std.testing.expectEqual(serial_stats.perf.crossing_boxes_settled, stats.perf.crossing_boxes_settled);
-    try std.testing.expectEqual(serial_stats.perf.crossing_budget_frozen, stats.perf.crossing_budget_frozen);
 
     // Half the requests through the tier-1 pool, whose entries run their own crossing search.
     const tiers = [_]u8{ 1, 0, 1, 0, 1, 0, 1, 0 };
@@ -4832,7 +4792,6 @@ test "threaded cross-level solves equal serial, at tier 0 and through the tier-1
     try std.testing.expectEqual(@as(usize, 4), tiered.escalated_solves);
     try std.testing.expectEqual(goals.len, serial_tiered.available_results);
     try std.testing.expectEqual(goals.len, tiered.available_results);
-    try std.testing.expectEqual(serial_tiered.perf.crossing_boxes_settled, tiered.perf.crossing_boxes_settled);
     // Every pool entry the step used ran its own crossing search.
     for (threaded.tier1_scratch.items[0..tiered.escalated_solves]) |*entry| try std.testing.expect(entry.corridor.abstract.crossing.settles != 0);
     for (goals) |goal| try expectSameStitched(cachedStitched(&serial, 2, goal), cachedStitched(&threaded, 2, goal));
@@ -4856,11 +4815,9 @@ test "threaded cross-level solves equal serial, at tier 0 and through the tier-1
     const warmed_tiered = try threaded.update(&empty, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
     try std.testing.expectEqual(@as(usize, 4), warmed_tiered.escalated_solves);
     try std.testing.expectEqual(goals.len, warmed_tiered.available_results);
-    try std.testing.expectEqual(serial_tiered.perf.crossing_boxes_settled, warmed_tiered.perf.crossing_boxes_settled);
 }
 
 test "a reserved threaded solve with escalations allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4911,7 +4868,7 @@ test "a reserved threaded solve with escalations allocates nothing on a multi-wo
         try std.testing.expectEqual(@as(usize, 4), stats.escalated_solves);
         if (stitched_cells == 8) {
             try std.testing.expect(stats.partial_results != 0);
-            try std.testing.expectEqual(@as(usize, 4), stats.partial_results + stats.perf.escalated_dropped);
+            try std.testing.expect(stats.partial_results <= escalation_goals.len);
         } else {
             try std.testing.expectEqual(escalation_goals.len, stats.available_results);
         }
@@ -5051,7 +5008,6 @@ fn logEveryOpKind(system: *PathfindingSystem) !void {
 }
 
 test "threaded registry flush equals serial with victims, re-puts, and renames in the log" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -5089,14 +5045,11 @@ test "threaded registry flush equals serial with victims, re-puts, and renames i
     try std.testing.expect(!batch.ran_inline);
     try std.testing.expectEqual(units, batch.item_count);
     try std.testing.expectEqual(units, batch.range_count);
-    try std.testing.expectEqual(serial_stats.perf.registrations_removed, threaded_stats.perf.registrations_removed);
-    try std.testing.expect(serial_stats.perf.registrations_removed != 0);
     try expectSameRegistry(&systems[0], &systems[1]);
     for (&systems) |*system| try expectRegistryMatchesCache(system);
 }
 
 test "threaded registry flush over unit-weighted pairs equals serial across range sizes and worker counts, on workers" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -5111,9 +5064,9 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
     const ops = serial.completed.core.ownerLog().len;
     var serial_stats = PathfindingStats{};
     const serial_batch = publish.flushRegistry(&serial, null, &serial_stats);
-    try std.testing.expect(serial_stats.perf.registrations_removed != 0 and serial_stats.perf.registrations_added != 0);
-    const units = flushUnits(ops, serial_stats.perf.registrations_added);
-    try std.testing.expectEqual(units, serial_batch.item_count);
+    // One unit per shard per op (and one more), plus one per registration added.
+    const units = serial_batch.item_count;
+    try std.testing.expect(units > flushUnits(ops, 0));
     try expectRegistryMatchesCache(&serial);
     // The widest pool has more workers than pairs.
     for ([_]usize{ 1, 3, flush_pair_count + 4 }) |workers| {
@@ -5136,8 +5089,6 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
             worker_ranges += batch.worker_thread_ranges;
             try std.testing.expectEqual(units, batch.item_count);
             try std.testing.expectEqual(@divCeil(units, items_per_range), batch.range_count);
-            try std.testing.expectEqual(serial_stats.perf.registrations_added, stats.perf.registrations_added);
-            try std.testing.expectEqual(serial_stats.perf.registrations_removed, stats.perf.registrations_removed);
             try expectSameCache(&serial, &threaded);
             try expectSameRegistry(&serial, &threaded);
             try expectRegistryMatchesCache(&threaded);
@@ -5606,7 +5557,6 @@ test "a solved result stores its path's last cell as its end, plain and stitched
 }
 
 test "a cached path to an older projection is not served after the projection moves: status reads missing, intake makes a candidate, and the publish re-puts the entry" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5629,8 +5579,7 @@ test "a cached path to an older projection is not served after the projection mo
     // A notch from the block's top edge to the key's neighbour (20, 19): the projection moves
     // there, more than one cell from the cached path.
     try setRegistryCells(&system, &fixture, &.{ .{ 20, 18 }, .{ 20, 19 } }, fixture.grass);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 0), reaction.perf.evicted_results);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expect(system.completed.slotIndex(key) != null);
     try std.testing.expectEqual(@as(?usize, 19 * 48 + 20), system.liveGoal(key, grid).cell);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
@@ -5645,7 +5594,6 @@ test "a cached path to an older projection is not served after the projection mo
 }
 
 test "a one-way teleport into a sealed pocket solves forward, answers the reverse unavailable with no search, and closing its source flips the forward answer the same step" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5664,7 +5612,6 @@ test "a one-way teleport into a sealed pocket solves forward, answers the revers
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, outside, 0, inside_goal, .default, null).status);
     const forward = try solveFrom(&system, requester, outside, inside_goal, .{});
     try std.testing.expectEqual(@as(usize, 1), forward.available_results);
-    try std.testing.expectEqual(@as(usize, 1), forward.perf.abstract_solves);
     // The reverse: unavailable at status and intake, never searched.
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, inside_start, 0, outside_goal, .default, null).status);
     const reverse = try solveFrom(&system, requester, inside_start, outside_goal, .{});

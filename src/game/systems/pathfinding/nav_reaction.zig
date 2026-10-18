@@ -1236,7 +1236,6 @@ test "pathfinding incremental update is allocation-free at steady state (within 
 }
 
 test "pathfinding threaded incremental nav update is allocation-free at steady state" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // The serial allocation-free tests above only cover the inline stages. Only
     // applyBufferedNavUpdates/reactToPostCommitNavEvents with a real ThreadSystem drive the
     // plan, remask, and patch jobs, the remask indexing a per-participant scratch slot. Five
@@ -1302,8 +1301,6 @@ test "pathfinding threaded incremental nav update is allocation-free at steady s
     // otherwise this would silently retest the already-covered serial path. A plan over
     // several ranges merges through the plan order set into its reserved key lists.
     try std.testing.expect(!stats.remask_batch.ran_inline);
-    try std.testing.expect(!stats.perf.patch_batch.ran_inline);
-    try std.testing.expect(!stats.perf.plan_batch.ran_inline);
     try std.testing.expect(system.graph.plan_tallies.items.len > 1);
 
     for (cells) |cell| {
@@ -1370,7 +1367,6 @@ test "a fully walled level opened past its prior records grows at the reserve an
 }
 
 test "pathfinding incremental update flips cross-level link liveness when the endpoint cell changes" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1435,7 +1431,6 @@ test "pathfinding incremental update flips cross-level link liveness when the en
     });
     const open_stats = try updatePathfindingInline(&system, &open_stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), open_stats.available_results);
-    try std.testing.expectEqual(@as(usize, 1), open_stats.perf.cross_level_solves);
 }
 
 test "a static mark record after its reserve allocates nothing (FailingAllocator)" {
@@ -1518,14 +1513,12 @@ test "threaded nav mark interpretation equals serial for a dense multi-chunk edi
         try threaded.rebuildStaticNavGridWithWorld(&data, &world, null);
         threaded.nav_controls = .{ .adaptive = false, .items_per_range = items_per_range };
         try markEventsForTest(&threaded, events.items, &world, &threads);
-        if (comptime runtime_perf_log.enabled) try std.testing.expect(!threaded.perf.last_mark_batch.ran_inline);
         try std.testing.expectEqual(serial.nav_marks.items.len, threaded.nav_marks.items.len);
         for (serial.nav_marks.items, threaded.nav_marks.items) |a, b| try std.testing.expectEqual(a, b);
     }
 }
 
 test "a terrain nav record after its reserve allocates nothing inline and on a multi-worker ThreadSystem, threaded equal to inline; an out-of-memory reserve records no mark (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1549,7 +1542,6 @@ test "a terrain nav record after its reserve allocates nothing inline and on a m
     inline_system.recordTerrainNavEvents(events.items, &world, null);
     inline_system.allocator = std.testing.allocator;
     try std.testing.expect(!inline_failing.has_induced_failure);
-    try std.testing.expect(inline_system.perf.last_mark_batch.ran_inline);
 
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
@@ -1571,7 +1563,6 @@ test "a terrain nav record after its reserve allocates nothing inline and on a m
     system.recordTerrainNavEvents(events.items, &world, &threads);
     system.allocator = std.testing.allocator;
     try std.testing.expect(!steady.has_induced_failure);
-    try std.testing.expect(system.perf.last_mark_batch.range_count > 1 and !system.perf.last_mark_batch.ran_inline);
     try std.testing.expectEqual(inline_system.nav_marks.items.len, system.nav_marks.items.len);
     for (inline_system.nav_marks.items, system.nav_marks.items) |a, b| try std.testing.expectEqual(a, b);
 }

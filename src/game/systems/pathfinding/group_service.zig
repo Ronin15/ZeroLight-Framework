@@ -804,7 +804,6 @@ const group_service_schedule = [_][]const math.Vec2{
 };
 
 test "threaded group-field service equals serial for four fields building, finishing, rekeyed, and taken over by a waiting goal" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -819,7 +818,6 @@ test "threaded group-field service equals serial for four fields building, finis
     defer stream.deinit();
 
     var totals = PathfindingStats{};
-    var threaded_passes: usize = 0;
     const waiting = serial.graph.keyForWorld(0, cellWorld(4, 4), .default).?;
     var waited_steps: usize = 0;
     for (group_service_schedule) |goals| {
@@ -829,9 +827,6 @@ test "threaded group-field service equals serial for four fields building, finis
         try expectRequestStatsEqual(serial_stats, stats);
         try expectGroupFieldsEqual(&serial, &threaded);
         try expectRequestStateEqual(&serial, &threaded);
-        for ([_]BatchStats{ stats.perf.group_field_batch, stats.perf.group_field_begin_batch }) |batch| {
-            if (!batch.ran_inline and batch.item_count > 1) threaded_passes += 1;
-        }
         totals.group_fields_built += serial_stats.group_fields_built;
         totals.group_field_rebuild_throttled += serial_stats.group_field_rebuild_throttled;
         if (goals.len == 5 or (groupDemand(&serial, waiting) != 0 and groupFieldOf(&serial, waiting) == null)) waited_steps += 1;
@@ -844,11 +839,9 @@ test "threaded group-field service equals serial for four fields building, finis
     try std.testing.expect(totals.group_fields_built > 4);
     try std.testing.expect(waited_steps >= 2);
     try std.testing.expect(groupFieldOf(&serial, waiting) != null);
-    if (threads.workerThreadCount() > 0) try std.testing.expect(threaded_passes > 0);
 }
 
 test "group-field service allocates nothing on workers (FailingAllocator, multi-worker)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
@@ -887,15 +880,10 @@ test "group-field service allocates nothing on workers (FailingAllocator, multi-
     // Two fields still building advance; two new goals begin.
     try writeGroupGoals(&stream, requester, group_service_schedule[0]);
     const stats = try system.update(&stream, intake_test_agents, &threads, config);
-    try std.testing.expectEqual(@as(usize, 2), stats.perf.group_field_batch.item_count);
-    try std.testing.expect(!stats.perf.group_field_batch.ran_inline);
-    try std.testing.expectEqual(@as(usize, 2), stats.perf.group_field_begin_batch.item_count);
-    try std.testing.expect(!stats.perf.group_field_begin_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 2), stats.group_fields_built);
 }
 
 test "threaded group-field service with stall rounds equals serial and runs on workers" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -922,7 +910,6 @@ test "threaded group-field service with stall rounds equals serial and runs on w
     warm.clearRuntimeState();
     const warm_grows = warm.group_field_pool_growth.count;
 
-    var threaded_passes: usize = 0;
     for (0..80) |_| {
         const serial_stats = try updatePathfindingInline(&serial, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
         const stats = try threaded.update(&stream, intake_test_agents, &threads, .{ .adaptive = false, .items_per_range = 1, .max_solve_admissions_per_step = 0 });
@@ -935,9 +922,6 @@ test "threaded group-field service with stall rounds equals serial and runs on w
             try std.testing.expectEqual(warm_field.pushed_count, cold_field.pushed_count);
             try std.testing.expectEqual(warm_field.current_distance, cold_field.current_distance);
         }
-        for ([_]BatchStats{ stats.perf.group_field_batch, stats.perf.group_field_begin_batch }) |batch| {
-            if (!batch.ran_inline and batch.item_count > 1) threaded_passes += 1;
-        }
     }
     // Pools grew past their first-build size on both, by the same steps; never when warm.
     try std.testing.expectEqual(warm_grows, warm.group_field_pool_growth.count);
@@ -946,7 +930,6 @@ test "threaded group-field service with stall rounds equals serial and runs on w
     var ready: usize = 0;
     for (serial.group_fields.items) |field| ready += @intFromBool(field.state == .ready);
     try std.testing.expectEqual(@as(usize, 4), ready);
-    if (threads.workerThreadCount() > 0) try std.testing.expect(threaded_passes > 0);
 }
 
 test "a first group-field build that cannot allocate builds nothing and retries" {

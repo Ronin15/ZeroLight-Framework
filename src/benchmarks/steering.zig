@@ -241,8 +241,8 @@ const MeasuredCase = struct {
 
 // Off-main time of one steering step's stages.
 fn stagesOffMainNs(stats: SteeringStats) u64 {
-    return offMainNs(suite.perfBatch(stats.perf, "agents_batch")) + offMainNs(suite.perfBatch(stats.perf, "select_resolve_batch")) + offMainNs(suite.perfBatch(stats.perf, "select_claim_batch")) + offMainNs(suite.perfBatch(stats.perf, "directions_batch")) +
-        offMainNs(suite.perfBatch(stats.perf, "grid_bucket_batch")) + offMainNs(suite.perfBatch(stats.perf, "grid_sort_batch")) + offMainNs(stats.batch);
+    return offMainNs(stats.perf.agents_batch) + offMainNs(stats.perf.select_resolve_batch) + offMainNs(stats.perf.select_claim_batch) + offMainNs(stats.perf.directions_batch) +
+        offMainNs(stats.perf.grid_bucket_batch) + offMainNs(stats.perf.grid_sort_batch) + offMainNs(stats.batch);
 }
 
 // Every steering stage tuner has settled.
@@ -315,9 +315,13 @@ fn measureCase(
         last_stats = try step(&system, context, thread_ptr, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        const off_main_ns = stagesOffMainNs(last_stats) + offMainNs(steering.colliders.last_splice_batch) + offMainNs(suite.perfBatch(steering.colliders.perf, "last_query_splice_batch"));
+        const off_main_ns = stagesOffMainNs(last_stats) + offMainNs(steering.colliders.last_splice_batch) + offMainNs(steering.colliders.perf.last_query_splice_batch);
         main_total += elapsed_ns -| off_main_ns;
         accumulator.record(elapsed_ns, last_stats.batch);
+        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(steering_range_alignment_items), &.{
+            last_stats.perf.agents_batch,      last_stats.perf.select_resolve_batch, last_stats.perf.select_claim_batch, last_stats.perf.directions_batch,
+            last_stats.perf.grid_bucket_batch, last_stats.perf.grid_sort_batch,      last_stats.batch,
+        });
     }
 
     var stats = accumulator.finish();
@@ -325,12 +329,12 @@ fn measureCase(
     stats.output_count = last_stats.movement_intent_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(BatchStats{});
     stats.steering_stages = .{
-        .agents = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "agents_batch")),
-        .select_resolve = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "select_resolve_batch")),
-        .select_claim = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "select_claim_batch")),
-        .directions = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "directions_batch")),
-        .grid_bucket = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "grid_bucket_batch")),
-        .grid_sort = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "grid_sort_batch")),
+        .agents = suite.batchSummaryFromBatch(last_stats.perf.agents_batch),
+        .select_resolve = suite.batchSummaryFromBatch(last_stats.perf.select_resolve_batch),
+        .select_claim = suite.batchSummaryFromBatch(last_stats.perf.select_claim_batch),
+        .directions = suite.batchSummaryFromBatch(last_stats.perf.directions_batch),
+        .grid_bucket = suite.batchSummaryFromBatch(last_stats.perf.grid_bucket_batch),
+        .grid_sort = suite.batchSummaryFromBatch(last_stats.perf.grid_sort_batch),
         .band_max = largestGridBand(&system),
     };
     if (case.adaptive) {

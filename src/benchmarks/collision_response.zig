@@ -250,17 +250,18 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         const start_ns = suite.nowNs(io);
         last_stats = try stageRunOnce(&system, &fixture, thread_ptr, case);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        std.debug.assert(!expect_dispatch or (suite.perfBatch(last_stats.perf, "gather_batch").range_count > 1 and !suite.perfBatch(last_stats.perf, "gather_batch").ran_inline));
-        accumulator.record(elapsed_ns, suite.perfBatch(last_stats.perf, "gather_batch"));
+        std.debug.assert(!expect_dispatch or (last_stats.perf.gather_batch.range_count > 1 and !last_stats.perf.gather_batch.ran_inline));
+        accumulator.record(elapsed_ns, last_stats.perf.gather_batch);
+        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(movement_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.perf.apply_batch });
         // Main outside the stage batches: the main thread's own ranges inside a
         // dispatched batch are not counted (see the batch's `main_ranges`).
-        main_total += elapsed_ns -| offMainNs(suite.perfBatch(last_stats.perf, "gather_batch")) -| offMainNs(suite.perfBatch(last_stats.perf, "apply_batch"));
+        main_total += elapsed_ns -| offMainNs(last_stats.perf.gather_batch) -| offMainNs(last_stats.perf.apply_batch);
     }
 
     var stats = accumulator.finish();
     stats.candidate_pairs = last_stats.trigger_count;
     stats.output_count = last_stats.intent_count;
-    stats.secondary_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "apply_batch"));
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.apply_batch);
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.gather_tuner), settled_before_measurement);

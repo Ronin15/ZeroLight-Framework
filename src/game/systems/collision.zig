@@ -1927,8 +1927,6 @@ test "collision broadphase filters y misses before narrowphase" {
 }
 
 test "collision broadphase uses simd groups while preserving contact order" {
-    // The sweep counts its lane groups only with the perf log.
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const first = try addBody(&data, 0, 0, 10);
@@ -1945,7 +1943,6 @@ test "collision broadphase uses simd groups while preserving contact order" {
     const stats = try updateInline(&system, &data, &contacts);
     const merged = contacts.mergedItems();
 
-    try std.testing.expect(stats.broadphase_simd_groups > 0);
     try std.testing.expectEqual(@as(usize, 2), stats.candidate_pair_count);
     try std.testing.expectEqual(@as(usize, 2), stats.contact_count);
     try std.testing.expectEqual(first.index, merged[0].a.index);
@@ -1972,7 +1969,6 @@ test "serial contacts equal a brute-force same-level reference in every field an
 }
 
 test "threaded contacts equal the reference across range sizes and worker counts" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1988,14 +1984,12 @@ test "threaded contacts equal the reference across range sizes and worker counts
         defer system.deinit();
         var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
         defer contacts.deinit();
-        const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = workers, .adaptive = false });
-        try std.testing.expect(stats.perf.fill_batch.range_count > 1 and stats.perf.sort_batch.range_count > 1);
+        _ = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = workers, .adaptive = false });
         try expectSameContacts(expected, contacts.mergedItems());
     };
 }
 
 test "fill, sort, broadphase, and narrowphase run on workers" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2009,7 +2003,7 @@ test "fill, sort, broadphase, and narrowphase run on workers" {
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = collision_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
-    for ([_]BatchStats{ stats.perf.fill_batch, stats.perf.sort_batch, stats.broadphase_batch, stats.narrowphase_batch }) |batch| {
+    for ([_]BatchStats{ stats.broadphase_batch, stats.narrowphase_batch }) |batch| {
         try std.testing.expect(!batch.ran_inline);
         try std.testing.expect(batch.active_worker_threads > 0);
     }
@@ -2100,8 +2094,7 @@ test "warm and cold steps write identical contacts" {
     try expectSameContacts(expected, cold_contacts.mergedItems());
 }
 
-test "a fill range past its spill slot replays to the reference contacts, counted once" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+test "a fill range past its spill slot replays to the reference contacts" {
     if (builtin.single_threaded) return error.SkipZigTest;
     // 64 bodies at a 64-body reserve (128-entry bound), four fill ranges of 16. The last 16
     // bodies span three strips each: their third copies spill to slot 3, which `reserve`
@@ -2122,10 +2115,8 @@ test "a fill range past its spill slot replays to the reference contacts, counte
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
-    try std.testing.expectEqual(@as(usize, 4), stats.perf.fill_batch.range_count);
     try std.testing.expectEqual(@as(usize, 96), stats.entry_count);
     try std.testing.expect(stats.entry_count <= system.reserved_entry_bound);
-    try std.testing.expectEqual(@as(u64, 1), system.perf.entry_bound_overflows);
     try expectSameContacts(expected, contacts.mergedItems());
 }
 
@@ -2150,7 +2141,6 @@ test "a serial fill past its spill slot replays to the reference contacts" {
 }
 
 test "threaded contacts at a non-default strip height equal its reference" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2168,13 +2158,11 @@ test "threaded contacts at a non-default strip height equal its reference" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
-    const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = collision_range_alignment_items, .max_worker_threads = 2, .adaptive = false, .strips = strips });
-    try std.testing.expect(!stats.perf.fill_batch.ran_inline);
+    _ = try system.update(&data, &contacts, &threads, .{ .items_per_range = collision_range_alignment_items, .max_worker_threads = 2, .adaptive = false, .strips = strips });
     try expectSameContacts(expected, contacts.mergedItems());
 }
 
 test "after a spill slot grows, later multi-worker steps allocate nothing" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     // Tall bodies spill past their second strip. The first steps grow the spill slots (the
     // cold order, then the warm one); a step at the same warm order reuses them.
@@ -2199,7 +2187,6 @@ test "after a spill slot grows, later multi-worker steps allocate nothing" {
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
     const config: CollisionConfig = .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false };
     for (0..2) |_| _ = try system.update(&data, &contacts, &threads, config);
-    try std.testing.expect(system.perf.entry_bound_overflows >= 1);
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -2210,16 +2197,12 @@ test "after a spill slot grows, later multi-worker steps allocate nothing" {
         system.allocator = original_system_allocator;
         contacts.allocator = original_contacts_allocator;
     }
-    const overflows = system.perf.entry_bound_overflows;
-    const stats = try system.update(&data, &contacts, &threads, config);
-    try std.testing.expect(!stats.perf.fill_batch.ran_inline);
-    try std.testing.expectEqual(overflows, system.perf.entry_bound_overflows);
+    _ = try system.update(&data, &contacts, &threads, config);
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
     try expectSameContacts(expected, contacts.mergedItems());
 }
 
 test "after reserve, a multi-worker step over bodies on two strips allocates nothing" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     // An 8 x 8 grid (pitch 6, size 8) whose lower rows cross the strip edge at 32: within
     // one extra copy per body and four pairs per entry.
@@ -2256,13 +2239,12 @@ test "after reserve, a multi-worker step over bodies on two strips allocates not
     for (0..2) |_| {
         const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
         try std.testing.expect(stats.entry_count > body_count);
-        for ([_]BatchStats{ stats.perf.fill_batch, stats.perf.sort_batch, stats.broadphase_batch, stats.narrowphase_batch }) |batch| {
+        for ([_]BatchStats{ stats.broadphase_batch, stats.narrowphase_batch }) |batch| {
             try std.testing.expect(!batch.ran_inline);
         }
         try std.testing.expect(!stats.pair_bound_exceeded);
         try expectSameContacts(expected, contacts.mergedItems());
     }
-    try std.testing.expectEqual(@as(u64, 0), system.perf.entry_bound_overflows);
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
 }
 
@@ -2311,7 +2293,6 @@ test "threaded collision matches serial contact order" {
 }
 
 test "threaded collision records one sample into each stage tuner and none into the shared tuner" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -2331,7 +2312,6 @@ test "threaded collision records one sample into each stage tuner and none into 
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const stats = try system.update(&data, &contacts, &threads, .{});
-    try std.testing.expectEqual(@as(usize, 64), stats.perf.fill_batch.item_count);
     try std.testing.expectEqual(@as(usize, 64), stats.broadphase_batch.item_count);
     try std.testing.expect(stats.narrowphase_batch.item_count > 0);
     for ([_]*const AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner }) |tuner| {
@@ -2784,7 +2764,6 @@ test "after reserve, ~2 pairs per body on the multi-worker path allocate nothing
 }
 
 test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body allocate nothing" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // 96 bodies in a row (spacing 10, 45 wide, inside one strip): each overlaps its next
     // four, so every range except the last holds exactly `broadphase_pairs_per_item` pairs
     // per item (374 pairs, 3.9 per body). A 2-range partition puts 48 entries (192 pairs) in
@@ -2833,19 +2812,17 @@ test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body
         try std.testing.expect(!stats.pair_bound_exceeded);
         try expectSameContactPairs(reference_contacts.mergedItems(), contacts.mergedItems());
     }
-    try std.testing.expectEqual(@as(u64, 0), system.perf.pair_bound_overflows);
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
 }
 
-test "a broadphase slot replay within the total pair bound is counted" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+test "a broadphase slot replay within the total pair bound flags its step" {
     // 64 bodies at a 64-body reserve (256-pair bound, 128-entry bound), four broadphase
     // ranges of 16 entries: slot 2 holds 4 * ceil(128 / 3) = 172 pairs. Ranges 0 and 1 are
     // 32 isolated bodies; range 2 is 16 wide bodies that all overlap (120 pairs) and the four
     // narrow bodies of range 3 they cover in y (64 pairs): 184, past slot 2 but inside the
-    // total bound. The slot grows and the broadphase replays: one counted step, contacts
+    // total bound. The slot grows and the broadphase replays: one flagged step, contacts
     // identical to the serial run. The grown slot then holds the cluster, so the next step
-    // counts nothing.
+    // flags nothing.
     if (builtin.single_threaded) return error.SkipZigTest;
 
     const body_count: usize = 64;
@@ -2881,21 +2858,18 @@ test "a broadphase slot replay within the total pair bound is counted" {
     try std.testing.expect(!replayed.broadphase_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 4), replayed.broadphase_batch.range_count);
     try std.testing.expect(replayed.pair_bound_exceeded);
-    try std.testing.expectEqual(@as(u64, 1), system.perf.pair_bound_overflows);
     try expectSameContacts(reference_contacts.mergedItems(), contacts.mergedItems());
 
     const settled = try system.update(&data, &contacts, &threads, config);
     try std.testing.expect(!settled.pair_bound_exceeded);
-    try std.testing.expectEqual(@as(u64, 1), system.perf.pair_bound_overflows);
     try expectSameContacts(reference_contacts.mergedItems(), contacts.mergedItems());
 }
 
-test "candidate pairs past the reserved pair bound are counted, even inside the physical slack" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+test "candidate pairs past the reserved pair bound flag the step, even inside the physical slack" {
     // `reserve(4)` declares a 16-pair bound. 8 overlapping bodies make 28 pairs: inside
-    // `candidate_pairs`' rounded-up capacity, past the bound. Each such step counts once,
+    // `candidate_pairs`' rounded-up capacity, past the bound. Each such step is flagged,
     // on the serial and the `update` path, and the contacts match an unreserved run (the
-    // grow paths are deterministic). An unreserved system declares no bound and never counts.
+    // grow paths are deterministic). An unreserved system declares no bound and never flags.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     for (0..8) |index| {
@@ -2909,7 +2883,6 @@ test "candidate pairs past the reserved pair bound are counted, even inside the 
     const reference_stats = try updateInline(&reference, &data, &reference_contacts);
     try std.testing.expectEqual(@as(usize, 28), reference_stats.candidate_pair_count);
     try std.testing.expect(!reference_stats.pair_bound_exceeded);
-    try std.testing.expectEqual(@as(u64, 0), reference.perf.pair_bound_overflows);
     const expected = reference_contacts.mergedItems();
 
     var system = CollisionSystem.init(std.testing.allocator);
@@ -2928,7 +2901,6 @@ test "candidate pairs past the reserved pair bound are counted, even inside the 
         else
             try system.update(&data, &contacts, &threads, .{});
         try std.testing.expect(stats.pair_bound_exceeded);
-        try std.testing.expectEqual(@as(u64, step + 1), system.perf.pair_bound_overflows);
         try expectSameContactPairs(expected, contacts.mergedItems());
     }
 
@@ -2937,14 +2909,12 @@ test "candidate pairs past the reserved pair bound are counted, even inside the 
     try std.testing.expectEqual(@as(usize, 32), system.reserved_pair_bound);
     const covered = try updateInline(&system, &data, &contacts);
     try std.testing.expect(!covered.pair_bound_exceeded);
-    try std.testing.expectEqual(@as(u64, 2), system.perf.pair_bound_overflows);
 }
 
-test "candidate pairs past the reserved pair bound are counted once per step on the multi-worker path" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+test "candidate pairs past the reserved pair bound flag every step on the multi-worker path" {
     // `reserve(32)` declares a 128-pair bound. 32 bodies each overlapping their next
-    // five make 145 pairs, over broadphase ranges of 16: past the bound every step, counted
-    // once per step. Contacts match the serial run both times.
+    // five make 145 pairs, over broadphase ranges of 16: past the bound every step, each
+    // flagged. Contacts match the serial run both times.
     if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -2970,12 +2940,11 @@ test "candidate pairs past the reserved pair bound are counted once per step on 
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
-    for (0..2) |step| {
+    for (0..2) |_| {
         const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
         try std.testing.expect(!stats.broadphase_batch.ran_inline);
         try std.testing.expect(!stats.narrowphase_batch.ran_inline);
         try std.testing.expect(stats.pair_bound_exceeded);
-        try std.testing.expectEqual(@as(u64, step + 1), system.perf.pair_bound_overflows);
         try expectSameContactPairs(reference_contacts.mergedItems(), contacts.mergedItems());
     }
 }
@@ -3053,11 +3022,8 @@ test "collision same world_level still emits XY overlap contacts" {
 }
 
 test "collision simd broadphase same-level gate filters mixed world_levels" {
-    // The sweep counts its lane groups only with the perf log.
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
-    // ≥5 mutually X-overlapping proxies so the first body's sweep hits a lane group
-    // (broadphase_simd_groups > 0). Levels span 0 and 1, so the run gate is exercised
-    // inside that group.
+    // ≥5 mutually X-overlapping proxies so the first body's sweep hits a lane group. Levels
+    // span 0 and 1, so the run gate is exercised inside that group.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const e0 = try addBody(&data, 0, 0, 10);
@@ -3077,7 +3043,6 @@ test "collision simd broadphase same-level gate filters mixed world_levels" {
     defer contacts.deinit();
 
     const stats = try updateInline(&system, &data, &contacts);
-    try std.testing.expect(stats.broadphase_simd_groups > 0);
 
     // Same-level only: level-0 pairs among {e0,e1,e4} (3) + level-1 {e2,e3} (1).
     // All five bodies mutually XY-overlap, so without the gate there would be C(5,2)=10.

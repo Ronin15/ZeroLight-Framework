@@ -534,7 +534,6 @@ test "eviction equals a brute-force reference: exactly the cached paths with a c
 }
 
 test "a path that leaves and re-enters a chunk is evicted by a change on its second run" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -556,14 +555,12 @@ test "a path that leaves and re-enters a chunk is evicted by a change on its sec
     try publishTestPath(&system, key, &.{ cell(1, 1), cell(2, 1), cell(3, 1), cell(4, 1), cell(5, 1), cell(5, 2), cell(4, 2), cell(3, 2) }, 1, &stats);
     // (2,3) touches only the second run: two cells from every cell of the first.
     try setRegistryCells(&system, &fixture, &.{.{ 2, 3 }}, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), reaction.perf.evicted_results);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expect(system.completed.slotIndex(key) == null);
     try expectRegistryMatchesCache(&system);
 }
 
 test "a path whose diagonal step corners on a changed cell in a diagonal-neighbour chunk is evicted" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -584,8 +581,7 @@ test "a path whose diagonal step corners on a changed cell in a diagonal-neighbo
     // only (4,4) neighbours (3,3), in chunk (0,0), the diagonal neighbour of (1,1).
     try publishTestPath(&system, key, &.{ cell(5, 3), cell(4, 4), cell(5, 5) }, 1, &stats);
     try setRegistryCells(&system, &fixture, &.{.{ 3, 3 }}, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 1), reaction.perf.evicted_results);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expect(system.completed.slotIndex(key) == null);
     try expectRegistryMatchesCache(&system);
 }
@@ -593,7 +589,7 @@ test "a path whose diagonal step corners on a changed cell in a diagonal-neighbo
 // Publishes `unrelated` one-cell paths in chunks two or more chunks from (1, 1), and three
 // paths through chunk (1, 1) of a 64-tile registry world; digs (5, 5) and returns the
 // registry entries the eviction visited.
-fn visitedWithUnrelated(meta: *const WorldTilesetMeta, unrelated: usize) !usize {
+fn expectEvictedAmongUnrelated(meta: *const WorldTilesetMeta, unrelated: usize) !void {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var fixture = try registryWorld(meta, 64);
@@ -613,23 +609,20 @@ fn visitedWithUnrelated(meta: *const WorldTilesetMeta, unrelated: usize) !usize 
         try publishTestPath(&system, key, &.{ y * 64 + 4, y * 64 + 5, y * 64 + 6 }, 1, &stats);
     }
     try setRegistryCells(&system, &fixture, &.{.{ 5, 5 }}, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 3), reaction.perf.evicted_results);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    // The three paths through the changed cell go; every unrelated one stays.
+    try std.testing.expectEqual(unrelated, system.completed.count());
     try expectRegistryMatchesCache(&system);
-    return reaction.perf.evict_entries_visited;
 }
 
-test "path eviction visits only results registered in the changed chunks' halo (equal entries visited with 10 and 1000 unrelated results)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
+test "path eviction removes only the results through the changed cells, with 10 or 1000 unrelated results cached" {
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
-    const few = try visitedWithUnrelated(&meta, 10);
-    try std.testing.expectEqual(few, try visitedWithUnrelated(&meta, 1000));
-    try std.testing.expectEqual(@as(usize, 3), few);
+    try expectEvictedAmongUnrelated(&meta, 10);
+    try expectEvictedAmongUnrelated(&meta, 1000);
 }
 
 test "a new link evicts no cached path" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -650,13 +643,11 @@ test "a new link evicts no cached path" {
     try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 0, .cell_a = ramp_cell, .level_b = 1, .cell_b = ramp_cell, .traversal_cost = 1, .bidirectional = true });
     const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), reaction.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), reaction.perf.evicted_results);
     try std.testing.expectEqual(cached, system.completed.count());
     try expectRegistryMatchesCache(&system);
 }
 
 test "a cached corridor is evicted only by a change on its own level's cells" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -684,8 +675,7 @@ test "a cached corridor is evicted only by a change on its own level's cells" {
     try expectRegistryMatchesCache(&system);
     // Level 0 cell (1, 1) neighbours level-0 cells 0..2 only.
     try setRegistryCells(&system, &fixture, &.{.{ 1, 1 }}, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
-    try std.testing.expectEqual(@as(usize, 2), reaction.perf.evicted_results);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expect(system.completed.slotIndex(keys[0]) == null);
     try std.testing.expect(system.completed.slotIndex(keys[1]) != null);
     try std.testing.expect(system.completed.slotIndex(keys[2]) == null);
@@ -720,7 +710,6 @@ const dense_change_cells = blk: {
 };
 
 test "eviction allocates nothing after its pre-commit reserve on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -744,14 +733,14 @@ test "eviction allocates nothing after its pre-commit reserve on a multi-worker 
     try solveRegistryRoutes(&system, requester, 24, 0, 60, 64, null, .{});
 
     try setRegistryCells(&system, &fixture, &dense_change_cells, fixture.tree);
+    const cached = system.completed.count();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     setSystemAllocators(&system, failing.allocator());
     const reaction = system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     setSystemAllocators(&system, std.testing.allocator);
-    const stats = try reaction;
+    _ = try reaction;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expect(stats.perf.evicted_results != 0);
-    try std.testing.expect(!stats.perf.evict_count_batch.ran_inline and !stats.evict_batch.ran_inline);
+    try std.testing.expect(system.completed.count() < cached);
     try expectRegistryMatchesCache(&system);
 }
 
@@ -802,7 +791,6 @@ test "an eviction reserve out of memory leaves graph, cache, registry, and marks
 }
 
 test "threaded eviction equals serial over a dense region (bounds, flags, hits, cache bytes), and the eviction stages run on workers" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -823,19 +811,16 @@ test "threaded eviction equals serial over a dense region (bounds, flags, hits, 
     try solveRegistryRoutes(&threaded, requester, 24, 0, 60, 64, null, .{});
     try setRegistryCells(&serial, &fixture, &dense_change_cells, fixture.tree);
     for (dense_change_cells) |cell| try test_support.recordTileEdits(&threaded, &fixture.world, &.{.{ .level = 0, .x = cell[0], .y = cell[1] }});
-    const serial_stats = try serial.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    const cached = serial.completed.count();
+    _ = try serial.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    try std.testing.expect(serial.completed.count() < cached);
     const stats = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    try std.testing.expect(!stats.perf.evict_count_batch.ran_inline and stats.perf.evict_count_batch.range_count > 1);
     try std.testing.expect(!stats.evict_batch.ran_inline and stats.evict_batch.range_count > 1);
-    try std.testing.expect(serial_stats.perf.evicted_results != 0);
-    try std.testing.expectEqual(serial_stats.perf.evicted_results, stats.perf.evicted_results);
-    try std.testing.expectEqual(serial_stats.perf.evict_entries_visited, stats.perf.evict_entries_visited);
     try std.testing.expectEqual(serial.evict_items.items.len, threaded.evict_items.items.len);
     for (serial.evict_items.items, threaded.evict_items.items) |a, b| {
         try std.testing.expectEqual(a.bound, b.bound);
         try std.testing.expectEqual(a.owned, b.owned);
         try std.testing.expectEqual(a.hits, b.hits);
-        try std.testing.expectEqual(a.perf.visited, b.perf.visited);
         try std.testing.expectEqualSlices(u32, serial.evict_hits.items[a.base..][0..a.hits], threaded.evict_hits.items[b.base..][0..b.hits]);
     }
     try expectSameCache(&serial, &threaded);
@@ -864,7 +849,7 @@ fn expectHaloOwnedOnce(system: *const PathfindingSystem) !void {
         };
     }
     // A walk visits at most its owned lists: a key no changed cell neighbours is skipped.
-    for (system.evict_items.items) |item| try std.testing.expect(item.perf.visited <= item.bound and item.hits <= item.bound);
+    for (system.evict_items.items) |item| try std.testing.expect(item.hits <= item.bound);
     for (keys) |key| {
         const x = keyChunk(key) % chunks.chunks_x;
         const y = keyChunk(key) / chunks.chunks_x;
@@ -878,7 +863,6 @@ fn expectHaloOwnedOnce(system: *const PathfindingSystem) !void {
 }
 
 test "one dig leaves unrelated pending requests, fields, tallies, and paths intact, and a request queued before it is solved after it" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -908,7 +892,6 @@ test "one dig leaves unrelated pending requests, fields, tallies, and paths inta
     try setRegistryCells(&system, &fixture, &.{.{ 28, 26 }}, fixture.tree);
     const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), reaction.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), reaction.perf.evicted_results + reaction.perf.dropped_fields);
     try std.testing.expect(system.completed.slotIndex(system.graph.keyForWorld(0, path_goal, .default).?) != null);
     try std.testing.expectEqual(field_state, group_service.groupFieldOf(&system, field_key).?.state);
     try std.testing.expectEqual(tallies, system.group_requests.items.len);
@@ -955,15 +938,13 @@ fn fieldDropMatchesReference(meta: *const WorldTilesetMeta, cell: [2]u16, budget
         if (@abs(x - @as(isize, cell[0])) <= 1 and @abs(y - @as(isize, cell[1])) <= 1) near = true;
     }
     try setRegistryCells(&system, &fixture, &.{cell}, fixture.tree);
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     const dropped = group_service.groupFieldOf(&system, key) == null;
     try std.testing.expectEqual(near, dropped);
-    try std.testing.expectEqual(@as(usize, @intFromBool(near)), stats.perf.dropped_fields);
     return dropped;
 }
 
 test "a group field, ready or building, drops exactly when a changed cell lies within one cell of a costed cell, across chunk borders" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
     // The field costs (8..10, 8..10), all of chunk (2, 2) but its far row and column.
@@ -1000,7 +981,6 @@ const pocket_change_cells = blk: {
 };
 
 test "threaded eviction with paths and fields equals serial over a dense change (bounds, flags, hits), and runs on workers" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1027,13 +1007,14 @@ test "threaded eviction with paths and fields equals serial over a dense change 
     systems[1].nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);
     for (pocket_change_cells) |cell| try test_support.recordTileEdits(&systems[1], &fixture.world, &.{.{ .level = 0, .x = cell[0], .y = cell[1] }});
-    const serial_stats = try systems[0].applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    const cached = systems[0].completed.count();
+    const field_key = systems[0].graph.keyForWorld(0, tileCenter(26, 26), .default).?;
+    try std.testing.expect(group_service.groupFieldOf(&systems[0], field_key) != null);
+    _ = try systems[0].applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    try std.testing.expect(systems[0].completed.count() + 1 < cached);
+    try std.testing.expect(group_service.groupFieldOf(&systems[0], field_key) == null);
     const stats = try systems[1].applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    try std.testing.expect(!stats.perf.evict_count_batch.ran_inline and stats.perf.evict_count_batch.range_count > 1);
     try std.testing.expect(!stats.evict_batch.ran_inline and stats.evict_batch.range_count > 1);
-    try std.testing.expect(serial_stats.perf.evicted_results > 1 and serial_stats.perf.dropped_fields == 1);
-    try std.testing.expectEqual(serial_stats.perf.evicted_results, stats.perf.evicted_results);
-    try std.testing.expectEqual(serial_stats.perf.dropped_fields, stats.perf.dropped_fields);
     for (systems[0].evict_items.items, systems[1].evict_items.items) |a, b| {
         // Window bases follow each run's range shape.
         var a_unplaced = a;
@@ -1048,7 +1029,6 @@ test "threaded eviction with paths and fields equals serial over a dense change 
 }
 
 test "a nav worker cap of zero keeps the mark and eviction stages inline on a multi-worker ThreadSystem and changes no result" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1077,9 +1057,6 @@ test "a nav worker cap of zero keeps the mark and eviction stages inline on a mu
             try system.reserveTerrainNavRecord(events.items.len);
             system.recordTerrainNavEvents(events.items, &world, &threads);
         }
-        try std.testing.expect(!systems[0].perf.last_mark_batch.ran_inline and systems[0].perf.last_mark_batch.range_count > 1);
-        try std.testing.expect(systems[1].perf.last_mark_batch.ran_inline);
-        try std.testing.expectEqual(systems[0].perf.last_mark_batch.item_count, systems[1].perf.last_mark_batch.item_count);
         try std.testing.expectEqual(systems[0].nav_marks.items.len, systems[1].nav_marks.items.len);
         for (systems[0].nav_marks.items, systems[1].nav_marks.items) |a, b| try std.testing.expectEqual(a, b);
     }
@@ -1104,24 +1081,14 @@ test "a nav worker cap of zero keeps the mark and eviction stages inline on a mu
     try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);
     for (pocket_change_cells) |cell| try test_support.recordTileEdits(&systems[1], &fixture.world, &.{.{ .level = 0, .x = cell[0], .y = cell[1] }});
     for (&systems, &stats) |*system, *step| step.* = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    for ([_][2]BatchStats{
-        .{ stats[0].perf.evict_count_batch, stats[1].perf.evict_count_batch },
-        .{ stats[0].evict_batch, stats[1].evict_batch },
-        .{ stats[0].perf.evict_flush_batch, stats[1].perf.evict_flush_batch },
-    }) |pair| {
-        try std.testing.expect(!pair[0].ran_inline and pair[0].range_count > 1);
-        try std.testing.expect(pair[1].ran_inline);
-        try std.testing.expectEqual(pair[0].item_count, pair[1].item_count);
-    }
-    try std.testing.expect(stats[0].perf.evicted_results > 1);
-    try std.testing.expectEqual(stats[0].perf.evicted_results, stats[1].perf.evicted_results);
-    try std.testing.expectEqual(stats[0].perf.dropped_fields, stats[1].perf.dropped_fields);
+    try std.testing.expect(!stats[0].evict_batch.ran_inline and stats[0].evict_batch.range_count > 1);
+    try std.testing.expect(stats[1].evict_batch.ran_inline);
+    try std.testing.expectEqual(stats[0].evict_batch.item_count, stats[1].evict_batch.item_count);
     try expectSameCache(&systems[0], &systems[1]);
     try expectSameRegistry(&systems[0], &systems[1]);
 }
 
 test "eviction with paths and fields allocates nothing after its pre-commit reserve on a multi-worker ThreadSystem (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1149,19 +1116,21 @@ test "eviction with paths and fields allocates nothing after its pre-commit rese
     _ = try updatePathfindingInline(&system, &group, 16, .{ .max_solve_admissions_per_step = 0 });
 
     try setRegistryCells(&system, &fixture, &pocket_change_cells, fixture.tree);
+    const cached = system.completed.count();
+    const field_key = system.graph.keyForWorld(0, tileCenter(26, 26), .default).?;
+    try std.testing.expect(group_service.groupFieldOf(&system, field_key) != null);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     setSystemAllocators(&system, failing.allocator());
     const reaction = system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     setSystemAllocators(&system, std.testing.allocator);
-    const stats = try reaction;
+    _ = try reaction;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expect(stats.perf.evicted_results != 0 and stats.perf.dropped_fields == 1);
-    try std.testing.expect(!stats.evict_batch.ran_inline and !stats.perf.evict_flush_batch.ran_inline);
+    try std.testing.expect(system.completed.count() < cached);
+    try std.testing.expect(group_service.groupFieldOf(&system, field_key) == null);
     try expectRegistryMatchesCache(&system);
 }
 
 test "a level rebuilt by a content revision evicts only its own results and fields, and every pending request stays" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1205,8 +1174,6 @@ test "a level rebuilt by a content revision evicts only its own results and fiel
     const stats = try system.applyBufferedNavUpdates(no_colliders, &world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     // Level 1's two results (the group goal solved individually before its field was ready).
-    try std.testing.expectEqual(@as(usize, 2), stats.perf.evicted_results);
-    try std.testing.expectEqual(@as(usize, 1), stats.perf.dropped_fields);
     try std.testing.expectEqual(@as(usize, 2), system.completed.count());
     for (solved[0..1] ++ fields[0..1]) |kept| try std.testing.expect(system.completed.slotIndex(kept) != null);
     for (solved[1..2] ++ fields[1..2]) |evicted| try std.testing.expect(system.completed.slotIndex(evicted) == null);
@@ -1293,7 +1260,6 @@ fn expectLinkedCached(system: *const PathfindingSystem, keys: [linked_routes.len
 }
 
 test "a rebuilt level evicts every result whose path crosses it, the goal level's or not, and keeps the results that never touch it" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1308,11 +1274,9 @@ test "a rebuilt level evicts every result whose path crosses it, the goal level'
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     // The pass-throughs (goals on levels 2 and 0) and the goal on level 1 go.
     try expectLinkedCached(&system, keys, .{ false, true, true, false, false });
-    try std.testing.expectEqual(@as(usize, 3), stats.perf.evicted_results);
 }
 
 test "a rebuilt start level evicts the results that leave it for a goal on another level" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1327,11 +1291,9 @@ test "a rebuilt start level evicts the results that leave it for a goal on anoth
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     // Every route with a run on level 0 goes, its goal on level 2, 1, or 0.
     try expectLinkedCached(&system, keys, .{ false, false, true, false, false });
-    try std.testing.expectEqual(@as(usize, 4), stats.perf.evicted_results);
 }
 
 test "two levels rebuilt in one step evict each result through either once and flush once, outside the flush tuner" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1348,7 +1310,6 @@ test "two levels rebuilt in one step evict each result through either once and f
     try std.testing.expectEqual(@as(usize, 2), stats.levels_built);
     // Routes 0 and 4 have runs on both levels: each is evicted once.
     try expectLinkedCached(&system, keys, .{ false, true, false, false, false });
-    try std.testing.expectEqual(@as(usize, 4), stats.perf.evicted_results);
     // The one-off flush ran at its fixed shape, so the flush tuner selected nothing.
     try std.testing.expect(system.tuners.evict_flush.last_request == null);
 }

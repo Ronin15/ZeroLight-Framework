@@ -33,7 +33,6 @@ const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const AiBehavior = @import("../data_system.zig").AiBehavior;
 const DataSystem = @import("../data_system.zig").DataSystem;
@@ -1157,7 +1156,6 @@ test "serial has no steady-state allocation after warmup (FailingAllocator)" {
 }
 
 test "after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // The only reserved store is the gather rows (crossing bits
@@ -1207,14 +1205,12 @@ test "after reserve alone, threaded updates at 64- then 16-item ranges allocate 
     for (partitions, 0..) |items, step| {
         // Mirrors `SimulationFrame.beginStep`'s per-step reset of `events`.
         events.clearRetainingCapacity();
-        const stats = try sys.update(data.aiAgentSliceConst(), &data, &events, &threads, .{
+        _ = try sys.update(data.aiAgentSliceConst(), &data, &events, &threads, .{
             .items_per_range = items,
             .max_worker_threads = 2,
             .adaptive = false,
         });
         try testing.expectEqual(row_total, sys.rows.len);
-        try testing.expectEqual(rangeCount(row_total, items), stats.perf.batch.range_count);
-        try testing.expect(!stats.perf.batch.ran_inline);
         if (step == 0) try testing.expectEqual(row_total, events.stats.affect_threshold_crossed);
     }
     try testing.expectEqual(@as(usize, 0), failing.allocations);

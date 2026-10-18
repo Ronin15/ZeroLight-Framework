@@ -113,7 +113,8 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const start_ns = suite.nowNs(io);
         last_stats = try runOnce(&system, &fixture, think_set, &threads, case);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), suite.perfBatch(last_stats.perf, "batch"));
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.perf.batch);
+        try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(affect_range_alignment_items), last_stats.perf.batch);
     }
 
     std.debug.assert(options.iterations == 0 or system.rows.len == item_count);

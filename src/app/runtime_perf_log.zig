@@ -3,7 +3,6 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
-const builtin = @import("builtin");
 const logging = @import("../core/logging.zig");
 const sdl = @import("../platform/sdl.zig").c;
 const BatchStats = @import("thread_system.zig").BatchStats;
@@ -11,18 +10,15 @@ const SpritePrepStats = @import("../render/renderer.zig").SpritePrepStats;
 
 const log = logging.perf;
 
-// Instrumented in Debug and ReleaseSafe; fully compiled out of
-// ReleaseFast/ReleaseSmall (zero-sized types, no StageTimer, no counters).
+// The build's `perf_counters` switch: on for Debug and ReleaseSafe games and tests and for
+// every bench build; off compiles the log out (zero-sized types, no StageTimer, no counters).
 //
 // Debug (`dev` / `run`): fix cycles — iterate code and behavior. Perf lines may
 // appear but are not the soak authority (Debug is heavily pessimistic).
 // ReleaseSafe: intentional soaks for ranking and absolute scale numbers (slow
 // compile — not every edit). Emit uses `log.debug`; both modes' `auto` log
 // level includes debug.
-pub const enabled = switch (builtin.mode) {
-    .debug, .safe => true,
-    .fast, .small => false,
-};
+pub const enabled = @import("build_options").perf_counters;
 pub const interval_ns: u64 = 60 * std.time.ns_per_s;
 
 pub const FrameResult = enum {
@@ -889,47 +885,43 @@ fn averagePer(total: u64, count: u64) f64 {
 }
 
 test "runtime performance log accumulates frame samples until interval" {
-    if (!enabled) return error.SkipZigTest;
-
-    var perf = RuntimePerfLog.init(0);
-    perf.recordFrame(interval_ns / 2, .{
+    var log_under_test = EnabledRuntimePerfLog.init(0);
+    log_under_test.recordFrame(interval_ns / 2, .{
         .frame_delta_ns = 16 * std.time.ns_per_ms,
         .fixed_updates = 1,
         .hit_update_cap = false,
         .result = .submitted,
     });
 
-    try std.testing.expectEqual(@as(u64, 1), perf.frames);
-    try std.testing.expectEqual(@as(u64, 1), perf.metricValue(.submitted_frames));
-    try std.testing.expectEqual(@as(u64, 1), perf.metricValue(.fixed_updates));
-    try std.testing.expectEqual(@as(u64, 16 * std.time.ns_per_ms), perf.timingValue(.frame_interval).max_ns);
+    try std.testing.expectEqual(@as(u64, 1), log_under_test.frames);
+    try std.testing.expectEqual(@as(u64, 1), log_under_test.metricValue(.submitted_frames));
+    try std.testing.expectEqual(@as(u64, 1), log_under_test.metricValue(.fixed_updates));
+    try std.testing.expectEqual(@as(u64, 16 * std.time.ns_per_ms), log_under_test.timingValue(.frame_interval).max_ns);
 }
 
 test "runtime performance log reset clears accumulators" {
-    if (!enabled) return error.SkipZigTest;
-
-    var perf = RuntimePerfLog.init(0);
-    perf.recordMetric(.sdl_events, 3);
-    perf.recordTiming(.app_tick, 12);
-    perf.recordTiming(.gameplay_update, 8);
-    perf.recordBatch(.movement, .{
+    var log_under_test = EnabledRuntimePerfLog.init(0);
+    log_under_test.recordMetric(.sdl_events, 3);
+    log_under_test.recordTiming(.app_tick, 12);
+    log_under_test.recordTiming(.gameplay_update, 8);
+    log_under_test.recordBatch(.movement, .{
         .item_count = 16,
         .range_count = 1,
         .batch_duration_ns = 100,
         .ran_inline = true,
     });
-    perf.recordFrame(interval_ns / 2, .{
+    log_under_test.recordFrame(interval_ns / 2, .{
         .frame_delta_ns = 16 * std.time.ns_per_ms,
         .fixed_updates = 1,
         .hit_update_cap = true,
         .result = .submitted,
     });
 
-    perf.reset(interval_ns);
+    log_under_test.reset(interval_ns);
 
-    try std.testing.expectEqual(@as(u64, 0), perf.frames);
-    try std.testing.expectEqual(@as(u64, 0), perf.metricValue(.sdl_events));
-    try std.testing.expectEqual(@as(u64, 0), perf.timingValue(.app_tick).count);
-    try std.testing.expectEqual(@as(u64, 0), perf.timingValue(.gameplay_update).count);
-    try std.testing.expectEqual(@as(u64, 0), perf.batchValue(.movement).calls);
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.frames);
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.metricValue(.sdl_events));
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.timingValue(.app_tick).count);
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.timingValue(.gameplay_update).count);
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.batchValue(.movement).calls);
 }

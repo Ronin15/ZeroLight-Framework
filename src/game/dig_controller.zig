@@ -17,7 +17,6 @@
 //! `world_obstacle_changed`) for the post-commit nav re-mask.
 
 const std = @import("std");
-const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const builtin = @import("builtin");
 const logging = @import("../core/logging.zig");
 const math = @import("../core/math.zig");
@@ -1282,11 +1281,6 @@ fn runCrossChunkFalls(meta: *const world_tileset_meta.WorldTilesetMeta, threads:
     try std.testing.expectEqual(holes.len, reservation.carves);
     try std.testing.expectEqual(holes.len, reservation.carve_chunks.len);
     try dig.commitPlaneTraversalStage(&world, &data, &player, &frame, reservation, threads);
-    if (runtime_perf_log.enabled and threads != null) {
-        for ([_]@TypeOf(world.perf.last_terrain_edit_plan_batch){ world.perf.last_terrain_edit_plan_batch, world.perf.last_terrain_edit_write_batch }) |batch| {
-            try std.testing.expect(!batch.ran_inline and batch.range_count > 1);
-        }
-    }
     for (holes, npcs) |hole, npc| {
         try std.testing.expectEqual(@as(?u16, hole.level + 1), data.worldLevelConst(npc));
         try std.testing.expectEqual(dig.tunnel_tile, world.denseTile(world.denseFloorLayerForLevel(hole.level + 1).?, hole.cell.x, hole.cell.y));

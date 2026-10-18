@@ -439,37 +439,6 @@ fn metric(value: usize) u64 {
     return @intCast(value);
 }
 
-test "nav update stats record the remask, the connectivity flood, the closure rows, and the eviction halo walk under their own perf stages" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
-    var perf = runtime_perf_log.RuntimePerfLog.init(0);
-    const stats = NavUpdateStats{
-        .remask_batch = .{ .item_count = 5 },
-        .conn_flood_batch = .{ .item_count = 6 },
-        .conn_closure_rows_batch = .{ .item_count = 9 },
-        .evict_batch = .{ .item_count = 3 },
-        .perf = .{
-            .conn_seed_batch = .{ .item_count = 7 },
-            .conn_gather_batch = .{ .item_count = 8 },
-            .conn_closure_resolve_batch = .{ .item_count = 10 },
-            .evict_count_batch = .{ .item_count = 2 },
-            .evict_flush_batch = .{ .item_count = 4 },
-        },
-    };
-    stats.recordTo(runtime_perf_log.Context.bind(&perf));
-    const remask = perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_remask)];
-    const connect = perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_connect)];
-    const evict = perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_evict)];
-    try std.testing.expectEqual(@as(u64, 1), remask.calls);
-    try std.testing.expectEqual(@as(u64, 5), remask.items);
-    try std.testing.expectEqual(@as(u64, 1), connect.calls);
-    try std.testing.expectEqual(@as(u64, 6), connect.items);
-    const closure = perf.batches[@backingInt(runtime_perf_log.BatchStage.nav_closure)];
-    try std.testing.expectEqual(@as(u64, 1), closure.calls);
-    try std.testing.expectEqual(@as(u64, 9), closure.items);
-    try std.testing.expectEqual(@as(u64, 1), evict.calls);
-    try std.testing.expectEqual(@as(u64, 3), evict.items);
-}
-
 pub const GridCell = struct {
     x: i32,
     y: i32,

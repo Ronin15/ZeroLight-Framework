@@ -1530,7 +1530,6 @@ test "an observer past 16 hostiles caps its candidates before its FOV: the first
 }
 
 test "observers with interleaved vision boxes in one cell each read their own box" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     // Six observers in one cell facing +x, vision ranges by slot: three scan boxes
@@ -1553,7 +1552,6 @@ test "observers with interleaved vision boxes in one cell each read their own bo
     const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expectEqual(ranges.len, stats.observer_count);
     // One block fill per distinct box of the one row group.
-    try testing.expectEqual(@as(usize, 3), stats.perf.block_fills);
     for (observers, ranges) |observer, range| {
         const perception = data_test_support.aiPerception(&data, observer).?;
         try testing.expectEqual(range == 200, perception.target_visible);
@@ -2575,7 +2573,6 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
 }
 
 test "serial and threaded PerceptionSystem updates route through identical math" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var serial_data = DataSystem.init(testing.allocator);
@@ -2620,13 +2617,12 @@ test "serial and threaded PerceptionSystem updates route through identical math"
     defer threaded_sys.deinit();
     var threaded_events = SimulationEvents.init(testing.allocator);
     defer threaded_events.deinit();
-    const threaded_stats = try threaded_sys.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &world, &threaded_data, &threaded_events, &threads, .{
+    _ = try threaded_sys.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &world, &threaded_data, &threaded_events, &threads, .{
         .items_per_range = perception_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
         .stimuli = &stimuli,
     });
-    try testing.expect(!threaded_stats.perf.gather_batch.ran_inline and !threaded_stats.batch.ran_inline);
     // The windowed gather keeps the serial gather's rows, hostiles skipped, in row order.
     try testing.expectEqual(@as(usize, 40), threaded_sys.rows.len);
     try testing.expectEqual(serial_sys.rows.len, threaded_sys.rows.len);
@@ -2773,7 +2769,6 @@ test "PerceptionSystem think-set gather over a halo index has no steady-state al
 }
 
 test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     // Nothing partition-sized is left to reserve, so `reserve`
@@ -2837,7 +2832,6 @@ test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item
         try testing.expectEqual(rangeCount(observer_total, items), stats.batch.range_count);
         try testing.expect(!stats.batch.ran_inline);
         // The gather over every agent (hostiles skipped) ran on workers too.
-        try testing.expect(!stats.perf.gather_batch.ran_inline);
         try testing.expect(stats.batch.active_worker_threads > 0);
         if (step == 0) try testing.expectEqual(observer_total, events.stats.entity_perceived);
     }

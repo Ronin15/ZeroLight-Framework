@@ -1645,7 +1645,6 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 }
 
 test "a demo ramp dig is routable from both levels the next step" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
     defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
@@ -1683,7 +1682,6 @@ test "a demo ramp dig is routable from both levels the next step" {
     try appendPathRequest(&stream, .{ .entity = demo.player.entity, .start_level = 0, .goal_level = 1, .start = center(0, 4), .goal = center(4, 2) });
     const stats = try @import("systems/pathfinding/test_support.zig").updatePathfindingInline(&demo.pipeline.pathfinding, &stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 2), stats.available_results);
-    try std.testing.expectEqual(@as(usize, 2), stats.perf.cross_level_solves);
 
     // The link still climbs planes via the world tier.
     placePlayerInCell(&demo, 5, 2);

@@ -3062,12 +3062,9 @@ test "reserved sprite frame submits allocation-free with no overflow growth (Fai
     }
     try std.testing.expectEqual(reserved, renderer.spriteCommandCount());
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(usize, 0), renderer.batch.finishPrepStats(.{}).command_overflow_grows);
 }
 
-test "submits past the reservation inside the command list's slack count as drift" {
-    // Drift diagnostics compile out of shipping builds (`ReservationDrift` in sprite_batch.zig).
-    if (!@import("../app/runtime_perf_log.zig").enabled) return error.SkipZigTest;
+test "submits past the reservation inside the command list's slack pass the high water without growing the list" {
     const allocator = std.testing.allocator;
     var renderer = Renderer{
         .allocator = allocator,
@@ -3099,11 +3096,9 @@ test "submits past the reservation inside the command list's slack count as drif
         });
     }
     // The command list never grew, but the frame is past `command_high_water`, which is
-    // what makes `ensureFrameBatchCapacity` grow (and can GPU-idle stall): drift, counted
-    // once for the frame.
+    // what makes `ensureFrameBatchCapacity` grow (and can GPU-idle stall).
     try std.testing.expectEqual(capacity_before, renderer.batch.commands.capacity);
     try std.testing.expect(renderer.spriteCommandCount() > renderer.command_high_water);
-    try std.testing.expectEqual(@as(usize, 1), renderer.batch.finishPrepStats(.{}).command_overflow_grows);
 }
 
 test "linear merge matches stable sort for pre-sorted static and dynamic groups" {

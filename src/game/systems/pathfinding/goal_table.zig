@@ -9,7 +9,6 @@
 //! ordered main-thread merge between them; every grid change invalidates it.
 
 const std = @import("std");
-const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const simd = @import("../../../core/simd.zig");
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
@@ -432,7 +431,6 @@ test "the goal table holds exactly the distinct blocked goals in first-seen orde
 }
 
 test "the goal table is equal serial and threaded across worker counts and range sizes, with both stages on workers" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var system = try blockedGoalSystem(std.testing.allocator, &data);
@@ -449,12 +447,10 @@ test "the goal table is equal serial and threaded across worker counts and range
         var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
         defer threads.deinit();
         for ([_]usize{ 1, 2, 7, 8 }) |items_per_range| {
-            const stats = try system.resolveGoals(TestIntent, &intents, &threads, .{ .items_per_range = items_per_range, .adaptive = false });
+            _ = try system.resolveGoals(TestIntent, &intents, &threads, .{ .items_per_range = items_per_range, .adaptive = false });
             try std.testing.expectEqualSlices(u64, serial_refs, system.goals.refs.items);
             try std.testing.expectEqualSlices(u32, serial_live, system.goals.live.items);
             for (serial_refs, serial_live) |ref, live| try std.testing.expectEqual(live, system.goals.lookup(ref).?);
-            try std.testing.expect(!stats.perf.scan_batch.ran_inline and stats.perf.scan_batch.range_count > 1);
-            try std.testing.expect(!stats.perf.project_batch.ran_inline and stats.perf.project_batch.range_count > 1);
         }
         // No intents, and intents with no blocked goal: empty stages, a valid empty table.
         const open_goals = [_]TestIntent{ .{ .goal = cellPosition(.{ .x = 9, .y = 9 }) }, .{ .goal = cellPosition(.{ .x = 0, .y = 9 }) } };
@@ -467,7 +463,6 @@ test "the goal table is equal serial and threaded across worker counts and range
 }
 
 test "a reserved goal resolve allocates nothing on a real multi-worker thread system, and a failed growth leaves the table invalid and its storage intact (FailingAllocator)" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -485,7 +480,6 @@ test "a reserved goal resolve allocates nothing on a real multi-worker thread sy
     for ([_]?usize{ 1, 7, null }) |items_per_range| {
         const stats = try system.resolveGoals(TestIntent, &intents, &threads, .{ .items_per_range = items_per_range, .adaptive = items_per_range == null });
         try std.testing.expect(stats.distinct != 0);
-        try std.testing.expect(!stats.perf.scan_batch.ran_inline or items_per_range == null);
         _ = try system.resolveGoals(TestIntent, intents[0..17], null, .{});
     }
     try expectReferenceTable(&system, intents[0..17]);

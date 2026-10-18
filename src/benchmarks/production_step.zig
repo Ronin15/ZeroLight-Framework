@@ -643,7 +643,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var census = Census{};
     // Each measured step's queries read the index its build files from the positions the step
     // before it left.
-    var span_record: ?CellSpanRecord = if (runtime_perf_log.enabled and fields.shape == .stacked)
+    var span_record: ?CellSpanRecord = if (fields.shape == .stacked)
         try CellSpanRecord.init(allocator, &state.data, state.pipeline.spatial_index.view())
     else
         null;
@@ -651,19 +651,17 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     for (0..options.iterations) |iteration| {
         const step_ns = try step.run();
         accumulator.record(step_ns, .{});
-        if (comptime runtime_perf_log.enabled) census.add(&step.perf_log, step_ns);
+        census.add(&step.perf_log, step_ns);
         if (span_record) |*record| if (iteration + 1 < options.iterations) record.widen(&state.data);
     }
     var stats = accumulator.finish();
     stats.items_per_second = suite.itemsPerSecond(population, stats.mean_ns);
     stats.batch_carried = false;
     stats.output_count = population;
-    if (comptime runtime_perf_log.enabled) {
-        stats.production_step = census.finish(population, suite.tunerReport(&threads.adaptive_tuner));
-        if (span_record) |*record| {
-            try record.expectRowsUnchanged(&state.data);
-            try checkStackedSeparation(allocator, &stats.production_step.?, fields, record);
-        }
+    stats.production_step = census.finish(population, suite.tunerReport(&threads.adaptive_tuner));
+    if (span_record) |*record| {
+        try record.expectRowsUnchanged(&state.data);
+        try checkStackedSeparation(allocator, &stats.production_step.?, fields, record);
     }
     return stats;
 }

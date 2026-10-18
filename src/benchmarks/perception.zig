@@ -31,7 +31,6 @@
 //!   `sensed=`, `block_fills=`, and `checks_per_observer=`.
 
 const std = @import("std");
-const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
@@ -414,10 +413,11 @@ fn runCaseImpl(
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_stats.batch);
-        main_total += elapsed_ns -| (offMainNs(suite.perfBatch(last_stats.perf, "gather_batch")) + offMainNs(last_stats.batch));
+        try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(perception_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.batch });
+        main_total += elapsed_ns -| (offMainNs(last_stats.perf.gather_batch) + offMainNs(last_stats.batch));
     }
 
-    if (comptime runtime_perf_log.enabled) std.debug.assert(last_stats.perf.block_fills <= observerCellRuns(&fixture.data, &system, spatial_view) + last_stats.batch.range_count);
+    std.debug.assert(last_stats.perf.block_fills <= observerCellRuns(&fixture.data, &system, spatial_view) + last_stats.batch.range_count);
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.output_count = last_stats.nearest_threat_found_count;
@@ -426,8 +426,8 @@ fn runCaseImpl(
     stats.deferred_count = last_stats.los_blocked;
     stats.fallback_deferred_count = events.stats.entity_perceived + events.stats.entity_lost;
     stats.cache_evictions = events.stats.dropped;
-    if (comptime runtime_perf_log.enabled) stats.neighbor_block_fills = last_stats.perf.block_fills;
-    stats.splice_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_stats.perf, "gather_batch"));
+    stats.neighbor_block_fills = last_stats.perf.block_fills;
+    stats.splice_batch = suite.batchSummaryFromBatch(last_stats.perf.gather_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.compute_tuner), settled_before_measurement);
     }
@@ -607,7 +607,7 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.output_count = last_stats.nearest_threat_found_count;
     stats.sample_count = last_stats.sensed_count;
     stats.candidate_pairs = last_stats.candidate_checks;
-    if (comptime runtime_perf_log.enabled) stats.neighbor_block_fills = last_stats.perf.block_fills;
+    stats.neighbor_block_fills = last_stats.perf.block_fills;
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.compute_tuner), settled_before_measurement);
     }

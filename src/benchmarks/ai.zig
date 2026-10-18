@@ -19,7 +19,6 @@
 //! inline.
 
 const std = @import("std");
-const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
@@ -254,7 +253,8 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_ai_stats.separation_batch);
-        main_total += elapsed_ns -| (offMainNs(suite.perfBatch(last_ai_stats.perf, "gather_batch")) + offMainNs(last_ai_stats.separation_batch) + offMainNs(last_ai_stats.intent_batch));
+        try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(ai_range_alignment_items), &.{ last_ai_stats.perf.gather_batch, last_ai_stats.separation_batch, last_ai_stats.intent_batch });
+        main_total += elapsed_ns -| (offMainNs(last_ai_stats.perf.gather_batch) + offMainNs(last_ai_stats.separation_batch) + offMainNs(last_ai_stats.intent_batch));
     }
 
     var stats = accumulator.finish();
@@ -262,16 +262,14 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     std.debug.assert(last_ai_stats.separation_candidate_checks <= last_ai_stats.entity_count * max_separation_candidate_checks);
     // A fill per key a range's rows change to: at most the rows' cell runs plus the ranges.
     const ranges = last_ai_stats.separation_batch.range_count;
-    if (comptime runtime_perf_log.enabled) {
-        std.debug.assert(last_ai_stats.perf.separation_block_fills <= cellRuns(fixture, spatial_view, think_set, false) + ranges);
-        std.debug.assert(last_ai_stats.perf.cohere_block_fills <= cellRuns(fixture, spatial_view, think_set, true) + ranges);
-        stats.neighbor_block_fills = last_ai_stats.perf.separation_block_fills;
-        stats.secondary_neighbor_block_fills = last_ai_stats.perf.cohere_block_fills;
-    }
+    std.debug.assert(last_ai_stats.perf.separation_block_fills <= cellRuns(fixture, spatial_view, think_set, false) + ranges);
+    std.debug.assert(last_ai_stats.perf.cohere_block_fills <= cellRuns(fixture, spatial_view, think_set, true) + ranges);
+    stats.neighbor_block_fills = last_ai_stats.perf.separation_block_fills;
+    stats.secondary_neighbor_block_fills = last_ai_stats.perf.cohere_block_fills;
     stats.candidate_pairs = last_ai_stats.separation_candidate_checks;
     stats.output_count = last_ai_stats.intent_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(last_ai_stats.intent_batch);
-    stats.splice_batch = suite.batchSummaryFromBatch(suite.perfBatch(last_ai_stats.perf, "gather_batch"));
+    stats.splice_batch = suite.batchSummaryFromBatch(last_ai_stats.perf.gather_batch);
     stats.ai_behavior_histogram = behaviorHistogram(fixture.data.aiAgentSliceConst().behaviors);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.separation_tuner), separation_settled_before_measurement);

@@ -7,7 +7,6 @@
 //! toggle batch. Generic harness pieces stay in `suite.zig` and `../fixtures.zig`.
 
 const std = @import("std");
-const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const offMainNs = @import("../../app/thread_system.zig").offMainNs;
@@ -50,14 +49,19 @@ pub fn coldSettleLimit(options: suite.Options) usize {
     return @min(suite.adaptiveSettleIterationLimit(options), cold_settle_cap);
 }
 
+/// One pathfinding update under `case`; a fixed threaded case runs every update stage of
+/// more than one range on workers.
 pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
-    return try system.update(requests, agent_count, thread_system, .{
-        .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
+    const items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items);
+    const stats = try system.update(requests, agent_count, thread_system, .{
+        .items_per_range = items_per_range,
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
         .max_solved_requests_per_step = solve_budget,
         .max_solve_admissions_per_step = fallback_budget,
     });
+    try suite.checkStagesDispatched(case, thread_system, items_per_range, &updateBatches(stats));
+    return stats;
 }
 
 // Gives every pathfinding update stage this case's tuner, as the solve batch gets its own.
@@ -76,7 +80,7 @@ pub fn setPathStageTuners(system: *PathfindingSystem, case: suite.BenchmarkCase)
 
 // An update's stage batches, in `StageReport` order.
 fn updateBatches(stats: PathfindingStats) [update_stage_count]BatchStats {
-    return .{ stats.intake_batch, suite.perfBatch(stats.perf, "group_field_batch"), suite.perfBatch(stats.perf, "group_field_begin_batch"), stats.solve_batch, suite.perfBatch(stats.perf, "publish_copy_batch"), stats.registry_flush_batch, stats.resize_copy_batch };
+    return .{ stats.intake_batch, stats.perf.group_field_batch, stats.perf.group_field_begin_batch, stats.solve_batch, stats.perf.publish_copy_batch, stats.registry_flush_batch, stats.resize_copy_batch };
 }
 
 const update_stage_count = 7;
@@ -118,13 +122,11 @@ pub const StageReport = struct {
         self.timed_ns += elapsed_ns;
         self.main_ns += elapsed_ns -| offMainStageNs(stats);
         self.accept_main_ns += stats.accept_ns -| offMainNs(stats.intake_batch);
-        self.group_main_ns += stats.group_service_ns -| (offMainNs(suite.perfBatch(stats.perf, "group_field_batch")) + offMainNs(suite.perfBatch(stats.perf, "group_field_begin_batch")));
+        self.group_main_ns += stats.group_service_ns -| (offMainNs(stats.perf.group_field_batch) + offMainNs(stats.perf.group_field_begin_batch));
         self.solve_main_ns += stats.solve_ns -| offMainNs(stats.solve_batch);
-        self.publish_ns += stats.publish_ns -| offMainNs(suite.perfBatch(stats.perf, "publish_copy_batch"));
-        if (comptime runtime_perf_log.enabled) {
-            self.registrations_added += stats.perf.registrations_added;
-            self.registrations_removed += stats.perf.registrations_removed;
-        }
+        self.publish_ns += stats.publish_ns -| offMainNs(stats.perf.publish_copy_batch);
+        self.registrations_added += stats.perf.registrations_added;
+        self.registrations_removed += stats.perf.registrations_removed;
         self.unavailable += stats.unavailable_results;
         self.goal_fallbacks += stats.goal_fallbacks;
         self.shapes.add(updateBatches(stats));
@@ -358,7 +360,7 @@ pub const ReactionStages = struct {
     pub fn add(self: *ReactionStages, reaction: Reaction, batches: [3]BatchStats) void {
         self.samples += 1;
         self.timed_ns += reaction.elapsed_ns;
-        const main_ns = reaction.elapsed_ns -| if (comptime runtime_perf_log.enabled) reaction.stats.perf.off_main_stage_ns else 0;
+        const main_ns = reaction.elapsed_ns -| reaction.stats.perf.off_main_stage_ns;
         self.main_ns += main_ns;
         self.nav_main.add(main_ns, reaction.stats);
         self.nav_main.endSample();
@@ -389,11 +391,9 @@ pub const EvictReport = struct {
     evicted: usize = 0,
 
     pub fn add(self: *EvictReport, reaction: Reaction) void {
-        self.stages.add(reaction, .{ suite.perfBatch(reaction.stats.perf, "evict_count_batch"), reaction.stats.evict_batch, suite.perfBatch(reaction.stats.perf, "evict_flush_batch") });
-        if (comptime runtime_perf_log.enabled) {
-            self.visited = reaction.stats.perf.evict_entries_visited;
-            self.evicted = reaction.stats.perf.evicted_results;
-        }
+        self.stages.add(reaction, .{ reaction.stats.perf.evict_count_batch, reaction.stats.evict_batch, reaction.stats.perf.evict_flush_batch });
+        self.visited = reaction.stats.perf.evict_entries_visited;
+        self.evicted = reaction.stats.perf.evicted_results;
     }
 
     pub fn write(self: EvictReport, details: *suite.DetailLines) void {

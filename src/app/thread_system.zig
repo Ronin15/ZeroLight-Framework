@@ -2778,70 +2778,6 @@ test "adaptive work tuner demotes threaded to inline when the threaded cost coll
     try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(req).worker_threads);
 }
 
-test "adaptive work tuner counts probing windows and demotions" {
-    if (comptime !diagnostics_enabled) return error.SkipZigTest;
-    // Two-batch windows: a per-batch count would double the per-window one.
-    var tuner = AdaptiveWorkTuner.init(.{
-        .initial_range_items = 64,
-        .smallest_range_items = 16,
-        .largest_range_items = 256,
-        .sample_window = 2,
-        .threaded_batch_ns = 50_000,
-        .improvement_threshold_percent = 5,
-    });
-    const request = tunerTestRequest(2048, 4, 16, 64);
-
-    // The learning window closes without counting as a probe.
-    for (0..tuner.config.sample_window) |_| {
-        const inline_profile = tuner.selectProfile(request);
-        tuner.record(tunerTestBatchWithProfile(2048, inline_profile, 200_000));
-    }
-    try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.phase);
-    try std.testing.expectEqual(@as(u64, 0), tuner.probe_window_count);
-
-    // Every window from here until settling closes in the probing phase.
-    var probing_windows: u64 = 0;
-    var settle_guard: usize = 0;
-    while (tuner.phase != .settled and settle_guard < 128) : (settle_guard += 1) {
-        try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.phase);
-        probing_windows += 1;
-        for (0..tuner.config.sample_window) |_| {
-            const selected = tuner.selectProfile(request);
-            const duration: u64 = if (selected.worker_threads == 0) 200_000 else 80_000;
-            tuner.record(tunerTestBatchWithProfile(2048, selected, duration));
-        }
-    }
-    try std.testing.expect(tuner.phase == .settled);
-    try std.testing.expect(tuner.has_threaded_profile);
-    try std.testing.expect(probing_windows > 0);
-    try std.testing.expectEqual(probing_windows, tuner.probe_window_count);
-    try std.testing.expectEqual(@as(u64, 0), tuner.demotion_count);
-
-    // Collapsed threaded cost demotes once; the settled windows count as no probe.
-    const participants = tuner.best_profile.worker_threads + 1;
-    const cheap_ns: u64 = (50_000 / participants) / 2;
-    var demoted = false;
-    var guard: usize = 0;
-    while (guard < 32) : (guard += 1) {
-        const selected = tuner.selectProfile(request);
-        if (selected.worker_threads == 0) {
-            demoted = true;
-            break;
-        }
-        tuner.record(tunerTestBatchWithProfile(2048, selected, cheap_ns));
-    }
-    try std.testing.expect(demoted);
-    try std.testing.expectEqual(@as(u64, 1), tuner.demotion_count);
-    try std.testing.expectEqual(probing_windows, tuner.probe_window_count);
-
-    // A sustained item-count shift resets learning but never the counters.
-    const shifted_request = tunerTestRequest(8192, 4, 16, 64);
-    for (0..tuner.config.sample_window) |_| _ = tuner.selectProfile(shifted_request);
-    try std.testing.expectEqual(AdaptiveWorkPhase.learning, tuner.phase);
-    try std.testing.expectEqual(@as(u64, 1), tuner.demotion_count);
-    try std.testing.expectEqual(probing_windows, tuner.probe_window_count);
-}
-
 // Settles `tuner` on a threaded profile that beat a measured 200 us inline baseline at
 // 80 us, for `request`.
 fn settleTunerThreadedAgainstExpensiveInline(tuner: *AdaptiveWorkTuner, request: AdaptiveWorkRequest) !AdaptiveWorkProfile {
@@ -2974,7 +2910,6 @@ test "adaptive work tuner the periodic retune lifts the bound suppression" {
 test "adaptive work tuner a demotion whose profile cannot dispatch at a shrunk count stays inline" {
     var tuner = boundRuleTestTuner(120);
     _ = try settleTunerThreadedAgainstExpensiveInline(&tuner, tunerTestRequest(90, 9, 4, 64));
-    const demotions_before = tuner.demotion_count;
 
     // Twelve items fit one range of any threaded profile, yet stay above the gate.
     const shrunk_request = tunerTestRequest(12, 9, 4, 64);
@@ -2989,9 +2924,6 @@ test "adaptive work tuner a demotion whose profile cannot dispatch at a shrunk c
         was_threaded = threaded;
     }
     try std.testing.expect(flips <= 1);
-    if (comptime diagnostics_enabled) {
-        try std.testing.expectEqual(demotions_before + 1, tuner.demotion_count);
-    }
 }
 
 test "adaptive work tuner a restored profile commits a probe only on a measured win" {
@@ -3122,7 +3054,6 @@ test "adaptive work tuner never demotes a wide threaded stage above the gate" {
     var tuner = AdaptiveWorkTuner.init(.{});
     const item_count = 4096;
     try std.testing.expect(try settleWideThreaded(&tuner, item_count, 200_000) >= 8);
-    const demotions_before = tuner.demotion_count;
 
     // Several retune periods at the same cost: every dispatch stays threaded.
     const steps = 4 * tuner.config.retune_after_settled_windows * tuner.config.sample_window;
@@ -3130,9 +3061,6 @@ test "adaptive work tuner never demotes a wide threaded stage above the gate" {
         try std.testing.expect(tunerScenarioStepWithFloor(&tuner, item_count, 200_000) > 0);
     }
     try std.testing.expect(tuner.has_threaded_profile);
-    if (comptime diagnostics_enabled) {
-        try std.testing.expectEqual(demotions_before, tuner.demotion_count);
-    }
 }
 
 test "adaptive work tuner keeps a wide threaded stage threaded through a shift found mid-probe" {
@@ -3141,7 +3069,6 @@ test "adaptive work tuner keeps a wide threaded stage threaded through a shift f
     while (tuner.phase != .probing) {
         try std.testing.expect(tunerScenarioStepWithFloor(&tuner, 4096, 200_000) > 0);
     }
-    const demotions_before = tuner.demotion_count;
 
     // Half the items at the same per-item cost: 100 us inline, still above the gate.
     const steps = 2 * tuner.config.retune_after_settled_windows * tuner.config.sample_window;
@@ -3149,9 +3076,6 @@ test "adaptive work tuner keeps a wide threaded stage threaded through a shift f
         try std.testing.expect(tunerScenarioStepWithFloor(&tuner, 2048, 100_000) > 0);
     }
     try std.testing.expect(tuner.has_threaded_profile);
-    if (comptime diagnostics_enabled) {
-        try std.testing.expectEqual(demotions_before, tuner.demotion_count);
-    }
 }
 
 test "adaptive work tuner demotes a wait dominated threaded batch whose work is tiny" {

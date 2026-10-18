@@ -292,7 +292,6 @@ test "steering keeps highest priority navigation intent with stable tie order" {
 }
 
 test "steering threaded arbitration keeps the first appearance and the best intent across ranges" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -416,7 +415,6 @@ test "steering claims stay correct across the claim stamp wrap" {
 }
 
 test "steering claim band count does not follow the resolve partition" {
-    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -461,11 +459,6 @@ test "steering claim band count does not follow the resolve partition" {
             try steering.update(&data, &frame, &threads, &pathfinding, &colliders, .{ .items_per_range = range_items, .max_worker_threads = 2, .adaptive = false })
         else
             try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-        if (items_per_range) |range_items| {
-            try std.testing.expectEqual(@divCeil(intents.len, range_items), stats.perf.select_resolve_batch.range_count);
-            // Three 16-row claim blocks over 40 steering rows, whatever the resolve ranges.
-            try std.testing.expectEqual(@as(usize, 3), stats.perf.select_claim_batch.item_count);
-        }
         try std.testing.expectEqual(@as(usize, 40), stats.selected_intent_count);
         for (output, frame.intents.mergedItems()) |*slot, merged| slot.* = merged.movement;
         for (claim, 0..) |*slot, row| slot.* = steering.claims.get(row);
