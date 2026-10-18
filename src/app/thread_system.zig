@@ -1640,9 +1640,8 @@ pub fn StageThreads(comptime Config: type) type {
         }
 
         /// `threads` when a stage there can get a worker, else null.
-        pub fn withWorkers(threads: ?Self) ?Self {
-            const held = threads orelse return null;
-            return if (held.mayUseWorkers()) held else null;
+        pub fn withWorkers(threads: Self) ?Self {
+            return if (threads.mayUseWorkers()) threads else null;
         }
     };
 }
@@ -2535,7 +2534,6 @@ test "round dispatch records one tuner sample per step, and folds inline rounds 
 test "stage threads with workers is null with no worker or a zero worker cap" {
     const Config = struct { items_per_range: ?usize = null, max_worker_threads: ?usize = null, adaptive: bool = true };
     const Threads = StageThreads(Config);
-    try std.testing.expect(Threads.withWorkers(null) == null);
     var serial = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial.deinit();
     try std.testing.expect(Threads.withWorkers(.{ .thread_system = &serial, .config = .{} }) == null);

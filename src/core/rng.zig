@@ -42,14 +42,6 @@ pub fn uniformF32(seed: u64, entity_index: u32, step: u32, salt: u32) f32 {
     return @as(f32, @floatFromInt(top24)) * (1.0 / 16777216.0);
 }
 
-/// Bounded draw in `[0, bound)`. Plain modulo: acceptable for gameplay-scale
-/// bounds (picking among a handful of candidates), not intended for
-/// cryptographic-grade uniformity — bias is negligible for bound << 2^64.
-pub fn boundedU32(seed: u64, entity_index: u32, step: u32, salt: u32, bound: u32) u32 {
-    if (bound == 0) return 0;
-    return @intCast(mix64(seed, entity_index, step, salt) % bound);
-}
-
 /// Deterministic unit vector, uniform in direction. Reuses `math.sinCos`
 /// rather than reimplementing trig.
 pub fn unitVec2(seed: u64, entity_index: u32, step: u32, salt: u32) math.Vec2 {
@@ -110,19 +102,6 @@ test "uniformF32 is roughly uniformly distributed" {
         const c: f32 = @floatFromInt(count);
         try std.testing.expect(c > expected_per_bucket * 0.5);
         try std.testing.expect(c < expected_per_bucket * 1.5);
-    }
-}
-
-test "boundedU32 stays in [0, bound) including degenerate bounds" {
-    try std.testing.expectEqual(@as(u32, 0), boundedU32(1, 1, 1, 0, 0));
-    var i: u32 = 0;
-    while (i < 50) : (i += 1) {
-        try std.testing.expectEqual(@as(u32, 0), boundedU32(1, i, i, 0, 1));
-    }
-    i = 0;
-    while (i < 200) : (i += 1) {
-        const v = boundedU32(1, i, i * 3, 2, 7);
-        try std.testing.expect(v < 7);
     }
 }
 

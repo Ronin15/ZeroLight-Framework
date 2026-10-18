@@ -1036,7 +1036,6 @@ test "serial response math uses simd chunks and scalar tails" {
 
     try std.testing.expectEqual(@as(usize, simd.lane_count + 1), stats.intent_count);
     try std.testing.expectEqual(@as(usize, simd.lane_count), simd.vectorizedEnd(stats.intent_count));
-    try std.testing.expectEqual(@as(usize, 1), simd.tailLen(stats.intent_count));
     for (dynamics, 0..) |entity, index| {
         const body = data.movementBodyConst(entity).?;
         try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(index * 10)) - @as(f32, @floatFromInt(index + 1)), body.position.x, 0.001);

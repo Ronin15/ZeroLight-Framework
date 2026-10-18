@@ -964,7 +964,7 @@ pub const CollisionSystem = struct {
         self.pair_bound_overflows += 1;
         if (self.pair_bound_warned) return;
         self.pair_bound_warned = true;
-        if (comptime logging.enabled(.warn) and !builtin.is_test) logging.game.warn(
+        if (comptime logging.enabled(.warn)) logging.game.warn(
             "collision: {d} candidate pairs outgrew the reserved pair bound {d} (total or per range); collision stores or contact streams grew in-stage",
             .{ candidate_pair_count, self.reserved_pair_bound },
         );
@@ -985,7 +985,6 @@ pub const CollisionSystem = struct {
         self.entry_bound_overflows += 1;
         if (self.entry_bound_warned) return;
         self.entry_bound_warned = true;
-        if (builtin.is_test) return;
         if (entry_count > self.reserved_entry_bound) {
             if (comptime logging.enabled(.warn)) logging.game.warn(
                 "collision: {d} sweep entries exceeded the reserved entry bound {d}; collision stores grew in-stage",

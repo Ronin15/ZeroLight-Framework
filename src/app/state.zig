@@ -415,11 +415,6 @@ pub const StateStack = struct {
         return self.states.items.len;
     }
 
-    pub fn activeHandle(self: *const StateStack) ?StateHandle {
-        if (self.states.items.len == 0) return null;
-        return self.states.items[self.states.items.len - 1].handle;
-    }
-
     pub fn active(self: *const StateStack) ?State {
         if (self.states.items.len == 0) return null;
         return self.states.items[self.states.items.len - 1].state;
@@ -746,7 +741,7 @@ test "state stack owns pushed states and destroys removed states" {
 
     const first_handle = try stack.replaceGameplay(TestingState, .{ .id = 1, .deinit_count = &deinit_count });
     try std.testing.expectEqual(@as(usize, 1), stack.len());
-    try std.testing.expectEqual(first_handle, stack.activeHandle().?);
+    try std.testing.expectEqual(first_handle, stack.states.items[stack.states.items.len - 1].handle);
     try std.testing.expect(stack.contains(first_handle));
 
     const second_handle = try stack.pushModal(TestingState, .{ .id = 2, .deinit_count = &deinit_count });
@@ -1114,7 +1109,7 @@ test "consumed modal event suppresses routed frame command" {
     var event = testKeyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_ESCAPE, false);
     const routing_policy = stack.inputRoutingPolicy();
     const consumed = try stack.handleEvent(&event, &transitions);
-    if (!consumed) input_router.routeEvent(routing_policy, &event, &input, &commands);
+    if (!consumed) input_router.routeEventWithGamepad(routing_policy, &event, &input, &commands, null);
 
     try std.testing.expect(consumed);
     try std.testing.expect(!commands.wasPressed(.quit));
@@ -1187,13 +1182,13 @@ test "state stack input routing follows active state policy" {
     var input = InputState{};
     var commands = FrameCommands{};
     var move_down = testKeyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_A, false);
-    input_router.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
+    input_router.routeEventWithGamepad(stack.inputRoutingPolicy(), &move_down, &input, &commands, null);
     try std.testing.expect(!input.isHeld(.move_left));
 
     try std.testing.expect(stack.remove(modal_handle));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
-    input_router.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
+    input_router.routeEventWithGamepad(stack.inputRoutingPolicy(), &move_down, &input, &commands, null);
     try std.testing.expect(input.isHeld(.move_left));
 
     _ = try stack.pushOpaque(TestingState, .{});
@@ -1706,7 +1701,7 @@ test "reserved modal push consumes only reserved capacity and allocates zero (Fa
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(allocations_after_warmup, failing.allocations);
     try std.testing.expectEqual(@as(usize, 1), stack.len());
-    try std.testing.expectEqual(handle, stack.activeHandle().?);
+    try std.testing.expectEqual(handle, stack.states.items[stack.states.items.len - 1].handle);
 }
 
 test "quit transition reports through apply result" {

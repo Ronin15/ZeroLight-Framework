@@ -1045,7 +1045,7 @@ pub const SimulationPipeline = struct {
             self.population_capacity_grows += 1;
             if (!self.population_growth_logged) {
                 self.population_growth_logged = true;
-                if (comptime logging.enabled(.info) and !builtin.is_test) logging.game.info(
+                if (comptime logging.enabled(.info)) logging.game.info(
                     "population seam grew pipeline capacity to {d} bodies",
                     .{body},
                 );
@@ -1673,6 +1673,10 @@ pub const SimulationPipeline = struct {
 
 const StageTimer = @import("../app/runtime_perf_log.zig").StageTimer;
 
+const data_test_support = @import("data_system/test_support.zig");
+
+const static_colliders_test_support = @import("systems/static_colliders_test_support.zig");
+
 test "stageContract(.ai_decide) reads affect_drives, written by affect_update one stage earlier" {
     const contract = stageContract(.ai_decide);
     try std.testing.expect(contract.reads.contains(.affect_drives));
@@ -2161,7 +2165,7 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
 
     // Both stages ran over the same scoped agent this step (observable stage
     // order: ai_memory processes after perception and before ai reads it).
-    try std.testing.expectEqual(@as(usize, 1), stats.ai_memory.processed_count);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.ai_memory.memory_dense_indices.items.len);
     try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
 
     // Perception never saw the player (out of vision range) and AiMemory's
@@ -2314,13 +2318,13 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
     // Both perception and affect ran this step over the observer (the only
     // entity carrying AiAffect); both agents (observer + hostile) reach AI.
     try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
-    try std.testing.expectEqual(@as(usize, 1), stats.affect.processed_count);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.affect.rows.len);
     try std.testing.expectEqual(@as(usize, 2), stats.ai.entity_count);
 
     // Affect observed this step's perception output (hostile visible, close),
     // proving it ran after perception -- a stale/previous-step read would
     // have left fear/aggression at their zero default.
-    const affect_after = data.aiAffectConst(observer).?;
+    const affect_after = data_test_support.aiAffect(&data, observer).?;
     try std.testing.expect(affect_after.fear > 0);
     try std.testing.expect(affect_after.aggression > 0);
 }
@@ -2392,7 +2396,7 @@ test "pipeline fear selects flee before movement, not only a positive drive" {
         .sim_view = fullWorldSimView(&world),
     });
 
-    try std.testing.expectEqual(@import("data_system.zig").AiBehavior.flee, data.aiAgentConst(observer).?.active_behavior);
+    try std.testing.expectEqual(@import("data_system.zig").AiBehavior.flee, data_test_support.aiAgent(&data, observer).?.active_behavior);
 }
 
 test "pipeline perception acquire refreshes memory last_known the same step" {
@@ -2460,7 +2464,7 @@ test "pipeline perception acquire refreshes memory last_known the same step" {
         .sim_view = fullWorldSimView(&world),
     });
 
-    const memory = data.aiMemoryConst(observer).?;
+    const memory = data_test_support.aiMemory(&data, observer).?;
     try std.testing.expect(memory.last_known_target.eql(hostile));
     try std.testing.expectApproxEqAbs(@as(f32, 10), memory.last_known_x, 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 0), memory.last_known_y, 0.01);
@@ -2890,15 +2894,15 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     // struct-literal world (`cognition_region == null`) halo == think.
     try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
     try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
-    try std.testing.expectEqual(@as(usize, 1), stats.perception.candidate_population_count);
-    try std.testing.expectEqual(@as(usize, 0), stats.perception.perceived_events);
-    try std.testing.expectEqual(@as(usize, 0), stats.perception.lost_events);
-    try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.spatial_index.view().entryCount());
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.entity_perceived);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.entity_lost);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
 
     // No hostile candidate in range (default/neutral factions never read as
     // hostile toward each other or the player): the in-scope observer's sensed
     // state stays cold.
-    const observer_perception = data.aiPerceptionConst(observer).?;
+    const observer_perception = data_test_support.aiPerception(&data, observer).?;
     try std.testing.expect(!observer_perception.target_visible);
     try std.testing.expectEqual(EntityId.invalid, observer_perception.nearest_threat);
 
@@ -3008,15 +3012,15 @@ test "pipeline dual-list perception: think observer acquires off-phase halo host
         .min = .{ .x = -h, .y = -h },
         .max_exclusive = .{ .x = 1 + h, .y = 1 + h },
     }, stats.scope.active_region.?);
-    try std.testing.expectEqual(@as(usize, 2), stats.perception.candidate_population_count);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.spatial_index.view().entryCount());
     try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
     try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
 
-    const ally_perception = data.aiPerceptionConst(ally).?;
+    const ally_perception = data_test_support.aiPerception(&data, ally).?;
     try std.testing.expect(ally_perception.target_visible);
     try std.testing.expectEqual(hostile.index, ally_perception.nearest_threat.index);
 
-    const hostile_perception = data.aiPerceptionConst(hostile).?;
+    const hostile_perception = data_test_support.aiPerception(&data, hostile).?;
     try std.testing.expect(!hostile_perception.target_visible);
     try std.testing.expectEqual(EntityId.invalid, hostile_perception.nearest_threat);
 }
@@ -3051,7 +3055,7 @@ test "default-config pipeline publishes every perception acquisition and refresh
     try pipeline.reserve(&frame, 5);
 
     frame.beginStep();
-    const stats = try pipeline.update(.{
+    _ = try pipeline.update(.{
         .data = &data,
         .frame = &frame,
         .world = &world,
@@ -3064,10 +3068,9 @@ test "default-config pipeline publishes every perception acquisition and refresh
     });
 
     try std.testing.expectEqual(@as(usize, 2), countPerceptionEvents(&frame).perceived);
-    try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
-    try std.testing.expect(data.aiMemoryConst(observer_a).?.last_known_target.eql(hostile_a));
-    try std.testing.expect(data.aiMemoryConst(observer_b).?.last_known_target.eql(hostile_b));
+    try std.testing.expect(data_test_support.aiMemory(&data, observer_a).?.last_known_target.eql(hostile_a));
+    try std.testing.expect(data_test_support.aiMemory(&data, observer_b).?.last_known_target.eql(hostile_b));
 }
 
 test "derived perception share covers an identity swap for every observer" {
@@ -3123,11 +3126,10 @@ test "derived perception share covers an identity swap for every observer" {
         moveShareTestAgent(&data, far[index], base + 8);
     }
     frame.beginStep();
-    const stats = try pipeline.update(context);
+    _ = try pipeline.update(context);
     const counts = countPerceptionEvents(&frame);
     try std.testing.expectEqual(@as(usize, 3), counts.perceived);
     try std.testing.expectEqual(@as(usize, 3), counts.lost);
-    try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
 }
 
@@ -3204,7 +3206,7 @@ test "perception share grows at the seam so newly created observers never trunca
     // share's worst case is what runs.
     try markAllAlwaysActive(&data);
     frame.beginStep();
-    const stats = try pipeline.update(.{
+    _ = try pipeline.update(.{
         .data = &data,
         .frame = &frame,
         .world = &world,
@@ -3216,7 +3218,6 @@ test "perception share grows at the seam so newly created observers never trunca
         .sim_view = fullWorldSimView(&world),
     });
     try std.testing.expectEqual(@as(usize, 7), countPerceptionEvents(&frame).perceived);
-    try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
 }
 
@@ -3485,7 +3486,7 @@ test "pipeline chunk_derive after collision pose settle matches settled world po
 
     const body = data.movementBodyConst(player.entity).?;
     const settled = world.chunkCoordForWorldPos(body.position.x, body.position.y);
-    const meta_after = data.simulationMetadata(player.entity).?;
+    const meta_after = data_test_support.simulationMetadata(&data, player.entity).?;
     try std.testing.expectEqual(settled.x, meta_after.chunk.x);
     try std.testing.expectEqual(settled.y, meta_after.chunk.y);
     // Contact must have crossed the chunk-0 / chunk-1 boundary (cell 8 = chunk 1).
@@ -3550,12 +3551,12 @@ test "pipeline scope chunks and nav chunks are the world's chunks" {
     const world_chunk = world.chunkCoordForWorldPos(body.position.x, body.position.y);
     try std.testing.expectEqual(@as(i32, 2), world_chunk.x);
     try std.testing.expectEqual(@as(i32, 1), world_chunk.y);
-    const scope_chunk = data.simulationMetadata(player.entity).?.chunk;
+    const scope_chunk = data_test_support.simulationMetadata(&data, player.entity).?.chunk;
     try std.testing.expectEqual(world_chunk.x, scope_chunk.x);
     try std.testing.expectEqual(world_chunk.y, scope_chunk.y);
     const nav_grid = pipeline.pathfinding.graph.grid(0).?;
     const nav_cell = nav_grid.indexForCell(nav_grid.worldToCellClamped(body.position)).?;
-    const world_chunk_index: u32 = @intCast(world_chunk.y * @as(i32, world.chunksX()) + world_chunk.x);
+    const world_chunk_index: u32 = @intCast(world_chunk.y * @as(i32, @intCast(world.chunkGeometry().chunks_x)) + world_chunk.x);
     try std.testing.expectEqual(world_chunk_index, nav_grid.geometry.chunkOfCell(nav_cell));
 }
 
@@ -3647,7 +3648,7 @@ test "pipeline plane traversal batches fall landing tile events into one range" 
     }
     try std.testing.expectEqual(@as(usize, 2), tile_events);
     // Both landing carves share one events range (batched
-    // publishWorldTileChanges), not two appendRequired ranges of one each.
+    // publishWorldTileChangesAssumeCapacity), not two appendRequired ranges of one each.
     var batch_ranges: usize = 0;
     for (frame.events.range_stats.items) |range_stat| {
         if (range_stat.world_tile_changed >= 2) batch_ranges += 1;
@@ -3914,7 +3915,7 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
     try markAllAlwaysActive(&data);
 
     // Sanity: the observer does not hear anything before the step runs.
-    try std.testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+    try std.testing.expect(!data_test_support.aiPerception(&data, observer).?.heard_stimulus);
 
     const dig_config = try DigConfig.fromMeta(&meta);
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -3952,7 +3953,7 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
     // The observer heard this step's dig, which is only possible if dig produced
     // the stimulus before perception read `frame.stimuli` this step -- perception
     // running first would find the (freshly cleared) stimulus stream empty.
-    try std.testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
+    try std.testing.expect(data_test_support.aiPerception(&data, observer).?.heard_stimulus);
 }
 
 test "pipeline promotes deferred impacts before perception on the following step" {
@@ -4023,7 +4024,7 @@ test "pipeline promotes deferred impacts before perception on the following step
         .sim_view = fullWorldSimView(&world),
     });
 
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try std.testing.expect(perception.heard_stimulus);
     try std.testing.expectApproxEqAbs(impact_x, perception.heard_stimulus_x, 0.01);
     try std.testing.expectApproxEqAbs(impact_y, perception.heard_stimulus_y, 0.01);
@@ -4108,7 +4109,7 @@ test "pipeline defers player collision impacts until the next step" {
     try std.testing.expect(stats.collision.contact_count > 0);
     try std.testing.expectEqual(@as(usize, 1), pipeline.sensory.deferred_stimulus_count);
     try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.sensory.deferred_stimuli[0].kind);
-    try std.testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+    try std.testing.expect(!data_test_support.aiPerception(&data, observer).?.heard_stimulus);
 
     frame.beginStep();
     _ = try pipeline.update(.{
@@ -4122,7 +4123,7 @@ test "pipeline defers player collision impacts until the next step" {
         .bounds_height = 450,
         .sim_view = fullWorldSimView(&world),
     });
-    try std.testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
+    try std.testing.expect(data_test_support.aiPerception(&data, observer).?.heard_stimulus);
 }
 
 test "head-on player impact enqueues even after collision response zeroes approach velocity" {
@@ -4270,7 +4271,7 @@ test "pipeline emits player footstep stimulus before perception in the same step
         .sim_view = fullWorldSimView(&world),
     });
 
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try std.testing.expect(perception.heard_stimulus);
     try std.testing.expectApproxEqAbs(@as(f32, 5 * 32), perception.heard_stimulus_x, 0.01);
 }
@@ -5019,17 +5020,17 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
     frame.beginStep();
     frame.dig_intent = .hole;
     _ = try pipeline.update(ctx);
-    try std.testing.expect(data.aiPerceptionConst(observer_phase0).?.heard_stimulus);
-    try std.testing.expect(!data.aiPerceptionConst(observer_phase1).?.heard_stimulus);
+    try std.testing.expect(data_test_support.aiPerception(&data, observer_phase0).?.heard_stimulus);
+    try std.testing.expect(!data_test_support.aiPerception(&data, observer_phase1).?.heard_stimulus);
 
     // Following step runs stagger slot 1; sticky dig should reach phase-1.
     frame.beginStep();
     frame.dig_intent = .none;
     _ = try pipeline.update(ctx);
-    try std.testing.expect(data.aiPerceptionConst(observer_phase1).?.heard_stimulus);
-    try std.testing.expectApproxEqAbs(dig_stimulus_x, data.aiPerceptionConst(observer_phase1).?.heard_stimulus_x, 1.0);
-    try std.testing.expectApproxEqAbs(dig_stimulus_y, data.aiPerceptionConst(observer_phase1).?.heard_stimulus_y, 1.0);
-    try std.testing.expect(!data.aiPerceptionConst(observer_phase3).?.heard_stimulus);
+    try std.testing.expect(data_test_support.aiPerception(&data, observer_phase1).?.heard_stimulus);
+    try std.testing.expectApproxEqAbs(dig_stimulus_x, data_test_support.aiPerception(&data, observer_phase1).?.heard_stimulus_x, 1.0);
+    try std.testing.expectApproxEqAbs(dig_stimulus_y, data_test_support.aiPerception(&data, observer_phase1).?.heard_stimulus_y, 1.0);
+    try std.testing.expect(!data_test_support.aiPerception(&data, observer_phase3).?.heard_stimulus);
 
     // Slot 2 then slot 3: the linger window (cognition_stagger_n - 1 = 3 steps)
     // must still carry the dig to the furthest cohort before it expires.
@@ -5040,9 +5041,9 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
     frame.beginStep();
     frame.dig_intent = .none;
     _ = try pipeline.update(ctx);
-    try std.testing.expect(data.aiPerceptionConst(observer_phase3).?.heard_stimulus);
-    try std.testing.expectApproxEqAbs(dig_stimulus_x, data.aiPerceptionConst(observer_phase3).?.heard_stimulus_x, 1.0);
-    try std.testing.expectApproxEqAbs(dig_stimulus_y, data.aiPerceptionConst(observer_phase3).?.heard_stimulus_y, 1.0);
+    try std.testing.expect(data_test_support.aiPerception(&data, observer_phase3).?.heard_stimulus);
+    try std.testing.expectApproxEqAbs(dig_stimulus_x, data_test_support.aiPerception(&data, observer_phase3).?.heard_stimulus_x, 1.0);
+    try std.testing.expectApproxEqAbs(dig_stimulus_y, data_test_support.aiPerception(&data, observer_phase3).?.heard_stimulus_y, 1.0);
 }
 
 const GrowthScenarioResult = struct {
@@ -5182,7 +5183,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     // The zero-allocation proof covers perception and affect only if they ran: the
     // 5 observers' stagger phases cover all four, so every step thinks at least one.
     try std.testing.expect(first_stats.perception.observer_count >= 1);
-    try std.testing.expect(first_stats.affect.processed_count >= 1);
+    try std.testing.expect(pipeline.affect.rows.len >= 1);
     if (max_worker_threads > 0) {
         try std.testing.expect(!first_stats.movement.batch.ran_inline);
         try std.testing.expectEqual(rangeCount(37, first_items_per_range), first_stats.movement.batch.range_count);
@@ -5204,7 +5205,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
         const retune_stats = try retune_result;
         try std.testing.expectEqual(rangeCount(37, profile.items_per_range), retune_stats.movement.batch.range_count);
         try std.testing.expect(retune_stats.perception.observer_count >= 1);
-        try std.testing.expect(retune_stats.affect.processed_count >= 1);
+        try std.testing.expect(pipeline.affect.rows.len >= 1);
         try std.testing.expectEqual(@as(usize, 0), retune_failing.allocations);
     }
 
@@ -5356,7 +5357,7 @@ test "after population growth the seam's stream range counts are the binding res
     try markAllAlwaysActive(&data);
     // The crate alone is tier-policed, and its tier is wrong: the policy changes it, so
     // the tier stage appends every range.
-    var crate_metadata = data.simulationMetadata(crate).?;
+    var crate_metadata = data_test_support.simulationMetadata(&data, crate).?;
     crate_metadata.always_active = false;
     crate_metadata.tier = .dormant;
     try data.setSimulationMetadata(crate, crate_metadata);
@@ -5974,7 +5975,7 @@ test "a collider-sync OOM in a dig step still applies the dig the next step" {
     fixture.pipeline.static_colliders.chunk_lists.allocator = std.testing.allocator;
     fixture.pipeline.static_colliders.query_lists.allocator = std.testing.allocator;
     try std.testing.expectError(error.OutOfMemory, failed);
-    try std.testing.expectEqual(@as(usize, 0), fixture.pipeline.static_colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(fixture.pipeline.static_colliders));
     try std.testing.expect(fixture.navBlocked(1, 6, 3));
 
     // A step with no dig and no command: the retried sync and the kept dig marks apply.
@@ -6002,12 +6003,12 @@ test "a static nav-mark reserve OOM commits nothing and the retried commit reach
     try std.testing.expectError(error.OutOfMemory, failed);
     // Nothing committed: no entity, no row, and nav unchanged.
     try std.testing.expectEqual(entities_before, fixture.data.movementBodySliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, 0), fixture.pipeline.static_colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(fixture.pipeline.static_colliders));
     try std.testing.expect(!fixture.navBlocked(0, 2, 0));
 
     // The retried seam commits the same commands; nav takes the static.
     try fixture.seam();
-    try std.testing.expectEqual(@as(usize, 1), fixture.pipeline.static_colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 1), static_colliders_test_support.liveRowCount(fixture.pipeline.static_colliders));
     try std.testing.expect(fixture.navBlocked(0, 2, 0));
     try fixture.expectNavMatchesRebuild();
 }
@@ -6085,7 +6086,7 @@ test "statics committed at the seam leave the next step allocation-free" {
     frame.beginStep();
     try writeStructuralCommands(&frame, &commands);
     try std.testing.expect(!(try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
-    try std.testing.expectEqual(@as(usize, 21), pipeline.static_colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 21), static_colliders_test_support.liveRowCount(pipeline.static_colliders));
 
     // The next step reads the synced rows and allocates nothing on any owner.
     frame.beginStep();
@@ -6158,7 +6159,7 @@ test "a static committed at the seam pushes steering agents on the next step" {
     try frame.reserveStreams(pipeline.eventCapacitySum(), 4, 4, 4, 4, 4 + 16);
     try frame.reservePathRequests(1, 4);
     try pipeline.reserve(&frame, 4);
-    try std.testing.expectEqual(@as(usize, 1), pipeline.static_colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 1), static_colliders_test_support.liveRowCount(pipeline.static_colliders));
     const context: SimulationPipelineUpdateContext = .{
         .data = &data,
         .frame = &frame,

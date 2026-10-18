@@ -1642,7 +1642,7 @@ test "underground dense layers append in storage order not ascending render dept
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
-    try std.testing.expectEqual(@as(usize, 3), world.denseLayerCount());
+    try std.testing.expectEqual(@as(usize, 3), world.dense_layers.len);
     const grass_depth = denseLayerOrder(&world, 0).depth;
     const dirt_depth = denseLayerOrder(&world, 1).depth;
     const dirt_dark_depth = denseLayerOrder(&world, 2).depth;

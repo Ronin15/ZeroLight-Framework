@@ -136,9 +136,9 @@ pub const ActiveRegion = struct {
     }
 };
 
-/// Per-entity simulation metadata value type for get/set (`simulationMetadata`/
-/// `setSimulationMetadata`). The hot storage is dense SoA columns on the
-/// movement-body store; the hot path reads them directly via `scopeColumnsSlice`.
+/// Per-entity simulation metadata value type (`setSimulationMetadata`). The hot storage is
+/// dense SoA columns on the movement-body store; the hot path reads them directly via
+/// `scopeColumnsSlice`.
 pub const EntitySimulationMetadata = struct {
     tier: SimulationTier = .cognition,
     chunk: ChunkCoord = .{},

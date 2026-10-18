@@ -155,10 +155,10 @@ const Fixture = struct {
     // It invalidates nothing, as the add outside the window invalidated nothing.
     fn dropAddedTile(self: *Fixture) !void {
         const world = &self.world;
-        if (world.sparseTileCount() != self.sparse_count + 1) return error.AddedTileCountMismatch;
+        if (world.sparse_tiles.len != self.sparse_count + 1) return error.AddedTileCountMismatch;
         const added_index: u32 = @intCast(self.sparse_count);
         const chunk = world.chunkCoordForCell(added_tile_x, added_tile_y);
-        const chunk_index: usize = @intCast(chunk.y * @as(i32, world.chunksX()) + chunk.x);
+        const chunk_index: usize = @intCast(chunk.y * @as(i32, @intCast(world.chunkGeometry().chunks_x)) + chunk.x);
         const heads = world.level_terrain.items[added_tile_level].sparse_heads;
         if (heads[chunk_index] != added_index) return error.AddedTileIndexMismatch;
         const rows = world.sparse_tiles.slice();
@@ -224,7 +224,7 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, spar
         std.debug.assert(y < world_side);
         _ = try world.addSparseTile(level, x, y, fixture.window_tile, 0, window_depths[index % window_depths.len]);
     }
-    std.debug.assert(world.sparseTileCount() == sparse_count);
+    std.debug.assert(world.sparse_tiles.len == sparse_count);
 
     try fixture.batch.reserveStorage(window_tile_count, window_tile_count * 6, window_tile_count);
 }

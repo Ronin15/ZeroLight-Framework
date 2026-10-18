@@ -162,7 +162,7 @@ pub fn claimPublish(self: *PathfindingSystem, stats: *PathfindingStats) void {
 /// blocks and buckets their path runs' registrations by flush pair into its window,
 /// recording each pair's count in its band. The main thread sizes the windows from the
 /// selected shape, O(1) per result; inline it is one range. Returns the stage's batch.
-pub fn publishCopy(self: *PathfindingSystem, dispatch: ?Dispatch) BatchStats {
+pub fn publishCopy(self: *PathfindingSystem, dispatch: Dispatch) BatchStats {
     const item_count = self.solve_results.items.len;
     self.publish_ranges = 0;
     if (item_count == 0) return .{};
@@ -517,7 +517,7 @@ test "pathfinding a publish reserve out of memory claims nothing, leaves pending
     clearCompleted(&system);
     try std.testing.expectEqual(@as(usize, 0), system.completed.long_block_count);
     try std.testing.expectEqual(@as(usize, 1), (try solveIndividualGoals(&system, requester, &.{aged_goal}, 8)).available_results);
-    const aged_owner = system.completed.core.ownerOf(system.graph.keyForWorld(0, aged_goal, .default).?).?;
+    const aged_owner = test_support.cacheOwnerOf(system.completed.core, system.graph.keyForWorld(0, aged_goal, .default).?).?;
     system.completed.core.records.items[aged_owner].stamp -%= types.default_cache_ttl_steps + 1;
     var aged_registrations: usize = 0;
     for (&system.path_index) |*shard| aged_registrations += shard.entries.len - shard.entry_free.items.len;
@@ -577,7 +577,7 @@ test "the path registry holds every run of every published path, and the increme
     try expectRegistryMatchesCache(&system);
 
     // TTL expiry: an aged entry removed at intake.
-    const aged = system.completed.core.ownerOf(registryRouteKey(&system, 90, 24)).?;
+    const aged = test_support.cacheOwnerOf(system.completed.core, registryRouteKey(&system, 90, 24)).?;
     system.completed.core.records.items[aged].stamp -%= types.default_cache_ttl_steps + 1;
     try solveRegistryRoutes(&system, requester, 24, 90, 1, 16, null, .{});
     try expectRegistryMatchesCache(&system);

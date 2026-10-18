@@ -798,6 +798,8 @@ fn testThinkSet(sys: *SimulationScopeSystem, index: *const SpatialIndexSystem, s
     return (try compactCognitionInline(sys, &view, stagger_step, apply_stagger)).cognition;
 }
 
+const data_test_support = @import("../data_system/test_support.zig");
+
 test "SimulationScopeSystem AI gather filters halo and stagger" {
     const allocator = std.testing.allocator;
     var data = DataSystem.init(allocator);
@@ -1125,7 +1127,7 @@ test "deriveChunks recomputes every row's chunk from its settled position" {
     defer world.deinit();
     inline for (.{ a, dormant, b }) |ent| {
         const body = data.movementBodyConst(ent).?;
-        const meta = data.simulationMetadata(ent).?;
+        const meta = data_test_support.simulationMetadata(&data, ent).?;
         const expect = world.chunkCoordForWorldPos(body.position.x, body.position.y);
         try std.testing.expectEqual(expect.x, meta.chunk.x);
         try std.testing.expectEqual(expect.y, meta.chunk.y);

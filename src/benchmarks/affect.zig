@@ -116,10 +116,10 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.batch);
     }
 
-    std.debug.assert(options.iterations == 0 or last_stats.processed_count == item_count);
+    std.debug.assert(options.iterations == 0 or system.rows.len == item_count);
     var stats = accumulator.finish();
-    stats.candidate_pairs = last_stats.processed_count;
-    stats.output_count = last_stats.threshold_crossed_count;
+    stats.candidate_pairs = system.rows.len;
+    stats.output_count = fixture.events.stats.affect_threshold_crossed;
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.compute_tuner), settled_before_measurement);
     }

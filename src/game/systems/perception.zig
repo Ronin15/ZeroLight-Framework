@@ -22,7 +22,6 @@
 //! distinct scan box.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
 const logging = @import("../../core/logging.zig");
 const simd = @import("../../core/simd.zig");
@@ -127,8 +126,6 @@ pub const PerceptionConfig = struct {
 
 pub const PerceptionStats = struct {
     observer_count: usize = 0,
-    // Entries of the queried index.
-    candidate_population_count: usize = 0,
     // FOV-surviving hostile candidates summed across every observer this step
     // (post range/FOV gate, pre-LOS) — a selectivity signal for how much the
     // spatial-index + FOV filter narrows the candidate population before the
@@ -151,9 +148,6 @@ pub const PerceptionStats = struct {
     candidate_checks: usize = 0,
     /// Neighbor-block fills, one per (row group, scan box) a range walks.
     block_fills: usize = 0,
-    perceived_events: usize = 0,
-    lost_events: usize = 0,
-    dropped_events: usize = 0,
     gather_batch: BatchStats = .{},
     batch: BatchStats = .{},
 };
@@ -255,7 +249,7 @@ pub const PerceptionSystem = struct {
         const perception_slice = data.perceptionSlice();
         const gather_batch = try self.gatherPerceptionData(.{ .ai_agents = ai_agents, .movement = movement, .data = data, .perception_slice = perception_slice, .scope_dense_indices = config.scope_dense_indices, .cell_size = spatial.cell_size }, thread_system, config);
         const observer_count = self.rows.len;
-        if (observer_count == 0) return .{ .candidate_population_count = spatial.entryCount(), .gather_batch = gather_batch };
+        if (observer_count == 0) return .{ .gather_batch = gather_batch };
 
         const compute = Dispatch.init(thread_system, &self.compute_tuner, .{
             .items_per_range = config.items_per_range,
@@ -271,19 +265,15 @@ pub const PerceptionSystem = struct {
         const batch = compute.run(selection, observer_count, perception_range_alignment_items, &job, writePerceptionRangeJob);
 
         const totals = self.sumRangeStats(selection.range_count);
-        const merge = try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
+        try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
         return .{
             .observer_count = observer_count,
-            .candidate_population_count = spatial.entryCount(),
             .sensed_count = totals.sensed_count,
             .nearest_threat_found_count = totals.nearest_threat_found,
             .los_checks = totals.los_checks,
             .los_blocked = totals.los_blocked,
             .candidate_checks = totals.candidate_checks,
             .block_fills = totals.block_fills,
-            .perceived_events = merge.perceived,
-            .lost_events = merge.lost,
-            .dropped_events = merge.dropped,
             .gather_batch = gather_batch,
             .batch = batch,
         };
@@ -391,7 +381,7 @@ pub const PerceptionSystem = struct {
         events: *SimulationEvents,
         total: usize,
         max_events_per_step: usize,
-    ) !PerceptionEventMergeResult {
+    ) !void {
         const capped_total = @min(total, max_events_per_step);
         const dropped = total - capped_total;
 
@@ -440,20 +430,12 @@ pub const PerceptionSystem = struct {
         events.stats.dropped += dropped;
         if (dropped > 0 and !self.dropped_events_warned) {
             self.dropped_events_warned = true;
-            if (comptime logging.enabled(.warn) and !builtin.is_test) logging.game.warn(
+            if (comptime logging.enabled(.warn)) logging.game.warn(
                 "perception: {d} events dropped past the per-step share of {d}",
                 .{ dropped, max_events_per_step },
             );
         }
-
-        return .{ .perceived = sink.perceived, .lost = sink.lost, .dropped = dropped };
     }
-};
-
-const PerceptionEventMergeResult = struct {
-    perceived: usize,
-    lost: usize,
-    dropped: usize,
 };
 
 // One step's perception gather inputs, read-only on every range.
@@ -998,19 +980,15 @@ fn transitionEventCount(prev: EntityId, final: EntityId) usize {
 const TransitionSink = struct {
     writer: SimulationEvents.RangeWriter,
     remaining: usize,
-    perceived: usize = 0,
-    lost: usize = 0,
 
     fn write(self: *TransitionSink, observer: EntityId, prev: EntityId, final: EntityId) void {
         if (prev.isValid() and self.remaining > 0) {
             self.writer.write(.{ .stage = .domain_reaction, .payload = .{ .entity_lost = .{ .observer = observer, .target = prev } } });
             self.remaining -= 1;
-            self.lost += 1;
         }
         if (final.isValid() and self.remaining > 0) {
             self.writer.write(.{ .stage = .domain_reaction, .payload = .{ .entity_perceived = .{ .observer = observer, .target = final } } });
             self.remaining -= 1;
-            self.perceived += 1;
         }
     }
 };
@@ -1093,6 +1071,8 @@ fn updateInline(
     return system.update(ai_agents, movement, spatial, world, data, events, &threads, config);
 }
 
+const data_test_support = @import("../data_system/test_support.zig");
+
 test "perception production compute tuner uses central gate and range alignment" {
     var system = PerceptionSystem.init(std.testing.allocator);
     defer system.deinit();
@@ -1109,10 +1089,12 @@ test "fovTestScalar accepts squarely ahead, boundary, and rejects squarely behin
     // Squarely behind: candidate directly along -x (dot <= 0, rejected before squaring).
     try testing.expect(!fovTestScalar(1, 0, -10, 0, 100, cos_half_fov));
     // Just inside the cone: angle slightly less than 60 degrees.
-    const inside = math.rotate2D(.{ .x = 10, .y = 0 }, math.sinCos(std.math.pi / 3.0 - 0.05));
+    const inside_dir = math.sinCos(std.math.pi / 3.0 - 0.05);
+    const inside = math.Vec2{ .x = 10 * inside_dir.cos, .y = 10 * inside_dir.sin };
     try testing.expect(fovTestScalar(1, 0, inside.x, inside.y, inside.x * inside.x + inside.y * inside.y, cos_half_fov));
     // Just outside the cone: angle slightly more than 60 degrees.
-    const outside = math.rotate2D(.{ .x = 10, .y = 0 }, math.sinCos(std.math.pi / 3.0 + 0.05));
+    const outside_dir = math.sinCos(std.math.pi / 3.0 + 0.05);
+    const outside = math.Vec2{ .x = 10 * outside_dir.cos, .y = 10 * outside_dir.sin };
     try testing.expect(!fovTestScalar(1, 0, outside.x, outside.y, outside.x * outside.x + outside.y * outside.y, cos_half_fov));
 }
 
@@ -1217,7 +1199,7 @@ test "the compute range's facing matches computeFacingScalar lane-for-lane, incl
 
     for (entities, velocities, prev_facings) |ent, v, prev| {
         const expected = computeFacingScalar(v[0], v[1], .{ .x = prev[0], .y = prev[1] });
-        const perception = data.aiPerceptionConst(ent).?;
+        const perception = data_test_support.aiPerception(&data, ent).?;
         try testing.expectEqual(expected.x, perception.facing_x);
         try testing.expectEqual(expected.y, perception.facing_y);
     }
@@ -1253,12 +1235,12 @@ test "an observer skips itself by entity, not by its filtered observer row" {
         .scope_dense_indices = &scope,
     });
 
-    const z_perception = data.aiPerceptionConst(z).?;
+    const z_perception = data_test_support.aiPerception(&data, z).?;
     try testing.expect(z_perception.target_visible);
     try testing.expectEqual(y.index, z_perception.nearest_threat.index);
 
     // X is far from everyone (out of default vision_range) and unaffected.
-    const x_perception = data.aiPerceptionConst(x).?;
+    const x_perception = data_test_support.aiPerception(&data, x).?;
     try testing.expect(!x_perception.target_visible);
 }
 
@@ -1288,13 +1270,13 @@ test "think observer acquires an off-phase hostile from the halo candidate set" 
     });
 
     try testing.expectEqual(@as(usize, 1), stats.observer_count);
-    try testing.expectEqual(@as(usize, 2), stats.candidate_population_count);
+    try testing.expectEqual(@as(usize, 2), spatial_sys.view().entryCount());
 
-    const ally_perception = data.aiPerceptionConst(ally).?;
+    const ally_perception = data_test_support.aiPerception(&data, ally).?;
     try testing.expect(ally_perception.target_visible);
     try testing.expectEqual(hostile.index, ally_perception.nearest_threat.index);
 
-    const hostile_perception = data.aiPerceptionConst(hostile).?;
+    const hostile_perception = data_test_support.aiPerception(&data, hostile).?;
     try testing.expect(!hostile_perception.target_visible);
     try testing.expectEqual(EntityId.invalid, hostile_perception.nearest_threat);
 }
@@ -1322,11 +1304,11 @@ test "off-phase observer acquires the on-phase ally on the reverse think step" {
         .scope_dense_indices = &think,
     });
 
-    const hostile_perception = data.aiPerceptionConst(hostile).?;
+    const hostile_perception = data_test_support.aiPerception(&data, hostile).?;
     try testing.expect(hostile_perception.target_visible);
     try testing.expectEqual(ally.index, hostile_perception.nearest_threat.index);
 
-    const ally_perception = data.aiPerceptionConst(ally).?;
+    const ally_perception = data_test_support.aiPerception(&data, ally).?;
     try testing.expect(!ally_perception.target_visible);
     try testing.expectEqual(EntityId.invalid, ally_perception.nearest_threat);
 }
@@ -1358,13 +1340,13 @@ test "gapped think set: both observers skip themselves and acquire the off-phase
     });
 
     try testing.expectEqual(@as(usize, 2), stats.observer_count);
-    try testing.expectEqual(@as(usize, 3), stats.candidate_population_count);
+    try testing.expectEqual(@as(usize, 3), spatial_sys.view().entryCount());
 
-    try testing.expect(data.aiPerceptionConst(a).?.target_visible);
-    try testing.expectEqual(b.index, data.aiPerceptionConst(a).?.nearest_threat.index);
-    try testing.expect(data.aiPerceptionConst(c).?.target_visible);
-    try testing.expectEqual(b.index, data.aiPerceptionConst(c).?.nearest_threat.index);
-    try testing.expect(!data.aiPerceptionConst(b).?.target_visible);
+    try testing.expect(data_test_support.aiPerception(&data, a).?.target_visible);
+    try testing.expectEqual(b.index, data_test_support.aiPerception(&data, a).?.nearest_threat.index);
+    try testing.expect(data_test_support.aiPerception(&data, c).?.target_visible);
+    try testing.expectEqual(b.index, data_test_support.aiPerception(&data, c).?.nearest_threat.index);
+    try testing.expect(!data_test_support.aiPerception(&data, b).?.target_visible);
 }
 
 test "candidate outside vision_range is never selected" {
@@ -1384,7 +1366,7 @@ test "candidate outside vision_range is never selected" {
 
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
-    try testing.expect(!data.aiPerceptionConst(observer).?.target_visible);
+    try testing.expect(!data_test_support.aiPerception(&data, observer).?.target_visible);
 }
 
 test "FOV gating: candidate outside the cone is not perceived, inside is" {
@@ -1405,7 +1387,7 @@ test "FOV gating: candidate outside the cone is not perceived, inside is" {
     defer events.deinit();
 
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
-    try testing.expect(!data.aiPerceptionConst(observer).?.target_visible);
+    try testing.expect(!data_test_support.aiPerception(&data, observer).?.target_visible);
 
     // Now place a candidate directly ahead instead.
     var data2 = DataSystem.init(testing.allocator);
@@ -1420,7 +1402,7 @@ test "FOV gating: candidate outside the cone is not perceived, inside is" {
     var events2 = SimulationEvents.init(testing.allocator);
     defer events2.deinit();
     _ = try updateInline(&sys2, data2.aiAgentSliceConst(), data2.movementBodySliceConst(), spatial_sys2.view(), &world, &data2, &events2, .{});
-    try testing.expect(data2.aiPerceptionConst(observer2).?.target_visible);
+    try testing.expect(data_test_support.aiPerception(&data2, observer2).?.target_visible);
 }
 
 test "stance gating: only hostile candidates ever become nearest_threat" {
@@ -1442,7 +1424,7 @@ test "stance gating: only hostile candidates ever become nearest_threat" {
 
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(threat.index, perception.nearest_threat.index);
 }
@@ -1476,7 +1458,7 @@ test "candidate_checks counts only hostile rows on the observer's level" {
     // The neutral, the ally, and the level-0 hostiles cost no check.
     try testing.expectEqual(@as(usize, 1), stats.candidate_checks);
     try testing.expectEqual(@as(usize, 1), stats.sensed_count);
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(same_level.index, perception.nearest_threat.index);
 }
@@ -1502,7 +1484,7 @@ test "same-level gating skips cross-level candidates even when closest" {
 
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(far_same_level.index, perception.nearest_threat.index);
 }
@@ -1564,7 +1546,7 @@ test "observers with interleaved vision boxes in one cell each read their own bo
     // One block fill per distinct box of the one row group.
     try testing.expectEqual(@as(usize, 3), stats.block_fills);
     for (observers, ranges) |observer, range| {
-        const perception = data.aiPerceptionConst(observer).?;
+        const perception = data_test_support.aiPerception(&data, observer).?;
         try testing.expectEqual(range == 200, perception.target_visible);
         try testing.expect(perception.nearest_threat.eql(if (range == 200) far else EntityId.invalid));
     }
@@ -1589,7 +1571,7 @@ test "an observer behind 256 allies finds the hostile past them" {
 
     const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expectEqual(@as(usize, 1), stats.candidate_checks);
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(hostile.index, perception.nearest_threat.index);
 }
@@ -1617,7 +1599,7 @@ test "an observer under hostiles stacked on other levels finds the farther same-
     const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expectEqual(@as(usize, 1), stats.candidate_checks);
     try testing.expectEqual(@as(usize, 1), stats.sensed_count);
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(same_level.index, perception.nearest_threat.index);
 }
@@ -1643,7 +1625,7 @@ test "a hostile player on another level never enters an observer's candidates" {
     });
     try testing.expectEqual(@as(usize, 0), stats.sensed_count);
     try testing.expectEqual(@as(usize, 0), stats.los_checks);
-    try testing.expect(!data.aiPerceptionConst(observer).?.target_visible);
+    try testing.expect(!data_test_support.aiPerception(&data, observer).?.target_visible);
 }
 
 test "hearing detects an in-range same-level stimulus" {
@@ -1663,7 +1645,7 @@ test "hearing detects an in-range same-level stimulus" {
     const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 30, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 }};
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(!perception.target_visible);
     try testing.expect(perception.heard_stimulus);
     try testing.expectEqual(@as(f32, 30), perception.heard_stimulus_x);
@@ -1687,7 +1669,7 @@ test "hearing ignores zero-intensity in-range stimulus" {
     const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 30, .y = 0 }, .intensity = 0, .kind = .dig, .level = 0 }};
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
-    try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+    try testing.expect(!data_test_support.aiPerception(&data, observer).?.heard_stimulus);
 }
 
 test "hearing ignores an out-of-range stimulus" {
@@ -1707,7 +1689,7 @@ test "hearing ignores an out-of-range stimulus" {
     const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 100, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 }};
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
-    try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+    try testing.expect(!data_test_support.aiPerception(&data, observer).?.heard_stimulus);
 }
 
 test "hearing ignores a stimulus on a different level" {
@@ -1727,7 +1709,7 @@ test "hearing ignores a stimulus on a different level" {
     const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 30, .y = 0 }, .intensity = 1, .kind = .dig, .level = 1 }};
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
-    try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+    try testing.expect(!data_test_support.aiPerception(&data, observer).?.heard_stimulus);
 }
 
 test "hearing picks the nearest of multiple in-range stimuli" {
@@ -1750,7 +1732,7 @@ test "hearing picks the nearest of multiple in-range stimuli" {
     };
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.heard_stimulus);
     try testing.expectEqual(@as(f32, 20), perception.heard_stimulus_x);
 }
@@ -1777,7 +1759,7 @@ test "hearing intensity ranking prefers louder stimulus over nearer quieter one"
     };
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
 
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.heard_stimulus);
     // At k=1/65536: score(0.35, 100) ≈ 0.3495, score(1.0, 2500) ≈ 0.963 → dig wins.
     try testing.expectEqual(@as(f32, 50), perception.heard_stimulus_x);
@@ -1799,17 +1781,17 @@ test "hearing acquires non-dig footstep and impact kinds" {
 
     const foot = [_]WorldStimulus{.{ .position = .{ .x = 25, .y = 0 }, .intensity = 0.35, .kind = .footstep, .level = 0 }};
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &foot });
-    try testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
-    try testing.expectEqual(@as(f32, 25), data.aiPerceptionConst(observer).?.heard_stimulus_x);
+    try testing.expect(data_test_support.aiPerception(&data, observer).?.heard_stimulus);
+    try testing.expectEqual(@as(f32, 25), data_test_support.aiPerception(&data, observer).?.heard_stimulus_x);
 
     // Clear heard by running with empty stimuli
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &.{} });
-    try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+    try testing.expect(!data_test_support.aiPerception(&data, observer).?.heard_stimulus);
 
     const impact = [_]WorldStimulus{.{ .position = .{ .x = 15, .y = 0 }, .intensity = 0.85, .kind = .impact, .level = 0 }};
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &impact });
-    try testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
-    try testing.expectEqual(@as(f32, 15), data.aiPerceptionConst(observer).?.heard_stimulus_x);
+    try testing.expect(data_test_support.aiPerception(&data, observer).?.heard_stimulus);
+    try testing.expectEqual(@as(f32, 15), data_test_support.aiPerception(&data, observer).?.heard_stimulus_x);
 }
 
 test "LOS gating skips a blocked nearer candidate in favor of a farther clear one" {
@@ -1860,7 +1842,7 @@ test "LOS gating skips a blocked nearer candidate in favor of a farther clear on
 
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(farther_clear.index, perception.nearest_threat.index);
 }
@@ -1907,7 +1889,7 @@ test "LOS blocks a diagonal ray through a mid-segment occluder's interior, not j
 
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
 
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(!perception.target_visible);
     try testing.expectEqual(EntityId.invalid.index, perception.nearest_threat.index);
 }
@@ -2051,18 +2033,18 @@ test "a same-step blocking edit between observer and target occludes LOS with no
     defer events.deinit();
 
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
-    try testing.expect(data.aiPerceptionConst(observer).?.target_visible);
+    try testing.expect(data_test_support.aiPerception(&data, observer).?.target_visible);
 
     // The edit is the only thing between the two updates: no event, no reaction.
     _ = (try world.setDenseTile(fixture.layer, 4, 1, tree)) orelse return error.TestExpectedEqual;
     events.clearRetainingCapacity();
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
-    try testing.expect(!data.aiPerceptionConst(observer).?.target_visible);
+    try testing.expect(!data_test_support.aiPerception(&data, observer).?.target_visible);
 
     _ = (try world.setDenseTile(fixture.layer, 4, 1, grass)) orelse return error.TestExpectedEqual;
     events.clearRetainingCapacity();
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), world, &data, &events, .{});
-    try testing.expect(data.aiPerceptionConst(observer).?.target_visible);
+    try testing.expect(data_test_support.aiPerception(&data, observer).?.target_visible);
 }
 
 // A point at the center of cell (x, y) in tile units, or on its top (left) grid
@@ -2248,7 +2230,7 @@ test "player-candidate detection: hostile player within vision/FOV becomes neare
         .player_candidate = .{ .entity = player, .pos_x = 20, .pos_y = 0, .faction = .player, .level = 0 },
     });
 
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(player.index, perception.nearest_threat.index);
 }
@@ -2274,7 +2256,7 @@ test "a hostile player on the observer's nonzero level becomes nearest_threat" {
     });
 
     try testing.expectEqual(@as(usize, 1), stats.sensed_count);
-    const perception = data.aiPerceptionConst(observer).?;
+    const perception = data_test_support.aiPerception(&data, observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(player.index, perception.nearest_threat.index);
 }
@@ -2294,9 +2276,9 @@ test "transitions: invalid to valid emits entity_perceived" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
-    try testing.expectEqual(@as(usize, 1), stats.perceived_events);
-    try testing.expectEqual(@as(usize, 0), stats.lost_events);
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    try testing.expectEqual(@as(usize, 1), events.stats.entity_perceived);
+    try testing.expectEqual(@as(usize, 0), events.stats.entity_lost);
     const merged = events.mergedItems();
     try testing.expectEqual(@as(usize, 1), merged.len);
     try testing.expectEqual(SimulationEvent{ .stage = .domain_reaction, .payload = .{ .entity_perceived = .{ .observer = observer, .target = threat } } }, merged[0]);
@@ -2318,7 +2300,7 @@ test "transitions: valid to invalid emits entity_lost" {
     defer events.deinit();
 
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
-    try testing.expect(data.aiPerceptionConst(observer).?.target_visible);
+    try testing.expect(data_test_support.aiPerception(&data, observer).?.target_visible);
     events.clearRetainingCapacity();
 
     // Move the threat far outside vision_range and rebuild the spatial index
@@ -2327,13 +2309,13 @@ test "transitions: valid to invalid emits entity_lost" {
     var spatial_sys2 = try testSpatialIndex(&data);
     defer spatial_sys2.deinit();
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys2.view(), &world, &data, &events, .{});
-    try testing.expectEqual(@as(usize, 0), stats.perceived_events);
-    try testing.expectEqual(@as(usize, 1), stats.lost_events);
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys2.view(), &world, &data, &events, .{});
+    try testing.expectEqual(@as(usize, 0), events.stats.entity_perceived);
+    try testing.expectEqual(@as(usize, 1), events.stats.entity_lost);
     const merged = events.mergedItems();
     try testing.expectEqual(@as(usize, 1), merged.len);
     try testing.expectEqual(SimulationEvent{ .stage = .domain_reaction, .payload = .{ .entity_lost = .{ .observer = observer, .target = threat } } }, merged[0]);
-    try testing.expect(!data.aiPerceptionConst(observer).?.target_visible);
+    try testing.expect(!data_test_support.aiPerception(&data, observer).?.target_visible);
 }
 
 test "transitions: unchanged nearest_threat emits no event" {
@@ -2354,9 +2336,9 @@ test "transitions: unchanged nearest_threat emits no event" {
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     events.clearRetainingCapacity();
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
-    try testing.expectEqual(@as(usize, 0), stats.perceived_events);
-    try testing.expectEqual(@as(usize, 0), stats.lost_events);
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    try testing.expectEqual(@as(usize, 0), events.stats.entity_perceived);
+    try testing.expectEqual(@as(usize, 0), events.stats.entity_lost);
     try testing.expectEqual(@as(usize, 0), events.mergedItems().len);
 }
 
@@ -2376,7 +2358,7 @@ test "transitions: identity swap without passing through invalid emits lost then
     defer events.deinit();
 
     _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
-    try testing.expectEqual(first_threat.index, data.aiPerceptionConst(observer).?.nearest_threat.index);
+    try testing.expectEqual(first_threat.index, data_test_support.aiPerception(&data, observer).?.nearest_threat.index);
     events.clearRetainingCapacity();
 
     // Move the first threat far away and add a second, closer hostile in the
@@ -2387,14 +2369,14 @@ test "transitions: identity swap without passing through invalid emits lost then
     var spatial_sys2 = try testSpatialIndex(&data);
     defer spatial_sys2.deinit();
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys2.view(), &world, &data, &events, .{});
-    try testing.expectEqual(@as(usize, 1), stats.perceived_events);
-    try testing.expectEqual(@as(usize, 1), stats.lost_events);
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys2.view(), &world, &data, &events, .{});
+    try testing.expectEqual(@as(usize, 1), events.stats.entity_perceived);
+    try testing.expectEqual(@as(usize, 1), events.stats.entity_lost);
     const merged = events.mergedItems();
     try testing.expectEqual(@as(usize, 2), merged.len);
     try testing.expectEqual(SimulationEvent{ .stage = .domain_reaction, .payload = .{ .entity_lost = .{ .observer = observer, .target = first_threat } } }, merged[0]);
     try testing.expectEqual(SimulationEvent{ .stage = .domain_reaction, .payload = .{ .entity_perceived = .{ .observer = observer, .target = second_threat } } }, merged[1]);
-    try testing.expectEqual(second_threat.index, data.aiPerceptionConst(observer).?.nearest_threat.index);
+    try testing.expectEqual(second_threat.index, data_test_support.aiPerception(&data, observer).?.nearest_threat.index);
 }
 
 test "PerceptionSystem enforces its own per-step event cap and records the drop diagnostic" {
@@ -2414,13 +2396,12 @@ test "PerceptionSystem enforces its own per-step event cap and records the drop 
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .max_events_per_step = 1,
     });
-    try testing.expectEqual(@as(usize, 1), stats.perceived_events + stats.lost_events);
-    try testing.expectEqual(@as(usize, 1), stats.dropped_events);
-    try testing.expectEqual(@as(usize, 1), events.mergedItems().len);
+    try testing.expectEqual(@as(usize, 1), events.stats.entity_perceived + events.stats.entity_lost);
     try testing.expectEqual(@as(usize, 1), events.stats.dropped);
+    try testing.expectEqual(@as(usize, 1), events.mergedItems().len);
     try testing.expect(sys.dropped_events_warned);
 
     // The flag is once-only: a later capped step never clears it.
@@ -2495,7 +2476,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         var events = SimulationEvents.init(testing.allocator);
         defer events.deinit();
         _ = try updateInline(&sys, serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), spatial.view(), &world, &serial_data, &events, .{});
-        try testing.expectEqual(serial_ids.first_threat.index, serial_data.aiPerceptionConst(serial_ids.observer_a).?.nearest_threat.index);
+        try testing.expectEqual(serial_ids.first_threat.index, data_test_support.aiPerception(&serial_data, serial_ids.observer_a).?.nearest_threat.index);
     }
     {
         var spatial = try testSpatialIndex(&threaded_data);
@@ -2505,7 +2486,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         var events = SimulationEvents.init(testing.allocator);
         defer events.deinit();
         _ = try updateInline(&sys, threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), spatial.view(), &world, &threaded_data, &events, .{});
-        try testing.expectEqual(threaded_ids.first_threat.index, threaded_data.aiPerceptionConst(threaded_ids.observer_a).?.nearest_threat.index);
+        try testing.expectEqual(threaded_ids.first_threat.index, data_test_support.aiPerception(&threaded_data, threaded_ids.observer_a).?.nearest_threat.index);
     }
 
     // Transition step setup: A identity-swaps, B acquires a new hostile.
@@ -2580,8 +2561,8 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         .payload = .{ .entity_lost = .{ .observer = serial_ids.observer_a, .target = serial_ids.first_threat } },
     }, serial_merged[0]);
     // Cap drops the rest of the multi-kind transitions (A's perceived + B's acquire).
-    try testing.expect(serial_stats.dropped_events >= 2);
-    try testing.expectEqual(serial_stats.dropped_events, threaded_stats.dropped_events);
+    try testing.expect(serial_events.stats.dropped >= 2);
+    try testing.expectEqual(serial_events.stats.dropped, threaded_events.stats.dropped);
 }
 
 test "serial and threaded PerceptionSystem updates route through identical math" {
@@ -2646,8 +2627,8 @@ test "serial and threaded PerceptionSystem updates route through identical math"
     try testing.expectEqual(serial_ai.entities.len, threaded_ai.entities.len);
     var any_heard = false;
     for (serial_ai.entities, threaded_ai.entities) |serial_entity, threaded_entity| {
-        const serial_perception = serial_data.aiPerceptionConst(serial_entity) orelse continue;
-        const threaded_perception = threaded_data.aiPerceptionConst(threaded_entity) orelse continue;
+        const serial_perception = data_test_support.aiPerception(&serial_data, serial_entity) orelse continue;
+        const threaded_perception = data_test_support.aiPerception(&threaded_data, threaded_entity) orelse continue;
         try testing.expectEqual(serial_perception.target_visible, threaded_perception.target_visible);
         try testing.expectEqual(serial_perception.nearest_threat.index, threaded_perception.nearest_threat.index);
         try testing.expectEqual(serial_perception.facing_x, threaded_perception.facing_x);
@@ -2736,7 +2717,7 @@ test "PerceptionSystem has no steady-state allocation after warmup (FailingAlloc
     // adds no allocation.
     const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
     try testing.expectEqual(@as(usize, 1), stats.observer_count);
-    try testing.expect(data.aiPerceptionConst(data.aiAgentSliceConst().entities[0]).?.heard_stimulus);
+    try testing.expect(data_test_support.aiPerception(&data, data.aiAgentSliceConst().entities[0]).?.heard_stimulus);
 }
 
 test "PerceptionSystem think-set gather over a halo index has no steady-state allocation after warmup (FailingAllocator)" {
@@ -2777,7 +2758,7 @@ test "PerceptionSystem think-set gather over a halo index has no steady-state al
 
     const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, cfg);
     try testing.expectEqual(@as(usize, 2), stats.observer_count);
-    try testing.expectEqual(@as(usize, 4), stats.candidate_population_count);
+    try testing.expectEqual(@as(usize, 4), spatial_sys.view().entryCount());
     try testing.expectEqual(@as(usize, 2), sys.rows.len);
 }
 
@@ -2847,7 +2828,7 @@ test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item
         // The gather over every agent (hostiles skipped) ran on workers too.
         try testing.expect(!stats.gather_batch.ran_inline);
         try testing.expect(stats.batch.active_worker_threads > 0);
-        if (step == 0) try testing.expectEqual(observer_total, stats.perceived_events);
+        if (step == 0) try testing.expectEqual(observer_total, events.stats.entity_perceived);
     }
     try testing.expectEqual(@as(usize, 0), failing.allocations);
 }

@@ -149,19 +149,6 @@ pub const InterestMarkerStore = struct {
         return .{ .index = @intCast(index), .generation = generation };
     }
 
-    pub fn removeMarker(self: *InterestMarkerStore, id: InterestMarkerId) bool {
-        if (!id.isValid()) return false;
-        const index: usize = id.index;
-        if (!self.slotLive(index)) return false;
-        if (self.generations[index] != id.generation) return false;
-
-        self.generations[index] = 0;
-        self.faction_filter_present[index] = false;
-        std.debug.assert(self.live_count > 0);
-        self.live_count -= 1;
-        return true;
-    }
-
     /// Nearest in-range `investigate` marker (dist², then ascending slot).
     pub fn findBestInvestigateMarker(
         self: *const InterestMarkerStore,
@@ -200,7 +187,7 @@ pub const InterestMarkerStore = struct {
 
 const testing = std.testing;
 
-test "InterestMarkerStore capacity add remove and id invalidation" {
+test "InterestMarkerStore add, clear, and id invalidation" {
     var store = InterestMarkerStore.init(testing.allocator);
     defer store.deinit(testing.allocator);
 
@@ -214,9 +201,8 @@ test "InterestMarkerStore capacity add remove and id invalidation" {
     try testing.expect(id0.isValid());
     try testing.expectEqual(@as(usize, 1), store.count());
 
-    try testing.expect(store.removeMarker(id0));
+    store.clear();
     try testing.expectEqual(@as(usize, 0), store.count());
-    try testing.expect(!store.removeMarker(id0));
 
     const id1 = try store.addMarker(.{
         .kind = .investigate,

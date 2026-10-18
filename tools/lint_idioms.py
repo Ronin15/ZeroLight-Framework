@@ -415,13 +415,7 @@ def main() -> None:
     issues: list[tuple[str, int, str, str]] = []
     for path in files:
         issues.extend(lint_file(path))
-    # Rule 9 reports without failing until the cleanup clears its last hits; then it joins
-    # `issues` so it fails the build.
-    test_only_api = lint_test_only_api(files)
-    for rel, lineno, message, snippet in test_only_api:
-        print(f"{rel}:{lineno}: {message}\n    {snippet}", file=sys.stderr)
-    if test_only_api:
-        print(f"idiom-lint: {len(test_only_api)} rule-9 warning(s) (pub API with no production use)", file=sys.stderr)
+    issues.extend(lint_test_only_api(files))
 
     if issues:
         for rel, lineno, message, snippet in issues:

@@ -653,7 +653,7 @@ test "DestructibleController does not dual-write navigation or movement intents"
     defer frame.deinit();
     try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
     try frame.reserveStreams(4, 4, 4, 0, 0, 4);
-    try frame.reserveNavigationIntents(1, 1);
+    try frame.navigation_intents.reserve(1, 1);
     frame.beginStep();
     try frame.appendActionIntent(.{
         .entity = EntityId.invalid,

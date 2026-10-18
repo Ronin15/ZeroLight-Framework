@@ -52,6 +52,7 @@ const SimulationPipelineUpdateContext = @import("simulation_pipeline.zig").Simul
 const sim_view_overscan_chunks = @import("simulation_pipeline.zig").sim_view_overscan_chunks;
 const PopulationSyncStats = @import("simulation_pipeline.zig").PopulationSyncStats;
 const SimulationPipeline = @import("simulation_pipeline.zig").SimulationPipeline;
+const data_test_support = @import("data_system/test_support.zig");
 
 /// Minimal multi-level grass/dirt world for dig/plane/gate pipeline tests.
 /// 8×8 tiles cover cell fixtures around (3..6, 3) without full 320 demo paint.
@@ -214,7 +215,7 @@ pub fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
     }
     for (agents, 0..) |agent, i| {
         trace.bodies[i] = data.movementBodyConst(agent).?;
-        trace.agents[i] = data.aiAgentConst(agent).?;
+        trace.agents[i] = data_test_support.aiAgent(&data, agent).?;
     }
 
     // Scope came from the sim view: halo region, stagger gating, and the
@@ -526,7 +527,7 @@ pub fn fullWorldSimView(world: *const WorldSystem) Rect {
 /// one step (a worst-case event share, a stage-order read) mark it always-active.
 pub fn markAllAlwaysActive(data: *DataSystem) !void {
     for (data.movementBodySliceConst().entities) |entity| {
-        var metadata = data.simulationMetadata(entity).?;
+        var metadata = data_test_support.simulationMetadata(data, entity).?;
         metadata.always_active = true;
         try data.setSimulationMetadata(entity, metadata);
     }
@@ -758,7 +759,9 @@ pub fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: Adapt
     try std.testing.expect(pipeline.pathfinding.registry_growth.count > registry_growths);
     _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
 
-    for (markers) |id| try std.testing.expect(world.interest_markers.removeMarker(id));
+    // The crowd's markers are the world's only markers.
+    try std.testing.expectEqual(@as(usize, markers.len), world.interest_markers.count());
+    world.interest_markers.clear();
     try placePathingCrowdMarkers(&world, &markers, 1);
     pinPipelineThreadedProfiles(&pipeline, second);
     frame.beginStep();

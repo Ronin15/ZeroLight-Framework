@@ -506,7 +506,7 @@ test "eviction equals a brute-force reference: exactly the cached paths with a c
             flipped_count += 1;
         }
         var expected: [route_count]bool = undefined;
-        for (&expected, 0..) |*evicted, index| evicted.* = pathNearCells(&system, system.completed.core.ownerOf(registryRouteKey(&system, index, 24)).?, flipped[0..flipped_count]);
+        for (&expected, 0..) |*evicted, index| evicted.* = pathNearCells(&system, test_support.cacheOwnerOf(system.completed.core, registryRouteKey(&system, index, 24)).?, flipped[0..flipped_count]);
         if (flipped_count == 0) {
             // The cell keeps its tile: marked, but no cell changed.
             try test_support.recordTileEdits(&system, &fixture.world, &.{.{ .level = 0, .x = cells[0][0], .y = cells[0][1] }});
@@ -635,7 +635,7 @@ test "a new link evicts no cached path" {
     try solveRegistryRoutes(&system, requester, 24, 0, 40, 64, null, .{});
     const cached = system.completed.count();
     // A ramp on a cell a cached path crosses, and its far end below.
-    const first = storedPath(&system, system.completed.core.ownerOf(registryRouteKey(&system, 0, 24)).?);
+    const first = storedPath(&system, test_support.cacheOwnerOf(system.completed.core, registryRouteKey(&system, 0, 24)).?);
     const on_path: u16 = @intCast(first.cells[first.cells.len / 2]);
     const ramp_cell = @import("../../world/system.zig").CellCoord{ .x = @intCast(on_path % 24), .y = @intCast(on_path / 24) };
     try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 0, .cell_a = ramp_cell, .level_b = 1, .cell_b = ramp_cell, .traversal_cost = 1, .bidirectional = true });

@@ -864,13 +864,13 @@ test "nav over a world takes the world's chunk edge and tile size; a world-less 
     try std.testing.expectEqual(@as(usize, world.height), system.graph.geometry.height);
     const level_grid = system.graph.grid(0).?;
     try std.testing.expectEqual(world.chunk_size_tiles, level_grid.geometry.chunk_tiles);
-    try std.testing.expectEqual(@as(u32, world.chunksX()), level_grid.geometry.chunks_x);
-    try std.testing.expectEqual(@as(u32, world.chunksY()), level_grid.geometry.chunks_y);
+    try std.testing.expectEqual(world.chunkGeometry().chunks_x, level_grid.geometry.chunks_x);
+    try std.testing.expectEqual(world.chunkGeometry().chunks_y, level_grid.geometry.chunks_y);
     // Every tile's nav chunk is its world chunk.
     for (0..world.height) |y| {
         for (0..world.width) |x| {
             const tile_chunk = world.chunkCoordForCell(@intCast(x), @intCast(y));
-            const expected: u32 = @intCast(tile_chunk.y * @as(i32, world.chunksX()) + tile_chunk.x);
+            const expected: u32 = @intCast(tile_chunk.y * @as(i32, @intCast(world.chunkGeometry().chunks_x)) + tile_chunk.x);
             try std.testing.expectEqual(expected, level_grid.geometry.chunkOfCell(y * level_grid.geometry.width + x));
         }
     }

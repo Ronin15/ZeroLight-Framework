@@ -204,7 +204,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, wo
     for (1..landing_bands) |_| _ = try world.addDenseLayer(1, 0, .obstacle, overlay);
     if (landing_bands > 1) {
         const edge = world.chunk_size_tiles;
-        for (0..world.chunksY()) |chunk_y| for (0..world.chunksX()) |chunk_x| {
+        for (0..world.chunkGeometry().chunks_y) |chunk_y| for (0..world.chunkGeometry().chunks_x) |chunk_x| {
             for (0..landing_bands) |tile| {
                 const x: u16 = @intCast(chunk_x * edge + tile % edge);
                 const y: u16 = @intCast(chunk_y * edge + tile / edge % edge);

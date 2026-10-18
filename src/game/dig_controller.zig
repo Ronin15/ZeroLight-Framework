@@ -314,7 +314,7 @@ pub const DigController = struct {
         const allocator = self.scratch_allocator orelse return error.PlaneScratchUnreserved;
         try self.reservePlaneLists(allocator, needed);
         self.plane_scratch_grown += 1;
-        if (comptime logging.enabled(.warn) and !builtin.is_test) {
+        if (comptime logging.enabled(.warn)) {
             if (self.plane_scratch_grown == 1) logging.game.warn(
                 "plane traversal: {d} possible traversals exceeded the reserved scratch; grew to {d} (reservation short of the live population)",
                 .{ needed, self.plane_moves.capacity },
@@ -726,6 +726,7 @@ const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const warmLandingTerrain = @import("world/test_support.zig").warmLandingTerrain;
 const denseTileBlocksMovement = @import("world/test_support.zig").denseTileBlocksMovement;
+const sparseTileCellCoord = @import("world/test_support.zig").sparseTileCellCoord;
 const PlaneEntrySystem = @import("systems/plane_entry.zig").PlaneEntrySystem;
 
 // One dig in stage order: reserve, then commit the reserved edit.
@@ -1225,7 +1226,7 @@ test "plane stage decisions match the per-entry sequential traversal on shared c
             reference_cancels += @intFromBool(entry.target.action == .fall and !pre_carved and reference.data.worldLevelConst(entry.entity).? == entry.level);
         }
 
-        for (0..staged.world.denseLayerCount()) |layer| {
+        for (0..staged.world.dense_layers.len) |layer| {
             for (0..8) |y| for (0..8) |x| {
                 try std.testing.expectEqual(reference.world.denseTile(layer, @intCast(x), @intCast(y)), staged.world.denseTile(layer, @intCast(x), @intCast(y)));
             };
@@ -1887,7 +1888,7 @@ fn addBlockingExitContent(world: *WorldSystem, meta: *const world_tileset_meta.W
 
 // The level's overlay band: the last dense layer, added by `addBlockingExitContent`.
 fn exitOverlayLayer(world: *const WorldSystem) usize {
-    return world.denseLayerCount() - 1;
+    return world.dense_layers.len - 1;
 }
 
 // Level `level`'s sparse tiles as (cell, tile) pairs in row order, into `out`.
@@ -1895,7 +1896,7 @@ fn sparseRowsOf(world: *const WorldSystem, level: u16, out: []CellTile) []CellTi
     var count: usize = 0;
     for (world.sparse_tiles.items(.level_index), 0..) |row_level, index| {
         if (row_level != level) continue;
-        out[count] = .{ .cell = world.sparseTileCellCoord(index), .tile = world.sparse_tiles.items(.tile_id)[index] };
+        out[count] = .{ .cell = sparseTileCellCoord(world, index), .tile = world.sparse_tiles.items(.tile_id)[index] };
         count += 1;
     }
     return out[0..count];

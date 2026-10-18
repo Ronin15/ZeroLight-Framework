@@ -40,6 +40,7 @@ const default_chunk_size_tiles = @import("../game/world/system.zig").default_chu
 const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
 const IndexPopulation = @import("../game/systems/spatial_index.zig").IndexPopulation;
 const chunk_slot_bytes = @import("../game/systems/spatial_index.zig").chunk_slot_bytes;
+const spatial_index_test_support = @import("../game/systems/spatial_index_test_support.zig");
 const NeighborQuery = @import("../game/systems/spatial_index.zig").NeighborQuery;
 const NeighborLanes = @import("../game/systems/spatial_index.zig").NeighborLanes;
 const NeighborBlock = @import("../game/systems/spatial_index.zig").NeighborBlock;
@@ -198,7 +199,7 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.bucket_tuner), bucket_settled_before_measurement);
         stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.sort_tuner), sort_settled_before_measurement);
     }
-    return .{ .stats = stats, .directory_bytes = system.directoryBytes() };
+    return .{ .stats = stats, .directory_bytes = spatial_index_test_support.directoryBytes(&system) };
 }
 
 fn runOnce(system: *SpatialIndexSystem, data: *const DataSystem, geometry: IndexGeometry, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !SpatialIndexStats {

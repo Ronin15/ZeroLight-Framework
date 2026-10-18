@@ -361,6 +361,8 @@ const bruteForceLevelBlocked = @import("test_support.zig").bruteForceLevelBlocke
 const TerrainTestTiles = @import("test_support.zig").TerrainTestTiles;
 const procedural_test_config = @import("test_support.zig").procedural_test_config;
 
+const liveBlockCount = @import("test_support.zig").liveBlockCount;
+
 test "demo bounds past a u16 world side fail loudly instead of converting" {
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -420,7 +422,7 @@ test "procedural world build is identical serial and threaded" {
     var threaded = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, procedural_test_config, &worker_threads);
     defer threaded.deinit();
 
-    try std.testing.expectEqual(serial.sparseTileCount(), threaded.sparseTileCount());
+    try std.testing.expectEqual(serial.sparse_tiles.len, threaded.sparse_tiles.len);
     for (0..serial.height) |y| for (0..serial.width) |x| {
         const xi: u16 = @intCast(x);
         const yi: u16 = @intCast(y);
@@ -436,9 +438,9 @@ test "procedural world build is identical serial and threaded" {
         try std.testing.expectEqual(serial_store.uniformTile(chunk), threaded_store.uniformTile(chunk));
         try std.testing.expectEqual(serial.levelChunkBlockedForm(0, chunk), threaded.levelChunkBlockedForm(0, chunk));
     }
-    try std.testing.expectEqual(serial_store.liveBlockCount(), threaded_store.liveBlockCount());
+    try std.testing.expectEqual(liveBlockCount(serial_store), liveBlockCount(threaded_store));
     // The procedural ground is mixed somewhere, so the threaded fill really ran.
-    try std.testing.expect(threaded_store.liveBlockCount() > 0);
+    try std.testing.expect(liveBlockCount(threaded_store) > 0);
     try expectUniformExactlyWhenOneTile(&threaded, 0);
 }
 
@@ -494,7 +496,7 @@ test "procedural ground that paints a chunk with one non-fill tile leaves it uni
     for (0..world.chunkCountPerLevel()) |chunk| {
         try std.testing.expectEqual(@as(?TileId, stone), store.uniformTile(@intCast(chunk)));
     }
-    try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
+    try std.testing.expectEqual(@as(usize, 0), liveBlockCount(store));
 }
 
 fn buildProceduralWorldForAllocationTest(allocator: std.mem.Allocator, meta: *const WorldTilesetMeta, threads: *ThreadSystem) !void {

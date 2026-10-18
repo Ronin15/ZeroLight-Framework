@@ -33,7 +33,7 @@ const ConstAgentSnapshotSlice = @import("system.zig").ConstAgentSnapshotSlice;
 /// its own slice; each stage runs inline or on workers as its tuner selects. A cell lies in
 /// one band and the bands follow cell order, so every cell holds the same entries in the
 /// same order for any splitters and partition.
-pub fn buildAgentGrid(self: *SteeringSystem, threads: ?StageThreads, stats: *SteeringStats) void {
+pub fn buildAgentGrid(self: *SteeringSystem, threads: StageThreads, stats: *SteeringStats) void {
     const stage = StageThreads.withWorkers(threads) orelse {
         buildAgentGridDirect(self);
         stats.grid_bucket_batch = inlineBatch(self.agent_snapshot_rows.len, steering_range_alignment_items);
@@ -377,7 +377,7 @@ test "steering banded agent grid gives every cell the same entries as one band" 
         defer system.deinit();
         try fillGridTestSnapshot(&system, layout);
         var stats = SteeringStats{};
-        buildAgentGrid(&system, null, &stats);
+        buildAgentGrid(&system, inline_ranges, &stats);
         try std.testing.expectEqual(@as(usize, 0), system.agent_grid.splitter_count);
         var reference = try GridTestCells.capture(&system);
         defer reference.deinit();

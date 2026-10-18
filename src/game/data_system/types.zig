@@ -110,7 +110,6 @@ pub const component_masks = struct {
     pub const ai_memory = componentMask(.ai_memory);
     pub const ai_affect = componentMask(.ai_affect);
     pub const destructible = componentMask(.destructible);
-    pub const render_primitive = movement_body | facing | primitive_visual;
 };
 
 pub fn componentMask(component: Component) ComponentMask {
@@ -272,13 +271,6 @@ pub const ConstAssetReferenceSlice = struct {
     atlas_entry_ids: []const u16,
 };
 
-/// Dense component indices resolved in one entity-slot lookup for render-hot paths.
-pub const RenderEntityComponentIndices = struct {
-    movement_body: usize,
-    asset_ref: ?usize = null,
-    facing: ?usize = null,
-};
-
 /// A movement body's row, world level, and faction resolved in one entity-slot lookup.
 pub const BodyLevelFaction = struct {
     movement_body: usize,
@@ -296,7 +288,7 @@ pub const RenderCollectIndices = struct {
 
 /// Dense movement + primitive-visual row indices from a single entity slot resolve.
 /// Used by bounds clamp / tile gate so the hot path does one hash lookup, then pure
-/// SoA column writes (not `movementBodyPtr` + `primitiveVisualDenseIndex` per entity).
+/// SoA column writes (not a separate movement and visual lookup per entity).
 pub const MovementVisualDenseIndices = struct {
     movement: usize,
     visual: usize,

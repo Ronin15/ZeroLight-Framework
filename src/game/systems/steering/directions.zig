@@ -106,7 +106,6 @@ pub fn prepareDirections(
         selected_count += tally.count;
         request_count += tally.requests;
         stats.path_available_count += tally.available;
-        stats.path_partial_count += tally.partial;
         stats.path_pending_count += tally.pending;
         stats.path_unavailable_count += tally.unavailable;
         stats.replan_cooldown_count += tally.cooldowns;
@@ -130,7 +129,6 @@ pub const DirectionsTally = struct {
     count: usize = 0,
     requests: usize = 0,
     available: usize = 0,
-    partial: usize = 0,
     pending: usize = 0,
     unavailable: usize = 0,
     cooldowns: usize = 0,
@@ -390,7 +388,6 @@ fn directionFromPathStatus(
             return followWaypoint(view.next_waypoint, start, intent.goal, steering_agent.waypoint_tolerance, goal_distance);
         },
         .partial => {
-            tally.partial += 1;
             if (view.refresh) {
                 if (runtime.replan_cooldown == 0 and runtime.unavailable_backoff == 0) {
                     emit_request.* = true;
@@ -599,7 +596,7 @@ test "steering follows a partial path, requests the next hop inside its end wind
         frame.beginStep();
         try appendNavigationIntent(&frame, intent);
         const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-        try std.testing.expectEqual(@as(usize, 1), stats.path_partial_count);
+        try std.testing.expectEqual(@as(usize, 0), stats.path_available_count + stats.path_pending_count + stats.path_unavailable_count);
         try std.testing.expectEqual(@as(usize, 0), stats.path_request_count);
         try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
     }
@@ -621,7 +618,7 @@ test "steering follows a partial path, requests the next hop inside its end wind
         frame.beginStep();
         try appendNavigationIntent(&frame, intent);
         const stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-        try std.testing.expectEqual(@as(usize, 1), stats.path_partial_count);
+        try std.testing.expectEqual(@as(usize, 0), stats.path_available_count + stats.path_pending_count + stats.path_unavailable_count);
         try std.testing.expectEqual(@as(usize, 0), stats.stuck_replan_count);
         if (stats.path_request_count == 0) continue;
         try std.testing.expectEqual(@as(usize, 1), stats.path_request_count);
@@ -652,7 +649,7 @@ test "steering follows a partial path, requests the next hop inside its end wind
     frame.beginStep();
     try appendNavigationIntent(&frame, intent);
     const next_hop = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
-    try std.testing.expectEqual(@as(usize, 1), next_hop.path_partial_count);
+    try std.testing.expectEqual(@as(usize, 0), next_hop.path_available_count + next_hop.path_pending_count + next_hop.path_unavailable_count);
     try std.testing.expectEqual(@as(usize, 0), next_hop.path_request_count);
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
 }

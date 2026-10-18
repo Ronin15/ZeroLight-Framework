@@ -608,7 +608,7 @@ pub const Renderer = struct {
     /// allocation-free render frames. Marks the frame reserved at `command_high_water`,
     /// the same bound `ensureFrameBatchCapacity` grows past, so in perf-diagnostic builds a
     /// frame whose submits exceed it is counted as reservation drift
-    /// (`SpriteBatch.commandOverflowGrows`) even when the command list's rounded-up
+    /// (`ReservationDrift` in sprite_batch.zig) even when the command list's rounded-up
     /// capacity absorbed them; it still grows in every build.
     pub fn reserveSpriteCommands(self: *Renderer, command_capacity: usize) !void {
         if (command_capacity > self.command_high_water) {
@@ -1458,29 +1458,6 @@ pub const Renderer = struct {
         return try self.registerTexture(texture, internal);
     }
 
-    /// Replaces a non-internal texture's GPU image. Creates the new upload first,
-    /// then waits for GPU idle before releasing the old handle so in-flight frames
-    /// (up to `frames_in_flight`) never sample a freed texture.
-    pub fn replaceTextureFromPixels(
-        self: *Renderer,
-        id: TextureId,
-        pixels: []const u8,
-        width: u32,
-        height: u32,
-        pitch: usize,
-    ) !void {
-        const slot = self.resolveTextureSlot(id) orelse return error.InvalidTexture;
-        if (slot.internal) return error.InvalidTexture;
-
-        const next_texture = try gpu_texture.uploadFromPixels(self.allocator, self.device, pixels, width, height, pitch);
-        errdefer c.SDL_ReleaseGPUTexture(self.device, next_texture.texture);
-
-        self.waitForIdle();
-        c.SDL_ReleaseGPUTexture(self.device, slot.texture.?);
-        slot.texture = next_texture.texture;
-        slot.desc = next_texture.desc;
-    }
-
     fn registerTexture(self: *Renderer, texture: UploadedTexture, internal: bool) !TextureId {
         if (self.first_free_texture_slot) |index| {
             const slot = &self.texture_slots.items[@intCast(index)];
@@ -1560,7 +1537,7 @@ pub const Renderer = struct {
         // Over-submission beyond the reserved `command_high_water` is handled the same
         // way in Debug and ReleaseFast. `drawSprite` already grew the command list if
         // needed and, in a reserved frame of a perf-diagnostic build, counted crossing this
-        // same bound as drift (`SpriteBatch.commandOverflowGrows`); this fallback grows prepared/vertex/group
+        // same bound as drift (`ReservationDrift` in sprite_batch.zig); this fallback grows prepared/vertex/group
         // storage and the GPU streams before the threaded emit. There is no hard submit
         // bound. A Debug-only assert against `command_high_water` would panic where
         // ReleaseFast regrows.
@@ -2068,7 +2045,6 @@ test "internal texture slots cannot be destroyed or replaced through public APIs
 
     renderer.destroyTexture(texture);
     try std.testing.expect(renderer.resolveTextureSlot(texture) != null);
-    try std.testing.expectError(error.InvalidTexture, renderer.replaceTextureFromPixels(texture, &.{ 255, 255, 255, 255 }, 1, 1, 4));
 }
 
 test "drawable presentation uses full drawable scissor and overscan scissor clamps to drawable bounds" {
@@ -3086,11 +3062,11 @@ test "reserved sprite frame submits allocation-free with no overflow growth (Fai
     }
     try std.testing.expectEqual(reserved, renderer.spriteCommandCount());
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expectEqual(@as(u64, 0), renderer.batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(usize, 0), renderer.batch.finishPrepStats(.{}).command_overflow_grows);
 }
 
 test "submits past the reservation inside the command list's slack count as drift" {
-    // Drift diagnostics compile out of shipping builds (`SpriteBatch.ReservationDrift`).
+    // Drift diagnostics compile out of shipping builds (`ReservationDrift` in sprite_batch.zig).
     if (!@import("../app/runtime_perf_log.zig").enabled) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     var renderer = Renderer{
@@ -3127,7 +3103,6 @@ test "submits past the reservation inside the command list's slack count as drif
     // once for the frame.
     try std.testing.expectEqual(capacity_before, renderer.batch.commands.capacity);
     try std.testing.expect(renderer.spriteCommandCount() > renderer.command_high_water);
-    try std.testing.expectEqual(@as(u64, 1), renderer.batch.commandOverflowGrows());
     try std.testing.expectEqual(@as(usize, 1), renderer.batch.finishPrepStats(.{}).command_overflow_grows);
 }
 

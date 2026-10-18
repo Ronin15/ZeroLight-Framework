@@ -270,7 +270,7 @@ fn pageCount(blocks: usize, shift: u6) usize {
 /// owner id in the path registry: it stays below the logical capacity, so registry owner
 /// heads follow the capacity. Every removal logs a retire and every move a rename into the
 /// owner log, which the registry flush applies; the log holds at most `ops_per_entry` ops
-/// per entry live when it was last emptied. Main thread; readers (`slotIndex`, `ownerOf`,
+/// per entry live when it was last emptied. Main thread; readers (`slotIndex`,
 /// records) are safe on workers while nothing mutates.
 fn CacheCore(comptime Extra: type) type {
     return struct {
@@ -333,12 +333,6 @@ fn CacheCore(comptime Extra: type) type {
 
         pub fn slotIndex(self: *const Self, key: PathQueryKey) ?usize {
             return probeFind(ProbeSlot, self.slots.items, key);
-        }
-
-        /// The owner id of `key`'s entry, or null.
-        pub fn ownerOf(self: *const Self, key: PathQueryKey) ?u32 {
-            const index = self.slotIndex(key) orelse return null;
-            return self.slots.items[index].payload_index;
         }
 
         /// The key of live owner `owner`.
@@ -697,11 +691,6 @@ pub const ResultCache = struct {
         const long_pool = long_pages *| (@as(usize, 1) << long_shift) *| long_block_words *| @sizeOf(u32) +| listBytesBound([]u32, long_pages) +|
             listBytesBound(u32, long_pages *| (@as(usize, 1) << long_shift));
         return core +| stripes +| long_pool;
-    }
-
-    /// Long blocks one page of `long_block_words`-word blocks holds.
-    pub fn longBlocksPerPage(long_block_words: usize) usize {
-        return @as(usize, 1) << pageShift(long_block_words);
     }
 
     pub fn logicalCapacity(self: *const ResultCache) usize {
@@ -1288,6 +1277,8 @@ fn stitchedWaypointAt(grid: *const NavGrid, stitched: StitchedView, level: u16, 
 // Tests
 // ----------------------------------------------------------------------------
 
+const test_support = @import("test_support.zig");
+
 test "pathfinding waypoint hint matches full scan and recovers from a stale hint" {
     const grid = NavGrid{ .geometry = .init(100, 1, types.default_nav_chunk_tiles), .cell_size = 1 };
     const path = [_]u32{ 10, 11, 12, 13, 14, 15 };
@@ -1406,7 +1397,7 @@ fn expectResultCacheConsistent(cache: *const ResultCache) !void {
     for (core.records.items, 0..) |record, owner| {
         if (!record.live) continue;
         live += 1;
-        try std.testing.expectEqual(@as(?u32, @intCast(owner)), core.ownerOf(core.keyOf(@intCast(owner))));
+        try std.testing.expectEqual(@as(?u32, @intCast(owner)), test_support.cacheOwnerOf(core, core.keyOf(@intCast(owner))));
         const block = record.extra.long_block;
         if (block != no_block) {
             live_long += 1;
@@ -1514,7 +1505,7 @@ test "pathfinding result cache stores a long path whole in a long block and neve
 
     // One page of blocks: the long entries take blocks; inline entries need none.
     try std.testing.expectEqual(@as(usize, 1), try cache.reserveLongBlocks(std.testing.allocator, 1));
-    try std.testing.expectEqual(ResultCache.longBlocksPerPage(test_long_block_words), cache.long_block_count);
+    try std.testing.expectEqual(@as(usize, 1) << cache.long_page_shift, cache.long_block_count);
     for (0..4) |index| putTestEntry(&cache, index, 0, &stats);
     try std.testing.expectEqual(@as(usize, 0), stats.cache_evictions);
     for (0..4) |index| try expectTestEntry(&cache, index);
@@ -1549,8 +1540,8 @@ test "pathfinding result cache long pool never passes the page of the entry limi
     defer cache.deinit(std.testing.allocator);
     // Two 64 KiB blocks per page.
     const wide_long_words = 16384;
-    try std.testing.expectEqual(@as(usize, 2), ResultCache.longBlocksPerPage(wide_long_words));
     try testResize(&cache, std.testing.allocator, 4, test_inline_words, wide_long_words, 0);
+    try std.testing.expectEqual(@as(u6, 1), cache.long_page_shift);
     // Four live long entries (odd indices are long) fill the cache and the pool.
     try std.testing.expectEqual(@as(usize, 2), try cache.reserveLongBlocks(std.testing.allocator, 4));
     for ([_]usize{ 1, 3, 5, 7 }) |index| putTestEntry(&cache, index, 0, &stats);
@@ -1620,7 +1611,7 @@ test "pathfinding result cache grow and shrink keep entries, evicting oldest fir
     for (0..4) |index| putTestEntry(&tied, index * 4, 9, &stats);
     var lowest_index: usize = 0;
     for (0..4) |index| {
-        if (tied.core.ownerOf(testGoalKey(index * 4)).? == 0) lowest_index = index * 4;
+        if (test_support.cacheOwnerOf(tied.core, testGoalKey(index * 4)).? == 0) lowest_index = index * 4;
     }
     try testResize(&tied, std.testing.allocator, 3, test_inline_words, test_long_block_words, 9);
     for (0..4) |index| {
@@ -1971,7 +1962,7 @@ test "pathfinding every removal logs one retire and every move one rename, withi
     cache.core.finishOwnerLog(std.testing.allocator);
     const owner_of = struct {
         fn at(c: *const ResultCache, index: usize) u32 {
-            return c.core.ownerOf(testGoalKey(index)).?;
+            return test_support.cacheOwnerOf(c.core, testGoalKey(index)).?;
         }
     }.at;
     // A TTL removal and a re-put each retire their owner; a fresh claim of a free record
@@ -2038,12 +2029,12 @@ test "pathfinding a grow keeps every stored path at its address" {
     try testResize(&cache, std.testing.allocator, 8, 4096, test_long_block_words, 0);
     for (0..8) |index| testPut(&cache, testGoalKey(index), &.{ @intCast(index), 7 }, &.{}, 0, 0, &stats);
     var addresses: [8][*]const u32 = undefined;
-    for (&addresses, 0..) |*address, index| address.* = cache.storedWords(cache.core.ownerOf(testGoalKey(index)).?).ptr;
+    for (&addresses, 0..) |*address, index| address.* = cache.storedWords(test_support.cacheOwnerOf(cache.core, testGoalKey(index)).?).ptr;
     try std.testing.expectEqual(@as(usize, 1), cache.inline_pages.items.len);
     try testResize(&cache, std.testing.allocator, 64, 4096, test_long_block_words, 0);
     try std.testing.expectEqual(@as(usize, 8), cache.inline_pages.items.len);
     for (addresses, 0..) |address, index| {
-        const owner = cache.core.ownerOf(testGoalKey(index)).?;
+        const owner = test_support.cacheOwnerOf(cache.core, testGoalKey(index)).?;
         try std.testing.expectEqual(address, cache.storedWords(owner).ptr);
         try std.testing.expectEqualSlices(u32, &.{ @intCast(index), 7 }, cache.storedWords(owner)[0..2]);
     }
@@ -2059,13 +2050,13 @@ test "pathfinding a long-pool grow keeps every long path at its address" {
     try std.testing.expectEqual(@as(usize, 1), try cache.reserveLongBlocks(std.testing.allocator, 2));
     for (0..2) |index| putTestEntry(&cache, index * 4 + 1, 0, &stats);
     const before = [_][*]const u32{
-        cache.storedWords(cache.core.ownerOf(testGoalKey(1)).?).ptr,
-        cache.storedWords(cache.core.ownerOf(testGoalKey(5)).?).ptr,
+        cache.storedWords(test_support.cacheOwnerOf(cache.core, testGoalKey(1)).?).ptr,
+        cache.storedWords(test_support.cacheOwnerOf(cache.core, testGoalKey(5)).?).ptr,
     };
     try std.testing.expectEqual(@as(usize, 2), try cache.reserveLongBlocks(std.testing.allocator, 3));
     try std.testing.expectEqual(@as(usize, 6), cache.long_block_count);
-    try std.testing.expectEqual(before[0], cache.storedWords(cache.core.ownerOf(testGoalKey(1)).?).ptr);
-    try std.testing.expectEqual(before[1], cache.storedWords(cache.core.ownerOf(testGoalKey(5)).?).ptr);
+    try std.testing.expectEqual(before[0], cache.storedWords(test_support.cacheOwnerOf(cache.core, testGoalKey(1)).?).ptr);
+    try std.testing.expectEqual(before[1], cache.storedWords(test_support.cacheOwnerOf(cache.core, testGoalKey(5)).?).ptr);
     for ([_]usize{ 1, 5 }) |index| try expectTestEntry(&cache, index);
     try expectResultCacheConsistent(&cache);
 }

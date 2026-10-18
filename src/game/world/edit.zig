@@ -8,7 +8,6 @@
 //! as its methods.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -663,7 +662,7 @@ fn ensureDenseEditCapacity(self: *WorldSystem, list: anytype, needed: usize) err
     self.dense_edit_scratch_grows += 1;
     if (self.dense_edit_scratch_growth_logged) return;
     self.dense_edit_scratch_growth_logged = true;
-    if (comptime logging.enabled(.info) and !builtin.is_test) log.info("batched terrain edit scratch grew to {d}", .{list.capacity});
+    if (comptime logging.enabled(.info)) log.info("batched terrain edit scratch grew to {d}", .{list.capacity});
 }
 
 // The terrain pools' reserve seams: each counts a reserve that grew its pool.
@@ -680,7 +679,7 @@ fn countTerrainPoolGrowth(self: *WorldSystem) void {
     self.terrain_pool_grows += 1;
     if (self.terrain_pool_growth_logged) return;
     self.terrain_pool_growth_logged = true;
-    if (comptime logging.enabled(.info) and !builtin.is_test) log.info(
+    if (comptime logging.enabled(.info)) log.info(
         "terrain pools grew at their reserve seam ({d} dense layers, {d} levels)",
         .{ self.dense_layers.len, self.level_terrain.items.len },
     );
@@ -928,7 +927,7 @@ fn cellComposedBlocked(self: *const WorldSystem, level: u16, x: u16, y: u16) boo
 }
 
 // Tile-cell coordinate of a cell index (below width * height, so both fit u16).
-fn cellCoordOf(self: *const WorldSystem, cell: u32) CellCoord {
+pub fn cellCoordOf(self: *const WorldSystem, cell: u32) CellCoord {
     return .{ .x = @intCast(cell % self.width), .y = @intCast(cell / self.width) };
 }
 
@@ -1136,6 +1135,7 @@ const testApplySync = @import("test_support.zig").testApplySync;
 const testGpuTile = @import("test_support.zig").testGpuTile;
 const expectGpuStoreMatches = @import("test_support.zig").expectGpuStoreMatches;
 const expectSparseIndexConsistent = @import("test_support.zig").expectSparseIndexConsistent;
+const sparseTileCellCoord = @import("test_support.zig").sparseTileCellCoord;
 const WorldTilesetMeta = @import("../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const testWorldMeta = @import("test_support.zig").testWorldMeta;
 const testMinimalSurfaceWorld = @import("test_support.zig").testMinimalSurfaceWorld;
@@ -1148,6 +1148,10 @@ const world_gpu_tiles = @import("gpu_tiles.zig");
 fn cellCount(world: *const WorldSystem) usize {
     return @as(usize, world.width) * @as(usize, world.height);
 }
+
+const liveBlockCount = @import("test_support.zig").liveBlockCount;
+const liveSlotCount = @import("test_support.zig").liveSlotCount;
+const chunkBlockedCount = @import("test_support.zig").chunkBlockedCount;
 
 test "reserveDenseCellWrite covers N writes across uniform chunks on a resident layer (FailingAllocator)" {
     var meta = try testWorldMeta();
@@ -1182,8 +1186,8 @@ test "reserveDenseCellWrite covers N writes across uniform chunks on a resident 
         try std.testing.expect(!world.levelBlocksMovement(level, cell[0], cell[1]));
     }
     // One block and one slot per distinct chunk, not per write.
-    try std.testing.expectEqual(@as(usize, 3), world.dense_layers.items(.store)[layer].liveBlockCount());
-    try std.testing.expectEqual(@as(usize, 3), world.level_terrain.items[level].blocked.liveSlotCount());
+    try std.testing.expectEqual(@as(usize, 3), liveBlockCount(world.dense_layers.items(.store)[layer]));
+    try std.testing.expectEqual(@as(usize, 3), liveSlotCount(world.level_terrain.items[level].blocked));
     {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
         world.allocator = failing.allocator();
@@ -1205,7 +1209,7 @@ test "reserveDenseCellWrite covers N writes across uniform chunks on a resident 
     world.beginDenseCellWriteReserve();
     try std.testing.expectEqual(@as(?TileId, grass), world.dense_layers.items(.store)[layer].uniformTile(3));
     try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, 3));
-    try std.testing.expectEqual(@as(usize, 3), world.dense_layers.items(.store)[layer].liveBlockCount());
+    try std.testing.expectEqual(@as(usize, 3), liveBlockCount(world.dense_layers.items(.store)[layer]));
 
     // Reserving a write that changes nothing reserves nothing.
     try world.reserveDenseCellWrite(layer, 0, 0, water);
@@ -1368,7 +1372,7 @@ test "each chunk's sparse list holds exactly the level's tiles in that chunk" {
             var expected: std.ArrayList(u32) = .empty;
             defer expected.deinit(std.testing.allocator);
             for (level_indices) |sparse_index| {
-                const cell = world.sparseTileCellCoord(sparse_index);
+                const cell = sparseTileCellCoord(&world, sparse_index);
                 const cell_chunk = @as(u32, cell.y / 2) * chunks_x + @as(u32, cell.x / 2);
                 if (cell_chunk == chunk) try expected.append(std.testing.allocator, sparse_index);
             }
@@ -1474,10 +1478,10 @@ test "clearing a cell follows its chain's next row when a removal moves that row
     // Removing Y moves B into row 0, so (6, 6)'s chain walks row 0 then row 1, the
     // last row: removing row 0 moves row 1 into it, and the walk must follow.
     try std.testing.expect((try world.clearCellBlocking(0, 1, 1, tunnel)) != null);
-    try std.testing.expectEqual(@as(usize, 2), world.sparseTileCount());
+    try std.testing.expectEqual(@as(usize, 2), world.sparse_tiles.len);
     try expectSparseIndexConsistent(&world);
     try std.testing.expect((try world.clearCellBlocking(0, 6, 6, tunnel)) != null);
-    try std.testing.expectEqual(@as(usize, 0), world.sparseTileCount());
+    try std.testing.expectEqual(@as(usize, 0), world.sparse_tiles.len);
     try std.testing.expect(!world.levelBlocksMovement(0, 6, 6));
     try expectSparseIndexConsistent(&world);
 }
@@ -1526,7 +1530,7 @@ test "removing sparse tiles at the first, middle, last, and sole list positions 
             .last => list.len - 1,
         };
         const removed = list[position];
-        const coord = world.sparseTileCellCoord(removed);
+        const coord = sparseTileCellCoord(&world, removed);
         const before = testSparseRowKeys(&world, &before_buf);
         try std.testing.expect(world.levelBlocksMovement(removal.level, coord.x, coord.y));
 
@@ -1551,12 +1555,12 @@ test "removing sparse tiles at the first, middle, last, and sole list positions 
         }
         try std.testing.expect(skipped);
         // Every remaining tile still blocks its cell.
-        for (0..world.sparseTileCount()) |row| {
-            const remaining = world.sparseTileCellCoord(row);
+        for (0..world.sparse_tiles.len) |row| {
+            const remaining = sparseTileCellCoord(&world, row);
             try std.testing.expect(world.levelBlocksMovement(world.sparse_tiles.items(.level_index)[row], remaining.x, remaining.y));
         }
     }
-    try std.testing.expectEqual(@as(usize, 0), world.sparseTileCount());
+    try std.testing.expectEqual(@as(usize, 0), world.sparse_tiles.len);
 }
 
 test "repeated sparse add and clear cycles keep rows, lists, and composed bits at the live count" {
@@ -1574,14 +1578,14 @@ test "repeated sparse add and clear cycles keep rows, lists, and composed bits a
     for (0..16) |cycle| {
         for (0..3) |_| _ = try world.addSparseTile(0, 1, 1, deco, 0, .obstacle);
         _ = try world.addSparseTile(0, 6, 6, deco, 0, .obstacle);
-        try std.testing.expectEqual(@as(usize, 5), world.sparseTileCount());
+        try std.testing.expectEqual(@as(usize, 5), world.sparse_tiles.len);
         try std.testing.expect((try world.clearCellBlocking(0, 1, 1, tunnel)) != null);
         try std.testing.expect((try world.clearCellBlocking(0, 6, 6, tunnel)) != null);
 
-        try std.testing.expectEqual(@as(usize, 1), world.sparseTileCount());
+        try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
         try expectSparseIndexConsistent(&world);
         // No blocked cell remains, so the level holds no composed-bits slot.
-        try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[0].blocked.liveSlotCount());
+        try std.testing.expectEqual(@as(usize, 0), liveSlotCount(world.level_terrain.items[0].blocked));
         if (cycle == 0) row_capacity = world.sparse_tiles.capacity;
         try std.testing.expectEqual(row_capacity, world.sparse_tiles.capacity);
     }
@@ -1600,7 +1604,7 @@ test "clearCellBlocking leaves non-blocking content and returns no event when no
     const overlay = try world.addDenseLayer(0, 0, .obstacle, grass);
     _ = try world.addSparseTile(0, 2, 2, stone, 0, .floor);
     _ = try world.clearDenseTile(floor, 3, 3);
-    const slots_before = world.level_terrain.items[0].blocked.liveSlotCount();
+    const slots_before = liveSlotCount(world.level_terrain.items[0].blocked);
 
     // Walkable floor and overlay with a walkable decal, and a hole: nothing to clear.
     try std.testing.expectEqual(@as(?WorldObstacleChangedEvent, null), try world.clearCellBlocking(0, 2, 2, tunnel));
@@ -1608,8 +1612,8 @@ test "clearCellBlocking leaves non-blocking content and returns no event when no
     try std.testing.expectEqual(grass, world.denseTile(floor, 2, 2));
     try std.testing.expectEqual(grass, world.denseTile(overlay, 2, 2));
     try std.testing.expectEqual(invalid_tile_id, world.denseTile(floor, 3, 3));
-    try std.testing.expectEqual(@as(usize, 1), world.sparseTileCount());
-    try std.testing.expectEqual(slots_before, world.level_terrain.items[0].blocked.liveSlotCount());
+    try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
+    try std.testing.expectEqual(slots_before, liveSlotCount(world.level_terrain.items[0].blocked));
 
     // A blocking floor clears to the floor tile; the walkable overlay and decal stay.
     _ = try world.setDenseTile(floor, 2, 2, dirt);
@@ -1617,7 +1621,7 @@ test "clearCellBlocking leaves non-blocking content and returns no event when no
     try std.testing.expect((try world.clearCellBlocking(0, 2, 2, tunnel)) != null);
     try std.testing.expectEqual(tunnel, world.denseTile(floor, 2, 2));
     try std.testing.expectEqual(grass, world.denseTile(overlay, 2, 2));
-    try std.testing.expectEqual(@as(usize, 1), world.sparseTileCount());
+    try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
     try std.testing.expect(!world.levelBlocksMovement(0, 2, 2));
 
     // A blocking floor tile could not make the cell walkable.
@@ -1654,7 +1658,7 @@ test "clearCellBlocking after its reserve allocates nothing and opens a solid ch
     try std.testing.expect(event != null);
     try std.testing.expectEqual(tunnel, world.denseTile(floor, 1, 1));
     try std.testing.expectEqual(invalid_tile_id, world.denseTile(overlay, 1, 1));
-    try std.testing.expectEqual(@as(usize, 0), world.sparseTileCount());
+    try std.testing.expectEqual(@as(usize, 0), world.sparse_tiles.len);
     try std.testing.expect(!world.levelBlocksMovement(0, 1, 1));
     try std.testing.expect(world.levelBlocksMovement(0, 0, 1));
     try expectSparseIndexConsistent(&world);
@@ -1695,7 +1699,7 @@ fn expectTerrainMatchesReference(world: *const WorldSystem, reference: []const [
                 try std.testing.expectEqual(@as(u16, 0), unequal_pairs);
             }
         }
-        try std.testing.expectEqual(mixed_chunks, store.liveBlockCount());
+        try std.testing.expectEqual(mixed_chunks, liveBlockCount(store));
     }
     for (world.level_terrain.items, 0..) |terrain, level_index| {
         const level: u16 = @intCast(level_index);
@@ -1720,10 +1724,10 @@ fn expectTerrainMatchesReference(world: *const WorldSystem, reference: []const [
             else
                 .mixed;
             try std.testing.expectEqual(expected_form, terrain.blocked.form(chunk));
-            try std.testing.expectEqual(blocked_cells, terrain.blocked.blockedCount(geom, chunk));
+            try std.testing.expectEqual(blocked_cells, chunkBlockedCount(terrain.blocked, geom, chunk));
             mixed_chunks += @intFromBool(expected_form == .mixed);
         }
-        try std.testing.expectEqual(mixed_chunks, terrain.blocked.liveSlotCount());
+        try std.testing.expectEqual(mixed_chunks, liveSlotCount(terrain.blocked));
     }
 }
 
@@ -1846,8 +1850,8 @@ test "clearCellBlocking and refills match the flat reference in uniform blocked 
             try expectTerrainMatchesReference(&world, &reference);
         }
         // Refilled: every chunk is uniform again with no block or slot held.
-        for (0..fills.len) |layer| try std.testing.expectEqual(@as(usize, 0), world.dense_layers.items(.store)[layer].liveBlockCount());
-        try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[0].blocked.liveSlotCount());
+        for (0..fills.len) |layer| try std.testing.expectEqual(@as(usize, 0), liveBlockCount(world.dense_layers.items(.store)[layer]));
+        try std.testing.expectEqual(@as(usize, 0), liveSlotCount(world.level_terrain.items[0].blocked));
     }
 }
 
@@ -1908,9 +1912,9 @@ test "a multi-chunk change in one step on two levels writes allocation-free afte
         reference_storage[1][y * 16 + x] = tiles.dirt;
     };
     try expectTerrainMatchesReference(&world, &reference);
-    try std.testing.expectEqual(@as(usize, 0), world.dense_layers.items(.store)[surface].liveBlockCount());
-    try std.testing.expectEqual(@as(usize, 0), world.dense_layers.items(.store)[underground].liveBlockCount());
-    try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[1].blocked.liveSlotCount());
+    try std.testing.expectEqual(@as(usize, 0), liveBlockCount(world.dense_layers.items(.store)[surface]));
+    try std.testing.expectEqual(@as(usize, 0), liveBlockCount(world.dense_layers.items(.store)[underground]));
+    try std.testing.expectEqual(@as(usize, 0), liveSlotCount(world.level_terrain.items[1].blocked));
 }
 
 test "repeated dig and fill of one cell re-uniforms its block and reuses one pool entry" {
@@ -1942,9 +1946,9 @@ test "repeated dig and fill of one cell re-uniforms its block and reuses one poo
         try std.testing.expect(world.levelBlocksMovement(level, 5, 2));
         // One block and one slot were ever taken; each fill released them.
         try std.testing.expectEqual(@as(usize, 1), store.fills.items.len);
-        try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
+        try std.testing.expectEqual(@as(usize, 0), liveBlockCount(store));
         try std.testing.expectEqual(@as(usize, 1), world.level_terrain.items[level].blocked.bits.items.len);
-        try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[level].blocked.liveSlotCount());
+        try std.testing.expectEqual(@as(usize, 0), liveSlotCount(world.level_terrain.items[level].blocked));
     }
 }
 
@@ -2017,8 +2021,8 @@ test "a uniform chunk stays uniform while another chunk on its level is edited" 
         try std.testing.expectEqual(@as(?TileId, tiles.grass), store.uniformTile(@intCast(chunk)));
         try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(level, @intCast(chunk)));
     }
-    try std.testing.expectEqual(@as(usize, 1), store.liveBlockCount());
-    try std.testing.expectEqual(@as(usize, 1), world.level_terrain.items[level].blocked.liveSlotCount());
+    try std.testing.expectEqual(@as(usize, 1), liveBlockCount(store));
+    try std.testing.expectEqual(@as(usize, 1), liveSlotCount(world.level_terrain.items[level].blocked));
 }
 
 test "addSparseTile reserves the composed-bits slot before committing (FailingAllocator)" {
@@ -2438,7 +2442,7 @@ test "a batched dense edit composes the same tiles and blocked cells as single-c
             for (0..batched.chunkCountPerLevel()) |chunk| {
                 try std.testing.expectEqual(single_store.uniformTile(@intCast(chunk)), batched_store.uniformTile(@intCast(chunk)));
             }
-            try std.testing.expectEqual(single_store.liveBlockCount(), batched_store.liveBlockCount());
+            try std.testing.expectEqual(liveBlockCount(single_store), liveBlockCount(batched_store));
         }
         for (0..batched.level_terrain.items.len) |level| {
             for (0..batched.height) |y| for (0..batched.width) |x| {
@@ -3033,8 +3037,8 @@ test "a multi-level cave-in lands in one batched step and refills to uniform chu
     _ = try testSyncGpuTiles(&world, 0);
     try testApplySync(&world, &gpu_store);
     try expectGpuStoreMatches(&world, &gpu_store);
-    for (world.dense_layers.items(.store)) |store| try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
-    try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[1].blocked.liveSlotCount());
+    for (world.dense_layers.items(.store)) |store| try std.testing.expectEqual(@as(usize, 0), liveBlockCount(store));
+    try std.testing.expectEqual(@as(usize, 0), liveSlotCount(world.level_terrain.items[1].blocked));
 }
 
 test "a 1x1 border chunk turning uniform at another tile reads back from the GPU store" {
@@ -3075,7 +3079,7 @@ test "a 1x1 border chunk turning uniform at another tile reads back from the GPU
     try events.ensureTotalCapacity(std.testing.allocator, writes.len);
     try world.applyDenseCellWrites(&chunks, null, &events);
     try std.testing.expectEqual(@as(?TileId, tiles.cave), store.uniformTile(3));
-    try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
+    try std.testing.expectEqual(@as(usize, 0), liveBlockCount(store));
     _ = try testSyncGpuTiles(&world, 0);
     try testApplySync(&world, &gpu_store);
     try expectGpuStoreMatches(&world, &gpu_store);
@@ -3151,7 +3155,7 @@ test "a batched dense edit blocks and reopens a whole short border chunk" {
     // Every in-level cell blocked: the corner's slot went back and it reads BLOCKED.
     try std.testing.expectEqual(ChunkForm.blocked, world.levelChunkBlockedForm(0, corner));
     try std.testing.expectEqual(ChunkForm.mixed, world.levelChunkBlockedForm(0, 0));
-    try std.testing.expectEqual(@as(usize, 1), world.level_terrain.items[0].blocked.liveSlotCount());
+    try std.testing.expectEqual(@as(usize, 1), liveSlotCount(world.level_terrain.items[0].blocked));
 
     var reopen_corner = block_corner;
     for (&reopen_corner) |*write| write.tile = tiles.grass;
@@ -3165,8 +3169,8 @@ test "a batched dense edit blocks and reopens a whole short border chunk" {
     try std.testing.expectEqual(@as(usize, 5), events.items.len);
     try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(0, corner));
     try std.testing.expectEqual(ChunkForm.open, world.levelChunkBlockedForm(0, 0));
-    try std.testing.expectEqual(@as(usize, 0), world.level_terrain.items[0].blocked.liveSlotCount());
-    try std.testing.expectEqual(@as(usize, 0), world.dense_layers.items(.store)[0].liveBlockCount());
+    try std.testing.expectEqual(@as(usize, 0), liveSlotCount(world.level_terrain.items[0].blocked));
+    try std.testing.expectEqual(@as(usize, 0), liveBlockCount(world.dense_layers.items(.store)[0]));
 }
 
 test "a batched carve and restore of one cell leaves its uniform chunk unchanged" {
@@ -3181,14 +3185,14 @@ test "a batched carve and restore of one cell leaves its uniform chunk unchanged
         .{ .layer = 2, .x = 5, .y = 6, .tile = tiles.dirt },
     };
     const chunks = [_]DenseChunkWrites{.{ .level = 1, .chunk_x = 1, .chunk_y = 1, .writes = &writes }};
-    const slots_before = world.level_terrain.items[1].blocked.liveSlotCount();
+    const slots_before = liveSlotCount(world.level_terrain.items[1].blocked);
     var events: std.ArrayList(WorldTileChangedEvent) = .empty;
     defer events.deinit(std.testing.allocator);
     try events.ensureTotalCapacity(std.testing.allocator, writes.len);
     try world.applyDenseCellWrites(&chunks, null, &events);
     try std.testing.expectEqual(@as(usize, 0), events.items.len);
-    for (world.dense_layers.items(.store)) |store| try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
-    try std.testing.expectEqual(slots_before, world.level_terrain.items[1].blocked.liveSlotCount());
+    for (world.dense_layers.items(.store)) |store| try std.testing.expectEqual(@as(usize, 0), liveBlockCount(store));
+    try std.testing.expectEqual(slots_before, liveSlotCount(world.level_terrain.items[1].blocked));
     try std.testing.expectEqual(ChunkForm.blocked, world.levelChunkBlockedForm(1, 1 * 4 + 1));
     // No cell changed, so no layer is flagged for the GPU sync.
     try std.testing.expect(!world.resident_layers_changed);
@@ -3261,7 +3265,7 @@ test "unordered writes across levels and chunks group into (level, chunk) order,
                 _ = try sequential.setDenseTile(write.layer, write.x, write.y, write.tile);
             }
         }
-        for (0..grouped.denseLayerCount()) |layer| for (0..16) |y| for (0..16) |x| {
+        for (0..grouped.dense_layers.len) |layer| for (0..16) |y| for (0..16) |x| {
             try std.testing.expectEqual(sequential.denseTile(layer, @intCast(x), @intCast(y)), grouped.denseTile(layer, @intCast(x), @intCast(y)));
         };
         for (0..grouped.levelCount()) |level| for (0..16) |y| for (0..16) |x| {

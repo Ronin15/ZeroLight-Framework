@@ -218,6 +218,8 @@ fn preparedTextSharesTexture(a: PreparedText, b: PreparedText) bool {
     return a.isValid() and b.isValid() and a.texture.matches(b.texture.index, b.texture.generation);
 }
 
+const text_test_support = @import("text_test_support.zig");
+
 test "overlay font size follows drawable pixel scale" {
     try std.testing.expectEqual(@as(f32, 18), overlayFontSize(1));
     try std.testing.expectEqual(@as(f32, 36), overlayFontSize(2));
@@ -242,8 +244,8 @@ test "fps counter uses fixed glyph set" {
 
 test "prepareGlyphs twice with same keys does not destroy shared live textures" {
     const allocator = std.testing.allocator;
-    var fake = text.FakeBackend{};
-    var service = try text.initFakeTextService(allocator, &fake);
+    var fake = text_test_support.FakeBackend{};
+    var service = try text_test_support.initFakeTextService(allocator, &fake);
     defer service.deinitWithContext(&fake);
 
     var fps = FpsCounter{
@@ -256,7 +258,7 @@ test "prepareGlyphs twice with same keys does not destroy shared live textures" 
     try std.testing.expect(fps.glyphsValid());
     try std.testing.expectEqual(@as(u32, 11), fake.render_count); // prefix + 0-9
     try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
-    try std.testing.expectEqual(@as(u32, 11), text.countLiveTextEntries(&service));
+    try std.testing.expectEqual(@as(u32, 11), text_test_support.countLiveTextEntries(&service));
 
     const first_prefix = fps.prefix;
     const first_digit0 = fps.digits[0];
@@ -270,13 +272,13 @@ test "prepareGlyphs twice with same keys does not destroy shared live textures" 
     try std.testing.expectEqual(destroy_after_first, fake.destroy_count);
     try std.testing.expect(preparedTextSharesTexture(first_prefix, fps.prefix));
     try std.testing.expect(preparedTextSharesTexture(first_digit0, fps.digits[0]));
-    try std.testing.expectEqual(@as(u32, 11), text.countLiveTextEntries(&service));
+    try std.testing.expectEqual(@as(u32, 11), text_test_support.countLiveTextEntries(&service));
 }
 
 test "prepareGlyphs with different font retires prior glyphs and keeps cache bounded" {
     const allocator = std.testing.allocator;
-    var fake = text.FakeBackend{};
-    var service = try text.initFakeTextService(allocator, &fake);
+    var fake = text_test_support.FakeBackend{};
+    var service = try text_test_support.initFakeTextService(allocator, &fake);
     defer service.deinitWithContext(&fake);
 
     var fps = FpsCounter{
@@ -287,7 +289,7 @@ test "prepareGlyphs with different font retires prior glyphs and keeps cache bou
 
     try fps.prepareGlyphs(&service, &fake);
     try std.testing.expectEqual(@as(u32, 11), fake.render_count);
-    try std.testing.expectEqual(@as(u32, 11), text.countLiveTextEntries(&service));
+    try std.testing.expectEqual(@as(u32, 11), text_test_support.countLiveTextEntries(&service));
     const old_prefix = fps.prefix;
     const old_digit0 = fps.digits[0];
 
@@ -308,7 +310,7 @@ test "prepareGlyphs with different font retires prior glyphs and keeps cache bou
     try std.testing.expectEqual(@as(u32, 22), fake.render_count);
     // Prior 11 glyphs retired; only the new set remains live.
     try std.testing.expectEqual(@as(u32, 11), fake.destroy_count);
-    try std.testing.expectEqual(@as(u32, 11), text.countLiveTextEntries(&service));
+    try std.testing.expectEqual(@as(u32, 11), text_test_support.countLiveTextEntries(&service));
     try std.testing.expect(!preparedTextSharesTexture(old_prefix, fps.prefix));
     try std.testing.expect(!preparedTextSharesTexture(old_digit0, fps.digits[0]));
     try std.testing.expect(!old_prefix.texture.matches(fps.prefix.texture.index, fps.prefix.texture.generation));
@@ -316,8 +318,8 @@ test "prepareGlyphs with different font retires prior glyphs and keeps cache bou
 
 test "prepareGlyphs mid-prepare failure keeps old glyphs and destroys only non-shared new" {
     const allocator = std.testing.allocator;
-    var fake = text.FakeBackend{};
-    var service = try text.initFakeTextService(allocator, &fake);
+    var fake = text_test_support.FakeBackend{};
+    var service = try text_test_support.initFakeTextService(allocator, &fake);
     defer service.deinitWithContext(&fake);
 
     var fps = FpsCounter{
@@ -360,13 +362,13 @@ test "prepareGlyphs mid-prepare failure keeps old glyphs and destroys only non-s
     // Exactly the non-shared partial new set was destroyed: prefix + 5 digits.
     try std.testing.expectEqual(@as(u32, 6), fake.destroy_count);
     // Live entries are only the original 11 (partial new ones retired).
-    try std.testing.expectEqual(@as(u32, 11), text.countLiveTextEntries(&service));
+    try std.testing.expectEqual(@as(u32, 11), text_test_support.countLiveTextEntries(&service));
 }
 
 test "deinit releases prepared glyphs and clears handles" {
     const allocator = std.testing.allocator;
-    var fake = text.FakeBackend{};
-    var service = try text.initFakeTextService(allocator, &fake);
+    var fake = text_test_support.FakeBackend{};
+    var service = try text_test_support.initFakeTextService(allocator, &fake);
     defer service.deinitWithContext(&fake);
 
     var fps = FpsCounter{
@@ -376,7 +378,7 @@ test "deinit releases prepared glyphs and clears handles" {
 
     try fps.prepareGlyphs(&service, &fake);
     try std.testing.expect(fps.glyphsValid());
-    try std.testing.expectEqual(@as(u32, 11), text.countLiveTextEntries(&service));
+    try std.testing.expectEqual(@as(u32, 11), text_test_support.countLiveTextEntries(&service));
     try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
 
     fps.deinitWithContext(&service, &fake);
@@ -388,13 +390,13 @@ test "deinit releases prepared glyphs and clears handles" {
     }
     try std.testing.expect(fps.texture_dirty);
     try std.testing.expectEqual(@as(u32, 11), fake.destroy_count);
-    try std.testing.expectEqual(@as(u32, 0), text.countLiveTextEntries(&service));
+    try std.testing.expectEqual(@as(u32, 0), text_test_support.countLiveTextEntries(&service));
 }
 
 test "deinit is safe when no glyphs have been prepared" {
     const allocator = std.testing.allocator;
-    var fake = text.FakeBackend{};
-    var service = try text.initFakeTextService(allocator, &fake);
+    var fake = text_test_support.FakeBackend{};
+    var service = try text_test_support.initFakeTextService(allocator, &fake);
     defer service.deinitWithContext(&fake);
 
     var fps = FpsCounter{

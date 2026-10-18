@@ -9,7 +9,6 @@
 //! counts and the renderer remains the owner of GPU texture destruction.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const assets = @import("assets.zig");
 const image = @import("image.zig");
 const log = @import("../core/logging.zig").assets;
@@ -43,7 +42,7 @@ pub const AssetCache = struct {
         self.deinitWithContext(@ptrCast(renderer));
     }
 
-    fn initWithBackend(allocator: std.mem.Allocator, asset_store: assets.AssetStore, backend: TextureBackend) AssetCache {
+    pub fn initWithBackend(allocator: std.mem.Allocator, asset_store: assets.AssetStore, backend: TextureBackend) AssetCache {
         return .{
             .allocator = allocator,
             .assets = asset_store,
@@ -264,7 +263,7 @@ pub const AssetCache = struct {
         self.allocator.free(removed.value.path);
     }
 
-    fn deinitWithContext(self: *AssetCache, backend_context: *anyopaque) void {
+    pub fn deinitWithContext(self: *AssetCache, backend_context: *anyopaque) void {
         var iterator = self.entries.iterator();
         while (iterator.next()) |entry| {
             self.backend.destroy_texture(backend_context, entry.value_ptr.texture);
@@ -377,7 +376,7 @@ pub const StartupTextureInsert = struct {
     image: image.LoadedImage,
 };
 
-const TextureBackend = struct {
+pub const TextureBackend = struct {
     upload_image: *const fn (*anyopaque, image.LoadedImage) anyerror!TextureId,
     upload_images_batch: *const fn (*anyopaque, std.mem.Allocator, []const image.LoadedImage) anyerror![]TextureId,
     destroy_texture: *const fn (*anyopaque, TextureId) void,
@@ -422,56 +421,7 @@ fn nextCacheOwnerId() u64 {
     return if (id == 0) next_cache_owner_id.fetchAdd(1, .monotonic) else id;
 }
 
-const FakeBackend = struct {
-    upload_count: u32 = 0,
-    batch_upload_count: u32 = 0,
-    destroy_count: u32 = 0,
-    next_index: u32 = 0,
-    fail_upload: bool = false,
-    last_width: u32 = 0,
-    last_height: u32 = 0,
-    last_pitch: usize = 0,
-
-    fn backend() TextureBackend {
-        return .{
-            .upload_image = uploadImage,
-            .upload_images_batch = uploadImagesBatch,
-            .destroy_texture = destroyTexture,
-        };
-    }
-
-    fn uploadImage(context: *anyopaque, loaded_image: image.LoadedImage) !TextureId {
-        const self: *FakeBackend = @ptrCast(@alignCast(context));
-        if (self.fail_upload) return error.FakeUploadFailed;
-
-        const texture = try TextureId.init(self.next_index, 1);
-        self.next_index += 1;
-        self.upload_count += 1;
-        self.last_width = loaded_image.width;
-        self.last_height = loaded_image.height;
-        self.last_pitch = loaded_image.pitch;
-        return texture;
-    }
-
-    fn uploadImagesBatch(context: *anyopaque, allocator: std.mem.Allocator, images: []const image.LoadedImage) ![]TextureId {
-        const self: *FakeBackend = @ptrCast(@alignCast(context));
-        if (self.fail_upload) return error.FakeUploadFailed;
-
-        const ids = try allocator.alloc(TextureId, images.len);
-        errdefer allocator.free(ids);
-        for (images, ids) |loaded_image, *id| {
-            id.* = try uploadImage(context, loaded_image);
-        }
-        self.batch_upload_count += 1;
-        return ids;
-    }
-
-    fn destroyTexture(context: *anyopaque, texture: TextureId) void {
-        _ = texture;
-        const self: *FakeBackend = @ptrCast(@alignCast(context));
-        self.destroy_count += 1;
-    }
-};
+const FakeBackend = @import("cache_test_support.zig").FakeBackend;
 
 var test_startup_pixels: [4]u8 = @splat(255);
 
@@ -492,30 +442,6 @@ fn testCache(allocator: std.mem.Allocator) AssetCache {
         FakeBackend.backend(),
     );
 }
-
-pub const testing = if (builtin.is_test) struct {
-    pub const Backend = FakeBackend;
-
-    pub fn initCache(allocator: std.mem.Allocator, asset_store: assets.AssetStore) AssetCache {
-        return AssetCache.initWithBackend(allocator, asset_store, Backend.backend());
-    }
-
-    pub fn deinitCache(cache: *AssetCache, fake: *Backend) void {
-        cache.deinitWithContext(fake);
-    }
-
-    pub fn uploadCount(fake: *const Backend) u32 {
-        return fake.upload_count;
-    }
-
-    pub fn destroyCount(fake: *const Backend) u32 {
-        return fake.destroy_count;
-    }
-
-    pub fn entryCount(cache: *const AssetCache) usize {
-        return cache.entries.count();
-    }
-} else struct {};
 
 test "duplicate texture acquires reuse the same cached id" {
     const allocator = std.testing.allocator;

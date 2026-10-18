@@ -563,16 +563,6 @@ pub const Closure = struct {
         return (word >> @intCast(to_index % 32)) & 1 != 0;
     }
 
-    /// Live H-components.
-    pub fn hcompCount(self: *const Closure) usize {
-        return self.hcomps.len - self.hcomp_free.items.len;
-    }
-
-    /// Live terminals.
-    pub fn termCount(self: *const Closure) usize {
-        return self.terms.len - self.term_free.items.len;
-    }
-
     /// Re-takes the terminal and H-component column views after a pool grows.
     pub fn refreshColumns(self: *Closure) void {
         const terms = self.terms.slice();
@@ -2520,7 +2510,7 @@ test "a world build with one-way links frees its closure staging when it ends" {
     var system = try fixture.build(windowCapacity(window));
     defer system.deinit();
     const conn = &system.graph.connectivity;
-    try std.testing.expectEqual(@as(usize, 32), conn.closure.termCount());
+    try std.testing.expectEqual(@as(usize, 32), test_support.closureTermCount(conn.closure));
     const keep = conn.oneChunkStaging(system.graph.levelGraph(0).?.border_stride);
     try expectStagingWithin(conn, keep);
     try expectClosureStagingWithin(conn, keep);
@@ -2643,7 +2633,7 @@ test "the closure equals a full recompute after one-way adds, endpoint toggles, 
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
     try fixture.expectMatchesRebuild(&system);
-    try std.testing.expectEqual(@as(usize, 2), system.graph.connectivity.closure.hcompCount());
+    try std.testing.expectEqual(@as(usize, 2), test_support.closureHcompCount(system.graph.connectivity.closure));
     // A link within one component, then one joining two.
     try addOneWay(&fixture, 0, latticeRoom(chunks, 3), 0, latticeRoom(chunks, 1));
     _ = try applyWithinBounds(&fixture, &system);
@@ -2652,7 +2642,7 @@ test "the closure equals a full recompute after one-way adds, endpoint toggles, 
     try addOneWay(&fixture, 1, latticeRoom(chunks, 40), 0, latticeRoom(chunks, 10));
     _ = try applyWithinBounds(&fixture, &system);
     try fixture.expectMatchesRebuild(&system);
-    try std.testing.expectEqual(@as(usize, 1), system.graph.connectivity.closure.hcompCount());
+    try std.testing.expectEqual(@as(usize, 1), test_support.closureHcompCount(system.graph.connectivity.closure));
     // An endpoint closed and reopened: the component falls apart and rejoins.
     for ([_]TileId{ fixture.tree, fixture.grass }) |tile| {
         try setRoom(&fixture, &system, chunks, 1, 40, tile);
@@ -2681,11 +2671,11 @@ test "the closure equals a full recompute after one-way adds, endpoint toggles, 
     try fixture.expectMatchesRebuild(&system);
     try std.testing.expect(reach(&system.graph, level, fixture.cell(3, 3), 0, fixture.cell(latticeRoom(chunks, 3)[0], latticeRoom(chunks, 3)[1])) == .reaches);
     // Replacing level 1 with a blocking layer drops its terminals.
-    const terms = system.graph.connectivity.closure.termCount();
+    const terms = test_support.closureTermCount(system.graph.connectivity.closure);
     _ = try fixture.world.addDenseLayer(1, 0, .obstacle, fixture.tree);
     const replaced = try applyWithinBounds(&fixture, &system);
     try std.testing.expectEqual(@as(usize, 1), replaced.levels_built);
-    try std.testing.expect(system.graph.connectivity.closure.termCount() < terms);
+    try std.testing.expect(test_support.closureTermCount(system.graph.connectivity.closure) < terms);
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -2734,7 +2724,7 @@ test "two hundred seeded random steps of one-way links, endpoint toggles, and wa
         try fixture.expectMatchesRebuild(&system);
     }
     // The run grew real one-way systems.
-    try std.testing.expect(system.graph.connectivity.closure.termCount() > 8);
+    try std.testing.expect(test_support.closureTermCount(system.graph.connectivity.closure) > 8);
 }
 
 // The row words of `term` in its component's block.
@@ -3017,7 +3007,7 @@ test "repeated one-way toggles and terminal splits and merges return terminals, 
         fn of(c: *const Closure) Counts {
             var links: usize = 0;
             for (c.hcomp.k_cap, c.hcomp.link_count) |k_cap, count| links += if (k_cap != 0) count else 0;
-            return .{ .terms = c.termCount(), .hcomps = c.hcompCount(), .live_words = c.live_words, .term_pool = c.terms.len, .links = links };
+            return .{ .terms = test_support.closureTermCount(c), .hcomps = test_support.closureHcompCount(c), .live_words = c.live_words, .term_pool = c.terms.len, .links = links };
         }
     }.of;
     var start: ?Counts = null;
@@ -3127,7 +3117,7 @@ test "a system at its narrowed size neither narrows nor grows under toggles, and
     const regrown = roomHComp(&system, &fixture, chunks, narrow_tail);
     try std.testing.expectEqual(narrowed[0], closure.hcomp.k_cap[regrown]);
     try std.testing.expectEqual(narrowed[1], closure.hcomp.k_high[regrown]);
-    try std.testing.expectEqual(@as(usize, 1), closure.hcompCount());
+    try std.testing.expectEqual(@as(usize, 1), test_support.closureHcompCount(closure));
     try std.testing.expectEqual(narrowed[2] - blockWords(4), closure.live_words);
     // The narrowing freed the regrown block and the closed system's in its own batch.
     try std.testing.expectEqual(@as(usize, 2), again.closure_block_frees);
@@ -3145,7 +3135,7 @@ test "the heir of a component that falls into five pieces narrows; the other pie
     for ([_]usize{ 25, 50, 75, 100 }) |cut| try setRoom(&fixture, &system, chunks, 0, narrow_first + cut, fixture.tree);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.closure_shrinks);
-    try std.testing.expectEqual(@as(usize, 5), closure.hcompCount());
+    try std.testing.expectEqual(@as(usize, 5), test_support.closureHcompCount(closure));
     try std.testing.expectEqual(@as(u32, 64), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, narrow_tail)]);
     for ([_]usize{ 0, 26, 51, 76 }) |first| try std.testing.expectEqual(@as(u32, 32), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, narrow_first + first)]);
     try std.testing.expectEqual(blockWords(64) + 4 * blockWords(32), closure.live_words);
@@ -3310,14 +3300,14 @@ test "a relocating batch lands its pieces in the same nav reaction on workers: t
     defer system.deinit();
     system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     const closure = &system.graph.connectivity.closure;
-    try std.testing.expectEqual(@as(usize, 0), closure.termCount());
+    try std.testing.expectEqual(@as(usize, 0), test_support.closureTermCount(closure));
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     for (0..rooms) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.grass);
     frame.beginStep();
     const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, &threads);
     // One new system of 256: its block, 144 lines, lands on workers in this reaction.
-    try std.testing.expectEqual(@as(usize, 1), closure.hcompCount());
+    try std.testing.expectEqual(@as(usize, 1), test_support.closureHcompCount(closure));
     try std.testing.expectEqual(@as(u32, rooms), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, 0)]);
     const land = stats.conn_closure_land_batch;
     try std.testing.expectEqual(blockWords(rooms) / span_words, land.item_count);
@@ -3624,7 +3614,7 @@ test "reopening a closed chain in one batch counts each room's cell once: n_net 
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
     const closure = &system.graph.connectivity.closure;
-    try std.testing.expectEqual(@as(usize, 0), closure.termCount());
+    try std.testing.expectEqual(@as(usize, 0), test_support.closureTermCount(closure));
     for (0..rooms) |room| try setRoom(&fixture, &system, chunks, 0, room, fixture.grass);
     const stats = try applyWithinBounds(&fixture, &system);
     try std.testing.expectEqual(rooms, closure.limits.n_net);
@@ -3694,7 +3684,7 @@ test "a fill splitting one terminal root holding sixteen one-way endpoints in fa
     }
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
-    try std.testing.expectEqual(@as(usize, 2), system.graph.connectivity.closure.termCount());
+    try std.testing.expectEqual(@as(usize, 2), test_support.closureTermCount(system.graph.connectivity.closure));
     try setHubCorridor(&fixture, &system, tunnels, fixture.tree);
     var stats = NavUpdateStats{};
     const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, null, &stats)).?;
@@ -3710,7 +3700,7 @@ test "a fill splitting one terminal root holding sixteen one-way endpoints in fa
     // Every tunnel takes its own root; the first in link order takes the corridor's terminal
     // back, the rest pop new ones, and none leaves. The tunnels' mouths are the seed edges
     // whose kept far end held the terminal: the bound counts each.
-    try std.testing.expectEqual(@as(usize, tunnels + 1), system.graph.connectivity.closure.termCount());
+    try std.testing.expectEqual(@as(usize, tunnels + 1), test_support.closureTermCount(system.graph.connectivity.closure));
     try std.testing.expectEqual(@as(usize, tunnels - 1), stats.closure_terms_new);
     try std.testing.expectEqual(@as(usize, 0), stats.closure_terms_left);
     try std.testing.expectEqual(@as(usize, tunnels), system.graph.connectivity.closure.limits.n_net);
@@ -3741,7 +3731,7 @@ test "a world build's closure equals one maintained level by level as levels and
         // Checks the world build's closure (`buildClosure`) against this one.
         try fixture.expectMatchesRebuild(&system);
     }
-    try std.testing.expectEqual(@as(usize, 1), system.graph.connectivity.closure.hcompCount());
+    try std.testing.expectEqual(@as(usize, 1), test_support.closureHcompCount(system.graph.connectivity.closure));
 }
 
 test "a one-way link between unbuilt levels commits without allocating, stays dead while one end's level is unbuilt, and goes live with the second" {
@@ -3766,7 +3756,7 @@ test "a one-way link between unbuilt levels commits without allocating, stays de
     try std.testing.expectEqual(no_hcomp, closure.oneway.items(.hcomp)[0]);
     try system.graph.buildLevel(no_colliders.view(), &fixture.world, 1, null, &stats);
     try std.testing.expectEqual(no_hcomp, closure.oneway.items(.hcomp)[0]);
-    try std.testing.expectEqual(@as(usize, 0), closure.termCount());
+    try std.testing.expectEqual(@as(usize, 0), test_support.closureTermCount(closure));
     try system.graph.buildLevel(no_colliders.view(), &fixture.world, 2, null, &stats);
     try std.testing.expect(closure.oneway.items(.hcomp)[0] != no_hcomp);
     try std.testing.expect(reach(&system.graph, 1, fixture.cell(2, 2), 2, fixture.cell(9, 9)) == .reaches);
@@ -3917,19 +3907,19 @@ test "a merge and a split of terminal roots far from every endpoint join and par
     try addOneWay(&fixture, 0, .{ 30, 30 }, 1, .{ 29, 29 });
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
-    try std.testing.expectEqual(@as(usize, 2), system.graph.connectivity.closure.hcompCount());
+    try std.testing.expectEqual(@as(usize, 2), test_support.closureHcompCount(system.graph.connectivity.closure));
     // A gap in level 0's wall, its patch keys far from every endpoint, merges the halves.
     try fixture.setChunk(&system, 0, 4, 4, fixture.grass);
     const merged = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), merged.conn_merges);
-    try std.testing.expectEqual(@as(usize, 1), system.graph.connectivity.closure.hcompCount());
+    try std.testing.expectEqual(@as(usize, 1), test_support.closureHcompCount(system.graph.connectivity.closure));
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 1, fixture.cell(29, 29)) == .reaches);
     try fixture.expectMatchesRebuild(&system);
     // Refilled: the root splits and so does the system.
     try fixture.setChunk(&system, 0, 4, 4, fixture.tree);
     const split = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
     try std.testing.expectEqual(@as(usize, 1), split.conn_splits);
-    try std.testing.expectEqual(@as(usize, 2), system.graph.connectivity.closure.hcompCount());
+    try std.testing.expectEqual(@as(usize, 2), test_support.closureHcompCount(system.graph.connectivity.closure));
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 1, fixture.cell(29, 29)) != .reaches);
     try fixture.expectMatchesRebuild(&system);
 }
@@ -4100,7 +4090,7 @@ test "a fill splitting a one-chunk room holding two endpoint cells yields two te
     try std.testing.expectEqual(@as(u32, 8), roomBlockCap(&system, &fixture, chunks, 2));
     try setWall(&fixture, &system, chunks, 0, fixture.tree);
     const stats = try applyWithinBounds(&fixture, &system);
-    try std.testing.expectEqual(@as(usize, 9), closure.termCount());
+    try std.testing.expectEqual(@as(usize, 9), test_support.closureTermCount(closure));
     try std.testing.expectEqual(@as(usize, 1), stats.closure_terms_new);
     try std.testing.expectEqual(@as(usize, 1), closure.limits.n_net);
     try std.testing.expectEqual(@as(u32, 16), roomBlockCap(&system, &fixture, chunks, 2));
@@ -4124,7 +4114,7 @@ test "a fill splitting a room across a chunk border, both chunks changed, yields
     // Both walls filled in one batch: each side's seed edge ends in the other changed chunk.
     for (1..3) |index| try setWall(&fixture, &system, chunks, index, fixture.tree);
     const stats = try applyWithinBounds(&fixture, &system);
-    try std.testing.expectEqual(@as(usize, 9), closure.termCount());
+    try std.testing.expectEqual(@as(usize, 9), test_support.closureTermCount(closure));
     try std.testing.expectEqual(@as(usize, 1), stats.closure_terms_new);
     try std.testing.expectEqual(@as(u32, 16), roomBlockCap(&system, &fixture, chunks, 4));
     try fixture.expectMatchesRebuild(&system);
@@ -4182,13 +4172,13 @@ test "a dig merging rooms of two full one-way systems grows one block within the
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
     const closure = &system.graph.connectivity.closure;
-    try std.testing.expectEqual(@as(usize, 2), closure.hcompCount());
+    try std.testing.expectEqual(@as(usize, 2), test_support.closureHcompCount(closure));
     // The cell between rooms 0 and 8 dug: their roots merge, and so do the systems.
     try fixture.setCell(&system, 0, 0, 1, fixture.grass);
     _ = try applyWithinBounds(&fixture, &system);
     try std.testing.expect(closure.limits.merge);
-    try std.testing.expectEqual(@as(usize, 1), closure.hcompCount());
-    try std.testing.expectEqual(@as(usize, 15), closure.termCount());
+    try std.testing.expectEqual(@as(usize, 1), test_support.closureHcompCount(closure));
+    try std.testing.expectEqual(@as(usize, 15), test_support.closureTermCount(closure));
     try std.testing.expectEqual(@as(u32, 16), roomBlockCap(&system, &fixture, chunks, 15));
     try std.testing.expectEqual(@as(usize, 16), closure.limits.q_max);
     try fixture.expectMatchesRebuild(&system);
@@ -4240,7 +4230,7 @@ test "a dead link with both ends in a batch's keys is taken loose once" {
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
     const closure = &system.graph.connectivity.closure;
-    try std.testing.expectEqual(@as(usize, 0), closure.termCount());
+    try std.testing.expectEqual(@as(usize, 0), test_support.closureTermCount(closure));
     // Room 8 of chunk 0 filled.
     try setRoom(&fixture, &system, chunks, 0, 8, fixture.tree);
     const stats = try applyWithinBounds(&fixture, &system);
@@ -4258,7 +4248,7 @@ test "a world build of disjoint one-way links reserves one H-component id per li
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
     const closure = &system.graph.connectivity.closure;
-    try std.testing.expectEqual(@as(usize, 5), closure.hcompCount());
+    try std.testing.expectEqual(@as(usize, 5), test_support.closureHcompCount(closure));
     try std.testing.expectEqual(@as(usize, 5), closure.hcomps.len);
 }
 

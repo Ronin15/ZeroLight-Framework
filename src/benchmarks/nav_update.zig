@@ -60,6 +60,7 @@ const tile_size: f32 = 32.0;
 // default, so the scattered footprint stays one dirty cell per distinct chunk (its item_count
 // equals the dirty-chunk count) even if the default changes.
 const nav_chunk_tiles: u16 = @import("../game/world/system.zig").default_chunk_size_tiles;
+const static_colliders_test_support = @import("../game/systems/static_colliders_test_support.zig");
 const chunks_per_side: usize = @as(usize, world_tiles) / nav_chunk_tiles;
 const total_chunks: usize = chunks_per_side * chunks_per_side;
 
@@ -760,7 +761,7 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     }
     var stats = accumulator.finish();
     stats.output_count = chunks_patched;
-    stats.candidate_pairs = fixture.colliders.rowCount();
+    stats.candidate_pairs = static_colliders_test_support.liveRowCount(fixture.colliders);
     stats.items_per_second = suite.itemsPerSecond(change_count, stats.mean_ns);
     stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.plan_batch);

@@ -308,7 +308,7 @@ pub const PathfindingSystem = struct {
             self.count += amount;
             if (self.logged) return;
             self.logged = true;
-            if (comptime logging.enabled(level) and !builtin.is_test) @field(logging.game, @tagName(level))(format, args);
+            if (comptime logging.enabled(level)) @field(logging.game, @tagName(level))(format, args);
         }
     };
 
@@ -5258,7 +5258,7 @@ test "an elastic grow and shrink keep cached paths and registrations, and a rena
     try expectRegistryMatchesCache(&system);
     // The last route's owner sits past the floor's 32 entries.
     const moved_key = registryRouteKey(&system, 37, 24);
-    const owner_before = system.completed.core.ownerOf(moved_key).?;
+    const owner_before = test_support.cacheOwnerOf(system.completed.core, moved_key).?;
     try std.testing.expect(owner_before >= 32);
     var cells: std.ArrayList(u32) = .empty;
     defer cells.deinit(std.testing.allocator);
@@ -5268,7 +5268,7 @@ test "an elastic grow and shrink keep cached paths and registrations, and a rena
     defer empty.deinit();
     for (0..system.capacity.capacity_shrink_window) |_| _ = try updatePathfindingInline(&system, &empty, 1, .{});
     try std.testing.expectEqual(@as(usize, 32), system.completed.logicalCapacity());
-    const owner_after = system.completed.core.ownerOf(moved_key).?;
+    const owner_after = test_support.cacheOwnerOf(system.completed.core, moved_key).?;
     try std.testing.expect(owner_after < 32);
     try std.testing.expectEqualSlices(u32, cells.items, storedPath(&system, owner_after).cells);
     try expectRegistryMatchesCache(&system);

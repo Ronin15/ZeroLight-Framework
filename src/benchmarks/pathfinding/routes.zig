@@ -15,7 +15,7 @@ const RangeOutputStream = @import("../../game/simulation.zig").RangeOutputStream
 const PathfindingCapacity = @import("../../game/systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("../../game/systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("../../game/systems/pathfinding.zig").PathfindingSystem;
-const NavGraph = @import("../../game/systems/pathfinding/nav_graph.zig").NavGraph;
+const pathfinding_test_support = @import("../../game/systems/pathfinding/test_support.zig");
 const pathfinding_range_alignment_items = @import("../../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const default_tier1_abstract_node_cap = @import("../../game/systems/pathfinding/types.zig").default_tier1_abstract_node_cap;
 const refLevel = @import("../../game/systems/pathfinding/types.zig").refLevel;
@@ -321,7 +321,7 @@ fn runLevelSizeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     }
     try writeLevelZeroCells(&open, wall[0..wall_len], open.blocking);
     // The built world's content sizes the nav.
-    size_config.content = NavGraph.storageContentOf(&open.world);
+    size_config.content = pathfinding_test_support.navStorageContentOf(&open.world);
     try nav_size.checkNavSize(level_size_group.name, item_count, case, size_config);
 
     // An 8x8 block of starts left of the wall and their goals mirrored right of it,
@@ -453,7 +453,7 @@ fn runCrossLevelCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     }
 
     // The built world's content and links size the nav.
-    size_config.content = NavGraph.storageContentOf(&open.world);
+    size_config.content = pathfinding_test_support.navStorageContentOf(&open.world);
     try nav_size.checkNavSize(group_name, item_count, case, size_config);
 
     // Starts in an 8x8 block at the level-0 center, goals in an 8x8 block below it on
@@ -530,7 +530,7 @@ fn runCrossLevelShaftCase(allocator: std.mem.Allocator, io: std.Io, options: sui
         .bidirectional = false,
     });
     // The built world's content and links size the nav.
-    size_config.content = NavGraph.storageContentOf(&open.world);
+    size_config.content = pathfinding_test_support.navStorageContentOf(&open.world);
     try nav_size.checkNavSize(cross_level_shaft_group.name, item_count, case, size_config);
 
     var requests: [route_request_count]PathRequest = undefined;
@@ -1359,7 +1359,7 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         .agent_budget = agent_count,
         .group_fields = 1,
         .batch = nav_size.NavBatch.none,
-        .content = NavGraph.storageContentOf(&open.world),
+        .content = pathfinding_test_support.navStorageContentOf(&open.world),
         .tier1_abstract_nodes = if (config.variant == .probe) long_path_probe_nodes else default_tier1_abstract_node_cap,
     };
     try nav_size.checkNavSize(long_path_group.name, item_count, case, size_config);
@@ -1464,7 +1464,7 @@ fn addBorderTeleports(world: *WorldSystem, side: u16, deepest: u16, count: usize
 fn levelChunkIndex(world: *const WorldSystem, cell: CellCoord) usize {
     const chunk = world.chunkCoordForCell(cell.x, cell.y);
     // In range: chunk coordinates of an in-world cell are non-negative.
-    return @as(usize, @intCast(chunk.y)) * world.chunksX() + @as(usize, @intCast(chunk.x));
+    return @as(usize, @intCast(chunk.y)) * world.chunkGeometry().chunks_x + @as(usize, @intCast(chunk.x));
 }
 
 // Level cells within `teleport_border_band` of the border.
@@ -1708,8 +1708,8 @@ fn initLinkFoldFixture(allocator: std.mem.Allocator, io: std.Io, random: std.Ran
 // `deepest`, each pad between random cells of the two. Fails when a pad's span falls under
 // `random_pad_min_span`, so a pad never reads as a short link.
 fn addProbePads(world: *WorldSystem, random: std.Random, deepest: u16, first_pair: usize, pairs: usize, per_pair: usize) !void {
-    const chunks_x: usize = world.chunksX();
-    const chunks_y: usize = world.chunksY();
+    const chunks_x: usize = world.chunkGeometry().chunks_x;
+    const chunks_y: usize = world.chunkGeometry().chunks_y;
     const tiles = world.chunk_size_tiles;
     if (first_pair + pairs > chunks_x * chunks_y) return error.LinkFoldProbeTooMany;
     for (first_pair..first_pair + pairs) |pair| {

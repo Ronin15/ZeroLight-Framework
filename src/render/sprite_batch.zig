@@ -299,7 +299,7 @@ const ReservationDrift = if (perf_diagnostics_enabled) struct {
         if (self.frame_grows != 0) return;
         self.frame_grows = 1;
         self.lifetime_grows += 1;
-        if (comptime logging.enabled(.warn) and !builtin.is_test) {
+        if (comptime logging.enabled(.warn)) {
             if (std.math.isPowerOfTwo(self.lifetime_grows))
                 logging.render.warn("sprite commands exceeded the frame reservation ({d} > {d}; {d} frames so far); reserveSpriteCommands bound is short", .{ count, reservation, self.lifetime_grows });
         }
@@ -385,15 +385,6 @@ pub const SpriteBatch = struct {
     /// capacity growth never depends on it.
     pub fn markFrameReserved(self: *SpriteBatch, command_reservation: usize) void {
         self.reservation_drift.markReserved(command_reservation, self.commands.items.len);
-    }
-
-    /// Lifetime diagnostic count of reserved frames whose submits exceeded the frame's
-    /// command reservation (`ReservationDrift`). Tracked only in Debug/ReleaseSafe
-    /// (`runtime_perf_log.enabled`); always 0 in ReleaseFast/ReleaseSmall. Not the perf
-    /// metric: `sprite_command_overflow_grows` records the per-frame
-    /// `SpritePrepStats.command_overflow_grows` (0 or 1) from `finishPrepStats`.
-    pub fn commandOverflowGrows(self: *const SpriteBatch) u64 {
-        return self.reservation_drift.lifetimeGrows();
     }
 
     /// Cold geometric growth of the command list for one more submit (the same policy
@@ -1709,13 +1700,13 @@ test "draw sprite past a reserved frame's capacity grows in order and counts the
     }
     // Drift is counted only where perf diagnostics compile in (never in shipping builds).
     const drift: u64 = @intFromBool(perf_diagnostics_enabled);
-    try std.testing.expectEqual(drift, batch.commandOverflowGrows());
+    try std.testing.expectEqual(drift, batch.reservation_drift.lifetimeGrows());
     try std.testing.expectEqual(@as(usize, @intCast(drift)), batch.finishPrepStats(.{}).command_overflow_grows);
 
     // The per-frame share resets; the lifetime count stays.
     batch.beginFrame();
     try std.testing.expectEqual(@as(usize, 0), batch.finishPrepStats(.{}).command_overflow_grows);
-    try std.testing.expectEqual(drift, batch.commandOverflowGrows());
+    try std.testing.expectEqual(drift, batch.reservation_drift.lifetimeGrows());
 }
 
 test "submits past the reservation are drift even inside the physical slack" {
@@ -1728,7 +1719,7 @@ test "submits past the reservation are drift even inside the physical slack" {
 
     batch.markFrameReserved(reservation);
     for (0..reservation) |i| try batch.drawSprite(try testOrderedSprite(i));
-    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(u64, 0), batch.reservation_drift.lifetimeGrows());
 
     // Past the reservation, well inside the physical capacity: no growth, still drift.
     // Counted once for the frame however far it overshoots, and re-marking the frame at
@@ -1736,14 +1727,14 @@ test "submits past the reservation are drift even inside the physical slack" {
     for (reservation..reservation + 3) |i| try batch.drawSprite(try testOrderedSprite(i));
     batch.markFrameReserved(reservation);
     try std.testing.expectEqual(capacity, batch.commands.capacity);
-    try std.testing.expectEqual(@as(u64, 1), batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(u64, 1), batch.reservation_drift.lifetimeGrows());
     try std.testing.expectEqual(@as(usize, 1), batch.finishPrepStats(.{}).command_overflow_grows);
 
     // Every drifting frame counts.
     batch.beginFrame();
     batch.markFrameReserved(reservation);
     for (0..reservation + 1) |i| try batch.drawSprite(try testOrderedSprite(i));
-    try std.testing.expectEqual(@as(u64, 2), batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(u64, 2), batch.reservation_drift.lifetimeGrows());
 }
 
 test "marking a frame reserved below its submitted count counts the drift" {
@@ -1752,12 +1743,12 @@ test "marking a frame reserved below its submitted count counts the drift" {
     defer batch.deinit();
     try batch.reserveStorage(16, 16 * 6, 16);
     for (0..5) |i| try batch.drawSprite(try testOrderedSprite(i));
-    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(u64, 0), batch.reservation_drift.lifetimeGrows());
 
     batch.markFrameReserved(4);
-    try std.testing.expectEqual(@as(u64, 1), batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(u64, 1), batch.reservation_drift.lifetimeGrows());
     try batch.drawSprite(try testOrderedSprite(5));
-    try std.testing.expectEqual(@as(u64, 1), batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(u64, 1), batch.reservation_drift.lifetimeGrows());
 }
 
 test "draw sprite growth OOM leaves the reserved stream unchanged" {
@@ -1773,7 +1764,7 @@ test "draw sprite growth OOM leaves the reserved stream unchanged" {
     try std.testing.expectError(error.OutOfMemory, batch.drawSprite(try testOrderedSprite(capacity)));
     try std.testing.expectEqual(capacity, batch.commands.items.len);
     try std.testing.expectEqual(capacity, batch.commands.capacity);
-    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(u64, 0), batch.reservation_drift.lifetimeGrows());
 }
 
 test "draw sprite growth outside a reserved frame is not counted" {
@@ -1783,5 +1774,5 @@ test "draw sprite growth outside a reserved frame is not counted" {
     try batch.drawSprite(try testOrderedSprite(0));
 
     try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
-    try std.testing.expectEqual(@as(u64, 0), batch.commandOverflowGrows());
+    try std.testing.expectEqual(@as(u64, 0), batch.reservation_drift.lifetimeGrows());
 }

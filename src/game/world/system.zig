@@ -311,10 +311,7 @@ pub const WorldSystem = struct {
         bounds_height: f32,
     ) !WorldSystem {
         const meta = runtime_assets.worldTilesetMeta() orelse return error.WorldTilesetMetadataUnavailable;
-        var world = try initDemoFromMeta(allocator, meta, bounds_width, bounds_height);
-        errdefer world.deinit();
-        try world.addUndergroundLevels(meta);
-        return world;
+        return initDemoFromMetaWithUnderground(allocator, meta, bounds_width, bounds_height);
     }
 
     pub fn initProcedural(
@@ -561,23 +558,9 @@ pub const WorldSystem = struct {
     pub const groupDenseCellWrites = world_edit.groupDenseCellWrites;
     pub const reserveDenseCellWrites = world_edit.reserveDenseCellWrites;
 
-    pub fn denseLayerCount(self: *const WorldSystem) usize {
-        return self.dense_layers.len;
-    }
-
     /// The level a dense layer is a band of.
     pub fn denseLayerLevel(self: *const WorldSystem, layer_index: usize) u16 {
         return self.dense_layers.items(.level_index)[layer_index];
-    }
-
-    /// Tile-cell coordinate of a sparse tile, decoded from its stored cell index. A
-    /// sparse index is valid only until the next sparse tile removal.
-    pub fn sparseTileCellCoord(self: *const WorldSystem, index: usize) CellCoord {
-        const cell = self.sparse_tiles.items(.cell_index)[index];
-        return .{
-            .x = @intCast(cell % self.width),
-            .y = @intCast(cell / self.width),
-        };
     }
 
     pub fn levelCount(self: *const WorldSystem) usize {
@@ -794,16 +777,6 @@ pub const WorldSystem = struct {
 
     pub fn levelLinks(self: *const WorldSystem) []const LevelLink {
         return self.level_links.items;
-    }
-
-    pub fn sparseTileCount(self: *const WorldSystem) usize {
-        return self.sparse_tiles.len;
-    }
-
-    /// A sparse index is valid only until the next sparse tile removal.
-    pub fn sparseTileBlocksMovement(self: *const WorldSystem, index: usize) bool {
-        if (index >= self.sparse_tiles.len) return false;
-        return self.sparse_tiles.items(.flags)[index].blocks_movement;
     }
 
     pub fn cellRect(self: *const WorldSystem, x: u16, y: u16) ?Rect {
@@ -1052,17 +1025,6 @@ pub const WorldSystem = struct {
         const min: i64 = std.math.minInt(i32);
         const max: i64 = std.math.maxInt(i32);
         return @intCast(@max(min, @min(max, value)));
-    }
-
-    /// Level-local chunk grid width (every level shares one grid). Requires a level.
-    pub fn chunksX(self: *const WorldSystem) u16 {
-        // At most the u16 width.
-        return @intCast(self.chunkGeometry().chunks_x);
-    }
-
-    /// Level-local chunk grid height. See `chunksX`.
-    pub fn chunksY(self: *const WorldSystem) u16 {
-        return @intCast(self.chunkGeometry().chunks_y);
     }
 
     /// Chunks per level, the length of every per-level chunk directory. Requires a level.
@@ -2130,7 +2092,7 @@ test "a blocking dense layer add and procedural fills advance the level's conten
         var world = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, config, &threads);
         defer world.deinit();
         var blocking_sparse = false;
-        for (0..world.sparseTileCount()) |index| blocking_sparse = blocking_sparse or world.sparseTileBlocksMovement(index);
+        for (0..world.sparse_tiles.len) |index| blocking_sparse = blocking_sparse or world.sparse_tiles.items(.flags)[index].blocks_movement;
         seen_blocking_sparse[@intFromBool(blocking_sparse)] = true;
         try std.testing.expectEqual(@as(u32, 1) + @intFromBool(blocking_sparse), world.level_terrain.items[0].content_revision);
     }

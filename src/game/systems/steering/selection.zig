@@ -41,7 +41,7 @@ pub fn selectIntents(
     data: *const DataSystem,
     agent_count: usize,
     intents: []const NavigationIntent,
-    threads: ?StageThreads,
+    threads: StageThreads,
     stats: *SteeringStats,
 ) void {
     const intent_count = intents.len;

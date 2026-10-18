@@ -55,6 +55,7 @@ const steering_range_alignment_items = @import("../game/systems/steering/system.
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
+const static_colliders_test_support = @import("../game/systems/static_colliders_test_support.zig");
 
 pub const group = suite.BenchmarkGroup{
     .name = "steering",
@@ -531,7 +532,7 @@ fn createStaticChangeFixture(allocator: std.mem.Allocator, static_count: usize) 
     try pathfinding.rebuildStaticNavGrid(&data, nav_width, nav_height, nav_cell_size);
     var colliders = try buildColliders(allocator, &data, &pathfinding, nav_width, nav_height);
     errdefer colliders.deinit();
-    if (colliders.rowCount() != static_count) return error.WrongStaticCount;
+    if (static_colliders_test_support.liveRowCount(colliders) != static_count) return error.WrongStaticCount;
 
     return .{
         .steering = .{ .data = data, .frame = frame, .pathfinding = pathfinding, .colliders = colliders, .agents = agents },
@@ -691,7 +692,7 @@ fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usi
     var colliders = try buildColliders(allocator, &data, &pathfinding, nav_extent, nav_extent);
     errdefer colliders.deinit();
     if (layout == .churned) try churnStatics(allocator, &data, &colliders, statics, positions, prng.random());
-    if (colliders.rowCount() != chunk_count * statics_per_chunk) return error.WrongStaticCount;
+    if (static_colliders_test_support.liveRowCount(colliders) != chunk_count * statics_per_chunk) return error.WrongStaticCount;
     try pathfinding.rebuildStaticNavGrid(&data, nav_extent, nav_extent, nav_cell_size);
 
     return .{ .steering = .{
@@ -728,7 +729,7 @@ fn churnStatics(
 
     for (commands, churned) |*command, index| command.* = .{ .destroy_entity = statics[index] };
     try churnCommit(&frame, data, colliders, commands);
-    if (colliders.rowCount() != statics.len - churned.len) return error.StaticDestroysMissing;
+    if (static_colliders_test_support.liveRowCount(colliders) != statics.len - churned.len) return error.StaticDestroysMissing;
 
     for (commands, churned) |*command, index| command.* = .{ .create_entity = .{
         .movement_body = .{ .position = positions[index], .previous_position = positions[index], .velocity = .{}, .speed = 0 },

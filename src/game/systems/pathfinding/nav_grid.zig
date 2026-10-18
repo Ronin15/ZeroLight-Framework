@@ -211,14 +211,6 @@ pub const NavGrid = struct {
         return if (entry == open_entry or entry == blocked_entry) null else entry;
     }
 
-    pub fn chunkForm(self: *const NavGrid, chunk: u32) ChunkForm {
-        return switch (self.dir.items[chunk]) {
-            open_entry => .open,
-            blocked_entry => .blocked,
-            else => .mixed,
-        };
-    }
-
     /// Blocked cells of `chunk`.
     pub fn chunkBlockedCount(self: *const NavGrid, chunk: u32) u32 {
         return switch (self.dir.items[chunk]) {
@@ -945,8 +937,8 @@ test "OPEN and BLOCKED chunks hold no cell block after edits elsewhere on their 
     try system.reserve(test_support.abstractCapacity());
     try system.rebuildStaticNavGridWithWorld(&data, &world, null);
     const grid = system.graph.grid(0).?;
-    try std.testing.expectEqual(ChunkForm.blocked, grid.chunkForm(8));
-    try std.testing.expectEqual(ChunkForm.mixed, grid.chunkForm(4));
+    try std.testing.expectEqual(ChunkForm.blocked, test_support.navChunkForm(grid, 8));
+    try std.testing.expectEqual(ChunkForm.mixed, test_support.navChunkForm(grid, 4));
     try expectBlocksOnlyInMixedChunks(grid, &world);
 
     // Clear the mixed cell and dig into the blocked chunk: chunk (1,1) gives its block back
@@ -954,8 +946,8 @@ test "OPEN and BLOCKED chunks hold no cell block after edits elsewhere on their 
     _ = try world.setDenseTile(obstacle, 5, 5, grass);
     _ = try world.setDenseTile(obstacle, 9, 9, grass);
     _ = try test_support.applyTileEdits(&system, &test_support.no_colliders, &world, &.{ .{ .level = 0, .x = 5, .y = 5 }, .{ .level = 0, .x = 9, .y = 9 } });
-    try std.testing.expectEqual(ChunkForm.mixed, grid.chunkForm(8));
-    try std.testing.expect(grid.chunkForm(4) != .mixed);
+    try std.testing.expectEqual(ChunkForm.mixed, test_support.navChunkForm(grid, 8));
+    try std.testing.expect(test_support.navChunkForm(grid, 4) != .mixed);
     try expectBlocksOnlyInMixedChunks(grid, &world);
 }
 
@@ -966,7 +958,7 @@ fn expectBlocksOnlyInMixedChunks(grid: *const NavGrid, world: *const WorldSystem
     for (0..grid.dir.items.len) |chunk_index| {
         const chunk: u32 = @intCast(chunk_index);
         const form = world.levelChunkBlockedForm(grid.level, chunk);
-        try std.testing.expectEqual(form, grid.chunkForm(chunk));
+        try std.testing.expectEqual(form, test_support.navChunkForm(grid, chunk));
         try std.testing.expectEqual(form == .mixed, grid.chunkBlock(chunk) != null);
         if (form == .mixed) mixed += 1;
     }

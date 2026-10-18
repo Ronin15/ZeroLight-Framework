@@ -111,10 +111,6 @@ pub const WorldLevelStore = struct {
         return self.rows.slice().items(.level)[index];
     }
 
-    pub fn levelPtr(self: *WorldLevelStore, index: usize) *u16 {
-        return &self.rows.slice().items(.level)[index];
-    }
-
     pub fn removeAt(self: *WorldLevelStore, index: usize) ?EntityId {
         const s = self.rows.slice();
         const last = self.rows.len - 1;

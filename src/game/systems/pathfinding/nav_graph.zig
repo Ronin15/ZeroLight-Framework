@@ -9,7 +9,6 @@
 //! the same batch over fresh storage.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
 const logging = @import("../../../core/logging.zig");
 const pdqSort = @import("../../../core/sort.zig").pdq;
@@ -1014,7 +1013,7 @@ pub const NavGraph = struct {
         batch_mark_chunks: usize = std.math.maxInt(usize),
         batch_links: usize = std.math.maxInt(usize),
         batch_keys: usize = std.math.maxInt(usize),
-        /// The world's chunk forms and link endpoints before the build (`storageContentOf`);
+        /// The world's chunk forms and link endpoints before the build;
         /// null charges every chunk mixed and `2 * links` endpoints wherever they fit.
         content: ?StorageContent = null,
     };
@@ -1031,35 +1030,6 @@ pub const NavGraph = struct {
         endpoint_chunks: usize = 0,
         max_chunk_endpoints: usize = 0,
     };
-
-    /// `StorageContent` of `world` from its composed chunk forms and link endpoint counts,
-    /// for a nav whose chunks are the world's: O(levels x chunks). Static colliders are not
-    /// counted; a nav over static bodies needs their chunks counted mixed.
-    pub fn storageContentOf(world: *const WorldSystem) StorageContent {
-        var content = StorageContent{};
-        const chunks = world.chunkCountPerLevel();
-        for (0..world.levelCount()) |level_index| {
-            const level: u16 = @intCast(level_index);
-            var open: usize = 0;
-            var mixed: usize = 0;
-            for (0..chunks) |chunk_index| {
-                const chunk: u32 = @intCast(chunk_index);
-                switch (world.levelChunkBlockedForm(level, chunk)) {
-                    .open => open += 1,
-                    .mixed => mixed += 1,
-                    .blocked => {},
-                }
-                const endpoints = world.levelChunkLinkEndpointCount(level, chunk);
-                content.endpoint_chunks += @intFromBool(endpoints != 0);
-                content.max_chunk_endpoints = @max(content.max_chunk_endpoints, endpoints);
-            }
-            content.open_chunks += open;
-            content.mixed_chunks += mixed;
-            content.max_level_open = @max(content.max_level_open, open);
-            content.max_level_mixed = @max(content.max_level_mixed, mixed);
-        }
-        return content;
-    }
 
     /// An over-estimate of `residentBytes` for `shape`: the grids' blocks for the mixed
     /// chunks; a record per open or mixed chunk and per chunk holding a link endpoint, each
@@ -1207,7 +1177,7 @@ pub const NavGraph = struct {
         fresh.land_deferral_logged = self.land_deferral_logged;
         self.deinit();
         self.* = fresh;
-        if (comptime logging.enabled(.info) and !builtin.is_test)
+        if (comptime logging.enabled(.info))
             logging.game.info("nav built: {} levels, {} resident bytes", .{ self.levels.items.len, self.residentBytes() });
         return stats;
     }
@@ -1508,7 +1478,7 @@ pub const NavGraph = struct {
             self.land_deferrals += 1;
             if (self.land_deferral_logged) return;
             self.land_deferral_logged = true;
-            if (comptime logging.enabled(.warn) and !builtin.is_test)
+            if (comptime logging.enabled(.warn))
                 logging.game.warn("nav closure landing deferred: out of memory; the next nav batch retries it", .{});
         };
     }
@@ -1516,7 +1486,7 @@ pub const NavGraph = struct {
     fn logPoolGrowth(self: *NavGraph) void {
         if (self.pool_grows == 0 or self.pool_growth_logged) return;
         self.pool_growth_logged = true;
-        if (comptime logging.enabled(.info) and !builtin.is_test)
+        if (comptime logging.enabled(.info))
             logging.game.info("nav storage grew ({} growths so far)", .{self.pool_grows});
     }
 
@@ -2153,7 +2123,7 @@ fn levelsEquivalent(a: *const NavGraph, b: *const NavGraph, level: u16) bool {
     if (ga.dir.items.len != gb.dir.items.len) return false;
     for (0..ga.dir.items.len) |chunk_index| {
         const chunk: u32 = @intCast(chunk_index);
-        if (ga.chunkForm(chunk) != gb.chunkForm(chunk)) return false;
+        if (test_support.navChunkForm(ga, chunk) != test_support.navChunkForm(gb, chunk)) return false;
         const slot_a = ga.chunkBlock(chunk) orelse continue;
         const slot_b = gb.chunkBlock(chunk).?;
         if (!std.mem.eql(u64, &ga.block_bits[slot_a], &gb.block_bits[slot_b])) return false;
@@ -2207,6 +2177,8 @@ fn fullRebuild(data: *const DataSystem, world: *const WorldSystem, capacity: typ
     try system.rebuildStaticNavGridWithWorld(data, world, null);
     return system;
 }
+
+const static_colliders_test_support = @import("../static_colliders_test_support.zig");
 
 test "incremental nav update remask matches the composed world mask across levels" {
     var data = DataSystem.init(std.testing.allocator);
@@ -2979,7 +2951,7 @@ test "a static obstacle move costs the same at 10 and 10k statics" {
         }
         var nav = try staticNav(&meta, 4096, statics.items, abstractCapacity());
         defer nav.deinit();
-        try std.testing.expectEqual(other_count + 1, nav.colliders.rowCount());
+        try std.testing.expectEqual(other_count + 1, static_colliders_test_support.liveRowCount(nav.colliders));
         const moved = nav.data.movementBodySliceConst().entities[0];
         const stats = try nav.commitAndReact(&.{moveCommand(moved, .{ .x = 196, .y = 196 })}, null);
         patched[run] = stats.chunks_patched;
@@ -3202,7 +3174,7 @@ test "a nav whose every chunk is mixed, with links in separate chunks, stays wit
     try system.rebuildNavFromColliders(&colliders, PathfindingSystem.worldNavExtent(&world), null);
     const graph = &system.graph;
     // The world's content: every chunk mixed, each link end alone in its chunk.
-    const content = NavGraph.storageContentOf(&world);
+    const content = test_support.navStorageContentOf(&world);
     try std.testing.expectEqual(graph.chunkCount(), content.mixed_chunks);
     try std.testing.expectEqual(@as(usize, 0), content.open_chunks);
     try std.testing.expectEqual(@as(usize, 2 * links), content.endpoint_chunks);
@@ -3258,7 +3230,7 @@ test "a nav over open and blocked levels is charged by the world's content and s
     _ = try world.setDenseTile(obstacle, 1, 1, tree);
     const lower = try world.addLevel(-32);
     const lower_floor = try world.addDenseLayer(lower, 0, .floor, dirt);
-    const content = NavGraph.storageContentOf(&world);
+    const content = test_support.navStorageContentOf(&world);
     const chunks = world.chunkCountPerLevel();
     try std.testing.expect(content.mixed_chunks >= 1);
     // Only level 0 holds open or mixed chunks.
@@ -3435,7 +3407,8 @@ fn denseWriterStep(system: *PathfindingSystem, world: *WorldSystem, frame: *Simu
     try events.ensureTotalCapacity(std.testing.allocator, write_count);
     try world.applyDenseCellWrites(chunks, null, events);
     frame.beginStep();
-    try frame.publishWorldTileChanges(events.items);
+    try frame.events.ensureEventAppendCapacity(events.items.len);
+    frame.publishWorldTileChangesAssumeCapacity(events.items);
     system.recordTerrainNavEvents(frame.events.mergedItems(), world, null);
 }
 
@@ -3499,7 +3472,7 @@ test "one chunk's change leaves every other chunk's record, connectivity nodes, 
     var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
     defer system.deinit();
     const closure = &system.graph.connectivity.closure;
-    try std.testing.expectEqual(@as(usize, 2), closure.termCount());
+    try std.testing.expectEqual(@as(usize, 2), test_support.closureTermCount(closure));
     const closure_words_before = try test_support.dupeClosureBlocks(std.testing.allocator, &system.graph);
     defer std.testing.allocator.free(closure_words_before);
     const term_index_before = try std.testing.allocator.dupe(u32, closure.term.index);
@@ -4092,7 +4065,7 @@ test "the remask changed mask equals old XOR new bits per changed key across ope
     try test_support.recordTileChange(&system, &fixture.world, mixed);
     try test_support.recordTileEdits(&system, &fixture.world, &.{.{ .level = 1, .x = 9, .y = 9 }});
     try std.testing.expectEqual(@as(usize, 2), try expectChangedMasksAreFlips(&system, &fixture.world));
-    try std.testing.expect(system.graph.grid(0).?.chunkForm(0) == .blocked);
+    try std.testing.expect(test_support.navChunkForm(system.graph.grid(0).?, 0) == .blocked);
 
     // Level 0 chunk (0, 0) blocked -> mixed; level 1 chunk (1, 1) mixed -> blocked.
     const opened = (try fixture.world.setDenseTile(fixture.obstacle[0], 1, 1, fixture.grass)).?;
@@ -4103,8 +4076,8 @@ test "the remask changed mask equals old XOR new bits per changed key across ope
         try test_support.recordTileChange(&system, &fixture.world, changed);
     };
     try std.testing.expectEqual(@as(usize, 2), try expectChangedMasksAreFlips(&system, &fixture.world));
-    try std.testing.expect(system.graph.grid(0).?.chunkForm(0) == .mixed);
-    try std.testing.expect(system.graph.grid(1).?.chunkForm(4) == .blocked);
+    try std.testing.expect(test_support.navChunkForm(system.graph.grid(0).?, 0) == .mixed);
+    try std.testing.expect(test_support.navChunkForm(system.graph.grid(1).?, 4) == .blocked);
 }
 
 test "a world build folds its authored links into the link bounds" {

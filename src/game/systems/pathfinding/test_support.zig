@@ -23,6 +23,7 @@ const WorldSystem = @import("../../world/system.zig").WorldSystem;
 const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
 const NavExtent = @import("nav_graph.zig").NavExtent;
 const NavGrid = @import("nav_grid.zig").NavGrid;
+const ChunkForm = @import("../../world/terrain.zig").ChunkForm;
 const ChunkBits = @import("../../world/terrain.zig").ChunkBits;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
@@ -59,6 +60,51 @@ const registry_shard_count = @import("types.zig").registry_shard_count;
 const registryShard = @import("types.zig").registryShard;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
 const no_entry = @import("../chunk_list_map.zig").no_entry;
+
+/// `NavGraph.StorageContent` of `world` from its composed chunk forms and link endpoint counts,
+/// for a nav whose chunks are the world's: O(levels x chunks). Static colliders are not
+/// counted; a nav over static bodies needs their chunks counted mixed.
+pub fn navStorageContentOf(world: *const WorldSystem) NavGraph.StorageContent {
+    var content = NavGraph.StorageContent{};
+    const chunks = world.chunkCountPerLevel();
+    for (0..world.levelCount()) |level_index| {
+        const level: u16 = @intCast(level_index);
+        var open: usize = 0;
+        var mixed: usize = 0;
+        for (0..chunks) |chunk_index| {
+            const chunk: u32 = @intCast(chunk_index);
+            switch (world.levelChunkBlockedForm(level, chunk)) {
+                .open => open += 1,
+                .mixed => mixed += 1,
+                .blocked => {},
+            }
+            const endpoints = world.levelChunkLinkEndpointCount(level, chunk);
+            content.endpoint_chunks += @intFromBool(endpoints != 0);
+            content.max_chunk_endpoints = @max(content.max_chunk_endpoints, endpoints);
+        }
+        content.open_chunks += open;
+        content.mixed_chunks += mixed;
+        content.max_level_open = @max(content.max_level_open, open);
+        content.max_level_mixed = @max(content.max_level_mixed, mixed);
+    }
+    return content;
+}
+
+/// The owner id of `key`'s entry in a cache core (a core or a pointer to one), or null.
+pub fn cacheOwnerOf(core: anytype, key: PathQueryKey) ?u32 {
+    const index = core.slotIndex(key) orelse return null;
+    return core.slots.items[index].payload_index;
+}
+
+/// Live terminals of a connectivity closure (a `Closure` or a pointer to one).
+pub fn closureTermCount(closure: anytype) usize {
+    return closure.terms.len - closure.term_free.items.len;
+}
+
+/// Live H-components of a connectivity closure (a `Closure` or a pointer to one).
+pub fn closureHcompCount(closure: anytype) usize {
+    return closure.hcomps.len - closure.hcomp_free.items.len;
+}
 
 pub fn addNavBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, static: bool) !EntityId {
     const entity = try data.createEntity();
@@ -247,6 +293,13 @@ pub fn cellOfLocal(geometry: ChunkGeometry, chunk: u32, local: u8) u32 {
     const mask: usize = geometry.chunk_tiles - 1;
     // Cells of a validated grid are below 2^32.
     return @intCast((bounds.y0 + (@as(usize, local) >> geometry.shift)) * geometry.width + bounds.x0 + (local & mask));
+}
+
+/// `grid`'s form at `chunk`: mixed when it holds a cell block, else open or blocked by its
+/// blocked count.
+pub fn navChunkForm(grid: *const NavGrid, chunk: u32) ChunkForm {
+    if (grid.chunkBlock(chunk) != null) return .mixed;
+    return if (grid.chunkBlockedCount(chunk) == 0) .open else .blocked;
 }
 
 /// Mixed chunks of `grid` holding a cell block.
@@ -587,7 +640,7 @@ pub fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem
         try t.expectEqual(@as(u32, @intCast(root)), closure.term.root[term]);
         try terminals.append(allocator, @intCast(root));
     }
-    try t.expectEqual(terminals.items.len, closure.termCount());
+    try t.expectEqual(terminals.items.len, closureTermCount(closure));
     // Components: maps, free lists, zero rows and columns, links, words.
     var live_words: usize = 0;
     var listed_links: usize = 0;
@@ -697,7 +750,7 @@ pub fn dupeClosureBlocks(allocator: std.mem.Allocator, graph: *const NavGraph) !
 pub fn expectSameClosure(a: *const NavGraph, b: *const NavGraph) !void {
     const t = std.testing;
     const allocator = t.allocator;
-    try t.expectEqual(a.connectivity.closure.termCount(), b.connectivity.closure.termCount());
+    try t.expectEqual(closureTermCount(a.connectivity.closure), closureTermCount(b.connectivity.closure));
     // Per terminal of `a`: the terminal of `b` at one of its root's nodes.
     var pairs: std.ArrayList([2]u32) = .empty;
     defer pairs.deinit(allocator);

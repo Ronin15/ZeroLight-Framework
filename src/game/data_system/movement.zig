@@ -248,13 +248,9 @@ pub const MovementBodyStore = struct {
 
 test "simd range helpers cover movement body vector and scalar tail counts" {
     try std.testing.expectEqual(@as(usize, 0), simd.vectorizedEnd(@as(usize, 0)));
-    try std.testing.expectEqual(@as(usize, 0), simd.tailLen(@as(usize, 0)));
     try std.testing.expectEqual(@as(usize, 0), simd.vectorizedEnd(simd.lane_count - 1));
-    try std.testing.expectEqual(@as(usize, simd.lane_count - 1), simd.tailLen(simd.lane_count - 1));
     try std.testing.expectEqual(@as(usize, simd.lane_count), simd.vectorizedEnd(simd.lane_count));
-    try std.testing.expectEqual(@as(usize, 0), simd.tailLen(simd.lane_count));
     try std.testing.expectEqual(@as(usize, simd.lane_count * 2), simd.vectorizedEnd(simd.lane_count * 2 + 1));
-    try std.testing.expectEqual(@as(usize, 1), simd.tailLen(simd.lane_count * 2 + 1));
 }
 
 test "MovementBodyStore append is allocation-free after ensureCapacity reserves" {

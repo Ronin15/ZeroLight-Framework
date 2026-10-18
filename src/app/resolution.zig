@@ -66,11 +66,6 @@ pub const Presentation = struct {
     viewport: Viewport,
 };
 
-pub const Point = struct {
-    x: f32,
-    y: f32,
-};
-
 pub fn computePresentation(
     policy: ResolutionPolicy,
     window_size: WindowSize,
@@ -95,36 +90,6 @@ pub fn computeViewport(policy: ResolutionPolicy, drawable_size: DrawableSize) !V
         .integer_fit => scaledViewport(policy.logical_size, drawable_size, integerFitScale(policy.logical_size, drawable_size), false),
         .overscan => scaledViewport(policy.logical_size, drawable_size, overscanScale(policy.logical_size, drawable_size), false),
     };
-}
-
-pub fn windowToDrawable(point: Point, window_size: WindowSize, drawable_size: DrawableSize) !Point {
-    try window_size.validate();
-    try drawable_size.validate();
-
-    return .{
-        .x = point.x * (@as(f32, @floatFromInt(drawable_size.width)) / @as(f32, @floatFromInt(window_size.width))),
-        .y = point.y * (@as(f32, @floatFromInt(drawable_size.height)) / @as(f32, @floatFromInt(window_size.height))),
-    };
-}
-
-pub fn drawableToLogical(point: Point, policy: ResolutionPolicy, drawable_size: DrawableSize) !?Point {
-    const viewport = try computeViewport(policy, drawable_size);
-    if (!pointInViewport(point, viewport)) return null;
-
-    return .{
-        .x = (point.x - @as(f32, @floatFromInt(viewport.x))) / viewport.scale_x,
-        .y = (point.y - @as(f32, @floatFromInt(viewport.y))) / viewport.scale_y,
-    };
-}
-
-pub fn windowToLogical(
-    point: Point,
-    policy: ResolutionPolicy,
-    window_size: WindowSize,
-    drawable_size: DrawableSize,
-) !?Point {
-    const drawable_point = try windowToDrawable(point, window_size, drawable_size);
-    return try drawableToLogical(drawable_point, policy, drawable_size);
 }
 
 fn stretchViewport(logical_size: LogicalSize, drawable_size: DrawableSize) Viewport {
@@ -200,14 +165,6 @@ fn centeredOffset(outer: u32, inner: u32) i32 {
     // never make `@intCast` overflow. Normal drawable sizes stay in range.
     const half = @min(@max(@divFloor(difference, 2), std.math.minInt(i32)), std.math.maxInt(i32));
     return @intCast(half);
-}
-
-fn pointInViewport(point: Point, viewport: Viewport) bool {
-    const x = @as(f32, @floatFromInt(viewport.x));
-    const y = @as(f32, @floatFromInt(viewport.y));
-    return point.x >= x and point.y >= y and
-        point.x < x + @as(f32, @floatFromInt(viewport.width)) and
-        point.y < y + @as(f32, @floatFromInt(viewport.height));
 }
 
 test "fit resolution policy computes centered letterbox viewport" {
@@ -287,12 +244,11 @@ test "invalid logical window and drawable sizes are rejected" {
     try std.testing.expectError(error.InvalidWindowSize, computePresentation(.{}, .{ .width = 0, .height = 720 }, .{ .width = 1, .height = 1 }));
 }
 
-test "retina style window maps through drawable pixels into logical coordinates" {
+test "retina style drawable fits the logical size at twice the scale" {
     const policy = ResolutionPolicy{
         .logical_size = .{ .width = 1280, .height = 720 },
         .scale_mode = .fit,
     };
-    const window_size = WindowSize{ .width = 1280, .height = 720 };
     const drawable_size = DrawableSize{ .width = 2560, .height = 1440 };
 
     const viewport = try computeViewport(policy, drawable_size);
@@ -301,26 +257,4 @@ test "retina style window maps through drawable pixels into logical coordinates"
     try std.testing.expectEqual(@as(u32, 2560), viewport.width);
     try std.testing.expectEqual(@as(u32, 1440), viewport.height);
     try std.testing.expectEqual(@as(f32, 2), viewport.scale_x);
-
-    const drawable_point = try windowToDrawable(.{ .x = 640, .y = 360 }, window_size, drawable_size);
-    try std.testing.expectEqual(@as(f32, 1280), drawable_point.x);
-    try std.testing.expectEqual(@as(f32, 720), drawable_point.y);
-
-    const logical_point = (try windowToLogical(.{ .x = 640, .y = 360 }, policy, window_size, drawable_size)).?;
-    try std.testing.expectApproxEqAbs(@as(f32, 640), logical_point.x, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 360), logical_point.y, 0.001);
-}
-
-test "letterbox hits outside the logical viewport are rejected" {
-    const policy = ResolutionPolicy{
-        .logical_size = .{ .width = 1280, .height = 720 },
-        .scale_mode = .fit,
-    };
-    const size = DrawableSize{ .width = 1024, .height = 768 };
-
-    try std.testing.expectEqual(@as(?Point, null), try drawableToLogical(.{ .x = 512, .y = 50 }, policy, size));
-
-    const logical_point = (try drawableToLogical(.{ .x = 512, .y = 384 }, policy, size)).?;
-    try std.testing.expectApproxEqAbs(@as(f32, 640), logical_point.x, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 360), logical_point.y, 0.001);
 }

@@ -236,9 +236,6 @@ comptime {
 /// backward shift (no tombstones under churn) and keeps its slots as columns that
 /// `Reader`s probe lock-free while nothing writes, which std's map exposes neither of.
 pub const ChunkListMap = struct {
-    /// Bytes one pooled entry takes: its key, owner, order, and three links, and its free
-    /// id.
-    pub const bytes_per_entry: usize = @sizeOf(u64) + 5 * @sizeOf(u32) + @sizeOf(u32);
     /// Bytes one table slot takes: its key, head, tail, value, count, and batch touch.
     pub const bytes_per_key_slot: usize = @sizeOf(u64) + 5 * @sizeOf(u32);
 
@@ -361,7 +358,7 @@ pub const ChunkListMap = struct {
         self.grows += 1;
         if (self.growth_logged) return;
         self.growth_logged = true;
-        if (comptime logging.enabled(.info) and !builtin.is_test)
+        if (comptime logging.enabled(.info))
             logging.game.info("{s} storage grew ({} growths so far)", .{ self.name, self.grows });
     }
 

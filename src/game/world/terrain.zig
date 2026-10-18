@@ -237,11 +237,6 @@ pub const DenseLayerStore = struct {
         self.fills.items[entry].changed = false;
     }
 
-    /// Blocks holding cells now (pool size less released blocks).
-    pub fn liveBlockCount(self: *const DenseLayerStore) usize {
-        return self.fills.items.len - self.free.items.len;
-    }
-
     /// Whether writing `new_tile` into `chunk` materializes a block.
     pub fn writeNeedsBlock(self: *const DenseLayerStore, chunk: u32, new_tile: TileId) bool {
         const uniform = self.uniformTile(chunk) orelse return false;
@@ -440,19 +435,6 @@ pub const ChunkBitsStore = struct {
             blocked_entry => true,
             else => |slot| bitIsSet(&self.bits.items[slot], local),
         };
-    }
-
-    /// Blocked cells of a mixed chunk (0 or the cell count for OPEN/BLOCKED).
-    pub fn blockedCount(self: *const ChunkBitsStore, geom: ChunkGeometry, chunk: u32) u32 {
-        return switch (self.dir[chunk]) {
-            open_entry => 0,
-            blocked_entry => geom.extent(chunk).cellCount(),
-            else => |slot| self.counts.items[slot],
-        };
-    }
-
-    pub fn liveSlotCount(self: *const ChunkBitsStore) usize {
-        return self.bits.items.len - self.free.items.len;
     }
 
     /// Whether setting `local` to `value` takes a slot.
@@ -848,6 +830,10 @@ pub const LevelTerrain = struct {
     }
 };
 
+const liveBlockCount = @import("test_support.zig").liveBlockCount;
+const liveSlotCount = @import("test_support.zig").liveSlotCount;
+const chunkBlockedCount = @import("test_support.zig").chunkBlockedCount;
+
 test "chunk geometry maps cells to chunk and local indices with short border chunks" {
     const geom = ChunkGeometry.init(10, 6, 4);
     try std.testing.expectEqual(@as(usize, 6), geom.chunkCount());
@@ -959,16 +945,16 @@ test "chunk bits store returns to OPEN and BLOCKED at the in-level cell count of
     _ = try store.ensureAvailable(allocator, 1);
     store.set(geom, 3, geom.localOf(4, 4), true);
     try std.testing.expectEqual(ChunkForm.blocked, store.form(3));
-    try std.testing.expectEqual(@as(usize, 0), store.liveSlotCount());
+    try std.testing.expectEqual(@as(usize, 0), liveSlotCount(store));
     // Chunk 1 (1 col x 4 rows): fill all four cells, then clear one.
     for (0..4) |row| store.set(geom, 1, geom.localOf(4, @intCast(row)), true);
     try std.testing.expectEqual(ChunkForm.blocked, store.form(1));
     store.set(geom, 1, geom.localOf(4, 2), false);
     try std.testing.expectEqual(ChunkForm.mixed, store.form(1));
-    try std.testing.expectEqual(@as(u32, 3), store.blockedCount(geom, 1));
+    try std.testing.expectEqual(@as(u32, 3), chunkBlockedCount(store, geom, 1));
     store.setChunk(1, false);
     try std.testing.expectEqual(ChunkForm.open, store.form(1));
-    try std.testing.expectEqual(@as(usize, 0), store.liveSlotCount());
+    try std.testing.expectEqual(@as(usize, 0), liveSlotCount(store));
 }
 
 test "a dense block returns to uniform at whichever one tile its in-level cells all hold" {
@@ -985,23 +971,23 @@ test "a dense block returns to uniform at whichever one tile its in-level cells 
         if (x != 3 or y != 3) try std.testing.expectEqual(@as(?TileId, null), store.uniformTile(0));
     };
     try std.testing.expectEqual(@as(?TileId, 7), store.uniformTile(0));
-    try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
+    try std.testing.expectEqual(@as(usize, 0), liveBlockCount(store));
 
     // The border chunk's eight in-level cells decide alone; its out-of-level cells
     // keep the old fill.
     for (0..4) |y| for (4..6) |x| store.write(geom, 1, geom.localOf(@intCast(x), @intCast(y)), 9);
     try std.testing.expectEqual(@as(?TileId, 9), store.uniformTile(1));
-    try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
+    try std.testing.expectEqual(@as(usize, 0), liveBlockCount(store));
 
     // A mixed block stays a block; restoring its one differing cell re-uniforms it.
     store.write(geom, 0, geom.localOf(2, 1), 3);
     try std.testing.expectEqual(@as(?TileId, null), store.readUniformTile(0));
-    try std.testing.expectEqual(@as(usize, 1), store.liveBlockCount());
+    try std.testing.expectEqual(@as(usize, 1), liveBlockCount(store));
     store.write(geom, 0, geom.localOf(2, 1), 7);
     try std.testing.expectEqual(@as(?TileId, 7), store.uniformTile(0));
     // One block was ever taken; each re-uniform released it.
     try std.testing.expectEqual(@as(usize, 1), store.fills.items.len);
-    try std.testing.expectEqual(@as(usize, 0), store.liveBlockCount());
+    try std.testing.expectEqual(@as(usize, 0), liveBlockCount(store));
 }
 
 test "owned-block writes re-uniform exactly like single-cell writes" {
@@ -1066,6 +1052,6 @@ fn expectOwnedWritesMatchSingle(geom: ChunkGeometry, seed: u64) !void {
                 try std.testing.expectEqual(single.tile(geom, x, y), owned.tile(geom, x, y));
             };
         }
-        try std.testing.expectEqual(single.liveBlockCount(), owned.liveBlockCount());
+        try std.testing.expectEqual(liveBlockCount(single), liveBlockCount(owned));
     }
 }

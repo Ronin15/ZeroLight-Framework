@@ -6,7 +6,7 @@
 //! (translate think rows to memory rows, order the member rows ascending, decay, visibility)
 //! plus the main thread's mark, compact, unmark, and event refresh. Every
 //! `ai_memory_event_stride`th AI row (the think rows in `ai-memory-sparse`) gets a synthetic
-//! perceived event each iteration, so `refreshed_count` scales with the think set without the
+//! perceived event each iteration, so the refreshes scale with the think set without the
 //! injection dominating the window.
 //! - `ai-memory`: every agent's memory, the think set in store order. Pass shape: time linear
 //!   in agents; the tuned case within spread of the best control; main's time per processed
@@ -186,13 +186,13 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     const think_count = if (think_set) |rows| rows.len else item_count;
-    std.debug.assert(last_stats.processed_count == think_count);
+    std.debug.assert(system.memory_dense_indices.items.len == think_count);
     std.debug.assert(last_stats.gather_batch.item_count == think_count);
     std.debug.assert(last_stats.batch.item_count == think_count);
     std.debug.assert(last_stats.visible_batch.item_count == think_count);
     std.debug.assert(last_stats.order_batch.item_count == run.touched_words);
-    stats.candidate_pairs = last_stats.processed_count;
-    stats.output_count = last_stats.refreshed_count;
+    stats.candidate_pairs = system.memory_dense_indices.items.len;
+    stats.output_count = fixture.frame.events.stats.entity_perceived;
     stats.splice_batch = suite.batchSummaryFromBatch(last_stats.gather_batch);
     stats.query_splice_batch = suite.batchSummaryFromBatch(last_stats.order_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.visible_batch);

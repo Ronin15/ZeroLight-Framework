@@ -1253,6 +1253,8 @@ fn thinkSetInline(scope: *SimulationScopeSystem, view: *const SpatialIndexView) 
     return (try scope.compactCognition(view, 0, false, &threads, .{})).cognition;
 }
 
+const data_test_support = @import("../data_system/test_support.zig");
+
 test "ai gather rows keep MAL columns compact after gather" {
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -3479,7 +3481,7 @@ test "arbitration graceful degrade to wander when perception/memory/affect are a
     try std.testing.expectEqual(@as(f32, 10), intents[0].goal.x);
     try std.testing.expectEqual(@as(f32, 10), intents[0].goal.y);
     try std.testing.expectEqual(@as(i16, 0), intents[0].priority);
-    try std.testing.expect(data.aiAgentConst(entity).?.active_behavior == .wander);
+    try std.testing.expect(data_test_support.aiAgent(&data, entity).?.active_behavior == .wander);
 }
 
 test "invalid pursue goal writes wander active_behavior so fatigue does not treat it as exertion" {
@@ -3520,7 +3522,7 @@ test "invalid pursue goal writes wander active_behavior so fatigue does not trea
         .perception_slice = data.aiPerceptionSliceConst(),
     });
 
-    const agent = data.aiAgentConst(entity).?;
+    const agent = data_test_support.aiAgent(&data, entity).?;
     try std.testing.expect(agent.active_behavior == .wander);
     try std.testing.expectEqual(@as(u16, 0), agent.commitment_remaining);
 }

@@ -39,7 +39,6 @@ pub const PrimitiveVisual = @import("data_system/types.zig").PrimitiveVisual;
 pub const ConstPrimitiveVisualSlice = @import("data_system/types.zig").ConstPrimitiveVisualSlice;
 pub const AssetReference = @import("data_system/types.zig").AssetReference;
 pub const ConstAssetReferenceSlice = @import("data_system/types.zig").ConstAssetReferenceSlice;
-pub const RenderEntityComponentIndices = @import("data_system/types.zig").RenderEntityComponentIndices;
 pub const RenderCollectIndices = @import("data_system/types.zig").RenderCollectIndices;
 pub const MovementVisualDenseIndices = @import("data_system/types.zig").MovementVisualDenseIndices;
 pub const MovementSteeringDenseIndices = @import("data_system/types.zig").MovementSteeringDenseIndices;

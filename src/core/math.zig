@@ -163,15 +163,6 @@ pub fn sinCos(angle: f32) SinCos {
     return .{ .sin = @sin(angle), .cos = @cos(angle) };
 }
 
-/// Rotates `v` counter-clockwise by a precomputed sin/cos pair:
-/// `(x*cos - y*sin, x*sin + y*cos)`.
-pub fn rotate2D(v: Vec2, angle: SinCos) Vec2 {
-    return .{
-        .x = v.x * angle.cos - v.y * angle.sin,
-        .y = v.x * angle.sin + v.y * angle.cos,
-    };
-}
-
 /// Angle (radians, `[-pi, pi]`) of the vector `(x, y)` measured from +x. The
 /// single project chokepoint for direction -> angle conversion (e.g. baking a
 /// facing vector into a `Sprite.rotation`), so callers never inline the trig.
@@ -360,36 +351,10 @@ test "normalizeOrDefaultFinite falls back on degenerate inputs" {
     try std.testing.expectEqual(default, normalizeOrDefaultFinite(std.math.floatMax(f32), std.math.floatMax(f32), 1.0e-4, default));
 }
 
-test "rotate2D rotates points by a precomputed sin/cos pair" {
-    const quarter = sinCos(std.math.pi / 2.0);
-    const rotated = rotate2D(.{ .x = 1, .y = 0 }, quarter);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), rotated.x, 1.0e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1), rotated.y, 1.0e-6);
-
-    const identity = sinCos(0);
-    const unchanged = rotate2D(.{ .x = 3, .y = -4 }, identity);
-    try std.testing.expectApproxEqAbs(@as(f32, 3), unchanged.x, 1.0e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, -4), unchanged.y, 1.0e-6);
-
-    // Matches the inline formula the sprite quad emitter previously hand-rolled.
-    const angle = sinCos(0.7);
-    const point = Vec2{ .x = 2, .y = 5 };
-    try std.testing.expectApproxEqAbs(
-        point.x * angle.cos - point.y * angle.sin,
-        rotate2D(point, angle).x,
-        1.0e-6,
-    );
-    try std.testing.expectApproxEqAbs(
-        point.x * angle.sin + point.y * angle.cos,
-        rotate2D(point, angle).y,
-        1.0e-6,
-    );
-}
-
-test "atan2 recovers the angle sinCos rotated a +x unit vector by" {
+test "atan2 recovers the angle of a sinCos unit vector" {
     for ([_]f32{ 0, 0.5, 1.2, -0.8, std.math.pi / 2.0, -std.math.pi / 2.0 }) |angle| {
-        const dir = rotate2D(.{ .x = 1, .y = 0 }, sinCos(angle));
-        try std.testing.expectApproxEqAbs(angle, atan2(dir.y, dir.x), 1.0e-6);
+        const dir = sinCos(angle);
+        try std.testing.expectApproxEqAbs(angle, atan2(dir.sin, dir.cos), 1.0e-6);
     }
     try std.testing.expectApproxEqAbs(std.math.pi / 2.0, atan2(1, 0), 1.0e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0), atan2(0, 1), 1.0e-6);

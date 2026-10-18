@@ -419,8 +419,8 @@ fn runCaseImpl(
     stats.candidate_pairs = last_stats.los_checks;
     stats.sample_count = last_stats.sensed_count;
     stats.deferred_count = last_stats.los_blocked;
-    stats.fallback_deferred_count = last_stats.perceived_events + last_stats.lost_events;
-    stats.cache_evictions = last_stats.dropped_events;
+    stats.fallback_deferred_count = events.stats.entity_perceived + events.stats.entity_lost;
+    stats.cache_evictions = events.stats.dropped;
     stats.neighbor_block_fills = last_stats.block_fills;
     stats.splice_batch = suite.batchSummaryFromBatch(last_stats.gather_batch);
     if (case.adaptive) {

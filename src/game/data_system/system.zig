@@ -26,12 +26,10 @@ const ScopeColumnsSlice = types.ScopeColumnsSlice;
 const ConstScopeColumnsSlice = types.ConstScopeColumnsSlice;
 const FacingData = types.FacingData;
 const ConstFacingSlice = types.ConstFacingSlice;
-const ConstFactionSlice = types.ConstFactionSlice;
 const PrimitiveVisual = types.PrimitiveVisual;
 const ConstPrimitiveVisualSlice = types.ConstPrimitiveVisualSlice;
 const AssetReference = types.AssetReference;
 const ConstAssetReferenceSlice = types.ConstAssetReferenceSlice;
-const RenderEntityComponentIndices = types.RenderEntityComponentIndices;
 const BodyLevelFaction = types.BodyLevelFaction;
 const RenderCollectIndices = types.RenderCollectIndices;
 const MovementVisualDenseIndices = types.MovementVisualDenseIndices;
@@ -257,15 +255,6 @@ pub const DataSystem = struct {
         return slot.hasComponents(mask);
     }
 
-    /// Returns simulation-scope metadata for a live entity, read from its dense
-    /// movement-body scope row. Entities without a movement body (and stale/dead/
-    /// invalid IDs) return null — scope metadata exists only for simulated entities.
-    pub fn simulationMetadata(self: *const DataSystem, id: EntityId) ?EntitySimulationMetadata {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const di: usize = slot.movement_body_index orelse return null;
-        return self.movement_bodies.scopeMetadataAt(di);
-    }
-
     /// Writes the full scope metadata for an entity into its dense scope row, keeping the
     /// row's stagger phase when `metadata.stagger_phase` is `keep_stagger_phase`. The level
     /// comes from the entity's `world_level` row when it has one, and a supplied level must
@@ -476,16 +465,6 @@ pub const DataSystem = struct {
         return @intCast(dense_index);
     }
 
-    pub fn renderEntityComponentIndices(self: *const DataSystem, id: EntityId) ?RenderEntityComponentIndices {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const movement_body = slot.movement_body_index orelse return null;
-        return .{
-            .movement_body = @intCast(movement_body),
-            .asset_ref = if (slot.asset_ref_index) |index| @intCast(index) else null,
-            .facing = if (slot.facing_index) |index| @intCast(index) else null,
-        };
-    }
-
     pub fn bodyLevelFaction(self: *const DataSystem, id: EntityId) ?BodyLevelFaction {
         const slot = self.resolveSlotConst(id) orelse return null;
         const movement_body = slot.movement_body_index orelse return null;
@@ -598,12 +577,6 @@ pub const DataSystem = struct {
         return self.primitive_visuals.sliceConst();
     }
 
-    pub fn primitiveVisualDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const dense_index = slot.primitive_visual_index orelse return null;
-        return @intCast(dense_index);
-    }
-
     /// One slot resolve → dense movement + visual row indices for SoA clamp/gate.
     /// Null if the entity is missing either component (or is not alive).
     pub fn movementVisualDenseIndices(self: *const DataSystem, id: EntityId) ?MovementVisualDenseIndices {
@@ -651,12 +624,6 @@ pub const DataSystem = struct {
         slot.addComponent(.asset_reference);
     }
 
-    pub fn assetReferenceConst(self: *const DataSystem, id: EntityId) ?AssetReference {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const dense_index = slot.asset_ref_index orelse return null;
-        return self.asset_refs.get(@intCast(dense_index));
-    }
-
     pub fn assetReferenceSliceConst(self: *const DataSystem) ConstAssetReferenceSlice {
         return self.asset_refs.sliceConst();
     }
@@ -678,12 +645,6 @@ pub const DataSystem = struct {
         const slot = self.resolveSlotConst(id) orelse return null;
         const dense_index = slot.collision_bounds_index orelse return null;
         return self.collision_bounds.get(@intCast(dense_index));
-    }
-
-    pub fn collisionBoundsDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const dense_index = slot.collision_bounds_index orelse return null;
-        return @intCast(dense_index);
     }
 
     pub fn collisionBoundsSliceConst(self: *const DataSystem) ConstCollisionBoundsSlice {
@@ -709,12 +670,6 @@ pub const DataSystem = struct {
         return self.collision_responses.get(@intCast(dense_index));
     }
 
-    pub fn collisionResponseDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const dense_index = slot.collision_response_index orelse return null;
-        return @intCast(dense_index);
-    }
-
     pub fn collisionResponseSliceConst(self: *const DataSystem) ConstCollisionResponseSlice {
         return self.collision_responses.sliceConst();
     }
@@ -732,22 +687,8 @@ pub const DataSystem = struct {
         slot.addComponent(.ai_agent);
     }
 
-    pub fn aiAgentConst(self: *const DataSystem, id: EntityId) ?AiAgent {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const dense_index = slot.ai_agent_index orelse return null;
-        return self.ai_agents.get(@intCast(dense_index));
-    }
-
     pub fn aiAgentSliceConst(self: *const DataSystem) ConstAiAgentSlice {
         return self.ai_agents.sliceConst();
-    }
-
-    /// Dense `AiAgentStore` row index for `id`, or `null` when the entity
-    /// carries no `AiAgent` component. Mirrors `aiAffectDenseIndex`.
-    pub fn aiAgentDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const dense_index = slot.ai_agent_index orelse return null;
-        return @intCast(dense_index);
     }
 
     /// Mutable hot-column view for arbitration's per-step sticky-selection
@@ -767,12 +708,6 @@ pub const DataSystem = struct {
         const dense_index = try self.steering_agents.append(self.allocator, id, agent);
         slot.steering_agent_index = dense_index;
         slot.addComponent(.steering_agent);
-    }
-
-    pub fn steeringAgentConst(self: *const DataSystem, id: EntityId) ?SteeringAgent {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const dense_index = slot.steering_agent_index orelse return null;
-        return self.steering_agents.get(@intCast(dense_index));
     }
 
     pub fn steeringAgentDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
@@ -803,12 +738,6 @@ pub const DataSystem = struct {
         return self.world_levels.get(@intCast(dense_index));
     }
 
-    pub fn worldLevelPtr(self: *DataSystem, id: EntityId) ?*u16 {
-        const slot = self.resolveSlot(id) orelse return null;
-        const dense_index = slot.world_level_index orelse return null;
-        return self.world_levels.levelPtr(@intCast(dense_index));
-    }
-
     pub fn worldLevelSliceConst(self: *const DataSystem) ConstWorldLevelSlice {
         return self.world_levels.sliceConst();
     }
@@ -837,10 +766,6 @@ pub const DataSystem = struct {
         return self.factions.factionAt(@intCast(dense_index));
     }
 
-    pub fn factionSliceConst(self: *const DataSystem) ConstFactionSlice {
-        return self.factions.sliceConst();
-    }
-
     pub fn setAiPerception(self: *DataSystem, id: EntityId, perception_value: AiPerception) !void {
         try validateAiPerception(perception_value);
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
@@ -854,12 +779,6 @@ pub const DataSystem = struct {
         const dense_index = try self.ai_perceptions.append(self.allocator, id, perception_value);
         slot.ai_perception_index = dense_index;
         slot.addComponent(.ai_perception);
-    }
-
-    pub fn aiPerceptionConst(self: *const DataSystem, id: EntityId) ?AiPerception {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const dense_index = slot.ai_perception_index orelse return null;
-        return self.ai_perceptions.get(@intCast(dense_index));
     }
 
     pub fn aiPerceptionSliceConst(self: *const DataSystem) ConstPerceptionSlice {
@@ -894,12 +813,6 @@ pub const DataSystem = struct {
         slot.addComponent(.ai_memory);
     }
 
-    pub fn aiMemoryConst(self: *const DataSystem, id: EntityId) ?AiMemory {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const dense_index = slot.ai_memory_index orelse return null;
-        return self.ai_memories.get(@intCast(dense_index));
-    }
-
     pub fn aiMemorySliceConst(self: *const DataSystem) ConstAiMemorySlice {
         return self.ai_memories.sliceConst();
     }
@@ -930,12 +843,6 @@ pub const DataSystem = struct {
         const dense_index = try self.ai_affects.append(self.allocator, id, affect_value);
         slot.ai_affect_index = dense_index;
         slot.addComponent(.ai_affect);
-    }
-
-    pub fn aiAffectConst(self: *const DataSystem, id: EntityId) ?AiAffect {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const dense_index = slot.ai_affect_index orelse return null;
-        return self.ai_affects.get(@intCast(dense_index));
     }
 
     pub fn aiAffectSliceConst(self: *const DataSystem) ConstAiAffectSlice {
@@ -977,14 +884,6 @@ pub const DataSystem = struct {
         return self.destructibles.sliceConst();
     }
 
-    /// Dense `DestructibleStore` row index for `id`, or `null` when the entity
-    /// carries no `Destructible` component.
-    pub fn destructibleDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
-        const slot = self.resolveSlotConst(id) orelse return null;
-        const dense_index = slot.destructible_index orelse return null;
-        return @intCast(dense_index);
-    }
-
     // Rewrites only the scope row's level; the rest of the row is as stored.
     fn syncScopeLevelFromWorldLevel(self: *DataSystem, id: EntityId, level: u16) void {
         const slot = self.resolveSlotConst(id) orelse return;
@@ -1019,7 +918,7 @@ pub const DataSystem = struct {
         return slot;
     }
 
-    fn resolveSlotConst(self: *const DataSystem, id: EntityId) ?*const EntitySlot {
+    pub fn resolveSlotConst(self: *const DataSystem, id: EntityId) ?*const EntitySlot {
         if (!id.isValid()) return null;
         const index: usize = @intCast(id.index);
         if (index >= self.slots.items.len) return null;
@@ -1214,6 +1113,8 @@ fn expectWorldLevelColumnsAligned(slice: ConstWorldLevelSlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.levels.len);
 }
 
+const data_test_support = @import("test_support.zig");
+
 test "world level round-trips through set get ptr and dense slice" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1234,10 +1135,8 @@ test "world level round-trips through set get ptr and dense slice" {
     try std.testing.expect(data.hasComponents(second, component_masks.world_level));
     try std.testing.expect(!data.hasComponents(third, component_masks.movement_body));
 
-    const level_ptr = data.worldLevelPtr(second).?;
-    try std.testing.expectEqual(@as(u16, 7), level_ptr.*);
-    level_ptr.* = 11;
-    try std.testing.expectEqual(@as(u16, 11), data.worldLevelConst(second));
+    try data.setWorldLevel(second, 11);
+    try std.testing.expectEqual(@as(?u16, 11), data.worldLevelConst(second));
 
     const slice = data.worldLevelSliceConst();
     try expectWorldLevelColumnsAligned(slice);
@@ -1293,7 +1192,7 @@ test "setWorldLevel syncs simulation scope metadata level when movement body exi
         .chunk = .{ .x = 2, .y = -1 },
         .level = 5,
         .stagger_phase = 2,
-    }, data.simulationMetadata(entity).?);
+    }, data_test_support.simulationMetadata(&data, entity).?);
     try std.testing.expectEqual(@as(u16, 5), data.scopeColumnsSliceConst().level[0]);
 
     try data.setWorldLevel(entity, 5);
@@ -1302,7 +1201,7 @@ test "setWorldLevel syncs simulation scope metadata level when movement body exi
         .chunk = .{ .x = 2, .y = -1 },
         .level = 5,
         .stagger_phase = 2,
-    }, data.simulationMetadata(entity).?);
+    }, data_test_support.simulationMetadata(&data, entity).?);
 
     try data.setWorldLevel(entity, 8);
     try std.testing.expectEqual(@as(u16, 8), data.scopeColumnsSliceConst().level[0]);
@@ -1345,9 +1244,9 @@ test "entity simulation metadata defaults and rejects stale ids" {
     // Scope metadata lives on the dense movement-body scope row, so an entity
     // must have a movement body to carry it. Bodiless entities report null.
     const entity = try data.createEntity();
-    try std.testing.expect(data.simulationMetadata(entity) == null);
+    try std.testing.expect(data_test_support.simulationMetadata(&data, entity) == null);
     try data.setMovementBody(entity, .{});
-    try std.testing.expectEqual(EntitySimulationMetadata{ .level = 0, .stagger_phase = 0 }, data.simulationMetadata(entity).?);
+    try std.testing.expectEqual(EntitySimulationMetadata{ .level = 0, .stagger_phase = 0 }, data_test_support.simulationMetadata(&data, entity).?);
     try data.setSimulationMetadata(entity, .{
         .tier = .locomotion,
         .chunk = .{ .x = 4, .y = -2 },
@@ -1358,18 +1257,18 @@ test "entity simulation metadata defaults and rejects stale ids" {
         .chunk = .{ .x = 4, .y = -2 },
         .level = 3,
         .stagger_phase = 0,
-    }, data.simulationMetadata(entity).?);
+    }, data_test_support.simulationMetadata(&data, entity).?);
     // The scope columns view exposes the same level the metadata round-tripped.
     try std.testing.expectEqual(@as(u16, 3), data.scopeColumnsSliceConst().level[0]);
 
     try std.testing.expect(data.destroyEntity(entity));
-    try std.testing.expect(data.simulationMetadata(entity) == null);
+    try std.testing.expect(data_test_support.simulationMetadata(&data, entity) == null);
     try std.testing.expectError(error.InvalidEntity, data.setSimulationMetadata(entity, .{}));
 
     const reused = try data.createEntity();
     try std.testing.expectEqual(entity.index, reused.index);
     try data.setMovementBody(reused, .{});
-    try std.testing.expectEqual(EntitySimulationMetadata{ .level = 0, .stagger_phase = 0 }, data.simulationMetadata(reused).?);
+    try std.testing.expectEqual(EntitySimulationMetadata{ .level = 0, .stagger_phase = 0 }, data_test_support.simulationMetadata(&data, reused).?);
 }
 
 test "a simulation metadata write keeps the row's stagger phase and level unless it names them" {
@@ -1380,24 +1279,24 @@ test "a simulation metadata write keeps the row's stagger phase and level unless
     try data.setMovementBody(try data.createEntity(), .{});
     const entity = try data.createEntity();
     try data.setMovementBody(entity, .{});
-    const appended_phase = data.simulationMetadata(entity).?.stagger_phase;
+    const appended_phase = data_test_support.simulationMetadata(&data, entity).?.stagger_phase;
     try std.testing.expectEqual(@as(u8, 1 % cognition_stagger_n), appended_phase);
 
     try data.setSimulationMetadata(entity, .{ .tier = .locomotion, .chunk = .{ .x = 3, .y = 1 }, .level = 2 });
-    const kept = data.simulationMetadata(entity).?;
+    const kept = data_test_support.simulationMetadata(&data, entity).?;
     try std.testing.expectEqual(appended_phase, kept.stagger_phase);
     try std.testing.expectEqual(SimulationTier.locomotion, kept.tier);
     try std.testing.expectEqual(@as(u16, 2), kept.level);
 
     try data.setSimulationMetadata(entity, .{ .tier = .cognition, .stagger_phase = 3 });
-    try std.testing.expectEqual(@as(u8, 3), data.simulationMetadata(entity).?.stagger_phase);
-    try std.testing.expectEqual(@as(?u16, 2), data.simulationMetadata(entity).?.level);
+    try std.testing.expectEqual(@as(u8, 3), data_test_support.simulationMetadata(&data, entity).?.stagger_phase);
+    try std.testing.expectEqual(@as(?u16, 2), data_test_support.simulationMetadata(&data, entity).?.level);
     try data.setSimulationMetadata(entity, .{ .tier = .cognition });
-    try std.testing.expectEqual(@as(u8, 3), data.simulationMetadata(entity).?.stagger_phase);
-    try std.testing.expectEqual(@as(?u16, 2), data.simulationMetadata(entity).?.level);
+    try std.testing.expectEqual(@as(u8, 3), data_test_support.simulationMetadata(&data, entity).?.stagger_phase);
+    try std.testing.expectEqual(@as(?u16, 2), data_test_support.simulationMetadata(&data, entity).?.level);
 
     try std.testing.expectError(error.InvalidStaggerPhase, data.setSimulationMetadata(entity, .{ .stagger_phase = cognition_stagger_n }));
-    try std.testing.expectEqual(@as(u8, 3), data.simulationMetadata(entity).?.stagger_phase);
+    try std.testing.expectEqual(@as(u8, 3), data_test_support.simulationMetadata(&data, entity).?.stagger_phase);
 }
 
 test "a simulation metadata write takes the level from the entity's world level row" {
@@ -1407,19 +1306,19 @@ test "a simulation metadata write takes the level from the entity's world level 
     const entity = try data.createEntity();
     try data.setMovementBody(entity, .{});
     try data.setWorldLevel(entity, 5);
-    try std.testing.expectEqual(@as(?u16, 5), data.simulationMetadata(entity).?.level);
+    try std.testing.expectEqual(@as(?u16, 5), data_test_support.simulationMetadata(&data, entity).?.level);
 
     // An omitted level reads the world-level row, never the field default.
     try data.setSimulationMetadata(entity, .{ .tier = .locomotion, .chunk = .{ .x = 2, .y = 7 } });
-    try std.testing.expectEqual(@as(?u16, 5), data.simulationMetadata(entity).?.level);
+    try std.testing.expectEqual(@as(?u16, 5), data_test_support.simulationMetadata(&data, entity).?.level);
     try std.testing.expectEqual(@as(u16, 5), data.scopeColumnsSliceConst().level[0]);
     try data.setSimulationMetadata(entity, .{ .tier = .cognition, .level = 5 });
-    try std.testing.expectEqual(@as(?u16, 5), data.simulationMetadata(entity).?.level);
+    try std.testing.expectEqual(@as(?u16, 5), data_test_support.simulationMetadata(&data, entity).?.level);
 
     // A later world-level move carries onto the row, and the next write keeps it.
     try data.setWorldLevel(entity, 0);
     try data.setSimulationMetadata(entity, .{ .tier = .kinematic });
-    try std.testing.expectEqual(@as(?u16, 0), data.simulationMetadata(entity).?.level);
+    try std.testing.expectEqual(@as(?u16, 0), data_test_support.simulationMetadata(&data, entity).?.level);
 }
 
 test "entity simulation metadata resets with retained capacity" {
@@ -1437,7 +1336,7 @@ test "entity simulation metadata resets with retained capacity" {
     const reused = try data.createEntity();
     try std.testing.expectEqual(entity.index, reused.index);
     try data.setMovementBody(reused, .{});
-    try std.testing.expectEqual(EntitySimulationMetadata{ .level = 0, .stagger_phase = 0 }, data.simulationMetadata(reused).?);
+    try std.testing.expectEqual(EntitySimulationMetadata{ .level = 0, .stagger_phase = 0 }, data_test_support.simulationMetadata(&data, reused).?);
 }
 
 test "full active scope stats count tiers and current stage slices" {
@@ -1560,7 +1459,7 @@ test "component masks track entity membership for system queries" {
     try data.setMovementBody(entity, testBody(1));
     try data.setFacing(entity, .{ .direction = .right });
     try std.testing.expect(data.hasComponents(entity, component_masks.movement_body | component_masks.facing));
-    try std.testing.expect(!data.hasComponents(entity, component_masks.render_primitive));
+    try std.testing.expect(!data.hasComponents(entity, component_masks.movement_body | component_masks.facing | component_masks.primitive_visual));
     try std.testing.expect(!data.hasComponents(entity, component_masks.collision_bounds));
     try std.testing.expect(!data.hasComponents(entity, component_masks.collision_response));
 
@@ -1569,7 +1468,7 @@ test "component masks track entity membership for system queries" {
     try data.setCollisionResponse(entity, testResponse(.solid, .dynamic, 0));
     try data.setAiAgent(entity, .{ .active_behavior = .wander });
     try data.setSteeringAgent(entity, testSteeringAgent(1));
-    try std.testing.expect(data.hasComponents(entity, component_masks.render_primitive));
+    try std.testing.expect(data.hasComponents(entity, component_masks.movement_body | component_masks.facing | component_masks.primitive_visual));
     try std.testing.expect(data.hasComponents(entity, component_masks.collision_bounds));
     try std.testing.expect(data.hasComponents(entity, component_masks.collision_response));
     try std.testing.expect(data.hasComponents(entity, component_masks.ai_agent));
@@ -1582,32 +1481,6 @@ test "component masks track entity membership for system queries" {
     try std.testing.expect(data.destroyEntity(entity));
     try std.testing.expectEqual(@as(ComponentMask, 0), data.componentMaskFor(entity));
     try std.testing.expect(!data.hasComponents(entity, component_masks.movement_body));
-}
-
-test "render entity component indices resolve movement asset and facing slots" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-
-    const entity = try data.createEntity();
-    try data.setMovementBody(entity, testBody(1));
-
-    const movement_only = data.renderEntityComponentIndices(entity).?;
-    try std.testing.expectEqual(@as(usize, 0), movement_only.movement_body);
-    try std.testing.expect(movement_only.asset_ref == null);
-    try std.testing.expect(movement_only.facing == null);
-
-    try data.setFacing(entity, .{ .direction = .down });
-    const with_facing = data.renderEntityComponentIndices(entity).?;
-    try std.testing.expect(with_facing.facing != null);
-    try std.testing.expect(with_facing.asset_ref == null);
-
-    try data.setAssetReference(entity, .{ .sprite = .demo_tile });
-    const full = data.renderEntityComponentIndices(entity).?;
-    try std.testing.expect(full.asset_ref != null);
-    try std.testing.expect(full.facing != null);
-    try std.testing.expectEqual(with_facing.movement_body, full.movement_body);
-
-    try std.testing.expect(data.renderEntityComponentIndices(EntityId.invalid) == null);
 }
 
 test "bodyLevelFaction matches movementBodyDenseIndex, worldLevelConst, and factionConst" {
@@ -1658,7 +1531,7 @@ test "movementVisualDenseIndices resolves both rows from one slot lookup" {
     try std.testing.expectEqual(@as(usize, 0), indices.movement);
     try std.testing.expectEqual(@as(usize, 0), indices.visual);
     try std.testing.expectEqual(data.movementBodyDenseIndex(entity).?, indices.movement);
-    try std.testing.expectEqual(data.primitiveVisualDenseIndex(entity).?, indices.visual);
+    try std.testing.expectEqual(data_test_support.primitiveVisualDenseIndex(&data, entity).?, indices.visual);
     try std.testing.expect(data.movementVisualDenseIndices(EntityId.invalid) == null);
 }
 
@@ -1760,7 +1633,6 @@ test "movement body columns can be loaded directly through simd helpers" {
     const slice = data.movementBodySliceConst();
     try expectMovementBodyColumnsAligned(slice);
     try std.testing.expectEqual(@as(usize, simd.lane_count), simd.vectorizedEnd(slice.entities.len));
-    try std.testing.expectEqual(@as(usize, 1), simd.tailLen(slice.entities.len));
 
     try std.testing.expectEqual([_]f32{ 1, 2, 3, 4 }, simd.toFloatArray(simd.loadFloat4(slice.position_x[0..])));
     try std.testing.expectEqual([_]f32{ 11, 12, 13, 14 }, simd.toFloatArray(simd.loadFloat4(slice.position_y[0..])));
@@ -1893,7 +1765,7 @@ test "asset references store stable sprite ids and optional atlas entries" {
 
     const entity = try data.createEntity();
     try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 8 });
-    const asset_ref = data.assetReferenceConst(entity).?;
+    const asset_ref = data_test_support.assetReference(&data, entity).?;
     try std.testing.expectEqual(SpriteAssetId.grim_characters, asset_ref.sprite);
     try std.testing.expectEqual(@as(u16, 8), asset_ref.atlas_entry_id);
 
@@ -1932,11 +1804,11 @@ test "collision bounds store is columnar compact and rejects invalid bounds" {
     try std.testing.expect(data.collisionBoundsConst(first) != null);
     try std.testing.expect(data.collisionBoundsConst(third) != null);
     try std.testing.expect(data.collisionBoundsConst(second) == null);
-    try std.testing.expect(data.collisionBoundsDenseIndex(first) != null);
-    try std.testing.expect(data.collisionBoundsDenseIndex(third) != null);
-    try std.testing.expectEqual(@as(?usize, null), data.collisionBoundsDenseIndex(second));
-    try std.testing.expectEqual(first.index, slice.entities[data.collisionBoundsDenseIndex(first).?].index);
-    try std.testing.expectEqual(third.index, slice.entities[data.collisionBoundsDenseIndex(third).?].index);
+    try std.testing.expect(data_test_support.collisionBoundsDenseIndex(&data, first) != null);
+    try std.testing.expect(data_test_support.collisionBoundsDenseIndex(&data, third) != null);
+    try std.testing.expectEqual(@as(?usize, null), data_test_support.collisionBoundsDenseIndex(&data, second));
+    try std.testing.expectEqual(first.index, slice.entities[data_test_support.collisionBoundsDenseIndex(&data, first).?].index);
+    try std.testing.expectEqual(third.index, slice.entities[data_test_support.collisionBoundsDenseIndex(&data, third).?].index);
 }
 
 test "collision response store is columnar compact and rejects invalid response data" {
@@ -1966,11 +1838,11 @@ test "collision response store is columnar compact and rejects invalid response 
     try std.testing.expect(data.collisionResponseConst(first) != null);
     try std.testing.expect(data.collisionResponseConst(third) != null);
     try std.testing.expect(data.collisionResponseConst(second) == null);
-    try std.testing.expect(data.collisionResponseDenseIndex(first) != null);
-    try std.testing.expect(data.collisionResponseDenseIndex(third) != null);
-    try std.testing.expectEqual(@as(?usize, null), data.collisionResponseDenseIndex(second));
-    try std.testing.expectEqual(first.index, slice.entities[data.collisionResponseDenseIndex(first).?].index);
-    try std.testing.expectEqual(third.index, slice.entities[data.collisionResponseDenseIndex(third).?].index);
+    try std.testing.expect(data_test_support.collisionResponseDenseIndex(&data, first) != null);
+    try std.testing.expect(data_test_support.collisionResponseDenseIndex(&data, third) != null);
+    try std.testing.expectEqual(@as(?usize, null), data_test_support.collisionResponseDenseIndex(&data, second));
+    try std.testing.expectEqual(first.index, slice.entities[data_test_support.collisionResponseDenseIndex(&data, first).?].index);
+    try std.testing.expectEqual(third.index, slice.entities[data_test_support.collisionResponseDenseIndex(&data, third).?].index);
 }
 
 test "structural commands apply entity creation and component changes in order" {
@@ -2014,12 +1886,12 @@ test "structural commands apply entity creation and component changes in order" 
     const ai_slice = data.aiAgentSliceConst();
     try expectAiAgentColumnsAligned(ai_slice);
     try std.testing.expectEqual(@as(usize, 2), ai_slice.entities.len);
-    const existing_ai = data.aiAgentConst(existing).?;
+    const existing_ai = data_test_support.aiAgent(&data, existing).?;
     try std.testing.expectEqual(AiBehavior.pursue, existing_ai.active_behavior);
     try std.testing.expectEqual(@as(f32, 0.75), existing_ai.gain_pursue);
-    try std.testing.expectEqual(@as(f32, 14), data.steeringAgentConst(existing).?.agent_radius);
+    try std.testing.expectEqual(@as(f32, 14), data_test_support.steeringAgent(&data, existing).?.agent_radius);
     // created one also has ai from template
-    try std.testing.expect(data.aiAgentConst(data.movementBodySliceConst().entities[0]) != null or data.aiAgentConst(data.movementBodySliceConst().entities[1]) != null);
+    try std.testing.expect(data_test_support.aiAgent(&data, data.movementBodySliceConst().entities[0]) != null or data_test_support.aiAgent(&data, data.movementBodySliceConst().entities[1]) != null);
 }
 
 test "structural commands skip stale entities and preserve deterministic command order" {
@@ -2064,7 +1936,7 @@ test "ai agent component stores dense columns, supports template create and set/
     // change. active_behavior is hot and stays whatever the first append set.
     try data.setAiAgent(first, .{ .active_behavior = .pursue, .wander_amplitude = 7, .gain_pursue = 0.3 });
 
-    const first_agent = data.aiAgentConst(first).?;
+    const first_agent = data_test_support.aiAgent(&data, first).?;
     try std.testing.expectEqual(AiBehavior.wander, first_agent.active_behavior);
     try std.testing.expectEqual(@as(f32, 7), first_agent.wander_amplitude);
     try std.testing.expectEqual(@as(f32, 0.3), first_agent.gain_pursue);
@@ -2080,9 +1952,9 @@ test "ai agent component stores dense columns, supports template create and set/
     const slice = data.aiAgentSliceConst();
     try expectAiAgentColumnsAligned(slice);
     try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
-    try std.testing.expect(data.aiAgentConst(first) != null);
-    try std.testing.expect(data.aiAgentConst(third) != null);
-    try std.testing.expect(data.aiAgentConst(second) == null);
+    try std.testing.expect(data_test_support.aiAgent(&data, first) != null);
+    try std.testing.expect(data_test_support.aiAgent(&data, third) != null);
+    try std.testing.expect(data_test_support.aiAgent(&data, second) == null);
 }
 
 test "steering agent component stores dense columns, supports set/get, rejects invalid, compacts on destroy" {
@@ -2106,7 +1978,7 @@ test "steering agent component stores dense columns, supports set/get, rejects i
         .unavailable_backoff_steps = 23,
     });
 
-    const first_agent = data.steeringAgentConst(first).?;
+    const first_agent = data_test_support.steeringAgent(&data, first).?;
     try std.testing.expectEqual(@as(f32, 9), first_agent.agent_radius);
     try std.testing.expectEqual(@as(f32, 3), first_agent.waypoint_tolerance);
     try std.testing.expectEqual(@as(f32, 42), first_agent.avoidance_radius);
@@ -2125,9 +1997,9 @@ test "steering agent component stores dense columns, supports set/get, rejects i
     const slice = data.steeringAgentSliceConst();
     try expectSteeringAgentColumnsAligned(slice);
     try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
-    try std.testing.expect(data.steeringAgentConst(first) != null);
-    try std.testing.expect(data.steeringAgentConst(third) != null);
-    try std.testing.expect(data.steeringAgentConst(second) == null);
+    try std.testing.expect(data_test_support.steeringAgent(&data, first) != null);
+    try std.testing.expect(data_test_support.steeringAgent(&data, third) != null);
+    try std.testing.expect(data_test_support.steeringAgent(&data, second) == null);
     try std.testing.expect(data.steeringAgentDenseIndex(first) != null);
     try std.testing.expect(data.steeringAgentDenseIndex(third) != null);
     try std.testing.expectEqual(@as(?usize, null), data.steeringAgentDenseIndex(second));
@@ -2151,10 +2023,10 @@ test "ai agent via EntityTemplate in structural create and mask queries" {
     const entity = data.movementBodySliceConst().entities[0];
     try std.testing.expect(data.hasComponents(entity, component_masks.ai_agent | component_masks.steering_agent | component_masks.movement_body));
     try std.testing.expect(!data.hasComponents(entity, component_masks.collision_response));
-    const agent = data.aiAgentConst(entity).?;
+    const agent = data_test_support.aiAgent(&data, entity).?;
     try std.testing.expectEqual(AiBehavior.wander, agent.active_behavior);
     try std.testing.expectEqual(@as(f32, 55), agent.wander_amplitude);
-    try std.testing.expectEqual(@as(f32, 13), data.steeringAgentConst(entity).?.agent_radius);
+    try std.testing.expectEqual(@as(f32, 13), data_test_support.steeringAgent(&data, entity).?.agent_radius);
 }
 
 test "structural commands set stable asset references" {
@@ -2170,7 +2042,7 @@ test "structural commands set stable asset references" {
 
     _ = try data.applyStructuralCommands(&commands);
     const entity = data.assetReferenceSliceConst().entities[0];
-    const asset_ref = data.assetReferenceConst(entity).?;
+    const asset_ref = data_test_support.assetReference(&data, entity).?;
     try std.testing.expectEqual(SpriteAssetId.grim_characters, asset_ref.sprite);
     try std.testing.expectEqual(@as(u16, 9), asset_ref.atlas_entry_id);
 }
@@ -2477,12 +2349,12 @@ test "set_simulation_tier preserves chunk and stagger_phase" {
 
     const entity = try data.createEntity();
     try data.setMovementBody(entity, .{});
-    const orig = data.simulationMetadata(entity).?;
+    const orig = data_test_support.simulationMetadata(&data, entity).?;
     const orig_chunk = orig.chunk;
     const orig_phase = orig.stagger_phase;
 
     try data.setSimulationTier(entity, .locomotion);
-    const updated = data.simulationMetadata(entity).?;
+    const updated = data_test_support.simulationMetadata(&data, entity).?;
 
     try std.testing.expectEqual(SimulationTier.locomotion, updated.tier);
     try std.testing.expectEqual(orig_chunk, updated.chunk);
@@ -2513,8 +2385,8 @@ test "structural command set_simulation_tier commits and skips stale entities" {
     try std.testing.expectEqual(@as(usize, 0), stats.created);
     try std.testing.expectEqual(@as(usize, 2), stats.stale_skipped);
     // The command after the skipped ones still applied — no partial commit.
-    try std.testing.expectEqual(SimulationTier.dormant, data.simulationMetadata(alive).?.tier);
-    try std.testing.expectEqual(@as(?EntitySimulationMetadata, null), data.simulationMetadata(bodiless));
+    try std.testing.expectEqual(SimulationTier.dormant, data_test_support.simulationMetadata(&data, alive).?.tier);
+    try std.testing.expectEqual(@as(?EntitySimulationMetadata, null), data_test_support.simulationMetadata(&data, bodiless));
     try std.testing.expectEqual(data.scanLiveTierCounts(), data.tier_counts);
 }
 
@@ -2568,7 +2440,7 @@ test "faction round-trips through set get ptr and dense slice" {
     faction_ptr.* = .hostile;
     try std.testing.expectEqual(@as(?Faction, .hostile), data.factionConst(second));
 
-    const slice = data.factionSliceConst();
+    const slice = data.factions.sliceConst();
     try std.testing.expectEqual(slice.entities.len, slice.factions.len);
     try std.testing.expectEqual(@as(usize, 3), slice.entities.len);
     try std.testing.expectEqual(Faction.player, slice.factions[0]);
@@ -2606,7 +2478,7 @@ test "faction store is columnar and compact after removal" {
 
     try std.testing.expect(data.destroyEntity(second));
 
-    const slice = data.factionSliceConst();
+    const slice = data.factions.sliceConst();
     try std.testing.expectEqual(slice.entities.len, slice.factions.len);
     try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
     for (slice.entities, 0..) |entity, index| {
@@ -2650,7 +2522,7 @@ test "ai perception round-trips through set/get and rejects invalid tunables" {
     try data.setAiPerception(first, .{ .vision_range = 150, .fov_half_angle_radians = 0.4 });
     try data.setAiPerception(second, .{ .vision_range = 300, .fov_half_angle_radians = 0.9 });
 
-    const first_perception = data.aiPerceptionConst(first).?;
+    const first_perception = data_test_support.aiPerception(&data, first).?;
     try std.testing.expectEqual(@as(f32, 150), first_perception.vision_range);
     try std.testing.expectEqual(@as(f32, 0.4), first_perception.fov_half_angle_radians);
     try std.testing.expect(!first_perception.target_visible);
@@ -2687,7 +2559,7 @@ test "ai perception retune through setAiPerception preserves hot sensing state" 
     // A retune (same entity, new cold tunables) must not wipe the hot state above.
     try data.setAiPerception(entity, .{ .vision_range = 400, .fov_half_angle_radians = 1.0 });
 
-    const after = data.aiPerceptionConst(entity).?;
+    const after = data_test_support.aiPerception(&data, entity).?;
     try std.testing.expectEqual(@as(f32, 400), after.vision_range);
     try std.testing.expectEqual(@as(f32, 1.0), after.fov_half_angle_radians);
     try std.testing.expectApproxEqAbs(@cos(@as(f32, 1.0)), after.cos_half_fov, 1e-6);
@@ -2714,7 +2586,7 @@ test "ai perception via EntityTemplate in structural create and mask queries" {
 
     const entity = data.movementBodySliceConst().entities[0];
     try std.testing.expect(data.hasComponents(entity, component_masks.ai_perception | component_masks.movement_body));
-    try std.testing.expectEqual(@as(f32, 320), data.aiPerceptionConst(entity).?.vision_range);
+    try std.testing.expectEqual(@as(f32, 320), data_test_support.aiPerception(&data, entity).?.vision_range);
 }
 
 test "structural command commit sets ai_perception without allocating after preflight reserves capacity" {
@@ -2743,7 +2615,7 @@ test "structural command commit sets ai_perception without allocating after pref
     try std.testing.expectEqual(@as(usize, 1), stats.created);
     try std.testing.expectEqual(@as(usize, 2), stats.components_set);
     const entity = data.movementBodySliceConst().entities[0];
-    try std.testing.expectEqual(@as(f32, 128), data.aiPerceptionConst(entity).?.vision_range);
+    try std.testing.expectEqual(@as(f32, 128), data_test_support.aiPerception(&data, entity).?.vision_range);
 }
 
 test "ai perception store is columnar and compact after removal" {
@@ -2766,7 +2638,7 @@ test "ai perception store is columnar and compact after removal" {
     // The swap-remove moved `third` into `second`'s old dense slot; resolving
     // it back through its EntitySlot proves removeAiPerceptionAt fixed up the
     // slot's ai_perception_index rather than just leaving the dense columns paired.
-    try std.testing.expectEqual(@as(f32, 300), data.aiPerceptionConst(third).?.vision_range);
+    try std.testing.expectEqual(@as(f32, 300), data_test_support.aiPerception(&data, third).?.vision_range);
 }
 
 test "ai perception survives entity destruction and reuse with generational correctness" {
@@ -2777,16 +2649,16 @@ test "ai perception survives entity destruction and reuse with generational corr
     try data.setAiPerception(original, .{ .vision_range = 111 });
     try std.testing.expect(data.destroyEntity(original));
 
-    try std.testing.expectEqual(@as(?AiPerception, null), data.aiPerceptionConst(original));
+    try std.testing.expectEqual(@as(?AiPerception, null), data_test_support.aiPerception(&data, original));
 
     const reused = try data.createEntity();
     try std.testing.expectEqual(original.index, reused.index);
     try std.testing.expect(reused.generation != original.generation);
-    try std.testing.expectEqual(@as(?AiPerception, null), data.aiPerceptionConst(reused));
+    try std.testing.expectEqual(@as(?AiPerception, null), data_test_support.aiPerception(&data, reused));
 
     try data.setAiPerception(reused, .{ .vision_range = 222 });
-    try std.testing.expectEqual(@as(f32, 222), data.aiPerceptionConst(reused).?.vision_range);
-    try std.testing.expectEqual(@as(?AiPerception, null), data.aiPerceptionConst(original));
+    try std.testing.expectEqual(@as(f32, 222), data_test_support.aiPerception(&data, reused).?.vision_range);
+    try std.testing.expectEqual(@as(?AiPerception, null), data_test_support.aiPerception(&data, original));
 }
 
 test "ai memory round-trips through set/get and rejects invalid fields" {
@@ -2797,7 +2669,7 @@ test "ai memory round-trips through set/get and rejects invalid fields" {
     const target = try data.createEntity();
     try data.setAiMemory(first, .{ .last_known_target = target, .last_known_x = 5, .last_known_y = 9, .staleness = 12, .familiarity = 0.4 });
 
-    const stored = data.aiMemoryConst(first).?;
+    const stored = data_test_support.aiMemory(&data, first).?;
     try std.testing.expectEqual(target, stored.last_known_target);
     try std.testing.expectEqual(@as(f32, 5), stored.last_known_x);
     try std.testing.expectEqual(@as(f32, 9), stored.last_known_y);
@@ -2830,7 +2702,7 @@ test "ai memory store is columnar and compact after removal" {
     // The swap-remove moved `third` into `second`'s old dense slot; resolving
     // it back through its EntitySlot proves removeAiMemoryAt fixed up the
     // slot's ai_memory_index rather than just leaving the dense columns paired.
-    try std.testing.expectEqual(@as(f32, 300), data.aiMemoryConst(third).?.staleness);
+    try std.testing.expectEqual(@as(f32, 300), data_test_support.aiMemory(&data, third).?.staleness);
 }
 
 test "ai memory survives entity destruction and reuse with generational correctness" {
@@ -2841,16 +2713,16 @@ test "ai memory survives entity destruction and reuse with generational correctn
     try data.setAiMemory(original, .{ .staleness = 111 });
     try std.testing.expect(data.destroyEntity(original));
 
-    try std.testing.expectEqual(@as(?AiMemory, null), data.aiMemoryConst(original));
+    try std.testing.expectEqual(@as(?AiMemory, null), data_test_support.aiMemory(&data, original));
 
     const reused = try data.createEntity();
     try std.testing.expectEqual(original.index, reused.index);
     try std.testing.expect(reused.generation != original.generation);
-    try std.testing.expectEqual(@as(?AiMemory, null), data.aiMemoryConst(reused));
+    try std.testing.expectEqual(@as(?AiMemory, null), data_test_support.aiMemory(&data, reused));
 
     try data.setAiMemory(reused, .{ .staleness = 222 });
-    try std.testing.expectEqual(@as(f32, 222), data.aiMemoryConst(reused).?.staleness);
-    try std.testing.expectEqual(@as(?AiMemory, null), data.aiMemoryConst(original));
+    try std.testing.expectEqual(@as(f32, 222), data_test_support.aiMemory(&data, reused).?.staleness);
+    try std.testing.expectEqual(@as(?AiMemory, null), data_test_support.aiMemory(&data, original));
 }
 
 test "destructible round-trips through set/get and clears on destroy" {
@@ -2892,8 +2764,8 @@ test "destructible store is columnar and compact after removal" {
     // it back through its EntitySlot proves removeDestructibleAt fixed up the
     // slot's destructible_index rather than just leaving the dense columns paired.
     try std.testing.expectEqual(@as(u8, 3), data.destructibleConst(third).?.hit_points);
-    try std.testing.expectEqual(@as(?usize, null), data.destructibleDenseIndex(second));
-    try std.testing.expect(data.destructibleDenseIndex(third) != null);
+    try std.testing.expectEqual(@as(?usize, null), data_test_support.destructibleDenseIndex(&data, second));
+    try std.testing.expect(data_test_support.destructibleDenseIndex(&data, third) != null);
 }
 
 test "ai affect round-trips through set/get, retunes cold-only, and rejects invalid fields" {
@@ -2903,7 +2775,7 @@ test "ai affect round-trips through set/get, retunes cold-only, and rejects inva
     const first = try data.createEntity();
     try data.setAiAffect(first, .{ .baseline_fear = 0.2, .decay_rate_fear = 0.1, .threshold_fear = 0.5 });
 
-    const stored = data.aiAffectConst(first).?;
+    const stored = data_test_support.aiAffect(&data, first).?;
     try std.testing.expectEqual(@as(f32, 0.2), stored.baseline_fear);
     try std.testing.expectEqual(@as(f32, 0.1), stored.decay_rate_fear);
     try std.testing.expectEqual(@as(f32, 0.5), stored.threshold_fear);
@@ -2914,8 +2786,8 @@ test "ai affect round-trips through set/get, retunes cold-only, and rejects inva
     const dense = data.aiAffectDenseIndex(first).?;
     live.fear[dense] = 0.9;
     try data.setAiAffect(first, .{ .baseline_fear = 0.7 });
-    try std.testing.expectEqual(@as(f32, 0.7), data.aiAffectConst(first).?.baseline_fear);
-    try std.testing.expectEqual(@as(f32, 0.9), data.aiAffectConst(first).?.fear);
+    try std.testing.expectEqual(@as(f32, 0.7), data_test_support.aiAffect(&data, first).?.baseline_fear);
+    try std.testing.expectEqual(@as(f32, 0.9), data_test_support.aiAffect(&data, first).?.fear);
 
     try std.testing.expectError(error.InvalidAiAffect, data.setAiAffect(first, .{ .baseline_fear = -1 }));
     try std.testing.expectError(error.InvalidAiAffect, data.setAiAffect(first, .{ .decay_rate_fear = 0 }));
@@ -2942,7 +2814,7 @@ test "ai affect store is columnar and compact after removal" {
     // The swap-remove moved `third` into `second`'s old dense slot; resolving
     // it back through its EntitySlot proves removeAiAffectAt fixed up the
     // slot's ai_affect_index rather than just leaving the dense columns paired.
-    try std.testing.expectEqual(@as(f32, 0.3), data.aiAffectConst(third).?.baseline_fear);
+    try std.testing.expectEqual(@as(f32, 0.3), data_test_support.aiAffect(&data, third).?.baseline_fear);
 }
 
 test "ai affect survives entity destruction and reuse with generational correctness" {
@@ -2953,16 +2825,16 @@ test "ai affect survives entity destruction and reuse with generational correctn
     try data.setAiAffect(original, .{ .baseline_fear = 0.4 });
     try std.testing.expect(data.destroyEntity(original));
 
-    try std.testing.expectEqual(@as(?AiAffect, null), data.aiAffectConst(original));
+    try std.testing.expectEqual(@as(?AiAffect, null), data_test_support.aiAffect(&data, original));
 
     const reused = try data.createEntity();
     try std.testing.expectEqual(original.index, reused.index);
     try std.testing.expect(reused.generation != original.generation);
-    try std.testing.expectEqual(@as(?AiAffect, null), data.aiAffectConst(reused));
+    try std.testing.expectEqual(@as(?AiAffect, null), data_test_support.aiAffect(&data, reused));
 
     try data.setAiAffect(reused, .{ .baseline_fear = 0.6 });
-    try std.testing.expectEqual(@as(f32, 0.6), data.aiAffectConst(reused).?.baseline_fear);
-    try std.testing.expectEqual(@as(?AiAffect, null), data.aiAffectConst(original));
+    try std.testing.expectEqual(@as(f32, 0.6), data_test_support.aiAffect(&data, reused).?.baseline_fear);
+    try std.testing.expectEqual(@as(?AiAffect, null), data_test_support.aiAffect(&data, original));
 }
 
 fn testBody(base: f32) MovementBody {

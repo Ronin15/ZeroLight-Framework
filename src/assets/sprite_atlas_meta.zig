@@ -10,18 +10,6 @@ const std = @import("std");
 const atlas_meta_common = @import("atlas_meta_common.zig");
 const manifest = @import("manifest.zig");
 
-pub const SpriteEntry = struct {
-    id: u16,
-    name: []const u8,
-    category: []const u8,
-    column: u32,
-    row: u32,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-};
-
 pub const AtlasInfo = struct {
     path: []const u8,
     sprite_asset_id: []const u8,
@@ -95,14 +83,6 @@ pub const SpriteAtlasMeta = struct {
         };
     }
 
-    pub fn frameWidth(self: SpriteAtlasMeta) f32 {
-        return @floatFromInt(self.parsed.value.frame_width);
-    }
-
-    pub fn frameHeight(self: SpriteAtlasMeta) f32 {
-        return @floatFromInt(self.parsed.value.frame_height);
-    }
-
     pub fn columns(self: SpriteAtlasMeta) u32 {
         return self.parsed.value.columns;
     }
@@ -111,27 +91,10 @@ pub const SpriteAtlasMeta = struct {
         return self.parsed.value.rows;
     }
 
-    pub fn spriteCount(self: SpriteAtlasMeta) u32 {
-        return self.parsed.value.sprite_count;
-    }
-
-    pub fn sourceRectByName(self: SpriteAtlasMeta, sprite_name: []const u8) ?manifest.SourceRect {
-        const id = self.name_to_id.get(sprite_name) orelse return null;
-        return self.sourceRectForId(id);
-    }
-
     pub fn sourceRectForId(self: SpriteAtlasMeta, id: u16) ?manifest.SourceRect {
         const index: usize = id;
         if (index >= self.source_rect_valid.len or !self.source_rect_valid[index]) return null;
         return self.source_rects[index];
-    }
-
-    /// Returned `SpriteEntry` slices (`name`, `category`) borrow the parsed JSON
-    /// and are valid until this meta object is deinitialized.
-    pub fn spriteByName(self: SpriteAtlasMeta, sprite_name: []const u8) ?SpriteEntry {
-        const id = self.name_to_id.get(sprite_name) orelse return null;
-        const index = self.id_to_index.get(id) orelse return null;
-        return jsonSpriteToEntry(self.parsed.value.sprites[index]);
     }
 };
 
@@ -141,20 +104,6 @@ fn sourceRectFromSprite(sprite: JsonSpriteEntry) manifest.SourceRect {
         .y = sprite.y,
         .w = sprite.width,
         .h = sprite.height,
-    };
-}
-
-fn jsonSpriteToEntry(sprite: JsonSpriteEntry) SpriteEntry {
-    return .{
-        .id = sprite.id,
-        .name = sprite.name,
-        .category = sprite.category,
-        .column = sprite.column,
-        .row = sprite.row,
-        .x = sprite.x,
-        .y = sprite.y,
-        .width = sprite.width,
-        .height = sprite.height,
     };
 }
 
@@ -277,9 +226,16 @@ fn validateRoot(root: *const JsonRoot) !void {
     }
 }
 
+// The parsed JSON entry named `sprite_name`.
+fn jsonSpriteNamed(meta: SpriteAtlasMeta, sprite_name: []const u8) !JsonSpriteEntry {
+    const id = meta.name_to_id.get(sprite_name) orelse return error.TestExpectedEqual;
+    const index = meta.id_to_index.get(id) orelse return error.TestExpectedEqual;
+    return meta.parsed.value.sprites[index];
+}
+
 fn expectSpriteNameAligned(meta: SpriteAtlasMeta, sprite_name: []const u8) !void {
-    const by_name = meta.sourceRectByName(sprite_name) orelse return error.TestExpectedEqual;
-    const entry = meta.spriteByName(sprite_name) orelse return error.TestExpectedEqual;
+    const entry = try jsonSpriteNamed(meta, sprite_name);
+    const by_name = meta.sourceRectForId(entry.id) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(by_name.x, entry.x);
     try std.testing.expectEqual(by_name.y, entry.y);
     try std.testing.expectEqual(by_name.w, entry.width);
@@ -328,15 +284,15 @@ test "grim characters metadata parses installed json" {
     defer meta.deinit();
 
     try std.testing.expectEqualStrings("grim_dark_characters", meta.name());
-    try std.testing.expect(meta.spriteCount() > 0);
-    try std.testing.expectEqual(meta.spriteCount(), meta.parsed.value.sprites.len);
-    try std.testing.expect(meta.frameWidth() > 0);
-    try std.testing.expect(meta.frameHeight() > 0);
+    try std.testing.expect(meta.parsed.value.sprite_count > 0);
+    try std.testing.expectEqual(meta.parsed.value.sprite_count, meta.parsed.value.sprites.len);
+    try std.testing.expect(meta.parsed.value.frame_width > 0);
+    try std.testing.expect(meta.parsed.value.frame_height > 0);
 
-    const adventurer = meta.spriteByName("adventurer") orelse return error.TestExpectedEqual;
+    const adventurer = try jsonSpriteNamed(meta, "adventurer");
     try std.testing.expectEqualStrings("hero", adventurer.category);
 
-    const source = meta.sourceRectByName("adventurer") orelse return error.TestExpectedEqual;
+    const source = meta.sourceRectForId(adventurer.id) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(f32, 0), source.x);
     try std.testing.expectEqual(@as(f32, 0), source.y);
     try std.testing.expect(meta.sourceRectForId(9999) == null);
@@ -354,11 +310,11 @@ test "grim items metadata parses installed json" {
     defer meta.deinit();
 
     try std.testing.expectEqualStrings("grim_dark_items", meta.name());
-    try std.testing.expect(meta.spriteCount() > 0);
-    try std.testing.expectEqual(meta.spriteCount(), meta.parsed.value.sprites.len);
-    try std.testing.expect(meta.frameWidth() > 0);
+    try std.testing.expect(meta.parsed.value.sprite_count > 0);
+    try std.testing.expectEqual(meta.parsed.value.sprite_count, meta.parsed.value.sprites.len);
+    try std.testing.expect(meta.parsed.value.frame_width > 0);
 
-    const sword = meta.spriteByName("sword") orelse return error.TestExpectedEqual;
+    const sword = try jsonSpriteNamed(meta, "sword");
     try std.testing.expectEqualStrings("weapon_melee", sword.category);
 
     const sample_names = [_][]const u8{ "sword", "health_potion", "iron_key", "torch" };

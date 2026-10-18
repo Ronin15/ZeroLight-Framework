@@ -379,12 +379,6 @@ pub const SimulationEvents = struct {
         self.finishWrite();
     }
 
-    pub fn appendDiagnostic(self: *SimulationEvents, event: SimulationEvent) void {
-        self.appendRequired(event) catch {
-            self.stats.dropped += 1;
-        };
-    }
-
     pub fn ensureCanAppend(self: *const SimulationEvents, count: usize) !void {
         if (!self.withinLimit(count)) return error.EventCapacityExceeded;
     }
@@ -804,10 +798,6 @@ pub const SimulationFrame = struct {
         try self.path_requests.reserve(range_count, request_capacity);
     }
 
-    pub fn reserveNavigationIntents(self: *SimulationFrame, range_count: usize, intent_capacity: usize) !void {
-        try self.navigation_intents.reserve(range_count, intent_capacity);
-    }
-
     pub fn reserveActionIntents(self: *SimulationFrame, range_count: usize, intent_capacity: usize) !void {
         try self.action_intents.reserve(range_count, intent_capacity);
     }
@@ -942,16 +932,10 @@ pub const SimulationFrame = struct {
     }
 
     /// Publishes fall/dig landing tile changes in a single event range with one
-    /// finishWrite. Mirrors publishStructuralChanges so N plane-traversal carves
-    /// stay O(N) rather than O(N^2) from per-event appendRequired.
-    pub fn publishWorldTileChanges(self: *SimulationFrame, changes: []const WorldTileChangedEvent) !void {
-        try self.events.ensureEventAppendCapacity(changes.len);
-        self.publishWorldTileChangesAssumeCapacity(changes);
-    }
-
-    /// `publishWorldTileChanges` after `events.ensureEventAppendCapacity(n)` with
-    /// `n >= changes.len` and no append since: allocation-free and infallible, so a writer
-    /// can publish what it wrote on an error path.
+    /// finishWrite, after `events.ensureEventAppendCapacity(n)` with `n >= changes.len`
+    /// and no append since: allocation-free and infallible, so a writer can publish what
+    /// it wrote on an error path. N carves stay O(N), not O(N^2) from per-event
+    /// appendRequired.
     pub fn publishWorldTileChangesAssumeCapacity(self: *SimulationFrame, changes: []const WorldTileChangedEvent) void {
         if (changes.len == 0) return;
         var writer = self.events.appendReservedRange(changes.len);
@@ -1305,26 +1289,6 @@ test "simulation events collect deterministic threaded records and stats" {
     try std.testing.expectEqual(@as(usize, 3), events.stats.structural_commit_stage);
 }
 
-test "simulation events drop diagnostic records when capacity cannot grow" {
-    for (0..5) |fail_index| {
-        var events = SimulationEvents.init(std.testing.allocator);
-        defer events.deinit();
-
-        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        const original_allocator = events.stream.allocator;
-        events.stream.allocator = failing_allocator.allocator();
-        defer events.stream.allocator = original_allocator;
-
-        events.appendDiagnostic(entityCreatedEvent(1));
-
-        try std.testing.expectEqual(@as(usize, 0), events.stream.counts.items.len);
-        try std.testing.expectEqual(@as(usize, 0), events.range_stats.items.len);
-        try std.testing.expectEqual(@as(usize, 0), events.mergedItems().len);
-        try std.testing.expectEqual(@as(usize, 0), events.stats.total);
-        try std.testing.expectEqual(@as(usize, 1), events.stats.dropped);
-    }
-}
-
 test "simulation events enforce explicit per-step event capacity" {
     var events = SimulationEvents.init(std.testing.allocator);
     defer events.deinit();
@@ -1333,12 +1297,10 @@ test "simulation events enforce explicit per-step event capacity" {
     events.setCapacityLimit(1);
 
     try events.appendRequired(entityCreatedEvent(1));
-    events.appendDiagnostic(entityCreatedEvent(2));
 
     try std.testing.expectError(error.EventCapacityExceeded, events.appendRequired(entityCreatedEvent(3)));
     try std.testing.expectEqual(@as(usize, 1), events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 1), events.stats.total);
-    try std.testing.expectEqual(@as(usize, 1), events.stats.dropped);
 
     var ranged_events = SimulationEvents.init(std.testing.allocator);
     defer ranged_events.deinit();
@@ -1717,7 +1679,7 @@ test "stimulusHearingScore prefers nearer equal intensities and louder equal dis
     try std.testing.expect(stimulusHearingScore(0, 0) < 0);
 }
 
-test "SimulationFrame.publishWorldTileChanges writes N events in a single range" {
+test "SimulationFrame.publishWorldTileChangesAssumeCapacity writes N events in a single range" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 8, 4, 4, 4, 4);
@@ -1728,7 +1690,8 @@ test "SimulationFrame.publishWorldTileChanges writes N events in a single range"
         .{ .level = 2, .x = 0, .y = 1, .old_tile_id = 3, .new_tile_id = 4, .old_blocks_movement = true, .new_blocks_movement = false },
     };
     const ranges_before = frame.events.rangeCount();
-    try frame.publishWorldTileChanges(&changes);
+    try frame.events.ensureEventAppendCapacity(changes.len);
+    frame.publishWorldTileChangesAssumeCapacity(&changes);
     try std.testing.expectEqual(ranges_before + 1, frame.events.rangeCount());
     try std.testing.expectEqual(@as(usize, 3), frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 3), frame.events.stats.world_tile_changed);

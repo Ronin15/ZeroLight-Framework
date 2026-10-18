@@ -97,6 +97,11 @@ pub fn build(b: *std.Build) void {
     // useful for reading a benchmark table. An explicit -Dlog-level=debug still overrides this
     // for bench troubleshooting, same as it does for the game build.
     const bench_log_level = parseLogLevel(log_level_arg, .fast);
+    // Unit tests default to errors only (auto -> .err): the warn and info diagnostics the
+    // engine logs on recovered degradation and growth stay out of test output, and the test
+    // runner owns `std_options`, so the level is set here once. An explicit -Dlog-level still
+    // overrides it.
+    const test_log_level: std.log.Level = if (std.mem.eql(u8, log_level_arg, "auto")) .err else log_level;
     const gpu_shader_formats = shaderFormatsForTarget(target.result.os.tag);
     // Full LTO needs LLVM+LLD. Linux ships with `-flto=full`; Darwin and
     // Windows do not (see `ltoSupportedForTarget`).
@@ -129,6 +134,15 @@ pub fn build(b: *std.Build) void {
     benchBuildOptions.addOption(bool, "debug_overlay", debug_overlay);
     benchBuildOptions.addOption(u8, "log_level", @backingInt(bench_log_level));
     benchBuildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
+
+    const testBuildOptions = b.addOptions();
+    testBuildOptions.addOption([]const u8, "app_name", app_name);
+    testBuildOptions.addOption([]const u8, "window_title", window_title);
+    testBuildOptions.addOption([]const u8, "asset_root", asset_root);
+    testBuildOptions.addOption(bool, "gpu_debug", gpu_debug);
+    testBuildOptions.addOption(bool, "debug_overlay", debug_overlay);
+    testBuildOptions.addOption(u8, "log_level", @backingInt(test_log_level));
+    testBuildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
 
     const fetch_sdl_step = b.step("fetch-sdl", "Fetch pinned Windows SDL packages into zig-pkg/ and validate them");
     if (target.result.os.tag != .windows) {
@@ -169,7 +183,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = if (sanitize_thread) true else null,
     });
 
-    const unitTestsModule = createSdlModule(b, target, optimize, buildOptions, "src/tests.zig", windows_sdl, sdl_c_module);
+    const unitTestsModule = createSdlModule(b, target, optimize, testBuildOptions, "src/tests.zig", windows_sdl, sdl_c_module);
     // Repeatable; only tests whose names contain one of these texts compile and run.
     const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose names contain this text (repeatable)") orelse &.{};
     const unit_tests = b.addTest(.{

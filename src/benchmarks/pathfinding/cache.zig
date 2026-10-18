@@ -26,6 +26,7 @@ const NavUpdateStats = @import("../../game/systems/pathfinding/types.zig").NavUp
 const CellCoord = @import("../../game/world/system.zig").CellCoord;
 const default_chunk_size_tiles = @import("../../game/world/system.zig").default_chunk_size_tiles;
 const fixtures = @import("../fixtures.zig");
+const pathfinding_test_support = @import("../../game/systems/pathfinding/test_support.zig");
 const nav_size = @import("../nav_size.zig");
 const suite = @import("../suite.zig");
 const coldWarmup = @import("nav_fixtures.zig").coldWarmup;
@@ -585,7 +586,7 @@ fn runElasticShrink(
     if (shrink.kept != @min(cached.items.len, shrink.cache_capacity_after)) return error.ElasticShrinkEvictedWrongCount;
     shrink.evicted = cached.items.len - shrink.kept;
     for (cached.items) |entry| {
-        const owner = system.completed.core.ownerOf(entry.key) orelse continue;
+        const owner = pathfinding_test_support.cacheOwnerOf(system.completed.core, entry.key) orelse continue;
         if (owner != entry.owner) shrink.moved += 1;
     }
     return shrink;

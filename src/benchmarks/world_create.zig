@@ -152,8 +152,8 @@ fn checkPhasesMatchInitProcedural(allocator: std.mem.Allocator, io: std.Io, meta
 
     const same_shape = whole.width == phased.width and whole.height == phased.height and
         whole.tile_size == phased.tile_size and whole.chunk_size_tiles == phased.chunk_size_tiles and
-        whole.levelCount() == phased.levelCount() and whole.denseLayerCount() == phased.denseLayerCount() and
-        whole.sparseTileCount() == phased.sparseTileCount();
+        whole.levelCount() == phased.levelCount() and whole.dense_layers.len == phased.dense_layers.len and
+        whole.sparse_tiles.len == phased.sparse_tiles.len;
     if (!same_shape) return error.WorldCreatePhaseDrift;
     for (0..whole.levelCount()) |level_index| {
         const level: u16 = @intCast(level_index);
@@ -162,7 +162,7 @@ fn checkPhasesMatchInitProcedural(allocator: std.mem.Allocator, io: std.Io, meta
             if (whole.levelBlocksMovement(level, @intCast(x), @intCast(y)) != phased.levelBlocksMovement(level, @intCast(x), @intCast(y))) return error.WorldCreatePhaseDrift;
         };
     }
-    for (0..whole.denseLayerCount()) |layer| {
+    for (0..whole.dense_layers.len) |layer| {
         for (0..whole.height) |y| for (0..whole.width) |x| {
             if (whole.denseTile(layer, @intCast(x), @intCast(y)) != phased.denseTile(layer, @intCast(x), @intCast(y))) return error.WorldCreatePhaseDrift;
         };

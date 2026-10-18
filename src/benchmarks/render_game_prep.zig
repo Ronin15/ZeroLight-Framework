@@ -340,7 +340,7 @@ fn collectProductionDynamicRecords(fixture: *Fixture) !void {
         &fixture.runtime_assets,
         1.0,
     );
-    fixture.last_collected_records = fixture.scene_prep.orderedRecords().len;
+    fixture.last_collected_records = fixture.scene_prep.records.items.len;
     std.debug.assert(fixture.last_collected_records == expectedBenchCollectedRecords(fixture.item_count));
 }
 
@@ -404,8 +404,8 @@ fn emitPreparedDrawSpan(
     span: render_prep.DynamicDepthRange,
     fallback_texture: sprite_batch.TextureId,
 ) !void {
-    const sorted_indices = prep.sortedRecordIndices();
-    const records = prep.orderedRecords();
+    const sorted_indices = prep.sort_indices.items;
+    const records = prep.records.items;
     for (sorted_indices[span.start..span.end]) |record_index| {
         try emitPreparedDraw(batch, records[record_index].draw, fallback_texture);
     }
@@ -820,7 +820,7 @@ fn runOffviewCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
         accumulator.record(suite.elapsedNs(start_ns, end_ns), .{});
     }
     var stats = accumulator.finish();
-    stats.output_count = fixture.scene_prep.orderedRecords().len;
+    stats.output_count = fixture.scene_prep.records.items.len;
     stats.sample_count = offview_visible_rows;
     stats.render_capacities = .{
         .record_capacity = render_prep.dynamicRecordCapacity(fixture.scene()),
@@ -831,7 +831,7 @@ fn runOffviewCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
 
 fn collectOffview(fixture: *OffviewFixture, visible: render_prep.VisibleWorldRect, expected_records: usize) !void {
     try render_prep.collectDynamicRecords(&fixture.scene_prep, fixture.scene(), visible, &fixture.runtime_assets, 1.0);
-    std.debug.assert(fixture.scene_prep.orderedRecords().len == expected_records);
+    std.debug.assert(fixture.scene_prep.records.items.len == expected_records);
 }
 
 fn writeOffviewWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {

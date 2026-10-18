@@ -103,8 +103,6 @@ pub const SteeringStats = struct {
     movement_intent_count: usize = 0,
     path_request_count: usize = 0,
     path_available_count: usize = 0,
-    /// Agents a partial path served (`PathStatus.partial`).
-    path_partial_count: usize = 0,
     path_pending_count: usize = 0,
     path_unavailable_count: usize = 0,
     replan_cooldown_count: usize = 0,

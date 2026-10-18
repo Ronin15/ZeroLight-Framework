@@ -1007,13 +1007,6 @@ pub const SpatialIndexSystem = struct {
         if (self.level_slots.items.len < geometry.level_count) try self.fitLevels(geometry.level_count);
     }
 
-    /// Bytes the level directories hold.
-    pub fn directoryBytes(self: *const SpatialIndexSystem) usize {
-        var bytes: usize = 0;
-        for (self.level_slots.items) |slots| bytes += slots.len * chunk_slot_bytes;
-        return bytes;
-    }
-
     // Grows or shrinks the directories to `level_count` levels, new ones all stale.
     fn fitLevels(self: *SpatialIndexSystem, level_count: usize) error{OutOfMemory}!void {
         self.freeLevels(level_count);
@@ -1648,7 +1641,8 @@ fn chooseSplitters(data: *const DataSystem, population: IndexPopulation, grid: G
 // ---- Tests --------------------------------------------------------------------
 
 const testing = std.testing;
-const buildInline = @import("spatial_index_test_support.zig").buildInline;
+const spatial_index_test_support = @import("spatial_index_test_support.zig");
+const buildInline = spatial_index_test_support.buildInline;
 
 // The test queries' budget ceiling, past every test layout's entry count, and their block.
 const max_test_checks: u16 = 512;
@@ -3269,7 +3263,7 @@ test "the level directories follow the geometry: reset on a grid change, grown f
     defer system.deinit();
     _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
     try testing.expectEqual(@as(usize, 2), system.level_slots.items.len);
-    try testing.expectEqual(2 * 16 * chunk_slot_bytes, system.directoryBytes());
+    try testing.expectEqual(2 * 16 * chunk_slot_bytes, spatial_index_test_support.directoryBytes(&system));
 
     // A body on a level past the geometry's gets its directory, and the next build without
     // it releases the tail.
@@ -3305,7 +3299,7 @@ test "the level directories follow the geometry: reset on a grid change, grown f
                 try buildInline(&system, empty.data, empty.population, testGeometry(32, 4, 2), .{});
             try testing.expectEqual(@as(usize, 0), stats.entity_count);
             try testing.expectEqual(@as(usize, 2), system.level_slots.items.len);
-            try testing.expectEqual(2 * 16 * chunk_slot_bytes, system.directoryBytes());
+            try testing.expectEqual(2 * 16 * chunk_slot_bytes, spatial_index_test_support.directoryBytes(&system));
         }
     }
     try data.setWorldLevel(body, 1);
@@ -3313,7 +3307,7 @@ test "the level directories follow the geometry: reset on a grid change, grown f
     // A grid change rebuilds every directory at the new chunk count.
     _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 8, 3), .{});
     try testing.expectEqual(@as(usize, 3), system.level_slots.items.len);
-    try testing.expectEqual(3 * 64 * chunk_slot_bytes, system.directoryBytes());
+    try testing.expectEqual(3 * 64 * chunk_slot_bytes, spatial_index_test_support.directoryBytes(&system));
     for (system.level_slots.items) |slots| try testing.expectEqual(@as(usize, 64), slots.len);
     try expectRecordsAgree(&system);
 }

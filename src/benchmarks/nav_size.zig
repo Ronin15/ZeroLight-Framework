@@ -51,7 +51,7 @@ pub const NavSizeConfig = struct {
     /// The escalated search's abstract node cap (`PathfindingCapacity.max_abstract_nodes`),
     /// which sizes each tier-1 corridor scratch; the library default unless a probe raises it.
     tier1_abstract_nodes: usize = (PathfindingCapacity{}).max_abstract_nodes,
-    /// The built world's chunk forms and link endpoints (`NavGraph.storageContentOf`), plus
+    /// The built world's chunk forms and link endpoints (`navStorageContentOf` in the pathfinding test support), plus
     /// what the workload adds; null charges every chunk mixed.
     content: ?NavGraph.StorageContent = null,
 

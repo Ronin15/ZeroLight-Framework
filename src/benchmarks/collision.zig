@@ -60,6 +60,7 @@ const default_chunk_size_tiles = @import("../game/world/system.zig").default_chu
 const tile_size = @import("../assets/world_tileset_meta.zig").required_tile_size;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
+const static_colliders_test_support = @import("../game/systems/static_colliders_test_support.zig");
 
 pub const group = suite.BenchmarkGroup{
     .name = "collision",
@@ -419,7 +420,7 @@ const StaticMover = struct {
         // The statics' tiles: two tiles per pitch cell a side.
         const cells: u32 = @intCast(2 * fixture.side);
         try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles));
-        if (colliders.rowCount() != fixture.side * fixture.side) return error.WrongStaticCount;
+        if (static_colliders_test_support.liveRowCount(colliders) != fixture.side * fixture.side) return error.WrongStaticCount;
         fixtures.setSpliceTuners(&colliders, case);
         const home = pitchCellOrigin(fixture.side - 1, fixture.side - 1);
         // Statics sit on even tiles, so an odd tile offset lands on a free tile.

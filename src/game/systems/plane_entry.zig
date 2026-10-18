@@ -225,7 +225,7 @@ pub const PlaneEntrySystem = struct {
         std.debug.assert(self.entries.capacity >= self.reserved_items);
         std.debug.assert(self.tallies.capacity >= maxRangeCount(self.reserved_items, plane_entry_range_alignment_items));
         self.windows_grown += 1;
-        if (comptime logging.enabled(.warn) and !builtin.is_test) {
+        if (comptime logging.enabled(.warn)) {
             if (self.windows_grown == 1) logging.game.warn(
                 "plane entry gather: {d} AI rows exceeded the reserved windows; grew to {d} (reservation short of the live population)",
                 .{ needed, target },

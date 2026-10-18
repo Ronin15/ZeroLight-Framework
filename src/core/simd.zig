@@ -334,14 +334,6 @@ pub inline fn vectorizedEnd(item_count: usize) usize {
     return vectorCount(item_count) * lane_count;
 }
 
-pub inline fn tailLen(item_count: usize) usize {
-    return item_count - vectorizedEnd(item_count);
-}
-
-pub inline fn hasTail(item_count: usize) bool {
-    return tailLen(item_count) != 0;
-}
-
 /// Counts positions `index` where `lhs[index] != rhs[index]`; the slices have equal
 /// length. Whole registers, then a scalar tail.
 pub fn countUnequalU16(lhs: []const u16, rhs: []const u16) u32 {
@@ -424,24 +416,8 @@ pub const Vec2x4 = struct {
     y: Float4,
 };
 
-/// Per-lane sine and cosine results.
-pub const SinCos4 = struct {
-    sin: Float4,
-    cos: Float4,
-};
-
 /// Four lanes gathered at `indices`: the gather of the packed-SoA-scratch pattern.
 pub inline fn gatherFloat4(values: []const f32, indices: [lane_count]usize) Float4 {
-    return .{
-        values[indices[0]],
-        values[indices[1]],
-        values[indices[2]],
-        values[indices[3]],
-    };
-}
-
-/// Gathers four `i32` values from `values` at the given indices into lane order.
-pub inline fn gatherInt4(values: []const i32, indices: [lane_count]usize) Int4 {
     return .{
         values[indices[0]],
         values[indices[1]],
@@ -524,23 +500,6 @@ pub inline fn lerpVec2Float4(start: Vec2x4, end: Vec2x4, amount: Float4) Vec2x4 
 /// Per-lane 2D dot product: `ax * bx + ay * by`.
 pub inline fn dotFloat4(ax: Float4, ay: Float4, bx: Float4, by: Float4) Float4 {
     return addFloat4(mulFloat4(ax, bx), mulFloat4(ay, by));
-}
-
-/// Per-lane sine. Uses the compiler builtin element-wise over the vector; the
-/// single call site lets a vectorized polynomial replace this later without
-/// touching callers.
-pub inline fn sinFloat4(values: Float4) Float4 {
-    return @sin(values);
-}
-
-/// Per-lane cosine. See `sinFloat4` for the implementation note.
-pub inline fn cosFloat4(values: Float4) Float4 {
-    return @cos(values);
-}
-
-/// Per-lane sine and cosine together, for rotation and field-of-view math.
-pub inline fn sinCosFloat4(values: Float4) SinCos4 {
-    return .{ .sin = @sin(values), .cos = @cos(values) };
 }
 
 fn expectFloatArrayApprox(actual: [lane_count]f32, expected: [lane_count]f32) !void {
@@ -667,26 +626,18 @@ test "maskBits holds each lane at its bit, for every lane pattern" {
     }
 }
 
-test "tail helpers cover empty partial exact and multi lane counts" {
+test "vector count and vectorized end cover empty partial exact and multi lane counts" {
     try std.testing.expectEqual(@as(usize, 0), vectorCount(0));
     try std.testing.expectEqual(@as(usize, 0), vectorizedEnd(0));
-    try std.testing.expectEqual(@as(usize, 0), tailLen(0));
-    try std.testing.expect(!hasTail(0));
 
     try std.testing.expectEqual(@as(usize, 0), vectorCount(3));
     try std.testing.expectEqual(@as(usize, 0), vectorizedEnd(3));
-    try std.testing.expectEqual(@as(usize, 3), tailLen(3));
-    try std.testing.expect(hasTail(3));
 
     try std.testing.expectEqual(@as(usize, 1), vectorCount(4));
     try std.testing.expectEqual(@as(usize, 4), vectorizedEnd(4));
-    try std.testing.expectEqual(@as(usize, 0), tailLen(4));
-    try std.testing.expect(!hasTail(4));
 
     try std.testing.expectEqual(@as(usize, 2), vectorCount(11));
     try std.testing.expectEqual(@as(usize, 8), vectorizedEnd(11));
-    try std.testing.expectEqual(@as(usize, 3), tailLen(11));
-    try std.testing.expect(hasTail(11));
 }
 
 test "countUnequalU16 matches its scalar form over every tail length and random, equal, and different data" {
@@ -807,12 +758,6 @@ test "gather and scatter move lanes through sparse indices" {
     const source = [_]f32{ 10, 11, 12, 13, 14, 15 };
     const gathered = gatherFloat4(&source, .{ 5, 0, 3, 1 });
     try expectFloatArrayApprox(toFloatArray(gathered), .{ 15, 10, 13, 11 });
-
-    const int_source = [_]i32{ 0, -1, -2, -3, -4 };
-    try std.testing.expectEqual(
-        [_]i32{ -4, 0, -2, -1 },
-        toIntArray(gatherInt4(&int_source, .{ 4, 0, 2, 1 })),
-    );
 
     var dest = [_]f32{ 0, 0, 0, 0, 0, 0 };
     scatterFloat4(&dest, .{ 5, 0, 3, 1 }, float4(15, 10, 13, 11));
@@ -1037,20 +982,6 @@ test "orderedBitsFloat4 matches math.orderedBits lane-for-lane" {
     while (start < cases.len) : (start += lane_count) {
         const lanes: [lane_count]u32 = orderedBitsFloat4(loadFloat4(cases[start..]));
         for (0..lane_count) |lane| try std.testing.expectEqual(math.orderedBits(cases[start + lane]), lanes[lane]);
-    }
-}
-
-test "sin and cos match scalar builtins per lane" {
-    const angles = float4(0, std.math.pi / 6.0, std.math.pi / 2.0, std.math.pi);
-    const sines = toFloatArray(sinFloat4(angles));
-    const cosines = toFloatArray(cosFloat4(angles));
-    const both = sinCosFloat4(angles);
-
-    inline for (0..lane_count) |lane| {
-        try std.testing.expectApproxEqAbs(@sin(angles[lane]), sines[lane], 0.0001);
-        try std.testing.expectApproxEqAbs(@cos(angles[lane]), cosines[lane], 0.0001);
-        try std.testing.expectApproxEqAbs(sines[lane], both.sin[lane], 0.0001);
-        try std.testing.expectApproxEqAbs(cosines[lane], both.cos[lane], 0.0001);
     }
 }
 

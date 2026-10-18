@@ -598,11 +598,6 @@ pub const StaticColliderSystem = struct {
         };
     }
 
-    /// Live rows.
-    pub fn rowCount(self: *const StaticColliderSystem) usize {
-        return self.rows.len - self.row_free.items.len;
-    }
-
     /// Whether captured changes wait for a `sync` (a failed sync keeps them). O(1).
     pub fn hasPendingChanges(self: *const StaticColliderSystem) bool {
         return self.pending_dirty.items.len != 0;
@@ -761,7 +756,7 @@ pub const StaticColliderSystem = struct {
         self.row_grows += 1;
         if (self.row_growth_logged) return;
         self.row_growth_logged = true;
-        if (comptime logging.enabled(.info) and !builtin.is_test)
+        if (comptime logging.enabled(.info))
             logging.game.info("static collider rows grew ({} growths so far)", .{self.row_grows});
     }
 
@@ -769,7 +764,7 @@ pub const StaticColliderSystem = struct {
         self.anchor_grows += 1;
         if (self.anchor_growth_logged) return;
         self.anchor_growth_logged = true;
-        if (comptime logging.enabled(.info) and !builtin.is_test)
+        if (comptime logging.enabled(.info))
             logging.game.info("static collider anchor blocks grew ({} growths so far)", .{self.anchor_grows});
     }
 
@@ -1219,7 +1214,7 @@ fn expectQueryTier(colliders: *const StaticColliderSystem) !void {
             entries += 1;
         }
     }
-    try std.testing.expectEqual(colliders.rowCount(), entries);
+    try std.testing.expectEqual(static_colliders_test_support.liveRowCount(colliders), entries);
 }
 
 const AnchorWords = [anchor_block_words]u64;
@@ -1296,7 +1291,7 @@ fn expectSameAnchors(a: *const StaticColliderSystem, b: *const StaticColliderSys
 // Whether `a` and `b` hold the same rows, the same lists over `levels` levels, the same
 // query tier, and the same anchor bits; each system's tiers and blocks agree with its rows.
 fn expectSameRows(a: *const StaticColliderSystem, b: *const StaticColliderSystem, levels: u16) !void {
-    try std.testing.expectEqual(a.rowCount(), b.rowCount());
+    try std.testing.expectEqual(static_colliders_test_support.liveRowCount(a), static_colliders_test_support.liveRowCount(b));
     const index_count = @max(a.row_of_index.items.len, b.row_of_index.items.len);
     for (0..index_count) |index| {
         try std.testing.expectEqual(placementOfIndex(a, @intCast(index)), placementOfIndex(b, @intCast(index)));
@@ -1366,12 +1361,14 @@ const SeamFixture = struct {
     }
 };
 
+const static_colliders_test_support = @import("static_colliders_test_support.zig");
+
 test "creating a static from a template indexes it once" {
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
     // A 1.5-cell box at a chunk corner covers four chunks.
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 112, .y = 112 }, .{ .x = 48, .y = 48 }) }});
-    try std.testing.expectEqual(@as(usize, 1), fixture.colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 1), static_colliders_test_support.liveRowCount(fixture.colliders));
     try std.testing.expectEqual(@as(usize, 4), listEntryCount(&fixture.colliders));
     try std.testing.expectEqual(@as(usize, 1), fixture.colliders.changesThisStep().len);
     const change = fixture.colliders.changesThisStep()[0];
@@ -1405,7 +1402,7 @@ test "destroying a template-created static frees every footprint entry" {
     const entity = fixture.colliders.changesThisStep()[0].entity;
     try std.testing.expect(listEntryCount(&fixture.colliders) > 1);
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .destroy_entity = entity }});
-    try std.testing.expectEqual(@as(usize, 0), fixture.colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(fixture.colliders));
     try std.testing.expectEqual(@as(usize, 0), listEntryCount(&fixture.colliders));
     try std.testing.expectEqual(@as(usize, 0), fixture.colliders.chunk_lists.live_keys);
     const change = fixture.colliders.changesThisStep()[0];
@@ -1438,7 +1435,7 @@ test "a destroy and a create reusing the index in one commit keep only the new r
         .{ .destroy_entity = old },
         .{ .create_entity = staticTemplate(.{ .x = 1000, .y = 1000 }, .{ .x = 8, .y = 8 }) },
     });
-    try std.testing.expectEqual(@as(usize, 1), fixture.colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 1), static_colliders_test_support.liveRowCount(fixture.colliders));
     const change = fixture.colliders.changesThisStep()[0];
     // The slot was reused: one change for the index, from the old row to the new one.
     try std.testing.expectEqual(@as(usize, 1), fixture.colliders.changesThisStep().len);
@@ -1605,7 +1602,7 @@ test "sync after reserve allocates nothing (FailingAllocator)" {
         fixture.colliders.capture(&fixture.frame);
         try fixture.colliders.sync(&fixture.data, null);
     }
-    try std.testing.expectEqual(@as(usize, 16), fixture.colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 16), static_colliders_test_support.liveRowCount(fixture.colliders));
     try std.testing.expectEqual(no_value, fixture.colliders.chunk_lists.value(kept_chunk));
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
@@ -1791,7 +1788,7 @@ test "a rebuild adds its growths to the row, chunk-list, query-list, and anchor-
     try std.testing.expectEqual(total_queries + empty_reference.query_lists.grows, fixture.colliders.query_lists.grows);
     try std.testing.expectEqual(total_anchors + empty_reference.anchor_grows, fixture.colliders.anchor_grows);
     try expectGrowthsLogged(&fixture.colliders);
-    try std.testing.expectEqual(@as(usize, 0), fixture.colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(fixture.colliders));
 }
 
 test "a move inside its footprint chunks touches no list" {
@@ -1827,7 +1824,7 @@ test "a destroy-heavy sync grows no rows" {
     var destroys: [32]StructuralCommand = undefined;
     for (fixture.colliders.changesThisStep(), &destroys) |change, *command| command.* = .{ .destroy_entity = change.entity };
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &destroys);
-    try std.testing.expectEqual(@as(usize, 0), fixture.colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(fixture.colliders));
     try std.testing.expectEqual(pooled, fixture.colliders.rows.len);
     try std.testing.expectEqual(grows, fixture.colliders.row_grows);
 }
@@ -1883,7 +1880,7 @@ test "a threaded sync after its reserves allocates nothing on a multi-worker Thr
         try std.testing.expectEqual(@as(usize, 48), fixture.colliders.anchor_sets.items.len);
         try std.testing.expectEqual(@as(usize, 48), fixture.colliders.anchor_clears.items.len);
     }
-    try std.testing.expectEqual(@as(usize, 48), fixture.colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 48), static_colliders_test_support.liveRowCount(fixture.colliders));
     try std.testing.expect(fixture.colliders.anchor_blocks.items.len != 0);
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
@@ -1906,7 +1903,7 @@ test "a row pool grow that fails after the pool moved keeps the column views on 
     try std.testing.expectEqual(columns.items(.cell_max_y).ptr, fixture.colliders.row_cell_max_y.ptr);
     // The retry adds rows beside the kept one.
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 400, .y = 40 }, .{ .x = 8, .y = 8 }) }});
-    try std.testing.expectEqual(@as(usize, 2), fixture.colliders.rowCount());
+    try std.testing.expectEqual(@as(usize, 2), static_colliders_test_support.liveRowCount(fixture.colliders));
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
