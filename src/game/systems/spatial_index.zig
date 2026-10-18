@@ -36,7 +36,6 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const setRowCount = @import("../../app/thread_system.zig").setRowCount;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
@@ -1059,9 +1058,9 @@ pub const SpatialIndexSystem = struct {
 
     /// Builds the index of `population`'s slots from their previous positions over
     /// `geometry`'s grid. Every stage runs on workers under the index's own tuners, or
-    /// inline as they select; with no worker available it builds serially. Allocates only
-    /// past `reserve`'s capacity or `reserveGeometry`'s directories, on the calling thread
-    /// before any dispatch that uses them.
+    /// inline as they select; with no worker available each runs inline as one range.
+    /// Allocates only past `reserve`'s capacity or `reserveGeometry`'s directories, on the
+    /// calling thread before any dispatch that uses them.
     pub fn build(
         self: *SpatialIndexSystem,
         data: *const DataSystem,
@@ -1072,7 +1071,7 @@ pub const SpatialIndexSystem = struct {
     ) !SpatialIndexStats {
         const slot_count = try self.beginBuild(population, geometry, config);
         if (slot_count == 0) return self.finishEmptyBuild(.{});
-        const threads = StageThreads.withWorkers(.{ .thread_system = thread_system, .config = config }) orelse return self.buildDirect(data, population);
+        const threads = StageThreads{ .thread_system = thread_system, .config = config };
         const stages = BuildStages{ .bucket = threads.stage(&self.bucket_tuner), .sort = threads.stage(&self.sort_tuner), .link = threads.stage(&self.link_tuner) };
         return self.buildBanded(data, population, stages, chooseSplitters(data, population, self.grid));
     }
@@ -1105,29 +1104,6 @@ pub const SpatialIndexSystem = struct {
         self.slot_rows.items.len = slot_count;
         self.keys.items.len = slot_count;
         return slot_count;
-    }
-
-    // The serial build: one fill straight into the keys, then one band's sort and link.
-    fn buildDirect(self: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation) !SpatialIndexStats {
-        const slot_count = population.len();
-        const fill = self.fillContext(data, population);
-        // At most slot_count <= maxInt(u32) keys.
-        const entry_count: u32 = @intCast(fillSlots(&fill, 0, slot_count, self.keys.items));
-        self.setEntryCount(entry_count);
-        var band_start: [band_count + 1]u32 = @splat(entry_count);
-        band_start[0] = 0;
-        var tallies: [band_count]BandTally = @splat(.{});
-        if (entry_count != 0) tallies[0] = self.bandWriter().finishBand(0, entry_count);
-        var link = try self.prepareLink(band_start, tallies, 1);
-        if (tallies[0].cell_count != 0) linkBand(&link, 0);
-        return .{
-            .entity_count = entry_count,
-            .sort_batch = inlineBatch(entry_count, spatial_index_range_alignment_items),
-            .perf = if (comptime runtime_perf_log.enabled) .{
-                .bucket_batch = inlineBatch(slot_count, spatial_index_range_alignment_items),
-                .link_batch = inlineBatch(tallies[0].cell_count, spatial_index_range_alignment_items),
-            } else .{},
-        };
     }
 
     // `index_bucket` over the slots into the bands of `splitters` (nondecreasing cell
@@ -2144,7 +2120,8 @@ test "serial and threaded index builds match across layouts, splitters, range si
 
         var reference_system = SpatialIndexSystem.init(testing.allocator);
         defer reference_system.deinit();
-        _ = try buildInline(&reference_system, &data, population, layout_geometry, config);
+        const reference_stats = try buildInline(&reference_system, &data, population, layout_geometry, config);
+        try testing.expect(reference_stats.sort_batch.ran_inline);
         var reference = try TestCapture.capture(&reference_system);
         defer reference.deinit();
         // The one cell holds every faction, each its own cell.
@@ -2161,7 +2138,9 @@ test "serial and threaded index builds match across layouts, splitters, range si
                 for ([_]usize{ 16, 1024 }) |sort_items| {
                     for ([_]usize{ 16, 1024 }) |link_items| {
                         _ = try system.beginBuild(population, layout_geometry, config);
-                        _ = try system.buildBanded(&data, population, testStages(&threads, &tuners, workers, bucket_items, sort_items, link_items), chooseSplitters(&data, population, system.grid));
+                        const stats = try system.buildBanded(&data, population, testStages(&threads, &tuners, workers, bucket_items, sort_items, link_items), chooseSplitters(&data, population, system.grid));
+                        // A layout's entries span more than one 16-key sort range.
+                        if (sort_items == 16) try testing.expect(!stats.sort_batch.ran_inline);
                         try expectIndexMatches(&system, &reference, &reference_system);
                     }
                 }
@@ -2172,15 +2151,18 @@ test "serial and threaded index builds match across layouts, splitters, range si
         const stages = testStages(&threads, &tuners, 3, 64, 64, 16);
         for (std.meta.tags(TestSplitters)) |set| {
             _ = try system.beginBuild(population, layout_geometry, config);
-            _ = try system.buildBanded(&data, population, stages, testSplitters(set, reference.cell_keys.items));
+            const stats = try system.buildBanded(&data, population, stages, testSplitters(set, reference.cell_keys.items));
+            try testing.expect(!stats.sort_batch.ran_inline);
             try expectIndexMatches(&system, &reference, &reference_system);
         }
 
-        // The production build, and a config that allows no worker builds serially.
-        _ = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .items_per_range = 16, .max_worker_threads = 3, .adaptive = false });
+        // The production build, and a config that allows no worker builds inline.
+        const threaded_stats = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .items_per_range = 16, .max_worker_threads = 3, .adaptive = false });
+        try testing.expect(!threaded_stats.sort_batch.ran_inline);
         // The link stage partitions the cells: one range of them may run inline.
         try expectIndexMatches(&system, &reference, &reference_system);
-        _ = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .max_worker_threads = 0 });
+        const inline_stats = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .max_worker_threads = 0 });
+        try testing.expect(inline_stats.sort_batch.ran_inline);
         try expectIndexMatches(&system, &reference, &reference_system);
     }
 }
@@ -2280,7 +2262,8 @@ test "serial and threaded builds over population rows match, each entry carrying
     var tuners: [3]AdaptiveWorkTuner = @splat(AdaptiveWorkTuner.init(.{}));
     for ([_]TestSplitters{ .stride, .straddle_chunk }) |set| {
         _ = try system.beginBuild(population, layout_geometry, config);
-        _ = try system.buildBanded(&data, population, testStages(&threads, &tuners, 3, 16, 16, 16), testSplitters(set, reference.cell_keys.items));
+        const stats = try system.buildBanded(&data, population, testStages(&threads, &tuners, 3, 16, 16, 16), testSplitters(set, reference.cell_keys.items));
+        try testing.expect(!stats.sort_batch.ran_inline);
         try expectIndexMatches(&system, &reference, &reference_system);
     }
 }
@@ -2877,25 +2860,25 @@ test "row parts hold each chunk row's cells at their local x, and a chunk or row
     var serial = SpatialIndexSystem.init(testing.allocator);
     defer serial.deinit();
     _ = try buildInline(&serial, &data, population, geometry, config);
-    const one_band = serial.view();
+    const inline_index = serial.view();
     // Chunk-major: chunk 0's row 0, chunk 1's rows 0 and 3, chunk 2's row 0.
     try testing.expectEqualSlices(RowPart, &.{
         .{ .cells = 1 << 15, .first_cell = 0 },
         .{ .cells = 1 | 1 << 15, .first_cell = 1 },
         .{ .cells = 1 << 4, .first_cell = 3 },
         .{ .cells = 1 | 1 << 15, .first_cell = 4 },
-    }, one_band.rows);
-    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5, 6 }, one_band.cells);
+    }, inline_index.rows);
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5, 6 }, inline_index.cells);
     const neutral = factionIndex(.neutral);
     const expected_records = [_]struct { row_mask: u64, first_row: u32 }{ .{ .row_mask = 1, .first_row = 0 }, .{ .row_mask = 1 | 1 << 3, .first_row = 1 }, .{ .row_mask = 1, .first_row = 3 } };
-    try testing.expectEqual(expected_records.len, one_band.chunk_records.len);
-    for (expected_records, one_band.chunk_records, one_band.level_slots[0][0..3], 0..) |want, record, slot, chunk| {
-        try testing.expectEqual(one_band.build_stamp, slot.build);
+    try testing.expectEqual(expected_records.len, inline_index.chunk_records.len);
+    for (expected_records, inline_index.chunk_records, inline_index.level_slots[0][0..3], 0..) |want, record, slot, chunk| {
+        try testing.expectEqual(inline_index.build_stamp, slot.build);
         try testing.expectEqual(@as(u32, @intCast(chunk)), slot.record);
         try testing.expectEqual(want.row_mask, record.row_masks[neutral]);
         try testing.expectEqual(want.first_row, record.first_rows[neutral]);
     }
-    try testing.expect(one_band.level_slots[0][3].build != one_band.build_stamp);
+    try testing.expect(inline_index.level_slots[0][3].build != inline_index.build_stamp);
 
     // A splitter at chunk 1's row 3 puts its row parts in two bands; one at its row 0's
     // second cell puts that row part's cells in two bands.
@@ -2909,9 +2892,9 @@ test "row parts hold each chunk row's cells at their local x, and a chunk or row
     var banded = SpatialIndexSystem.init(testing.allocator);
     defer banded.deinit();
     const query = NeighborQuery{ .x = 325, .y = 5, .level = 0, .radius = 1000, .max_candidate_checks = 64 };
-    var one_band_visits = RecordingVisitor{};
-    _ = testQuery(one_band, query, &one_band_visits);
-    try testing.expectEqual(@as(usize, 6), one_band_visits.count);
+    var inline_visits = RecordingVisitor{};
+    _ = testQuery(inline_index, query, &inline_visits);
+    try testing.expectEqual(@as(usize, 6), inline_visits.count);
     for ([_]TestSplitters{ .straddle_chunk, .straddle_row }) |set| {
         _ = try banded.beginBuild(population, geometry, config);
         _ = try banded.buildBanded(&data, population, testStages(&threads, &tuners, 2, 16, 16, 16), testSplitters(set, reference.cell_keys.items));
@@ -2919,7 +2902,7 @@ test "row parts hold each chunk row's cells at their local x, and a chunk or row
         // Both indexes visit every entry, in order, across the chunk edges.
         var two_band_visits = RecordingVisitor{};
         _ = testQuery(banded.view(), query, &two_band_visits);
-        try one_band_visits.expectEqual(&two_band_visits);
+        try inline_visits.expectEqual(&two_band_visits);
     }
 }
 
