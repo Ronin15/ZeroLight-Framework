@@ -428,11 +428,14 @@ comptime {
 
 const ContactCountTallyList = std.array_list.Aligned(ContactCountTally, .fromByteUnits(thread_shared_record_alignment));
 
-// A fill's band starts: band b's entries are `[entry_start[b], entry_start[b + 1])`, of
-// which the first copies rank `[first_start[b], first_start[b + 1])` among all first copies.
+// A fill's band starts: band b's entries are `[entry_start[b], entry_start[b + 1])`.
+// Its first copies rank `[first_start[b], first_start[b + 1])` among all first copies,
+// and its second copies rank `[second_start[b], second_start[b + 1])` among all second
+// copies. Within the band the runs are first, then second, then spill.
 const BandStarts = struct {
     entry_start: [band_count + 1]u32,
     first_start: [band_count + 1]u32,
+    second_start: [band_count + 1]u32,
 };
 
 pub const CollisionSystem = struct {
@@ -442,6 +445,9 @@ pub const CollisionSystem = struct {
     // Sort elements in sweep order; a threaded fill first writes each range's first copies
     // into its window.
     keys: SortEntryList = .empty,
+    // The banded sort's merge tails, indexed like `keys` and reserved with them.
+    // The direct path does not read it.
+    merge_scratch: SortEntryList = .empty,
     // A threaded fill's band-placed first-copy windows.
     staging: SortEntryList = .empty,
     first_offsets: SlotList(BandOffsets) = .empty,
@@ -513,6 +519,7 @@ pub const CollisionSystem = struct {
         self.second_scratch.deinit(self.allocator);
         self.first_offsets.deinit(self.allocator);
         self.staging.deinit(self.allocator);
+        self.merge_scratch.deinit(self.allocator);
         self.keys.deinit(self.allocator);
         self.proxies.deinit(self.allocator);
         self.* = undefined;
@@ -527,7 +534,8 @@ pub const CollisionSystem = struct {
     /// Broadphase pairs are data-dependent and keep per-range slots sized for the most
     /// entries range r of any partition covers (`@divCeil(entries, r + 1)`, r full ranges
     /// precede it), never clamped to the total: `broadphase_pairs_per_item` pairs per entry
-    /// for every `r < maxRangeCount`. The keys and entries hold `entries_per_body` per body;
+    /// for every `r < maxRangeCount`. The keys, the merge buffer, and the entries hold
+    /// `entries_per_body` per body;
     /// the merged candidates, the narrowphase staging (at most one contact per candidate
     /// pair, one window per range), and its tallies hold the pair bound over the body
     /// capacity (`broadphasePairBound`). A denser or taller scene, in total or inside one
@@ -541,6 +549,7 @@ pub const CollisionSystem = struct {
         const pair_capacity = broadphasePairBound(body_capacity);
         try self.proxies.ensureTotalCapacity(self.allocator, hotStoreCapacity(body_capacity));
         try self.keys.ensureTotalCapacity(self.allocator, entry_capacity);
+        try self.merge_scratch.ensureTotalCapacity(self.allocator, entry_capacity);
         try self.staging.ensureTotalCapacity(self.allocator, body_capacity);
         try self.entries.ensureTotalCapacity(self.allocator, hotStoreCapacity(entry_capacity + simd.lane_count));
         try self.warm_sources.ensureTotalCapacity(self.allocator, body_capacity);
@@ -794,6 +803,9 @@ pub const CollisionSystem = struct {
         const bands = bandStarts(self.first_offsets.items, self.second_offsets.items, spill_slots);
         const entry_count: usize = bands.entry_start[band_count];
         const first_count: usize = bands.first_start[band_count];
+        // Before `sizeEntries`: a failed ensure leaves the step's lengths unchanged.
+        try self.merge_scratch.ensureTotalCapacity(self.allocator, entry_count);
+        self.merge_scratch.items.len = entry_count;
         try self.sizeEntries(entry_count, input_count);
         if (entry_count != 0) {
             const sort_stage = threads.stage(&self.sort_tuner);
@@ -804,6 +816,7 @@ pub const CollisionSystem = struct {
                 .spills = .{ .slots = spill_slots },
                 .bands = bands,
                 .writer = self.entryWriter(),
+                .scratch = self.merge_scratch.items,
                 .range_count = sort_selection.range_count,
             };
             const sort_batch = sort_stage.run(sort_selection, entry_count, collision_range_alignment_items, &sort_job, sortJob);
@@ -1332,13 +1345,17 @@ fn fillJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 // Each band's entries start after every range's copies of the earlier bands. O(ranges *
 // bands) on the main thread.
 fn bandStarts(first_offsets: []const PaddedSlot(BandOffsets), second_offsets: []const PaddedSlot(BandOffsets), spill_slots: []const PaddedSlot(SpillCopies)) BandStarts {
-    var starts = BandStarts{ .entry_start = @splat(0), .first_start = @splat(0) };
+    var starts = BandStarts{ .entry_start = @splat(0), .first_start = @splat(0), .second_start = @splat(0) };
     for (first_offsets) |slot| {
         for (&starts.first_start, slot.value.offsets) |*start, offset| start.* += offset;
     }
     starts.entry_start = starts.first_start;
     for (second_offsets) |slot| {
         for (&starts.entry_start, slot.value.offsets) |*start, offset| start.* += offset;
+    }
+    // Seconds before each band, before the spill sum moves `entry_start`.
+    for (&starts.second_start, starts.entry_start, starts.first_start) |*second, entry, first| {
+        second.* = entry - first;
     }
     for (spill_slots) |slot| {
         for (&starts.entry_start, slot.value.offsets.offsets) |*start, offset| start.* += offset;
@@ -1355,6 +1372,8 @@ const SortJob = struct {
     spills: SpillSource,
     bands: BandStarts,
     writer: EntryWriter,
+    // Indexed like the keys. The owner of a band writes only that band's slice.
+    scratch: []SortEntry,
     range_count: usize,
 };
 
@@ -1373,7 +1392,14 @@ fn sortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         const end = job.bands.entry_start[band + 1];
         const gathered = EntrySort.gatherBand(job.writer.keys[start..end], band, .{ job.firsts, job.seconds, job.spills });
         std.debug.assert(gathered == end - start);
-        job.writer.finishBand(start, end, job.bands.first_start[band]);
+        const first_len = job.bands.first_start[band + 1] - job.bands.first_start[band];
+        const second_len = job.bands.second_start[band + 1] - job.bands.second_start[band];
+        const band_len = end - start;
+        std.debug.assert(first_len + second_len <= band_len);
+        const spill_len = band_len - first_len - second_len;
+        std.debug.assert(first_len + second_len + spill_len == band_len);
+        std.debug.assert(end <= job.scratch.len);
+        job.writer.finishBand(start, end, job.bands.first_start[band], first_len, second_len, spill_len, job.scratch);
     }
 }
 
@@ -1384,10 +1410,21 @@ const EntryWriter = struct {
     entries: EntryColumns,
     warm_sources: []u32,
 
-    // Sorts the band's keys `[start, end)` and writes it. pdqsort: the key is total, so an
-    // unstable sort is exact.
-    fn finishBand(self: EntryWriter, start: u32, end: u32, first_rank: u32) void {
-        pdqSort(SortEntry, self.keys[start..end], {}, entryLessThan);
+    // Sorts the band's first, second, and spill runs, merges the second and spill tails
+    // back from `scratch`, and writes the band. A warm first or second run is already
+    // ordered, so those sorts are linear. Spill copies are emitted in slot order, so
+    // that sort is not. The key is total, so the unstable sort matches the merge.
+    fn finishBand(self: EntryWriter, start: u32, end: u32, first_rank: u32, first_len: u32, second_len: u32, spill_len: u32, scratch: []SortEntry) void {
+        const first_end = start + first_len;
+        const second_end = first_end + second_len;
+        std.debug.assert(second_end + spill_len == end);
+        pdqSort(SortEntry, self.keys[start..first_end], {}, entryLessThan);
+        pdqSort(SortEntry, self.keys[first_end..second_end], {}, entryLessThan);
+        pdqSort(SortEntry, self.keys[second_end..end], {}, entryLessThan);
+        @memcpy(scratch[first_end..second_end], self.keys[first_end..second_end]);
+        @memcpy(scratch[second_end..end], self.keys[second_end..end]);
+        mergeIntoSorted(self.keys[start..second_end], first_len, scratch[first_end..second_end]);
+        mergeIntoSorted(self.keys[start..end], second_end - start, scratch[second_end..end]);
         self.writeSorted(start, end, first_rank);
     }
 
@@ -1988,6 +2025,23 @@ test "threaded contacts equal the reference across range sizes and worker counts
         _ = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = workers, .adaptive = false });
         try expectSameContacts(expected, contacts.mergedItems());
     };
+
+    // One sort range with workers present: the inline banded path, not the direct step.
+    var inline_system = CollisionSystem.init(std.testing.allocator);
+    defer inline_system.deinit();
+    var inline_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer inline_contacts.deinit();
+    const inline_stats = try inline_system.update(&data, &inline_contacts, &threads, .{
+        .items_per_range = 4096,
+        .max_worker_threads = 1,
+        .adaptive = false,
+    });
+    try std.testing.expect(threads.workerThreadCount() > 0);
+    try std.testing.expectEqual(@as(usize, 1), inline_stats.broadphase_batch.range_count);
+    try std.testing.expect(inline_stats.broadphase_batch.ran_inline);
+    // Direct's untimed batch leaves available workers at 0.
+    try std.testing.expect(inline_stats.broadphase_batch.available_worker_threads != 0);
+    try expectSameContacts(expected, inline_contacts.mergedItems());
 }
 
 test "fill, sort, broadphase, and narrowphase run on workers" {
@@ -2405,6 +2459,7 @@ test "thread-written collision range scratch uses cache-line sized slots" {
         @intFromPtr(system.second_scratch.items.ptr),
         @intFromPtr(system.second_staging.items.ptr),
         @intFromPtr(system.keys.items.ptr),
+        @intFromPtr(system.merge_scratch.items.ptr),
         @intFromPtr(system.staging.items.ptr),
     }) |address| try std.testing.expectEqual(@as(usize, 0), address % thread_shared_record_alignment);
 }
@@ -3104,22 +3159,62 @@ test "narrowphase simd contacts match scalar contactForCandidate" {
 test "merging sorted runs equals sorting their concatenation" {
     var prng = std.Random.DefaultPrng.init(0x6d_65_72_67);
     const random = prng.random();
-    for ([_][2]usize{ .{ 0, 0 }, .{ 5, 0 }, .{ 0, 5 }, .{ 1, 1 }, .{ 40, 13 }, .{ 7, 60 } }) |lengths| {
+    // Three runs, unique keys: the two merges `finishBand` makes, every entry field.
+    for ([_][3]usize{
+        .{ 0, 0, 0 },
+        .{ 5, 0, 0 },
+        .{ 0, 5, 0 },
+        .{ 0, 0, 5 },
+        .{ 1, 1, 1 },
+        .{ 40, 13, 7 },
+        .{ 7, 60, 3 },
+        .{ 0, 4, 9 },
+    }) |lengths| {
+        const first_len = lengths[0];
+        const second_len = lengths[1];
+        const spill_len = lengths[2];
+        const total = first_len + second_len + spill_len;
         var keys: [120]SortEntry = undefined;
-        var tail: [60]SortEntry = undefined;
-        const head = keys[0..lengths[0]];
-        for (head) |*entry| entry.* = .{ .key = random.uintLessThan(u128, 50), .slot = 0, .first = true };
-        for (tail[0..lengths[1]], 0..) |*entry, index| entry.* = .{ .key = random.uintLessThan(u128, 50), .slot = @intCast(index), .first = false };
-        std.sort.pdq(SortEntry, head, {}, entryLessThan);
-        std.sort.pdq(SortEntry, tail[0..lengths[1]], {}, entryLessThan);
+        var scratch: [120]SortEntry = undefined;
+        var order: [120]u128 = undefined;
+        for (order[0..total], 0..) |*key, index| key.* = index;
+        random.shuffle(u128, order[0..total]);
+        for (keys[0..first_len], order[0..first_len]) |*entry, key| {
+            entry.* = .{ .key = key, .slot = random.int(u32), .first = true };
+        }
+        for (keys[first_len..][0..second_len], order[first_len..][0..second_len]) |*entry, key| {
+            entry.* = .{ .key = key, .slot = random.int(u32), .first = false };
+        }
+        for (keys[first_len + second_len ..][0..spill_len], order[first_len + second_len ..][0..spill_len]) |*entry, key| {
+            entry.* = .{ .key = key, .slot = random.int(u32), .first = false };
+        }
+        pdqSort(SortEntry, keys[0..first_len], {}, entryLessThan);
+        pdqSort(SortEntry, keys[first_len..][0..second_len], {}, entryLessThan);
+        pdqSort(SortEntry, keys[first_len + second_len ..][0..spill_len], {}, entryLessThan);
         var expected: [120]SortEntry = undefined;
-        @memcpy(expected[0..lengths[0]], head);
-        @memcpy(expected[lengths[0]..][0..lengths[1]], tail[0..lengths[1]]);
-        const total = lengths[0] + lengths[1];
+        @memcpy(expected[0..total], keys[0..total]);
         std.sort.pdq(SortEntry, expected[0..total], {}, entryLessThan);
-        mergeIntoSorted(keys[0..total], lengths[0], tail[0..lengths[1]]);
-        for (expected[0..total], keys[0..total]) |want, got| try std.testing.expectEqual(want.key, got.key);
+        const second_end = first_len + second_len;
+        @memcpy(scratch[first_len..second_end], keys[first_len..second_end]);
+        @memcpy(scratch[second_end..total], keys[second_end..total]);
+        mergeIntoSorted(keys[0..second_end], first_len, scratch[first_len..second_end]);
+        mergeIntoSorted(keys[0..total], second_end, scratch[second_end..total]);
+        for (expected[0..total], keys[0..total]) |want, got| try std.testing.expectEqual(want, got);
     }
+
+    // Equal keys take the tail (`>`), so the tail entry is the later one.
+    var tied = [_]SortEntry{
+        .{ .key = 4, .slot = 1, .first = true },
+        .{ .key = 4, .slot = 1, .first = true },
+    };
+    const tied_tail = [_]SortEntry{
+        .{ .key = 4, .slot = 2, .first = false },
+    };
+    mergeIntoSorted(&tied, 1, &tied_tail);
+    try std.testing.expectEqual(@as(u32, 1), tied[0].slot);
+    try std.testing.expectEqual(@as(u32, 2), tied[1].slot);
+    try std.testing.expect(tied[0].first);
+    try std.testing.expect(!tied[1].first);
 }
 
 test "strips are the tile size rounded down to a power of two" {

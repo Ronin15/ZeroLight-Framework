@@ -670,6 +670,13 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_contacts, metric(collision_stats.contact_count));
         perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
         if (collision_stats.pair_bound_exceeded) perf.recordMetric(.collision_pair_bound_exceeded, 1);
+        if (comptime runtime_perf_log.enabled) {
+            const sort_batch = collision_stats.perf.sort_batch;
+            // Direct's inline batch is untimed and has no workers, so it is not a sample.
+            if (sort_batch.available_worker_threads != 0 or sort_batch.batch_duration_ns != 0) {
+                perf.recordBatch(.collision_sort, sort_batch);
+            }
+        }
         perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
         perf.recordBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
 
