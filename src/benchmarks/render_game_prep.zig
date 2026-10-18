@@ -173,8 +173,8 @@ fn runCaseWithConfig(
     defer draw_list.deinit(allocator);
     try draw_list.ensureTotalCapacity(allocator, fixture.static_group_count + command_capacity);
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
 
     if (suite.adaptiveTunerForCase(case, render_game_prep_range_alignment_items)) |tuner| {
         batch.adaptive_tuner = tuner;
@@ -188,7 +188,7 @@ fn runCaseWithConfig(
             &batch,
             &draw_list,
             table.resolver(),
-            if (threads) |*thread_system| thread_system else null,
+            &threads,
             case,
             allocator,
         );
@@ -208,7 +208,7 @@ fn runCaseWithConfig(
             &batch,
             &draw_list,
             table.resolver(),
-            if (threads) |*thread_system| thread_system else null,
+            &threads,
             case,
             allocator,
         );
@@ -258,7 +258,7 @@ fn runMeasuredOnce(
     batch: *sprite_batch.SpriteBatch,
     draw_list: *std.ArrayList(sprite_batch.DrawGroup),
     resolver: sprite_batch.TextureResolver,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
     allocator: std.mem.Allocator,
 ) !MeasuredGamePrep {
@@ -314,14 +314,10 @@ fn runMeasuredOnce(
 
 fn emitVertices(
     batch: *sprite_batch.SpriteBatch,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) BatchStats {
-    if (!case.usesThreadSystem()) {
-        return batch.emitVerticesAssumeCapacity(null, .{ .adaptive = false });
-    }
-
-    return batch.emitVerticesAssumeCapacity(thread_system.?, .{
+    return batch.emitVerticesAssumeCapacity(thread_system, .{
         .items_per_range = case.stageItemsPerRange(render_game_prep_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,

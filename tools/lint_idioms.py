@@ -349,7 +349,7 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
 
 # Rule 9: production files and the roots that are not production (tests, benches,
 # GPU smoke). Lines inside `test` blocks never count as production references.
-NON_PRODUCTION_ROOTS = {"src/tests.zig", "src/benchmark_runner.zig", "src/gpu_smoke.zig", "src/platform/gpu_smoke_impl.zig"}
+NON_PRODUCTION_ROOTS = {"src/tests.zig", "src/benchmark_runner.zig", "src/gpu_smoke.zig", "src/gpu_smoke_impl.zig"}
 # `pub` API the owner keeps in production with no production caller yet (engine surface
 # for games), keyed `(path, name)` with the owner's reason. Only the owner adds entries.
 OWNER_KEPT_API = {

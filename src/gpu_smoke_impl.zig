@@ -3,27 +3,28 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
-const AssetStore = @import("../assets/assets.zig").AssetStore;
+const ThreadSystem = @import("app/thread_system.zig").ThreadSystem;
+const AssetStore = @import("assets/assets.zig").AssetStore;
 const build_options = @import("build_options");
-const config = @import("../config.zig");
-const log = @import("../core/logging.zig").platform;
-const RenderOrder = @import("../render/renderer.zig").RenderOrder;
-const Renderer = @import("../render/renderer.zig").Renderer;
-const TilemapParams = @import("../render/renderer.zig").TilemapParams;
-const TileStoreSpan = @import("../render/renderer.zig").TileStoreSpan;
-const packTileData = @import("../render/renderer.zig").packTileData;
-const tile_store_no_link = @import("../render/renderer.zig").tile_store_no_link;
-const tileStoreBlockElements = @import("../render/renderer.zig").tileStoreBlockElements;
-const tileStoreUniformWord = @import("../render/renderer.zig").tileStoreUniformWord;
-const Position = @import("../render/renderer.zig").Position;
-const Uv = @import("../render/renderer.zig").Uv;
-const VertexColor = @import("../render/renderer.zig").VertexColor;
-const VertexColumnsConst = @import("../render/renderer.zig").VertexColumnsConst;
-const writeWorldSpriteQuad = @import("../render/renderer.zig").writeWorldSpriteQuad;
-const TextureDesc = @import("../render/resources.zig").TextureDesc;
-const TileDataId = @import("../render/resources.zig").TileDataId;
-const nextGeneration = @import("../render/resources.zig").nextGeneration;
-const sdl = @import("sdl.zig");
+const config = @import("config.zig");
+const log = @import("core/logging.zig").platform;
+const RenderOrder = @import("render/renderer.zig").RenderOrder;
+const Renderer = @import("render/renderer.zig").Renderer;
+const TilemapParams = @import("render/renderer.zig").TilemapParams;
+const TileStoreSpan = @import("render/renderer.zig").TileStoreSpan;
+const packTileData = @import("render/renderer.zig").packTileData;
+const tile_store_no_link = @import("render/renderer.zig").tile_store_no_link;
+const tileStoreBlockElements = @import("render/renderer.zig").tileStoreBlockElements;
+const tileStoreUniformWord = @import("render/renderer.zig").tileStoreUniformWord;
+const Position = @import("render/renderer.zig").Position;
+const Uv = @import("render/renderer.zig").Uv;
+const VertexColor = @import("render/renderer.zig").VertexColor;
+const VertexColumnsConst = @import("render/renderer.zig").VertexColumnsConst;
+const writeWorldSpriteQuad = @import("render/renderer.zig").writeWorldSpriteQuad;
+const TextureDesc = @import("render/resources.zig").TextureDesc;
+const TileDataId = @import("render/resources.zig").TileDataId;
+const nextGeneration = @import("render/resources.zig").nextGeneration;
+const sdl = @import("platform/sdl.zig");
 const c = sdl.c;
 
 const SmokeDepth = enum(i32) {
@@ -53,6 +54,8 @@ pub fn main(init: std.process.Init) !void {
 
     var renderer = try Renderer.init(init.gpa, window.handle, assets, app_config);
     defer renderer.deinit();
+    var threads = try ThreadSystem.init(init.gpa, init.io, app_config.threading);
+    defer threads.deinit();
 
     const tile_store = try createSmokeTileStore(&renderer);
 
@@ -84,8 +87,8 @@ pub fn main(init: std.process.Init) !void {
     // `endFrame` retires the store first (no device drain; SDL frees the buffer
     // after frame A completes) and the retained draw naming it is skipped.
     if (!renderer.claimTileStore(tile_store)) return error.TileStoreNotLive;
-    try submitSmokeFrame(&renderer, app_config, "sprite and tilemap on store A");
-    try submitSmokeFrame(&renderer, app_config, "sprite after store A sweep");
+    try submitSmokeFrame(&renderer, &threads, app_config, "sprite and tilemap on store A");
+    try submitSmokeFrame(&renderer, &threads, app_config, "sprite after store A sweep");
     if (renderer.claimTileStore(tile_store)) {
         log.err("SDL_GPU smoke tile store survived a frame without a claim", .{});
         return error.TileStoreNotSwept;
@@ -101,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
     renderer.beginStaticGeometry();
     try appendSmokeTilemap(&renderer, tile_quad, tile_store);
     try appendSmokeTilemap(&renderer, tile_quad, replacement);
-    try submitSmokeFrame(&renderer, app_config, "tilemap on store B beside a stale draw on store A");
+    try submitSmokeFrame(&renderer, &threads, app_config, "tilemap on store B beside a stale draw on store A");
     if (!renderer.claimTileStore(replacement)) {
         log.err("SDL_GPU smoke replacement tile store did not survive its first frame", .{});
         return error.TileStoreNotLive;
@@ -130,21 +133,21 @@ pub fn main(init: std.process.Init) !void {
         wrap_store,
         .{ .first_directory = 0, .count = 1 },
     );
-    try submitSmokeFrame(&renderer, app_config, "tilemap with a wrapped toroidal word and a discarded chunk");
+    try submitSmokeFrame(&renderer, &threads, app_config, "tilemap with a wrapped toroidal word and a discarded chunk");
     if (!renderer.claimTileStore(wrap_store)) {
         log.err("SDL_GPU smoke wrap tile store did not survive its first frame", .{});
         return error.TileStoreNotLive;
     }
 
     renderer.beginStaticGeometry();
-    try smokeTransferGrowth(&renderer, app_config, init.gpa);
-    try smokeTileUploadOom(&renderer, app_config, init.gpa, tile_quad);
+    try smokeTransferGrowth(&renderer, &threads, app_config, init.gpa);
+    try smokeTileUploadOom(&renderer, &threads, app_config, init.gpa, tile_quad);
 }
 
 // Frames uploading a small, a larger, then a small batch: only the larger one
 // replaces the pooled transfer, with at least twice its previous size, and the
 // small one after it reuses the grown transfer.
-fn smokeTransferGrowth(renderer: *Renderer, app_config: config.AppConfig, allocator: std.mem.Allocator) !void {
+fn smokeTransferGrowth(renderer: *Renderer, threads: *ThreadSystem, app_config: config.AppConfig, allocator: std.mem.Allocator) !void {
     const small_elements: u32 = 1;
     const larger_elements: u32 = renderer.tile_upload_transfer_byte_size / @sizeOf(u32) + 1;
     const values = try allocator.alloc(u32, larger_elements);
@@ -161,7 +164,7 @@ fn smokeTransferGrowth(renderer: *Renderer, app_config: config.AppConfig, alloca
     var grows: usize = 0;
     var bytes = bytes_before;
     inline for ([_][]const u32{ values[0..small_elements], values, values[0..small_elements] }, [_][]const u8{ "small transfer upload", "larger transfer upload", "small upload after transfer growth" }) |frame_values, label| {
-        try submitSmokeUploadFrame(renderer, app_config, store, frame_values, label);
+        try submitSmokeUploadFrame(renderer, threads, app_config, store, frame_values, label);
         if (renderer.tile_upload_transfer_byte_size != bytes) grows += 1;
         bytes = renderer.tile_upload_transfer_byte_size;
     }
@@ -184,6 +187,7 @@ fn smokeTransferGrowth(renderer: *Renderer, app_config: config.AppConfig, alloca
 
 fn submitSmokeUploadFrame(
     renderer: *Renderer,
+    threads: *ThreadSystem,
     app_config: config.AppConfig,
     store: TileDataId,
     values: []const u32,
@@ -195,7 +199,7 @@ fn submitSmokeUploadFrame(
     const spans = [_]TileStoreSpan{.{ .dst_element = 0, .count = count }};
     try renderer.reserveTileStoreUploads(store, count, spans.len, values.len);
     renderer.queueTileStoreUploads(store, &spans, values);
-    try submitSmokeFrame(renderer, app_config, label);
+    try submitSmokeFrame(renderer, threads, app_config, label);
 }
 
 // Store state an out-of-memory reserve must leave unchanged.
@@ -221,6 +225,7 @@ fn tileStoreUploadState(renderer: *const Renderer, id: TileDataId) TileStoreUplo
 // were, the first success queues without allocating, and the frame draws the store.
 fn smokeTileUploadOom(
     renderer: *Renderer,
+    threads: *ThreadSystem,
     app_config: config.AppConfig,
     allocator: std.mem.Allocator,
     quad: VertexColumnsConst,
@@ -268,7 +273,7 @@ fn smokeTileUploadOom(
 
     renderer.beginStaticGeometry();
     try appendSmokeTilemap(renderer, quad, store);
-    try submitSmokeFrame(renderer, app_config, "tilemap after an OOM-swept growing upload");
+    try submitSmokeFrame(renderer, threads, app_config, "tilemap after an OOM-swept growing upload");
     const after = tileStoreUploadState(renderer, store);
     if (after.pending_spans != 0 or after.growth_source != null or !renderer.claimTileStore(store)) {
         log.err("SDL_GPU smoke OOM-swept tile store did not flush and survive its frame", .{});
@@ -391,7 +396,7 @@ fn appendSmokeTilemap(renderer: *Renderer, quad: VertexColumnsConst, tile_store:
     );
 }
 
-fn submitSmokeFrame(renderer: *Renderer, app_config: config.AppConfig, comptime label: []const u8) !void {
+fn submitSmokeFrame(renderer: *Renderer, threads: *ThreadSystem, app_config: config.AppConfig, comptime label: []const u8) !void {
     renderer.beginFrame(app_config.clear_color);
     try renderer.submitOrderedRectInSpace(
         .{ .x = 96, .y = 32, .w = 64, .h = 64 },
@@ -399,7 +404,7 @@ fn submitSmokeFrame(renderer: *Renderer, app_config: config.AppConfig, comptime 
         RenderOrder.world(@backingInt(SmokeDepth.test_rect)),
         .world,
     );
-    switch (try renderer.endFrame(null)) {
+    switch (try renderer.endFrame(threads)) {
         .submitted => log.debug("SDL_GPU smoke submitted " ++ label ++ " frame", .{}),
         .skipped_no_swapchain => {
             log.err("SDL_GPU smoke could not acquire a swapchain texture", .{});

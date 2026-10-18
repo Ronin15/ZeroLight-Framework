@@ -837,7 +837,7 @@ pub const Renderer = struct {
 
     /// Retires every tile store no owner claimed since the previous `endFrame`
     /// (`claimTileStore`), then prepares, uploads, and draws the frame.
-    pub fn endFrame(self: *Renderer, thread_system: ?*ThreadSystem) !FrameResult {
+    pub fn endFrame(self: *Renderer, thread_system: *ThreadSystem) !FrameResult {
         self.sweepUnclaimedTileStores();
         try self.ensureFrameBatchCapacity();
         const window_size = try self.currentWindowSize();
@@ -1733,7 +1733,7 @@ pub const Renderer = struct {
         return self.batch.lastPrepStats();
     }
 
-    fn prepareFrameCommands(self: *Renderer, thread_system: ?*ThreadSystem) !void {
+    fn prepareFrameCommands(self: *Renderer, thread_system: *ThreadSystem) !void {
         _ = self.batch.buildAssumeCapacity(self.textureResolver(), thread_system, .{});
     }
 };
@@ -2198,8 +2198,10 @@ test "same-texture dynamic run straddling a static span interleaves by order" {
             }
         }.resolve,
     };
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
     try batch.ensureFrameStorage();
-    _ = batch.buildAssumeCapacity(resolver, null, .{});
+    _ = batch.buildAssumeCapacity(resolver, &threads, .{});
     try std.testing.expectEqual(@as(usize, 2), batch.draw_groups.items.len);
 
     var list: std.ArrayList(DrawGroup) = .empty;

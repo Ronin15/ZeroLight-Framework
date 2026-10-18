@@ -40,8 +40,8 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer batch.deinit();
     try batch.reserveStorage(item_count, item_count * 6, item_count);
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
 
     if (suite.adaptiveTunerForCase(case, sprite_prep_range_alignment_items)) |tuner| {
         batch.adaptive_tuner = tuner;
@@ -51,7 +51,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     // settled_before_measurement and work_tuning reflect the path actually timed.
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(batch.adaptive_tuner.phase == .settled)) {
-        _ = try runMeasuredOnce(item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
+        _ = try runMeasuredOnce(item_count, &batch, table.resolver(), &threads, case, io);
     }
     const settled_before_measurement = if (case.adaptive) (batch.adaptive_tuner.phase == .settled) else false;
 
@@ -60,7 +60,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var last_prep = sprite_batch.SpritePrepStats{};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const measured = try runMeasuredOnce(item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
+        const measured = try runMeasuredOnce(item_count, &batch, table.resolver(), &threads, case, io);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), measured.stats.batch);
         phase_accumulator.record(measured.phases);
@@ -92,7 +92,7 @@ fn runMeasuredOnce(
     item_count: usize,
     batch: *sprite_batch.SpriteBatch,
     resolver: sprite_batch.TextureResolver,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
     io: std.Io,
 ) !MeasuredPrep {
@@ -126,14 +126,10 @@ fn runMeasuredOnce(
 
 fn emitVertices(
     batch: *sprite_batch.SpriteBatch,
-    thread_system: ?*ThreadSystem,
+    thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) BatchStats {
-    if (!case.usesThreadSystem()) {
-        return batch.emitVerticesAssumeCapacity(null, .{ .adaptive = false });
-    }
-
-    return batch.emitVerticesAssumeCapacity(thread_system.?, .{
+    return batch.emitVerticesAssumeCapacity(thread_system, .{
         .items_per_range = case.stageItemsPerRange(sprite_prep_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
