@@ -20,7 +20,9 @@ recommend design instead of patching the symptom.
 
 The rule files in `.claude/rules/` load automatically: unscoped ones at start,
 path-scoped ones when you Read a matching file. Read a file you only grepped
-before relying on its rules. A fix meets them like any change.
+before relying on its rules. A fix meets them like any change, and never
+adds a test hook, skip, or counter read (`tests-benchmarks.md` § Test and
+production code).
 
 ## Classify First
 

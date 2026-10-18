@@ -6,9 +6,27 @@ paths:
 
 # Tests And Benchmarks
 
+## Test and production code
+
+The standard Zig layout; every change, plan, and review follows it.
+
+1. Production code holds only what production runs: no entry point,
+   parameter, branch, field, stage, hook, path, or work that only tests or
+   benches use, and no separate serial entry.
+2. Tests are `test` blocks in the owning file, named by behavior. A helper
+   only that file's tests use is a private file-scope function in that file.
+3. A module's `*test_support.zig` holds only what tests in other files or
+   benches need (benches are a separate root and see nothing private),
+   including byte bounds production does not use, built from `@sizeOf`.
+4. Diagnostic counters sit behind the comptime perf-log switch, which
+   removes their code and storage from shipping builds; the bench build
+   always enables it. Benches read counters; tests never do and never skip,
+   so every test is a logic test that runs in every build mode.
+
+`tools/lint_idioms.py` enforces what it can; the rest is a review finding.
+
 ## Tests
 
-- Tests are `test` blocks beside their code, named by behavior.
 - Prefer focused window-free contract tests; display/GPU checks belong in
   `gpu-smoke`.
 - A fix ships with a test that would fail without it, judged from the code,
@@ -27,19 +45,10 @@ paths:
 - Full procedural world-building paths run only when under test, at
   most 16x16 tiles and 1 underground level. A growth or scale test may use a
   larger populated world, or more levels, built directly.
-- Tests and benches never shape production code. Production modules carry no
-  test- or bench-only entry points, tags, payloads, fields, stages, hooks,
-  shortcuts, or paths, and production never does work only so it can be
-  measured or checked. Tests and benches drive the production functions and
-  use private helpers, fixtures, mocks, or real payloads; diagnostic
-  counters production keeps for measurement sit behind the comptime
-  perf-log switch, which removes their code and storage from shipping
-  builds (`zig-style.md` § Logging).
-- Counters belong to benches, never tests. Tests never read perf counters
-  and never skip: they assert behavior through production's observable
-  results, so every test runs in every build mode. A work bound is proven by
-  a bench pass-shape assert that reads the counters; the bench build always
-  enables the perf-log switch.
+- Tests assert behavior through production's observable results and drive
+  the production functions with private helpers, fixtures, mocks, or real
+  payloads. A work bound is proven by a bench pass-shape assert that reads
+  the counters (`zig-style.md` § Logging).
 - Tests never time anything and never call `src/benchmarks/` (except the
   shared harness's tests of its own pure utilities); bench-fixture
   correctness relies on internal asserts firing during a real bench run.
@@ -92,10 +101,9 @@ paths:
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).
-- Benches read production defaults, constants, and layouts; never copy
-  them. Byte bounds production does not use live in the owning module's
-  `*test_support.zig`, built from the structure's `@sizeOf`. A memory
-  estimate is checked whole against live bytes.
+- Benches read production defaults, constants, layouts, and byte bounds
+  (§ Test and production code, 3); never copy them. A memory estimate is
+  checked whole against live bytes.
 - Each group's doc states what it measures and its pass shape, and its
   asserts check that shape. Exception: a branch's measuring landing states
   each finding's pass shape in the group doc and asserts only fixture

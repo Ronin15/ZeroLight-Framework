@@ -103,7 +103,8 @@ section with nothing new is omitted.
 - **Pre-implementation check** (`.claude/rules/engine-design.md` § Cost
   model) against the live code at the design's HEAD; every `file:line` taken
   from an earlier brief or report is re-checked, never copied.
-- **Tests, benches, diagnostics**: each claimed growth order names the
+- **Tests, benches, diagnostics**, placed per `tests-benchmarks.md` § Test
+  and production code: each claimed growth order names the
   scaling bench group and sizes that will measure it
   (`.claude/rules/tests-benchmarks.md`); a slice that replaces a structure
   measures the old one first, so the baseline is measured, not derived (the

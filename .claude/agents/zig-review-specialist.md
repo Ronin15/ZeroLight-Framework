@@ -96,6 +96,9 @@ routes to design.
    A change path whose named cost-driver stage has no `runtime_perf_log`
    entry is a finding; so is logging stages beyond the cost drivers
    (`threading.md`).
+   **Test and production code**, every review: check every touched file
+   against `tests-benchmarks.md` § Test and production code; each departure
+   is a finding, never weighed against how existing code does it.
 5. **Scope**: the changed files against the brief's Files list; an unlisted
    file is a finding.
 6. **Roadmap docs**, when the change edits them: check against the roadmap index § Ground Rules (bare

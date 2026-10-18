@@ -35,7 +35,9 @@ them.
    Layout), with no unrelated refactor or reformat. Touch only the files the
    brief lists; a needed file outside the list stops the work and is
    reported, never edited first.
-4. Add the tests and scaling benches the rules require for the change.
+4. Add the tests and scaling benches the rules require for the change,
+   placed per `tests-benchmarks.md` § Test and production code; existing code
+   that departs from it is never a pattern to copy.
    Doc edits wait until the slice's programming is done: until then, put the
    doc changes as notes in the report.
 5. Validate per `.claude/rules/build-validation.md`. Write `zig build test`
