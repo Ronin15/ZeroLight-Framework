@@ -18,36 +18,33 @@ paths:
   (`memory-performance.md` § SIMD and core math).
 - Import declarations directly
   (`const Engine = @import("app/engine.zig").Engine;`), or a snake_case file
-  namespace where the call reads better.
-- A file-local alias of an imported declaration (`const Allocator =
-  std.mem.Allocator;`, `const Entity = types.Entity;`) is idiomatic Zig, as in
-  `std`. A `pub` re-export belongs only on a module's public surface (a package
-  facade, `Renderer`'s exported types); a bridge alias, one kept so an old path
-  still resolves after a move or rename, is not: importers switch to the new
-  path in the same change.
-- No unused file-scope declarations (dead imports or aliases); Zig compiles
-  only what is referenced, so they build clean and go stale (`idiom-lint`
-  enforces).
+  namespace where the call reads better. A file-local alias of an imported
+  declaration (`const Allocator = std.mem.Allocator;`) is idiomatic. A `pub`
+  re-export belongs only on a module's public surface (a package facade,
+  `Renderer`'s exported types), never as a bridge alias keeping an old path
+  resolving after a move or rename: importers switch in the same change.
+- No unused file-scope declarations (dead imports or aliases): they build
+  clean and go stale (`idiom-lint` enforces). Remove callerless `pub` helpers
+  and any `pub` export whose doc asserts a contract nothing references.
 - No `_mod` suffixes or double names (`thread.ThreadSystem`); never rename
   SDL/C, build-option, or `std.Build` names.
 - Use `std` before writing your own: containers, heaps (`std.PriorityQueue`),
-  bitsets (`std.bit_set`), sorts, searches, hashing, and parsing. Write your own
-  only when std has no API for the job or a bench shows it beats std on a hot
-  path; state that reason at the site. Code that duplicates std without that
-  reason is replaced with the std version as soon as it is found.
+  bitsets (`std.bit_set`), sorts, searches, hashing, and parsing. Write your
+  own only when std has no API for the job or a bench shows it beats std on a
+  hot path, stating that reason at the site; code duplicating std without it
+  is replaced with the std version as soon as it is found.
 - Sorts on a production path use `src/core/sort.zig` (`pdq`, `insertion`):
-  std's sorts swap through `std.mem.swap`, a per-byte loop (measured). Where a
-  stable `std.mem.sort` has a comparator that is a total order, it moves to
-  `pdq`; where ties are possible, it keeps `std.mem.sort`, or uses `insertion`
-  when the input is small and bounded. Test, bench, and cold one-off sorts keep
-  std.
+  std's sorts swap through `std.mem.swap`, a per-byte loop (measured). A stable
+  `std.mem.sort` whose comparator is a total order moves to `pdq`; where ties
+  are possible it keeps `std.mem.sort`, or uses `insertion` when the input is
+  small and bounded. Test, bench, and cold one-off sorts keep std.
 - Current spellings (`idiom-lint` enforces most):
   - `std.ArrayList` (unmanaged, `.empty`), never `std.ArrayListUnmanaged` or
-    managed constructors.
+    managed constructors; `std.array_list.Aligned`, never
+    `std.ArrayListAligned`.
   - `@backingInt`/`@fromBackingInt`, not `@intFromEnum`/`@enumFromInt`.
   - `@splat(x)`, not `**`; `@memcpy`/`@memset`, not `std.mem.copy`/`set`;
     `@memmove`, not `std.mem.copyForwards`/`copyBackwards`.
-  - `std.array_list.Aligned`, never `std.ArrayListAligned`.
   - `std.mem.print`, not `std.fmt.bufPrint`.
   - `@typeInfo(T).<kind>.field_names`/`field_types` or `std.meta.tags(E)`, not
     `std.meta.fields`.
@@ -60,15 +57,13 @@ paths:
   - No `usingnamespace`, `std.BoundedArray`, or `kCamel` constants.
 - Never gate a hook on `@hasDecl` (0.17 sees only `pub` decls); make it
   required and call it unconditionally.
-- Remove callerless `pub` helpers and any `pub` export whose doc asserts a
-  contract nothing references.
 
 ## Errors and resources
 
 - Keep error sets explicit (`error{SdlError}`), except `*anyopaque` +
   `anyerror!T` vtables at cold type-erased service boundaries.
 - Never swallow an error where diagnosis matters. Advance edge/latch state only
-  on the success path (`enqueue(...) catch return; latch = true;`); otherwise it
+  on the success path (`enqueue(...) catch return; latch = true;`), or it
   desyncs from the engine.
 - Pair every SDL/GPU/audio resource creation with its cleanup at the owning
   site, `errdefer` partial initialization, and keep `defer` next to creation.
@@ -99,10 +94,9 @@ paths:
 ## Logging
 
 - Route runtime diagnostics through the owning module's scoped logger in
-  `src/core/logging.zig`:
-  `const log = @import("../core/logging.zig").render;`.
-- Never call `std.log`/`std.log.scoped(...)` directly; `std.debug.print` is for
-  `src/benchmarks/` CLI stdout only.
+  `src/core/logging.zig` (`const log = @import("../core/logging.zig").render;`).
+  Never call `std.log`/`std.log.scoped(...)` directly; `std.debug.print` is
+  for `src/benchmarks/` CLI stdout only.
 - `info`/`debug` for lifecycle, config, and fallback; `warn` for recovered
   degradation; `err` for real failures. Pure helpers and validation stay
   log-free.

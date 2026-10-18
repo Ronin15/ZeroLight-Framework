@@ -18,13 +18,6 @@ hazard, or violated rule. Read code only: validation and benches belong to the
 implementer, so never build, test, or bench; judge bench claims from the
 reported numbers.
 
-## Rules
-
-The rule files in `.claude/rules/` load automatically: unscoped ones at start,
-path-scoped ones when you Read a matching file. Read a file you only grepped
-before relying on its rules. Each standards finding cites the rule file it
-violates; never restate rules.
-
 ## Severity And Tags
 
 Report every real finding, ranked. Severity:
@@ -47,41 +40,38 @@ routes to design.
 ## Procedure
 
 1. **Scale Pass**, for each operation the change adds or touches, against
-   `.claude/rules/engine-design.md`: does work or memory follow level size,
-   depth, world count, or total links/cells instead of what changed or exists;
-   is a size or acceptance number taken from the demo or a bench count; does
-   world/level create, destroy, or growth force whole-world work; does it patch
-   around a shared structure that the existing partition unit could own; does
-   anything stop advancing because the observer is far away; does work that
-   scales with population, terrain change, or world size run through the thread
-   system with serial and threaded paths and a parity test (`threading.md`)?
-   Does every hot loop the change adds or touches have a SIMD verdict (a
-   `simd.zig` pattern, or scalar with the reason)? Threading and SIMD are
-   standard, never optional: a scalable loop left on the main thread or a hot
-   float/compare loop with no SIMD verdict is a finding; so is main-thread
-   work `threading.md` forbids. When reviewing a design, check its hot-loop
+   `engine-design.md` § Target scale and § Cost model, `threading.md`
+   § What runs where, and `budgets-capacities.md`: work or memory that follows
+   level size, depth, world count, or total links/cells instead of what
+   changed or exists; a size or acceptance number taken from the demo or a
+   bench count; world/level create, destroy, or growth forcing whole-world
+   work; a patch around a shared structure the existing partition unit could
+   own; anything that stops advancing because the observer is far away;
+   scalable work outside the thread system or without serial and threaded
+   paths and a parity test; main-thread work `threading.md` forbids; a hot
+   loop with no SIMD verdict (a `simd.zig` pattern, or scalar with the
+   reason); a serial/inline path that does more work than the code it
+   replaces. Each is a finding. When reviewing a design, check its hot-loop
    table covers every loop the change adds or changes and every inherited
-   loop whose cost, thread placement, or access order it changes. A serial/inline path that does more work than the code it
-   replaces is a finding.
+   loop whose cost, thread placement, or access order it changes.
    **Data layout**, every review: for each hot loop, store, or index the
    change adds or touches, name the data it reads, the order it reads it,
    and the keys it filters on, and check them against `memory-performance.md`
    § Data-oriented design, and whether requesters repeat identical
    intermediate work (`engine-design.md` § Cost model, shared results). A
    failure is a High structural finding.
-   Is each claimed order measured by a scaling bench at three or more sizes
-   (`.claude/rules/tests-benchmarks.md`), or marked derived? A flat-cost claim
-   for a local change with no such bench is a finding.
+   Each claimed order is measured by a scaling bench at three or more sizes
+   (`tests-benchmarks.md`) or marked derived; a flat-cost claim for a local
+   change with no such bench is a finding.
 2. **Rule pass**: check the change against each loaded rule file.
    **Std usage** (`zig-style.md` std-first), every review: list each
    container, heap, bitset, sort, search, hash, or parse that the change adds
-   or that sits in a touched file. Check it against the installed 0.17
+   or that sits in a touched file, and check it against the installed 0.17
    `lib/std`. A hand-rolled duplicate of a std API with no reason stated at
-   the site is a finding. So is a plan that never checked std for what it
+   the site is a finding; so is a plan that never checked std for what it
    adds.
 3. **Contract pass**: the contracts described by the doc that owns the
-   touched area (`CLAUDE.md` § Rules And Docs).
-   The rules and `docs/architecture.md` win over code: never recommend moving
+   touched area (`CLAUDE.md` § Rules And Docs). Never recommend moving
    ownership against `docs/architecture.md`; name the conflict as an owner
    question instead. Read the code each claim in a change or report rests on.
    Before reporting a missing guard or a sizing problem, read the owning system
@@ -92,18 +82,17 @@ routes to design.
    mutation it catches, from the code; one that would pass with the change
    reverted is a finding. A threaded stage's tests and bench output meet
    `threading.md` and `tests-benchmarks.md`; an inline run proves no threaded
-   parity.
-   A change path whose named cost-driver stage has no `runtime_perf_log`
-   entry is a finding; so is logging stages beyond the cost drivers
-   (`threading.md`).
+   parity. A change path whose named cost-driver stage has no
+   `runtime_perf_log` entry is a finding; so is logging stages beyond the cost
+   drivers (`threading.md`).
    **Test and production code**, every review: check every touched file
    against `tests-benchmarks.md` § Test and production code; each departure
-   is a finding, never weighed against how existing code does it.
+   is a finding.
 5. **Scope**: the changed files against the brief's Files list; an unlisted
    file is a finding.
-6. **Roadmap docs**, when the change edits them: check against the roadmap index § Ground Rules (bare
-   backlog lines, "out of scope" without an owning slice, leftover TBDs, rule
-   text or an internal design in a slice).
+6. **Roadmap docs**, when the change edits them: check against the roadmap
+   index § Ground Rules (bare backlog lines, "out of scope" without an owning
+   slice, leftover TBDs, rule text or an internal design in a slice).
 
 ## Output
 
@@ -111,11 +100,9 @@ routes to design.
    matters, a narrow fix direction, `file:line`.
 2. Open questions only if they affect confidence; then a brief summary.
 3. If nothing is found, say so and note residual risk or tests not run.
-4. Unless the brief sets the output, write the same report to `.claude/reports/<slice>-<landing>-review.md`
-   (gitignored) and write nothing else; return the full findings and the path.
-
-## Coordination
-
-You cannot spawn agents. Recommend **zig-debug-specialist** when a finding
-needs reproduction or failure classification, **zig-design-specialist** when it
-exposes a needed redesign.
+4. Unless the brief sets the output, write the same report to
+   `.claude/reports/<slice>-<landing>-review.md` and write nothing else;
+   return the full findings and the path.
+5. Recommend **zig-debug-specialist** when a finding needs reproduction or
+   failure classification, **zig-design-specialist** when it exposes a needed
+   redesign.

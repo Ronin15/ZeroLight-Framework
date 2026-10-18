@@ -33,20 +33,19 @@ The standard Zig layout; every change, plan, and review follows it.
   never by revert-and-rerun runs. Never drop a proof test or
   `FailingAllocator` proof to save time; a work-bound proof moves to its
   bench group, never away.
-- A threaded stage has a bench dispatch check proving it ran on workers,
-  not inline.
+- A threaded stage has a bench dispatch check proving it ran on workers, not
+  inline.
 - Terrain contract tests cover a multi-chunk one-step change and repeated
-  dig/fill.
-- An incremental path (nav patch, terrain or link change) gets an
+  dig/fill. An incremental path (nav patch, terrain or link change) gets an
   incremental == full-rebuild parity test.
 - Use the smallest `WorldSystem`/`DataSystem` fixture that exercises the
   behavior (a `1x1` world still has one real chunk); multi-chunk tests shrink
-  the chunk size rather than grow the world.
-- Full procedural world-building paths run only when under test, at
-  most 16x16 tiles and 1 underground level. A growth or scale test may use a
-  larger populated world, or more levels, built directly.
-- Tests assert behavior through production's observable results and drive
-  the production functions with private helpers, fixtures, mocks, or real
+  the chunk size rather than grow the world. Full procedural world-building
+  paths run only when under test, at most 16x16 tiles and 1 underground level;
+  a growth or scale test may build a larger populated world, or more levels,
+  directly.
+- Tests assert behavior through production's observable results, driving the
+  production functions with private helpers, fixtures, mocks, or real
   payloads. A work bound is proven by a bench pass-shape assert that reads
   the counters (`zig-style.md` § Logging).
 - Tests never time anything and never call `src/benchmarks/` (except the
@@ -58,72 +57,67 @@ The standard Zig layout; every change, plan, and review follows it.
 
 ## Benchmarks
 
-- All performance claims and OOM/leak sweeps come from `zig build bench`. The
+- All performance claims and OOM/leak sweeps come from `zig build bench`; the
   ReleaseSafe runtime perf dump is diagnostic trend data for locating a
   regression, never a perf claim or gate.
 - Benches measure how an algorithm scales, never a target count. Bench sizes
   are sample points on a curve, never capacities, budgets, acceptance
   thresholds, or frame-time verdicts; never pick a size or cap because a bench
-  count fit, and never report "fast enough at N".
-- A perf question with no covering case gets a new case under
-  `src/benchmarks/`.
-- Run benches targeted to the code being tested or changed
-  (`--group <name> --items N`), never the full suite; full sweeps only when
-  the owner or a slice asks.
-- Bench only changes that can move a hot path, once: one right-sized config
-  per group the change touches, plus each scaling bench's sizes. A threaded
-  stage's bench reports its main-thread share, and main's time per item stays
-  flat across sizes. Compare before/after on adjacent commits in Debug (ReleaseFast only
-  per `build-validation.md`) with one run per side (`tools/bench_ab.py`); a
-  case more than 10% slower is rerun alone with 3 reps. When the change
-  alters a bench's fixture or input order, the base code also runs on the
-  new fixture; the like-for-like gap is the code's. A constant is material
-  when it moves the stage's total beyond the run-to-run spread at the
-  bench's sizes. A bench's serial case runs the production function inline
-  (no workers), never a separate serial entry. A threaded stage is judged on
-  its `thread-adaptive-tuned-range` case (the production tuner) against its base;
+  count fit, and never report "fast enough at N". A perf question with no
+  covering case gets a new case under `src/benchmarks/`.
+- Bench only changes that can move a hot path, targeted to the groups the
+  change touches (`--group <name> --items N`): one right-sized config per
+  group plus each scaling bench's sizes, never the full suite (full sweeps
+  only when the owner or a slice asks).
+- A landing's before/after runs once, after its code is done: adjacent
+  commits in Debug (ReleaseFast only per `build-validation.md`), one run per
+  side (`tools/bench_ab.py`). A case more than 10% slower is rerun alone with
+  3 reps; a review fix reruns only the cases it touches. When the change
+  alters a bench's fixture or input order, the base code also runs on the new
+  fixture; the like-for-like gap is the code's.
+- A threaded stage's bench reports its main-thread share, and main's time per
+  item stays flat across sizes; its serial case is the production function
+  run inline (`threading.md`). The stage is judged on its
+  `thread-adaptive-tuned-range` case (the production tuner) against its base;
   the other cases are controls, and the tuned case matches or beats the best
   of them within spread. The tuned case's report says which path is
   production at a size: where it runs inline, the serial path is production
   and is judged like the tuned case; where it threads, `serial-direct` is a
   control, judged only for a worse growth order or added per-item work (a new
   scan or indirection), never for a constant gap.
-- A landing's before/after runs once, after its code is done; a review fix
-  reruns only the cases it touches. Each slower
-  case gets one verdict: noise (within spread after 3 reps), planned cost
-  (work the design or a SIMD shape adds, named and reported), a control's
-  gap (a path that is not production at that size; reported), or a
-  regression (material overhead or a worse growth order on the path that is
-  production), which is what gets optimized. A regression
-  gets one attribution, one fix, and one re-measure of that case; if it is
-  still slower, it is reported and becomes a checklist item in its owning
+- Each slower case gets one verdict: noise (within spread after 3 reps),
+  planned cost (work the design or a SIMD shape adds, named and reported), a
+  control's gap (a path that is not production at that size; reported), or a
+  regression (material overhead or a worse growth order on the production
+  path), which is what gets optimized. A constant is material when it moves
+  the stage's total beyond the run-to-run spread at the bench's sizes. A
+  regression gets one attribution, one fix, and one re-measure of that case;
+  if still slower, it is reported and becomes a checklist item in its owning
   slice.
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).
 - Benches read production defaults, constants, layouts, and byte bounds
-  (§ Test and production code, 3); never copy them. A memory estimate is
-  checked whole against live bytes.
+  (§ Test and production code, 3), never copies; a memory estimate is checked
+  whole against live bytes.
 - Each group's doc states what it measures and its pass shape, and its
-  asserts check that shape. Exception: a branch's measuring landing states
+  asserts check that shape; exception: a branch's measuring landing states
   each finding's pass shape in the group doc and asserts only fixture
-  invariants; the shape assert lands with the fix. A config the bench cannot
-  run fails, never skips.
-  A variant, column, or assert that measures a removed design goes with it.
-- Shared harness pieces (item codes, labels, stage shapes, reporting,
-  fixtures, memory estimates) live once (`docs/development-workflow.md`
-  § Benchmarks). A group declares its label and formatter in its definition,
+  invariants, and the shape assert lands with the fix. A config the bench
+  cannot run fails, never skips. A variant, column, or assert that measures a
+  removed design goes with it.
+- Shared harness pieces live once (`docs/development-workflow.md`
+  § Benchmarks); a group declares its label and formatter in its definition,
   never through a switch on its name.
-- A scaling bench runs at least three sizes far enough apart to show the growth
-  shape, each right-sized: large enough that the shape is clear and the
-  threaded case runs the changed stage, no larger (oversized runs slow the dev
-  cycle and show nothing more). A sweep varies one axis with the others
-  fixed, never a cross product, and the fixture's world stays fixed unless
-  world size is the axis. It passes when the shape matches the cost
-  model's order (flat for a local change, linear where linear is right). A
-  cost that grows with world size on a local change is a design defect
-  regardless of the absolute number, except reachability maintenance
-  (`budgets-capacities.md`), whose benches pass when each removal's cost
-  follows its own smaller side or detour reach and never another change or
-  the level around it; and each one-way change's closure cost follows its own
-  one-way system and affected rows, never another system's.
+- A scaling bench runs at least three sizes far enough apart to show the
+  growth shape, each right-sized: large enough that the shape is clear and the
+  threaded case runs the changed stage, no larger. A sweep varies one axis
+  with the others fixed, never a cross product, and the fixture's world stays
+  fixed unless world size is the axis. It passes when the shape matches the
+  cost model's order (flat for a local change, linear where linear is right).
+  A cost that grows with world size on a local change is a design defect
+  regardless of the absolute number, except reachability maintenance, whose
+  benches pass when each change's cost follows its own bound in
+  `budgets-capacities.md` (a removal's own smaller side or detour reach; a
+  one-way change's own system and affected rows), never another change, the
+  level around it, or another one-way system.

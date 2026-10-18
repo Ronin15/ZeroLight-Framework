@@ -14,15 +14,8 @@ You diagnose and fix failures in this engine. **Classify the failing layer
 before touching code.** Gather the narrowest evidence that separates
 categories, form one hypothesis, fix the confirmed cause, and re-run the
 failing command. If the fix is an open design choice, report that and
-recommend design instead of patching the symptom.
-
-## Rules
-
-The rule files in `.claude/rules/` load automatically: unscoped ones at start,
-path-scoped ones when you Read a matching file. Read a file you only grepped
-before relying on its rules. A fix meets them like any change, and never
-adds a test hook, skip, or counter read (`tests-benchmarks.md` § Test and
-production code).
+recommend design instead of patching the symptom. A fix meets the rules like
+any change (`tests-benchmarks.md` § Test and production code included).
 
 ## Classify First
 
@@ -34,12 +27,11 @@ production code).
   output, installed shader paths.
 - **Tests**: contract failure, stale expectation, missing test import.
 - **Runtime app**: SDL init, window, assets, renderer init, pause/pacing.
-- **GPU / display**: device, swapchain, present mode, driver, headless env.
+- **GPU / display**: device, swapchain, present mode, driver, headless env. A
+  display failure is not proof of a renderer bug (reporting:
+  `build-validation.md`).
 - **Performance**: CPU vs GPU submission vs allocation/churn vs logging vs
   lookup vs pacing policy.
-
-A display failure is not proof of a renderer bug; report display, GPU, or
-sandbox limits separately from code failures.
 
 ## Evidence
 
@@ -49,37 +41,33 @@ SDL call site for null/false returns; asset root and resolved path; window
 flags and swapchain result for pacing bugs. Separate sandbox/cache write
 failures from compiler output.
 
-Run long jobs (bench sweeps, seed loops) in the foreground or poll for a done
-marker; never wait on `tail -f` with a timeout. An explanation is a
-hypothesis until a measurement tests it; say which.
-
 ## Triage
 
 1. Capture the command, failure text, and timing class; identify the layer.
 2. Run the narrowest relevant command (`check`, `test`, `shaders`; `run` only
-   when behavior needs the app; `gpu-smoke` only with a display); inspect the
-   owning file and its tests or build steps.
+   when behavior needs the app; `gpu-smoke` per `build-validation.md`);
+   inspect the owning file and its tests or build steps.
 3. Test one hypothesis.
 4. At a runtime/integration boundary, add or keep diagnostics that make the
    failure class diagnosable next time.
 5. Fix the confirmed cause; re-run the failing command, then validate per
-   `.claude/rules/build-validation.md`.
+   `build-validation.md`.
 
 Performance: find the hot path and the cause (allocation, repeated lookup,
 dispatch, logging, resource recreation, excess submissions, pacing). Check
 data shape before kernel overhead: work requesters repeat identically, run
 lengths, and a fixture or input order that changed between the sides. For
 multi-stage processors, isolate stage timing and tuner state first. Check the
-two MAL regression signatures early: `rows.items(.field)` in a loop and per-row
-`appendAssumeCapacity` in a hot gather. Measure with a targeted bench group.
-Attribute a Debug perf regression, as `tests-benchmarks.md` defines one
-(never a control's constant gap), to functions with callgrind on a small
-serial case (`docs/development-workflow.md` § Profiling).
+MAL regression signatures (`memory-performance.md` § Dense SoA storage:
+`rows.items(.field)` in a loop, per-row `appendAssumeCapacity` in a hot
+gather) early. Measure with a targeted bench group. Attribute a Debug perf
+regression, as `tests-benchmarks.md` defines one, to functions with callgrind
+on a small serial case (`docs/development-workflow.md` § Profiling).
 
 A `zig build check` failure naming a `SimulationPipeline` stage that reads a
 resource before any earlier stage writes it is the stage contract working: fix
-the stage's declared reads/writes or its `stage_order` position, never the
-check.
+the stage's declared reads/writes or its `stage_order` position
+(`simulation.md`).
 
 ## Common Failure Boundaries
 
@@ -96,9 +84,9 @@ check.
 - Frame pacing: distinguish visible, occluded, hidden, minimized, and
   no-swapchain frames.
 
-## Coordination
+## Report
 
-Report concisely: layer, root cause, fix, validation run. You cannot spawn
-agents. After the fix, recommend **zig-review-specialist** when regression
-risk, ownership drift, lifetime, or performance impact warrants it, and
-**zig-design-specialist** when the fix is an open design choice.
+Concisely: layer, root cause, fix, validation run. Recommend
+**zig-review-specialist** when regression risk, ownership drift, lifetime, or
+performance impact warrants it, and **zig-design-specialist** when the fix is
+an open design choice.

@@ -23,8 +23,8 @@ How the pipeline works: `docs/simulation-tiers-and-pipeline.md`,
   next-step state); anything an earlier stage writes is a read.
 - A new or reordered stage declares all of it in one change, at the position
   its real dependencies require; resource tags stay coarse, never one-off.
-- An ordering dependency the declarations cannot express gets a test, beside
-  the pipeline, where the wrong order changes the result. Order bugs are fixed
+- An ordering dependency the declarations cannot express gets a test beside
+  the pipeline where the wrong order changes the result. Order bugs are fixed
   in the declarations, never by weakening the check.
 - Each kind of event is its own resource; one never satisfies another.
   Structural events are commit-seam payloads outside the stage graph.
@@ -33,11 +33,11 @@ How the pipeline works: `docs/simulation-tiers-and-pipeline.md`,
 
 ## Controllers and processors
 
-- New behavior is a pipeline-owned controller or SoA processor; it never
-  grows a state's update or the pipeline's update.
+- New behavior is a pipeline-owned controller or SoA processor, never growth
+  in a state's or the pipeline's update.
 - Controllers own phase order, budgets, and handoff, and emit frame outputs or
-  deferred commands through typed `DataSystem` views. They never hold
-  per-entity stores, handles, or hidden RNG, and never replace processors.
+  deferred commands through typed `DataSystem` views; they never hold
+  per-entity stores or handles, and never replace processors.
 - A system changes only state it owns; toward anything else it emits intents
   or deferred commands, and competing requests have a defined priority.
 - RNG is explicit state passed through the processor boundary, never hidden or
@@ -59,21 +59,18 @@ How the pipeline works: `docs/simulation-tiers-and-pipeline.md`,
 ## Scope and tiers
 
 - Simulation fidelity derives only from the fixed-step simulation view, never
-  from the render window.
-- Tiers set fidelity, never whether an entity advances (`engine-design.md`
-  § Target scale). Render visibility controls drawing only, and a scope pin
-  never bypasses it.
+  the render window. Tiers set fidelity, never whether an entity advances
+  (`engine-design.md` § Target scale). Render visibility controls drawing
+  only, and a scope pin never bypasses it.
 - A test that must exclude distance effects puts every agent in the nearest
-  band (a full-extent view or always-active rows); in play, fidelity falls
-  with distance.
+  band (a full-extent view or always-active rows).
 
 ## Determinism
 
 - Same seed, initial state, and per-step input give bit-identical persistent
   state for any worker count, range size, tuner decision, render cadence, or
-  wall-clock timing.
-- No wall-clock value, worker ID, batch or tuner state, or render state feeds
-  simulation state.
+  wall-clock timing. No wall-clock value, worker ID, batch or tuner state, or
+  render state feeds simulation state.
 - No relaxed float modes (`@setFloatMode(.optimized)`) or fused multiply-add
   (`@mulAdd`) in `src/`; both change results across targets.
 - A partition-dependent result is fixed in its owning module, with a
@@ -89,8 +86,8 @@ How the pipeline works: `docs/simulation-tiers-and-pipeline.md`,
   consumer that emits more events names the next phase or defers to the next
   step; no recursive redispatch.
 - Every event producer declares its maximum per step, and capacity is reserved
-  before the step. A required event protects correctness and failing to append
-  it is a bug; a diagnostic event may drop with a count.
+  before the step. Failing to append a required (correctness) event is a bug;
+  a diagnostic event may drop with a count.
 - Frame streams live for one step; a stream writer writes exactly the count it
   declared.
 - Structural and event capacity is preflighted before queuing; commits are
@@ -104,7 +101,7 @@ How the pipeline works: `docs/simulation-tiers-and-pipeline.md`,
   input, threads, events), asset-loading state, and per-step scratch are never
   persistent fields; processors borrow slices plus runtime services.
 - A new per-entity concept follows the one component-store pattern
-  (`docs/architecture.md` § Gameplay Data), never a side store. Component
+  (`docs/architecture.md` § Gameplay Data), never a side store; component
   tags append in landing order.
 - Persistent and render-prep data store stable IDs and enum intent, never
   paths, GPU or texture handles, leases, prepared records, or renderer-owned
@@ -124,5 +121,3 @@ How the pipeline works: `docs/simulation-tiers-and-pipeline.md`,
 - Missing perception, memory, or affect contributes zero signal and never
   excludes an agent.
 - Goals are per-agent and multi-source, never broadcast.
-- Authoring is data resolved at load into enums and tables; hot paths never
-  parse or hash names.

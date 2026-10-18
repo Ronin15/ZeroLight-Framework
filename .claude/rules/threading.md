@@ -12,21 +12,20 @@ How the thread system works: `docs/architecture.md` § Thread System.
 - Work that grows with population, change size, or world size runs on
   workers, across chunks, levels, and world instances. Small fixed or cold
   one-off work may stay serial; the cost model (`engine-design.md`) decides.
-- The main thread is never a fallback owner. It holds only orchestration,
-  boundaries, and ordered merges with O(1) work per item. Per-item work that
-  grows threads, even under a per-step budget; scalable work never moves to
-  main to ease ordering or testing.
+- The main thread is never a fallback owner: it holds only orchestration,
+  boundaries, and ordered merges with O(1) work per item. Growing per-item work
+  threads, even under a per-step budget; scalable work never moves to main to
+  ease ordering or testing.
 - State transitions, structural changes, platform/GPU/audio calls, I/O, and
   resource ownership stay off workers unless a deferred boundary is designed.
   Workers never change `DataSystem` structure; structural commits batch at the
   commit seam.
-- Every threaded stage ships a serial path with identical results and parity
-  tests in its first implementation, under a named owner with immutable inputs
-  and owned outputs. The serial path is the stage's own function run inline
-  (no workers), the path production takes below the tuner's gate, never a
-  separate entry only tests or benches call. Running inline below the
-  tuner's gate is a measured choice, not a violation, as long as the threaded
-  path exists.
+- Every threaded stage ships, in its first implementation, a serial path with
+  identical results and parity tests, under a named owner with immutable
+  inputs and owned outputs. The serial path is the stage's own function run
+  inline (no workers), the path production takes below the tuner's gate,
+  never a separate entry only tests or benches call. Running inline below the
+  gate is a measured choice, not a violation, while the threaded path exists.
 
 ## Building a stage
 
@@ -43,17 +42,17 @@ How the thread system works: `docs/architecture.md` § Thread System.
   floors. Before changing thread policy or a stage's shape, isolate that
   stage's timing and tuner state.
 - A dispatch from inside a dispatch runs inline on its caller and touches no
-  tuner; it is a recovered mistake, never a design. A thread that neither owns
-  nor serves the thread system never dispatches.
+  tuner: a recovered mistake, never a design. A thread that neither owns nor
+  serves the thread system never dispatches.
 
 ## Writes, capacity, and determinism
 
 - Workers write only to slots they exclusively own (per range or per worker),
-  verifiable at the call site; never to a shared appendable collection. Each
+  verifiable at the call site, never to a shared appendable collection. Each
   job opens by asserting its write range against the buffer length and its
   range index against the dispatched range count.
 - Output capacity is reserved on the main thread before dispatch, sized from
-  the value the dispatch uses. An undersized reserve is a data race, not an
+  the value the dispatch uses; an undersized reserve is a data race, not an
   out-of-memory error.
 - Output with at most one record per item writes the item's own window; output
   whose size depends on the data keeps per-range slots bounded at the seam by
@@ -66,9 +65,6 @@ How the thread system works: `docs/architecture.md` § Thread System.
   before the cap, with parity tests that cross ranges and hit the cap.
 - Hot loops iterate dense columns; membership masks never become dynamic
   joins.
-
-## Memory between workers
-
 - Worker ranges never share a writable cache line. Pad only records with real
   false-sharing risk: per-range and per-row slots to the cache-line quantum, a
   contended shared record to the platform cache line. Disjoint but scattered
@@ -82,5 +78,5 @@ How the thread system works: `docs/architecture.md` § Thread System.
   merges only after a clean run.
 - Allocation-free proofs run on the real multi-worker thread system.
 - The runtime perf log records each change path's cost-driver stage only;
-  every other stage's timing is bench output, so the log stays readable. Bench
-  output reports an inline stage as inline, never as a zero-worker range.
+  every other stage's timing is bench output. Bench output reports an inline
+  stage as inline, never as a zero-worker range.
