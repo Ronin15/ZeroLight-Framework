@@ -101,9 +101,10 @@ Every design, and every fix touching storage or per-change work, states:
   `core/`, `platform/`, and the `src/app/` services it runs on
   (`ThreadSystem`, the state and input interfaces, audio, the runtime perf
   log); `src/app/` imports game states only to construct them;
-  `render/`, `assets/`, `core/`, and `platform/`
-  (gpu-smoke included) never import `src/game/`, and `core/` and `platform/`
-  never import `src/app/`.
+  `render/`, `assets/`, `core/`, and `platform/` never import `src/game/`,
+  `core/` imports only `core/`, and `platform/` only `core/`. Dev-tool roots
+  (`gpu_smoke.zig`, `benchmark_runner.zig`, `tests.zig`) sit outside the
+  layers, may import any of them, and no layer imports them.
 - Gameplay logic lives in states, controllers, and processors, never in
   `main.zig` or `Engine` conditionals.
 - App and game code use `Renderer`; never import `src/render/gpu/*` outside
