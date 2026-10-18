@@ -18,6 +18,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const logging = @import("../../core/logging.zig");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const pdqSort = @import("../../core/sort.zig").pdq;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
@@ -149,19 +150,6 @@ pub const OrderedIndexSet = struct {
         for (self.tiers[0..self.tier_count]) |tier| bytes += bitSetBytes(tier);
         return bytes;
     }
-
-    // `residentBytes` of a set reserved for indices below `bits`: its tiers as `reserve`
-    // builds them.
-    pub fn storageBytesBound(bits: usize) usize {
-        var bytes: usize = 0;
-        var tier_bits = bits;
-        while (true) {
-            bytes +|= bitSetBytesFor(tier_bits);
-            if (tier_bits <= word_bits) break;
-            tier_bits = maskCount(tier_bits);
-        }
-        return bytes;
-    }
 };
 
 /// Fails the build unless every field of `T` is named exactly once, in `counted` (its
@@ -236,9 +224,6 @@ comptime {
 /// backward shift (no tombstones under churn) and keeps its slots as columns that
 /// `Reader`s probe lock-free while nothing writes, which std's map exposes neither of.
 pub const ChunkListMap = struct {
-    /// Bytes one table slot takes: its key, head, tail, value, count, and batch touch.
-    pub const bytes_per_key_slot: usize = @sizeOf(u64) + 5 * @sizeOf(u32);
-
     allocator: std.mem.Allocator,
     /// What the lists hold, naming this map in its growth log.
     name: []const u8,
@@ -278,9 +263,12 @@ pub const ChunkListMap = struct {
     splice_records: SpliceRecordList = .empty,
     emptied_keys: std.ArrayList(u64) = .empty,
     in_batch: bool = false,
-    /// Telemetry: table, entry-pool, and batch-scratch growths, logged once.
-    grows: u64 = 0,
+    /// The first table, entry-pool, or batch-scratch growth is logged once.
     growth_logged: bool = false,
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: the growths so far.
+    pub const Perf = if (runtime_perf_log.enabled) struct { grows: u64 = 0 } else struct {};
 
     /// `name` outlives the map.
     pub fn init(allocator: std.mem.Allocator, name: []const u8) ChunkListMap {
@@ -294,19 +282,8 @@ pub const ChunkListMap = struct {
             "retired_owner_heads", "claims",     "touched",    "splice_records", "emptied_keys",
         }, &.{
             "allocator",  "name",       "live_keys",        "entry_key", "entry_owner", "entry_order",
-            "entry_prev", "entry_next", "entry_owner_next", "in_batch",  "grows",       "growth_logged",
+            "entry_prev", "entry_next", "entry_owner_next", "in_batch",  "perf",        "growth_logged",
         });
-    }
-
-    /// Bytes the table, entry pool, free ids, owner heads, and batch scratch hold (allocated
-    /// capacity).
-    pub fn residentBytes(self: *const ChunkListMap) usize {
-        var bytes = self.slot_keys.len * bytes_per_key_slot + std.MultiArrayList(Entry).capacityInBytes(self.entries.capacity) +
-            self.entry_free.capacity * @sizeOf(u32) + self.owner_heads.capacity * @sizeOf(u32) + self.retired_owner_heads.capacity * @sizeOf(u32) +
-            self.claims.capacity * @sizeOf(Claim) + self.touched.capacity * @sizeOf(TouchedKey) +
-            self.splice_records.capacity * @sizeOf(SpliceRecord) + self.emptied_keys.capacity * @sizeOf(u64);
-        if (self.owner_heads_replacement) |replacement| bytes += replacement.capacity * @sizeOf(u32);
-        return bytes;
     }
 
     pub fn deinit(self: *ChunkListMap) void {
@@ -339,11 +316,10 @@ pub const ChunkListMap = struct {
     }
 
     fn countGrowth(self: *ChunkListMap) void {
-        self.grows += 1;
+        if (comptime runtime_perf_log.enabled) self.perf.grows += 1;
         if (self.growth_logged) return;
         self.growth_logged = true;
-        if (comptime logging.enabled(.info))
-            logging.game.info("{s} storage grew ({} growths so far)", .{ self.name, self.grows });
+        if (comptime logging.enabled(.info)) logging.game.info("{s} storage grew", .{self.name});
     }
 
     /// Guarantees `new_keys` more keys, `new_entries` more inserts, and owner ids below
@@ -502,12 +478,6 @@ pub const ChunkListMap = struct {
     pub fn value(self: *const ChunkListMap, key: u64) u32 {
         const slot = self.findSlot(key) orelse return no_value;
         return self.slot_values[slot];
-    }
-
-    /// The entries in `key`'s list; 0 when absent. O(1) expected; never mutates.
-    pub fn keyCount(self: *const ChunkListMap, key: u64) u32 {
-        const slot = self.findSlot(key) orelse return 0;
-        return self.slot_counts[slot];
     }
 
     /// Sets present `key`'s value; `no_value` clears it. A key whose list a `commitBatch`
@@ -1068,7 +1038,7 @@ test "maps grown through reserve stay within the pooled bound of their summed pe
         }
     }
     var resident: usize = 0;
-    for (&maps) |*map| resident += map.residentBytes();
+    for (&maps) |*map| resident += @import("chunk_list_map_test_support.zig").residentBytes(map);
     var peak_sum: usize = 0;
     for (peaks) |peak| peak_sum += peak;
     try std.testing.expect(resident <= @import("chunk_list_map_test_support.zig").pooledStorageBytesBound(maps.len, peak_sum, peak_sum, 64));
@@ -1529,7 +1499,6 @@ fn expectCountsMatchLists(map: *const ChunkListMap) !void {
         var entry = map.slot_heads[slot];
         while (entry != no_entry) : (entry = map.entry_next[entry]) length += 1;
         try std.testing.expectEqual(length, map.slot_counts[slot]);
-        try std.testing.expectEqual(length, map.keyCount(key));
         try std.testing.expectEqual(length, map.reader().keyCount(key));
         listed += length;
     }
@@ -1554,7 +1523,7 @@ test "add keeps every run of one owner in insertion order without dedupe" {
     try collectEntries(&map, key, &owners, &orders);
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 1, 1, 0 }, owners.items);
     try std.testing.expectEqualSlices(u32, &.{ 40, 7, 3, 3, 90 }, orders.items);
-    try std.testing.expectEqual(@as(u32, 5), map.keyCount(key));
+    try std.testing.expectEqual(@as(u32, 5), map.reader().keyCount(key));
     try expectCountsMatchLists(&map);
 }
 
@@ -1563,7 +1532,7 @@ test "add keeps every run of one owner in insertion order without dedupe" {
 fn expectSameMaps(a: *const ChunkListMap, b: *const ChunkListMap, keys: []const u64, owner_count: usize) !void {
     try expectSameLists(a, b, keys);
     for (keys) |key| {
-        try std.testing.expectEqual(a.keyCount(key), b.keyCount(key));
+        try std.testing.expectEqual(a.reader().keyCount(key), b.reader().keyCount(key));
         var entry = a.head(key);
         while (entry != no_entry) : (entry = a.entry_next[entry]) try std.testing.expectEqual(a.entry_order[entry], b.entry_order[entry]);
     }
@@ -1604,7 +1573,7 @@ test "addAll equals one add per record, for runs of one key, a key change back, 
     maps[1].addAll(&records);
     try expectSameMaps(&maps[0], &maps[1], &.{ a, b, c }, 4);
     try std.testing.expectEqual(maps[0].live_keys, maps[1].live_keys);
-    try std.testing.expectEqual(@as(u32, 5), maps[1].keyCount(a));
+    try std.testing.expectEqual(@as(u32, 5), maps[1].reader().keyCount(a));
     try expectCountsMatchLists(&maps[1]);
 }
 

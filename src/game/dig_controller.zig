@@ -377,7 +377,7 @@ pub const DigController = struct {
         player: *const Player,
         frame: *SimulationFrame,
         npc_entries: []const PlaneEntry,
-        thread_system: ?*ThreadSystem,
+        thread_system: *ThreadSystem,
     ) PlaneStageError!PlaneTraversalReservation {
         self.plane_tile_changes.clearRetainingCapacity();
         self.plane_moves.clearRetainingCapacity();
@@ -454,7 +454,7 @@ pub const DigController = struct {
     /// (with the same `thread_system`) and nothing written since. Attaches the missing
     /// `world_level` rows (allocation-free after the reserve, and idempotent on a retry),
     /// then writes every landing carve as one batched dense edit
-    /// (`WorldSystem.applyDenseCellWrites`, its chunks on `thread_system` when given): all
+    /// (`WorldSystem.applyDenseCellWrites`, its chunks on `thread_system`): all
     /// or nothing, and its only growth is the terrain pools' (counted), so an error writes
     /// no terrain. Then publishes the carves as one event range and applies each decided
     /// traversal in order (allocation-free). The player's cell-entry latch
@@ -467,7 +467,7 @@ pub const DigController = struct {
         player: *Player,
         frame: *SimulationFrame,
         reservation: PlaneTraversalReservation,
-        thread_system: ?*ThreadSystem,
+        thread_system: *ThreadSystem,
     ) PlaneStageError!void {
         const scratch = &self.plane_tile_changes;
         std.debug.assert(scratch.items.len == 0);
@@ -481,10 +481,9 @@ pub const DigController = struct {
 
     // The carve batch's stage threading: the world's terrain-edit tuners under
     // `carve_controls`, or inline without a thread system.
-    fn carveThreads(self: *const DigController, world: *WorldSystem, thread_system: ?*ThreadSystem) ?TerrainEditThreads {
-        const ts = thread_system orelse return null;
+    fn carveThreads(self: *const DigController, world: *WorldSystem, thread_system: *ThreadSystem) TerrainEditThreads {
         return .{
-            .thread_system = ts,
+            .thread_system = thread_system,
             .plan_tuner = &world.terrain_edit_plan_tuner,
             .write_tuner = &world.terrain_edit_write_tuner,
             .controls = self.carve_controls,
@@ -737,11 +736,13 @@ fn testDig(dig: *const DigController, world: *WorldSystem, data: *const DataSyst
 
 // One plane stage: a serial entry gather, the reserve, then the commit.
 fn testPlaneTraversalStage(dig: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player, frame: *SimulationFrame) !void {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
     defer plane_entry.deinit();
     const entries = try plane_entry.gather(data, world, player.entity, dig.tunnel_tile, null);
-    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries, null);
-    try dig.commitPlaneTraversalStage(world, data, player, frame, reservation, null);
+    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries, &serial_threads);
+    try dig.commitPlaneTraversalStage(world, data, player, frame, reservation, &serial_threads);
 }
 
 // A frame with room for a small plane stage's events, its step begun.
@@ -1011,9 +1012,11 @@ fn runPlaneStageOverEntries(
     tw: *TestWorld,
     frame: *SimulationFrame,
 ) !usize {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const entries = try plane_entry.gather(&tw.data, &tw.world, tw.player.entity, dig.tunnel_tile, null);
-    const reservation = try dig.reservePlaneTraversalStage(&tw.world, &tw.data, &tw.player, frame, entries, null);
-    try dig.commitPlaneTraversalStage(&tw.world, &tw.data, &tw.player, frame, reservation, null);
+    const reservation = try dig.reservePlaneTraversalStage(&tw.world, &tw.data, &tw.player, frame, entries, &serial_threads);
+    try dig.commitPlaneTraversalStage(&tw.world, &tw.data, &tw.player, frame, reservation, &serial_threads);
     return reservation.carves;
 }
 
@@ -1176,6 +1179,8 @@ fn changeLessThan(_: void, lhs: WorldTileChangedEvent, rhs: WorldTileChangedEven
 }
 
 test "plane stage decisions match the per-entry sequential traversal on shared columns, ramps, and pre-carved landings" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const allocator = std.testing.allocator;
     const asset_store = AssetStore.init(allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
@@ -1200,9 +1205,9 @@ test "plane stage decisions match the per-entry sequential traversal on shared c
         var staged_entry = PlaneEntrySystem.init(allocator);
         defer staged_entry.deinit();
         const staged_entries = try staged_entry.gather(&staged.data, &staged.world, staged.player.entity, dig.tunnel_tile, null);
-        const reservation = try dig.reservePlaneTraversalStage(&staged.world, &staged.data, &staged.player, &frame, staged_entries, null);
+        const reservation = try dig.reservePlaneTraversalStage(&staged.world, &staged.data, &staged.player, &frame, staged_entries, &serial_threads);
         const staged_carves = reservation.carves;
-        try dig.commitPlaneTraversalStage(&staged.world, &staged.data, &staged.player, &frame, reservation, null);
+        try dig.commitPlaneTraversalStage(&staged.world, &staged.data, &staged.player, &frame, reservation, &serial_threads);
 
         // The reference: the same entries in the same order, attaches first.
         var plane_entry = PlaneEntrySystem.init(allocator);
@@ -1246,7 +1251,7 @@ test "plane stage decisions match the per-entry sequential traversal on shared c
 // Falls whose landings lie on two levels and four chunks, entered in AI row order that is
 // not (level, chunk) order: the stage's one carve batch, serial or on `threads`, carves
 // every landing and publishes the carves in (level, chunk, cell) order.
-fn runCrossChunkFalls(meta: *const world_tileset_meta.WorldTilesetMeta, threads: ?*ThreadSystem, out: *[8]WorldTileChangedEvent) ![]WorldTileChangedEvent {
+fn runCrossChunkFalls(meta: *const world_tileset_meta.WorldTilesetMeta, threads: *ThreadSystem, out: *[8]WorldTileChangedEvent) ![]WorldTileChangedEvent {
     const allocator = std.testing.allocator;
     // 8x8 cells in 4-cell chunks: four chunks per level.
     var world = try WorldSystem.initDemoFromMetaWithChunkSize(allocator, meta, meta.tileSize() * 8, meta.tileSize() * 8, 4);
@@ -1294,7 +1299,9 @@ test "plane stage carves landings entered out of chunk order across levels in on
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
     var serial_buffer: [8]WorldTileChangedEvent = undefined;
-    const serial = try runCrossChunkFalls(&meta, null, &serial_buffer);
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
+    const serial = try runCrossChunkFalls(&meta, &serial_threads, &serial_buffer);
     // Landings on level 1 (chunks 0, 3), then level 2 (chunks 1, 2).
     const want = [_][3]u16{ .{ 1, 1, 1 }, .{ 1, 6, 6 }, .{ 2, 5, 1 }, .{ 2, 2, 6 } };
     try std.testing.expectEqual(want.len, serial.len);

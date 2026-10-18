@@ -765,7 +765,7 @@ const testHaloIndex = @import("spatial_index_test_support.zig").testHaloIndex;
 // A thread system with no workers: every pass runs its production path inline as one
 // range and records no tuner sample.
 fn inlineThreads() !ThreadSystem {
-    return ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    return ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
 }
 
 fn gatherAiInline(sys: *SimulationScopeSystem, data: *const DataSystem, region: ?ActiveRegion) !AiPopulationGatherResult {

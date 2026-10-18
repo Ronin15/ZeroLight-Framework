@@ -324,8 +324,7 @@ pub const DataSystem = struct {
 
     /// Current full-active scope counters. Tier histograms come from the
     /// incrementally-maintained `tier_counts` (O(1), no per-step slot scan); stage
-    /// counts come free from dense slice lengths. `scanLiveTierCounts` is the
-    /// parity baseline the counters must match. `total_entities` is the count of
+    /// counts come free from dense slice lengths. `total_entities` is the count of
     /// entities carrying a simulation tier (i.e. those with a movement body), not
     /// the full live-entity set.
     pub fn simulationScopeStatsFullActive(self: *const DataSystem) SimulationScopeStats {
@@ -341,17 +340,6 @@ pub const DataSystem = struct {
             .ai_stage_entities = self.ai_agents.len(),
             .steering_stage_entities = self.steering_agents.len(),
         };
-    }
-
-    /// O(rows) scan of the dense scope tier column — the parity baseline for the
-    /// incrementally maintained `tier_counts`. Same-file test/debug only; not on
-    /// the hot path. Counts entities with a movement body (those that carry a tier).
-    fn scanLiveTierCounts(self: *const DataSystem) [4]usize {
-        var counts = [4]usize{ 0, 0, 0, 0 };
-        for (self.movement_bodies.scopeSliceConst().tier) |tier| {
-            counts[@backingInt(tier)] += 1;
-        }
-        return counts;
     }
 
     pub fn isStaticNavigationObstacle(self: *const DataSystem, id: EntityId) bool {
@@ -752,12 +740,6 @@ pub const DataSystem = struct {
         const dense_index = try self.factions.append(self.allocator, id, entity_faction);
         slot.faction_index = dense_index;
         slot.addComponent(.faction);
-    }
-
-    pub fn factionPtr(self: *DataSystem, id: EntityId) ?*Faction {
-        const slot = self.resolveSlot(id) orelse return null;
-        const dense_index = slot.faction_index orelse return null;
-        return self.factions.factionPtr(@intCast(dense_index));
     }
 
     pub fn factionConst(self: *const DataSystem, id: EntityId) ?Faction {
@@ -2329,9 +2311,9 @@ test "incremental tier counts track create, destroy, metadata change, and reset"
 
     // The incrementally-maintained counters must equal a fresh live scan, and the
     // public scope stats must agree cell-for-cell.
-    try std.testing.expectEqual(data.scanLiveTierCounts(), data.tier_counts);
+    try std.testing.expectEqual(data_test_support.scanLiveTierCounts(&data), data.tier_counts);
     const stats = data.simulationScopeStatsFullActive();
-    const scan = data.scanLiveTierCounts();
+    const scan = data_test_support.scanLiveTierCounts(&data);
     try std.testing.expectEqual(scan[@backingInt(SimulationTier.dormant)], stats.dormant_entities);
     try std.testing.expectEqual(scan[@backingInt(SimulationTier.kinematic)], stats.kinematic_entities);
     try std.testing.expectEqual(scan[@backingInt(SimulationTier.locomotion)], stats.locomotion_entities);
@@ -2359,7 +2341,7 @@ test "set_simulation_tier preserves chunk and stagger_phase" {
     try std.testing.expectEqual(SimulationTier.locomotion, updated.tier);
     try std.testing.expectEqual(orig_chunk, updated.chunk);
     try std.testing.expectEqual(orig_phase, updated.stagger_phase);
-    try std.testing.expectEqual(data.scanLiveTierCounts(), data.tier_counts);
+    try std.testing.expectEqual(data_test_support.scanLiveTierCounts(&data), data.tier_counts);
 }
 
 test "structural command set_simulation_tier commits and skips stale entities" {
@@ -2387,7 +2369,7 @@ test "structural command set_simulation_tier commits and skips stale entities" {
     // The command after the skipped ones still applied — no partial commit.
     try std.testing.expectEqual(SimulationTier.dormant, data_test_support.simulationMetadata(&data, alive).?.tier);
     try std.testing.expectEqual(@as(?EntitySimulationMetadata, null), data_test_support.simulationMetadata(&data, bodiless));
-    try std.testing.expectEqual(data.scanLiveTierCounts(), data.tier_counts);
+    try std.testing.expectEqual(data_test_support.scanLiveTierCounts(&data), data.tier_counts);
 }
 
 test "entering a non-moving tier snaps interpolation history to position" {
@@ -2435,17 +2417,14 @@ test "faction round-trips through set get ptr and dense slice" {
     try std.testing.expect(data.hasComponents(second, component_masks.faction));
     try std.testing.expect(!data.hasComponents(third, component_masks.movement_body));
 
-    const faction_ptr = data.factionPtr(second).?;
-    try std.testing.expectEqual(Faction.ally, faction_ptr.*);
-    faction_ptr.* = .hostile;
+    try data.setFaction(second, .hostile);
     try std.testing.expectEqual(@as(?Faction, .hostile), data.factionConst(second));
 
-    const slice = data.factions.sliceConst();
-    try std.testing.expectEqual(slice.entities.len, slice.factions.len);
-    try std.testing.expectEqual(@as(usize, 3), slice.entities.len);
-    try std.testing.expectEqual(Faction.player, slice.factions[0]);
-    try std.testing.expectEqual(Faction.hostile, slice.factions[1]);
-    try std.testing.expectEqual(Faction.hostile, slice.factions[2]);
+    const rows = data.factions.rows.slice();
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqual(Faction.player, rows.items(.faction)[0]);
+    try std.testing.expectEqual(Faction.hostile, rows.items(.faction)[1]);
+    try std.testing.expectEqual(Faction.hostile, rows.items(.faction)[2]);
 }
 
 test "faction via EntityTemplate in structural create and mask queries" {
@@ -2478,12 +2457,11 @@ test "faction store is columnar and compact after removal" {
 
     try std.testing.expect(data.destroyEntity(second));
 
-    const slice = data.factions.sliceConst();
-    try std.testing.expectEqual(slice.entities.len, slice.factions.len);
-    try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
-    for (slice.entities, 0..) |entity, index| {
+    const rows = data.factions.rows.slice();
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    for (rows.items(.entity), rows.items(.faction)) |entity, faction| {
         const expected: Faction = if (entity.matches(first.index, first.generation)) .player else .hostile;
-        try std.testing.expectEqual(expected, slice.factions[index]);
+        try std.testing.expectEqual(expected, faction);
     }
 
     // The swap-remove moved `third` into `second`'s old dense slot; resolving

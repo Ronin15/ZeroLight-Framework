@@ -520,6 +520,8 @@ fn writeIntakeScenarioRequests(stream: *RangeOutputStream(PathRequest), entity: 
 const intake_table_requests: usize = 15;
 
 test "threaded request intake equals serial intake across range sizes and worker counts" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -532,7 +534,7 @@ test "threaded request intake equals serial intake across range sizes and worker
 
     var serial = try intakeScenarioSystem(&data, requester, 1);
     defer serial.deinit();
-    _ = try serial.resolveGoals(PathRequest, table_requests, null, .{});
+    _ = try serial.resolveGoals(PathRequest, table_requests, &serial_threads, .{});
     const serial_stats = try updatePathfindingInline(&serial, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
     // The scenario reaches every class: two sealed requests, the expired sealed one, and two
     // sealed blocked ones read unavailable from reach, never pending.

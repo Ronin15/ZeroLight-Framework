@@ -19,7 +19,6 @@ const ChunkForm = world_terrain.ChunkForm;
 const max_chunk_cells = world_terrain.max_chunk_cells;
 const ColliderView = @import("../static_colliders.zig").ColliderView;
 const types = @import("types.zig");
-const listBytesBound = @import("nav_graph.zig").listBytesBound;
 const default_cell_size = types.default_cell_size;
 const growPool = @import("connectivity.zig").growPool;
 const GridCell = types.GridCell;
@@ -57,7 +56,7 @@ const NavCellBlock = struct {
 const empty_block = NavCellBlock{ .bits = @splat(0), .labels = @splat(0), .blocked_count = 0, .label_count = 0 };
 
 // One pooled block's columns.
-const cell_block_bytes = @sizeOf(ChunkBits) + max_chunk_cells + @sizeOf(u16) + @sizeOf(u8);
+pub const cell_block_bytes = @sizeOf(ChunkBits) + max_chunk_cells + @sizeOf(u16) + @sizeOf(u8);
 
 // Bit of cell (x + dx, y + dy) in a 3x3 `neighborhood` mask.
 fn neighborhoodBit(dx: i32, dy: i32) u4 {
@@ -599,16 +598,6 @@ pub const NavGrid = struct {
             self.block_free.capacity * @sizeOf(u32);
     }
 
-    /// An over-estimate of `residentBytes` summed over `levels` levels of `chunks` chunks
-    /// each, whose block needs (mixed chunks, plus the fresh blocks a batch takes before it
-    /// frees the old) sum to `block_need`: the directories, and each level's block pool and
-    /// free list at their worst growth (`growPool`: the pool at most twice its need, the free
-    /// list exactly the pool).
-    pub fn storageBytesBound(levels: usize, chunks: usize, block_need: usize) usize {
-        const blocks = 2 *| block_need;
-        return levels *| listBytesBound(u32, chunks) +| blocks *| (cell_block_bytes +| @sizeOf(u32));
-    }
-
     // Projects a blocked goal cell to the nearest open cell on this level within a
     // bounded radius, scanning rings outward in (dy, dx) order. Only tests openness, not
     // reachability from any start (that is the search's job); returns the open index, or
@@ -727,9 +716,9 @@ test "a block pool grown one claim at a time stays within its storage bound, its
     }
     try std.testing.expect(pool_grows > 1);
     try std.testing.expectEqual(chunks, grid.blocks.capacity);
-    try std.testing.expect(grid.residentBytes() <= NavGrid.storageBytesBound(1, chunks, claims));
+    try std.testing.expect(grid.residentBytes() <= test_support.navGridStorageBytesBound(1, chunks, claims));
     // The pool's doubling past its need is charged: half the blocks' bound is short of it.
-    try std.testing.expect(grid.residentBytes() > NavGrid.storageBytesBound(1, chunks, claims / 2));
+    try std.testing.expect(grid.residentBytes() > test_support.navGridStorageBytesBound(1, chunks, claims / 2));
 }
 
 test "pathfinding nav grid blocked set matches per-level composed mask" {

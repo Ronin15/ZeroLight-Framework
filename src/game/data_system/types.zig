@@ -217,11 +217,6 @@ pub const ConstFacingSlice = struct {
     directions: []const Facing,
 };
 
-pub const ConstFactionSlice = struct {
-    entities: []const EntityId,
-    factions: []const Faction,
-};
-
 /// Data-only primitive visual component. Render order and colors live here, but
 /// prepared draw records and renderer handles stay outside DataSystem.
 pub const PrimitiveVisual = struct {

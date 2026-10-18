@@ -228,10 +228,10 @@ pub fn hasPendingNavUpdates(self: *const PathfindingSystem, world: *const WorldS
 /// pending requests and group tallies survive both, since a solve re-checks its live goal
 /// and reach. Invalidates the step's goal table. A committed step stays on a later error;
 /// marks and the level, revision, and link gaps stay pending for the next call. The
-/// world-wide revision is compared once; levels are walked only when it moved. A
-/// non-null `thread_system` lets each stage thread under its tuner. Counts one step of
+/// world-wide revision is compared once; levels are walked only when it moved. Each stage
+/// threads on `thread_system` under its tuner. Counts one step of
 /// the batch staging's release windows (`NavGraph.tickStagingStep`).
-pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const StaticColliderSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) NavApplyError!NavUpdateStats {
+pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const StaticColliderSystem, world: *const WorldSystem, thread_system: *ThreadSystem) NavApplyError!NavUpdateStats {
     var stats = NavUpdateStats{};
     self.goals.invalidate();
     // The step's tick of the batch staging's release windows, before any batch; the
@@ -299,7 +299,7 @@ pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const Stati
 /// gaps) and emits one `nav_region_invalidated` when the graph changed. Runs after
 /// `colliders` synced this step's commit. A failed apply keeps the marks and gaps for the
 /// next step.
-pub fn reactToPostCommitNavEvents(self: *PathfindingSystem, frame: *SimulationFrame, colliders: *const StaticColliderSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) (NavApplyError || error{EventCapacityExceeded})!NavUpdateStats {
+pub fn reactToPostCommitNavEvents(self: *PathfindingSystem, frame: *SimulationFrame, colliders: *const StaticColliderSystem, world: *const WorldSystem, thread_system: *ThreadSystem) (NavApplyError || error{EventCapacityExceeded})!NavUpdateStats {
     // The terrain records' mark time since the last reaction folds into this one's stats.
     var marks = NavUpdateStats{};
     if (comptime runtime_perf_log.enabled) {
@@ -800,6 +800,8 @@ test "pathfinding incremental update with no real change does no work" {
 }
 
 test "pathfinding buffered nav updates grow without dropping and clear after apply" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -842,7 +844,7 @@ test "pathfinding buffered nav updates grow without dropping and clear after app
     try std.testing.expect(marked > system.limits.frame_requests);
     try std.testing.expect(system.hasPendingNavUpdates(&world));
 
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, null);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     // The far block — marked last, the first a fixed cap would drop — reached the graph.
     const nav = system.graph.grid(0).?;
@@ -952,6 +954,8 @@ test "a nav update reports its marks batch's remask, and an update without marks
 }
 
 test "reactToPostCommitNavEvents preserves buffered marks across a failed apply instead of dropping them" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -980,7 +984,7 @@ test "reactToPostCommitNavEvents preserves buffered marks across a failed apply 
     // applyBufferedNavUpdates.
     frame.events.setCapacityLimit(frame.events.mergedItems().len);
 
-    try std.testing.expectError(error.EventCapacityExceeded, system.reactToPostCommitNavEvents(&frame, no_colliders, &world, null));
+    try std.testing.expectError(error.EventCapacityExceeded, system.reactToPostCommitNavEvents(&frame, no_colliders, &world, &serial_threads));
     // The mark from this failed call must survive: no entry-clear on the next call may drop a
     // pending edit the world already committed but the nav graph has not yet learned about.
     try std.testing.expect(system.hasPendingNavUpdates(&world));
@@ -990,13 +994,15 @@ test "reactToPostCommitNavEvents preserves buffered marks across a failed apply 
     // failed step must still reach the graph.
     frame.events.setCapacityLimit(null);
     frame.beginStep();
-    const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &world, null);
+    const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     try std.testing.expect(!system.hasPendingNavUpdates(&world));
     try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = 2, .y = 2 }));
 }
 
 test "reactToPostCommitNavEvents maps world_obstacle_changed to one mark (not O(tiles) marks)" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     // A multi-tile world_obstacle_changed must record one tile-box mark, not one mark per
     // tile. Multi-chunk fixture
     // (nav_chunk_tiles=4) so the dirty rect spans ≥2 abstract chunks and a control
@@ -1078,7 +1084,7 @@ test "reactToPostCommitNavEvents maps world_obstacle_changed to one mark (not O(
     // forcing ensureCanAppend to fail before applyBufferedNavUpdates, same pattern
     // as the preserve-buffered-marks test above.
     frame.events.setCapacityLimit(frame.events.mergedItems().len);
-    try std.testing.expectError(error.EventCapacityExceeded, system.reactToPostCommitNavEvents(&frame, no_colliders, &world, null));
+    try std.testing.expectError(error.EventCapacityExceeded, system.reactToPostCommitNavEvents(&frame, no_colliders, &world, &serial_threads));
 
     // One mark covering the rect: O(1) per event, not O(tiles).
     try std.testing.expectEqual(@as(usize, 1), system.nav_marks.items.len);
@@ -1089,7 +1095,7 @@ test "reactToPostCommitNavEvents maps world_obstacle_changed to one mark (not O(
     // Apply the leftover mark: dirty tiles block; control cell in the untouched chunk stays open.
     frame.events.setCapacityLimit(null);
     frame.beginStep();
-    const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &world, null);
+    const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     y = min_y;
     while (y < max_y_exclusive) : (y += 1) {
@@ -1114,6 +1120,8 @@ test "reactToPostCommitNavEvents maps world_obstacle_changed to one mark (not O(
 }
 
 test "a recorded obstacle-rect event past the world edge marks its in-world part" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     // A rect whose max corner is past the world edge still dirties the in-bounds
     // portion (perception-style clamp), rather than all-or-nothing no-op on cellRect miss.
     var data = DataSystem.init(std.testing.allocator);
@@ -1149,7 +1157,7 @@ test "a recorded obstacle-rect event past the world edge marks its in-world part
     try test_support.recordTerrainEvents(&system, &.{obstacleRectEvent(0, in_min_x, in_min_y, 1000, 1000)}, &world);
     try std.testing.expectEqual(@as(usize, 1), system.nav_marks.items.len);
 
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, null);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
 
     // Every in-bounds tile of the painted strip is blocked after the clamped dirty apply.
@@ -1452,27 +1460,30 @@ test "a static mark record after its reserve allocates nothing (FailingAllocator
     try std.testing.expectEqual(@as(u16, 2), system.nav_marks.items[3].level);
 }
 
-test "a terrain nav record reserve counts each growth of the marks, staging, or tallies once, and a covered reserve none" {
+test "a terrain nav record reserve grows the marks, staging, or tallies only past a covered reserve, and logs the first growth" {
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(baselineCapacity());
-    // The capacity seam reserves the steady high-water uncounted; a record within it grows
+    // The capacity seam reserves the steady high-water unlogged; a record within it grows
     // nothing.
+    const capacities = .{ system.nav_marks.capacity, system.nav_mark_staging.capacity, system.nav_mark_tallies.capacity };
     try system.reserveTerrainNavRecord(system.limits.frame_requests);
-    try std.testing.expectEqual(@as(u64, 0), system.nav_mark_growth.count);
+    try std.testing.expectEqual(capacities, .{ system.nav_marks.capacity, system.nav_mark_staging.capacity, system.nav_mark_tallies.capacity });
     try std.testing.expect(!system.nav_mark_growth.logged);
 
-    // Room for the marks, so only the staging and tallies grow: one growth.
+    // Room for the marks, so only the staging and tallies grow.
     const staging_bound = system.nav_mark_staging.capacity + 1;
     try system.nav_marks.ensureTotalCapacity(system.allocator, 2 * staging_bound);
+    const marks = system.nav_marks.capacity;
     try system.reserveTerrainNavRecord(staging_bound);
-    try std.testing.expectEqual(@as(u64, 1), system.nav_mark_growth.count);
+    try std.testing.expectEqual(marks, system.nav_marks.capacity);
+    try std.testing.expect(system.nav_mark_staging.capacity >= staging_bound);
     try std.testing.expect(system.nav_mark_growth.logged);
 
-    // All three grow in one reserve: still one growth.
+    // All three grow in one reserve.
     const all_bound = @max(system.nav_marks.capacity, system.nav_mark_staging.capacity) + 1;
     try system.reserveTerrainNavRecord(all_bound);
-    try std.testing.expectEqual(@as(u64, 2), system.nav_mark_growth.count);
+    try std.testing.expect(system.nav_marks.capacity >= all_bound);
     try std.testing.expect(system.nav_mark_staging.capacity >= all_bound);
     try std.testing.expect(system.nav_mark_tallies.capacity >= maxRangeCount(all_bound, nav_mark_range_alignment_items));
 }

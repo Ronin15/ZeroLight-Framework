@@ -20,7 +20,7 @@ const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 
 /// `SteeringSystem.update` inline as one range: a thread system with no workers.
 pub fn updateSteeringInline(steering: *SteeringSystem, data: *const DataSystem, frame: *SimulationFrame, pathfinding: *const PathfindingSystem, colliders: *const StaticColliderSystem) !SteeringStats {
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     return steering.update(data, frame, &threads, pathfinding, colliders, .{});
 }
@@ -99,6 +99,8 @@ pub fn testColliders(pathfinding: *const PathfindingSystem, data: *const DataSys
 // The commit seam for statics in this step: the collider reserve, the commit of
 // `commands`, the capture, and the sync.
 pub fn commitStaticsForTest(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, commands: []const StructuralCommand) !void {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     try colliders.reserveForCommit(data, commands.len);
     try frame.structural_commands.prepareRangeCounts(1);
     frame.structural_commands.addCount(0, commands.len);
@@ -109,7 +111,7 @@ pub fn commitStaticsForTest(frame: *SimulationFrame, data: *DataSystem, collider
     frame.structural_commands.finishWrite();
     _ = try frame.applyStructuralCommands(data);
     colliders.capture(frame);
-    try colliders.sync(data, null);
+    try colliders.sync(data, &serial_threads);
 }
 
 // Parity statics on a 512-unit level of 16-unit cells (2 x 2 chunks): boxes of size

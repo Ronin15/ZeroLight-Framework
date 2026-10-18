@@ -1365,8 +1365,8 @@ const NavFixture = struct {
     base: Fixture,
     pipeline: SimulationPipeline,
     io: std.Io,
-    // The case's thread system for the dig and ramp reactions; null runs them serial.
-    threads: ?*ThreadSystem = null,
+    // The case's thread system for the dig and ramp reactions.
+    threads: *ThreadSystem,
     // The most recent reaction's stats and wall time.
     last_stats: NavUpdateStats = .{},
     last_reaction_ns: u64 = 0,
@@ -1434,7 +1434,7 @@ const NavFixture = struct {
     // The writer's nav record of the step's published tile events (reserved before the
     // write), then the post-commit nav reaction; fails unless it applied one incremental
     // update, drained every mark, and signaled the invalidation once.
-    fn reactToFrame(self: *NavFixture, frame: *SimulationFrame, thread_system: ?*ThreadSystem) !NavUpdateStats {
+    fn reactToFrame(self: *NavFixture, frame: *SimulationFrame, thread_system: *ThreadSystem) !NavUpdateStats {
         const pathfinding = &self.pipeline.pathfinding;
         pathfinding.recordTerrainNavEvents(frame.events.mergedItems(), &self.base.world, thread_system);
         const stats = try pathfinding.reactToPostCommitNavEvents(frame, &self.pipeline.static_colliders, &self.base.world, thread_system);
@@ -1479,7 +1479,7 @@ fn navSizeConfig(side: u16, levels: usize, participant_count: usize, batch: nav_
 }
 
 // Builds the pipeline, and with it the nav, over `fixture`'s world, taking ownership of it.
-fn navFixtureOver(allocator: std.mem.Allocator, io: std.Io, fixture: Fixture, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !NavFixture {
+fn navFixtureOver(allocator: std.mem.Allocator, io: std.Io, fixture: Fixture, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !NavFixture {
     var base = fixture;
     errdefer base.deinit();
     // No entities; the pipeline reads the rows only at init.
@@ -1491,7 +1491,7 @@ fn navFixtureOver(allocator: std.mem.Allocator, io: std.Io, fixture: Fixture, ca
         .nav_build_thread_system = thread_system,
         .dig = base.dig,
     });
-    return .{ .base = base, .pipeline = pipeline, .io = io };
+    return .{ .base = base, .pipeline = pipeline, .io = io, .threads = thread_system };
 }
 
 // `reaction`: the workload runs the post-commit reaction, so its mark stage dispatches too.
@@ -1516,9 +1516,9 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     const side = code.level_side;
     const levels = code.levels;
     if (levels < cave_in_levels + 1 or side < 256) return error.ChunkScaleWorldTooSmall;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     // The dig square's cells on the deepest level; the ramps' too, with their exits' obstacle
     // rects on the level above and their links.
@@ -1650,7 +1650,7 @@ fn navTunersSettled(nav: *const NavFixture, revert: *const RevertEditTuners) boo
 // the cells written before each write, as a terrain writer reserves from its event budget.
 // Publishing the events is untimed setup. The reversal runs on `revert`'s edit tuners and
 // the fixture's revert stage tuners (swapped in and out untimed).
-fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, frame: *SimulationFrame, edit_threads: ?TerrainEditThreads, revert: *RevertEditTuners, thread_system: ?*ThreadSystem, timing: *NavBatchTiming) !usize {
+fn runNavBatchIteration(io: std.Io, nav: *NavFixture, edit: *BatchEdit, frame: *SimulationFrame, edit_threads: ?TerrainEditThreads, revert: *RevertEditTuners, thread_system: *ThreadSystem, timing: *NavBatchTiming) !usize {
     for ([_][]const DenseChunkWrites{ edit.forward_chunks.items, edit.back_chunks.items }, [_]usize{ edit.forward.items.len, edit.back.items.len }) |chunks, cell_count| {
         const reverting = chunks.ptr == edit.back_chunks.items.ptr;
         if (reverting) nav.swapRevertTuners();
@@ -1805,9 +1805,9 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     const levels = scale[1];
     if (side < 256 or (if (workload == .enclose) levels != 1 else levels < cave_in_levels + 1)) return error.ChunkScaleWorldTooSmall;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     // Every cell of the edit's chunks as a mark; its keys: a cave-in's square on each of its
     // levels, an explosion disk's bounding square, or each doorway chunk with its neighbours.
@@ -1848,7 +1848,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         try nav.pipeline.pathfinding.reserveTerrainNavRecord(edit.back.items.len);
         try applyBatch(&nav.base.world, edit.back_chunks.items, &edit.events, null);
         try publishBatchEvents(&frame, edit.events.items);
-        _ = try nav.reactToFrame(&frame, null);
+        _ = try nav.reactToFrame(&frame, nav.threads);
     }
 
     const world = &nav.base.world;
@@ -1857,12 +1857,12 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     world.terrain_edit_write_tuner = editTunerForCase(case);
     var revert_tuners = RevertEditTuners.forCase(case);
     nav.setTuners(case);
-    const edit_threads: ?TerrainEditThreads = if (threads) |*thread_system| .{
-        .thread_system = thread_system,
+    const edit_threads = TerrainEditThreads{
+        .thread_system = thread_ptr,
         .plan_tuner = &world.terrain_edit_plan_tuner,
         .write_tuner = &world.terrain_edit_write_tuner,
         .controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, edit_range_alignment_items) },
-    } else null;
+    };
 
     var unused_timing: NavBatchTiming = .{};
     var warm = suite.Warmup.init(options, case, 1);
@@ -1936,9 +1936,9 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     if (levels < cave_in_levels + 1 or side < 256) return error.ChunkScaleWorldTooSmall;
     // Every iteration (warmup included) adds a level, so the size check holds at the
     // deepest the run gets.
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     // Level builds only: no marks batch. The world first: its content, and the levels the run
     // adds, size the nav. Added levels are solid, except the replace case's newest level, which

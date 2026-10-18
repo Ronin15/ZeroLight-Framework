@@ -15,7 +15,8 @@ paths:
   never by revert-and-rerun runs. Never drop a proof test or
   `FailingAllocator` proof to save time; a work-bound proof moves to its
   bench group, never away.
-- A threaded stage has a test proving it ran on workers, not inline.
+- A threaded stage has a bench dispatch check proving it ran on workers,
+  not inline.
 - Terrain contract tests cover a multi-chunk one-step change and repeated
   dig/fill.
 - An incremental path (nav patch, terrain or link change) gets an
@@ -91,9 +92,10 @@ paths:
 - Scaling benches ship with the first implementation; terrain features bench
   destruction-shaped workloads (a one-step explosion region, repeated
   dig/fill).
-- Benches read production defaults, constants, layouts, and byte bounds
-  (pure `@sizeOf`-based bounds beside each structure); never copy them. A
-  memory estimate is checked whole against live bytes.
+- Benches read production defaults, constants, and layouts; never copy
+  them. Byte bounds production does not use live in the owning module's
+  `*test_support.zig`, built from the structure's `@sizeOf`. A memory
+  estimate is checked whole against live bytes.
 - Each group's doc states what it measures and its pass shape, and its
   asserts check that shape. Exception: a branch's measuring landing states
   each finding's pass shape in the group doc and asserts only fixture

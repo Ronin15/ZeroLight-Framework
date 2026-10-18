@@ -671,7 +671,7 @@ fn addAgentWithPerceptionMemoryAffect(
 
 // `AffectSystem.update` inline as one range: a thread system with no workers.
 fn updateInline(system: *AffectSystem, ai_agents: ConstAiAgentSlice, data: *DataSystem, events: *SimulationEvents, config: AffectConfig) !AffectStats {
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     return system.update(ai_agents, data, events, &threads, config);
 }

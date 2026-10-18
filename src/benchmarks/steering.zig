@@ -576,7 +576,7 @@ fn staticChangeOnce(system: *SteeringSystem, fixture: *StaticChangeFixture, thre
     const frame = &fixture.steering.frame;
     const colliders = &fixture.steering.colliders;
     const seam = fixtures.CommitSeam{ .colliders = colliders, .steering = system, .structural_headroom = fixtures.StaticMove.structural_headroom };
-    const commit = try seam.commit(frame, &fixture.steering.data, &.{fixture.mover.command()}, if (case.usesThreadSystem()) thread_system else null);
+    const commit = try seam.commit(frame, &fixture.steering.data, &.{fixture.mover.command()}, thread_system);
     if (commit.structural.components_set != 1) return error.StaticMoveNotApplied;
     if (colliders.changesThisStep().len != 1) return error.StaticChangeNotSynced;
     fixture.mover.advance();
@@ -622,7 +622,7 @@ const StaticDenseFixture = struct {
 // of a square slot grid spanning the chunk, so every chunk the agents query holds exactly
 // `statics_per_chunk` statics and no static crosses a chunk edge. `layout` sets the order the
 // statics are created in and whether half are churned through the commit seam.
-fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usize, layout: StaticDenseLayout) !StaticDenseFixture {
+fn createStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, statics_per_chunk: usize, layout: StaticDenseLayout) !StaticDenseFixture {
     if (statics_per_chunk == 0) return error.NoStatics;
     const slot_side = std.math.sqrt(statics_per_chunk - 1) + 1;
     std.debug.assert(slot_side * slot_side >= statics_per_chunk);
@@ -695,7 +695,7 @@ fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usi
     const nav_extent = @as(f32, @floatFromInt(chunks_per_axis)) * chunk_px;
     var colliders = try buildColliders(allocator, &data, &pathfinding, nav_extent, nav_extent);
     errdefer colliders.deinit();
-    if (layout == .churned) try churnStatics(allocator, &data, &colliders, statics, positions, prng.random());
+    if (layout == .churned) try churnStatics(allocator, io, &data, &colliders, statics, positions, prng.random());
     if (static_colliders_test_support.liveRowCount(colliders) != chunk_count * statics_per_chunk) return error.WrongStaticCount;
     try pathfinding.rebuildStaticNavGrid(&data, nav_extent, nav_extent, nav_cell_size);
 
@@ -713,6 +713,7 @@ fn createStaticDenseFixture(allocator: std.mem.Allocator, statics_per_chunk: usi
 // sync, as play does; `statics` is left holding the live ids.
 fn churnStatics(
     allocator: std.mem.Allocator,
+    io: std.Io,
     data: *DataSystem,
     colliders: *StaticColliderSystem,
     statics: []EntityId,
@@ -728,11 +729,14 @@ fn churnStatics(
     defer allocator.free(commands);
     var frame = SimulationFrame.init(allocator);
     defer frame.deinit();
+    // Untimed: the commits' collider syncs run inline.
+    var threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
     // A create emits its entity event and one per component (body, bounds, response).
     try frame.reserveStreams(1, churned.len * 4, 0, 0, 0, churned.len);
 
     for (commands, churned) |*command, index| command.* = .{ .destroy_entity = statics[index] };
-    try churnCommit(&frame, data, colliders, commands);
+    try churnCommit(&frame, data, colliders, commands, &threads);
     if (static_colliders_test_support.liveRowCount(colliders) != statics.len - churned.len) return error.StaticDestroysMissing;
 
     for (commands, churned) |*command, index| command.* = .{ .create_entity = .{
@@ -740,7 +744,7 @@ fn churnStatics(
         .collision_bounds = .{ .size = .{ .x = static_size, .y = static_size } },
         .collision_response = .{ .mode = .solid, .mobility = .static, .restitution = 0 },
     } };
-    try churnCommit(&frame, data, colliders, commands);
+    try churnCommit(&frame, data, colliders, commands, &threads);
     var created: usize = 0;
     for (frame.structural_changes_scratch.items) |change| switch (change) {
         .entity_created => |entity| {
@@ -754,10 +758,10 @@ fn churnStatics(
 
 // `commands` as one step's commit through the seam, its share one destroy or create per
 // command; fails unless every command changed a static.
-fn churnCommit(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, commands: []const StructuralCommand) !void {
+fn churnCommit(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, commands: []const StructuralCommand, thread_system: *ThreadSystem) !void {
     frame.beginStep();
     const seam = fixtures.CommitSeam{ .colliders = colliders, .structural_headroom = structuralEventHeadroom(commands.len, 0) };
-    _ = try seam.commit(frame, data, commands, null);
+    _ = try seam.commit(frame, data, commands, thread_system);
     if (colliders.changesThisStep().len != commands.len) return error.StaticChurnNotSynced;
 }
 
@@ -765,7 +769,7 @@ fn runStaticDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const code = try StaticDenseCode.decode(item_count);
 
-    var fixture = try createStaticDenseFixture(allocator, code.statics_per_chunk, code.layout);
+    var fixture = try createStaticDenseFixture(allocator, io, code.statics_per_chunk, code.layout);
     defer fixture.deinit(allocator);
     const measured = try measureCase(allocator, io, options, case, code.statics_per_chunk, &fixture.steering, &fixture, prepareStaticDense, staticDenseOnce);
     var stats = measured.stats;

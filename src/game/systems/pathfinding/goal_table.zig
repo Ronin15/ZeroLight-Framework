@@ -124,19 +124,6 @@ pub const GoalTable = struct {
         std.debug.assert(self.refs.capacity >= limit and self.live.capacity >= limit and self.scan_refs.capacity >= limit);
     }
 
-    /// Bytes the map, entries, and scan staging hold (allocated capacity).
-    pub fn residentBytes(self: *const GoalTable) usize {
-        return self.map.residentBytes() + self.refs.capacity * @sizeOf(u64) + self.live.capacity * @sizeOf(u32) +
-            self.scan_refs.capacity * @sizeOf(u64) + self.scan_tallies.capacity * @sizeOf(ScanTally);
-    }
-
-    /// `residentBytes` once reserved for at most `limit` intents. Saturates.
-    pub fn storageBytesBound(limit: usize) usize {
-        return ElementMap.storageBytesBound(limit) +| std.ArrayList(u64).growCapacity(limit) *| @sizeOf(u64) +|
-            LineList(u32).growCapacity(limit) *| @sizeOf(u32) +| LineList(u64).growCapacity(limit) *| @sizeOf(u64) +|
-            LineList(ScanTally).growCapacity(maxRangeCount(limit, scan_range_alignment_items)) *| @sizeOf(ScanTally);
-    }
-
     pub fn invalidate(self: *GoalTable) void {
         self.valid = false;
     }
@@ -406,6 +393,8 @@ fn expectReferenceTable(system: *const PathfindingSystem, intents: []const TestI
 }
 
 test "the goal table holds exactly the distinct blocked goals in first-seen order with their projections, and nothing for open goals or unbuilt levels" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var system = try blockedGoalSystem(std.testing.allocator, &data);
@@ -414,7 +403,7 @@ test "the goal table holds exactly the distinct blocked goals in first-seen orde
     var intents: [97]TestIntent = undefined;
     mixedIntents(grid, &intents);
     try system.reserveGoals(intents.len);
-    const stats = try system.resolveGoals(TestIntent, &intents, null, .{});
+    const stats = try system.resolveGoals(TestIntent, &intents, &serial_threads, .{});
     try expectReferenceTable(&system, &intents);
     try std.testing.expectEqual(intents.len, stats.intents);
     try std.testing.expectEqual(system.goals.refs.items.len, stats.distinct);
@@ -431,6 +420,8 @@ test "the goal table holds exactly the distinct blocked goals in first-seen orde
 }
 
 test "the goal table is equal serial and threaded across worker counts and range sizes, with both stages on workers" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var system = try blockedGoalSystem(std.testing.allocator, &data);
@@ -438,7 +429,7 @@ test "the goal table is equal serial and threaded across worker counts and range
     var intents: [203]TestIntent = undefined;
     mixedIntents(system.graph.grid(0).?, &intents);
     try system.reserveGoals(intents.len);
-    _ = try system.resolveGoals(TestIntent, &intents, null, .{});
+    _ = try system.resolveGoals(TestIntent, &intents, &serial_threads, .{});
     const serial_refs = try std.testing.allocator.dupe(u64, system.goals.refs.items);
     defer std.testing.allocator.free(serial_refs);
     const serial_live = try std.testing.allocator.dupe(u32, system.goals.live.items);
@@ -463,6 +454,8 @@ test "the goal table is equal serial and threaded across worker counts and range
 }
 
 test "a reserved goal resolve allocates nothing on a real multi-worker thread system, and a failed growth leaves the table invalid and its storage intact (FailingAllocator)" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -480,7 +473,7 @@ test "a reserved goal resolve allocates nothing on a real multi-worker thread sy
     for ([_]?usize{ 1, 7, null }) |items_per_range| {
         const stats = try system.resolveGoals(TestIntent, &intents, &threads, .{ .items_per_range = items_per_range, .adaptive = items_per_range == null });
         try std.testing.expect(stats.distinct != 0);
-        _ = try system.resolveGoals(TestIntent, intents[0..17], null, .{});
+        _ = try system.resolveGoals(TestIntent, intents[0..17], &serial_threads, .{});
     }
     try expectReferenceTable(&system, intents[0..17]);
     // Past the limit the resolve grows at its entry; the failed growth writes no entry.
@@ -493,11 +486,11 @@ test "a reserved goal resolve allocates nothing on a real multi-worker thread sy
     try std.testing.expectEqual(limit_before, system.goals.limit);
     try std.testing.expectEqual(refs_before, system.goals.refs.items.len);
     try std.testing.expectEqual(@as(?u32, null), system.goals.lookup(system.goals.refs.items[0]));
-    // The retry with memory grows, counted.
+    // The retry with memory grows the table and logs it.
     system.allocator = std.testing.allocator;
-    const grows_before = system.goal_table_growth.count;
     _ = try system.resolveGoals(TestIntent, &more, &threads, .{});
-    try std.testing.expectEqual(grows_before + 1, system.goal_table_growth.count);
+    try std.testing.expect(system.goals.limit > limit_before);
+    try std.testing.expect(system.goal_table_growth.logged);
     try expectReferenceTable(&system, &more);
 }
 
@@ -506,12 +499,14 @@ test "a reserved goal table holds exactly its storage bound, and a smaller reser
     var table = GoalTable{};
     defer table.deinit(allocator);
     try table.reserve(allocator, 1000);
-    try std.testing.expectEqual(GoalTable.storageBytesBound(1000), table.residentBytes());
+    try std.testing.expectEqual(test_support.goalTableStorageBytesBound(1000), test_support.goalTableResidentBytes(&table));
     try table.reserve(allocator, 10);
-    try std.testing.expectEqual(GoalTable.storageBytesBound(1000), table.residentBytes());
+    try std.testing.expectEqual(test_support.goalTableStorageBytesBound(1000), test_support.goalTableResidentBytes(&table));
 }
 
 test "a nav batch, an apply of edits, or a rebuild invalidates the goal table, and lookups then compute the projection on the grid now" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const allocator = std.testing.allocator;
     var meta = try test_support.loadTestWorldMeta(allocator);
     defer meta.deinit();
@@ -536,7 +531,7 @@ test "a nav batch, an apply of edits, or a rebuild invalidates the goal table, a
     // Each opened cell comes first in the projection's ring scan over the cells opened so far.
     const changes = [_][3]u16{ .{ 4, 6, 0 }, .{ 6, 5, 1 }, .{ 4, 5, 2 } };
     for (changes) |change| {
-        _ = try system.resolveGoals(TestIntent, &intents, null, .{});
+        _ = try system.resolveGoals(TestIntent, &intents, &serial_threads, .{});
         try std.testing.expect(system.goals.lookup(ref) != null);
         // Open a cell of the block, so the projection moves to it.
         const changed = (try world.setDenseTile(obstacle, change[0], change[1], grass)).?;
@@ -544,7 +539,7 @@ test "a nav batch, an apply of edits, or a rebuild invalidates the goal table, a
             0 => _ = try test_support.applyTileChange(&system, &test_support.no_colliders, &world, changed),
             1 => {
                 try test_support.recordTileChange(&system, &world, changed);
-                _ = try system.applyBufferedNavUpdates(&test_support.no_colliders, &world, null);
+                _ = try system.applyBufferedNavUpdates(&test_support.no_colliders, &world, &serial_threads);
             },
             else => try system.rebuildStaticNavGridWithWorld(&data, &world, null),
         }
@@ -558,11 +553,13 @@ test "a nav batch, an apply of edits, or a rebuild invalidates the goal table, a
 }
 
 test "an empty goal table that reserved no slots misses every lookup, and the live goal is computed" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var system = try blockedGoalSystem(std.testing.allocator, &data);
     defer system.deinit();
-    const stats = try system.resolveGoals(TestIntent, &.{}, null, .{});
+    const stats = try system.resolveGoals(TestIntent, &.{}, &serial_threads, .{});
     try std.testing.expectEqual(@as(usize, 0), stats.distinct);
     try std.testing.expect(system.goals.valid and system.goals.limit == 0);
     const ref = goalRef(.walk, 0, 3 * 10 + 3);

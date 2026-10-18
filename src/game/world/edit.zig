@@ -660,7 +660,7 @@ fn reserveDenseEditScratch(self: *WorldSystem, group_count: usize, strides: Dens
     try ensureDenseEditCapacity(self, &scratch.band_counts, strides.bands);
 }
 
-// One batched-edit scratch list's growth seam: geometric, and counted once grown.
+// One batched-edit scratch list's growth seam: geometric, its first growth logged once.
 fn ensureDenseEditCapacity(self: *WorldSystem, list: anytype, needed: usize) error{OutOfMemory}!void {
     if (list.capacity >= needed) return;
     try list.ensureTotalCapacity(self.allocator, needed);

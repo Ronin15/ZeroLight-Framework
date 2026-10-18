@@ -749,9 +749,7 @@ pub const SimulationPipeline = struct {
     /// Tracked logical population capacity: every population-sized pipeline capacity is
     /// reserved to it. Grown only by `syncPopulationCapacity` at the commit seam.
     movement_body_capacity: usize,
-    /// Telemetry: population seam growths (perf metric `population_capacity_grows`).
-    population_capacity_grows: u64 = 0,
-    /// Once-only flag for the first-growth log.
+    /// Once-only flag for the first population-seam growth log.
     population_growth_logged: bool = false,
     /// This pipeline's share of `frame.events`' `capacity_limit` for perception,
     /// passed through as `PerceptionConfig.max_events_per_step`. Derived share
@@ -1046,7 +1044,6 @@ pub const SimulationPipeline = struct {
 
         if (body_grew or shares_grew) {
             stats.grew = true;
-            self.population_capacity_grows += 1;
             if (!self.population_growth_logged) {
                 self.population_growth_logged = true;
                 if (comptime logging.enabled(.info)) logging.game.info(
@@ -1114,7 +1111,7 @@ pub const SimulationPipeline = struct {
     /// step. Main work is O(1) per changed static and per footprint chunk entering or
     /// leaving; the per-chunk sorted placement threads under `thread_system`. On error the
     /// rows are unchanged, nothing is recorded, and the changes stay for the next sync.
-    pub fn syncStaticColliders(self: *SimulationPipeline, data: *const DataSystem, thread_system: ?*ThreadSystem) !void {
+    pub fn syncStaticColliders(self: *SimulationPipeline, data: *const DataSystem, thread_system: *ThreadSystem) !void {
         try self.static_colliders.sync(data, thread_system);
         self.pathfinding.recordStaticColliderChanges(self.static_colliders.changesThisStep());
     }
@@ -1133,7 +1130,7 @@ pub const SimulationPipeline = struct {
         self: *SimulationPipeline,
         frame: *SimulationFrame,
         world: *const WorldSystem,
-        thread_system: ?*ThreadSystem,
+        thread_system: *ThreadSystem,
     ) !NavUpdateStats {
         return self.pathfinding.reactToPostCommitNavEvents(frame, &self.static_colliders, world, thread_system);
     }
@@ -3798,6 +3795,8 @@ test "plane traversal multi-entity world_level attach OOM leaves landings uncarv
 }
 
 test "plane traversal multi-fall after its reserve commits and publishes allocation-free (FailingAllocator)" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
     defer meta.deinit();
@@ -3846,7 +3845,7 @@ test "plane traversal multi-fall after its reserve commits and publishes allocat
     var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
     defer plane_entry.deinit();
     const entries = try plane_entry.gather(&data, &world, player.entity, dig.tunnel_tile, null);
-    const reservation = try dig.reservePlaneTraversalStage(&world, &data, &player, &frame, entries, null);
+    const reservation = try dig.reservePlaneTraversalStage(&world, &data, &player, &frame, entries, &serial_threads);
     try std.testing.expectEqual(@as(usize, 2), reservation.carves);
 
     const original_frame = frame.allocator;
@@ -3869,7 +3868,7 @@ test "plane traversal multi-fall after its reserve commits and publishes allocat
         dig.scratch_allocator = original_dig;
     }
 
-    try dig.commitPlaneTraversalStage(&world, &data, &player, &frame, reservation, null);
+    try dig.commitPlaneTraversalStage(&world, &data, &player, &frame, reservation, &serial_threads);
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
@@ -5164,7 +5163,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
     try std.testing.expect(maxEventsPerStep(.plane_traversal, pipeline.eventBudgets()) >= 25);
     try std.testing.expect(pipeline.pathfinding.effective_agent_capacity >= 12);
-    try std.testing.expect(pipeline.population_capacity_grows >= 1);
+    try std.testing.expect(pipeline.population_growth_logged);
 
     const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
     // Multi-worker runs pin a 2-worker, 16-item partition (3 movement ranges at 37
@@ -6103,6 +6102,8 @@ fn steeringStageLateralForTest(pipeline: *SimulationPipeline, context: Simulatio
 }
 
 test "a static committed at the seam pushes steering agents on the next step" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     // The commit seam's collider sync writes the static rows the steering stage reads,
     // outside the stage graph. Steering run between the commit and the sync still sees
     // the box parked; after the sync it pushes away from the box.
@@ -6165,12 +6166,14 @@ test "a static committed at the seam pushes steering agents on the next step" {
     try std.testing.expectApproxEqAbs(@as(f32, 0), try steeringStageLateralForTest(&pipeline, context, agent), 0.001);
 
     // After the seam's sync, the stage pushes the agent away from the box (+y).
-    try pipeline.syncStaticColliders(&data, null);
+    try pipeline.syncStaticColliders(&data, &serial_threads);
     pipeline.reactToPostCommitSteeringEvents(&frame);
     try std.testing.expect(try steeringStageLateralForTest(&pipeline, context, agent) > 0.05);
 }
 
 test "a static move splices its collider's chunk lists, and a seam with no static change splices none" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var world = try minimalSyncWorld();
     defer world.deinit();
     var data = DataSystem.init(std.testing.allocator);
@@ -6197,7 +6200,7 @@ test "a static move splices its collider's chunk lists, and a seam with no stati
     try pipeline.reserveStaticColliders(&frame, &data);
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
-    try pipeline.syncStaticColliders(&data, null);
+    try pipeline.syncStaticColliders(&data, &serial_threads);
     try std.testing.expect(pipeline.static_colliders.last_splice_batch.item_count > 0);
 
     // A seam with no static change resets the batch.
@@ -6205,7 +6208,7 @@ test "a static move splices its collider's chunk lists, and a seam with no stati
     try pipeline.reserveStaticColliders(&frame, &data);
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
-    try pipeline.syncStaticColliders(&data, null);
+    try pipeline.syncStaticColliders(&data, &serial_threads);
     try std.testing.expectEqual(@as(usize, 0), pipeline.static_colliders.last_splice_batch.item_count);
 }
 

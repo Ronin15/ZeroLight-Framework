@@ -27,8 +27,12 @@ reviewer diligence:
    production file is referenced by production code (outside `test` blocks,
    file-scope test helpers (named `*ForTest` / `*WithTestBackend`, or using
    `std.testing`), `*test_support.zig`, `src/benchmarks/`, and the
-   test/bench/smoke roots).
-   Every hit is removed from production; no annotation exempts one.
+   test/bench/smoke roots). A `pub fn` name declared more than once needs at
+   least as many production call sites as distinct declaration shapes, and a
+   non-`pub` method needs a production reference in its own file (methods of
+   file-scope test fixtures excepted).
+   Every hit is removed from production; no annotation exempts one. The only
+   exemptions are the owner's `OWNER_KEPT_API` entries.
 
 Scans every `src/**/*.zig` file plus `build.zig`. Rules in SRC_ONLY_PATTERNS
 apply to `src/` only. All rules match code with string/char-literal contents
@@ -346,6 +350,11 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
 # Rule 9: production files and the roots that are not production (tests, benches,
 # GPU smoke). Lines inside `test` blocks never count as production references.
 NON_PRODUCTION_ROOTS = {"src/tests.zig", "src/benchmark_runner.zig", "src/gpu_smoke.zig", "src/platform/gpu_smoke_impl.zig"}
+# `pub` API the owner keeps in production with no production caller yet (engine surface
+# for games), keyed `(path, name)` with the owner's reason. Only the owner adds entries.
+OWNER_KEPT_API = {
+    ("src/app/state.zig", "pass_through_overlay"): "owner 2026-10-17: engine state preset kept for games",
+}
 PUB_DECL = re.compile(r"^\s*pub\s+(?:inline\s+|extern\s+|export\s+)?(?:fn|const|var)\s+([A-Za-z_][A-Za-z0-9_]*)")
 # Entry hooks the compiler or std looks up by name.
 PUB_ENTRY_NAMES = {"main", "std_options", "panic", "root"}
@@ -365,6 +374,10 @@ def is_production(path: Path) -> bool:
 
 
 TOP_LEVEL_FN = re.compile(r"^(?:pub\s+)?(?:inline\s+|export\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+PUB_FN_DECL = re.compile(r"^\s*pub\s+(?:inline\s+|extern\s+|export\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+# A method: an indented non-`pub` fn (a container's member).
+METHOD_DECL = re.compile(r"^\s+(?:inline\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+TOP_LEVEL_DECL = re.compile(r"^(?:pub\s+)?(?:const|var|fn|inline\s+fn)\s+([A-Za-z_][A-Za-z0-9_]*)")
 TEST_HELPER_NAME = re.compile(r"(?:ForTest|WithTestBackend)$")
 
 
@@ -404,6 +417,88 @@ def production_lines(path: Path) -> tuple[list[str], list[str]]:
     return decls, refs
 
 
+def own_spellings(name: str, decl_line: str, ref_line: str) -> int:
+    """How often a declaration line spells its own name as a reference: once, unless the
+    line sits in a test helper (its references are already blanked)."""
+    return len([w for w in WORD.findall(decl_line) if w == name]) if ref_line else 0
+
+
+def fn_shape(decls: list[str], index: int) -> str:
+    """A `fn` declaration's parameter types after the first (the receiver) and its return
+    type, whitespace-normalized: implementations of one protocol (state hooks, a comptime
+    enabled/disabled pair, visitors) share a shape and are served by the same call sites."""
+    text = ""
+    for line in decls[index : index + 40]:
+        text += " " + line
+        if line.rstrip().endswith("{") or line.rstrip().endswith(";"):
+            break
+    start = text.find("(")
+    depth = 0
+    end = start
+    for position in range(start, len(text)):
+        if text[position] in "([{":
+            depth += 1
+        elif text[position] in ")]}":
+            depth -= 1
+            if depth == 0:
+                end = position
+                break
+    params: list[str] = []
+    depth = 0
+    current = ""
+    for char in text[start + 1 : end]:
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        if char == "," and depth == 0:
+            params.append(current)
+            current = ""
+        else:
+            current += char
+    if current.strip():
+        params.append(current)
+    types = [param.split(":", 1)[1] if ":" in param else param for param in params[1:]]
+    result = text[end + 1 :].rsplit("{", 1)[0]
+    return " ".join(" ".join(types + ["->", result]).split())
+
+
+def top_level_spans(decls: list[str]) -> list[tuple[str, int, int]]:
+    """File-scope declarations as `(name, first, last)` line spans: each runs to the line
+    before the next file-scope declaration."""
+    starts = [(index, m.group(1)) for index, line in enumerate(decls) if (m := TOP_LEVEL_DECL.match(line))]
+    spans: list[tuple[str, int, int]] = []
+    for position, (index, name) in enumerate(starts):
+        last = starts[position + 1][0] - 1 if position + 1 < len(starts) else len(decls) - 1
+        spans.append((name, index, last))
+    return spans
+
+
+def test_fixture_spans(decls: list[str], refs: list[str]) -> list[tuple[int, int]]:
+    """Spans of the file-scope non-`pub` declarations only tests reach: referenced from no
+    line outside the spans of such declarations (themselves included). Found as the largest
+    such set, by dropping every declaration a live line references until none drops."""
+    spans = top_level_spans(decls)
+    owner = [-1] * len(decls)
+    for position, (_, first, last) in enumerate(spans):
+        for line in range(first, last + 1):
+            owner[line] = position
+    words = [set(WORD.findall(line)) for line in refs]
+    fixture = [not decls[first].lstrip().startswith("pub ") for _, first, _ in spans]
+    changed = True
+    while changed:
+        changed = False
+        for position, (name, _, _) in enumerate(spans):
+            if not fixture[position]:
+                continue
+            for line, line_words in enumerate(words):
+                if name in line_words and owner[line] != position and (owner[line] == -1 or not fixture[owner[line]]):
+                    fixture[position] = False
+                    changed = True
+                    break
+    return [(first, last) for position, (_, first, last) in enumerate(spans) if fixture[position]]
+
+
 def lint_test_only_api(files: list[Path]) -> list[tuple[str, int, str, str]]:
     prod = [path for path in files if is_production(path)]
     scanned = {path: production_lines(path) for path in prod}
@@ -413,6 +508,21 @@ def lint_test_only_api(files: list[Path]) -> list[tuple[str, int, str, str]]:
         for code in ref_lines:
             for word in WORD.findall(code):
                 counts[word] = counts.get(word, 0) + 1
+    # Every production `pub fn` declaration of each name, and the spellings those
+    # declaration lines contribute to `counts`.
+    fn_decls: dict[str, list[tuple[Path, int]]] = {}
+    fn_shapes: dict[str, set[str]] = {}
+    fn_decl_spellings: dict[str, int] = {}
+    for path in prod:
+        decls, refs = scanned[path]
+        for index, code in enumerate(decls):
+            decl = PUB_FN_DECL.match(code)
+            if not decl or decl.group(1) in PUB_ENTRY_NAMES:
+                continue
+            name = decl.group(1)
+            fn_decls.setdefault(name, []).append((path, index))
+            fn_shapes.setdefault(name, set()).add(fn_shape(decls, index))
+            fn_decl_spellings[name] = fn_decl_spellings.get(name, 0) + own_spellings(name, code, refs[index])
     issues: list[tuple[str, int, str, str]] = []
     for path in prod:
         rel = path.relative_to(REPO_ROOT).as_posix()
@@ -422,13 +532,56 @@ def lint_test_only_api(files: list[Path]) -> list[tuple[str, int, str, str]]:
             if not decl or decl.group(1) in PUB_ENTRY_NAMES:
                 continue
             name = decl.group(1)
-            # The declaration line itself spells the name once, unless it sits in a test helper.
-            own = len([w for w in WORD.findall(code) if w == name]) if scanned[path][1][index] else 0
+            if (rel, name) in OWNER_KEPT_API:
+                continue
+            own = own_spellings(name, code, scanned[path][1][index])
             if counts.get(name, 0) > own:
                 continue
             here = raw_lines[index]
             issues.append(
                 (rel, index + 1, f"`pub {name}` has no production use (only tests or benches reach it); remove it from production", here.strip())
+            )
+    # A `pub fn` name declared more than once counts as used once any one of them is
+    # called: flag a name with fewer production call sites than distinct declarations
+    # (same-shape implementations of one protocol count once), since at least one of them
+    # is unreached.
+    flagged = {(rel, line) for rel, line, _, _ in issues}
+    for name, sites in sorted(fn_decls.items()):
+        calls = counts.get(name, 0) - fn_decl_spellings.get(name, 0)
+        distinct = len(fn_shapes[name])
+        if len(sites) < 2 or calls >= distinct:
+            continue
+        for path, index in sites:
+            rel = path.relative_to(REPO_ROOT).as_posix()
+            if (rel, name) in OWNER_KEPT_API or (rel, index + 1) in flagged:
+                continue
+            here = path.read_text(encoding="utf-8").splitlines()[index]
+            issues.append(
+                (rel, index + 1, f"`pub fn {name}` has {distinct} distinct declarations in production but {calls} call sites; remove the ones only tests or benches reach", here.strip())
+            )
+    # Non-`pub` methods are reachable only from their own file: flag one with no in-file
+    # production reference. Methods of a file-scope declaration nothing in production
+    # references (a test fixture) are test code.
+    for path in prod:
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        decls, refs = scanned[path]
+        raw_lines = path.read_text(encoding="utf-8").splitlines()
+        file_counts: dict[str, int] = {}
+        for code in refs:
+            for word in WORD.findall(code):
+                file_counts[word] = file_counts.get(word, 0) + 1
+        fixtures = test_fixture_spans(decls, refs)
+        for index, code in enumerate(decls):
+            method = METHOD_DECL.match(code)
+            if not method or not refs[index]:
+                continue
+            if any(first <= index <= last for first, last in fixtures):
+                continue
+            name = method.group(1)
+            if file_counts.get(name, 0) > own_spellings(name, code, refs[index]):
+                continue
+            issues.append(
+                (rel, index + 1, f"method `{name}` has no production use in its file (only tests reach it); remove it from production", raw_lines[index].strip())
             )
     return issues
 

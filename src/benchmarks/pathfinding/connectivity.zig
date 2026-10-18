@@ -248,7 +248,7 @@ fn checkOnewayIsolated(fixture: *const ReactFixture, stats: NavUpdateStats, tail
 
 // Blocks `cells` (open before) and runs the nav reaction, then reopens them and runs it again
 // on `revert_tuners` (swapped in and out untimed).
-fn runToggle(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks, revert_tuners: *fixtures.NavTuners) !ToggleSample {
+fn runToggle(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, cells: []const CellCoord, thread_system: *ThreadSystem, checks: ToggleChecks, revert_tuners: *fixtures.NavTuners) !ToggleSample {
     const tail_capacity = fixture.system.graph.connectivity.closure.tail.capacity;
     const change = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
     if (checks.isolated) try checkOnewayIsolated(fixture, change.stats, tail_capacity);
@@ -385,7 +385,7 @@ const ToggleReport = struct {
 // cells flipped per second. The revert runs on its own stage tuner set, copied from the
 // fixture's, so each set learns one workload; the retire's reactions keep the tuners as
 // they were (`OnewayBallast.untimedReaction`).
-fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *ReactFixture, cells: []const CellCoord, thread_system: ?*ThreadSystem, checks: ToggleChecks, ballast: ?*OnewayBallast) !suite.RunStats {
+fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *ReactFixture, cells: []const CellCoord, thread_system: *ThreadSystem, checks: ToggleChecks, ballast: ?*OnewayBallast) !suite.RunStats {
     var revert_tuners = fixture.system.tuners;
     for (0..options.warmup_iterations) |_| {
         if (ballast) |chain| try chain.retire(io, fixture, thread_system);
@@ -524,7 +524,7 @@ const SplitConfig = struct {
 };
 
 // The split fixture on a walkable level: the structure's solid chunks written, no requests.
-fn initSplitFixture(allocator: std.mem.Allocator, io: std.Io, config: SplitConfig, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
+fn initSplitFixture(allocator: std.mem.Allocator, io: std.Io, config: SplitConfig, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, config.side, 1);
     errdefer open.world.deinit();
     if (config.spanChunks() * open.world.chunk_size_tiles > config.side) return error.ConnectivitySplitStructureTooLarge;
@@ -593,7 +593,7 @@ fn checkSplitTopology(allocator: std.mem.Allocator, world: *const WorldSystem, c
 // one cell far off in the open level, then reverts both. Fails unless the flood expands
 // exactly the room's `room_flood_nodes`: a removal's flood follows its own side, never
 // another change in the batch.
-fn checkFarFillAddsNothing(allocator: std.mem.Allocator, io: std.Io, fixture: *ReactFixture, config: SplitConfig, gap: []const CellCoord, room_flood_nodes: usize, thread_system: ?*ThreadSystem) !void {
+fn checkFarFillAddsNothing(allocator: std.mem.Allocator, io: std.Io, fixture: *ReactFixture, config: SplitConfig, gap: []const CellCoord, room_flood_nodes: usize, thread_system: *ThreadSystem) !void {
     const chunk_tiles = fixture.open.world.chunk_size_tiles;
     const far = CellCoord{ .x = @intCast(config.side - chunk_tiles / 2), .y = @intCast(config.side - chunk_tiles / 2) };
     if (config.inStructure(far, chunk_tiles)) return error.ConnectivitySplitFarFillInRoom;
@@ -612,9 +612,9 @@ fn checkFarFillAddsNothing(allocator: std.mem.Allocator, io: std.Io, fixture: *R
 fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try SplitConfig.decode(item_count);
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     // The gap chunk's cells.
     const size_config = toggleSizeConfig(config.side, 1, 0, participant_count, .{ .mark_chunks = default_chunk_size_tiles * default_chunk_size_tiles, .links = 0, .keys = toggle_batch_keys });
@@ -872,7 +872,7 @@ const OnewayBallast = struct {
     // reopen does not land exactly the ballast's one block or the close does not free exactly
     // it, when the block holds no more than twice the live words it left, or when the nav
     // holds more bytes than charged.
-    fn retire(self: *OnewayBallast, io: std.Io, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !void {
+    fn retire(self: *OnewayBallast, io: std.Io, fixture: *ReactFixture, thread_system: *ThreadSystem) !void {
         self.reopen = try untimedReaction(io, fixture, self.cells, fixture.open.walkable, thread_system);
         const reopen = self.reopen.stats;
         if (reopen.perf.closure_tail_used != self.block_words or reopen.perf.closure_landed_words != self.block_words or reopen.perf.closure_block_allocs != 1) return error.ConnectivityOnewayBallastLanding;
@@ -885,13 +885,13 @@ const OnewayBallast = struct {
     }
 
     // Closes every ballast room in one untimed reaction.
-    fn closeAll(self: *OnewayBallast, io: std.Io, fixture: *ReactFixture, thread_system: ?*ThreadSystem) !void {
+    fn closeAll(self: *OnewayBallast, io: std.Io, fixture: *ReactFixture, thread_system: *ThreadSystem) !void {
         self.close = try untimedReaction(io, fixture, self.cells, fixture.open.blocking, thread_system);
     }
 
     // Sets the ballast's rooms to `tile` in one reaction, leaving every tuner as it was, so
     // it never trains the timed reactions' stages.
-    fn untimedReaction(io: std.Io, fixture: *ReactFixture, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !Reaction {
+    fn untimedReaction(io: std.Io, fixture: *ReactFixture, cells: []const CellCoord, tile: TileId, thread_system: *ThreadSystem) !Reaction {
         const tuners = fixture.system.tuners;
         defer fixture.system.tuners = tuners;
         return fixture.changeLevelAndReact(io, ballast_level, cells, tile, thread_system);
@@ -1017,7 +1017,7 @@ fn addOnewayLink(world: *WorldSystem, from: OnewayRoom, to: OnewayRoom) !void {
     });
 }
 
-fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayConfig, rooms: []const OnewayRoom, ballast: []const OnewayRoom, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
+fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayConfig, rooms: []const OnewayRoom, ballast: []const OnewayRoom, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, oneway_side, oneway_levels);
     errdefer open.world.deinit();
     std.debug.assert(open.world.chunk_size_tiles == default_chunk_size_tiles);
@@ -1056,7 +1056,7 @@ fn initOnewayFixture(allocator: std.mem.Allocator, io: std.Io, config: OnewayCon
 }
 
 // Closes `rooms` (level-0 rooms of one chain) in one untimed nav reaction.
-fn cutOnewayChain(allocator: std.mem.Allocator, io: std.Io, fixture: *ReactFixture, rooms: []const OnewayRoom, thread_system: ?*ThreadSystem) !void {
+fn cutOnewayChain(allocator: std.mem.Allocator, io: std.Io, fixture: *ReactFixture, rooms: []const OnewayRoom, thread_system: *ThreadSystem) !void {
     const cells = try allocator.alloc(CellCoord, rooms.len);
     defer allocator.free(cells);
     for (rooms, cells) |room, *cell| {
@@ -1074,9 +1074,9 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
     // Its pass shape reads the closure's diagnostic counters, kept only with the perf log.
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try OnewayConfig.decode(item_count);
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
     const rooms = try onewayRooms(allocator, config);
     defer allocator.free(rooms);

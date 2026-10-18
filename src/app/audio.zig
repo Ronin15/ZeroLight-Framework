@@ -230,18 +230,7 @@ pub const AudioService = struct {
     last_warned_control_error: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator, asset_store: assets.AssetStore, config: AudioConfig) !AudioService {
-        var service = AudioService{
-            .allocator = allocator,
-            .assets = asset_store,
-            .config = config,
-            .enabled = config.enabled,
-            .backend = disabledBackend(),
-            .backend_context = disabledBackendContext(),
-            .master_gain = config.master_gain,
-            .sfx_gain = config.sfx_gain,
-            .music_gain = config.music_gain,
-        };
-        if (!config.enabled) return service;
+        if (!config.enabled) return initWithBackend(allocator, asset_store, config, disabledBackend(), disabledBackendContext());
 
         const production_context = try allocator.create(ProductionBackendContext);
         var context_initialized = false;
@@ -253,10 +242,8 @@ pub const AudioService = struct {
             allocator.destroy(production_context);
         }
 
-        service.backend = productionBackend();
-        service.backend_context = @ptrCast(production_context);
+        var service = try initWithBackend(allocator, asset_store, config, productionBackend(), @ptrCast(production_context));
         service.owns_backend_context = true;
-        try service.createTracks();
         log.debug("audio initialized: sfx_tracks={} master_gain={} sfx_gain={} music_gain={}", .{
             service.sfx_tracks.items.len,
             service.master_gain,
@@ -266,6 +253,8 @@ pub const AudioService = struct {
         return service;
     }
 
+    /// Builds the service over `backend` and `backend_context`, which the caller owns and
+    /// keeps alive past `deinit`; creates the tracks when `config.enabled`.
     pub fn initWithBackend(
         allocator: std.mem.Allocator,
         asset_store: assets.AssetStore,

@@ -5,8 +5,8 @@
 //! Runtime asset cache for renderer-backed resources.
 //! Cache lookups are intended for setup, state transitions, and explicit release
 //! points. Hot render paths should keep drawing with retained TextureId values.
-//! TextureLease is a non-owning token: the cache remains the owner of retain
-//! counts and the renderer remains the owner of GPU texture destruction.
+//! TextureLease is a non-owning token: the cache owns each entry (one lease per
+//! path; releasing it removes the entry) and the renderer owns GPU texture destruction.
 
 const std = @import("std");
 const assets = @import("assets.zig");
@@ -88,7 +88,6 @@ pub const AssetCache = struct {
             try self.entries.put(self.allocator, owned_path, .{
                 .path = owned_path,
                 .texture = texture,
-                .retain_count = 1,
             });
             put_done = true;
             errdefer {
@@ -195,12 +194,6 @@ pub const AssetCache = struct {
         const entry = self.entries.getPtr(relative_path) orelse return;
         if (!textureIdsEqual(entry.texture, texture)) return;
 
-        if (entry.retain_count > 1) {
-            entry.retain_count -= 1;
-            log.debug("released cached texture \"{s}\" count={}", .{ entry.path, entry.retain_count });
-            return;
-        }
-
         const removed = self.entries.fetchRemove(relative_path) orelse return;
         self.backend.destroy_texture(backend_context, removed.value.texture);
         self.allocator.free(removed.value.path);
@@ -257,17 +250,6 @@ pub const AssetCache = struct {
         return slot;
     }
 
-    fn resolveLeaseSlotConst(self: *const AssetCache, handle: LeaseHandle) ?*const LeaseSlot {
-        if (!handle.isValid()) return null;
-        const index: usize = @intCast(handle.index);
-        if (index >= self.lease_slots.items.len) return null;
-
-        const slot = &self.lease_slots.items[index];
-        if (!slot.alive) return null;
-        if (!handle.matches(handle.index, slot.generation)) return null;
-        return slot;
-    }
-
     fn retireLeaseSlot(self: *AssetCache, index: u32, slot: *LeaseSlot) void {
         std.debug.assert(slot.alive);
         slot.path = null;
@@ -303,7 +285,6 @@ pub const LeaseHandle = struct {
 const TextureEntry = struct {
     path: []const u8,
     texture: TextureId,
-    retain_count: u32,
 };
 
 const LeaseSlot = struct {
@@ -430,7 +411,7 @@ test "texture lease release validates the texture id before retiring a slot" {
     cache.releaseTextureWithContext(&fake, &forged);
     try std.testing.expect(!forged.isAlive());
     try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
-    try std.testing.expect(cache.resolveLeaseSlotConst(lease.handle) != null);
+    try std.testing.expect(cache.resolveLeaseSlot(lease.handle) != null);
 
     cache.releaseTextureWithContext(&fake, &lease);
     try std.testing.expect(!lease.isAlive());
@@ -454,7 +435,7 @@ test "texture lease release validates the owning cache before retiring a slot" {
     cache_b.releaseTextureWithContext(&fake_b, &foreign);
     try std.testing.expect(foreign.isAlive());
     try std.testing.expectEqual(@as(u32, 0), fake_b.destroy_count);
-    try std.testing.expect(cache_b.resolveLeaseSlotConst(lease_b.handle) != null);
+    try std.testing.expect(cache_b.resolveLeaseSlot(lease_b.handle) != null);
 
     cache_a.releaseTextureWithContext(&fake_a, &foreign);
     try std.testing.expect(!foreign.isAlive());

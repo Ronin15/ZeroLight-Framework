@@ -34,7 +34,6 @@ pub const ScopeColumnsSlice = @import("data_system/types.zig").ScopeColumnsSlice
 pub const ConstScopeColumnsSlice = @import("data_system/types.zig").ConstScopeColumnsSlice;
 pub const FacingData = @import("data_system/types.zig").FacingData;
 pub const ConstFacingSlice = @import("data_system/types.zig").ConstFacingSlice;
-pub const ConstFactionSlice = @import("data_system/types.zig").ConstFactionSlice;
 pub const PrimitiveVisual = @import("data_system/types.zig").PrimitiveVisual;
 pub const ConstPrimitiveVisualSlice = @import("data_system/types.zig").ConstPrimitiveVisualSlice;
 pub const AssetReference = @import("data_system/types.zig").AssetReference;

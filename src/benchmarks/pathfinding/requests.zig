@@ -27,6 +27,7 @@ const default_goal_requantization_hysteresis_distance = @import("../../game/syst
 const CellCoord = @import("../../game/world/system.zig").CellCoord;
 const default_chunk_size_tiles = @import("../../game/world/system.zig").default_chunk_size_tiles;
 const default_group_field_build_budget = @import("../../game/systems/pathfinding/types.zig").default_group_field_build_budget;
+const groupFieldResidentBytes = @import("../../game/systems/pathfinding/test_support.zig").groupFieldResidentBytes;
 const fixtures = @import("../fixtures.zig");
 const suite = @import("../suite.zig");
 const coldWarmup = @import("nav_fixtures.zig").coldWarmup;
@@ -339,7 +340,7 @@ const Workload = enum {
 };
 
 // `count` requests of `workload` on its level, world-backed nav built over it.
-fn initRequestFixture(allocator: std.mem.Allocator, io: std.Io, workload: Workload, count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !RouteFixture {
+fn initRequestFixture(allocator: std.mem.Allocator, io: std.Io, workload: Workload, count: usize, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !RouteFixture {
     if (count > workload.capacity()) return error.RequestLayoutTooSmall;
     var open = try buildOpenWorld(allocator, io, workload.side(), 1);
     var open_owned = true;
@@ -825,7 +826,7 @@ const PackFixture = struct {
     }
 };
 
-fn initPackFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !PackFixture {
+fn initPackFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !PackFixture {
     const side = group_field_detour_side;
     if (agent_count > (side / 2 - 2) * ((side - 8) / 3)) return error.PackLayoutTooSmall;
     var open = try buildDetourWorld(allocator, io, side);
@@ -1110,7 +1111,7 @@ fn writeFieldMemory(details: *suite.DetailLines, system: *const PathfindingSyste
         fields += 1;
         covered += field.pushed_count;
         blocks += field.used_blocks;
-        resident += field.residentBytes();
+        resident += groupFieldResidentBytes(field);
     }
     if (fields == 0) return;
     details.print("fields={} per_field covered={} blocks={} resident={}B bytes_per_cell={} pool_grows={} pool_failures={}\n", .{
@@ -1119,8 +1120,8 @@ fn writeFieldMemory(details: *suite.DetailLines, system: *const PathfindingSyste
         blocks / fields,
         resident / fields,
         resident / @max(@as(usize, 1), covered),
-        system.group_field_pool_growth.count,
-        system.group_field_pool_failure.count,
+        system.group_field_pool_growth.perf.count,
+        system.group_field_pool_failure.perf.count,
     });
 }
 

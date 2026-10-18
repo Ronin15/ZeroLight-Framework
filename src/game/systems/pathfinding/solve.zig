@@ -1945,6 +1945,7 @@ test "abstract expansion visits only same-label peers, border mirrors, and live 
 
 const LevelLink = @import("../../world/system.zig").LevelLink;
 const WorldSystem = @import("../../world/system.zig").WorldSystem;
+const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 
 // 16x16 cells in 4-tile chunks over `levels` levels, each with random walls.
@@ -2268,6 +2269,8 @@ test "the cross-level heuristic is consistent along every abstract edge and at m
 }
 
 test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract graph, links built whole or through marks" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const allocator = std.testing.allocator;
     const DataSystem = @import("../../data_system.zig").DataSystem;
     var meta = try test_support.loadTestWorldMeta(allocator);
@@ -2310,9 +2313,9 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
         try marked.reserve(capacity);
         try marked.rebuildStaticNavGridWithWorld(&data, &marked_world, null);
         for (links[0..first_apply]) |link| try marked_world.addLevelLink(link);
-        _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, null);
+        _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, &serial_threads);
         for (links[first_apply..]) |link| try marked_world.addLevelLink(link);
-        _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, null);
+        _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, &serial_threads);
         try std.testing.expect(std.meta.eql(whole.graph.link_bounds, marked.graph.link_bounds));
         for (whole.graph.level_crossings.items, marked.graph.level_crossings.items) |a, b| try std.testing.expect(std.meta.eql(a, b));
 
@@ -2376,7 +2379,7 @@ test "abstract A* reaches the cost of an exhaustive Dijkstra over the abstract g
     try marked.reserve(capacity);
     try marked.rebuildStaticNavGridWithWorld(&data, &marked_world, null);
     try marked_world.addLevelLink(pocket_teleport);
-    _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, null);
+    _ = try marked.applyBufferedNavUpdates(&test_support.no_colliders, &marked_world, &serial_threads);
     var abstract = AbstractScratch{};
     defer abstract.deinit(allocator);
     try abstract.reserve(allocator, 4096);

@@ -233,10 +233,6 @@ pub const StateTransitions = struct {
         try self.replaceOwnedState(state, policy);
     }
 
-    pub fn replaceGameplay(self: *StateTransitions, comptime T: type, value: T) !void {
-        try self.replace(T, value, state_policy.gameplay);
-    }
-
     pub fn replaceOwnedState(self: *StateTransitions, state: State, policy: StatePolicy) !void {
         errdefer state.destroy(self.allocator);
         try self.enqueue(.{ .replace = .{ .state = state, .policy = policy } });
@@ -264,14 +260,6 @@ pub const StateTransitions = struct {
 
     pub fn pushModal(self: *StateTransitions, comptime T: type, value: T) !void {
         try self.push(T, value, state_policy.modal_overlay);
-    }
-
-    pub fn pushOverlay(self: *StateTransitions, comptime T: type, value: T) !void {
-        try self.push(T, value, state_policy.pass_through_overlay);
-    }
-
-    pub fn pushOpaque(self: *StateTransitions, comptime T: type, value: T) !void {
-        try self.push(T, value, state_policy.opaque_screen);
     }
 
     pub fn remove(self: *StateTransitions, handle: StateHandle) !void {
@@ -332,16 +320,6 @@ pub const StateStack = struct {
         self.states.deinit(self.allocator);
     }
 
-    pub fn push(self: *StateStack, comptime T: type, value: T, policy: StatePolicy) !StateHandle {
-        const state = try State.create(T, self.allocator, value);
-        errdefer state.destroy(self.allocator);
-        return try self.pushOwned(state, policy);
-    }
-
-    pub fn pushModal(self: *StateStack, comptime T: type, value: T) !StateHandle {
-        return self.push(T, value, state_policy.modal_overlay);
-    }
-
     pub fn reserveForAdditionalStates(self: *StateStack, additional: usize) !void {
         try self.states.ensureUnusedCapacity(self.allocator, additional);
     }
@@ -352,31 +330,9 @@ pub const StateStack = struct {
         return self.pushOwnedAssumeCapacity(state, state_policy.modal_overlay);
     }
 
-    pub fn pushOverlay(self: *StateStack, comptime T: type, value: T) !StateHandle {
-        return self.push(T, value, state_policy.pass_through_overlay);
-    }
-
-    pub fn pushOpaque(self: *StateStack, comptime T: type, value: T) !StateHandle {
-        return self.push(T, value, state_policy.opaque_screen);
-    }
-
-    pub fn replace(self: *StateStack, comptime T: type, value: T, policy: StatePolicy) !StateHandle {
-        const state = try State.create(T, self.allocator, value);
-        errdefer state.destroy(self.allocator);
-        return try self.replaceOwned(state, policy);
-    }
-
-    pub fn replaceGameplay(self: *StateStack, comptime T: type, value: T) !StateHandle {
-        return self.replace(T, value, state_policy.gameplay);
-    }
-
     pub fn replaceOwnedState(self: *StateStack, state: State, policy: StatePolicy) !StateHandle {
         errdefer state.destroy(self.allocator);
         return try self.replaceOwned(state, policy);
-    }
-
-    pub fn replaceOwnedGameplay(self: *StateStack, state: State) !StateHandle {
-        return self.replaceOwnedState(state, state_policy.gameplay);
     }
 
     pub fn remove(self: *StateStack, handle: StateHandle) bool {
@@ -700,6 +656,8 @@ fn testKeyEvent(event_type: u32, key: c.SDL_Keycode, repeat: bool) c.SDL_Event {
     } };
 }
 
+const state_test_support = @import("state_test_support.zig");
+
 test "state stack owns pushed states and destroys removed states" {
     const TestingState = struct {
         id: u32,
@@ -739,19 +697,19 @@ test "state stack owns pushed states and destroys removed states" {
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    const first_handle = try stack.replaceGameplay(TestingState, .{ .id = 1, .deinit_count = &deinit_count });
+    const first_handle = try state_test_support.replaceState(&stack, TestingState, .{ .id = 1, .deinit_count = &deinit_count }, state_policy.gameplay);
     try std.testing.expectEqual(@as(usize, 1), stack.len());
     try std.testing.expectEqual(first_handle, stack.states.items[stack.states.items.len - 1].handle);
     try std.testing.expect(stack.contains(first_handle));
 
-    const second_handle = try stack.pushModal(TestingState, .{ .id = 2, .deinit_count = &deinit_count });
+    const second_handle = try state_test_support.pushState(&stack, TestingState, .{ .id = 2, .deinit_count = &deinit_count }, state_policy.modal_overlay);
     try std.testing.expectEqual(@as(usize, 2), stack.len());
 
     try std.testing.expect(stack.remove(second_handle));
     try std.testing.expect(!stack.contains(second_handle));
     try std.testing.expectEqual(@as(u32, 1), deinit_count);
 
-    _ = try stack.replaceGameplay(TestingState, .{ .id = 3, .deinit_count = &deinit_count });
+    _ = try state_test_support.replaceState(&stack, TestingState, .{ .id = 3, .deinit_count = &deinit_count }, state_policy.gameplay);
     try std.testing.expect(!stack.contains(first_handle));
     try std.testing.expectEqual(@as(u32, 2), deinit_count);
 }
@@ -796,9 +754,9 @@ test "state stack deinit destroys remaining states from top to bottom" {
     {
         var stack = StateStack.init(std.testing.allocator);
         defer stack.deinit();
-        _ = try stack.replaceGameplay(TestingState, .{ .id = 1, .deinit_order = &deinit_order });
-        _ = try stack.pushModal(TestingState, .{ .id = 2, .deinit_order = &deinit_order });
-        _ = try stack.pushOverlay(TestingState, .{ .id = 3, .deinit_order = &deinit_order });
+        _ = try state_test_support.replaceState(&stack, TestingState, .{ .id = 1, .deinit_order = &deinit_order }, state_policy.gameplay);
+        _ = try state_test_support.pushState(&stack, TestingState, .{ .id = 2, .deinit_order = &deinit_order }, state_policy.modal_overlay);
+        _ = try state_test_support.pushState(&stack, TestingState, .{ .id = 3, .deinit_order = &deinit_order }, state_policy.pass_through_overlay);
     }
 
     try std.testing.expectEqualSlices(u32, &.{ 3, 2, 1 }, deinit_order.items);
@@ -844,11 +802,11 @@ test "state stack replace destroys existing states from top to bottom" {
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    _ = try stack.replaceGameplay(TestingState, .{ .id = 1, .deinit_order = &deinit_order });
-    _ = try stack.pushModal(TestingState, .{ .id = 2, .deinit_order = &deinit_order });
-    _ = try stack.pushOverlay(TestingState, .{ .id = 3, .deinit_order = &deinit_order });
+    _ = try state_test_support.replaceState(&stack, TestingState, .{ .id = 1, .deinit_order = &deinit_order }, state_policy.gameplay);
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .id = 2, .deinit_order = &deinit_order }, state_policy.modal_overlay);
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .id = 3, .deinit_order = &deinit_order }, state_policy.pass_through_overlay);
 
-    _ = try stack.replaceGameplay(TestingState, .{ .id = 4, .deinit_order = &deinit_order });
+    _ = try state_test_support.replaceState(&stack, TestingState, .{ .id = 4, .deinit_order = &deinit_order }, state_policy.gameplay);
 
     try std.testing.expectEqualSlices(u32, &.{ 3, 2, 1 }, deinit_order.items);
     try std.testing.expectEqual(@as(usize, 1), stack.len());
@@ -889,7 +847,7 @@ test "state stack removeIfPresent clears live handles and leaves stale handles a
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    var handle: ?StateHandle = try stack.pushModal(TestingState, .{});
+    var handle: ?StateHandle = try state_test_support.pushState(&stack, TestingState, .{}, state_policy.modal_overlay);
     try std.testing.expect(stack.removeIfPresent(&handle));
     try std.testing.expect(handle == null);
     try std.testing.expectEqual(@as(usize, 0), stack.len());
@@ -945,14 +903,14 @@ test "modal state blocks updates below and pass-through state allows them" {
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    _ = try stack.replaceGameplay(TestingState, .{ .update_count = &bottom_updates });
-    const modal_handle = try stack.pushModal(TestingState, .{ .update_count = &top_updates });
+    _ = try state_test_support.replaceState(&stack, TestingState, .{ .update_count = &bottom_updates }, state_policy.gameplay);
+    const modal_handle = try state_test_support.pushState(&stack, TestingState, .{ .update_count = &top_updates }, state_policy.modal_overlay);
     try stack.update(testUpdateContext(&InputState{}, &audio, &runtime_assets, 0.0, &transitions, &threads));
     try std.testing.expectEqual(@as(u32, 0), bottom_updates);
     try std.testing.expectEqual(@as(u32, 1), top_updates);
 
     try std.testing.expect(stack.remove(modal_handle));
-    _ = try stack.pushOverlay(TestingState, .{ .update_count = &top_updates });
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .update_count = &top_updates }, state_policy.pass_through_overlay);
     try stack.update(testUpdateContext(&InputState{}, &audio, &runtime_assets, 0.0, &transitions, &threads));
     try std.testing.expectEqual(@as(u32, 1), bottom_updates);
     try std.testing.expectEqual(@as(u32, 2), top_updates);
@@ -1001,9 +959,9 @@ test "state event handling stops at consumed state" {
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    _ = try stack.replaceGameplay(TestingState, .{ .handled_count = &bottom_count });
-    _ = try stack.pushOverlay(TestingState, .{ .handled_count = &middle_count });
-    _ = try stack.pushOverlay(TestingState, .{ .handled_count = &top_count, .consume = true });
+    _ = try state_test_support.replaceState(&stack, TestingState, .{ .handled_count = &bottom_count }, state_policy.gameplay);
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .handled_count = &middle_count }, state_policy.pass_through_overlay);
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .handled_count = &top_count, .consume = true }, state_policy.pass_through_overlay);
 
     const event = c.SDL_Event{ .type = c.SDL_EVENT_QUIT };
     const consumed = try stack.handleEvent(&event, &transitions);
@@ -1055,8 +1013,8 @@ test "modal state blocks event handling below it" {
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    _ = try stack.replaceGameplay(TestingState, .{ .handled_count = &bottom_count });
-    _ = try stack.pushModal(TestingState, .{ .handled_count = &modal_count });
+    _ = try state_test_support.replaceState(&stack, TestingState, .{ .handled_count = &bottom_count }, state_policy.gameplay);
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .handled_count = &modal_count }, state_policy.modal_overlay);
 
     const event = c.SDL_Event{ .type = c.SDL_EVENT_QUIT };
     const consumed = try stack.handleEvent(&event, &transitions);
@@ -1103,7 +1061,7 @@ test "consumed modal event suppresses routed frame command" {
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    _ = try stack.pushModal(ConsumingState, .{});
+    _ = try state_test_support.pushState(&stack, ConsumingState, .{}, state_policy.modal_overlay);
     var input = InputState{};
     var commands = FrameCommands{};
     var event = testKeyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_ESCAPE, false);
@@ -1162,17 +1120,17 @@ test "state stack input routing follows active state policy" {
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggle_debug_overlay));
     try std.testing.expect(!stack.inputRoutingPolicy().allowsContext(.ui));
 
-    _ = try stack.replaceGameplay(TestingState, .{});
+    _ = try state_test_support.replaceState(&stack, TestingState, .{}, state_policy.gameplay);
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
 
-    const modal_handle = try stack.pushModal(TestingState, .{});
+    const modal_handle = try state_test_support.pushState(&stack, TestingState, .{}, state_policy.modal_overlay);
     try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggle_debug_overlay));
 
-    _ = try stack.pushOverlay(TestingState, .{});
+    _ = try state_test_support.pushState(&stack, TestingState, .{}, state_policy.pass_through_overlay);
     try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
@@ -1191,7 +1149,7 @@ test "state stack input routing follows active state policy" {
     input_router.routeEventWithGamepad(stack.inputRoutingPolicy(), &move_down, &input, &commands, null);
     try std.testing.expect(input.isHeld(.move_left));
 
-    _ = try stack.pushOpaque(TestingState, .{});
+    _ = try state_test_support.pushState(&stack, TestingState, .{}, state_policy.opaque_screen);
     try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggle_debug_overlay));
@@ -1240,9 +1198,9 @@ test "opaque state render policy hides states below it" {
     defer stack.deinit();
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
-    _ = try stack.replaceGameplay(TestingState, .{ .render_count = &bottom_count });
-    _ = try stack.pushOpaque(TestingState, .{ .render_count = &opaque_count });
-    _ = try stack.pushOverlay(TestingState, .{ .render_count = &overlay_count });
+    _ = try state_test_support.replaceState(&stack, TestingState, .{ .render_count = &bottom_count }, state_policy.gameplay);
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .render_count = &opaque_count }, state_policy.opaque_screen);
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .render_count = &overlay_count }, state_policy.pass_through_overlay);
 
     var renderer: Renderer = undefined;
     // TestingState.render never touches text_service; an unset service pointer
@@ -1301,9 +1259,9 @@ test "transition requests apply after dispatch and preserve FIFO order" {
     defer stack.deinit();
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
-    _ = try stack.replaceGameplay(TestingState, .{ .id = 1, .render_order = &render_order });
+    _ = try state_test_support.replaceState(&stack, TestingState, .{ .id = 1, .render_order = &render_order }, state_policy.gameplay);
     try transitions.pushModal(TestingState, .{ .id = 2, .render_order = &render_order });
-    try transitions.pushOverlay(TestingState, .{ .id = 3, .render_order = &render_order });
+    try transitions.push(TestingState, .{ .id = 3, .render_order = &render_order }, state_policy.pass_through_overlay);
     const result = try stack.applyTransitions(&transitions);
 
     try std.testing.expect(!result.quit_requested);
@@ -1358,7 +1316,7 @@ test "queued transition from update waits until applyTransitions" {
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    _ = try stack.replaceGameplay(QueuingState, .{});
+    _ = try state_test_support.replaceState(&stack, QueuingState, .{}, state_policy.gameplay);
     try stack.update(testUpdateContext(&InputState{}, &audio, &runtime_assets, 0.0, &transitions, &threads));
 
     try std.testing.expectEqual(@as(usize, 1), stack.len());
@@ -1407,7 +1365,7 @@ test "queued transition from handleEvent waits until applyTransitions" {
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    _ = try stack.replaceGameplay(QueuingState, .{});
+    _ = try state_test_support.replaceState(&stack, QueuingState, .{}, state_policy.gameplay);
     const event = c.SDL_Event{ .type = c.SDL_EVENT_QUIT };
     const consumed = try stack.handleEvent(&event, &transitions);
 
@@ -1469,10 +1427,10 @@ test "event dispatch batch keeps stack stable until applyTransitions" {
     var event_count: usize = 0;
     var queued = false;
 
-    _ = try stack.replaceGameplay(QueuingState, .{
+    _ = try state_test_support.replaceState(&stack, QueuingState, .{
         .event_count = &event_count,
         .queued = &queued,
-    });
+    }, state_policy.gameplay);
     const first = c.SDL_Event{ .type = c.SDL_EVENT_KEY_DOWN };
     const second = c.SDL_Event{ .type = c.SDL_EVENT_KEY_UP };
 
@@ -1527,11 +1485,11 @@ test "stale duplicate and remove after replace transitions are no-ops" {
     defer stack.deinit();
 
     const stale_handle = StateHandle{ .id = 999 };
-    const live_handle = try stack.replaceGameplay(TestingState, .{});
+    const live_handle = try state_test_support.replaceState(&stack, TestingState, .{}, state_policy.gameplay);
 
     try transitions.remove(stale_handle);
     try transitions.remove(stale_handle);
-    try transitions.replaceGameplay(TestingState, .{});
+    try transitions.replace(TestingState, .{}, state_policy.gameplay);
     try transitions.remove(live_handle);
     const result = try stack.applyTransitions(&transitions);
 
@@ -1579,7 +1537,7 @@ test "transition queue destroys unapplied owned states" {
         var transitions = StateTransitions.init(std.testing.allocator);
         defer transitions.deinit();
         try transitions.pushModal(TestingState, .{ .deinit_count = &deinit_count });
-        try transitions.replaceGameplay(TestingState, .{ .deinit_count = &deinit_count });
+        try transitions.replace(TestingState, .{ .deinit_count = &deinit_count }, state_policy.gameplay);
     }
 
     try std.testing.expectEqual(@as(u32, 2), deinit_count);
@@ -1755,8 +1713,8 @@ test "pop transition removes and destroys the current top state" {
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    _ = try stack.replaceGameplay(TestingState, .{ .id = 1, .deinit_count = &deinit_count });
-    _ = try stack.pushModal(TestingState, .{ .id = 2, .deinit_count = &deinit_count });
+    _ = try state_test_support.replaceState(&stack, TestingState, .{ .id = 1, .deinit_count = &deinit_count }, state_policy.gameplay);
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .id = 2, .deinit_count = &deinit_count }, state_policy.modal_overlay);
     try std.testing.expectEqual(@as(usize, 2), stack.len());
 
     var transitions = StateTransitions.init(std.testing.allocator);
@@ -1826,8 +1784,8 @@ test "isGameplayActive and pauseActive/resumeActive target the gameplay policy e
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    _ = try stack.replaceGameplay(TestingState, .{ .pause_count = &game_pause, .resume_count = &game_resume });
-    _ = try stack.pushOverlay(TestingState, .{ .pause_count = &overlay_pause, .resume_count = &overlay_resume });
+    _ = try state_test_support.replaceState(&stack, TestingState, .{ .pause_count = &game_pause, .resume_count = &game_resume }, state_policy.gameplay);
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .pause_count = &overlay_pause, .resume_count = &overlay_resume }, state_policy.pass_through_overlay);
 
     try std.testing.expect(stack.isGameplayActive());
     try std.testing.expectEqual(@as(usize, 2), stack.len());
@@ -1881,7 +1839,7 @@ test "opaque non-gameplay top yields isGameplayActive false and pauseActive deli
 
     // Simulate non-gameplay opaque top (e.g. MainMenu bootstrap via opaque_screen policy, or replaceOpaque).
     // No replaceGameplay entry exists, so isGameplayActive is false and pauseActive is a no-op (no onPause delivered to menu).
-    _ = try stack.pushOpaque(TestingState, .{ .pause_count = &menu_pause });
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .pause_count = &menu_pause }, state_policy.opaque_screen);
 
     try std.testing.expect(!stack.isGameplayActive());
     try std.testing.expectEqual(@as(usize, 1), stack.len());
@@ -1932,8 +1890,8 @@ test "opaque non-gameplay state above gameplay blocks pause recipient" {
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    _ = try stack.replaceGameplay(TestingState, .{ .pause_count = &game_pause });
-    _ = try stack.pushOpaque(TestingState, .{ .pause_count = &opaque_pause });
+    _ = try state_test_support.replaceState(&stack, TestingState, .{ .pause_count = &game_pause }, state_policy.gameplay);
+    _ = try state_test_support.pushState(&stack, TestingState, .{ .pause_count = &opaque_pause }, state_policy.opaque_screen);
 
     try std.testing.expect(!stack.isGameplayActive());
     stack.pauseActive();

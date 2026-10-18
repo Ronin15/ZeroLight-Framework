@@ -530,14 +530,18 @@ pub const StaticColliderSystem = struct {
     row_cell_min_y: []u32 = &.{},
     row_cell_max_x: []u32 = &.{},
     row_cell_max_y: []u32 = &.{},
-    /// Telemetry: row-pool growths, logged once.
-    row_grows: u64 = 0,
+    /// The first row-pool growth is logged once.
     row_growth_logged: bool = false,
-    /// Telemetry: anchor-block pool and anchor-edit scratch growths, logged once.
-    anchor_grows: u64 = 0,
+    /// The first anchor-block pool or anchor-edit scratch growth is logged once.
     anchor_growth_logged: bool = false,
 
-    pub const Perf = if (runtime_perf_log.enabled) struct { last_query_splice_batch: BatchStats = .{} } else struct {};
+    /// Kept only with `runtime_perf_log.enabled`: the query lists' last splice batch, and the
+    /// row-pool and anchor growths so far.
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        last_query_splice_batch: BatchStats = .{},
+        row_grows: u64 = 0,
+        anchor_grows: u64 = 0,
+    } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) StaticColliderSystem {
         return .{
@@ -691,10 +695,12 @@ pub const StaticColliderSystem = struct {
         fresh.splice_tuner = self.splice_tuner;
         fresh.query_splice_tuner = self.query_splice_tuner;
         fresh.splice_controls = self.splice_controls;
-        fresh.row_grows += self.row_grows;
-        fresh.chunk_lists.grows += self.chunk_lists.grows;
-        fresh.query_lists.grows += self.query_lists.grows;
-        fresh.anchor_grows += self.anchor_grows;
+        if (comptime runtime_perf_log.enabled) {
+            fresh.perf.row_grows += self.perf.row_grows;
+            fresh.perf.anchor_grows += self.perf.anchor_grows;
+            fresh.chunk_lists.perf.grows += self.chunk_lists.perf.grows;
+            fresh.query_lists.perf.grows += self.query_lists.perf.grows;
+        }
         self.deinit();
         self.* = fresh;
     }
@@ -756,19 +762,17 @@ pub const StaticColliderSystem = struct {
     }
 
     fn countRowGrowth(self: *StaticColliderSystem) void {
-        self.row_grows += 1;
+        if (comptime runtime_perf_log.enabled) self.perf.row_grows += 1;
         if (self.row_growth_logged) return;
         self.row_growth_logged = true;
-        if (comptime logging.enabled(.info))
-            logging.game.info("static collider rows grew ({} growths so far)", .{self.row_grows});
+        if (comptime logging.enabled(.info)) logging.game.info("static collider rows grew", .{});
     }
 
     fn countAnchorGrowth(self: *StaticColliderSystem) void {
-        self.anchor_grows += 1;
+        if (comptime runtime_perf_log.enabled) self.perf.anchor_grows += 1;
         if (self.anchor_growth_logged) return;
         self.anchor_growth_logged = true;
-        if (comptime logging.enabled(.info))
-            logging.game.info("static collider anchor blocks grew ({} growths so far)", .{self.anchor_grows});
+        if (comptime logging.enabled(.info)) logging.game.info("static collider anchor blocks grew", .{});
     }
 
     // Grows the free anchor-block list to at least `needed` ids, new blocks all-zero.
@@ -908,7 +912,7 @@ pub const StaticColliderSystem = struct {
     /// sync. The change list resets on every call.
     // SIMD verdict: scalar. Per changed entity, gather-bound placement reads
     // (`isStaticNavigationObstacle`, the obstacle rect) and branchy row and list edits.
-    pub fn sync(self: *StaticColliderSystem, data: *const DataSystem, thread_system: ?*ThreadSystem) error{OutOfMemory}!void {
+    pub fn sync(self: *StaticColliderSystem, data: *const DataSystem, thread_system: *ThreadSystem) error{OutOfMemory}!void {
         self.changes.clearRetainingCapacity();
         self.last_splice_batch = .{};
         if (comptime runtime_perf_log.enabled) self.perf.last_query_splice_batch = .{};
@@ -1039,9 +1043,8 @@ pub const StaticColliderSystem = struct {
     }
 
     // A splice stage's threading under `thread_system`, with its own `tuner`.
-    fn spliceThreads(self: *const StaticColliderSystem, thread_system: ?*ThreadSystem, tuner: *AdaptiveWorkTuner) ?Dispatch {
-        const threads = thread_system orelse return null;
-        return Dispatch.init(threads, tuner, self.splice_controls);
+    fn spliceThreads(self: *const StaticColliderSystem, thread_system: *ThreadSystem, tuner: *AdaptiveWorkTuner) Dispatch {
+        return Dispatch.init(thread_system, tuner, self.splice_controls);
     }
 
     // `entity`'s placement when it is a live static navigation obstacle.
@@ -1121,11 +1124,13 @@ fn staticTemplate(position: math.Vec2, size: math.Vec2) EntityTemplate {
 
 // The commit seam in order: reserve, commit `commands`, capture, sync.
 fn commitForTest(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, commands: []const StructuralCommand) !void {
-    return commitForTestWith(frame, data, colliders, commands, null);
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
+    return commitForTestWith(frame, data, colliders, commands, &serial_threads);
 }
 
 // `commitForTest` with the sync's splice stage under `thread_system`.
-fn commitForTestWith(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, commands: []const StructuralCommand, thread_system: ?*ThreadSystem) !void {
+fn commitForTestWith(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, commands: []const StructuralCommand, thread_system: *ThreadSystem) !void {
     frame.beginStep();
     try colliders.reserveForCommit(data, commands.len);
     try frame.structural_commands.prepareRangeCounts(1);
@@ -1497,10 +1502,12 @@ test "sync runs out of memory at every allocation and leaves the structure uncha
     if (builtin.single_threaded) return error.SkipZigTest;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
-    for ([_]?*ThreadSystem{ null, &threads }) |thread_system| try expectSyncOutOfMemorySafe(thread_system);
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
+    for ([_]*ThreadSystem{ &serial_threads, &threads }) |thread_system| try expectSyncOutOfMemorySafe(thread_system);
 }
 
-fn expectSyncOutOfMemorySafe(thread_system: ?*ThreadSystem) !void {
+fn expectSyncOutOfMemorySafe(thread_system: *ThreadSystem) !void {
     var fail_index: usize = 0;
     while (true) : (fail_index += 1) {
         var fixture = try SeamFixture.init();
@@ -1540,7 +1547,7 @@ fn expectSyncOutOfMemorySafe(thread_system: ?*ThreadSystem) !void {
         fixture.colliders.query_lists.allocator = std.testing.allocator;
         if (result) |_| {
             try std.testing.expect(!failing.has_induced_failure);
-            if (thread_system != null) try std.testing.expect(!fixture.colliders.last_splice_batch.ran_inline);
+            if (thread_system.workerThreadCount() != 0) try std.testing.expect(!fixture.colliders.last_splice_batch.ran_inline);
             // The swept sync grew the anchor-block pool.
             try std.testing.expect(fixture.colliders.anchor_blocks.items.len > blocks_before);
             var after = try fixture.rebuilt();
@@ -1562,6 +1569,8 @@ fn expectSyncOutOfMemorySafe(thread_system: ?*ThreadSystem) !void {
 }
 
 test "sync after reserve allocates nothing (FailingAllocator)" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
     var templates: [16]StructuralCommand = undefined;
@@ -1604,7 +1613,7 @@ test "sync after reserve allocates nothing (FailingAllocator)" {
             fixture.colliders.query_lists.allocator = std.testing.allocator;
         }
         fixture.colliders.capture(&fixture.frame);
-        try fixture.colliders.sync(&fixture.data, null);
+        try fixture.colliders.sync(&fixture.data, &serial_threads);
     }
     try std.testing.expectEqual(@as(usize, 16), static_colliders_test_support.liveRowCount(fixture.colliders));
     try std.testing.expectEqual(no_value, fixture.colliders.chunk_lists.value(kept_chunk));
@@ -1736,7 +1745,7 @@ fn expectGrowthsLogged(colliders: *const StaticColliderSystem) !void {
     try std.testing.expect(colliders.anchor_growth_logged);
 }
 
-test "a rebuild adds its growths to the row, chunk-list, query-list, and anchor-block growth counters and keeps their logged flags" {
+test "a rebuild keeps the row, chunk-list, query-list, and anchor-block growth logs' flags" {
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
     var prng = std.Random.DefaultPrng.init(0x9e0);
@@ -1745,40 +1754,18 @@ test "a rebuild adds its growths to the row, chunk-list, query-list, and anchor-
     defer commands.deinit(std.testing.allocator);
     for (0..60) |_| try commands.append(std.testing.allocator, randomStatic(random));
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, commands.items);
-    const row_grows = fixture.colliders.row_grows;
-    const list_grows = fixture.colliders.chunk_lists.grows;
-    const query_grows = fixture.colliders.query_lists.grows;
-    const anchor_grows = fixture.colliders.anchor_grows;
-    try std.testing.expect(row_grows != 0 and list_grows != 0 and query_grows != 0 and anchor_grows != 0);
     try expectGrowthsLogged(&fixture.colliders);
     // The two list tiers log under distinct names.
     try std.testing.expect(!std.mem.eql(u8, fixture.colliders.chunk_lists.name, fixture.colliders.query_lists.name));
 
-    // A rebuild of the same statics grows as a fresh one does, on top of the earlier count.
-    var reference = try fixture.rebuilt();
-    defer reference.deinit();
+    // A rebuild of the same statics keeps the logged flags.
     try fixture.colliders.rebuild(&fixture.data, test_geometry);
-    try std.testing.expectEqual(row_grows + reference.row_grows, fixture.colliders.row_grows);
-    try std.testing.expectEqual(list_grows + reference.chunk_lists.grows, fixture.colliders.chunk_lists.grows);
-    try std.testing.expectEqual(query_grows + reference.query_lists.grows, fixture.colliders.query_lists.grows);
-    try std.testing.expectEqual(anchor_grows + reference.anchor_grows, fixture.colliders.anchor_grows);
     try expectGrowthsLogged(&fixture.colliders);
 
-    // A rebuild over no statics keeps the counts and the logged flags.
+    // So does a rebuild over no statics.
     var empty = DataSystem.init(std.testing.allocator);
     defer empty.deinit();
-    var empty_reference = StaticColliderSystem.init(std.testing.allocator);
-    defer empty_reference.deinit();
-    try empty_reference.rebuild(&empty, test_geometry);
-    const total_rows = fixture.colliders.row_grows;
-    const total_lists = fixture.colliders.chunk_lists.grows;
-    const total_queries = fixture.colliders.query_lists.grows;
-    const total_anchors = fixture.colliders.anchor_grows;
     try fixture.colliders.rebuild(&empty, test_geometry);
-    try std.testing.expectEqual(total_rows + empty_reference.row_grows, fixture.colliders.row_grows);
-    try std.testing.expectEqual(total_lists + empty_reference.chunk_lists.grows, fixture.colliders.chunk_lists.grows);
-    try std.testing.expectEqual(total_queries + empty_reference.query_lists.grows, fixture.colliders.query_lists.grows);
-    try std.testing.expectEqual(total_anchors + empty_reference.anchor_grows, fixture.colliders.anchor_grows);
     try expectGrowthsLogged(&fixture.colliders);
     try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(fixture.colliders));
 }
@@ -1812,13 +1799,13 @@ test "a destroy-heavy sync grows no rows" {
     for (&creates, 0..) |*command, at| command.* = .{ .create_entity = staticTemplate(.{ .x = @floatFromInt(at * 60), .y = 100 }, .{ .x = 8, .y = 8 }) };
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &creates);
     const pooled = fixture.colliders.rows.len;
-    const grows = fixture.colliders.row_grows;
+    const capacity = fixture.colliders.rows.capacity;
     var destroys: [32]StructuralCommand = undefined;
     for (fixture.colliders.changesThisStep(), &destroys) |change, *command| command.* = .{ .destroy_entity = change.entity };
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &destroys);
     try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(fixture.colliders));
     try std.testing.expectEqual(pooled, fixture.colliders.rows.len);
-    try std.testing.expectEqual(grows, fixture.colliders.row_grows);
+    try std.testing.expectEqual(capacity, fixture.colliders.rows.capacity);
 }
 
 test "a threaded sync after its reserves allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
@@ -2412,7 +2399,7 @@ test "a chunk's anchor block is released when its last anchor leaves and reused 
     // The first move claims a second block before the old one is released.
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(entity, .{ .x = 168, .y = 40 })});
     const pooled = fixture.colliders.anchor_blocks.items.len;
-    const grows = fixture.colliders.anchor_grows;
+    const capacity = fixture.colliders.anchor_blocks.capacity;
     try std.testing.expectEqual(@as(usize, 2), pooled);
     var from_chunk: u32 = 1;
     for (0..8) |step| {
@@ -2426,7 +2413,7 @@ test "a chunk's anchor block is released when its last anchor leaves and reused 
         try std.testing.expectEqual(pooled, fixture.colliders.anchor_blocks.items.len);
         from_chunk = to_chunk;
     }
-    try std.testing.expectEqual(grows, fixture.colliders.anchor_grows);
+    try std.testing.expectEqual(capacity, fixture.colliders.anchor_blocks.capacity);
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
     try expectSameRows(&fixture.colliders, &rebuilt, 1);

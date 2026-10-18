@@ -229,7 +229,7 @@ pub const RouteFixture = struct {
 };
 
 // Takes ownership of `open`; adds one entity per request.
-pub fn initRouteFixture(allocator: std.mem.Allocator, open: OpenWorld, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !RouteFixture {
+pub fn initRouteFixture(allocator: std.mem.Allocator, open: OpenWorld, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !RouteFixture {
     var owned_open = open;
     errdefer owned_open.world.deinit();
     var data = DataSystem.init(allocator);
@@ -315,12 +315,12 @@ pub const ReactFixture = struct {
     // record reserve, then the write and its tile events), then times the writer's nav record
     // of the events and the post-commit nav reaction; returns the reaction's time and stats.
     // `changed` holds `cells.len` entries.
-    pub fn changeAndReact(self: *ReactFixture, io: std.Io, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !Reaction {
+    pub fn changeAndReact(self: *ReactFixture, io: std.Io, cells: []const CellCoord, tile: TileId, thread_system: *ThreadSystem) !Reaction {
         return self.changeLevelAndReact(io, 0, cells, tile, thread_system);
     }
 
     // `changeAndReact` on `level`.
-    pub fn changeLevelAndReact(self: *ReactFixture, io: std.Io, level: u16, cells: []const CellCoord, tile: TileId, thread_system: ?*ThreadSystem) !Reaction {
+    pub fn changeLevelAndReact(self: *ReactFixture, io: std.Io, level: u16, cells: []const CellCoord, tile: TileId, thread_system: *ThreadSystem) !Reaction {
         const layer = OpenWorld.floor(level);
         self.changed.clearRetainingCapacity();
         try self.system.reserveTerrainNavRecord(cells.len);
@@ -416,7 +416,7 @@ pub const EvictReport = struct {
 
 // Builds the colliders and the world-backed nav over `open` and `data`, then moves them
 // and `requests` into the fixture. On error they stay with the caller.
-pub fn assembleReactFixture(allocator: std.mem.Allocator, open: *OpenWorld, data: *DataSystem, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
+pub fn assembleReactFixture(allocator: std.mem.Allocator, open: *OpenWorld, data: *DataSystem, requests: []PathRequest, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
     const extent = PathfindingSystem.worldNavExtent(&open.world);

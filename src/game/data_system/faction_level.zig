@@ -11,7 +11,6 @@ const std = @import("std");
 const types = @import("types.zig");
 const EntityId = types.EntityId;
 const Faction = @import("../faction.zig").Faction;
-const ConstFactionSlice = types.ConstFactionSlice;
 const ConstWorldLevelSlice = types.ConstWorldLevelSlice;
 
 const FactionRow = struct {
@@ -46,10 +45,6 @@ pub const FactionStore = struct {
         self.rows.slice().items(.faction)[index] = entity_faction;
     }
 
-    pub fn factionPtr(self: *FactionStore, index: usize) *Faction {
-        return &self.rows.slice().items(.faction)[index];
-    }
-
     pub fn factionAt(self: *const FactionStore, index: usize) Faction {
         return self.rows.slice().items(.faction)[index];
     }
@@ -60,11 +55,6 @@ pub const FactionStore = struct {
         const moved_entity = if (index != last) s.items(.entity)[last] else null;
         self.rows.swapRemove(index);
         return moved_entity;
-    }
-
-    pub fn sliceConst(self: *const FactionStore) ConstFactionSlice {
-        const s = self.rows.slice();
-        return .{ .entities = s.items(.entity), .factions = s.items(.faction) };
     }
 
     pub fn clearRetainingCapacity(self: *FactionStore) void {

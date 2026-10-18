@@ -24,6 +24,16 @@ fn rowOf(data: *const DataSystem, id: EntityId, comptime field: []const u8) ?usi
     return row;
 }
 
+/// Per-tier counts from an O(rows) scan of the dense scope tier column: the parity
+/// baseline for the incrementally maintained `DataSystem.tier_counts`.
+pub fn scanLiveTierCounts(data: *const DataSystem) [4]usize {
+    var counts = [4]usize{ 0, 0, 0, 0 };
+    for (data.movement_bodies.scopeSliceConst().tier) |tier| {
+        counts[@backingInt(tier)] += 1;
+    }
+    return counts;
+}
+
 pub fn simulationMetadata(data: *const DataSystem, id: EntityId) ?EntitySimulationMetadata {
     return data.movement_bodies.scopeMetadataAt(rowOf(data, id, "movement_body_index") orelse return null);
 }

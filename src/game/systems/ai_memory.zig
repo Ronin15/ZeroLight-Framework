@@ -151,14 +151,19 @@ pub const AiMemorySystem = struct {
     // against them.
     reserved_think_rows: usize = 0,
     reserved_memory_rows: usize = 0,
-    /// Telemetry: steps whose think or memory rows exceeded the reservation and grew the
-    /// scratch on the main thread before dispatch. Nonzero means the population seam's
-    /// reserve is short; the first warns once.
-    scratch_grown: u64 = 0,
+    /// Set by the first step whose think or memory rows exceeded the reservation and grew
+    /// the scratch on the main thread before dispatch (the population seam's reserve is
+    /// short), which warns once.
+    scratch_growth_logged: bool = false,
+    perf: Perf = .{},
     gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     order_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     decay_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     visible_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+
+    /// Kept only with `runtime_perf_log.enabled`: the steps that grew the scratch past its
+    /// reservation.
+    pub const Perf = if (runtime_perf_log.enabled) struct { scratch_grows: u64 = 0 } else struct {};
 
     /// Sizes the scratch for `pop` think rows and `pop` memory rows under every partition
     /// the tuners can pick. Grow-only; the pipeline calls it at its population seam.
@@ -356,13 +361,13 @@ pub const AiMemorySystem = struct {
         const think_target = if (think_count > self.reserved_think_rows) hotStoreCapacity(think_count + think_count / 2) else 0;
         const row_target = if (row_count > self.reserved_memory_rows) hotStoreCapacity(row_count + row_count / 2) else 0;
         try self.growScratch(think_target, row_target);
-        self.scratch_grown += 1;
-        if (comptime logging.enabled(.warn)) {
-            if (self.scratch_grown == 1) logging.game.warn(
-                "ai memory: {d} think rows / {d} memory rows exceeded the reserved scratch; grew to {d} / {d} (reservation short of the live population)",
-                .{ think_count, row_count, self.reserved_think_rows, self.reserved_memory_rows },
-            );
-        }
+        if (comptime runtime_perf_log.enabled) self.perf.scratch_grows += 1;
+        if (self.scratch_growth_logged) return;
+        self.scratch_growth_logged = true;
+        if (comptime logging.enabled(.warn)) logging.game.warn(
+            "ai memory: {d} think rows / {d} memory rows exceeded the reserved scratch; grew to {d} / {d} (reservation short of the live population)",
+            .{ think_count, row_count, self.reserved_think_rows, self.reserved_memory_rows },
+        );
     }
 
     // Grows the scratch to at least `think_target` think rows and `row_target` memory rows,
@@ -742,7 +747,7 @@ fn appendLostEvent(frame: *SimulationFrame, observer: EntityId, target: EntityId
 
 // `AiMemorySystem.update` inline as one range: a thread system with no workers.
 fn updateInline(system: *AiMemorySystem, ai_agents: ConstAiAgentSlice, data: *DataSystem, frame: *SimulationFrame, config: AiMemoryConfig) !AiMemoryStats {
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     return system.update(ai_agents, data, frame, &threads, config);
 }
@@ -1435,7 +1440,7 @@ test "AiMemorySystem growth past reserve orders correctly and counts once" {
     var sys = AiMemorySystem.init(testing.allocator);
     defer sys.deinit();
     try sys.reserve(8);
-    try testing.expectEqual(@as(u64, 0), sys.scratch_grown);
+    try testing.expect(!sys.scratch_growth_logged);
 
     for (0..2) |_| {
         frame.beginStep();
@@ -1444,7 +1449,8 @@ test "AiMemorySystem growth past reserve orders correctly and counts once" {
         try testing.expectEqual(agent_count, sys.memory_dense_indices.items.len);
         for (sys.memory_dense_indices.items, 0..) |row, rank| try testing.expectEqual(@as(u32, @intCast(rank)), row);
         try expectMasksClear(&sys);
-        try testing.expectEqual(@as(u64, 1), sys.scratch_grown);
+        // The first step grew past the population, so the second grows nothing.
+        try testing.expect(sys.scratch_growth_logged and sys.reserved_think_rows >= agent_count and sys.reserved_memory_rows >= agent_count);
     }
 }
 
@@ -1488,7 +1494,7 @@ test "AiMemorySystem scratch growth fails each allocation as OutOfMemory with st
         }
         failures += 1;
         try testing.expectError(error.OutOfMemory, failed);
-        try testing.expectEqual(@as(u64, 0), sys.scratch_grown);
+        try testing.expect(!sys.scratch_growth_logged);
         try testing.expectEqual(think_limit, sys.reserved_think_rows);
         try testing.expectEqual(row_limit, sys.reserved_memory_rows);
         try expectMasksClear(&sys);
@@ -1499,7 +1505,7 @@ test "AiMemorySystem scratch growth fails each allocation as OutOfMemory with st
         try testing.expectEqual(agent_count, sys.memory_dense_indices.items.len);
         for (sys.memory_dense_indices.items, 0..) |row, rank| try testing.expectEqual(@as(u32, @intCast(rank)), row);
         try expectMasksClear(&sys);
-        try testing.expectEqual(@as(u64, 1), sys.scratch_grown);
+        try testing.expect(sys.scratch_growth_logged and sys.reserved_think_rows >= agent_count);
         for (staleness_before, data.aiMemorySliceConst().staleness) |before, after| try testing.expectEqual(before + 1, after);
     }
     // At least the five per-row lists, each grown far past `reserve(8)`, allocate.

@@ -287,12 +287,16 @@ pub const PathfindingSystem = struct {
 
     // A counted growth or failure and whether its one log line was written.
     const GrowthCounter = struct {
-        count: u64 = 0,
         logged: bool = false,
+        perf: GrowthPerf = .{},
 
-        /// Adds `amount` and logs the first record at `level` through the game logger.
+        /// The growths so far, kept only with `runtime_perf_log.enabled`.
+        pub const GrowthPerf = if (runtime_perf_log.enabled) struct { count: u64 = 0 } else struct {};
+
+        /// Counts `amount` growths and logs the first record at `level` through the game
+        /// logger.
         pub fn record(self: *GrowthCounter, amount: u64, comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
-            self.count += amount;
+            if (comptime runtime_perf_log.enabled) self.perf.count += amount;
             if (self.logged) return;
             self.logged = true;
             if (comptime logging.enabled(level)) @field(logging.game, @tagName(level))(format, args);
@@ -892,18 +896,17 @@ pub const PathfindingSystem = struct {
     /// from one entry. `goal_scan` dispatches over intents, each range writing its window of
     /// distinct blocked refs; the main thread merges the windows in range order (O(1) per
     /// entry); `goal_project` dispatches over the distinct goals, one projection each. Both
-    /// stages run under their own tuners with `config`'s controls, inline without a thread
-    /// system. Intents past the reserved limit grow the table here, before any table write,
+    /// stages run under their own tuners with `config`'s controls. Intents past the reserved limit grow the table here, before any table write,
     /// geometrically and counted; on error the table is invalid and its storage intact. The
     /// table is valid until the next grid change. Equal for any partition.
-    pub fn resolveGoals(self: *PathfindingSystem, comptime Intent: type, intents: []const Intent, thread_system: ?*ThreadSystem, config: PathfindingConfig) error{OutOfMemory}!GoalResolveStats {
+    pub fn resolveGoals(self: *PathfindingSystem, comptime Intent: type, intents: []const Intent, thread_system: *ThreadSystem, config: PathfindingConfig) error{OutOfMemory}!GoalResolveStats {
         var stats = GoalResolveStats{ .intents = intents.len };
         self.goals.invalidate();
         if (intents.len > self.goals.limit) {
             try self.goals.reserve(self.allocator, @max(intents.len, self.goals.limit *| 2));
             self.countGoalTableGrowth();
         }
-        const threads: ?StageThreads = if (thread_system) |system| .{ .thread_system = system, .config = config } else null;
+        const threads = StageThreads{ .thread_system = thread_system, .config = config };
         if (!self.graph.valid()) {
             self.goals.beginScan(0, 0);
             _ = self.goals.mergeScan(1);
@@ -912,7 +915,7 @@ pub const PathfindingSystem = struct {
         }
         var graphs: goal_table.Graphs = undefined;
         for (std.enums.values(TraversalClass)) |traversal| graphs.set(traversal, self.graphFor(traversal));
-        const scan_dispatch: ?Dispatch = if (threads) |stage| stage.stage(&self.tuners.goal_scan) else null;
+        const scan_dispatch = threads.stage(&self.tuners.goal_scan);
         // An empty stage has no shape to select.
         const scan_shape: StageShape = if (intents.len == 0) .{} else stageShape(scan_dispatch, intents.len, goal_table.scan_range_alignment_items);
         self.goals.beginScan(intents.len, scan_shape.range_count);
@@ -929,7 +932,7 @@ pub const PathfindingSystem = struct {
         if (comptime runtime_perf_log.enabled) stats.perf.scan_batch = scan_batch;
         stats.blocked = self.goals.mergeScan(scan_shape.items_per_range);
         const distinct = self.goals.refs.items.len;
-        const project_dispatch: ?Dispatch = if (threads) |stage| stage.stage(&self.tuners.goal_project) else null;
+        const project_dispatch = threads.stage(&self.tuners.goal_project);
         const project_shape: StageShape = if (distinct == 0) .{} else stageShape(project_dispatch, distinct, goal_table.project_range_alignment_items);
         var project = goal_table.ProjectJob{
             .refs = self.goals.refs.items,
@@ -1834,6 +1837,8 @@ test "pathfinding warmed individual update does not allocate" {
 }
 
 test "pathfinding request storage stays within its bound after reserve, solves, and a goal resolve" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1861,7 +1866,7 @@ test "pathfinding request storage stays within its bound after reserve, solves, 
         try appendPathRequest(&stream, request.*);
     }
     _ = try updatePathfindingInline(&system, &stream, requests.len, .{});
-    _ = try system.resolveGoals(PathRequest, &requests, null, .{});
+    _ = try system.resolveGoals(PathRequest, &requests, &serial_threads, .{});
     try std.testing.expect(system.completed.count() != 0);
     try expectRequestStorageWithin(&system, capacity, shape);
 }
@@ -3969,6 +3974,8 @@ test "status refreshes a partial exactly where intake re-solves it: one chunk si
 }
 
 test "a partial solved toward an older goal projection is not served after the projection moves" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -4003,7 +4010,7 @@ test "a partial solved toward an older goal projection is not served after the p
 
     // A notch to the key's neighbour (20, 19) moves the projection there; the partial stays.
     try setRegistryCells(&system, &fixture, &.{ .{ 20, 18 }, .{ 20, 19 } }, fixture.grass);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(system.completed.slotIndex(key) != null);
     try std.testing.expectEqual(@as(?usize, 19 * 48 + 20), system.liveGoal(key, grid).cell);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
@@ -4233,8 +4240,8 @@ test "an unbuilt group field holds no memory after reserve" {
     try system.reserve(stallingFieldCapacity(1));
     try system.rebuildStaticNavGrid(&data, 2048, 2048, 32);
     try std.testing.expectEqual(@as(usize, 4), system.group_fields.items.len);
-    for (system.group_fields.items) |field| try std.testing.expectEqual(@as(usize, 0), field.residentBytes());
-    try std.testing.expectEqual(@as(u64, 0), system.group_field_pool_growth.count);
+    for (system.group_fields.items) |*field| try std.testing.expectEqual(@as(usize, 0), test_support.groupFieldResidentBytes(field));
+    try std.testing.expect(!system.group_field_pool_growth.logged);
 }
 
 test "a field cell cap at the slot-id width fails the reserve" {
@@ -4978,7 +4985,7 @@ fn prepareMixedFlush(system: *PathfindingSystem, requester: EntityId) !void {
         const route = registryRoute(index, 24);
         try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
     }
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var stats = PathfindingStats{};
     try system.updateThreaded(&stream, 16, .{ .thread_system = &threads, .config = .{} }, &stats);
@@ -5098,6 +5105,8 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
 }
 
 test "an elastic grow and shrink keep cached paths and registrations, and a renamed owner is evicted by a change on its path" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5133,7 +5142,7 @@ test "an elastic grow and shrink keep cached paths and registrations, and a rena
     // A dig on the moved path's middle cell evicts it under its new owner id.
     const middle = cells.items[cells.items.len / 2];
     try setRegistryCells(&system, &fixture, &.{.{ @intCast(middle % 24), @intCast(middle / 24) }}, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(system.completed.slotIndex(moved_key) == null);
     try expectRegistryMatchesCache(&system);
 }
@@ -5355,6 +5364,8 @@ fn lastSolveNodes(system: *const PathfindingSystem) usize {
 }
 
 test "each solve outcome: an invalid graph, a missing goal level, no live goal, and no reach are unavailable without a search; a blocked start is dropped; reachable searches past their caps retry" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5407,7 +5418,7 @@ test "each solve outcome: an invalid graph, a missing goal level, no live goal, 
     try std.testing.expect(system.pending_keys.contains(goal_key));
     // The pending request's goal sealed off before its solve.
     try setRegistryCells(&system, &fixture, &.{ .{ 19, 19 }, .{ 20, 19 }, .{ 21, 19 }, .{ 19, 20 }, .{ 21, 20 }, .{ 19, 21 }, .{ 20, 21 }, .{ 21, 21 } }, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
     system.scratch_slots.items[0].corridor.abstract.reset();
@@ -5462,6 +5473,8 @@ fn digProjectionTunnel(system: *PathfindingSystem, fixture: *RegistryWorld, firs
 }
 
 test "a blocked goal whose projection lies in a sealed area is unavailable at status and intake, and reads its new projection's answer after a nearer cell opens outside" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5480,7 +5493,7 @@ test "a blocked goal whose projection lies in a sealed area is unavailable at st
     // A tunnel stopping one cell short of the key's still-blocked cell: its projection is
     // now (15, 1), reachable.
     try digProjectionTunnel(&system, &fixture, 15);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
     const solved = try solveFrom(&system, requester, start, goal, .{});
     try std.testing.expectEqual(@as(usize, 1), solved.available_results);
@@ -5489,6 +5502,8 @@ test "a blocked goal whose projection lies in a sealed area is unavailable at st
 }
 
 test "a dig opening a sealed pocket makes its goals reachable after that step's reaction, and a fill sealing it answers a pending request at solve with no search" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5502,13 +5517,13 @@ test "a dig opening a sealed pocket makes its goals reachable after that step's 
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outsideStart(0), 0, goal, .default, null).status);
     // Dig a gap in the pocket's wall column.
     try setRegistryCells(&system, &fixture, &.{.{ pocket_cells, 3 }}, fixture.grass);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, outsideStart(0), 0, goal, .default, null).status);
     // Accepted and left pending, then the gap filled before its solve.
     _ = try solveFrom(&system, requester, outsideStart(0), goal, .{ .max_solve_admissions_per_step = 0 });
     try std.testing.expectEqual(@as(usize, 1), system.pending.len);
     try setRegistryCells(&system, &fixture, &.{.{ pocket_cells, 3 }}, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
     system.scratch_slots.items[0].corridor.abstract.reset();
@@ -5557,6 +5572,8 @@ test "a solved result stores its path's last cell as its end, plain and stitched
 }
 
 test "a cached path to an older projection is not served after the projection moves: status reads missing, intake makes a candidate, and the publish re-puts the entry" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5579,7 +5596,7 @@ test "a cached path to an older projection is not served after the projection mo
     // A notch from the block's top edge to the key's neighbour (20, 19): the projection moves
     // there, more than one cell from the cached path.
     try setRegistryCells(&system, &fixture, &.{ .{ 20, 18 }, .{ 20, 19 } }, fixture.grass);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(system.completed.slotIndex(key) != null);
     try std.testing.expectEqual(@as(?usize, 19 * 48 + 20), system.liveGoal(key, grid).cell);
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
@@ -5594,6 +5611,8 @@ test "a cached path to an older projection is not served after the projection mo
 }
 
 test "a one-way teleport into a sealed pocket solves forward, answers the reverse unavailable with no search, and closing its source flips the forward answer the same step" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5619,12 +5638,14 @@ test "a one-way teleport into a sealed pocket solves forward, answers the revers
     try std.testing.expectEqual(@as(usize, 0), reverse.solved_requests + system.pending.len);
     // Closing the link's source cell: the forward goal reads unavailable after the reaction.
     try setRegistryCells(&system, &fixture, &.{.{ 20, 20 }}, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, outside, 0, inside_goal, .default, null).status);
     try std.testing.expectEqual(@as(usize, 1), (try solveFrom(&system, requester, outside, inside_goal, .{})).unavailable_results);
 }
 
 test "a crowd at one blocked unreachable goal shares one projection: the resolve projects once, intake answers every request from the table, and every status reads unavailable" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -5640,7 +5661,7 @@ test "a crowd at one blocked unreachable goal shares one projection: the resolve
     defer stream.deinit();
     const goal = tileCenter(14, 1);
     for (0..crowd) |index| try appendPathRequest(&stream, .{ .entity = requester, .start = tileCenter(@intCast(40 + index % 8), @intCast(10 + index / 8)), .goal = goal });
-    const resolve = try system.resolveGoals(PathRequest, stream.mergedItems(), null, .{});
+    const resolve = try system.resolveGoals(PathRequest, stream.mergedItems(), &serial_threads, .{});
     try std.testing.expectEqual(@as(usize, crowd), resolve.blocked);
     try std.testing.expectEqual(@as(usize, 1), resolve.distinct);
     try std.testing.expectEqual(@as(usize, 1), resolve.distinct);

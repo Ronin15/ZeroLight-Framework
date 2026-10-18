@@ -318,7 +318,7 @@ fn expectMovementDataApproxEqual(actual: *const data.DataSystem, expected: *cons
 
 // `MovementSystem.update` inline as one range: a thread system with no workers.
 fn updateInline(slice: *data.MovementBodySlice, delta_seconds: f32) !void {
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var system = MovementSystem.init();
     _ = system.update(slice, &threads, delta_seconds, .{});
@@ -326,7 +326,7 @@ fn updateInline(slice: *data.MovementBodySlice, delta_seconds: f32) !void {
 
 // `MovementSystem.applyIntents` inline as one range: a thread system with no workers.
 fn applyIntentsInline(bodies: *data.DataSystem, frame: *const SimulationFrame) !void {
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var system = MovementSystem.init();
     _ = system.applyIntents(bodies, frame, &threads, .{});

@@ -109,9 +109,8 @@ pub const BenchmarkCase = struct {
     }
 
     /// A stage's `items_per_range` control: null for adaptive cases so the stage's tuner
-    /// picks the range, and for the serial case so it runs its thread system's one inline
-    /// range (`fixtures.initRequiredCaseThreads`), the shape production takes below the
-    /// tuner's gate; otherwise `fixedItemsPerRange`.
+    /// picks the range, otherwise `fixedItemsPerRange`. The serial case's thread system has
+    /// no workers, so its stages run one inline range whatever the control.
     pub fn stageItemsPerRange(self: BenchmarkCase, range_alignment_items: usize) ?usize {
         return self.stageItemsPerRangeForPartition(default_items_per_range, range_alignment_items);
     }
@@ -120,7 +119,7 @@ pub const BenchmarkCase = struct {
     /// chunk for chunk-partitioned stages) instead of the element default: the range modes
     /// scale from that partition.
     pub fn stageItemsPerRangeForPartition(self: BenchmarkCase, partition_items: usize, range_alignment_items: usize) ?usize {
-        if (self.adaptive or self.worker_mode == .serial_direct) return null;
+        if (self.adaptive) return null;
         return self.fixedItemsPerRangeForPartition(partition_items, range_alignment_items);
     }
 

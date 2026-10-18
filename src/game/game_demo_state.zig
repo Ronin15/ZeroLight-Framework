@@ -1268,9 +1268,11 @@ const denseTileBlocksMovement = @import("world/test_support.zig").denseTileBlock
 // The player's cell-entry plane traversal through the plane stage with no NPC entries;
 // its landing carve publishes into the demo's frame.
 fn traversePlaneForTest(demo: *GameDemoState) !void {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const dig = &demo.pipeline.dig;
-    const reservation = try dig.reservePlaneTraversalStage(&demo.world, &demo.data, &demo.player, &demo.simulation_frame, &.{}, null);
-    try dig.commitPlaneTraversalStage(&demo.world, &demo.data, &demo.player, &demo.simulation_frame, reservation, null);
+    const reservation = try dig.reservePlaneTraversalStage(&demo.world, &demo.data, &demo.player, &demo.simulation_frame, &.{}, &serial_threads);
+    try dig.commitPlaneTraversalStage(&demo.world, &demo.data, &demo.player, &demo.simulation_frame, reservation, &serial_threads);
 }
 
 fn placePlayerInCell(demo: *GameDemoState, cx: u16, cy: u16) void {
@@ -1576,7 +1578,7 @@ test "demo init rejects missing character atlas metadata" {
 }
 
 test "demo world tile event invalidates navigation after commit reaction" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
@@ -1645,7 +1647,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 }
 
 test "a demo ramp dig is routable from both levels the next step" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
@@ -1725,7 +1727,7 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
 }
 
 test "demo multi-cell obstacle rect event blocks every covered nav cell in one batch" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
@@ -2116,7 +2118,7 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
 }
 
 test "demo structural static obstacle change emits one navigation invalidation event" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
@@ -2252,7 +2254,7 @@ fn addBystanderBodyForTest(data: *DataSystem, level: u16) !EntityId {
 // row, and places the static box: beside the agent with `move_static`, else where it is
 // parked. Returns the agent's lateral steering component on the next step.
 fn lateralSteeringAfterNavOutOfMemory(move_static: bool) !f32 {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
@@ -2318,7 +2320,7 @@ test "a nav reaction that runs out of memory still runs the steering reaction an
 }
 
 test "a population growth seam that runs out of memory still runs the steering reaction and returns the error" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var fixture: DemoConfigPipelineFixture = undefined;
     try fixture.init(std.testing.allocator);
@@ -2362,7 +2364,7 @@ test "a population growth seam that runs out of memory still runs the steering r
 }
 
 test "a population-seam OOM still records the step's static changes" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var fixture: DemoConfigPipelineFixture = undefined;
     try fixture.init(std.testing.allocator);
@@ -2414,7 +2416,7 @@ test "a population-seam OOM still records the step's static changes" {
 }
 
 test "a collider sync that runs out of memory leaves steering on the pre-commit rows and the next seam converges" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var fixture: DemoConfigPipelineFixture = undefined;
     try fixture.init(std.testing.allocator);
@@ -2562,7 +2564,7 @@ test "every producer budget fits the demo event bound allocation-free in one ste
 }
 
 test "demo preflights navigation invalidation event before structural mutation" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
@@ -2595,7 +2597,7 @@ test "demo preflights navigation invalidation event before structural mutation" 
 }
 
 test "demo preflights same-batch static obstacle promotion before mutation" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
@@ -2633,7 +2635,7 @@ test "demo preflights same-batch static obstacle promotion before mutation" {
 }
 
 test "demo unrelated structural component change does not invalidate navigation" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
@@ -2662,7 +2664,7 @@ test "demo unrelated structural component change does not invalidate navigation"
 }
 
 test "demo dynamic entity structural destruction does not invalidate navigation" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
@@ -2698,7 +2700,7 @@ test "demo dynamic entity structural destruction does not invalidate navigation"
 }
 
 test "demo commit seam grows pipeline capacity" {
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     var fixture: DemoConfigPipelineFixture = undefined;
     try fixture.init(std.testing.allocator);

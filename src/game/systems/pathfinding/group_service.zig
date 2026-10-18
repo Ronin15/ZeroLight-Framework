@@ -770,6 +770,13 @@ test "group-field threshold pin is clamped" {
     try std.testing.expectEqual(@as(usize, 2000), system.groupFieldThreshold());
 }
 
+// Blocks every group field's pool holds.
+fn fieldPoolBlocks(system: *const PathfindingSystem) usize {
+    var blocks: usize = 0;
+    for (system.group_fields.items) |field| blocks += field.blocks.len;
+    return blocks;
+}
+
 fn groupFieldServiceSystem(data: *const DataSystem, participant_count: usize) !PathfindingSystem {
     var system = PathfindingSystem.init(std.testing.allocator);
     errdefer system.deinit();
@@ -908,7 +915,8 @@ test "threaded group-field service with stall rounds equals serial and runs on w
     try warm.rebuildStaticNavGrid(&data, 2048, 2048, 32);
     for (0..80) |_| _ = try updatePathfindingInline(&warm, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
     warm.clearRuntimeState();
-    const warm_grows = warm.group_field_pool_growth.count;
+    const warm_blocks = fieldPoolBlocks(&warm);
+    const cold_blocks = fieldPoolBlocks(&serial);
 
     for (0..80) |_| {
         const serial_stats = try updatePathfindingInline(&serial, &stream, intake_test_agents, .{ .max_solve_admissions_per_step = 0 });
@@ -923,10 +931,10 @@ test "threaded group-field service with stall rounds equals serial and runs on w
             try std.testing.expectEqual(warm_field.current_distance, cold_field.current_distance);
         }
     }
-    // Pools grew past their first-build size on both, by the same steps; never when warm.
-    try std.testing.expectEqual(warm_grows, warm.group_field_pool_growth.count);
-    try std.testing.expect(serial.group_field_pool_growth.count > 4);
-    try std.testing.expectEqual(serial.group_field_pool_growth.count, threaded.group_field_pool_growth.count);
+    // Pools grew past their first-build size on both, alike; never when warm.
+    try std.testing.expectEqual(warm_blocks, fieldPoolBlocks(&warm));
+    try std.testing.expect(fieldPoolBlocks(&serial) > cold_blocks);
+    try std.testing.expectEqual(fieldPoolBlocks(&serial), fieldPoolBlocks(&threaded));
     var ready: usize = 0;
     for (serial.group_fields.items) |field| ready += @intFromBool(field.state == .ready);
     try std.testing.expectEqual(@as(usize, 4), ready);
@@ -956,10 +964,10 @@ test "a first group-field build that cannot allocate builds nothing and retries"
     const failed = try updatePathfindingInline(&system, &stream, intake_test_agents, config);
     system.allocator = std.testing.allocator;
     try std.testing.expectEqual(@as(usize, 0), failed.group_fields_built);
-    try std.testing.expectEqual(@as(u64, 1), system.group_field_pool_failure.count);
+    try std.testing.expect(system.group_field_pool_failure.logged);
     for (system.group_fields.items) |field| {
         try std.testing.expectEqual(GroupFieldState.empty, field.state);
-        try std.testing.expectEqual(@as(usize, 0), field.residentBytes());
+        try std.testing.expectEqual(@as(usize, 0), test_support.groupFieldResidentBytes(&field));
     }
 
     // The next step builds the same field a fresh system builds on its first step.
@@ -981,6 +989,8 @@ test "a first group-field build that cannot allocate builds nothing and retries"
 }
 
 test "a group field for a blocked goal builds at the goal table's live goal" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -997,7 +1007,7 @@ test "a group field for a blocked goal builds at the goal table's live goal" {
     defer stream.deinit();
     const goal = tileCenter(10, 10);
     for (0..3) |index| try appendPathRequest(&stream, .{ .entity = requester, .kind = .group, .start = tileCenter(@intCast(2 + index), 2), .goal = goal });
-    _ = try system.resolveGoals(PathRequest, stream.mergedItems(), null, .{});
+    _ = try system.resolveGoals(PathRequest, stream.mergedItems(), &serial_threads, .{});
     try std.testing.expectEqual(@as(usize, 1), system.goals.refs.items.len);
     // The decision reads the table's entry: point it at another open cell.
     const grid = system.graph.grid(0).?;

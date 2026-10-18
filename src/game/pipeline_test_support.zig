@@ -75,11 +75,13 @@ pub fn gateTestWorld(meta: *const world_tileset_meta.WorldTilesetMeta, carve: []
 
 /// One plane stage's dig half: a serial entry gather, the reserve, then the commit.
 pub fn testPlaneTraversalStage(dig: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player, frame: *SimulationFrame) !void {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var plane_entry = PlaneEntrySystem.init(std.testing.allocator);
     defer plane_entry.deinit();
     const entries = try plane_entry.gather(data, world, player.entity, dig.tunnel_tile, null);
-    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries, null);
-    try dig.commitPlaneTraversalStage(world, data, player, frame, reservation, null);
+    const reservation = try dig.reservePlaneTraversalStage(world, data, player, frame, entries, &serial_threads);
+    try dig.commitPlaneTraversalStage(world, data, player, frame, reservation, &serial_threads);
 }
 
 pub fn placePlayerFlush(data: *DataSystem, player: Player, cell: [2]u16) void {
@@ -538,13 +540,15 @@ pub fn markAllAlwaysActive(data: *DataSystem) !void {
 /// reactions (nav apply only after a successful population seam and collider sync; steering
 /// always), returning the first error.
 pub fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const extra_event_count: usize = if (pipeline.navReactionMayEmit(data, frame, world)) maxEventsPerStep(.nav_reaction, .{}) else 0;
     try pipeline.reserveStaticColliders(frame, data);
     _ = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
     pipeline.captureStaticColliderChanges(frame);
     const sync = pipeline.syncPopulationCapacity(frame, data);
-    const colliders = pipeline.syncStaticColliders(data, null);
-    const nav_update = if (sync) |_| (if (colliders) |_| pipeline.reactToPostCommitNavEvents(frame, world, null) else |err| err) else |err| err;
+    const colliders = pipeline.syncStaticColliders(data, &serial_threads);
+    const nav_update = if (sync) |_| (if (colliders) |_| pipeline.reactToPostCommitNavEvents(frame, world, &serial_threads) else |err| err) else |err| err;
     pipeline.reactToPostCommitSteeringEvents(frame);
     const sync_stats = try sync;
     try colliders;
@@ -729,20 +733,28 @@ pub fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: Adapt
     pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = first_items_per_range });
     // Population-sized pathfinding storage the seam grew: the agent capacity and every
     // counted growth but the registry's path content.
-    const PathfindingSeamState = struct { agent_capacity: usize, goal_table: u64, nav_mark: u64, evict: u64, group_field_pool: u64 };
+    const PathfindingSeamState = struct { agent_capacity: usize, goal_table: usize, nav_mark: usize, evict: usize, group_field_pool: usize };
     const seam_state = struct {
         fn of(pathfinding: *const PathfindingSystem) PathfindingSeamState {
+            var field_blocks: usize = 0;
+            for (pathfinding.group_fields.items) |field| field_blocks += field.blocks.len;
             return .{
                 .agent_capacity = pathfinding.effective_agent_capacity,
-                .goal_table = pathfinding.goal_table_growth.count,
-                .nav_mark = pathfinding.nav_mark_growth.count,
-                .evict = pathfinding.evict_growth.count,
-                .group_field_pool = pathfinding.group_field_pool_growth.count,
+                .goal_table = pathfinding.goals.limit,
+                .nav_mark = pathfinding.nav_marks.capacity + pathfinding.nav_mark_staging.capacity,
+                .evict = pathfinding.evict_items.capacity + pathfinding.evict_hits.capacity,
+                .group_field_pool = field_blocks,
             };
         }
-    }.of;
-    const seam_before = seam_state(&pipeline.pathfinding);
-    const registry_growths = pipeline.pathfinding.registry_growth.count;
+
+        fn registry(pathfinding: *const PathfindingSystem) usize {
+            var capacity: usize = 0;
+            for (&pathfinding.path_index) |*shard| capacity += shard.slot_keys.len + shard.entries.capacity + shard.owner_heads.capacity;
+            return capacity;
+        }
+    };
+    const seam_before = seam_state.of(&pipeline.pathfinding);
+    const registry_before = seam_state.registry(&pipeline.pathfinding);
     frame.beginStep();
     var counters = TestAllocatorCounters.init();
     var counting_swap: TestAllocatorSwap = .{};
@@ -752,8 +764,8 @@ pub fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: Adapt
     const first_stats = try first_result;
     try std.testing.expectEqual(pathing_crowd_count, first_stats.steering.path_request_count);
     try counters.expectOnlyOwnersAllocated(&.{"pathfinding"});
-    try std.testing.expectEqual(seam_before, seam_state(&pipeline.pathfinding));
-    try std.testing.expect(pipeline.pathfinding.registry_growth.count > registry_growths);
+    try std.testing.expectEqual(seam_before, seam_state.of(&pipeline.pathfinding));
+    try std.testing.expect(seam_state.registry(&pipeline.pathfinding) > registry_before);
     _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
 
     // The crowd's markers are the world's only markers.

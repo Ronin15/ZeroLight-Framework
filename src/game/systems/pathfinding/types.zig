@@ -80,7 +80,7 @@ pub const default_group_field_max_build_steps: usize = 16;
 // default_group_field_max_build_steps on any level. Cells past it are uncovered: `sample`
 // misses and the request takes the individual path (statusForKeyAndStart,
 // groupFieldServes), never `.unavailable`. Field memory follows the chunks a build covers
-// (GroupField.storageBytesBound), not this cap. Never derived from level or world size.
+// (its pool claims a block per covered chunk), not this cap. Never derived from level or world size.
 pub const default_group_field_max_cells: usize = default_group_field_build_budget * default_group_field_max_build_steps;
 // Group-field threshold: same-goal sharers required in one step before a shared flow field
 // builds. The gated cost: a shared field floods up to group_field_max_cells cells at

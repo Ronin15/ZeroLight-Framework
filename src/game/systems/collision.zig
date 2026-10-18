@@ -345,7 +345,7 @@ pub const CollisionStats = struct {
     entry_count: usize = 0,
     contact_count: usize = 0,
     candidate_pair_count: usize = 0,
-    /// Sweep lane groups. Counted only with `runtime_perf_log.enabled`, else 0.
+    /// Sweep lane groups: counted and set only with `runtime_perf_log.enabled`, else 0.
     broadphase_simd_groups: usize = 0,
     broadphase_batch: BatchStats = .{},
     narrowphase_batch: BatchStats = .{},
@@ -374,13 +374,11 @@ const CandidatePair = struct {
 const BroadphaseRangeBuffer = struct {
     pairs: std.ArrayList(CandidatePair) = .empty,
     required_capacity: usize = 0,
-    simd_groups: usize = 0,
     perf: SweepPerf = .{},
 
     fn clearRetainingCapacity(self: *BroadphaseRangeBuffer) void {
         self.pairs.clearRetainingCapacity();
         self.required_capacity = 0;
-        self.simd_groups = 0;
         self.perf = .{};
     }
 
@@ -599,8 +597,10 @@ pub const CollisionSystem = struct {
         const broadphase = try self.buildBroadphaseCandidatesThreaded(thread_system, broadphase_selection, stats.entry_count);
         if (broadphase_selection.active_tuner) |tuner| tuner.record(broadphase.batch);
         stats.broadphase_batch = broadphase.batch;
-        stats.broadphase_simd_groups = broadphase.simd_groups;
-        if (comptime runtime_perf_log.enabled) stats.perf.broadphase_visits = broadphase.perf.visits;
+        if (comptime runtime_perf_log.enabled) {
+            stats.broadphase_simd_groups = broadphase.perf.simd_groups;
+            stats.perf.broadphase_visits = broadphase.perf.visits;
+        }
         const candidate_pair_count = self.candidate_pairs.items.len;
         stats.candidate_pair_count = candidate_pair_count;
         if (candidate_pair_count == 0) {
@@ -640,8 +640,10 @@ pub const CollisionSystem = struct {
 
         const broadphase = try self.buildBroadphaseCandidatesDirect(stats.entry_count);
         stats.broadphase_batch = inlineBatch(stats.entry_count, collision_range_alignment_items);
-        stats.broadphase_simd_groups = broadphase.simd_groups;
-        if (comptime runtime_perf_log.enabled) stats.perf.broadphase_visits = broadphase.perf.visits;
+        if (comptime runtime_perf_log.enabled) {
+            stats.broadphase_simd_groups = broadphase.perf.simd_groups;
+            stats.perf.broadphase_visits = broadphase.perf.visits;
+        }
         const candidate_pair_count = self.candidate_pairs.items.len;
         stats.candidate_pair_count = candidate_pair_count;
         if (candidate_pair_count == 0) {
@@ -1054,7 +1056,7 @@ pub const CollisionSystem = struct {
                 grew = true;
                 continue;
             }
-            return .{ .simd_groups = buffer.simd_groups, .perf = buffer.perf, .grew = grew };
+            return .{ .perf = buffer.perf, .grew = grew };
         }
     }
 
@@ -1095,9 +1097,11 @@ pub const CollisionSystem = struct {
             }
 
             result.batch = batch;
-            for (self.broadphase_ranges.items[0..selection.range_count]) |*slot| {
-                result.simd_groups += slot.buffer.simd_groups;
-                if (comptime runtime_perf_log.enabled) result.perf.visits += slot.buffer.perf.visits;
+            if (comptime runtime_perf_log.enabled) {
+                for (self.broadphase_ranges.items[0..selection.range_count]) |*slot| {
+                    result.perf.simd_groups += slot.buffer.perf.simd_groups;
+                    result.perf.visits += slot.buffer.perf.visits;
+                }
             }
             try self.mergeBroadphaseRangeBuffers(selection.range_count);
             return result;
@@ -1442,12 +1446,11 @@ fn mergeIntoSorted(keys: []SortEntry, head_len: usize, tail: []const SortEntry) 
 
 // ---- Broadphase -----------------------------------------------------------------------
 
-// The sweep's visits (`CollisionStats.Perf.perf.broadphase_visits`), kept only with
-// `runtime_perf_log.enabled`.
-const SweepPerf = if (runtime_perf_log.enabled) struct { visits: usize = 0 } else struct {};
+// The sweep's lane groups (`CollisionStats.broadphase_simd_groups`) and visits
+// (`CollisionStats.perf.broadphase_visits`), kept only with `runtime_perf_log.enabled`.
+const SweepPerf = if (runtime_perf_log.enabled) struct { simd_groups: usize = 0, visits: usize = 0 } else struct {};
 
 const BroadphaseBuildResult = struct {
-    simd_groups: usize = 0,
     perf: SweepPerf = .{},
     batch: BatchStats = .{},
     /// A range slot (or the serial candidate list) allocated in-stage: an unreserved slot
@@ -1490,7 +1493,7 @@ fn sweepEntries(entries: ConstEntryColumns, start: usize, end: usize, buffer: *B
                 simd.lessThanFloat4Bits(simd.loadFloat4(entries.min_x[candidate..]), max_x);
             if (active == 0) break;
             if (comptime runtime_perf_log.enabled) {
-                buffer.simd_groups += 1;
+                buffer.perf.simd_groups += 1;
                 buffer.perf.visits += @popCount(active);
             }
             const overlap_y = simd.greaterThanFloat4Bits(max_y, simd.loadFloat4(entries.min_y[candidate..])) &
@@ -1870,7 +1873,7 @@ fn fillReferenceLayout(data: *DataSystem) !void {
 // `CollisionSystem.update` over the scoped bodies (null = all), inline: a thread system with
 // no workers.
 fn updateScopedInline(system: *CollisionSystem, data: *const DataSystem, contacts: *RangeOutputStream(CollisionContact), scope_dense_indices: ?[]const u32) !CollisionStats {
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     return system.update(data, contacts, &threads, .{ .scope_dense_indices = scope_dense_indices });
 }

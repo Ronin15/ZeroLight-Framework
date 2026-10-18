@@ -442,7 +442,7 @@ const StaticMover = struct {
 
     // The move's set_movement_body through the commit seam (its splice stages on
     // `thread_system` when set).
-    fn moveAndSync(self: *StaticMover, data: *DataSystem, thread_system: ?*ThreadSystem) !void {
+    fn moveAndSync(self: *StaticMover, data: *DataSystem, thread_system: *ThreadSystem) !void {
         self.frame.beginStep();
         const seam = fixtures.CommitSeam{ .colliders = &self.colliders, .structural_headroom = fixtures.StaticMove.structural_headroom };
         const commit = try seam.commit(&self.frame, data, &.{self.move.command()}, thread_system);
@@ -546,7 +546,7 @@ fn runOnce(
     thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) !CollisionStats {
-    if (mover) |static_mover| try static_mover.moveAndSync(data, if (case.usesThreadSystem()) thread_system else null);
+    if (mover) |static_mover| try static_mover.moveAndSync(data, thread_system);
 
     return try system.update(data, contacts, thread_system, .{
         .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),

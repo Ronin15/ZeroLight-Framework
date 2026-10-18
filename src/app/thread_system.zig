@@ -1778,9 +1778,8 @@ const BatchShape = struct {
 
 // The shared align/clamp/collapse applied to any chosen profile: align the range
 // size to the caller's alignment, drop workers a single-range batch can't use, and
-// collapse a tuner-selected inline batch to one full-width range. `tuner_active`
-// gates only the inline collapse — a fixed (non-adaptive) inline batch keeps its
-// requested range size so its range count stays meaningful.
+// collapse to one full-width range a batch no worker may take or one the tuner selected
+// inline. A fixed inline batch with workers allowed keeps its requested range size.
 fn shapeBatch(item_count: usize, profile: AdaptiveWorkProfile, max_worker_threads: usize, range_alignment_items: usize, tuner_active: bool) BatchShape {
     const aligned = std.mem.alignForwardAnyAlign(usize, @max(profile.items_per_range, @as(usize, 1)), range_alignment_items);
     const aligned_range_count = rangeCount(item_count, aligned);
@@ -1788,7 +1787,8 @@ fn shapeBatch(item_count: usize, profile: AdaptiveWorkProfile, max_worker_thread
         @as(usize, 0)
     else
         @min(profile.worker_threads, @min(max_worker_threads, aligned_range_count - 1));
-    const items_per_range = if (worker_threads == 0 and tuner_active and profile.worker_threads == 0)
+    // A batch no worker may take, or one the tuner selected inline, runs as one range.
+    const items_per_range = if (worker_threads == 0 and (max_worker_threads == 0 or (tuner_active and profile.worker_threads == 0)))
         item_count
     else
         aligned;

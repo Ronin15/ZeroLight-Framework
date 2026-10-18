@@ -9,8 +9,6 @@
 const std = @import("std");
 const BenchmarkCase = @import("suite.zig").BenchmarkCase;
 const PathfindingCapacity = @import("../game/systems/pathfinding/types.zig").PathfindingCapacity;
-const NavGraph = @import("../game/systems/pathfinding/nav_graph.zig").NavGraph;
-const GroupField = @import("../game/systems/pathfinding/group_field.zig").GroupField;
 const PathfindingSystem = @import("../game/systems/pathfinding/system.zig").PathfindingSystem;
 const pathfinding_test_support = @import("../game/systems/pathfinding/test_support.zig");
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
@@ -54,7 +52,7 @@ pub const NavSizeConfig = struct {
     tier1_abstract_nodes: usize = (PathfindingCapacity{}).max_abstract_nodes,
     /// The built world's chunk forms and link endpoints (`navStorageContentOf` in the pathfinding test support), plus
     /// what the workload adds; null charges every chunk mixed.
-    content: ?NavGraph.StorageContent = null,
+    content: ?pathfinding_test_support.NavStorageContent = null,
 
     fn levelChunks(self: NavSizeConfig) usize {
         const per_side = std.math.divCeil(usize, self.side, default_chunk_size_tiles) catch unreachable; // lint:allow catch-unreachable: the chunk edge is a nonzero constant
@@ -94,9 +92,9 @@ pub fn navSizeCapacity(config: NavSizeConfig) PathfindingCapacity {
     };
 }
 
-// `navStorageBytes` by what reports it at run time: the graph (`NavGraph.residentBytes`),
-// the group fields (`GroupField.residentBytes`), and the request side's parts
-// (`test_support.requestResidentBytes`).
+// `navStorageBytes` by what holds it at run time: the graph (`NavGraph.residentBytes`),
+// the group fields (`groupFieldResidentBytes`), and the request side's parts
+// (`requestResidentBytes`).
 const NavStorageParts = struct {
     graph: usize,
     group_fields: usize,
@@ -110,9 +108,9 @@ const NavStorageParts = struct {
 };
 
 // An over-estimate of the bytes the per-chunk nav takes for `config` at its agent-budget
-// ceiling, from the production bounds: the graph (`NavGraph.storageBytesBound`), group
-// fields (`GroupField.storageBytesBound`), and the request side
-// (`test_support.requestStorageBytesBound`). Search scratch and group fields are sized
+// ceiling, from the pathfinding test support's bounds: the graph (`navStorageBytesBound`),
+// group fields (`groupFieldStorageBytesBound`), and the request side
+// (`requestStorageBytesBound`). Search scratch and group fields are sized
 // by their node and cell budgets, never by level cells.
 fn navStorageBytes(config: NavSizeConfig) usize {
     return navStorageParts(config).total();
@@ -123,7 +121,7 @@ fn navStorageParts(config: NavSizeConfig) NavStorageParts {
     const capacity = navSizeCapacity(config);
     const chunks = config.levelChunks();
     const levels: usize = @max(1, config.levels);
-    const graph = NavGraph.storageBytesBound(.{
+    const graph = pathfinding_test_support.navStorageBytesBound(.{
         .chunks = chunks,
         .levels = levels,
         .links = config.links,
@@ -137,7 +135,7 @@ fn navStorageParts(config: NavSizeConfig) NavStorageParts {
     });
     return .{
         .graph = graph,
-        .group_fields = config.group_fields *| GroupField.storageBytesBound(capacity.group_field_max_cells, chunks),
+        .group_fields = config.group_fields *| pathfinding_test_support.groupFieldStorageBytesBound(capacity.group_field_max_cells, chunks),
         .request = pathfinding_test_support.requestStorageBytesBound(capacity, .{
             .long_results = config.long_results,
             .runs_per_result = config.runs_per_result,
@@ -154,7 +152,7 @@ fn navStorageParts(config: NavSizeConfig) NavStorageParts {
 pub fn checkNavBytes(group_name: []const u8, item_count: usize, config: NavSizeConfig, system: *const PathfindingSystem) !void {
     const parts = navStorageParts(config);
     var field_bytes: usize = 0;
-    for (system.group_fields.items) |*field| field_bytes += field.residentBytes();
+    for (system.group_fields.items) |*field| field_bytes += pathfinding_test_support.groupFieldResidentBytes(field);
     const resident = pathfinding_test_support.requestResidentBytes(system);
     var past = false;
     past = reportPart(group_name, item_count, "graph", system.graph.residentBytes(), parts.graph) or past;
@@ -210,7 +208,7 @@ test "nav storage parts pass the config's shape to the graph and field bounds, a
     var batch = base;
     batch.batch = .{ .mark_chunks = 300, .links = 10, .keys = 400 };
     for ([_]NavSizeConfig{ base, batch }) |config| {
-        try std.testing.expectEqual(NavGraph.storageBytesBound(.{
+        try std.testing.expectEqual(pathfinding_test_support.navStorageBytesBound(.{
             .chunks = 256,
             .levels = 2,
             .links = 64,
@@ -220,7 +218,7 @@ test "nav storage parts pass the config's shape to the graph and field bounds, a
             .batch_links = config.batch.links,
             .batch_keys = config.batch.keys,
         }), navStorageParts(config).graph);
-        try std.testing.expectEqual(2 * GroupField.storageBytesBound((PathfindingCapacity{}).group_field_max_cells, 256), navStorageParts(config).group_fields);
+        try std.testing.expectEqual(2 * pathfinding_test_support.groupFieldStorageBytesBound((PathfindingCapacity{}).group_field_max_cells, 256), navStorageParts(config).group_fields);
     }
     const base_parts = navStorageParts(base);
     const batch_parts = navStorageParts(batch);

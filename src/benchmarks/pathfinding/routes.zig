@@ -1269,7 +1269,7 @@ fn runLongPathHops(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, s
                 break .partial;
             }
             // Neither arrived nor partial, and no longer pending: the tier-1 attempt dropped it.
-            if (system.pending.len == 0) break .dropped;
+            if (attempt == 1 and system.pending.len == 0) break .dropped;
             if (attempt == 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.LongPathNotEscalated;
         } else return error.LongPathStillPending;
         switch (ended) {
@@ -1367,7 +1367,7 @@ fn runLongPathCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     const capacity = nav_size.navSizeCapacity(size_config);
     open_owned = false;
-    var fixture = try initRouteFixture(allocator, open, requests[0..agent_count], capacity, null);
+    var fixture = try initRouteFixture(allocator, open, requests[0..agent_count], capacity, &threads);
     defer fixture.deinit();
     try nav_size.checkNavBytes(long_path_group.name, item_count, size_config, &fixture.system);
     var empty = RangeOutputStream(PathRequest).init(allocator);
@@ -1692,7 +1692,7 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
 // The link-fold world, with no requests: `config.pads` random pads off the first
 // `probe_pairs` probe chunk pairs, and `config.preload` pads joining each pair.
-fn initLinkFoldFixture(allocator: std.mem.Allocator, io: std.Io, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
+fn initLinkFoldFixture(allocator: std.mem.Allocator, io: std.Io, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, link_fold_side, link_fold_levels);
     errdefer open.world.deinit();
     const deepest = link_fold_levels - 1;
@@ -1747,7 +1747,7 @@ const LinkFoldSample = struct {
 // nav reaction that applies them and counts the touched chunks' endpoints untimed. Fails
 // unless the reaction applied every pad in one marks batch and patched exactly the touched
 // chunks.
-fn foldPadBatch(io: std.Io, fixture: *ReactFixture, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, batch: usize, thread_system: ?*ThreadSystem) !LinkFoldSample {
+fn foldPadBatch(io: std.Io, fixture: *ReactFixture, random: std.Random, config: LinkFoldConfig, probe_pairs: usize, batch: usize, thread_system: *ThreadSystem) !LinkFoldSample {
     const world = &fixture.open.world;
     const graph = &fixture.system.graph;
     const applied_before = graph.links_applied;

@@ -49,14 +49,11 @@ pub fn initCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.Ben
 }
 
 /// The case's thread system for a stage that requires one: the engine's default config at
-/// the case's worker count. The serial case has no workers and one range per stage (its
-/// stages pass no range size), the shape production takes below the tuner's gate; the
-/// size is `maxInt(u32)`, as the tests' inline helpers use, since the dispatch aligns it
-/// forward.
+/// the case's worker count. The serial case has no workers, so every stage runs as one
+/// inline range, the shape production takes on a machine with no spare core.
 pub fn initRequiredCaseThreads(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase) !ThreadSystem {
     var config = ThreadSystemConfig{};
     config.max_worker_threads = case.maxWorkerThreads();
-    if (!case.usesThreadSystem()) config.items_per_range = std.math.maxInt(u32);
     return ThreadSystem.init(allocator, io, config);
 }
 
@@ -112,7 +109,7 @@ pub const CommitSeam = struct {
     /// stages on `thread_system` when set). The population seam does not run: a bench grows
     /// no pipeline capacity. Runs in `frame`'s current step, whose structural commands are
     /// empty; the step's changes stay in the frame for the caller.
-    pub fn commit(self: CommitSeam, frame: *SimulationFrame, data: *DataSystem, commands: []const StructuralCommand, thread_system: ?*ThreadSystem) !Result {
+    pub fn commit(self: CommitSeam, frame: *SimulationFrame, data: *DataSystem, commands: []const StructuralCommand, thread_system: *ThreadSystem) !Result {
         try writeOneRange(StructuralCommand, &frame.structural_commands, commands);
         const nav_may_emit = if (self.nav) |nav| self.colliders.hasPendingChanges() or nav.system.navReactionMayEmit(data, frame, nav.world) else false;
         try self.colliders.reserveForCommit(data, commands.len);

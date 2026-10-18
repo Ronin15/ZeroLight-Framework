@@ -623,7 +623,7 @@ const StageOutcome = struct {
 // Gathers with `thread_system` and `config`, checks the entries against `want` when
 // given, then runs the plane stage's reserve and commit (its carve batch on
 // `thread_system` too) on them.
-fn runParityStage(population: usize, thread_system: ?*ThreadSystem, config: PlaneEntryConfig, want: ?[]const PlaneEntry) !StageOutcome {
+fn runParityStage(population: usize, thread_system: *ThreadSystem, config: PlaneEntryConfig, want: ?[]const PlaneEntry) !StageOutcome {
     var fixture: TestFixture = undefined;
     try fixture.init(population);
     defer fixture.deinit();
@@ -672,13 +672,13 @@ test "plane entry gather: serial, inline, and threaded entries and stage results
     const want = try allocator.dupe(PlaneEntry, serial_entries);
     defer allocator.free(want);
 
-    var serial_outcome = try runParityStage(population, null, .{}, want);
+    var inline_threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
+    var serial_outcome = try runParityStage(population, &inline_threads, .{}, want);
     defer serial_outcome.deinit();
     // Falls: kind 2 and 8 per set carve one landing between them; kind 4 climbs.
     try std.testing.expectEqual(population / agent_kind_count, serial_outcome.published);
 
-    var inline_threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer inline_threads.deinit();
     inline for (.{ PlaneEntryConfig{}, PlaneEntryConfig{ .items_per_range = 16, .adaptive = false } }) |config| {
         var outcome = try runParityStage(population, &inline_threads, config, want);
         defer outcome.deinit();
@@ -791,6 +791,8 @@ test "plane entry SIMD blocks match the scalar entry test" {
 }
 
 test "plane entry gather never yields the player, even as an AI agent; the stage traverses it once on its own path" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var fixture: TestFixture = undefined;
     try fixture.init(0);
     defer fixture.deinit();
@@ -825,8 +827,8 @@ test "plane entry gather never yields the player, even as an AI agent; the stage
     defer frame.deinit();
     try frame.reserveStreams(4, entries.len + 1, 0, 0, 0, 0);
     frame.beginStep();
-    const reservation = try dig.reservePlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, entries, null);
-    try dig.commitPlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, reservation, null);
+    const reservation = try dig.reservePlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, entries, &serial_threads);
+    try dig.commitPlaneTraversalStage(&fixture.world, data, &fixture.player, &frame, reservation, &serial_threads);
     // One fall each: the player's landing at (4,1) and the NPCs' shared one at (4,0).
     try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(player));
     try std.testing.expectEqual(@as(u16, 1), fixture.player.current_level);

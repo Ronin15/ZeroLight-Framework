@@ -165,7 +165,7 @@ fn evictAgentBudget(result_count: usize) usize {
 // goal rows at every count and is no request's goal.
 const evict_dig_cell: CellCoord = .{ .x = 250, .y = 9 };
 
-fn initShortRouteFixture(allocator: std.mem.Allocator, io: std.Io, result_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
+fn initShortRouteFixture(allocator: std.mem.Allocator, io: std.Io, result_count: usize, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, short_route_side, 1);
     errdefer open.world.deinit();
     var data = DataSystem.init(allocator);
@@ -258,7 +258,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         if (churn) |*registry_churn| try registry_churn.run(io, &fixture, case, thread_ptr);
     }
     // The size config charges no long block.
-    if (fixture.system.long_block_growth.count != 0) return error.ShortRouteTookLongBlock;
+    if (fixture.system.long_block_growth.perf.count != 0) return error.ShortRouteTookLongBlock;
     try nav_size.checkNavBytes(evict_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     report.write(&stats.details);
@@ -374,7 +374,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         accumulator.record(last.elapsed_ns, last.busiest_solve_batch);
     }
     // The size config charges no long block.
-    if (system.long_block_growth.count != 0) return error.ShortRouteTookLongBlock;
+    if (system.long_block_growth.perf.count != 0) return error.ShortRouteTookLongBlock;
     try nav_size.checkNavBytes(elastic_ramp_group.name, item_count, size_config, &system);
     var stats = accumulator.finish();
     stats.output_count = last.solves;
@@ -523,7 +523,7 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
         shrink_report.add(shrink);
     }
     // The size config charges no long block.
-    if (system.long_block_growth.count != 0) return error.ShortRouteTookLongBlock;
+    if (system.long_block_growth.perf.count != 0) return error.ShortRouteTookLongBlock;
 
     try nav_size.checkNavBytes(elastic_shrink_group.name, item_count, size_config, &system);
     var stats = accumulator.finish();

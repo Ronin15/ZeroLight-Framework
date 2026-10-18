@@ -156,12 +156,15 @@ fn smokeTransferGrowth(renderer: *Renderer, app_config: config.AppConfig, alloca
         .chunk_shift = smoke_chunk_shift,
         .side = smoke_directory_side,
     });
-    const grows_before = renderer.tile_upload_transfer_grows;
+    // Growth is geometric, so each growth changes the pooled transfer's size.
     const bytes_before = renderer.tile_upload_transfer_byte_size;
-    try submitSmokeUploadFrame(renderer, app_config, store, values[0..small_elements], "small transfer upload");
-    try submitSmokeUploadFrame(renderer, app_config, store, values, "larger transfer upload");
-    try submitSmokeUploadFrame(renderer, app_config, store, values[0..small_elements], "small upload after transfer growth");
-    const grows = renderer.tile_upload_transfer_grows - grows_before;
+    var grows: usize = 0;
+    var bytes = bytes_before;
+    inline for ([_][]const u32{ values[0..small_elements], values, values[0..small_elements] }, [_][]const u8{ "small transfer upload", "larger transfer upload", "small upload after transfer growth" }) |frame_values, label| {
+        try submitSmokeUploadFrame(renderer, app_config, store, frame_values, label);
+        if (renderer.tile_upload_transfer_byte_size != bytes) grows += 1;
+        bytes = renderer.tile_upload_transfer_byte_size;
+    }
     if (grows != 1) {
         log.err("SDL_GPU smoke tile upload transfer grew {d} times over small/larger/small, expected 1", .{grows});
         return error.TransferGrowthMismatch;

@@ -448,8 +448,8 @@ pub const AiSystem = struct {
             .entity_count = entity_count,
             .intent_count = entity_count,
             .navigation_intent_count = entity_count,
-            .separation_candidate_checks = sumU16(gathered.items(.separation_candidate_count)),
-            .separation_neighbor_samples = sumU8(gathered.items(.separation_neighbor_count)),
+            .separation_candidate_checks = if (comptime runtime_perf_log.enabled) sumU16(gathered.items(.separation_candidate_count)) else 0,
+            .separation_neighbor_samples = if (comptime runtime_perf_log.enabled) sumU8(gathered.items(.separation_neighbor_count)) else 0,
             .separation_batch = separation_batch,
             .intent_batch = intent_batch,
             .perf = if (comptime runtime_perf_log.enabled) .{
@@ -1246,21 +1246,21 @@ fn updateInline(
     delta_seconds: f32,
     config: AiConfig,
 ) !AiStats {
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     return system.update(ai_agents, movement, spatial, data, frame, &threads, delta_seconds, config);
 }
 
 // `AiSystem.gatherAiData` inline as one range: a thread system with no workers.
 fn gatherInline(system: *AiSystem, inputs: AiGatherInputs) !void {
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     _ = try system.gatherAiData(inputs, &threads, .{});
 }
 
 // The unstaggered think set over `view`, compacted inline.
 fn thinkSetInline(scope: *SimulationScopeSystem, view: *const SpatialIndexView) ![]const u32 {
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     return (try scope.compactCognition(view, 0, false, &threads, .{})).cognition;
 }
@@ -2637,7 +2637,7 @@ test "the threaded gather writes every row the serial gather does, skipping bodi
 
     var serial_ai = AiSystem.init(std.testing.allocator);
     defer serial_ai.deinit();
-    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
     _ = try serial_ai.gatherAiData(inputs, &inline_threads, .{});
     // Every eleventh agent has no body.
@@ -2728,9 +2728,11 @@ test "ai spatial separation caps dense neighbor samples" {
     });
 
     try std.testing.expectEqual(@as(usize, count), stats.intent_count);
-    try std.testing.expect(stats.separation_neighbor_samples <= count * @as(usize, max_separation_neighbors));
-    try std.testing.expect(stats.separation_candidate_checks <= count * @as(usize, max_separation_candidate_checks));
-    try std.testing.expect(stats.separation_neighbor_samples > 0);
+    const gathered = ai_sys.rows.slice();
+    const neighbor_samples = sumU8(gathered.items(.separation_neighbor_count));
+    try std.testing.expect(neighbor_samples <= count * @as(usize, max_separation_neighbors));
+    try std.testing.expect(sumU16(gathered.items(.separation_candidate_count)) <= count * @as(usize, max_separation_candidate_checks));
+    try std.testing.expect(neighbor_samples > 0);
 }
 
 test "ai spatial separation finds neighbors past the grid edge at negative coordinates" {
@@ -2779,8 +2781,9 @@ test "ai spatial separation finds neighbors past the grid edge at negative coord
     });
 
     try std.testing.expectEqual(@as(usize, 2), stats.intent_count);
-    try std.testing.expectEqual(@as(usize, 2), stats.separation_candidate_checks);
-    try std.testing.expectEqual(@as(usize, 2), stats.separation_neighbor_samples);
+    const gathered = ai_sys.rows.slice();
+    try std.testing.expectEqual(@as(usize, 2), sumU16(gathered.items(.separation_candidate_count)));
+    try std.testing.expectEqual(@as(usize, 2), sumU8(gathered.items(.separation_neighbor_count)));
 }
 
 test "think rows skip themselves and find halo neighbors" {
@@ -2816,7 +2819,7 @@ test "think rows skip themselves and find halo neighbors" {
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    const stats = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
+    _ = try updateInline(&ai_sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
         .scope_dense_indices = &think,
     });
 
@@ -2825,8 +2828,8 @@ test "think rows skip themselves and find halo neighbors" {
     try std.testing.expectEqual(a.index, gathered.items(.entity)[0].index);
     try std.testing.expectEqual(c.index, gathered.items(.entity)[1].index);
     // Each thinker checks the two others and separates from B alone.
-    try std.testing.expectEqual(@as(usize, 4), stats.separation_candidate_checks);
-    try std.testing.expectEqual(@as(usize, 2), stats.separation_neighbor_samples);
+    try std.testing.expectEqual(@as(usize, 4), sumU16(gathered.items(.separation_candidate_count)));
+    try std.testing.expectEqual(@as(usize, 2), sumU8(gathered.items(.separation_neighbor_count)));
     try std.testing.expectEqual(@as(u8, 1), gathered.items(.separation_neighbor_count)[0]);
     try std.testing.expectEqual(@as(u8, 1), gathered.items(.separation_neighbor_count)[1]);
     // Cohere reaches B (40 away) and the other thinker (80 away).

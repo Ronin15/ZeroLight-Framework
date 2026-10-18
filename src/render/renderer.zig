@@ -442,17 +442,13 @@ pub const Renderer = struct {
     // Pooled transfer buffer holding every store's pending values for one copy pass.
     tile_upload_transfer: ?*c.SDL_GPUTransferBuffer = null,
     tile_upload_transfer_byte_size: u32 = 0,
-    // Times a larger transfer replaced the pooled one; the first replacement logs once.
-    tile_upload_transfer_grows: u64 = 0,
+    // The first time a larger transfer replaced the pooled one is logged once.
     tile_upload_transfer_growth_logged: bool = false,
-    // Times a tile store grew into a larger buffer; the first growth logs once.
-    tile_store_grows: u64 = 0,
+    // The first time a tile store grew into a larger buffer is logged once.
     tile_store_growth_logged: bool = false,
-    // Times the retained static streams grew; the first growth logs once.
-    static_stream_grows: u64 = 0,
+    // The first growth of the retained static streams is logged once.
     static_stream_growth_logged: bool = false,
-    // Times the dynamic batch streams grew past their reservation; the first warns once.
-    batch_stream_grows: u64 = 0,
+    // The first growth of the dynamic batch streams past their reservation warns once.
     batch_stream_growth_logged: bool = false,
     batch: sprite_batch.SpriteBatch,
     white_texture: TextureId = TextureId.invalid,
@@ -1361,7 +1357,6 @@ pub const Renderer = struct {
 
     fn countTileStoreGrowth(self: *Renderer, capacity: u32) void {
         @branchHint(.cold);
-        self.tile_store_grows += 1;
         if (self.tile_store_growth_logged) return;
         self.tile_store_growth_logged = true;
         if (comptime logging.enabled(.info)) log.info("tile store grew to {d} elements", .{capacity});
@@ -1421,7 +1416,6 @@ pub const Renderer = struct {
 
     fn countTileUploadTransferGrowth(self: *Renderer, byte_size: u32) void {
         @branchHint(.cold);
-        self.tile_upload_transfer_grows += 1;
         if (self.tile_upload_transfer_growth_logged) return;
         self.tile_upload_transfer_growth_logged = true;
         if (comptime logging.enabled(.info)) log.info("tile upload transfer grew to {d} bytes", .{byte_size});
@@ -1715,7 +1709,6 @@ pub const Renderer = struct {
     // so the first warns.
     fn countBatchStreamGrowth(self: *Renderer, capacity: usize) void {
         @branchHint(.cold);
-        self.batch_stream_grows += 1;
         if (self.batch_stream_growth_logged) return;
         self.batch_stream_growth_logged = true;
         if (comptime logging.enabled(.warn)) log.warn("vertex batch streams grew to {d} vertices; reserve capacity to avoid this", .{capacity});
@@ -1723,7 +1716,6 @@ pub const Renderer = struct {
 
     fn countStaticStreamGrowth(self: *Renderer, capacity: usize) void {
         @branchHint(.cold);
-        self.static_stream_grows += 1;
         if (self.static_stream_growth_logged) return;
         self.static_stream_growth_logged = true;
         if (comptime logging.enabled(.info)) log.info("static vertex streams grew to {d} vertices", .{capacity});

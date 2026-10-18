@@ -483,6 +483,8 @@ fn pathNearCells(system: *const PathfindingSystem, owner: u32, changed: []const 
 }
 
 test "eviction equals a brute-force reference: exactly the cached paths with a cell within one cell of a changed cell" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -518,7 +520,7 @@ test "eviction equals a brute-force reference: exactly the cached paths with a c
         } else {
             try setRegistryCells(&system, &fixture, cells, fixture.tree);
         }
-        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         var evicted_any = false;
         for (expected, 0..) |evicted, index| {
             try std.testing.expectEqual(evicted, system.completed.slotIndex(registryRouteKey(&system, index, 24)) == null);
@@ -528,12 +530,14 @@ test "eviction equals a brute-force reference: exactly the cached paths with a c
         try expectRegistryMatchesCache(&system);
         if (flipped_count != 0) {
             try setRegistryCells(&system, &fixture, cells, fixture.grass);
-            _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+            _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         }
     }
 }
 
 test "a path that leaves and re-enters a chunk is evicted by a change on its second run" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -555,12 +559,14 @@ test "a path that leaves and re-enters a chunk is evicted by a change on its sec
     try publishTestPath(&system, key, &.{ cell(1, 1), cell(2, 1), cell(3, 1), cell(4, 1), cell(5, 1), cell(5, 2), cell(4, 2), cell(3, 2) }, 1, &stats);
     // (2,3) touches only the second run: two cells from every cell of the first.
     try setRegistryCells(&system, &fixture, &.{.{ 2, 3 }}, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(system.completed.slotIndex(key) == null);
     try expectRegistryMatchesCache(&system);
 }
 
 test "a path whose diagonal step corners on a changed cell in a diagonal-neighbour chunk is evicted" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -581,7 +587,7 @@ test "a path whose diagonal step corners on a changed cell in a diagonal-neighbo
     // only (4,4) neighbours (3,3), in chunk (0,0), the diagonal neighbour of (1,1).
     try publishTestPath(&system, key, &.{ cell(5, 3), cell(4, 4), cell(5, 5) }, 1, &stats);
     try setRegistryCells(&system, &fixture, &.{.{ 3, 3 }}, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(system.completed.slotIndex(key) == null);
     try expectRegistryMatchesCache(&system);
 }
@@ -590,6 +596,8 @@ test "a path whose diagonal step corners on a changed cell in a diagonal-neighbo
 // paths through chunk (1, 1) of a 64-tile registry world; digs (5, 5) and returns the
 // registry entries the eviction visited.
 fn expectEvictedAmongUnrelated(meta: *const WorldTilesetMeta, unrelated: usize) !void {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var fixture = try registryWorld(meta, 64);
@@ -609,7 +617,7 @@ fn expectEvictedAmongUnrelated(meta: *const WorldTilesetMeta, unrelated: usize) 
         try publishTestPath(&system, key, &.{ y * 64 + 4, y * 64 + 5, y * 64 + 6 }, 1, &stats);
     }
     try setRegistryCells(&system, &fixture, &.{.{ 5, 5 }}, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     // The three paths through the changed cell go; every unrelated one stays.
     try std.testing.expectEqual(unrelated, system.completed.count());
     try expectRegistryMatchesCache(&system);
@@ -623,6 +631,8 @@ test "path eviction removes only the results through the changed cells, with 10 
 }
 
 test "a new link evicts no cached path" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -641,13 +651,15 @@ test "a new link evicts no cached path" {
     const on_path: u16 = @intCast(first.cells[first.cells.len / 2]);
     const ramp_cell = @import("../../world/system.zig").CellCoord{ .x = @intCast(on_path % 24), .y = @intCast(on_path / 24) };
     try fixture.world.addLevelLink(.{ .kind = .ramp, .level_a = 0, .cell_a = ramp_cell, .level_b = 1, .cell_b = ramp_cell, .traversal_cost = 1, .bidirectional = true });
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), reaction.incremental_rebuilds);
     try std.testing.expectEqual(cached, system.completed.count());
     try expectRegistryMatchesCache(&system);
 }
 
 test "a cached corridor is evicted only by a change on its own level's cells" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -675,7 +687,7 @@ test "a cached corridor is evicted only by a change on its own level's cells" {
     try expectRegistryMatchesCache(&system);
     // Level 0 cell (1, 1) neighbours level-0 cells 0..2 only.
     try setRegistryCells(&system, &fixture, &.{.{ 1, 1 }}, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(system.completed.slotIndex(keys[0]) == null);
     try std.testing.expect(system.completed.slotIndex(keys[1]) != null);
     try std.testing.expect(system.completed.slotIndex(keys[2]) == null);
@@ -745,6 +757,8 @@ test "eviction allocates nothing after its pre-commit reserve on a multi-worker 
 }
 
 test "an eviction reserve out of memory leaves graph, cache, registry, and marks intact, and the retry equals an unfailed apply" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -761,7 +775,7 @@ test "an eviction reserve out of memory leaves graph, cache, registry, and marks
     const cached = system.completed.count();
     try setRegistryCells(&system, &fixture, &dense_change_cells, fixture.tree);
     for (dense_change_cells) |cell| try test_support.recordTileEdits(&reference, &fixture.world, &.{.{ .level = 0, .x = cell[0], .y = cell[1] }});
-    _ = try reference.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try reference.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
 
     // Every allocation of the apply fails in turn; the eviction scratch grows here for the
     // first time, so some attempt fails at the eviction reserve after the graph's.
@@ -773,7 +787,7 @@ test "an eviction reserve out of memory leaves graph, cache, registry, and marks
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         system.allocator = failing.allocator();
         system.graph.allocator = failing.allocator();
-        const result = system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        const result = system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         system.allocator = std.testing.allocator;
         system.graph.allocator = std.testing.allocator;
         if (result) |_| break else |err| try std.testing.expectEqual(error.OutOfMemory, err);
@@ -791,6 +805,8 @@ test "an eviction reserve out of memory leaves graph, cache, registry, and marks
 }
 
 test "threaded eviction equals serial over a dense region (bounds, flags, hits, cache bytes), and the eviction stages run on workers" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -812,7 +828,7 @@ test "threaded eviction equals serial over a dense region (bounds, flags, hits, 
     try setRegistryCells(&serial, &fixture, &dense_change_cells, fixture.tree);
     for (dense_change_cells) |cell| try test_support.recordTileEdits(&threaded, &fixture.world, &.{.{ .level = 0, .x = cell[0], .y = cell[1] }});
     const cached = serial.completed.count();
-    _ = try serial.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try serial.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(serial.completed.count() < cached);
     const stats = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     try std.testing.expect(!stats.evict_batch.ran_inline and stats.evict_batch.range_count > 1);
@@ -856,13 +872,15 @@ fn expectHaloOwnedOnce(system: *const PathfindingSystem) !void {
         inline for (.{ -1, 0, 1 }) |dy| inline for (.{ -1, 0, 1 }) |dx| {
             if (chunkAround(chunks, keyLevel(key), x, y, dx, dy)) |halo| {
                 // A key whose runs were all evicted holds none now; it was owned if it held any.
-                if (system.path_index[registryShard(halo.key)].keyCount(halo.key) != 0) try std.testing.expect(owned.contains(halo.key));
+                if (system.path_index[registryShard(halo.key)].reader().keyCount(halo.key) != 0) try std.testing.expect(owned.contains(halo.key));
             }
         };
     }
 }
 
 test "one dig leaves unrelated pending requests, fields, tallies, and paths intact, and a request queued before it is solved after it" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -890,7 +908,7 @@ test "one dig leaves unrelated pending requests, fields, tallies, and paths inta
 
     // Dig a cell far from all of them.
     try setRegistryCells(&system, &fixture, &.{.{ 28, 26 }}, fixture.tree);
-    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    const reaction = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), reaction.incremental_rebuilds);
     try std.testing.expect(system.completed.slotIndex(system.graph.keyForWorld(0, path_goal, .default).?) != null);
     try std.testing.expectEqual(field_state, group_service.groupFieldOf(&system, field_key).?.state);
@@ -910,6 +928,8 @@ test "one dig leaves unrelated pending requests, fields, tallies, and paths inta
 // expansions a step, drops on a change at `cell`; checks the brute-force rule (a changed
 // cell within one cell of a costed cell) against the field built before the change.
 fn fieldDropMatchesReference(meta: *const WorldTilesetMeta, cell: [2]u16, budget: usize) !bool {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var fixture = try registryWorld(meta, 24);
@@ -938,7 +958,7 @@ fn fieldDropMatchesReference(meta: *const WorldTilesetMeta, cell: [2]u16, budget
         if (@abs(x - @as(isize, cell[0])) <= 1 and @abs(y - @as(isize, cell[1])) <= 1) near = true;
     }
     try setRegistryCells(&system, &fixture, &.{cell}, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     const dropped = group_service.groupFieldOf(&system, key) == null;
     try std.testing.expectEqual(near, dropped);
     return dropped;
@@ -981,6 +1001,8 @@ const pocket_change_cells = blk: {
 };
 
 test "threaded eviction with paths and fields equals serial over a dense change (bounds, flags, hits), and runs on workers" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     if (builtin.single_threaded) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1010,7 +1032,7 @@ test "threaded eviction with paths and fields equals serial over a dense change 
     const cached = systems[0].completed.count();
     const field_key = systems[0].graph.keyForWorld(0, tileCenter(26, 26), .default).?;
     try std.testing.expect(group_service.groupFieldOf(&systems[0], field_key) != null);
-    _ = try systems[0].applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try systems[0].applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(systems[0].completed.count() + 1 < cached);
     try std.testing.expect(group_service.groupFieldOf(&systems[0], field_key) == null);
     const stats = try systems[1].applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
@@ -1131,6 +1153,8 @@ test "eviction with paths and fields allocates nothing after its pre-commit rese
 }
 
 test "a level rebuilt by a content revision evicts only its own results and fields, and every pending request stays" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1171,7 +1195,7 @@ test "a level rebuilt by a content revision evicts only its own results and fiel
 
     // A blocking fill of level 1 moves its content revision with no per-cell event.
     _ = try world.addDenseLayer(1, 0, .obstacle, tree);
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, null);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     // Level 1's two results (the group goal solved individually before its field was ready).
     try std.testing.expectEqual(@as(usize, 2), system.completed.count());
@@ -1260,6 +1284,8 @@ fn expectLinkedCached(system: *const PathfindingSystem, keys: [linked_routes.len
 }
 
 test "a rebuilt level evicts every result whose path crosses it, the goal level's or not, and keeps the results that never touch it" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1270,13 +1296,15 @@ test "a rebuilt level evicts every result whose path crosses it, the goal level'
     defer system.deinit();
     const keys = try solveLinkedRoutes(&system, &data, &world);
     try blockLevels(&world, &meta, &.{1});
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, null);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     // The pass-throughs (goals on levels 2 and 0) and the goal on level 1 go.
     try expectLinkedCached(&system, keys, .{ false, true, true, false, false });
 }
 
 test "a rebuilt start level evicts the results that leave it for a goal on another level" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1287,7 +1315,7 @@ test "a rebuilt start level evicts the results that leave it for a goal on anoth
     defer system.deinit();
     const keys = try solveLinkedRoutes(&system, &data, &world);
     try blockLevels(&world, &meta, &.{0});
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, null);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
     // Every route with a run on level 0 goes, its goal on level 2, 1, or 0.
     try expectLinkedCached(&system, keys, .{ false, false, true, false, false });
@@ -1315,6 +1343,8 @@ test "two levels rebuilt in one step evict each result through either once and f
 }
 
 test "a level build that fails after an earlier level was evicted still flushes its evictions, and the retry finishes the rest" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
     var fail_index: usize = 0;
@@ -1329,7 +1359,7 @@ test "a level build that fails after an earlier level was evicted still flushes 
         try blockLevels(&world, &meta, &.{ 1, 2 });
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         setSystemAllocators(&system, failing.allocator());
-        const result = system.applyBufferedNavUpdates(no_colliders, &world, null);
+        const result = system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
         setSystemAllocators(&system, std.testing.allocator);
         _ = result catch {
             const graphs = system.graph.level_graphs.items;
@@ -1337,7 +1367,7 @@ test "a level build that fails after an earlier level was evicted still flushes 
             if (graphs[1].built_revision != world.levelContentRevision(1) or graphs[2].built_revision == world.levelContentRevision(2)) continue;
             try std.testing.expect(system.completed.slotIndex(keys[0]) == null);
             try expectLinkedCached(&system, keys, .{ false, true, true, false, false });
-            _ = try system.applyBufferedNavUpdates(no_colliders, &world, null);
+            _ = try system.applyBufferedNavUpdates(no_colliders, &world, &serial_threads);
             try expectLinkedCached(&system, keys, .{ false, true, false, false, false });
             return;
         };

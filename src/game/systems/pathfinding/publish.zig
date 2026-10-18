@@ -76,9 +76,9 @@ pub fn reservePublish(self: *PathfindingSystem) error{OutOfMemory}!void {
         registrations += solved.run_count;
         for (&shard_registrations, solved.shard_counts) |*total, shard_count| total.* += shard_count;
     }
-    const grows_before = registryGrowths(self);
+    const capacity_before = registryCapacity(self);
     for (&self.path_index, shard_registrations) |*shard, count| try shard.reserve(count, count, self.completed.logicalCapacity());
-    var grows = registryGrowths(self) - grows_before;
+    var grows: u64 = @intFromBool(registryCapacity(self) != capacity_before);
     // Each range window starts on a cache line.
     const padding = (reg_window_alignment_items - 1) * maxRangeCount(self.solve_results.items.len, 1);
     if (registrations + padding > self.reg_buckets.capacity) {
@@ -90,23 +90,23 @@ pub fn reservePublish(self: *PathfindingSystem) error{OutOfMemory}!void {
     if (pages != 0) self.long_block_growth.record(pages, .info, "path cache long-block pool grew to {d} blocks", .{self.completed.long_block_count});
 }
 
-// Growths of every registry shard's table, entry pool, and owner heads so far.
-fn registryGrowths(self: *const PathfindingSystem) u64 {
-    var grows: u64 = 0;
-    for (&self.path_index) |*shard| grows += shard.grows;
-    return grows;
+// Every registry shard's table slots, entry pool, and owner heads: a reserve that changed
+// it grew.
+fn registryCapacity(self: *const PathfindingSystem) usize {
+    var capacity: usize = 0;
+    for (&self.path_index) |*shard| capacity += shard.slot_keys.len + shard.entries.capacity + shard.owner_heads.capacity;
+    return capacity;
 }
 
 fn countRegistryGrowth(self: *PathfindingSystem, grows: u64) void {
-    self.registry_growth.record(grows, .info, "path registry storage grew ({d} growths so far)", .{self.registry_growth.count + grows});
+    self.registry_growth.record(grows, .info, "path registry storage grew", .{});
 }
 
 /// Every registry shard holds an owner head per cache owner id below `capacity`.
 pub fn reserveRegistryOwners(self: *PathfindingSystem, capacity: usize) !void {
-    const grows_before = registryGrowths(self);
+    const capacity_before = registryCapacity(self);
     for (&self.path_index) |*shard| try shard.reserve(0, 0, capacity);
-    const grows = registryGrowths(self) - grows_before;
-    if (grows != 0) countRegistryGrowth(self, grows);
+    if (registryCapacity(self) != capacity_before) countRegistryGrowth(self, 1);
 }
 
 /// Drops every path registration, as when the result cache dropped every entry.
@@ -480,8 +480,8 @@ test "pathfinding result publish after its reserve allocates nothing (FailingAll
     // Warm: the first publish grows the long pool at its reserve.
     try std.testing.expectEqual(goals.len, (try solveIndividualGoals(&system, requester, &goals, 8)).available_results);
     try std.testing.expect(system.completed.long_block_count >= goals.len);
-    const grows = system.long_block_growth.count;
-    try std.testing.expect(grows >= 1);
+    try std.testing.expect(system.long_block_growth.logged);
+    const long_blocks = system.completed.long_block_count;
 
     // Cleared (every block free again), the same results publish on a failing allocator.
     clearCompleted(&system);
@@ -494,7 +494,7 @@ test "pathfinding result publish after its reserve allocates nothing (FailingAll
     }
     const stats = try solveIndividualGoals(&system, requester, &goals, 8);
     try std.testing.expectEqual(goals.len, stats.available_results);
-    try std.testing.expectEqual(grows, system.long_block_growth.count);
+    try std.testing.expectEqual(long_blocks, system.completed.long_block_count);
     for (goals) |goal| {
         var cells = try cachedPathCells(&system, goal);
         defer cells.deinit(std.testing.allocator);
@@ -560,13 +560,15 @@ test "pathfinding a publish reserve out of memory claims nothing, leaves pending
     try std.testing.expectEqual(@as(usize, 0), retry.accepted_requests);
     try std.testing.expectEqual(goals.len + 1, retry.available_results);
     try std.testing.expectEqual(@as(usize, 0), system.pending.len);
-    try std.testing.expect(system.long_block_growth.count >= 1);
+    try std.testing.expect(system.completed.long_block_count >= goals.len);
     for (goals) |goal| {
         try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, cellWorld(1, 2), 0, goal, .default, null).status);
     }
 }
 
 test "the path registry holds every run of every published path, and the incremental registry equals one rebuilt from the live cache after victims, TTL expiry, evictions, re-puts, and a shrink with renames" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -593,7 +595,7 @@ test "the path registry holds every run of every published path, and the increme
 
     // Evictions: a dig across the middle of the map.
     try setRegistryCells(&system, &fixture, &.{ .{ 11, 11 }, .{ 12, 11 }, .{ 12, 12 } }, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try expectRegistryMatchesCache(&system);
 
     // A re-put: the same key published with a different path.

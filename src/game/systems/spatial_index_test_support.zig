@@ -43,7 +43,7 @@ pub fn testHaloIndex(data: *const DataSystem, halo: ?[]const u32) !SpatialIndexS
 
 /// `SpatialIndexSystem.build` inline as one range: a thread system with no workers.
 pub fn buildInline(system: *SpatialIndexSystem, data: *const DataSystem, population: IndexPopulation, geometry: IndexGeometry, config: SpatialIndexConfig) !SpatialIndexStats {
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     return system.build(data, population, geometry, &threads, config);
 }

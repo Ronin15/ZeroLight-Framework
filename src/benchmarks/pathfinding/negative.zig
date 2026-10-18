@@ -85,7 +85,6 @@ pub const negative_burst_group = suite.BenchmarkGroup{
 
 // The case's goal resolve over `intents`, as the pipeline's `path_goal_resolve` stage.
 fn runResolveGoals(system: *PathfindingSystem, intents: []const PathRequest, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !GoalResolveStats {
-    if (!case.usesThreadSystem()) return system.resolveGoals(PathRequest, intents, null, .{});
     return system.resolveGoals(PathRequest, intents, thread_system, .{
         .items_per_range = case.stageItemsPerRange(goal_scan_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
@@ -179,7 +178,7 @@ fn checkPocketLayout(allocator: std.mem.Allocator, side: u16, goal_count: usize,
 
 // The pocket on a walkable `side`² level with one requester per request; goals are set per
 // step. Nav is world-backed, so the far dig reaches it through `changeAndReact`.
-fn initPocketFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, requester_count: usize, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
+fn initPocketFixture(allocator: std.mem.Allocator, io: std.Io, side: u16, requester_count: usize, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, side, 1);
     errdefer open.world.deinit();
     const walls = pocketWallCells();
@@ -477,7 +476,7 @@ fn checkBurstLayout(config: BurstConfig) !void {
     if (burst_requester_row + rows > burst_side) return error.NegativeBurstRequesterRowsTooFew;
 }
 
-fn initBurstFixture(allocator: std.mem.Allocator, io: std.Io, config: BurstConfig, capacity: PathfindingCapacity, thread_system: ?*ThreadSystem) !ReactFixture {
+fn initBurstFixture(allocator: std.mem.Allocator, io: std.Io, config: BurstConfig, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
     var open = try buildOpenWorld(allocator, io, burst_side, 1);
     errdefer open.world.deinit();
     const walls = burstWallCells();

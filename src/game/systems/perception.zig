@@ -1074,7 +1074,7 @@ fn updateInline(
     events: *SimulationEvents,
     config: PerceptionConfig,
 ) !PerceptionStats {
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     return system.update(ai_agents, movement, spatial, world, data, events, &threads, config);
 }

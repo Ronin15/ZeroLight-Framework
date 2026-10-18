@@ -166,8 +166,8 @@ const Fixture = struct {
 
     // Untimed, before each stage: applies the last stage's nav marks, puts every faller back
     // on level 0 entering its hole, refills its landing cell, and begins the frame step.
-    fn resetStep(self: *Fixture) !void {
-        _ = try self.nav.applyBufferedNavUpdates(&self.colliders, &self.world, null);
+    fn resetStep(self: *Fixture, thread_system: *ThreadSystem) !void {
+        _ = try self.nav.applyBufferedNavUpdates(&self.colliders, &self.world, thread_system);
         const tile_size = self.world.tile_size;
         const floor1 = self.world.denseFloorLayerForLevel(1).?;
         for (self.fallers.items) |faller| {
@@ -330,11 +330,11 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // A fixed threaded case with more than one range of agents dispatches the gather.
     const expect_dispatch = !case.adaptive and threads.workerThreadCount() > 0 and item_count > plane_entry.config.items_per_range.?;
 
-    try fixture.resetStep();
+    try fixture.resetStep(thread_ptr);
     var warm = suite.Warmup.init(options, case, 1);
     while (warm.next(plane_entry.tuner.phase == .settled)) {
         _ = try runStage(&fixture, thread_ptr);
-        try fixture.resetStep();
+        try fixture.resetStep(thread_ptr);
     }
     const settled_before_measurement = if (case.adaptive) (plane_entry.tuner.phase == .settled) else false;
 
@@ -356,7 +356,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
             if (!batch.ran_inline) off_main += batch.batch_duration_ns;
         }
         main_total += elapsed_ns -| off_main;
-        try fixture.resetStep();
+        try fixture.resetStep(thread_ptr);
     }
     std.debug.assert(entries == fixture.fallers.items.len);
     var stats = accumulator.finish();

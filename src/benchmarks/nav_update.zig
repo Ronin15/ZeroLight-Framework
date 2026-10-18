@@ -183,7 +183,7 @@ fn setFootprint(fixture: *Fixture, allocator: std.mem.Allocator, cells: usize) !
 // One open-then-blocked toggle of the footprint: the first half opens it (grass), the second
 // re-blocks it (tree) on the revert stage tuners (swapped untimed), each one nav update; only
 // the updates are timed. Returns both halves' sum.
-fn runToggle(fixture: *Fixture, io: std.Io, thread_system: ?*ThreadSystem) !u64 {
+fn runToggle(fixture: *Fixture, io: std.Io, thread_system: *ThreadSystem) !u64 {
     var elapsed: u64 = 0;
     try writeFootprint(fixture, fixture.grass);
     elapsed += try timeNavUpdate(fixture, io, thread_system);
@@ -208,7 +208,7 @@ fn writeFootprint(fixture: *Fixture, tile: TileId) !void {
 // Times one incremental nav update over the fixture's footprint. The terrain record of the
 // footprint's writes (serial, so it trains no tuner) is untimed setup, as production records
 // edits before the patch. Fails unless the update applied and remasked the footprint's chunks.
-fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: ?*ThreadSystem) !u64 {
+fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: *ThreadSystem) !u64 {
     try fixture.system.reserveTerrainNavRecord(fixture.events.items.len);
     fixture.system.recordTerrainNavEvents(fixture.events.items, &fixture.world, null);
     const t0 = suite.nowNs(io);
@@ -227,9 +227,9 @@ fn toggleTunersSettled(tuners: *const fixtures.NavTuners) bool {
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
 
     var fixture = try buildFixture(allocator, io, fixtures.participantCount(thread_ptr));
     defer fixture.deinit();
@@ -239,7 +239,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     try writeFootprint(&fixture, fixture.tree);
     try fixture.system.reserveTerrainNavRecord(fixture.events.items.len);
     fixture.system.recordTerrainNavEvents(fixture.events.items, &fixture.world, null);
-    _ = try fixture.system.applyBufferedNavUpdates(&fixture.colliders, &fixture.world, null);
+    _ = try fixture.system.applyBufferedNavUpdates(&fixture.colliders, &fixture.world, thread_ptr);
     fixtures.setNavTuners(&fixture.system, case);
     fixture.revert_tuners = fixture.system.tuners;
 
@@ -375,7 +375,7 @@ const StaticMoveFixture = struct {
 
     // One move to the other cell through the commit seam (`fixtures.CommitSeam`) with nav.
     // Returns the time from the command write through the reaction.
-    fn moveAndReact(self: *StaticMoveFixture, io: std.Io, thread_system: ?*ThreadSystem) !struct { ns: u64, stats: NavUpdateStats } {
+    fn moveAndReact(self: *StaticMoveFixture, io: std.Io, thread_system: *ThreadSystem) !struct { ns: u64, stats: NavUpdateStats } {
         self.frame.beginStep();
         const seam = fixtures.CommitSeam{
             .colliders = &self.colliders,
@@ -428,9 +428,9 @@ fn initStaticMoveFixture(allocator: std.mem.Allocator, io: std.Io, other_statics
 fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, other_statics: usize, dynamic_bodies: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
 
     var fixture = try initStaticMoveFixture(allocator, io, other_statics, dynamic_bodies, participant_count);
@@ -550,7 +550,7 @@ const StaticDenseFixture = struct {
     // and every destroy + create as one commit. Returns the time from the command build
     // through the reaction, its commit, sync, and reaction phases, and the splice and
     // reaction off-main stage time.
-    fn changeAndReact(self: *StaticDenseFixture, io: std.Io, thread_system: ?*ThreadSystem) !DenseChangeTiming {
+    fn changeAndReact(self: *StaticDenseFixture, io: std.Io, thread_system: *ThreadSystem) !DenseChangeTiming {
         self.frame.beginStep();
         const start_ns = suite.nowNs(io);
         self.commands.clearRetainingCapacity();
@@ -734,9 +734,9 @@ fn runStaticDenseTailCase(allocator: std.mem.Allocator, io: std.Io, options: sui
 fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, tail: bool) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
-    var threads = try fixtures.initCaseThreads(allocator, io, case);
-    defer if (threads) |*thread_system| thread_system.deinit();
-    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
 
     var fixture = try initStaticDenseFixture(allocator, io, item_count, participant_count, tail);

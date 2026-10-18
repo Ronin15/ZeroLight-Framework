@@ -23,7 +23,6 @@ const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const RoundDispatch = @import("../../../app/thread_system.zig").RoundDispatch;
 const accumulateBatch = @import("../../../app/thread_system.zig").accumulateBatch;
 const runStage = @import("../../../app/thread_system.zig").runStage;
-const NavGraph = @import("nav_graph.zig").NavGraph;
 const BatchLevels = @import("nav_graph.zig").BatchLevels;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
 const keyLevel = @import("../chunk_list_map.zig").keyLevel;
@@ -37,14 +36,11 @@ const types = @import("types.zig");
 const NavUpdateStats = types.NavUpdateStats;
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const StageTimer = runtime_perf_log.StageTimer;
-const listBytesBound = @import("nav_graph.zig").listBytesBound;
-const rowsBytesBound = @import("nav_graph.zig").rowsBytesBound;
 const simd = @import("../../../core/simd.zig");
 const Connectivity = @import("connectivity.zig").Connectivity;
 const ElementColumns = @import("connectivity.zig").ElementColumns;
 const GroupColumns = @import("connectivity.zig").GroupColumns;
 const Neighbour = @import("connectivity.zig").Neighbour;
-const StorageShape = @import("connectivity.zig").StorageShape;
 const portalNode = @import("connectivity.zig").portalNode;
 const forEachEdge = @import("connectivity.zig").forEachEdge;
 const findRoot = @import("connectivity.zig").findRoot;
@@ -66,7 +62,7 @@ const no_scc: u32 = std.math.maxInt(u32);
 // free the next free index (`no_index` ends the list). An entry is live exactly when the
 // terminal it names points back to that index of that block.
 // Words of one rows item's span and one landing line: a 64-byte cache line.
-const span_words: usize = 16;
+pub const span_words: usize = 16;
 
 // ----------------------------------------------------------------------------------------
 // One-way closure storage
@@ -646,36 +642,6 @@ pub fn countOneWay(links: []const LevelLink) usize {
     var count: usize = 0;
     for (links) |link| count += @intFromBool(!link.bidirectional);
     return count;
-}
-
-/// The closure's share of `storageBytesBound`: its one-way rows, terminal and H-component pools,
-/// blocks and tail, and a batch's staging over `keys` keys holding at most `key_nodes` nodes. A batch holds at most every terminal as an old or popped
-/// one, every one-way link live or loose, and blocks whose caps sum to twice the terminals.
-pub fn closureBytesBound(shape: StorageShape, keys: usize, key_nodes: usize) usize {
-    if (shape.oneway_links == 0) return 0;
-    const terminals = 2 *| shape.oneway_links;
-    const system = @max(1, @min(shape.system_terminals, terminals));
-    // A block's cap is a power of two below twice its component's terminals.
-    const cap_max = std.math.ceilPowerOfTwo(usize, 2 *| system) catch std.math.maxInt(usize);
-    const row_words = @max(1, cap_max / 32);
-    const spans = @divCeil(row_words, span_words);
-    const live_words = 2 *| terminals *| (row_words +| 2) +| span_words *| terminals;
-    const blocks = (3 *| live_words +| span_words *| terminals) *| @sizeOf(u32);
-    const registry = rowsBytesBound(OneWayRow, shape.oneway_links);
-    // Terminals pop up to twice the live ones; H-components split into a piece per link.
-    const pools = 2 *| 3 *| terminals *| (@sizeOf(TermRow) + @sizeOf(u32)) +| 2 *| 2 *| terminals *| (@sizeOf(HCompRow) + @sizeOf(u32));
-    const staging = 2 *| listBytesBound(usize, keys +| 1) +| 2 *| listBytesBound(u32, keys) +| listBytesBound(CandTally, keys) +|
-        listBytesBound(u32, 3 *| key_nodes) +|
-        listBytesBound(OneWayEntry, @min(keys *| shape.chunk_endpoints, 2 *| shape.links)) +|
-        listBytesBound(u32, terminals) +| rowsBytesBound(TouchRow, terminals) +|
-        listBytesBound(u32, terminals / 16 +| terminals) +| listBytesBound(u32, 2 *| terminals) +|
-        3 *| listBytesBound(u32, terminals) +| listBytesBound(ResolveOut, terminals) +|
-        rowsBytesBound(SlotRow, 2 *| terminals) +| rowsBytesBound(PieceRow, terminals) +|
-        2 *| listBytesBound(u32, terminals) +| listBytesBound(FreedIndex, terminals) +| listBytesBound(MaskItem, terminals) +|
-        rowsBytesBound(APosRow, 2 *| terminals) +|
-        listBytesBound(CopyItem, 6 *| terminals *| spans) +| listBytesBound(RowsItem, 3 *| terminals *| spans) +|
-        listBytesBound(usize, 2 *| terminals +| 2) +| listBytesBound(LandBlock, terminals);
-    return registry +| pools +| blocks +| staging;
 }
 
 // ----------------------------------------------------------------------------------------
@@ -2459,7 +2425,6 @@ const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const no_colliders = &test_support.no_colliders;
 const reach = @import("connectivity.zig").reach;
 const StagingSizes = @import("connectivity.zig").StagingSizes;
-const storageBytesBound = @import("connectivity.zig").storageBytesBound;
 const TestWorld = test_support.TestWorld;
 const exhausted_pool_window = test_support.exhausted_pool_window;
 const expectExhaustedPoolBatch = test_support.expectExhaustedPoolBatch;
@@ -2495,8 +2460,10 @@ fn expectClosureStagingWithin(conn: *const Connectivity, keep: StagingSizes) !vo
 
 // Runs `steps` steps with no nav change.
 fn quietSteps(fixture: *TestWorld, system: *PathfindingSystem, steps: usize) !void {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     for (0..steps) |_| {
-        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         try std.testing.expectEqual(@as(usize, 0), stats.incremental_rebuilds);
     }
 }
@@ -2534,6 +2501,8 @@ test "a world build with one-way links frees its closure staging when it ends" {
 }
 
 test "a one-way world's single dig stays allocation-free after its closure staging is released" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -2544,14 +2513,14 @@ test "a one-way world's single dig stays allocation-free after its closure stagi
     const conn = &system.graph.connectivity;
     // The dig and its refill, each one chunk, set the closure floor.
     try setRoom(&fixture, &system, chunks, 0, 5, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try setRoom(&fixture, &system, chunks, 0, 5, fixture.grass);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     // A dense change through the chain grows the closure staging; two quiet windows free it.
     for (0..8) |index| try setRoom(&fixture, &system, chunks, 0, index, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     for (0..8) |index| try setRoom(&fixture, &system, chunks, 0, index, fixture.grass);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     const dense_staging = conn.stagingBytes();
     try quietSteps(&fixture, &system, 2 * window);
     try std.testing.expect(conn.stagingBytes() < dense_staging);
@@ -2629,7 +2598,9 @@ fn expectWithinBounds(closure: *const Closure, stats: NavUpdateStats) !void {
 
 // Applies `system`'s buffered nav updates and asserts its closure stayed within its bound.
 fn applyWithinBounds(fixture: *TestWorld, system: *PathfindingSystem) !NavUpdateStats {
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try expectWithinBounds(&system.graph.connectivity.closure, stats);
     return stats;
 }
@@ -2690,6 +2661,8 @@ test "the closure equals a full recompute after one-way adds, endpoint toggles, 
 }
 
 test "two hundred seeded random steps of one-way links, endpoint toggles, and wall digs and fills match a full recompute after each" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var prng = std.Random.DefaultPrng.init(0x1b1b);
     const random = prng.random();
     const chunks: u16 = 4;
@@ -2729,7 +2702,7 @@ test "two hundred seeded random steps of one-way links, endpoint toggles, and wa
                 .bidirectional = random.uintLessThan(u8, 5) == 0,
             });
         }
-        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         try expectWithinBounds(&system.graph.connectivity.closure, stats);
         try fixture.expectMatchesRebuild(&system);
     }
@@ -2756,6 +2729,8 @@ fn roomTerm(system: *const PathfindingSystem, fixture: *const TestWorld, chunks:
 }
 
 test "closing and reopening a chain's head leaves every other row bitwise" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -2769,18 +2744,20 @@ test "closing and reopening a chain's head leaves every other row bitwise" {
     for (2..8) |index| @memcpy(&before[index], termRow(closure, roomTerm(&system, &fixture, chunks, 0, index)));
     const terms = test_support.closureTermCount(closure);
     try setRoom(&fixture, &system, chunks, 0, 1, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     // The head left: its only out-edge's source; no other row reaches it.
     try std.testing.expectEqual(terms - 1, test_support.closureTermCount(closure));
     for (2..8) |index| try std.testing.expectEqualSlices(u32, &before[index], termRow(closure, roomTerm(&system, &fixture, chunks, 0, index)));
     try setRoom(&fixture, &system, chunks, 0, 1, fixture.grass);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(terms, test_support.closureTermCount(closure));
     for (2..8) |index| try std.testing.expectEqualSlices(u32, &before[index], termRow(closure, roomTerm(&system, &fixture, chunks, 0, index)));
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "a batch where one terminal leaves and another joins a full block reuses the freed index: the block keeps its capacity, words, and allocation" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -2800,7 +2777,7 @@ test "a batch where one terminal leaves and another joins a full block reuses th
     // One batch: the tail's room closed, and a new link from the chain to room 20.
     try setRoom(&fixture, &system, chunks, 0, 7, fixture.tree);
     try addOneWay(&fixture, 0, latticeRoom(chunks, 6), 0, latticeRoom(chunks, 20));
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     // The tail's terminal left and room 20's took its index.
     try std.testing.expectEqual(terms, test_support.closureTermCount(closure));
     const joined = roomTerm(&system, &fixture, chunks, 0, 20);
@@ -2815,6 +2792,8 @@ test "a batch where one terminal leaves and another joins a full block reuses th
 }
 
 test "a dig touching no one-way system leaves every block and word in place; a world without one-way links keeps its closure inactive" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -2829,7 +2808,7 @@ test "a dig touching no one-way system leaves every block and word in place; a w
     // Two rooms with no endpoint joined, far from the chain's row.
     const wall = latticeWall(chunks, 60);
     try fixture.setCell(&system, 0, wall[0], wall[1], fixture.grass);
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_rows_batch.item_count);
     try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
     try std.testing.expectEqualSlices(u32, words, closure.hcomp.block[id]);
@@ -2840,7 +2819,7 @@ test "a dig touching no one-way system leaves every block and word in place; a w
     var plain_system = try plain.build(test_support.abstractCapacity());
     defer plain_system.deinit();
     try plain.setCell(&plain_system, 0, wall[0], wall[1], plain.grass);
-    _ = try plain_system.applyBufferedNavUpdates(no_colliders, &plain.world, null);
+    _ = try plain_system.applyBufferedNavUpdates(no_colliders, &plain.world, &serial_threads);
     try std.testing.expect(!plain_system.graph.connectivity.closure.active);
 }
 
@@ -2881,6 +2860,8 @@ fn ranOnWorkers(batch: BatchStats) bool {
 }
 
 test "threaded closure stages equal the inline ones word for word across worker counts and range sizes, and the rows run on workers" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const chunks: u16 = 8;
     for ([_]usize{ 1, 2, 4 }) |workers| {
@@ -2920,7 +2901,7 @@ test "threaded closure stages equal the inline ones word for word across worker 
                         for (144..232) |room| try markRoom(&fixture, &systems, chunks, room, fixture.tree);
                     },
                 }
-                const serial = try inline_system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+                const serial = try inline_system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
                 const stats = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
                 try expectWithinBounds(&inline_system.graph.connectivity.closure, serial);
                 try expectWithinBounds(&threaded.graph.connectivity.closure, stats);
@@ -2971,6 +2952,8 @@ test "a one-way toggle and a terminal root split prepared with the real allocato
 }
 
 test "repeated one-way toggles and terminal splits and merges return terminals, components, words, and links to their counts, and every reaction ends with its blocks landed" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -2992,12 +2975,12 @@ test "repeated one-way toggles and terminal splits and merges return terminals, 
         // The tail toggled, then the wall between rooms 3 and 4 opened and closed.
         for ([_]TileId{ fixture.tree, fixture.grass }) |tile| {
             try setRoom(&fixture, &system, chunks, 0, 7, tile);
-            _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+            _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
             try std.testing.expect(closure.tail.items.len == 0 and closure.residents.items.len == 0);
         }
         for ([_]TileId{ fixture.grass, fixture.tree }) |tile| {
             try fixture.setCell(&system, 0, wall[0], wall[1], tile);
-            _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+            _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
             try std.testing.expect(closure.tail.items.len == 0 and closure.residents.items.len == 0);
         }
         if (start) |first| try std.testing.expectEqual(first, counts(closure)) else start = counts(closure);
@@ -3013,8 +2996,10 @@ const narrow_tail: usize = 255;
 // Sets the narrow chain's first 100 rooms to `tile` in one batch: closed, 28 terminals
 // remain. Returns the batch's stats.
 fn narrowChain(fixture: *TestWorld, system: *PathfindingSystem, tile: TileId) !NavUpdateStats {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     for (narrow_first..narrow_first + 100) |room| try setRoom(fixture, system, 8, 0, room, tile);
-    return system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    return system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
 }
 
 // The H-component of lattice room `index`'s terminal on level 0.
@@ -3023,6 +3008,8 @@ fn roomHComp(system: *const PathfindingSystem, fixture: *const TestWorld, chunks
 }
 
 test "a one-way system that loses most of its terminals narrows its block and frees the old one in the same batch; a far dig allocates and frees no block" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3045,17 +3032,19 @@ test "a one-way system that loses most of its terminals narrows its block and fr
     const block = closure.hcomp.block[id].ptr;
     const wall = latticeWall(chunks, 40);
     try fixture.setCell(&system, 0, wall[0], wall[1], fixture.grass);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
     try std.testing.expectEqual(blockWords(64), closure.live_words);
     // A tail toggle keeps the narrowed block.
     try setRoom(&fixture, &system, chunks, 0, narrow_tail, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
     try fixture.expectMatchesRebuild(&system);
 }
 
 test "a system at its narrowed size neither narrows nor grows under toggles, and regrowing then narrowing again returns its block and words" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3072,7 +3061,7 @@ test "a system at its narrowed size neither narrows nor grows under toggles, and
     const block = closure.hcomp.block[id].ptr;
     for (0..8) |toggle| {
         try setRoom(&fixture, &system, chunks, 0, narrow_tail, if (toggle % 2 == 0) fixture.tree else fixture.grass);
-        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         try std.testing.expectEqual(narrowed[0], closure.hcomp.k_cap[id]);
         try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
     }
@@ -3094,6 +3083,8 @@ test "a system at its narrowed size neither narrows nor grows under toggles, and
 }
 
 test "the heir of a component that falls into five pieces narrows; the other pieces take blocks sized to their terminals" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3102,7 +3093,7 @@ test "the heir of a component that falls into five pieces narrows; the other pie
     defer system.deinit();
     const closure = &system.graph.connectivity.closure;
     for ([_]usize{ 25, 50, 75, 100 }) |cut| try setRoom(&fixture, &system, chunks, 0, narrow_first + cut, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 5), test_support.closureHcompCount(closure));
     try std.testing.expectEqual(@as(u32, 64), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, narrow_tail)]);
     for ([_]usize{ 0, 26, 51, 76 }) |first| try std.testing.expectEqual(@as(u32, 32), closure.hcomp.k_cap[roomHComp(&system, &fixture, chunks, narrow_first + first)]);
@@ -3361,6 +3352,8 @@ fn deferNarrowingLanding(fixture: *TestWorld, system: *PathfindingSystem) !void 
 }
 
 test "release windows closing while a landing is deferred keep the tail and its blocks; the next batch lands them" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const chunks: u16 = 8;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3375,7 +3368,7 @@ test "release windows closing while a landing is deferred keep the tail and its 
     defer frame.deinit();
     for (0..3) |_| {
         frame.beginStep();
-        _ = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, null);
+        _ = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, &serial_threads);
     }
     // The windows released the batch's other staging, never the tail under the block.
     try std.testing.expect(closure.slots.capacity < slots_held);
@@ -3384,7 +3377,7 @@ test "release windows closing while a landing is deferred keep the tail and its 
     try fixture.expectMatchesRebuild(&system);
     // Each step closes a window, which resets the batch limits `expectWithinBounds` reads.
     try setRoom(&fixture, &system, chunks, 0, narrow_tail, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(closure.residents.items.len == 0 and closure.tail.items.len == 0);
     try std.testing.expectEqual(blockWords(64), closure.hcomp.block[roomHComp(&system, &fixture, chunks, narrow_first + 100)].len);
     try fixture.expectMatchesRebuild(&system);
@@ -3477,6 +3470,8 @@ const FailOnceAllocator = struct {
 };
 
 test "a nav update failing after a level build left blocks in the tail lands them on its error path, or keeps them resident when that landing fails too" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     for ([_]bool{ false, true }) |landing_fails| {
         var fixture = try TestWorld.init(6, 1);
         defer fixture.deinit();
@@ -3504,7 +3499,7 @@ test "a nav update failing after a level build left blocks in the tail lands the
         const broken = if (landing_fails) failing.allocator() else once.allocator();
         system.allocator = broken;
         system.graph.allocator = broken;
-        const result = system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        const result = system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         system.allocator = std.testing.allocator;
         system.graph.allocator = std.testing.allocator;
         try std.testing.expectError(error.OutOfMemory, result);
@@ -3512,7 +3507,7 @@ test "a nav update failing after a level build left blocks in the tail lands the
         try std.testing.expectEqual(@as(usize, @intFromBool(landing_fails)), closure.residents.items.len);
         try std.testing.expect(reach(&system.graph, 1, fixture.cell(2, 2), 2, fixture.cell(9, 9)) == .reaches);
         // The retry builds the level, landing any block first.
-        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         try std.testing.expectEqual(@as(usize, 4), system.graph.levelCount());
         try std.testing.expectEqual(@as(usize, 0), closure.residents.items.len);
         try std.testing.expectEqual(@as(usize, 0), closure.tail.items.len);
@@ -3658,6 +3653,8 @@ test "a fill splitting one terminal root holding sixteen one-way endpoints in fa
 }
 
 test "a world build's closure equals one maintained level by level as levels and their one-way links arrive in play" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     const chunks: u16 = 4;
     var fixture = try latticeWorld(chunks, 1);
     defer fixture.deinit();
@@ -3675,7 +3672,7 @@ test "a world build's closure equals one maintained level by level as levels and
         try addChain(&fixture, chunks, level, 3, 4);
         try addOneWay(&fixture, level - 1, latticeRoom(chunks, 4), level, latticeRoom(chunks, 3));
         try addOneWay(&fixture, level, latticeRoom(chunks, 6), level - 1, latticeRoom(chunks, 0));
-        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
         // Checks the world build's closure (`buildClosure`) against this one.
         try fixture.expectMatchesRebuild(&system);
@@ -3816,6 +3813,8 @@ test "a nav worker cap of zero keeps every graph, connectivity, and closure stag
 }
 
 test "a merge and a split of terminal roots far from every endpoint join and part their one-way systems" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
     var fixture = try TestWorld.init(8, 2);
     defer fixture.deinit();
     // Both levels halved by a solid chunk column; each level-0 half reaches the level-1 half
@@ -3828,13 +3827,13 @@ test "a merge and a split of terminal roots far from every endpoint join and par
     try std.testing.expectEqual(@as(usize, 2), test_support.closureHcompCount(system.graph.connectivity.closure));
     // A gap in level 0's wall, its patch keys far from every endpoint, merges the halves.
     try fixture.setChunk(&system, 0, 4, 4, fixture.grass);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), test_support.closureHcompCount(system.graph.connectivity.closure));
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 1, fixture.cell(29, 29)) == .reaches);
     try fixture.expectMatchesRebuild(&system);
     // Refilled: the root splits and so does the system.
     try fixture.setChunk(&system, 0, 4, 4, fixture.tree);
-    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, null);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 2), test_support.closureHcompCount(system.graph.connectivity.closure));
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 1, fixture.cell(29, 29)) != .reaches);
     try fixture.expectMatchesRebuild(&system);
@@ -3946,7 +3945,7 @@ test "a one-way chain cut to a few rooms, reopened, and toggled stays within the
     const stride = graph.levelGraph(0).?.border_stride;
     const chunk_cells = @as(usize, test_chunk) * test_chunk;
     const chunk_endpoints = @min(2 * links, chunk_cells);
-    const shape = StorageShape{
+    const shape = test_support.ConnectivityStorageShape{
         .nodes = graph.chunkCount() * stride + 2 * links,
         .level_chunks = graph.chunkCount(),
         .level_nodes = graph.chunkCount() * stride + 2 * links,
@@ -3959,7 +3958,7 @@ test "a one-way chain cut to a few rooms, reopened, and toggled stays within the
         .system_terminals = rooms,
         .participants = 1,
     };
-    const graph_shape = NavGraph.StorageShape{
+    const graph_shape = test_support.NavStorageShape{
         .chunks = graph.chunkCount(),
         .levels = 1,
         .chunk_tiles = test_chunk,
@@ -3974,21 +3973,21 @@ test "a one-way chain cut to a few rooms, reopened, and toggled stays within the
     for ([_]TileId{ fixture.tree, fixture.grass }) |tile| {
         for (0..cut) |index| try setRoom(&fixture, &system, chunks, 0, index, tile);
         _ = try applyWithinBounds(&fixture, &system);
-        try std.testing.expect(graph.connectivity.residentBytes() <= storageBytesBound(shape));
-        try std.testing.expect(graph.residentBytes() <= NavGraph.storageBytesBound(graph_shape));
+        try std.testing.expect(graph.connectivity.residentBytes() <= test_support.connectivityStorageBytesBound(shape));
+        try std.testing.expect(graph.residentBytes() <= test_support.navStorageBytesBound(graph_shape));
     }
     for (0..4) |_| {
         for ([_]TileId{ fixture.tree, fixture.grass }) |tile| {
             try setRoom(&fixture, &system, chunks, 0, rooms - 1, tile);
             _ = try applyWithinBounds(&fixture, &system);
-            try std.testing.expect(graph.connectivity.residentBytes() <= storageBytesBound(shape));
+            try std.testing.expect(graph.connectivity.residentBytes() <= test_support.connectivityStorageBytesBound(shape));
         }
     }
     try fixture.expectMatchesRebuild(&system);
     // The closure is charged only for one-way links.
     var two_way = shape;
     two_way.oneway_links = 0;
-    try std.testing.expect(storageBytesBound(two_way) < storageBytesBound(shape));
+    try std.testing.expect(test_support.connectivityStorageBytesBound(two_way) < test_support.connectivityStorageBytesBound(shape));
 }
 
 test "a fill splitting a one-chunk room holding two endpoint cells yields two terminals within the bound" {
