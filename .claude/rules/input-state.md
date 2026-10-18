@@ -22,7 +22,8 @@ How it works: `docs/state-stack-and-input.md`.
 - `StatePolicy.gameplay` is the single source of "active gameplay". Pause
   applies only over active gameplay, never over menus; lower states receive
   only what policy allows.
-- Gameplay never advances on a non-rendering frame (render cadence:
+- The simulation never advances on a non-rendering frame; a pause stops all
+  of it (`engine-design.md` § Target scale; render cadence:
   `memory-performance.md` § Hot paths).
 
 ## Input

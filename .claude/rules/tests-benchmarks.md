@@ -69,8 +69,8 @@ The standard Zig layout; every change, plan, and review follows it.
   change touches (`--group <name> --items N`): one right-sized config per
   group plus each scaling bench's sizes, never the full suite (full sweeps
   only when the owner or a slice asks).
-- A landing's before/after runs once, after its code is done: adjacent
-  commits in Debug (ReleaseFast only per `build-validation.md`), one run per
+- A landing's before/after runs once, after its code is done: the base
+  commit against the tree in Debug (ReleaseFast only per `build-validation.md`), one run per
   side (`tools/bench_ab.py`). A case more than 10% slower is rerun alone with
   3 reps; a review fix reruns only the cases it touches. When the change
   alters a bench's fixture or input order, the base code also runs on the new

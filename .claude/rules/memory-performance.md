@@ -36,8 +36,9 @@ paths:
   never by a per-frame workaround.
 - No per-frame, per-event, per-draw, or per-processor-loop string lookup,
   hash-map dispatch, broad dynamic dispatch, callback chains, repeated
-  descriptor validation, formatted logging, or resource churn unless measured,
-  bounded, and isolated. Use enums, bitsets, arrays, slices, direct indices,
+  descriptor validation, or resource churn unless measured, bounded, and
+  isolated; formatted logging there only in Debug and ReleaseSafe, behind its
+  level gate (`zig-style.md` § Logging). Use enums, bitsets, arrays, slices, direct indices,
   ring buffers, prepared resources, stable asset IDs, and generational handles.
 - Authoring data (names, catalogs, AI archetypes) resolves at load or setup
   into enums, tables, and numeric IDs; hot paths never parse or hash names.

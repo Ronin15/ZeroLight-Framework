@@ -28,7 +28,7 @@ Report every real finding, ranked. Severity:
   failure.
 - **Medium**: missing validation, stale handles, hidden per-frame allocation,
   poor failure handling, untested changed contracts, ownership drift, roadmap
-  process violations, a scaling claim with no three-size bench.
+  process violations.
 - **Low**: maintainability, naming, duplication, doc drift.
 
 Tag each finding **structural** (a symptom of a design that fails the cost

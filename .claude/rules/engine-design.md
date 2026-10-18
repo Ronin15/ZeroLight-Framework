@@ -7,8 +7,8 @@ detail (helper sets, fields, stages, benches, examples) lives in the doc it
 cites, which docs commits keep current. The rules and `docs/architecture.md`
 win over code: code that disagrees is wrong and is fixed, never a pattern to
 copy or extend or an excuse for a departure. A rule that blocks a sound design gets a
-proposed edit with its reason, landing in its rule file in the same change;
-never loosen a rule to ease work. Owner decisions are not reopened.
+proposed edit with its reason; once the owner approves it, it lands in its
+rule file in the same change. Never loosen a rule to ease work. Owner decisions are not reopened.
 
 ## Target scale
 
@@ -20,6 +20,8 @@ never loosen a rule to ease work. Owner decisions are not reopened.
   observer lowers fidelity, never progress (far-off AI thinks on slower ticks;
   cheap processors such as movement stay near full rate). Dormant is only for
   inert things (items at rest), which still change slowly (decay outdoors).
+  Only a pause stops progress, and a pause stops everything: every world and
+  every system.
 - Population that matters (villagers, people, NPCs) persists and advances
   wherever it is; only unimportant ambient spawns (stray monsters, animals)
   may be recycled far from the observer.

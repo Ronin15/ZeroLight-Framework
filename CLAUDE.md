@@ -53,8 +53,8 @@ orchestrates, verifies every agent claim against live code, and reports.
   real finding is reported and checked against live code and
   `docs/architecture.md`; one with a stated local fix goes to `zig-specialist`,
   one whose fix is an open choice to design. A finding not fixed in its landing
-  becomes a checklist item in the owning slice with its `file:line` and failure
-  scenario, never only a memory note.
+  becomes a checklist item in the owning slice with its `file:line`, failure
+  scenario, and pass condition, never only a memory note.
 - `zig-debug-specialist` for failures.
 - `docs-specialist` (Sonnet, owner's choice) writes the doc changes for a
   slice's docs commit and routes findings into roadmap slices; it edits docs
@@ -64,8 +64,9 @@ orchestrates, verifies every agent claim against live code, and reports.
 - Terse reports and docs, never by dropping findings. Make engineering calls
   without asking, on best practice, scale, performance, and efficiency, never
   on what today's code happens to produce or by doing less work, and report
-  them. Rules guide: a call on those criteria may depart from a rule and is
-  reported with its reasoning as a decision made; a departure that would recur
+  them. A call may depart from a rule only where the rule's letter would cost
+  best practice, scale, or performance, never to ease work; it is reported
+  with its reasoning as a decision made, and a departure that would recur
   becomes a proposed rule edit. Only scope added or dropped, product/gameplay
   behavior, rule edits, a major redesign, a `ThreadSystem`/tuner redesign, and
   anything that doesn't make sense go to the owner. No model/effort overrides
