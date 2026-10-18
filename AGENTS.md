@@ -36,13 +36,15 @@ Add code under the owning module: boundaries in `engine-design.md`
 
 Non-trivial Zig design, implementation, review, and debugging goes through the
 `.grok/agents/` specialists. Spawn one with `spawn_subagent` and
-`subagent_type` set to its name. The brief is the child's whole prompt: it
-does not see this session. Trivial means a local fix in 1–2 files with no
+`subagent_type` set to its name. The child does not see this session, so the
+brief file is the whole task. Trivial means a local fix in 1–2 files with no
 design question; the main session may do that inline. The main session
 orchestrates, verifies every agent claim against live code, and reports.
 
 - A non-trivial brief names the files in scope and the change's cost-model
-  questions (what its work and memory grow with).
+  questions (what its work and memory grow with). Write it to
+  `.grok/reports/<topic>-brief.md`. The spawn prompt cites that path and
+  does not paste the brief.
 - `zig-design-specialist` runs only when a design is open or the existing
   structure fails the cost model, and plans right before implementation,
   against the live code. Local fixes and calls a plan or review triage already
@@ -99,10 +101,12 @@ Validation cadence and modes: `build-validation.md`.
 ## Grok Tooling (`.grok/`)
 
 - Agent names stay stable: `.claude/workflows/` calls them by name (`agentType`).
-- Design and review agents write plans and reports to `.grok/reports/`
-  (gitignored); briefs cite the file instead of pasting it.
+- Plans, reviews, unit briefs, and landing reports go in `.grok/reports/`
+  (gitignored). Design and review agents write theirs; the main session
+  writes `<topic>-brief.md`; `zig-specialist` writes `<topic>-landing.md`
+  unless the brief names another path. A spawn prompt cites the file.
 - `tools/bench_ab.py` is the before/after bench; `zig-specialist` runs it
-  (DW § Benchmarks).
+  when the change can move a hot path (DW § Benchmarks).
 - `hooks/zig-fmt.sh` runs `zig fmt` on each `.zig`/`.zon` file a
   `search_replace` or `write` just edited (needs `jq`); it does not replace
   validation.
