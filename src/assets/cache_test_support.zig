@@ -6,9 +6,7 @@
 //! cache's backend-context seam. Test-only: no production path imports it.
 
 const std = @import("std");
-const assets = @import("assets.zig");
 const image = @import("image.zig");
-const AssetCache = @import("cache.zig").AssetCache;
 const TextureBackend = @import("cache.zig").TextureBackend;
 const TextureId = @import("../render/resources.zig").TextureId;
 
@@ -61,8 +59,3 @@ pub const FakeBackend = struct {
         self.destroy_count += 1;
     }
 };
-
-/// A cache over `asset_store` whose uploads and destroys go to a `FakeBackend`.
-pub fn initCache(allocator: std.mem.Allocator, asset_store: assets.AssetStore) AssetCache {
-    return AssetCache.initWithBackend(allocator, asset_store, FakeBackend.backend());
-}

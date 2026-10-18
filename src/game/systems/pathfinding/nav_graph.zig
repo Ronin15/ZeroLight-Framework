@@ -1939,6 +1939,43 @@ const no_colliders = &test_support.no_colliders;
 const EntityId = @import("../../data_system.zig").EntityId;
 const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const test_support = @import("test_support.zig");
+
+/// Every live one-way closure block's rows and handed-out map entries, in H-component order,
+/// for a before-and-after compare. The caller frees the slice.
+fn dupeClosureBlocks(allocator: std.mem.Allocator, graph: *const NavGraph) ![]u32 {
+    const closure = &graph.connectivity.closure;
+    var words: std.ArrayList(u32) = .empty;
+    errdefer words.deinit(allocator);
+    for (closure.hcomp.k_cap, closure.hcomp.k_high, closure.hcomp.block) |k_cap, k_high, block| {
+        if (k_cap == 0) continue;
+        const rows = @as(usize, k_cap) * @max(1, k_cap / 32);
+        try words.appendSlice(allocator, block[0..rows]);
+        try words.appendSlice(allocator, block[rows..][0..k_high]);
+    }
+    return words.toOwnedSlice(allocator);
+}
+
+/// The commit seam for statics: reserves the colliders and `system`'s static marks,
+/// commits `commands`, captures and syncs the colliders, then records the sync's changes in
+/// `system` for the nav reaction.
+fn commitWithColliders(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, system: *PathfindingSystem, commands: []const StructuralCommand) !void {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
+    frame.beginStep();
+    try colliders.reserveForCommit(data, commands.len);
+    try system.reserveStaticColliderMarks(colliders.pendingChangeCount() + commands.len);
+    try frame.structural_commands.prepareRangeCounts(1);
+    frame.structural_commands.addCount(0, commands.len);
+    try frame.structural_commands.prefix();
+    var writer = frame.structural_commands.rangeWriter(0);
+    for (commands) |command| writer.write(command);
+    writer.finish();
+    frame.structural_commands.finishWrite();
+    _ = try frame.applyStructuralCommands(data);
+    colliders.capture(frame);
+    try colliders.sync(data, &serial_threads);
+    system.recordStaticColliderChanges(colliders.changesThisStep());
+}
 const updatePathfindingInline = @import("test_support.zig").updatePathfindingInline;
 const abstractCapacity = test_support.abstractCapacity;
 const addNavBody = test_support.addNavBody;
@@ -2611,7 +2648,7 @@ const StaticNav = struct {
 
     // Commits `commands` through the seam and runs the nav reaction.
     fn commitAndReact(self: *StaticNav, commands: []const StructuralCommand, thread_system: *ThreadSystem) !NavUpdateStats {
-        try test_support.commitWithColliders(&self.frame, &self.data, &self.colliders, &self.system, commands);
+        try commitWithColliders(&self.frame, &self.data, &self.colliders, &self.system, commands);
         return self.system.reactToPostCommitNavEvents(&self.frame, &self.colliders, &self.world, thread_system);
     }
 
@@ -2894,7 +2931,7 @@ test "incremental nav update threaded chunk patch matches a serial full rebuild 
     nav.system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
 
     const entity = nav.data.movementBodySliceConst().entities[0];
-    try test_support.commitWithColliders(&nav.frame, &nav.data, &nav.colliders, &nav.system, &.{.{ .destroy_entity = entity }});
+    try commitWithColliders(&nav.frame, &nav.data, &nav.colliders, &nav.system, &.{.{ .destroy_entity = entity }});
     const cells = [_]struct { x: u16, y: u16 }{
         .{ .x = 1, .y = 1 },  .{ .x = 13, .y = 1 },
         .{ .x = 1, .y = 13 }, .{ .x = 13, .y = 13 },
@@ -2932,7 +2969,7 @@ test "a static obstacle commit and its nav reaction are allocation-free at stead
         nav.system.allocator = original;
     }
     // The same move again: the reaction allocates nothing.
-    try test_support.commitWithColliders(&nav.frame, &nav.data, &nav.colliders, &nav.system, &.{moveCommand(entity, .{ .x = 228, .y = 228 })});
+    try commitWithColliders(&nav.frame, &nav.data, &nav.colliders, &nav.system, &.{moveCommand(entity, .{ .x = 228, .y = 228 })});
     const stats = try nav.system.reactToPostCommitNavEvents(&nav.frame, &nav.colliders, &nav.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
 }
@@ -3353,7 +3390,7 @@ test "one chunk's change leaves every other chunk's record, connectivity nodes, 
     defer system.deinit();
     const closure = &system.graph.connectivity.closure;
     try std.testing.expectEqual(@as(usize, 2), test_support.closureTermCount(closure));
-    const closure_words_before = try test_support.dupeClosureBlocks(std.testing.allocator, &system.graph);
+    const closure_words_before = try dupeClosureBlocks(std.testing.allocator, &system.graph);
     defer std.testing.allocator.free(closure_words_before);
     const term_index_before = try std.testing.allocator.dupe(u32, closure.term.index);
     defer std.testing.allocator.free(term_index_before);
@@ -3370,7 +3407,7 @@ test "one chunk's change leaves every other chunk's record, connectivity nodes, 
     const changed = (try fixture.world.setDenseTile(fixture.obstacle[0], 5, 5, fixture.tree)).?;
     const stats = try test_support.applyTileChange(&system, no_colliders, &fixture.world, changed);
     try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
-    const closure_words_after = try test_support.dupeClosureBlocks(std.testing.allocator, &system.graph);
+    const closure_words_after = try dupeClosureBlocks(std.testing.allocator, &system.graph);
     defer std.testing.allocator.free(closure_words_after);
     try std.testing.expectEqualSlices(u32, closure_words_before, closure_words_after);
     // The prepare may grow the terminal pool (the dig shares a root with a terminal); the
@@ -3497,7 +3534,7 @@ fn applyOomEdit(edit: OomEdit, system: *PathfindingSystem, data: *DataSystem, co
         .static_add => {
             var frame = SimulationFrame.init(std.testing.allocator);
             defer frame.deinit();
-            try test_support.commitWithColliders(&frame, data, colliders, system, &.{.{ .create_entity = staticTemplate(.{ .x = 200, .y = 200 }, .{ .x = 40, .y = 40 }) }});
+            try commitWithColliders(&frame, data, colliders, system, &.{.{ .create_entity = staticTemplate(.{ .x = 200, .y = 200 }, .{ .x = 40, .y = 40 }) }});
         },
         .level_add => {
             const level = try world.addLevel(-48);

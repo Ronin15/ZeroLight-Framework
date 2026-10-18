@@ -1097,6 +1097,16 @@ fn expectWorldLevelColumnsAligned(slice: ConstWorldLevelSlice) !void {
 
 const data_test_support = @import("test_support.zig");
 
+/// Per-tier counts from an O(rows) scan of the dense scope tier column: the parity
+/// baseline for the incrementally maintained `DataSystem.tier_counts`.
+fn scanLiveTierCounts(data: *const DataSystem) [4]usize {
+    var counts = [4]usize{ 0, 0, 0, 0 };
+    for (data.movement_bodies.scopeSliceConst().tier) |tier| {
+        counts[@backingInt(tier)] += 1;
+    }
+    return counts;
+}
+
 test "world level round-trips through set get ptr and dense slice" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2311,9 +2321,9 @@ test "incremental tier counts track create, destroy, metadata change, and reset"
 
     // The incrementally-maintained counters must equal a fresh live scan, and the
     // public scope stats must agree cell-for-cell.
-    try std.testing.expectEqual(data_test_support.scanLiveTierCounts(&data), data.tier_counts);
+    try std.testing.expectEqual(scanLiveTierCounts(&data), data.tier_counts);
     const stats = data.simulationScopeStatsFullActive();
-    const scan = data_test_support.scanLiveTierCounts(&data);
+    const scan = scanLiveTierCounts(&data);
     try std.testing.expectEqual(scan[@backingInt(SimulationTier.dormant)], stats.dormant_entities);
     try std.testing.expectEqual(scan[@backingInt(SimulationTier.kinematic)], stats.kinematic_entities);
     try std.testing.expectEqual(scan[@backingInt(SimulationTier.locomotion)], stats.locomotion_entities);
@@ -2341,7 +2351,7 @@ test "set_simulation_tier preserves chunk and stagger_phase" {
     try std.testing.expectEqual(SimulationTier.locomotion, updated.tier);
     try std.testing.expectEqual(orig_chunk, updated.chunk);
     try std.testing.expectEqual(orig_phase, updated.stagger_phase);
-    try std.testing.expectEqual(data_test_support.scanLiveTierCounts(&data), data.tier_counts);
+    try std.testing.expectEqual(scanLiveTierCounts(&data), data.tier_counts);
 }
 
 test "structural command set_simulation_tier commits and skips stale entities" {
@@ -2369,7 +2379,7 @@ test "structural command set_simulation_tier commits and skips stale entities" {
     // The command after the skipped ones still applied — no partial commit.
     try std.testing.expectEqual(SimulationTier.dormant, data_test_support.simulationMetadata(&data, alive).?.tier);
     try std.testing.expectEqual(@as(?EntitySimulationMetadata, null), data_test_support.simulationMetadata(&data, bodiless));
-    try std.testing.expectEqual(data_test_support.scanLiveTierCounts(&data), data.tier_counts);
+    try std.testing.expectEqual(scanLiveTierCounts(&data), data.tier_counts);
 }
 
 test "entering a non-moving tier snaps interpolation history to position" {

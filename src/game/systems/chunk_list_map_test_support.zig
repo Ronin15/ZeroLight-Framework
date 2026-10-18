@@ -2,14 +2,12 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! `ChunkListMap` and `OrderedIndexSet` byte counts and bounds for tests and benches, built
-//! from the structures' layouts. Test-only: no production path imports it.
+//! `ChunkListMap` byte counts and bounds for tests and benches, built from the
+//! structure's layout. Test-only: no production path imports it.
 
 const std = @import("std");
 const chunk_list_map = @import("chunk_list_map.zig");
 const ChunkListMap = chunk_list_map.ChunkListMap;
-const OrderedIndexSet = chunk_list_map.OrderedIndexSet;
-const bitSetBytesFor = chunk_list_map.bitSetBytesFor;
 
 /// The element type of `T.field`: a std list's, a `MultiArrayList`'s row, or a slice's.
 pub fn FieldElem(comptime T: type, comptime field: []const u8) type {
@@ -36,19 +34,6 @@ pub fn residentBytes(map: *const ChunkListMap) usize {
         map.claims.capacity * @sizeOf(FieldElem(ChunkListMap, "claims")) + map.touched.capacity * @sizeOf(FieldElem(ChunkListMap, "touched")) +
         map.splice_records.capacity * @sizeOf(FieldElem(ChunkListMap, "splice_records")) + map.emptied_keys.capacity * @sizeOf(u64);
     if (map.owner_heads_replacement) |replacement| bytes += replacement.capacity * @sizeOf(u32);
-    return bytes;
-}
-
-/// `OrderedIndexSet.residentBytes` of a set reserved for indices below `bits`: its tiers as
-/// `reserve` builds them.
-pub fn orderedIndexSetStorageBytesBound(bits: usize) usize {
-    var bytes: usize = 0;
-    var tier_bits = bits;
-    while (true) {
-        bytes +|= bitSetBytesFor(tier_bits);
-        if (tier_bits <= @bitSizeOf(OrderedIndexSet.Word)) break;
-        tier_bits = OrderedIndexSet.maskCount(tier_bits);
-    }
     return bytes;
 }
 

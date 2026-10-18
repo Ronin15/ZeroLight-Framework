@@ -673,6 +673,11 @@ pub const NavGrid = struct {
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const test_support = @import("test_support.zig");
+
+/// Mixed chunks of `grid` holding a cell block.
+fn liveBlockCount(grid: *const NavGrid) usize {
+    return grid.blocks.len - grid.block_free.items.len;
+}
 const baselineCapacity = test_support.baselineCapacity;
 const addNavBody = test_support.addNavBody;
 
@@ -951,7 +956,7 @@ fn expectBlocksOnlyInMixedChunks(grid: *const NavGrid, world: *const WorldSystem
         try std.testing.expectEqual(form == .mixed, grid.chunkBlock(chunk) != null);
         if (form == .mixed) mixed += 1;
     }
-    try std.testing.expectEqual(mixed, test_support.liveBlockCount(grid));
+    try std.testing.expectEqual(mixed, liveBlockCount(grid));
 }
 
 test "neighborhood equals eight isBlocked reads at chunk corners and level edges" {

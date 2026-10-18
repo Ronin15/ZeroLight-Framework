@@ -279,6 +279,10 @@ pub fn build(b: *std.Build) void {
     const test_run = b.addRunArtifact(unit_tests);
     addWindowsSdlRunRuntime(test_run, windows_sdl_runtime);
     test_step.dependOn(&test_run.step);
+    // The test binary's compile step. A `-Dtest-filter` compiles only the tests
+    // it names, so type-checking the suite is this step with no filter.
+    const test_compile_step = b.step("test-compile", "Type-check unit tests without running them");
+    test_compile_step.dependOn(&unit_tests.step);
 
     const bench_run = if (callgrind)
         addCallgrindBenchRun(b, target.result, sanitize_thread, bench_exe, callgrind_out)

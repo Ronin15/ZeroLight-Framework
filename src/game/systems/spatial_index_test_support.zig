@@ -19,7 +19,7 @@ const default_chunk_size_tiles = @import("../world/system.zig").default_chunk_si
 /// The consumers' test grid: 64 x 64 default chunks of 32-unit tiles from the origin, one
 /// level (the index grows a directory for any level a body is on). Bodies outside it clamp
 /// to its edge cells.
-pub const test_index_geometry = IndexGeometry{
+const test_index_geometry = IndexGeometry{
     .tile_size = 32,
     .chunk_size_tiles = default_chunk_size_tiles,
     .chunks_x = 64,

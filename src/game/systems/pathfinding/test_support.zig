@@ -25,7 +25,6 @@ const NavExtent = @import("nav_graph.zig").NavExtent;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const ChunkForm = @import("../../world/terrain.zig").ChunkForm;
 const ChunkBits = @import("../../world/terrain.zig").ChunkBits;
-const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
 const WorldTileChangedEvent = @import("../../simulation.zig").WorldTileChangedEvent;
 const NavUpdateStats = @import("types.zig").NavUpdateStats;
@@ -79,8 +78,8 @@ const default_flood_window = @import("connectivity.zig").default_flood_window;
 const default_flood_budget_cap = @import("connectivity.zig").default_flood_budget_cap;
 const span_words = @import("connectivity_closure.zig").span_words;
 const bitSetBytesFor = @import("../chunk_list_map.zig").bitSetBytesFor;
+const OrderedIndexSet = @import("../chunk_list_map.zig").OrderedIndexSet;
 const FieldElem = @import("../chunk_list_map_test_support.zig").FieldElem;
-const orderedIndexSetStorageBytesBound = @import("../chunk_list_map_test_support.zig").orderedIndexSetStorageBytesBound;
 const chunkListMapResidentBytes = @import("../chunk_list_map_test_support.zig").residentBytes;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const RegRecord = types.RegRecord;
@@ -109,7 +108,6 @@ const no_hcomp = @import("connectivity_closure.zig").no_hcomp;
 const no_oneway = @import("connectivity.zig").no_oneway;
 const no_index = @import("connectivity_closure.zig").no_index;
 const CellCoord = @import("../../world/system.zig").CellCoord;
-const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 const types = @import("types.zig");
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
@@ -127,6 +125,19 @@ const PathfindingConfig = @import("types.zig").PathfindingConfig;
 const registryShard = @import("types.zig").registryShard;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
 const no_entry = @import("../chunk_list_map.zig").no_entry;
+
+/// `OrderedIndexSet.residentBytes` of a set reserved for indices below `bits`: its tiers as
+/// `reserve` builds them.
+fn orderedIndexSetStorageBytesBound(bits: usize) usize {
+    var bytes: usize = 0;
+    var tier_bits = bits;
+    while (true) {
+        bytes +|= bitSetBytesFor(tier_bits);
+        if (tier_bits <= @bitSizeOf(OrderedIndexSet.Word)) break;
+        tier_bits = OrderedIndexSet.maskCount(tier_bits);
+    }
+    return bytes;
+}
 
 /// `NavStorageContent` of `world` from its composed chunk forms and link endpoint counts,
 /// for a nav whose chunks are the world's: O(levels x chunks). Static colliders are not
@@ -163,24 +174,9 @@ pub fn cacheOwnerOf(core: anytype, key: PathQueryKey) ?u32 {
     return core.slots.items[index].payload_index;
 }
 
-/// Live comps of a `Connectivity`.
-pub fn connectivityCompCount(connectivity: anytype) usize {
-    return connectivity.comps.len - connectivity.comp_free.items.len;
-}
-
-/// Live roots of a `Connectivity`: one per connected set of nodes.
-pub fn connectivityRootCount(connectivity: anytype) usize {
-    return connectivity.roots.len - connectivity.root_free.items.len;
-}
-
 /// Live terminals of a connectivity closure (a `Closure` or a pointer to one).
 pub fn closureTermCount(closure: anytype) usize {
     return closure.terms.len - closure.term_free.items.len;
-}
-
-/// Live H-components of a connectivity closure (a `Closure` or a pointer to one).
-pub fn closureHcompCount(closure: anytype) usize {
-    return closure.hcomps.len - closure.hcomp_free.items.len;
 }
 
 pub fn addNavBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, static: bool) !EntityId {
@@ -268,28 +264,6 @@ pub fn worldColliders(data: *const DataSystem, world: *const WorldSystem) !Stati
     errdefer colliders.deinit();
     try colliders.rebuild(data, try (NavExtent{ .world = world }).colliderGeometry());
     return colliders;
-}
-
-/// The commit seam for statics: reserves the colliders and `system`'s static marks,
-/// commits `commands`, captures and syncs the colliders, then records the sync's changes in
-/// `system` for the nav reaction.
-pub fn commitWithColliders(frame: *SimulationFrame, data: *DataSystem, colliders: *StaticColliderSystem, system: *PathfindingSystem, commands: []const StructuralCommand) !void {
-    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer serial_threads.deinit();
-    frame.beginStep();
-    try colliders.reserveForCommit(data, commands.len);
-    try system.reserveStaticColliderMarks(colliders.pendingChangeCount() + commands.len);
-    try frame.structural_commands.prepareRangeCounts(1);
-    frame.structural_commands.addCount(0, commands.len);
-    try frame.structural_commands.prefix();
-    var writer = frame.structural_commands.rangeWriter(0);
-    for (commands) |command| writer.write(command);
-    writer.finish();
-    frame.structural_commands.finishWrite();
-    _ = try frame.applyStructuralCommands(data);
-    colliders.capture(frame);
-    try colliders.sync(data, &serial_threads);
-    system.recordStaticColliderChanges(colliders.changesThisStep());
 }
 
 /// A terrain writer's nav record over `events` (terrain events only): its reserve, then the
@@ -383,11 +357,6 @@ pub fn cellOfLocal(geometry: ChunkGeometry, chunk: u32, local: u8) u32 {
 pub fn navChunkForm(grid: *const NavGrid, chunk: u32) ChunkForm {
     if (grid.chunkBlock(chunk) != null) return .mixed;
     return if (grid.chunkBlockedCount(chunk) == 0) .open else .blocked;
-}
-
-/// Mixed chunks of `grid` holding a cell block.
-pub fn liveBlockCount(grid: *const NavGrid) usize {
-    return grid.blocks.len - grid.block_free.items.len;
 }
 
 /// Portals across every record of every level of `graph`.
@@ -668,7 +637,7 @@ fn closureRootAt(graph: *const NavGraph, level: u16, cell: CellCoord) ?u32 {
 /// live block exactly its words and every free id blockless; every block at least a quarter
 /// full from 64 indices up; live words summing the live blocks; and each terminal's row equal
 /// to a search over live links between roots.
-pub fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem) !void {
+fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem) !void {
     const t = std.testing;
     const allocator = t.allocator;
     const conn = &graph.connectivity;
@@ -811,21 +780,6 @@ pub fn expectClosureConsistent(graph: *const NavGraph, world: *const WorldSystem
             try t.expectEqual(seen[to], closure.termReaches(conn.root_term[from], conn.root_term[to]));
         }
     }
-}
-
-/// Every live one-way closure block's rows and handed-out map entries, in H-component order,
-/// for a before-and-after compare. The caller frees the slice.
-pub fn dupeClosureBlocks(allocator: std.mem.Allocator, graph: *const NavGraph) ![]u32 {
-    const closure = &graph.connectivity.closure;
-    var words: std.ArrayList(u32) = .empty;
-    errdefer words.deinit(allocator);
-    for (closure.hcomp.k_cap, closure.hcomp.k_high, closure.hcomp.block) |k_cap, k_high, block| {
-        if (k_cap == 0) continue;
-        const rows = @as(usize, k_cap) * @max(1, k_cap / 32);
-        try words.appendSlice(allocator, block[0..rows]);
-        try words.appendSlice(allocator, block[rows..][0..k_high]);
-    }
-    return words.toOwnedSlice(allocator);
 }
 
 /// Asserts `a` and `b` hold the same terminals, keyed by a node of their root, with the same
@@ -1742,13 +1696,13 @@ pub fn requestStorageBytesBound(capacity: PathfindingCapacity, shape: RequestSha
 
 /// Bytes of a std list of `T` that `ensureTotalCapacity` grew to hold `need`: std's growth
 /// past it, first slots included. Storage bounds charge each list with it.
-pub fn listBytesBound(comptime T: type, need: usize) usize {
+fn listBytesBound(comptime T: type, need: usize) usize {
     return std.ArrayList(T).growCapacity(need) *| @sizeOf(T);
 }
 
 /// `listBytesBound` for a `std.MultiArrayList(Row)`, at the padded row size the resident
 /// counts charge.
-pub fn rowsBytesBound(comptime Row: type, need: usize) usize {
+fn rowsBytesBound(comptime Row: type, need: usize) usize {
     return std.MultiArrayList(Row).growCapacity(need) *| @sizeOf(Row);
 }
 
@@ -2011,12 +1965,12 @@ fn closureStorageBytesBound(shape: ConnectivityStorageShape, keys: usize, key_no
 }
 
 /// Bytes a connectivity element map's slots hold (allocated capacity).
-pub fn elementMapResidentBytes(map: anytype) usize {
+fn elementMapResidentBytes(map: anytype) usize {
     return map.keys.capacity * @sizeOf(u64) + map.values.capacity * @sizeOf(u32) + map.stamps.capacity * @sizeOf(u32);
 }
 
 /// `elementMapResidentBytes` of a `Map` once reserved for at most `limit` keys. Saturates.
-pub fn elementMapStorageBytesBound(comptime Map: type, limit: usize) usize {
+fn elementMapStorageBytesBound(comptime Map: type, limit: usize) usize {
     const slots = Map.slotCount(limit) catch return std.math.maxInt(usize);
     return slots *| (@sizeOf(u64) + 2 * @sizeOf(u32));
 }
@@ -2033,22 +1987,22 @@ fn probeTableStorageBytesBound(comptime Table: type, capacity: usize) usize {
 }
 
 /// Bytes `set` holds (allocated capacity).
-pub fn keySetResidentBytes(set: *const KeySet) usize {
+fn keySetResidentBytes(set: *const KeySet) usize {
     return probeTableResidentBytes(&set.table);
 }
 
 /// `keySetResidentBytes` once reserved for at most `capacity` keys.
-pub fn keySetStorageBytesBound(capacity: usize) usize {
+fn keySetStorageBytesBound(capacity: usize) usize {
     return probeTableStorageBytesBound(@FieldType(KeySet, "table"), capacity);
 }
 
 /// Bytes `map` holds (allocated capacity).
-pub fn groupKeyMapResidentBytes(map: *const GroupKeyMap) usize {
+fn groupKeyMapResidentBytes(map: *const GroupKeyMap) usize {
     return probeTableResidentBytes(&map.table);
 }
 
 /// `groupKeyMapResidentBytes` once reserved for at most `capacity` keys.
-pub fn groupKeyMapStorageBytesBound(capacity: usize) usize {
+fn groupKeyMapStorageBytesBound(capacity: usize) usize {
     return probeTableStorageBytesBound(@FieldType(GroupKeyMap, "table"), capacity);
 }
 

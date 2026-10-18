@@ -314,8 +314,11 @@ intent); dig and move keep their existing keyboard / stick bindings — see
 Unit tests live beside the code they cover as `test` blocks. Run them with
 `zig build test`. `-Dtest-filter=<text>` (repeatable) compiles and runs only
 tests whose names contain the text; names carry their module path, so
-`-Dtest-filter=systems.pathfinding` selects the pathfinding modules. Test
-rules: `.grok/rules/tests-benchmarks.md`.
+`-Dtest-filter=systems.pathfinding` selects the pathfinding modules. A filter
+that matches nothing compiles an empty stub and does not type-check the suite.
+`zig build test-compile` type-checks the test root and does not run it; pass
+no filter when the whole root must compile. Test rules:
+`.grok/rules/tests-benchmarks.md`.
 
 ## Validation Cadence
 

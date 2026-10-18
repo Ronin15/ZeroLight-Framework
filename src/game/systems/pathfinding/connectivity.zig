@@ -2705,6 +2705,16 @@ fn floodJob(context: *anyopaque, range: ParallelRange, worker: WorkerId) void {
 // ----------------------------------------------------------------------------------------
 
 const test_support = @import("test_support.zig");
+
+/// Live roots of a `Connectivity`: one per connected set of nodes.
+fn connectivityRootCount(connectivity: anytype) usize {
+    return connectivity.roots.len - connectivity.root_free.items.len;
+}
+
+/// Live comps of a `Connectivity`.
+fn connectivityCompCount(connectivity: anytype) usize {
+    return connectivity.comps.len - connectivity.comp_free.items.len;
+}
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const TileId = @import("../../world/system.zig").TileId;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
@@ -2749,21 +2759,21 @@ test "enclosing a room splits off exactly the room, and reopening merges it back
             const inside = fixture.cell(1, 1);
             const outside = fixture.cell(@as(usize, side) * test_chunk - 2, @as(usize, side) * test_chunk - 2);
             try std.testing.expect(reach(&system.graph, 0, inside, 0, outside) == .reaches);
-            const roots = test_support.connectivityRootCount(&system.graph.connectivity);
+            const roots = connectivityRootCount(&system.graph.connectivity);
 
             try fixture.setChunk(&system, 0, edge, edge / 2, fixture.tree);
             _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
             // A one-chunk room loses its only portal: no node is left to split off.
             const split: usize = if (edge > 1) 1 else 0;
             try std.testing.expect(reach(&system.graph, 0, inside, 0, outside) != .reaches);
-            try std.testing.expectEqual(roots + split, test_support.connectivityRootCount(&system.graph.connectivity));
+            try std.testing.expectEqual(roots + split, connectivityRootCount(&system.graph.connectivity));
             try fixture.expectMatchesRebuild(&system);
 
             try fixture.setChunk(&system, 0, edge, edge / 2, fixture.grass);
             const opened = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
             try std.testing.expectEqual(@as(usize, 0), opened.conn_flood_batch.item_count);
             try std.testing.expect(reach(&system.graph, 0, inside, 0, outside) == .reaches);
-            try std.testing.expectEqual(roots, test_support.connectivityRootCount(&system.graph.connectivity));
+            try std.testing.expectEqual(roots, connectivityRootCount(&system.graph.connectivity));
             try fixture.expectMatchesRebuild(&system);
         }
     }
@@ -2784,11 +2794,11 @@ test "cutting a ring floods and splits nothing" {
         }
         var system = try fixture.build(test_support.abstractCapacity());
         defer system.deinit();
-        const roots = test_support.connectivityRootCount(&system.graph.connectivity);
+        const roots = connectivityRootCount(&system.graph.connectivity);
         try fixture.setChunk(&system, 0, 0, span / 2, fixture.tree);
         const cut = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         try std.testing.expect(cut.conn_flood_batch.item_count != 0);
-        try std.testing.expectEqual(roots, test_support.connectivityRootCount(&system.graph.connectivity));
+        try std.testing.expectEqual(roots, connectivityRootCount(&system.graph.connectivity));
         try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(1, @as(usize, span - 1) * test_chunk + 1)) == .reaches);
         try fixture.expectMatchesRebuild(&system);
     }
@@ -2827,11 +2837,11 @@ test "an opening dig floods nothing and moves no node outside its chunk to anoth
     defer after.deinit();
     const gap_chunk: u32 = 3 * 6 + 2;
     try snapshotComps(&system.graph, &.{gap_chunk}, &before);
-    const roots = test_support.connectivityRootCount(&system.graph.connectivity);
+    const roots = connectivityRootCount(&system.graph.connectivity);
     try fixture.setChunk(&system, 0, 2, 3, fixture.grass);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_flood_batch.item_count);
-    try std.testing.expectEqual(roots - 1, test_support.connectivityRootCount(&system.graph.connectivity));
+    try std.testing.expectEqual(roots - 1, connectivityRootCount(&system.graph.connectivity));
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 20)) == .reaches);
     try snapshotComps(&system.graph, &.{gap_chunk}, &after);
     try std.testing.expectEqual(before.count(), after.count());
@@ -2876,24 +2886,24 @@ test "a new two-way link joins two components; a one-way link joins none but rea
     const bottom = fixture.cell(14, 14);
     try std.testing.expect(reach(&system.graph, 0, top, 1, bottom) != .reaches);
     // One-way: no undirected edge, one directed reach.
-    const roots = test_support.connectivityRootCount(&system.graph.connectivity);
+    const roots = connectivityRootCount(&system.graph.connectivity);
     try fixture.world.addLevelLink(.{ .kind = .teleport, .level_a = 0, .cell_a = .{ .x = 3, .y = 3 }, .level_b = 1, .cell_b = .{ .x = 9, .y = 9 }, .traversal_cost = 1, .bidirectional = false });
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-    try std.testing.expectEqual(roots, test_support.connectivityRootCount(&system.graph.connectivity));
+    try std.testing.expectEqual(roots, connectivityRootCount(&system.graph.connectivity));
     try std.testing.expect(reach(&system.graph, 0, top, 1, bottom) == .reaches);
     try std.testing.expect(reach(&system.graph, 1, bottom, 0, top) != .reaches);
     try fixture.expectMatchesRebuild(&system);
     // Two-way: one edge, a root merge.
     try fixture.world.addLevelLink(.{ .kind = .stair, .level_a = 0, .cell_a = .{ .x = 5, .y = 6 }, .level_b = 1, .cell_b = .{ .x = 10, .y = 2 }, .traversal_cost = 1, .bidirectional = true });
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-    try std.testing.expectEqual(roots - 1, test_support.connectivityRootCount(&system.graph.connectivity));
+    try std.testing.expectEqual(roots - 1, connectivityRootCount(&system.graph.connectivity));
     try std.testing.expect(reach(&system.graph, 0, top, 1, bottom) == .reaches);
     try std.testing.expect(reach(&system.graph, 1, bottom, 0, top) == .reaches);
     try fixture.expectMatchesRebuild(&system);
     // Blocking the level-1 endpoint cuts the only connection.
     try fixture.setCell(&system, 1, 10, 2, fixture.tree);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-    try std.testing.expectEqual(roots, test_support.connectivityRootCount(&system.graph.connectivity));
+    try std.testing.expectEqual(roots, connectivityRootCount(&system.graph.connectivity));
     // The one-way link still reaches forward; nothing reaches back.
     try std.testing.expect(reach(&system.graph, 0, top, 1, bottom) == .reaches);
     try std.testing.expect(reach(&system.graph, 1, bottom, 0, top) != .reaches);
@@ -3146,9 +3156,9 @@ test "repeatedly enclosing and reopening a room returns nodes, comps, and roots 
         try fixture.setChunk(&system, 0, 3, 1, fixture.grass);
         _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         try std.testing.expectEqual(nodes, system.graph.levelGraph(0).?.nodeCount());
-        try std.testing.expectEqual(@as(usize, 1), test_support.connectivityRootCount(&system.graph.connectivity));
+        try std.testing.expectEqual(@as(usize, 1), connectivityRootCount(&system.graph.connectivity));
         // Live comps from the first cycle on; the pool reaches its high-water by the second.
-        const now = [2]usize{ test_support.connectivityCompCount(&system.graph.connectivity), system.graph.connectivity.comps.len };
+        const now = [2]usize{ connectivityCompCount(&system.graph.connectivity), system.graph.connectivity.comps.len };
         if (cycle == 0) counts[0] = now[0] else try std.testing.expectEqual(counts[0], now[0]);
         if (cycle == 1) counts[1] = now[1] else if (cycle > 1) try std.testing.expectEqual(counts[1], now[1]);
     }
@@ -3302,9 +3312,9 @@ fn expectEnclosed(side: u16, case: EncloseCase) !void {
             try fixture.setCell(&system, 0, (side - 3) * test_chunk + 1, 2, fixture.tree);
         },
     }
-    const roots = test_support.connectivityRootCount(&system.graph.connectivity);
+    const roots = connectivityRootCount(&system.graph.connectivity);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-    try std.testing.expectEqual(roots + @as(usize, if (case == .both) 2 else 1), test_support.connectivityRootCount(&system.graph.connectivity));
+    try std.testing.expectEqual(roots + @as(usize, if (case == .both) 2 else 1), connectivityRootCount(&system.graph.connectivity));
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -3328,11 +3338,11 @@ fn ringCutTwice(side: u16, edge: u16) !void {
     }
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
-    const roots = test_support.connectivityRootCount(&system.graph.connectivity);
+    const roots = connectivityRootCount(&system.graph.connectivity);
     try fixture.setChunk(&system, 0, 0, span / 2, fixture.tree);
     try fixture.setChunk(&system, 0, span - 1, span / 2, fixture.tree);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-    try std.testing.expectEqual(roots + 1, test_support.connectivityRootCount(&system.graph.connectivity));
+    try std.testing.expectEqual(roots + 1, connectivityRootCount(&system.graph.connectivity));
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(1, @as(usize, span - 1) * test_chunk + 1)) != .reaches);
     try fixture.expectMatchesRebuild(&system);
 }
@@ -3373,11 +3383,11 @@ test "enclosing eight pockets of one component in one batch floods on workers an
         var threaded = try fixture.build(capacity);
         defer threaded.deinit();
         threaded.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
-        const roots = test_support.connectivityRootCount(&threaded.graph.connectivity);
+        const roots = connectivityRootCount(&threaded.graph.connectivity);
         try enclosePockets(&fixture, &.{ &inline_system, &threaded }, gaps[0..count]);
         _ = try inline_system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         const stats = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-        try std.testing.expectEqual(roots + count, test_support.connectivityRootCount(&threaded.graph.connectivity));
+        try std.testing.expectEqual(roots + count, connectivityRootCount(&threaded.graph.connectivity));
         try std.testing.expect(!stats.conn_flood_batch.ran_inline);
         try std.testing.expect(stats.conn_flood_batch.worker_thread_ranges != 0);
         try expectSameColumns(&inline_system.graph, &threaded.graph);
@@ -3711,10 +3721,10 @@ fn expectTunnelEnclosed(side: u16, length: u16) !void {
     try fixture.setChunk(null, 0, length + 1, row, fixture.tree);
     var system = try fixture.build(test_support.abstractCapacity());
     defer system.deinit();
-    const roots = test_support.connectivityRootCount(&system.graph.connectivity);
+    const roots = connectivityRootCount(&system.graph.connectivity);
     try fixture.setChunk(&system, 0, 1, row, fixture.tree);
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-    try std.testing.expectEqual(roots + 1, test_support.connectivityRootCount(&system.graph.connectivity));
+    try std.testing.expectEqual(roots + 1, connectivityRootCount(&system.graph.connectivity));
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -3731,10 +3741,10 @@ fn encloseRoomSystem(fixture: *TestWorld, edge: u16, budget_cap: u32) !struct { 
     var system = try fixture.build(test_support.abstractCapacity());
     errdefer system.deinit();
     system.graph.connectivity.flood_budget_cap = budget_cap;
-    const roots = test_support.connectivityRootCount(&system.graph.connectivity);
+    const roots = connectivityRootCount(&system.graph.connectivity);
     try fixture.setChunk(&system, 0, edge + 2, 2 + edge / 2, fixture.tree);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-    try std.testing.expectEqual(roots + 1, test_support.connectivityRootCount(&system.graph.connectivity));
+    try std.testing.expectEqual(roots + 1, connectivityRootCount(&system.graph.connectivity));
     try fixture.expectMatchesRebuild(&system);
     return .{ .system = system, .stats = stats };
 }
@@ -3771,10 +3781,10 @@ test "a hub family wider than one round splits the same in wide and narrow round
             var system = try fixture.build(test_support.abstractCapacity());
             defer system.deinit();
             if (narrow) narrowFloodWindow(&system);
-            const roots = test_support.connectivityRootCount(&system.graph.connectivity);
+            const roots = connectivityRootCount(&system.graph.connectivity);
             try setHubCorridor(&fixture, &system, tunnels, fixture.tree);
             _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-            try std.testing.expectEqual(roots + components - 1, test_support.connectivityRootCount(&system.graph.connectivity));
+            try std.testing.expectEqual(roots + components - 1, connectivityRootCount(&system.graph.connectivity));
             try fixture.expectMatchesRebuild(&system);
             try setHubCorridor(&fixture, null, tunnels, fixture.grass);
         }

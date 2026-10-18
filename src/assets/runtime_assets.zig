@@ -335,7 +335,7 @@ test "missing startup sprite marks id unavailable without requiring renderer acc
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = FakeBackend{};
-    var cache = cache_test_support.initCache(std.testing.allocator, asset_store);
+    var cache = initCache(std.testing.allocator, asset_store);
     defer cache.deinitWithContext(&fake);
 
     try preloadSpritesBatchWithTestBackend(&runtime_assets, asset_store, &cache, &fake, &.{.{
@@ -351,7 +351,7 @@ test "missing required startup sprite fails preload" {
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = FakeBackend{};
-    var cache = cache_test_support.initCache(std.testing.allocator, asset_store);
+    var cache = initCache(std.testing.allocator, asset_store);
     defer cache.deinitWithContext(&fake);
 
     try std.testing.expectError(
@@ -369,7 +369,7 @@ test "missing required startup sprite fails preload" {
 test "runtime assets deinit releases preloaded sprites exactly once" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = FakeBackend{};
-    var cache = cache_test_support.initCache(std.testing.allocator, asset_store);
+    var cache = initCache(std.testing.allocator, asset_store);
     defer cache.deinitWithContext(&fake);
     var audio = try AudioService.init(std.testing.allocator, asset_store, .{ .enabled = false });
     defer audio.deinit();
@@ -402,7 +402,7 @@ test "runtime assets deinit releases preloaded sprites exactly once" {
 test "startup preload attempts every registered sprite id" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = FakeBackend{};
-    var cache = cache_test_support.initCache(std.testing.allocator, asset_store);
+    var cache = initCache(std.testing.allocator, asset_store);
     defer cache.deinitWithContext(&fake);
     var audio = try AudioService.init(std.testing.allocator, asset_store, .{ .enabled = false });
     defer audio.deinit();
@@ -421,7 +421,7 @@ test "startup preload attempts every registered sprite id" {
 test "runtime asset missing sprite replacement releases the previous lease" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = FakeBackend{};
-    var cache = cache_test_support.initCache(std.testing.allocator, asset_store);
+    var cache = initCache(std.testing.allocator, asset_store);
     defer cache.deinitWithContext(&fake);
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
@@ -446,7 +446,7 @@ test "runtime asset missing sprite replacement releases the previous lease" {
 test "sprite catalog rejects an invalid path before any upload and leaves no lease" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = FakeBackend{};
-    var cache = cache_test_support.initCache(std.testing.allocator, asset_store);
+    var cache = initCache(std.testing.allocator, asset_store);
     defer cache.deinitWithContext(&fake);
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
@@ -477,7 +477,7 @@ test "sprite catalog rejects an invalid path before any upload and leaves no lea
 test "preloadSpritesBatch fails when a required sprite is missing mid-batch" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = FakeBackend{};
-    var cache = cache_test_support.initCache(std.testing.allocator, asset_store);
+    var cache = initCache(std.testing.allocator, asset_store);
     defer cache.deinitWithContext(&fake);
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
@@ -506,7 +506,7 @@ test "preloadSpritesBatch fails when a required sprite is missing mid-batch" {
 test "preloadSpritesBatch marks an optional sprite unavailable without failing the batch" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = FakeBackend{};
-    var cache = cache_test_support.initCache(std.testing.allocator, asset_store);
+    var cache = initCache(std.testing.allocator, asset_store);
     defer cache.deinitWithContext(&fake);
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
@@ -530,7 +530,7 @@ test "preloadSpritesBatch marks an optional sprite unavailable without failing t
 test "preloadSpritesBatch keeps the caller-supplied source_rect override, not the canonical manifest one" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = FakeBackend{};
-    var cache = cache_test_support.initCache(std.testing.allocator, asset_store);
+    var cache = initCache(std.testing.allocator, asset_store);
     defer cache.deinitWithContext(&fake);
 
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
@@ -646,7 +646,7 @@ test "startup metadata load parses installed atlases when present" {
 test "startup preload loads atlas metadata when installed atlases are available" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = FakeBackend{};
-    var cache = cache_test_support.initCache(std.testing.allocator, asset_store);
+    var cache = initCache(std.testing.allocator, asset_store);
     defer cache.deinitWithContext(&fake);
     var audio = try AudioService.init(std.testing.allocator, asset_store, .{ .enabled = false });
     defer audio.deinit();
@@ -669,6 +669,11 @@ test "startup preload loads atlas metadata when installed atlases are available"
 // public backend-context seam, exactly as production threads a `*Renderer`.
 const cache_test_support = @import("cache_test_support.zig");
 const FakeBackend = cache_test_support.FakeBackend;
+
+/// A cache over `asset_store` whose uploads and destroys go to a `FakeBackend`.
+fn initCache(allocator: std.mem.Allocator, asset_store: AssetStore) AssetCache {
+    return AssetCache.initWithBackend(allocator, asset_store, FakeBackend.backend());
+}
 
 fn preloadWithTestBackend(
     runtime_assets: *RuntimeAssets,
