@@ -20,6 +20,8 @@ const CellCoord = @import("../../game/world/system.zig").CellCoord;
 const TileId = @import("../../game/world/system.zig").TileId;
 const default_chunk_size_tiles = @import("../../game/world/system.zig").default_chunk_size_tiles;
 const connectivity_closure = @import("../../game/systems/pathfinding/connectivity_closure.zig");
+const default_flood_budget_cap = @import("../../game/systems/pathfinding/connectivity.zig").default_flood_budget_cap;
+const default_flood_window = @import("../../game/systems/pathfinding/connectivity.zig").default_flood_window;
 const fixtures = @import("../fixtures.zig");
 const nav_size = @import("../nav_size.zig");
 const suite = @import("../suite.zig");
@@ -41,15 +43,36 @@ const toggleSizeConfig = @import("nav_fixtures.zig").toggleSizeConfig;
 // corridor around a solid block of edge² chunks, walled off from the rest of the level, with
 // the gap one chunk of the ring; blocking it cuts the ring without splitting it. Variant 2: a
 // one-chunk tunnel of edge chunks along the level's north border, walled below, whose east
-// mouth chunk is the gap; blocking it seals the tunnel off the open level. One timed sample
-// blocks the gap chunk and runs the nav reaction, then reopens it and runs the reaction again;
-// the tile writes are untimed. `outputs` is the cells each change flips and `candidates` the
-// room, ring, or tunnel chunks. Passes when no config grows faster than its room, ring, or
-// tunnel chunks and every config is flat in side; asserted per sample, the block reaction's
-// flood expands at most three times the room's or tunnel's chunks plus two nodes, or half
-// again the ring's plus one node's slack, every reopen floods nothing, a far one-cell fill
-// sealed with the room's gap adds no flood node, and a fixed threaded case runs every
-// chunk-partitioned stage of more than one range on workers. `--details` prints the block and reopen
+// mouth chunk is the gap; blocking it seals the tunnel off the open level. Variant 3: two
+// edge-2 ringed rooms, at chunk (1, 1) and at (side / chunk - 6, side / chunk - 6), both gaps
+// filled in one batch. Variant 4: room A's gap, its east neighbour split by a wall written
+// before the build. Variant 5: an edge-4 ring cut on its west and east chunks in one batch.
+// Variants 3 to 5 keep that structure and sweep the level side at 256, 512, and 1024. Variant
+// 6: one 512² comb of 16 dead-end tunnels off a north corridor, joined and unjoined. Variant
+// 7: one edge-8 ringed room on a 256² level, sealed under the default flood cap and under a
+// four-proposal cap. Variant 8: eight edge-2 ringed rooms on a 384² level, every gap filled
+// in one batch. One timed sample blocks the variant's gap or gaps and runs the nav reaction,
+// then reopens them and runs the reaction again; the tile writes are untimed. `outputs` is
+// the cells each change flips and `candidates` the structure's chunks. Passes when variants
+// 0 to 2 grow no faster than their room, ring, or tunnel chunks and are flat in side;
+// asserted per sample, the block reaction's flood expands at most three times the room's or
+// tunnel's chunks plus two nodes, or half again the ring's plus one node's slack, every
+// reopen floods nothing, a far one-cell fill sealed with the room's gap adds no flood node,
+// and a fixed threaded case runs every chunk-partitioned stage of more than one range on
+// workers. Variant 3 seals both rooms and each room alone: the both-seal's flood nodes equal
+// the two rooms' floods added, and on a side larger than 256² that sum and each room's flood
+// equal the 256² seal. Variant 4's flood is at most twice room A's on that same side, and on
+// a side larger than 256² the walled flood and room A's equal the 256² seal. Variant 5's flood
+// is at most four times the smaller arc plus four nodes, and on a side larger than 256² it
+// equals the 256² seal. Variant 6's timed sample is the unjoined comb's corridor under the
+// default window; the joined comb is the same check. On both, the wide round's most searches
+// equal the tunnels, and a narrow round (the flood window at one node's slack plus four
+// slots) serves at most a quarter of them, takes at least four times the rounds, and visits
+// at most twice the wide build. Variant 7's timed sample is the default cap; its four-proposal
+// cap takes more rounds and at most two searches in a round. Variant 8's zero-worker flood and
+// the case's flood expand the same nodes, the batch holds more searches than rounds, and a
+// fixed threaded case runs that flood on workers when the batch is more than one range.
+// `--details` prints the block and reopen
 // reactions and the block reaction's plan, remask, patch, and connectivity shapes (the flood's
 // rounds, searches per round, and its tuner's policy) with the reactions' main-thread split.
 pub const connectivity_split_group = suite.BenchmarkGroup{
@@ -125,6 +148,20 @@ const connectivity_split_item_counts = [_]usize{
     splitItemCode(.tunnel, 62, 1024),
     splitItemCode(.tunnel, 8, 256),
     splitItemCode(.tunnel, 8, 2048),
+    // Flat in side: the structure stays at the bound's size.
+    splitItemCode(.rooms, 2, 256),
+    splitItemCode(.rooms, 2, 512),
+    splitItemCode(.rooms, 2, 1024),
+    splitItemCode(.walled, 2, 256),
+    splitItemCode(.walled, 2, 512),
+    splitItemCode(.walled, 2, 1024),
+    splitItemCode(.ring_arcs, 4, 256),
+    splitItemCode(.ring_arcs, 4, 512),
+    splitItemCode(.ring_arcs, 4, 1024),
+    // One fixture each: ratios and per-round bounds, not a side curve.
+    splitItemCode(.hub, 16, 512),
+    splitItemCode(.budget, 8, 256),
+    splitItemCode(.pockets, 2, 384),
 };
 
 fn onewayItemCode(comptime variant: OnewayVariant, comptime terminals: usize, comptime systems: usize) usize {
@@ -199,6 +236,12 @@ const ToggleChecks = struct {
     untouched: bool = false,
     // The most nodes the block reaction's flood may expand (`SplitConfig.floodBound`).
     flood_bound: ?usize = null,
+    // The block flood expands exactly this many nodes (a measured seal of the same gap).
+    exact_flood: ?usize = null,
+    // The block flood's folded batch holds more searches than rounds.
+    more_searches_than_rounds: bool = false,
+    // `checkStageDispatched` on the block flood's folded batch.
+    flood_dispatch: bool = false,
 };
 
 // Fails when a reaction's closure passed what its prepare bounded: tail words past its
@@ -270,6 +313,11 @@ fn runToggle(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, cell
     if (checks.flood_bound) |bound| {
         if (perf.conn_flood_nodes == 0 or perf.conn_flood_nodes > bound) return error.ConnectivitySplitFloodPastBound;
     }
+    if (checks.exact_flood) |nodes| {
+        if (perf.conn_flood_nodes != nodes) return error.ConnectivitySplitFloodPastBound;
+    }
+    if (checks.more_searches_than_rounds and stats.conn_flood_batch.item_count <= perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
+    if (checks.flood_dispatch) try suite.checkStageDispatched(case, thread_system, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), stats.conn_flood_batch);
     const revert = revert: {
         fixtures.swapNavTuners(&fixture.system, revert_tuners);
         defer fixtures.swapNavTuners(&fixture.system, revert_tuners);
@@ -414,6 +462,18 @@ const SplitVariant = enum(u8) {
     ring,
     // A one-chunk tunnel sealed by blocking its mouth chunk.
     tunnel,
+    // Two ringed rooms sealed in one batch.
+    rooms,
+    // Room A, its east neighbour split by a wall written before the build.
+    walled,
+    // One ring cut on its west and east chunks in one batch.
+    ring_arcs,
+    // A comb of dead-end tunnels off one corridor.
+    hub,
+    // One ringed room under the default flood cap and a four-proposal cap.
+    budget,
+    // Eight ringed rooms sealed in one batch.
+    pockets,
 };
 
 const SplitConfig = struct {
@@ -435,6 +495,7 @@ const SplitConfig = struct {
             .room => @as(usize, self.edge_chunks) + 1,
             .ring => @as(usize, self.edge_chunks) + 3,
             .tunnel => @as(usize, self.edge_chunks) + 2,
+            else => unreachable,
         };
     }
 
@@ -448,6 +509,7 @@ const SplitConfig = struct {
             .room => 3 * structure + 2,
             .ring => structure * 3 / 2 + border_stride,
             .tunnel => 3 * structure,
+            else => unreachable,
         };
     }
 
@@ -458,6 +520,7 @@ const SplitConfig = struct {
             .room => edge * edge,
             .ring => 4 * edge + 4,
             .tunnel => edge,
+            else => unreachable,
         };
     }
 
@@ -472,6 +535,7 @@ const SplitConfig = struct {
             .ring => chunk_x < edge + 2 and chunk_y < edge + 2 and
                 (chunk_x == 0 or chunk_y == 0 or chunk_x == edge + 1 or chunk_y == edge + 1),
             .tunnel => chunk_x < edge and chunk_y == 0,
+            else => unreachable,
         };
     }
 
@@ -488,6 +552,7 @@ const SplitConfig = struct {
             .ring => .{ .x = 0, .y = (self.edge_chunks + 2) / 2 },
             // The tunnel's east mouth.
             .tunnel => .{ .x = self.edge_chunks, .y = 0 },
+            else => unreachable,
         };
     }
 
@@ -506,6 +571,7 @@ const SplitConfig = struct {
             .room => self.edge_chunks,
             .ring => self.edge_chunks + 2,
             .tunnel => unreachable,
+            else => unreachable,
         };
         const gap = self.gapChunk();
         for (0..band + 1) |y| {
@@ -586,6 +652,7 @@ fn checkSplitTopology(allocator: std.mem.Allocator, world: *const WorldSystem, c
             if (sealed.stopped) return error.ConnectivitySplitRingNotEnclosed;
             if (sealed.reached != (config.structureChunks() - 1) * chunk_cells) return error.ConnectivitySplitRingSplit;
         },
+        else => unreachable,
     }
 }
 
@@ -612,6 +679,10 @@ fn checkFarFillAddsNothing(allocator: std.mem.Allocator, io: std.Io, fixture: *R
 fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try SplitConfig.decode(item_count);
+    switch (config.variant) {
+        .room, .ring, .tunnel => {},
+        else => return runSplitProofCase(allocator, io, options, case, item_count, config),
+    }
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
     const thread_ptr = &threads;
@@ -635,6 +706,524 @@ fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: s
     stats.output_count = gap.len;
     stats.candidate_pairs = config.structureChunks();
     return stats;
+}
+
+// The flat-in-side proofs compare a larger level with this one. It is the smallest side the
+// new codes sweep.
+const split_proof_reference_side: u16 = 256;
+const no_cells: []const CellCoord = &.{};
+
+const ProofCtx = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: suite.Options,
+    case: suite.BenchmarkCase,
+    item_count: usize,
+    threads: *ThreadSystem,
+    participants: usize,
+};
+
+const ProofFixture = struct {
+    fixture: ReactFixture,
+    gaps: []CellCoord,
+    // `gaps[0..first_gap]` is the first room when two rooms share the seal list; 0 when the
+    // list is one seal.
+    first_gap: usize,
+    config: SplitConfig,
+    batch_chunks: usize,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *ProofFixture) void {
+        self.allocator.free(self.gaps);
+        self.fixture.deinit(self.allocator);
+    }
+
+    fn gapA(self: ProofFixture) []CellCoord {
+        return self.gaps[0..self.first_gap];
+    }
+
+    fn gapB(self: ProofFixture) []CellCoord {
+        return self.gaps[self.first_gap..];
+    }
+};
+
+const RoomFloods = struct {
+    a: usize,
+    b: usize,
+    both: usize,
+};
+
+const WalledFloods = struct {
+    room_a: usize,
+    walled: usize,
+};
+
+fn levelChunks(side: u16) !u16 {
+    if (side < default_chunk_size_tiles or side % default_chunk_size_tiles != 0) return error.ConnectivitySplitStructureTooLarge;
+    return side / default_chunk_size_tiles;
+}
+
+fn cellsBatch(chunks: usize) nav_size.NavBatch {
+    const tiles: usize = default_chunk_size_tiles;
+    return .{ .mark_chunks = chunks * tiles * tiles, .links = 0, .keys = chunks * toggle_batch_keys };
+}
+
+fn proofSizeConfig(ctx: *const ProofCtx, config: SplitConfig, batch_chunks: usize) nav_size.NavSizeConfig {
+    return toggleSizeConfig(config.side, 1, 0, ctx.participants, cellsBatch(batch_chunks));
+}
+
+fn proofStructureChunks(config: SplitConfig) usize {
+    const edge: usize = config.edge_chunks;
+    return switch (config.variant) {
+        .rooms => 2 * edge * edge,
+        .walled, .budget => edge * edge,
+        .ring_arcs => 4 * edge + 4,
+        .hub => edge,
+        .pockets => 8 * edge * edge,
+        else => unreachable,
+    };
+}
+
+fn referenceConfig(config: SplitConfig) SplitConfig {
+    return .{ .variant = config.variant, .edge_chunks = config.edge_chunks, .side = split_proof_reference_side };
+}
+
+fn expectBlocks(world: *const WorldSystem, cell: CellCoord, blocks: bool) !void {
+    if (world.levelBlocksMovement(0, cell.x, cell.y) != blocks) return error.ConnectivitySplitTopology;
+}
+
+// `x` and `y` are inside the level, whose chunk count fits `u16`.
+fn appendChunk(chunks: *std.ArrayList(ChunkCoord), allocator: std.mem.Allocator, x: usize, y: usize, side_chunks: u16) !void {
+    if (x >= side_chunks or y >= side_chunks) return error.ConnectivitySplitStructureTooLarge;
+    try chunks.append(allocator, .{ .x = @intCast(x), .y = @intCast(y) });
+}
+
+fn requireChunk(chunk: ChunkCoord, side_chunks: u16) !void {
+    if (chunk.x >= side_chunks or chunk.y >= side_chunks) return error.ConnectivitySplitStructureTooLarge;
+}
+
+// The test's ringed room: a one-chunk wall around an `edge` square whose only opening is the
+// east gap. Appends the wall and returns the gap.
+fn appendRingedRoom(chunks: *std.ArrayList(ChunkCoord), allocator: std.mem.Allocator, origin_x: usize, origin_y: usize, edge: u16, side_chunks: u16) !ChunkCoord {
+    const edge_chunks: usize = edge;
+    const gap_x = origin_x + edge_chunks + 1;
+    const gap_y = origin_y + 1 + edge_chunks / 2;
+    const span = edge_chunks + 2;
+    for (0..span) |dy| {
+        for (0..span) |dx| {
+            const on_ring = dx == 0 or dy == 0 or dx == edge_chunks + 1 or dy == edge_chunks + 1;
+            if (!on_ring or (origin_x + dx == gap_x and origin_y + dy == gap_y)) continue;
+            try appendChunk(chunks, allocator, origin_x + dx, origin_y + dy, side_chunks);
+        }
+    }
+    if (gap_x >= side_chunks or gap_y >= side_chunks) return error.ConnectivitySplitStructureTooLarge;
+    return .{ .x = @intCast(gap_x), .y = @intCast(gap_y) };
+}
+
+fn roomPairOrigins(side_chunks: u16) ![2][2]usize {
+    // Room B sits at the far corner with a gap of open chunks between it and room A.
+    if (side_chunks < 16) return error.ConnectivitySplitStructureTooLarge;
+    const chunks: usize = side_chunks;
+    return .{ .{ 1, 1 }, .{ chunks - 6, chunks - 6 } };
+}
+
+// The long wall through the gap's east neighbour, plus the two cells that close its near end.
+// Coordinates stay inside the level, so they fit `u16`.
+fn walledNeighbourCells(allocator: std.mem.Allocator, gap: ChunkCoord, side: u16) ![]CellCoord {
+    const tiles: u32 = default_chunk_size_tiles;
+    const side_chunks: u32 = side / default_chunk_size_tiles;
+    const left: u32 = (@as(u32, gap.x) + 1) * tiles;
+    // Two cells above the chunk's bottom row. A 4-tile chunk puts that on row +2, which is
+    // where the wall sat, so the south label stays one cell tall.
+    const wall_y: u32 = @as(u32, gap.y) * tiles + tiles - 2;
+    if (side_chunks < 2 or left + 1 >= (side_chunks - 1) * tiles or wall_y + 1 >= side) return error.ConnectivitySplitStructureTooLarge;
+    const end: u32 = (side_chunks - 1) * tiles;
+    const span: usize = end - (left + 1);
+    const cells = try allocator.alloc(CellCoord, span + 2);
+    for (0..span) |index| cells[index] = .{ .x = @intCast(left + 1 + index), .y = @intCast(wall_y) };
+    cells[span] = .{ .x = @intCast(left), .y = @intCast(wall_y + 1) };
+    cells[span + 1] = .{ .x = @intCast(left + 1), .y = @intCast(wall_y + 1) };
+    return cells;
+}
+
+fn appendRingCutSolids(chunks: *std.ArrayList(ChunkCoord), allocator: std.mem.Allocator, edge: u16, side_chunks: u16) !void {
+    const span: usize = @as(usize, edge) + 2;
+    for (1..span - 1) |y| {
+        for (1..span - 1) |x| try appendChunk(chunks, allocator, x, y, side_chunks);
+    }
+    for (0..span + 1) |index| {
+        try appendChunk(chunks, allocator, span, index, side_chunks);
+        if (index != span) try appendChunk(chunks, allocator, index, span, side_chunks);
+    }
+}
+
+fn ringCuts(edge: u16) [2]ChunkCoord {
+    const span: u16 = edge + 2;
+    const mid = span / 2;
+    return .{ .{ .x = 0, .y = mid }, .{ .x = span - 1, .y = mid } };
+}
+
+fn appendHubSolids(chunks: *std.ArrayList(ChunkCoord), allocator: std.mem.Allocator, tunnels: u16, joined: bool) !void {
+    const side: usize = @as(usize, tunnels) * 2;
+    // The comb is the whole level, and a level side fits `u16`.
+    if (side > @as(usize, std.math.maxInt(u16))) return error.ConnectivitySplitStructureTooLarge;
+    const side_chunks: u16 = @intCast(side);
+    for (1..side) |y| {
+        var x: usize = 1;
+        while (x < side) : (x += 2) {
+            const bottom_link = joined and y == side - 1 and x % 4 == 3 and x + 1 < side - 1;
+            if (!bottom_link) try appendChunk(chunks, allocator, x, y, side_chunks);
+        }
+    }
+}
+
+fn buildProof(
+    ctx: *const ProofCtx,
+    config: SplitConfig,
+    solids: []const ChunkCoord,
+    extra: []const CellCoord,
+    gap_chunks: []const ChunkCoord,
+    first_gap_chunks: usize,
+    batch_chunks: usize,
+) !ProofFixture {
+    const size_config = proofSizeConfig(ctx, config, batch_chunks);
+    try nav_size.checkNavSize(connectivity_split_group.name, ctx.item_count, ctx.case, size_config);
+    var open = try buildOpenWorld(ctx.allocator, ctx.io, config.side, 1);
+    errdefer open.world.deinit();
+    if (solids.len != 0) {
+        const solid_cells = try chunkCells(ctx.allocator, solids, open.world.chunk_size_tiles);
+        defer ctx.allocator.free(solid_cells);
+        try writeLevelZeroCells(&open, solid_cells, open.blocking);
+        try expectBlocks(&open.world, solid_cells[0], true);
+    }
+    if (extra.len != 0) {
+        try writeLevelZeroCells(&open, extra, open.blocking);
+        try expectBlocks(&open.world, extra[0], true);
+    }
+    if (gap_chunks.len == 0) return error.ConnectivitySplitNoEdge;
+    const gap_cells = try chunkCells(ctx.allocator, gap_chunks, open.world.chunk_size_tiles);
+    errdefer ctx.allocator.free(gap_cells);
+    const per_chunk = @as(usize, open.world.chunk_size_tiles) * open.world.chunk_size_tiles;
+    const first = first_gap_chunks * per_chunk;
+    if (gap_cells.len == 0 or first > gap_cells.len) return error.ConnectivitySplitTopology;
+    try expectBlocks(&open.world, gap_cells[0], false);
+    var data = DataSystem.init(ctx.allocator);
+    errdefer data.deinit();
+    const requests = try ctx.allocator.alloc(PathRequest, 0);
+    errdefer ctx.allocator.free(requests);
+    const fixture = try assembleReactFixture(ctx.allocator, &open, &data, requests, nav_size.navSizeCapacity(size_config), ctx.threads);
+    return .{
+        .fixture = fixture,
+        .gaps = gap_cells,
+        .first_gap = first,
+        .config = config,
+        .batch_chunks = batch_chunks,
+        .allocator = ctx.allocator,
+    };
+}
+
+fn prepareProof(ctx: *const ProofCtx, proof: *ProofFixture) !void {
+    try proof.fixture.changed.ensureTotalCapacity(ctx.allocator, proof.gaps.len);
+    fixtures.setNavTuners(&proof.fixture.system, ctx.case);
+    const size_config = proofSizeConfig(ctx, proof.config, proof.batch_chunks);
+    try nav_size.checkNavBytes(connectivity_split_group.name, ctx.item_count, size_config, &proof.fixture.system);
+}
+
+fn openProof(
+    ctx: *const ProofCtx,
+    config: SplitConfig,
+    solids: []const ChunkCoord,
+    extra: []const CellCoord,
+    gap_chunks: []const ChunkCoord,
+    first_gap_chunks: usize,
+    batch_chunks: usize,
+) !ProofFixture {
+    var proof = try buildProof(ctx, config, solids, extra, gap_chunks, first_gap_chunks, batch_chunks);
+    errdefer proof.deinit();
+    try prepareProof(ctx, &proof);
+    return proof;
+}
+
+fn openRooms(ctx: *const ProofCtx, config: SplitConfig) !ProofFixture {
+    if (config.edge_chunks != 2) return error.ConnectivitySplitStructureTooLarge;
+    const side_chunks = try levelChunks(config.side);
+    const origins = try roomPairOrigins(side_chunks);
+    var solids: std.ArrayList(ChunkCoord) = .empty;
+    defer solids.deinit(ctx.allocator);
+    var gaps: [2]ChunkCoord = undefined;
+    for (origins, &gaps) |origin, *gap| gap.* = try appendRingedRoom(&solids, ctx.allocator, origin[0], origin[1], config.edge_chunks, side_chunks);
+    const solid_owned = try solids.toOwnedSlice(ctx.allocator);
+    defer ctx.allocator.free(solid_owned);
+    return openProof(ctx, config, solid_owned, no_cells, &gaps, 1, gaps.len);
+}
+
+fn openRoomA(ctx: *const ProofCtx, config: SplitConfig, wall: bool) !ProofFixture {
+    const side_chunks = try levelChunks(config.side);
+    var solids: std.ArrayList(ChunkCoord) = .empty;
+    defer solids.deinit(ctx.allocator);
+    const gap = try appendRingedRoom(&solids, ctx.allocator, 1, 1, config.edge_chunks, side_chunks);
+    const solid_owned = try solids.toOwnedSlice(ctx.allocator);
+    defer ctx.allocator.free(solid_owned);
+    const extra = if (wall) try walledNeighbourCells(ctx.allocator, gap, config.side) else try ctx.allocator.alloc(CellCoord, 0);
+    defer ctx.allocator.free(extra);
+    return openProof(ctx, config, solid_owned, extra, &.{gap}, 0, 1);
+}
+
+fn openRingArcs(ctx: *const ProofCtx, config: SplitConfig) !ProofFixture {
+    const side_chunks = try levelChunks(config.side);
+    var solids: std.ArrayList(ChunkCoord) = .empty;
+    defer solids.deinit(ctx.allocator);
+    try appendRingCutSolids(&solids, ctx.allocator, config.edge_chunks, side_chunks);
+    const cuts = ringCuts(config.edge_chunks);
+    try requireChunk(cuts[0], side_chunks);
+    try requireChunk(cuts[1], side_chunks);
+    const solid_owned = try solids.toOwnedSlice(ctx.allocator);
+    defer ctx.allocator.free(solid_owned);
+    return openProof(ctx, config, solid_owned, no_cells, &cuts, 0, cuts.len);
+}
+
+fn openHub(ctx: *const ProofCtx, config: SplitConfig, joined: bool) !ProofFixture {
+    const side_chunks = try levelChunks(config.side);
+    if (@as(usize, side_chunks) != @as(usize, config.edge_chunks) * 2) return error.ConnectivitySplitStructureTooLarge;
+    var solids: std.ArrayList(ChunkCoord) = .empty;
+    defer solids.deinit(ctx.allocator);
+    try appendHubSolids(&solids, ctx.allocator, config.edge_chunks, joined);
+    const solid_owned = try solids.toOwnedSlice(ctx.allocator);
+    defer ctx.allocator.free(solid_owned);
+    const corridor = try ctx.allocator.alloc(ChunkCoord, @as(usize, side_chunks));
+    defer ctx.allocator.free(corridor);
+    for (corridor, 0..) |*chunk, x| chunk.* = .{ .x = @intCast(x), .y = 0 };
+    return openProof(ctx, config, solid_owned, no_cells, corridor, 0, corridor.len);
+}
+
+fn openPockets(ctx: *const ProofCtx, config: SplitConfig) !ProofFixture {
+    // The eight-room arm: pitch 6 is the spacing of edge-2 rooms.
+    if (config.edge_chunks != 2) return error.ConnectivitySplitStructureTooLarge;
+    const side_chunks = try levelChunks(config.side);
+    var solids: std.ArrayList(ChunkCoord) = .empty;
+    defer solids.deinit(ctx.allocator);
+    var gaps: [8]ChunkCoord = undefined;
+    for (&gaps, 0..) |*gap, index| {
+        const origin_x = 1 + 6 * (index % 4);
+        const origin_y = 1 + 6 * (index / 4);
+        gap.* = try appendRingedRoom(&solids, ctx.allocator, origin_x, origin_y, config.edge_chunks, side_chunks);
+    }
+    const solid_owned = try solids.toOwnedSlice(ctx.allocator);
+    defer ctx.allocator.free(solid_owned);
+    return openProof(ctx, config, solid_owned, no_cells, &gaps, 0, gaps.len);
+}
+
+// Seals `cells` and reopens them. The stage tuners are put back, so the timed samples still
+// start from the case's fresh tuners.
+fn untimedSeal(io: std.Io, fixture: *ReactFixture, cells: []const CellCoord, thread_system: *ThreadSystem) !NavUpdateStats {
+    const tuners = fixture.system.tuners;
+    defer fixture.system.tuners = tuners;
+    const sealed = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
+    const opened = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
+    if (opened.stats.perf.conn_flood_nodes != 0) return error.ConnectivityOpeningFlooded;
+    return sealed.stats;
+}
+
+fn untimedHubSeal(ctx: *const ProofCtx, proof: *ProofFixture, narrow: bool) !NavUpdateStats {
+    const conn = &proof.fixture.system.graph.connectivity;
+    const saved = conn.flood_window;
+    defer conn.flood_window = saved;
+    if (narrow) {
+        // One node's slack plus four proposal slots.
+        const level = proof.fixture.system.graph.levelGraph(0) orelse return error.ConnectivitySplitNoLevel;
+        conn.flood_window = level.border_stride + conn.max_chunk_endpoints + 4;
+    } else {
+        conn.flood_window = default_flood_window;
+    }
+    return untimedSeal(ctx.io, &proof.fixture, proof.gaps, ctx.threads);
+}
+
+fn untimedBudgetSeal(ctx: *const ProofCtx, proof: *ProofFixture, cap: u32) !NavUpdateStats {
+    const conn = &proof.fixture.system.graph.connectivity;
+    const saved = conn.flood_budget_cap;
+    defer conn.flood_budget_cap = saved;
+    conn.flood_budget_cap = cap;
+    return untimedSeal(ctx.io, &proof.fixture, proof.gaps, ctx.threads);
+}
+
+fn expectRooms(floods: RoomFloods, reference: ?RoomFloods) !void {
+    if (floods.a == 0 or floods.b == 0) return error.ConnectivitySplitFloodPastBound;
+    if (floods.both != floods.a + floods.b) return error.ConnectivitySplitRoomsNotSum;
+    if (reference) |earlier| {
+        if (floods.a != earlier.a or floods.b != earlier.b or floods.both != earlier.both) return error.ConnectivitySplitNotFlat;
+    }
+}
+
+fn expectWalled(floods: WalledFloods, reference: ?WalledFloods) !void {
+    if (floods.room_a == 0 or floods.walled == 0) return error.ConnectivitySplitFloodPastBound;
+    if (floods.walled > 2 * floods.room_a) return error.ConnectivitySplitWalledPastBound;
+    if (reference) |earlier| {
+        if (floods.room_a != earlier.room_a or floods.walled != earlier.walled) return error.ConnectivitySplitNotFlat;
+    }
+}
+
+fn expectRingArc(flood: usize, edge: u16, reference: ?usize) !void {
+    // The ring's chunks but the two cuts, halved: the smaller arc.
+    const arc = (4 * (@as(usize, edge) + 1) - 2) / 2;
+    if (flood == 0 or flood > 4 * arc + 4) return error.ConnectivitySplitRingArcPastBound;
+    if (reference) |nodes| if (flood != nodes) return error.ConnectivitySplitNotFlat;
+}
+
+fn expectHub(wide: NavUpdateStats, narrow: NavUpdateStats, tunnels: usize) !void {
+    if (wide.perf.conn_round_items_max != tunnels) return error.ConnectivitySplitHubWideItems;
+    if (4 * narrow.perf.conn_round_items_max > tunnels) return error.ConnectivitySplitHubNarrowItems;
+    if (narrow.perf.conn_rounds < 4 * wide.perf.conn_rounds) return error.ConnectivitySplitHubRounds;
+    if (narrow.perf.conn_build_visits > 2 * wide.perf.conn_build_visits) return error.ConnectivitySplitHubVisits;
+}
+
+fn expectBudget(wide: NavUpdateStats, narrow: NavUpdateStats) !void {
+    if (narrow.perf.conn_rounds <= wide.perf.conn_rounds) return error.ConnectivitySplitBudgetRounds;
+    if (narrow.perf.conn_round_items_max > 2) return error.ConnectivitySplitBudgetItems;
+}
+
+fn measureRooms(ctx: *const ProofCtx, proof: *ProofFixture) !RoomFloods {
+    if (proof.first_gap == 0 or proof.first_gap >= proof.gaps.len) return error.ConnectivitySplitTopology;
+    const room_a = try untimedSeal(ctx.io, &proof.fixture, proof.gapA(), ctx.threads);
+    const room_b = try untimedSeal(ctx.io, &proof.fixture, proof.gapB(), ctx.threads);
+    const both = try untimedSeal(ctx.io, &proof.fixture, proof.gaps, ctx.threads);
+    return .{ .a = room_a.perf.conn_flood_nodes, .b = room_b.perf.conn_flood_nodes, .both = both.perf.conn_flood_nodes };
+}
+
+fn roomAFlood(ctx: *const ProofCtx, config: SplitConfig) !usize {
+    var proof = try openRoomA(ctx, config, false);
+    defer proof.deinit();
+    const stats = try untimedSeal(ctx.io, &proof.fixture, proof.gaps, ctx.threads);
+    return stats.perf.conn_flood_nodes;
+}
+
+fn measureWalled(ctx: *const ProofCtx, config: SplitConfig) !WalledFloods {
+    const room_a = try roomAFlood(ctx, config);
+    var proof = try openRoomA(ctx, config, true);
+    defer proof.deinit();
+    const stats = try untimedSeal(ctx.io, &proof.fixture, proof.gaps, ctx.threads);
+    return .{ .room_a = room_a, .walled = stats.perf.conn_flood_nodes };
+}
+
+fn ringFlood(ctx: *const ProofCtx, config: SplitConfig) !usize {
+    var proof = try openRingArcs(ctx, config);
+    defer proof.deinit();
+    const stats = try untimedSeal(ctx.io, &proof.fixture, proof.gaps, ctx.threads);
+    return stats.perf.conn_flood_nodes;
+}
+
+fn timeProof(ctx: *const ProofCtx, proof: *ProofFixture, checks: ToggleChecks) !suite.RunStats {
+    var stats = try runToggleSamples(ctx.io, ctx.options, ctx.case, ctx.item_count, &proof.fixture, proof.gaps, ctx.threads, checks, null);
+    const size_config = proofSizeConfig(ctx, proof.config, proof.batch_chunks);
+    try nav_size.checkNavBytes(connectivity_split_group.name, ctx.item_count, size_config, &proof.fixture.system);
+    stats.output_count = proof.gaps.len;
+    stats.candidate_pairs = proofStructureChunks(proof.config);
+    return stats;
+}
+
+fn runRoomsProof(ctx: *const ProofCtx, config: SplitConfig) !suite.RunStats {
+    var reference: ?RoomFloods = null;
+    if (config.side != split_proof_reference_side) {
+        var ref_proof = try openRooms(ctx, referenceConfig(config));
+        defer ref_proof.deinit();
+        reference = try measureRooms(ctx, &ref_proof);
+    }
+    var proof = try openRooms(ctx, config);
+    defer proof.deinit();
+    const floods = try measureRooms(ctx, &proof);
+    try expectRooms(floods, reference);
+    return timeProof(ctx, &proof, .{ .exact_flood = floods.both });
+}
+
+fn runWalledProof(ctx: *const ProofCtx, config: SplitConfig) !suite.RunStats {
+    if (config.edge_chunks != 2) return error.ConnectivitySplitStructureTooLarge;
+    var reference: ?WalledFloods = null;
+    if (config.side != split_proof_reference_side) reference = try measureWalled(ctx, referenceConfig(config));
+    const room_a = try roomAFlood(ctx, config);
+    var proof = try openRoomA(ctx, config, true);
+    defer proof.deinit();
+    const sealed = try untimedSeal(ctx.io, &proof.fixture, proof.gaps, ctx.threads);
+    const floods = WalledFloods{ .room_a = room_a, .walled = sealed.perf.conn_flood_nodes };
+    try expectWalled(floods, reference);
+    return timeProof(ctx, &proof, .{ .exact_flood = floods.walled });
+}
+
+fn runRingArcsProof(ctx: *const ProofCtx, config: SplitConfig) !suite.RunStats {
+    var reference: ?usize = null;
+    if (config.side != split_proof_reference_side) reference = try ringFlood(ctx, referenceConfig(config));
+    var proof = try openRingArcs(ctx, config);
+    defer proof.deinit();
+    const sealed = try untimedSeal(ctx.io, &proof.fixture, proof.gaps, ctx.threads);
+    try expectRingArc(sealed.perf.conn_flood_nodes, config.edge_chunks, reference);
+    return timeProof(ctx, &proof, .{ .exact_flood = sealed.perf.conn_flood_nodes });
+}
+
+fn runHubProof(ctx: *const ProofCtx, config: SplitConfig) !suite.RunStats {
+    const tunnels: usize = config.edge_chunks;
+    const joined = joined: {
+        var proof = try openHub(ctx, config, true);
+        defer proof.deinit();
+        const wide = try untimedHubSeal(ctx, &proof, false);
+        const narrow = try untimedHubSeal(ctx, &proof, true);
+        break :joined [2]NavUpdateStats{ wide, narrow };
+    };
+    try expectHub(joined[0], joined[1], tunnels);
+    var proof = try openHub(ctx, config, false);
+    defer proof.deinit();
+    const wide = try untimedHubSeal(ctx, &proof, false);
+    const narrow = try untimedHubSeal(ctx, &proof, true);
+    try expectHub(wide, narrow, tunnels);
+    return timeProof(ctx, &proof, .{ .exact_flood = wide.perf.conn_flood_nodes });
+}
+
+fn runBudgetProof(ctx: *const ProofCtx, config: SplitConfig) !suite.RunStats {
+    var proof = try openRoomA(ctx, config, false);
+    defer proof.deinit();
+    const wide = try untimedBudgetSeal(ctx, &proof, default_flood_budget_cap);
+    const narrow = try untimedBudgetSeal(ctx, &proof, 4);
+    try expectBudget(wide, narrow);
+    if (wide.perf.conn_flood_nodes == 0) return error.ConnectivitySplitFloodPastBound;
+    return timeProof(ctx, &proof, .{ .exact_flood = wide.perf.conn_flood_nodes });
+}
+
+fn runPocketsProof(ctx: *const ProofCtx, config: SplitConfig) !suite.RunStats {
+    var proof = try openPockets(ctx, config);
+    defer proof.deinit();
+    var inline_threads = try ThreadSystem.init(ctx.allocator, ctx.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
+    const inline_stats = try untimedSeal(ctx.io, &proof.fixture, proof.gaps, &inline_threads);
+    const case_stats = try untimedSeal(ctx.io, &proof.fixture, proof.gaps, ctx.threads);
+    if (inline_stats.perf.conn_flood_nodes == 0 or case_stats.perf.conn_flood_nodes != inline_stats.perf.conn_flood_nodes) return error.ConnectivitySplitPocketsNotEqual;
+    if (inline_stats.conn_flood_batch.item_count <= inline_stats.perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
+    if (case_stats.conn_flood_batch.item_count <= case_stats.perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
+    try suite.checkStageDispatched(ctx.case, ctx.threads, ctx.case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), case_stats.conn_flood_batch);
+    return timeProof(ctx, &proof, .{
+        .exact_flood = inline_stats.perf.conn_flood_nodes,
+        .more_searches_than_rounds = true,
+        .flood_dispatch = true,
+    });
+}
+
+fn runSplitProofCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: SplitConfig) !suite.RunStats {
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const ctx = ProofCtx{
+        .allocator = allocator,
+        .io = io,
+        .options = options,
+        .case = case,
+        .item_count = item_count,
+        .threads = &threads,
+        .participants = fixtures.participantCount(&threads),
+    };
+    return switch (config.variant) {
+        .rooms => runRoomsProof(&ctx, config),
+        .walled => runWalledProof(&ctx, config),
+        .ring_arcs => runRingArcsProof(&ctx, config),
+        .hub => runHubProof(&ctx, config),
+        .budget => runBudgetProof(&ctx, config),
+        .pockets => runPocketsProof(&ctx, config),
+        else => unreachable,
+    };
 }
 
 const OnewayVariant = enum(u8) {

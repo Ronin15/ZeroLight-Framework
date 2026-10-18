@@ -17,7 +17,9 @@ const PathfindingStats = @import("../../game/systems/pathfinding.zig").Pathfindi
 const PathfindingSystem = @import("../../game/systems/pathfinding.zig").PathfindingSystem;
 const GoalResolveStats = @import("../../game/systems/pathfinding/types.zig").GoalResolveStats;
 const goal_scan_range_alignment_items = @import("../../game/systems/pathfinding/goal_table.zig").scan_range_alignment_items;
+const goal_project_range_alignment_items = @import("../../game/systems/pathfinding/goal_table.zig").project_range_alignment_items;
 const CellCoord = @import("../../game/world/system.zig").CellCoord;
+const default_chunk_size_tiles = @import("../../game/world/system.zig").default_chunk_size_tiles;
 const fixtures = @import("../fixtures.zig");
 const nav_size = @import("../nav_size.zig");
 const suite = @import("../suite.zig");
@@ -74,7 +76,11 @@ pub const negative_dig_group = suite.BenchmarkGroup{
 // untimed in variant 0 and timed in variant 1. `outputs` is the requests answered unavailable;
 // the workload adds the goal projections. Passes when the step answers every request with no
 // search and nothing pending, linear in requests, with four projections for the blocked crowd
-// at every size. `--details` prints the update stages and the goal resolve's stage shapes.
+// at every size. Variant 2 resolves one intent per distinct blocked cell, one more than a
+// scan range and a project range; a fixed case uses one item per range. Its workload counts
+// are those intents and the distinct goals, not unavailable answers. Passes when a fixed
+// threaded case runs both the scan and the project on workers. `--details` prints the update stages and the goal
+// resolve's stage shapes.
 pub const negative_burst_group = suite.BenchmarkGroup{
     .name = "pathfinding-negative-burst",
     .item_label = BurstCode.label,
@@ -104,6 +110,10 @@ const negative_dig_item_counts = [_]usize{
     NegativeDigCode.of(.{ .level_side = 2048, .requests = 64 }),
 };
 
+// One more intent than a scan range or a project range, so one item per range is more than one
+// aligned range of either stage.
+const goal_dispatch_intents: usize = @max(goal_scan_range_alignment_items, goal_project_range_alignment_items) + 1;
+
 const negative_burst_item_counts = [_]usize{
     BurstCode.of(.{ .variant = .open_goals, .requests = 1024 }),
     BurstCode.of(.{ .variant = .open_goals, .requests = 4096 }),
@@ -111,6 +121,7 @@ const negative_burst_item_counts = [_]usize{
     BurstCode.of(.{ .variant = .blocked_crowd, .requests = 1024 }),
     BurstCode.of(.{ .variant = .blocked_crowd, .requests = 4096 }),
     BurstCode.of(.{ .variant = .blocked_crowd, .requests = 12288 }),
+    BurstCode.of(.{ .variant = .dispatch, .requests = goal_dispatch_intents }),
 };
 
 fn writeUnavailableWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
@@ -397,6 +408,8 @@ const BurstVariant = enum(u8) {
     open_goals,
     // Every request of a pocket at its blocked center.
     blocked_crowd,
+    // One intent per distinct blocked cell, past a scan range and a project range.
+    dispatch,
 };
 
 const BurstConfig = struct {
@@ -587,9 +600,114 @@ fn runBurst(io: std.Io, case: suite.BenchmarkCase, variant: BurstVariant, fixtur
     return .{ .elapsed_ns = elapsed_ns, .unavailable = stats.perf.unavailable_results, .projections = resolve.distinct, .stats = stats, .resolve = resolve };
 }
 
+// A square level large enough for `intents` blocked cells on row 1 and a start on row 3.
+fn dispatchSide(intents: usize) u16 {
+    const tiles: usize = default_chunk_size_tiles;
+    const chunks = (intents + 2 + tiles - 1) / tiles;
+    return @intCast(@max(chunks, 2) * tiles);
+}
+
+fn dispatchSizeConfig(side: u16, participant_count: usize, requests: usize) nav_size.NavSizeConfig {
+    return .{
+        .side = side,
+        .levels = 1,
+        .participant_count = participant_count,
+        .agent_budget = requests,
+        .group_fields = 1,
+        .long_results = 0,
+        .runs_per_result = 0,
+        .batch = nav_size.NavBatch.none,
+    };
+}
+
+// One blocked cell per intent. The start sits off that row.
+fn initDispatchFixture(allocator: std.mem.Allocator, io: std.Io, config: BurstConfig, capacity: PathfindingCapacity, thread_system: *ThreadSystem) !ReactFixture {
+    const side = dispatchSide(config.requests);
+    if (config.requests == 0 or @as(usize, side) <= config.requests + 1) return error.NegativeBurstDispatchGoals;
+    var open = try buildOpenWorld(allocator, io, side, 1);
+    errdefer open.world.deinit();
+    const blocked = try allocator.alloc(CellCoord, config.requests);
+    defer allocator.free(blocked);
+    for (blocked, 0..) |*cell, index| cell.* = .{ .x = @intCast(index + 1), .y = 1 };
+    try writeLevelZeroCells(&open, blocked, open.blocking);
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const requests = try allocator.alloc(PathRequest, config.requests);
+    errdefer allocator.free(requests);
+    const start = open.cellCenter(.{ .x = 1, .y = 3 });
+    for (requests, blocked) |*request, cell| {
+        request.* = .{
+            .entity = try data.createEntity(),
+            .start = start,
+            .goal = open.cellCenter(cell),
+        };
+    }
+    return assembleReactFixture(allocator, &open, &data, requests, capacity, thread_system);
+}
+
+fn checkGoalDispatch(case: suite.BenchmarkCase, thread_system: *ThreadSystem, resolve: GoalResolveStats, intents: usize) !void {
+    if (resolve.distinct != intents or resolve.blocked != intents) return error.NegativeBurstDispatchGoals;
+    if (resolve.perf.project_batch.item_count != resolve.distinct or resolve.distinct <= goal_project_range_alignment_items) return error.NegativeBurstDispatchGoals;
+    if (resolve.perf.scan_batch.item_count != intents or resolve.perf.scan_batch.item_count <= goal_scan_range_alignment_items) return error.NegativeBurstDispatchScan;
+    // One item per range: the dispatch aligns that up to the stage's own alignment.
+    try suite.checkStageDispatched(case, thread_system, 1, resolve.perf.scan_batch);
+    try suite.checkStageDispatched(case, thread_system, 1, resolve.perf.project_batch);
+}
+
+fn runDispatchResolve(io: std.Io, system: *PathfindingSystem, requests: []const PathRequest, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !struct { elapsed_ns: u64, resolve: GoalResolveStats } {
+    const start_ns = suite.nowNs(io);
+    // Fixed cases use one item per range, the shape the dispatch bound checks. Adaptive
+    // cases keep the case's own control; the check does not apply to them.
+    const resolve = try system.resolveGoals(PathRequest, requests, thread_system, .{
+        .items_per_range = if (case.adaptive) case.stageItemsPerRange(goal_scan_range_alignment_items) else 1,
+        .max_worker_threads = case.maxWorkerThreads(),
+        .adaptive = case.adaptive,
+    });
+    const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+    try checkGoalDispatch(case, thread_system, resolve, requests.len);
+    return .{ .elapsed_ns = elapsed_ns, .resolve = resolve };
+}
+
+fn runGoalDispatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, config: BurstConfig) !suite.RunStats {
+    if (config.requests <= goal_scan_range_alignment_items or config.requests <= goal_project_range_alignment_items) return error.NegativeBurstDispatchGoals;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const thread_ptr = &threads;
+    const side = dispatchSide(config.requests);
+    const size_config = dispatchSizeConfig(side, fixtures.participantCount(thread_ptr), config.requests);
+    try nav_size.checkNavSize(negative_burst_group.name, item_count, case, size_config);
+
+    var fixture = try initDispatchFixture(allocator, io, config, nav_size.navSizeCapacity(size_config), thread_ptr);
+    defer fixture.deinit(allocator);
+    try nav_size.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
+    setPathStageTuners(&fixture.system, case);
+
+    for (0..options.warmup_iterations) |_| _ = try runDispatchResolve(io, &fixture.system, fixture.requests, thread_ptr, case);
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var resolve_report = ResolveReport{};
+    var last: ?GoalResolveStats = null;
+    for (0..options.iterations) |_| {
+        const sample = try runDispatchResolve(io, &fixture.system, fixture.requests, thread_ptr, case);
+        resolve_report.add(sample.resolve);
+        accumulator.record(sample.elapsed_ns, sample.resolve.perf.scan_batch);
+        last = sample.resolve;
+    }
+
+    try nav_size.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
+    var stats = accumulator.finish();
+    resolve_report.write(&stats.details);
+    if (last) |resolve| {
+        stats.output_count = resolve.intents;
+        stats.candidate_pairs = resolve.distinct;
+    }
+    stats.items_per_second = suite.itemsPerSecond(config.requests, stats.mean_ns);
+    return stats;
+}
+
 fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     const config = try BurstConfig.decode(item_count);
+    if (config.variant == .dispatch) return runGoalDispatchCase(allocator, io, options, case, item_count, config);
     try checkBurstLayout(config);
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
