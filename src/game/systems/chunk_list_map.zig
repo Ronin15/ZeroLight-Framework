@@ -990,7 +990,7 @@ fn collectOwners(map: *const ChunkListMap, key: u64, out: *std.ArrayList(u32)) !
 const KeepKeys = struct {
     keys: []const u64,
 
-    pub fn contains(self: KeepKeys, key: u64) bool {
+    fn contains(self: KeepKeys, key: u64) bool {
         return std.mem.indexOfScalar(u64, self.keys, key) != null;
     }
 };

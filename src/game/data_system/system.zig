@@ -1097,6 +1097,34 @@ fn expectWorldLevelColumnsAligned(slice: ConstWorldLevelSlice) !void {
 
 const data_test_support = @import("test_support.zig");
 
+// The dense row of `id` in the store whose slot index field is `field`, or null when the
+// entity is dead or lacks the component.
+fn componentDenseRow(data: *const DataSystem, id: EntityId, comptime field: []const u8) ?usize {
+    const slot = data.resolveSlotConst(id) orelse return null;
+    const row = @field(slot.*, field) orelse return null;
+    return row;
+}
+
+fn primitiveVisualDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
+    return componentDenseRow(data, id, "primitive_visual_index");
+}
+
+fn collisionBoundsDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
+    return componentDenseRow(data, id, "collision_bounds_index");
+}
+
+fn collisionResponseDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
+    return componentDenseRow(data, id, "collision_response_index");
+}
+
+fn steeringAgent(data: *const DataSystem, id: EntityId) ?SteeringAgent {
+    return data.steering_agents.get(componentDenseRow(data, id, "steering_agent_index") orelse return null);
+}
+
+fn destructibleDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
+    return componentDenseRow(data, id, "destructible_index");
+}
+
 /// Per-tier counts from an O(rows) scan of the dense scope tier column: the parity
 /// baseline for the incrementally maintained `DataSystem.tier_counts`.
 fn scanLiveTierCounts(data: *const DataSystem) [4]usize {
@@ -1523,7 +1551,7 @@ test "movementVisualDenseIndices resolves both rows from one slot lookup" {
     try std.testing.expectEqual(@as(usize, 0), indices.movement);
     try std.testing.expectEqual(@as(usize, 0), indices.visual);
     try std.testing.expectEqual(data.movementBodyDenseIndex(entity).?, indices.movement);
-    try std.testing.expectEqual(data_test_support.primitiveVisualDenseIndex(&data, entity).?, indices.visual);
+    try std.testing.expectEqual(primitiveVisualDenseIndex(&data, entity).?, indices.visual);
     try std.testing.expect(data.movementVisualDenseIndices(EntityId.invalid) == null);
 }
 
@@ -1796,11 +1824,11 @@ test "collision bounds store is columnar compact and rejects invalid bounds" {
     try std.testing.expect(data.collisionBoundsConst(first) != null);
     try std.testing.expect(data.collisionBoundsConst(third) != null);
     try std.testing.expect(data.collisionBoundsConst(second) == null);
-    try std.testing.expect(data_test_support.collisionBoundsDenseIndex(&data, first) != null);
-    try std.testing.expect(data_test_support.collisionBoundsDenseIndex(&data, third) != null);
-    try std.testing.expectEqual(@as(?usize, null), data_test_support.collisionBoundsDenseIndex(&data, second));
-    try std.testing.expectEqual(first.index, slice.entities[data_test_support.collisionBoundsDenseIndex(&data, first).?].index);
-    try std.testing.expectEqual(third.index, slice.entities[data_test_support.collisionBoundsDenseIndex(&data, third).?].index);
+    try std.testing.expect(collisionBoundsDenseIndex(&data, first) != null);
+    try std.testing.expect(collisionBoundsDenseIndex(&data, third) != null);
+    try std.testing.expectEqual(@as(?usize, null), collisionBoundsDenseIndex(&data, second));
+    try std.testing.expectEqual(first.index, slice.entities[collisionBoundsDenseIndex(&data, first).?].index);
+    try std.testing.expectEqual(third.index, slice.entities[collisionBoundsDenseIndex(&data, third).?].index);
 }
 
 test "collision response store is columnar compact and rejects invalid response data" {
@@ -1830,11 +1858,11 @@ test "collision response store is columnar compact and rejects invalid response 
     try std.testing.expect(data.collisionResponseConst(first) != null);
     try std.testing.expect(data.collisionResponseConst(third) != null);
     try std.testing.expect(data.collisionResponseConst(second) == null);
-    try std.testing.expect(data_test_support.collisionResponseDenseIndex(&data, first) != null);
-    try std.testing.expect(data_test_support.collisionResponseDenseIndex(&data, third) != null);
-    try std.testing.expectEqual(@as(?usize, null), data_test_support.collisionResponseDenseIndex(&data, second));
-    try std.testing.expectEqual(first.index, slice.entities[data_test_support.collisionResponseDenseIndex(&data, first).?].index);
-    try std.testing.expectEqual(third.index, slice.entities[data_test_support.collisionResponseDenseIndex(&data, third).?].index);
+    try std.testing.expect(collisionResponseDenseIndex(&data, first) != null);
+    try std.testing.expect(collisionResponseDenseIndex(&data, third) != null);
+    try std.testing.expectEqual(@as(?usize, null), collisionResponseDenseIndex(&data, second));
+    try std.testing.expectEqual(first.index, slice.entities[collisionResponseDenseIndex(&data, first).?].index);
+    try std.testing.expectEqual(third.index, slice.entities[collisionResponseDenseIndex(&data, third).?].index);
 }
 
 test "structural commands apply entity creation and component changes in order" {
@@ -1881,7 +1909,7 @@ test "structural commands apply entity creation and component changes in order" 
     const existing_ai = data_test_support.aiAgent(&data, existing).?;
     try std.testing.expectEqual(AiBehavior.pursue, existing_ai.active_behavior);
     try std.testing.expectEqual(@as(f32, 0.75), existing_ai.gain_pursue);
-    try std.testing.expectEqual(@as(f32, 14), data_test_support.steeringAgent(&data, existing).?.agent_radius);
+    try std.testing.expectEqual(@as(f32, 14), steeringAgent(&data, existing).?.agent_radius);
     // created one also has ai from template
     try std.testing.expect(data_test_support.aiAgent(&data, data.movementBodySliceConst().entities[0]) != null or data_test_support.aiAgent(&data, data.movementBodySliceConst().entities[1]) != null);
 }
@@ -1970,7 +1998,7 @@ test "steering agent component stores dense columns, supports set/get, rejects i
         .unavailable_backoff_steps = 23,
     });
 
-    const first_agent = data_test_support.steeringAgent(&data, first).?;
+    const first_agent = steeringAgent(&data, first).?;
     try std.testing.expectEqual(@as(f32, 9), first_agent.agent_radius);
     try std.testing.expectEqual(@as(f32, 3), first_agent.waypoint_tolerance);
     try std.testing.expectEqual(@as(f32, 42), first_agent.avoidance_radius);
@@ -1989,9 +2017,9 @@ test "steering agent component stores dense columns, supports set/get, rejects i
     const slice = data.steeringAgentSliceConst();
     try expectSteeringAgentColumnsAligned(slice);
     try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
-    try std.testing.expect(data_test_support.steeringAgent(&data, first) != null);
-    try std.testing.expect(data_test_support.steeringAgent(&data, third) != null);
-    try std.testing.expect(data_test_support.steeringAgent(&data, second) == null);
+    try std.testing.expect(steeringAgent(&data, first) != null);
+    try std.testing.expect(steeringAgent(&data, third) != null);
+    try std.testing.expect(steeringAgent(&data, second) == null);
     try std.testing.expect(data.steeringAgentDenseIndex(first) != null);
     try std.testing.expect(data.steeringAgentDenseIndex(third) != null);
     try std.testing.expectEqual(@as(?usize, null), data.steeringAgentDenseIndex(second));
@@ -2018,7 +2046,7 @@ test "ai agent via EntityTemplate in structural create and mask queries" {
     const agent = data_test_support.aiAgent(&data, entity).?;
     try std.testing.expectEqual(AiBehavior.wander, agent.active_behavior);
     try std.testing.expectEqual(@as(f32, 55), agent.wander_amplitude);
-    try std.testing.expectEqual(@as(f32, 13), data_test_support.steeringAgent(&data, entity).?.agent_radius);
+    try std.testing.expectEqual(@as(f32, 13), steeringAgent(&data, entity).?.agent_radius);
 }
 
 test "structural commands set stable asset references" {
@@ -2752,8 +2780,8 @@ test "destructible store is columnar and compact after removal" {
     // it back through its EntitySlot proves removeDestructibleAt fixed up the
     // slot's destructible_index rather than just leaving the dense columns paired.
     try std.testing.expectEqual(@as(u8, 3), data.destructibleConst(third).?.hit_points);
-    try std.testing.expectEqual(@as(?usize, null), data_test_support.destructibleDenseIndex(&data, second));
-    try std.testing.expect(data_test_support.destructibleDenseIndex(&data, third) != null);
+    try std.testing.expectEqual(@as(?usize, null), destructibleDenseIndex(&data, second));
+    try std.testing.expect(destructibleDenseIndex(&data, third) != null);
 }
 
 test "ai affect round-trips through set/get, retunes cold-only, and rejects invalid fields" {

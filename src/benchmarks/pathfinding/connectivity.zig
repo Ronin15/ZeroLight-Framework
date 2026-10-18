@@ -833,7 +833,7 @@ fn walledNeighbourCells(allocator: std.mem.Allocator, gap: ChunkCoord, side: u16
     const tiles: u32 = default_chunk_size_tiles;
     const side_chunks: u32 = side / default_chunk_size_tiles;
     const left: u32 = (@as(u32, gap.x) + 1) * tiles;
-    // Two cells above the chunk's bottom row. A 4-tile chunk puts that on row +2, which is
+    // One cell above the chunk's bottom row. A 4-tile chunk puts that on row +2, which is
     // where the wall sat, so the south label stays one cell tall.
     const wall_y: u32 = @as(u32, gap.y) * tiles + tiles - 2;
     if (side_chunks < 2 or left + 1 >= (side_chunks - 1) * tiles or wall_y + 1 >= side) return error.ConnectivitySplitStructureTooLarge;

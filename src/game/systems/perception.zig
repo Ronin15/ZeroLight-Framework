@@ -1113,6 +1113,7 @@ const CandidateRecorder = struct {
     scratch: [64]struct { entry: u32, to_x: f32, to_y: f32, dist2: f32 } = undefined,
     count: usize = 0,
 
+    // `pub`: the spatial query calls this on an `anytype` visitor from another file.
     pub fn visitLanes(self: *CandidateRecorder, lanes: *const NeighborLanes) LaneStop {
         const entries: [simd.lane_count]u32 = lanes.entry;
         inline for (0..simd.lane_count) |lane| {

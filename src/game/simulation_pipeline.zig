@@ -2933,7 +2933,7 @@ const TestAllocatorSwap = struct {
     plane_entry: std.mem.Allocator = undefined,
     threads: std.mem.Allocator = undefined,
 
-    pub const Targets = struct {
+    const Targets = struct {
         pipeline: *SimulationPipeline,
         frame: *SimulationFrame,
         data: *DataSystem,
@@ -2945,7 +2945,7 @@ const TestAllocatorSwap = struct {
     const owner_count = owner_names.len;
 
     /// Every owner set to `allocator`.
-    pub fn uniform(allocator: std.mem.Allocator) TestAllocatorSwap {
+    fn uniform(allocator: std.mem.Allocator) TestAllocatorSwap {
         var out: TestAllocatorSwap = .{};
         inline for (owner_names) |name| @field(out, name) = allocator;
         return out;
@@ -2956,7 +2956,7 @@ const TestAllocatorSwap = struct {
         set(targets, to);
     }
 
-    pub fn restore(self: *const TestAllocatorSwap, targets: Targets) void {
+    fn restore(self: *const TestAllocatorSwap, targets: Targets) void {
         set(targets, self.*);
     }
 
@@ -3097,7 +3097,7 @@ fn pinThreadedProfile(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) v
 const TestAllocatorCounters = struct {
     counters: [TestAllocatorSwap.owner_count]std.testing.FailingAllocator,
 
-    pub fn init() TestAllocatorCounters {
+    fn init() TestAllocatorCounters {
         var self: TestAllocatorCounters = undefined;
         for (&self.counters) |*counter| counter.* = std.testing.FailingAllocator.init(std.testing.allocator, .{});
         return self;
@@ -3791,7 +3791,7 @@ const NavSeamFixture = struct {
         pathfinding: PathfindingCapacity = sync_test_pathfinding,
     };
 
-    pub fn init(self: *NavSeamFixture, options: Options) !void {
+    fn init(self: *NavSeamFixture, options: Options) !void {
         const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
         self.meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
         errdefer self.meta.deinit();
@@ -3829,7 +3829,7 @@ const NavSeamFixture = struct {
         self.player.current_level = 1;
     }
 
-    pub fn deinit(self: *NavSeamFixture) void {
+    fn deinit(self: *NavSeamFixture) void {
         self.pipeline.deinit();
         self.threads.deinit();
         self.frame.deinit();
@@ -3839,7 +3839,7 @@ const NavSeamFixture = struct {
     }
 
     /// One step's stages with `intent`, without the commit seam.
-    pub fn update(self: *NavSeamFixture, intent: DigIntent) !void {
+    fn update(self: *NavSeamFixture, intent: DigIntent) !void {
         self.frame.beginStep();
         self.frame.dig_intent = intent;
         _ = try self.pipeline.update(.{

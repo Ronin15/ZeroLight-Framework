@@ -128,7 +128,15 @@ fn writeUnavailableWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: su
     try writer.print("unavailable={}", .{stats.output_count});
 }
 
+// Dispatch stores intents and distinct goals in these counters. Any other variant, or a
+// code that does not decode, keeps unavailable answers and projections.
 fn writeBurstWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    if (BurstCode.decode(stats.item_count) catch null) |code| {
+        if (code.variant == .dispatch) {
+            try writer.print("intents={} distinct_goals={}", .{ stats.output_count, stats.candidate_pairs });
+            return;
+        }
+    }
     try writer.print("unavailable={} projections={}", .{ stats.output_count, stats.candidate_pairs });
 }
 

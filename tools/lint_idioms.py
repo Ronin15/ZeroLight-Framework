@@ -31,6 +31,11 @@ reviewer diligence:
    least as many production call sites as distinct declaration shapes, and a
    non-`pub` method needs a production reference in its own file (methods of
    file-scope test fixtures excepted).
+   A `pub` member of a file-private test fixture is not reported when that
+   member's name is also a production declaration (`init`, `deinit`,
+   `contains`). A clean run does not prove those members are private. A
+   cross-file `anytype` hook on such a fixture (`visitLanes`) stays `pub`
+   because the caller is another file. Both are review checks, not lint hits.
    Every hit is removed from production; no annotation exempts one. The only
    exemptions are the owner's `OWNER_KEPT_API` entries.
 

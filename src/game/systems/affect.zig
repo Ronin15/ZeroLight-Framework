@@ -678,6 +678,18 @@ fn updateInline(system: *AffectSystem, ai_agents: ConstAiAgentSlice, data: *Data
 
 const data_test_support = @import("../data_system/test_support.zig");
 
+// The dense row of `id` in the store whose slot index field is `field`, or null when the
+// entity is dead or lacks the component.
+fn componentDenseRow(data: *const DataSystem, id: EntityId, comptime field: []const u8) ?usize {
+    const slot = data.resolveSlotConst(id) orelse return null;
+    const row = @field(slot.*, field) orelse return null;
+    return row;
+}
+
+fn aiAgentDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
+    return componentDenseRow(data, id, "ai_agent_index");
+}
+
 test "decays toward baseline with no perception/memory present, and fatigue responds to behavior" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
@@ -789,7 +801,7 @@ test "fatigue rises under seek and decays under wander across steps" {
     // retunes cold tunables and preserves hot arbitration state (mirrors how
     // arbitration itself would write this, and how the perception test above
     // flips target_visible via perceptionSlice()).
-    const agent_index = data_test_support.aiAgentDenseIndex(&data, entity).?;
+    const agent_index = aiAgentDenseIndex(&data, entity).?;
     data.aiAgentSlice().active_behavior[agent_index] = .wander;
     for (0..10) |_| _ = try updateInline(&sys, data.aiAgentSliceConst(), &data, &events, .{});
     try testing.expect(data_test_support.aiAffect(&data, entity).?.fatigue < seeking_fatigue);
