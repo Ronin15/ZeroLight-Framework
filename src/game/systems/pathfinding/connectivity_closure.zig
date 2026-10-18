@@ -3852,16 +3852,19 @@ const CappedNavRun = struct {
         if (comptime std.mem.eql(u8, name, "plan")) return self.plan_batch;
         if (comptime std.mem.eql(u8, name, "patch")) return self.patch_batch;
         if (comptime std.mem.eql(u8, name, "mark")) return self.mark_batch;
-        return @field(self.stats, name);
+        if (comptime @hasField(NavUpdateStats, name)) return @field(self.stats, name);
+        return @field(self.stats.perf, name);
     }
 };
 
-// The stage names of `CappedNavRun.batch`: every `BatchStats` of `NavUpdateStats`, the key
-// plan and record patch, and `nav_mark`.
+// The stage names of `CappedNavRun.batch`: every `BatchStats` of `NavUpdateStats` and its
+// `perf`, the key plan and record patch, and `nav_mark`.
 const capped_nav_stages = blk: {
     var names: []const []const u8 = &.{ "plan", "patch", "mark" };
-    for (@typeInfo(NavUpdateStats).@"struct".field_names, @typeInfo(NavUpdateStats).@"struct".field_types) |name, field_type| {
-        if (field_type == BatchStats) names = names ++ .{name};
+    for ([_]type{ NavUpdateStats, NavUpdateStats.Perf }) |Stats| {
+        for (@typeInfo(Stats).@"struct".field_names, @typeInfo(Stats).@"struct".field_types) |name, field_type| {
+            if (field_type == BatchStats) names = names ++ .{name};
+        }
     }
     break :blk names;
 };
@@ -3932,9 +3935,10 @@ test "a nav worker cap of zero keeps every graph, connectivity, and closure stag
             }
         }
         try std.testing.expectEqual(on_workers.len, matched);
-        inline for (.{ "conn_splits", "conn_merges", "conn_flood_nodes", "closure_links", "closure_a_rows", "records_patched" }) |name| {
-            try std.testing.expectEqual(@field(uncapped.stats, name), @field(capped.stats, name));
+        inline for (.{ "conn_splits", "conn_merges", "conn_flood_nodes", "closure_links", "closure_a_rows" }) |name| {
+            try std.testing.expectEqual(@field(uncapped.stats.perf, name), @field(capped.stats.perf, name));
         }
+        try std.testing.expectEqual(uncapped.stats.records_patched, capped.stats.records_patched);
     }
 }
 

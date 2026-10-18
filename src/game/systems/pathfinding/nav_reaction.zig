@@ -1482,10 +1482,10 @@ test "a terrain nav record reserve counts each growth of the marks, staging, or 
     try std.testing.expect(system.nav_mark_tallies.capacity >= maxRangeCount(all_bound, nav_mark_range_alignment_items));
 }
 
-// The terrain record's reserve, then `nav_mark` over `events`, returning its off-main time.
-fn markEventsForTest(system: *PathfindingSystem, events: []const SimulationEvent, world: *const WorldSystem, thread_system: ?*ThreadSystem) !u64 {
+// The terrain record's reserve, then `nav_mark` over `events`.
+fn markEventsForTest(system: *PathfindingSystem, events: []const SimulationEvent, world: *const WorldSystem, thread_system: ?*ThreadSystem) !void {
     try system.reserveTerrainNavRecord(events.len);
-    return markNavEvents(system, events, world, thread_system);
+    markNavEvents(system, events, world, thread_system);
 }
 
 test "threaded nav mark interpretation equals serial for a dense multi-chunk edit with runs straddling ranges and mixed tile and obstacle events" {
@@ -1506,7 +1506,7 @@ test "threaded nav mark interpretation equals serial for a dense multi-chunk edi
     defer serial.deinit();
     try serial.reserve(abstractCapacity());
     try serial.rebuildStaticNavGridWithWorld(&data, &world, null);
-    _ = try markEventsForTest(&serial, events.items, &world, null);
+    try markEventsForTest(&serial, events.items, &world, null);
     // The merge folds same-chunk tile runs, so there are fewer marks than events.
     try std.testing.expect(serial.nav_marks.items.len < events.items.len);
     for (serial.nav_marks.items) |mark| try std.testing.expectEqual(types.NavMarkKind.tile_box, mark.kind);
@@ -1517,8 +1517,8 @@ test "threaded nav mark interpretation equals serial for a dense multi-chunk edi
         try threaded.reserve(abstractCapacity());
         try threaded.rebuildStaticNavGridWithWorld(&data, &world, null);
         threaded.nav_controls = .{ .adaptive = false, .items_per_range = items_per_range };
-        const off_main = try markEventsForTest(&threaded, events.items, &world, &threads);
-        try std.testing.expect(off_main != 0);
+        try markEventsForTest(&threaded, events.items, &world, &threads);
+        if (comptime runtime_perf_log.enabled) try std.testing.expect(!threaded.perf.last_mark_batch.ran_inline);
         try std.testing.expectEqual(serial.nav_marks.items.len, threaded.nav_marks.items.len);
         for (serial.nav_marks.items, threaded.nav_marks.items) |a, b| try std.testing.expectEqual(a, b);
     }

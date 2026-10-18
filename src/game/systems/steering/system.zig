@@ -1395,12 +1395,7 @@ fn expectSerialSelectionAndGrid(stats: SteeringStats) !void {
 fn behaviorStats(stats: SteeringStats) SteeringStats {
     var behavior = stats;
     behavior.batch = .{};
-    behavior.perf.agents_batch = .{};
-    behavior.perf.select_resolve_batch = .{};
-    behavior.perf.select_claim_batch = .{};
-    behavior.perf.directions_batch = .{};
-    behavior.perf.grid_bucket_batch = .{};
-    behavior.perf.grid_sort_batch = .{};
+    behavior.perf = .{};
     behavior.select_ns = 0;
     behavior.snapshot_ns = 0;
     behavior.directions_ns = 0;

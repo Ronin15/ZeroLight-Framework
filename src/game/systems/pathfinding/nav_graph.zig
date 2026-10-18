@@ -3294,7 +3294,7 @@ fn routes(system: *PathfindingSystem, data: *DataSystem, world: *const WorldSyst
         .start = center(start, tile),
         .goal = center(goal, tile),
     });
-    const stats = try updatePathfindingInline(&system, &stream, 8, .{});
+    const stats = try updatePathfindingInline(system, &stream, 8, .{});
     return stats.available_results == 1;
 }
 

@@ -5009,8 +5009,9 @@ test "an elastic resize keeps a building group field building" {
 const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 
 // Fills `system`'s 64-entry cache with routes [0, 64), then publishes routes [64, 80) into
-// the full cache inline without flushing: the flush has victims in the log and adds in
-// every publish band.
+// the full cache inline without flushing (the production update minus its closing flush,
+// on a 0-worker thread system): the flush has victims in the log and adds in every
+// publish band.
 fn prepareMixedFlush(system: *PathfindingSystem, requester: EntityId) !void {
     for (0..4) |batch| try solveRegistryRoutes(system, requester, 24, batch * 16, 16, 16, null, .{});
     try std.testing.expectEqual(@as(usize, 64), system.completed.count());
@@ -5020,8 +5021,10 @@ fn prepareMixedFlush(system: *PathfindingSystem, requester: EntityId) !void {
         const route = registryRoute(index, 24);
         try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
     }
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0, .items_per_range = std.math.maxInt(u32) });
+    defer threads.deinit();
     var stats = PathfindingStats{};
-    try system.updateInline(&stream, 16, .{}, &stats);
+    try system.updateThreaded(&stream, 16, .{ .thread_system = &threads, .config = .{} }, &stats);
     try std.testing.expect(stats.cache_evictions != 0);
     try std.testing.expect(system.completed.core.ownerLog().len != 0 and system.publish_ranges != 0);
 }

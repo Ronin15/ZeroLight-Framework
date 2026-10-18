@@ -1022,7 +1022,7 @@ test "threaded eviction with paths and fields equals serial over a dense change 
         var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer group.deinit();
         try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = tileCenter(20, 20), .goal = tileCenter(26, 26) });
-        _ = try updatePathfindingInline(&system, &group, 16, .{ .max_solve_admissions_per_step = 0 });
+        _ = try updatePathfindingInline(system, &group, 16, .{ .max_solve_admissions_per_step = 0 });
     }
     systems[1].nav_controls = .{ .adaptive = false, .items_per_range = 1 };
     try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);
@@ -1098,7 +1098,7 @@ test "a nav worker cap of zero keeps the mark and eviction stages inline on a mu
         var group = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer group.deinit();
         try appendPathRequest(&group, .{ .entity = requester, .kind = .group, .start = tileCenter(20, 20), .goal = tileCenter(26, 26) });
-        _ = try updatePathfindingInline(&system, &group, 16, .{ .max_solve_admissions_per_step = 0 });
+        _ = try updatePathfindingInline(system, &group, 16, .{ .max_solve_admissions_per_step = 0 });
         system.nav_controls = .{ .adaptive = false, .items_per_range = 1, .max_worker_threads = cap };
     }
     try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);

@@ -5933,7 +5933,7 @@ test "a plane traversal past a failed population seam reserves its nav record fr
     // The gather's windows were short of the AI rows too: grown once on main, then dispatched.
     try std.testing.expectEqual(@as(u64, 1), fixture.pipeline.plane_entry.windows_grown);
     try std.testing.expectEqual(@as(usize, 1), step.plane_entry_windows_grown);
-    try std.testing.expect(step.plane_entry.range_count >= 2 and !step.plane_entry.ran_inline);
+    try std.testing.expect(step.perf.plane_entry.range_count >= 2 and !step.perf.plane_entry.ran_inline);
     try std.testing.expectEqual(npc_count, fixture.frame.events.stats.world_tile_changed);
     try std.testing.expectEqual(@as(usize, 1), fixture.frame.events.range_stats.items.len);
     for (landings.items) |cell| try std.testing.expect(!denseTileBlocksMovement(&fixture.world, floor1, cell.x, cell.y));

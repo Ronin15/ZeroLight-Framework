@@ -1927,6 +1927,8 @@ test "collision broadphase filters y misses before narrowphase" {
 }
 
 test "collision broadphase uses simd groups while preserving contact order" {
+    // The sweep counts its lane groups only with the perf log.
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const first = try addBody(&data, 0, 0, 10);
@@ -3051,6 +3053,8 @@ test "collision same world_level still emits XY overlap contacts" {
 }
 
 test "collision simd broadphase same-level gate filters mixed world_levels" {
+    // The sweep counts its lane groups only with the perf log.
+    if (!runtime_perf_log.enabled) return error.SkipZigTest;
     // ≥5 mutually X-overlapping proxies so the first body's sweep hits a lane group
     // (broadphase_simd_groups > 0). Levels span 0 and 1, so the run gate is exercised
     // inside that group.

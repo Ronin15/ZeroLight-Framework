@@ -2072,10 +2072,11 @@ test "the details table's range columns read inline for an inline batch, never a
 }
 
 test "nav main split prints each section, the inline stage time, and the rest per sample" {
+    if (!diagnostics_enabled) return error.SkipZigTest;
     var buffer: [320]u8 = undefined;
     try std.testing.expectEqualStrings("", formatNavMainInto(&buffer, null));
     try std.testing.expectEqualStrings("", formatNavMainInto(&buffer, NavMainSummary{}));
-    const stats = NavUpdateStats{
+    const stats = NavUpdateStats{ .perf = .{
         .inline_stage_ns = 20_000,
         .main = .{
             .mark_ns = 1_000,
@@ -2088,7 +2089,7 @@ test "nav main split prints each section, the inline stage time, and the rest pe
             .closure_ns = 8_000,
             .evict_ns = 9_000,
         },
-    };
+    } };
     // Two samples: one reaction, then an iteration of a reaction merged from another summary.
     var summary = NavMainSummary{};
     summary.add(70_000, stats);
