@@ -73,6 +73,7 @@ pub fn setPathStageTuners(system: *PathfindingSystem, case: suite.BenchmarkCase)
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.group_field_stall = tuner;
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.publish_copy = tuner;
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.registry_flush = tuner;
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.registry_flush_count = tuner;
     if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.resize_copy = tuner;
     if (suite.adaptiveTunerForCase(case, goal_scan_range_alignment_items)) |tuner| system.tuners.goal_scan = tuner;
     if (suite.adaptiveTunerForCase(case, goal_project_range_alignment_items)) |tuner| system.tuners.goal_project = tuner;
@@ -105,8 +106,9 @@ pub const StageReport = struct {
     solve_main_ns: u128 = 0,
     publish_ns: u128 = 0,
     // Intake, group-field advance, group-field begin, solve, publish copy, registry flush,
-    // resize copy.
+    // resize copy. The flush count is separate: it is not a perf-log key.
     shapes: suite.StageShapes(update_stage_count) = .{},
+    count: suite.StageShapes(1) = .{},
     // Route groups that count unsolved routes: the last timed step's outcome.
     routes: ?RouteOutcome = null,
     // Path-registry entries the timed updates added and removed.
@@ -120,11 +122,12 @@ pub const StageReport = struct {
     pub fn add(self: *StageReport, elapsed_ns: u64, stats: PathfindingStats) void {
         self.samples += 1;
         self.timed_ns += elapsed_ns;
-        self.main_ns += elapsed_ns -| offMainStageNs(stats);
+        self.main_ns += elapsed_ns -| offMainStageNs(stats) -| offMainNs(stats.registry_flush_count_batch);
         self.accept_main_ns += stats.accept_ns -| offMainNs(stats.intake_batch);
         self.group_main_ns += stats.group_service_ns -| (offMainNs(stats.perf.group_field_batch) + offMainNs(stats.perf.group_field_begin_batch));
         self.solve_main_ns += stats.solve_ns -| offMainNs(stats.solve_batch);
         self.publish_ns += stats.publish_ns -| offMainNs(stats.perf.publish_copy_batch);
+        self.count.add(.{stats.registry_flush_count_batch});
         self.registrations_added += stats.perf.registrations_added;
         self.registrations_removed += stats.perf.registrations_removed;
         self.unavailable += stats.perf.unavailable_results;
@@ -138,13 +141,15 @@ pub const StageReport = struct {
         var labels: [update_stage_count][]const u8 = undefined;
         for (&buffers, &labels, 0..) |*buffer, *label, index| label.* = self.shapes.label(index, buffer);
         const samples: u128 = self.samples * std.time.ns_per_us;
-        details.print("intake={s} group_field={s}/{s} solve={s} publish_copy={s} registry_flush={s} resize_copy={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us", .{
+        var count_buffer: [48]u8 = undefined;
+        details.print("intake={s} group_field={s}/{s} solve={s} publish_copy={s} registry_flush={s} registry_flush_count={s} resize_copy={s} main={}us ({}%) main_phases accept={}us group={}us solve={}us publish={}us", .{
             labels[0],
             labels[1],
             labels[2],
             labels[3],
             labels[4],
             labels[5],
+            self.count.label(0, &count_buffer),
             labels[6],
             @as(u64, @intCast(self.main_ns / self.samples / std.time.ns_per_us)),
             @as(u64, @intCast(self.main_ns * 100 / self.timed_ns)),
@@ -387,11 +392,13 @@ pub const ReactionStages = struct {
 // --details.
 pub const EvictReport = struct {
     stages: ReactionStages = .{},
+    count: suite.StageShapes(1) = .{},
     visited: usize = 0,
     evicted: usize = 0,
 
     pub fn add(self: *EvictReport, reaction: Reaction) void {
         self.stages.add(reaction, .{ reaction.stats.perf.evict_count_batch, reaction.stats.evict_batch, reaction.stats.perf.evict_flush_batch });
+        self.count.add(.{reaction.stats.perf.registry_flush_count_batch});
         self.visited = reaction.stats.perf.evict_entries_visited;
         self.evicted = reaction.stats.perf.evicted_results;
     }
@@ -400,11 +407,13 @@ pub const EvictReport = struct {
         if (self.stages.timed_ns == 0) return;
         var shapes: [3][48]u8 = undefined;
         const labels = self.stages.labels(&shapes);
+        var count_buffer: [48]u8 = undefined;
         var main_buffer: [320]u8 = undefined;
-        details.print("evict_count={s} evict={s} evict_flush={s} main={}us ({}%) visited={} evicted={}{s}\n", .{
+        details.print("evict_count={s} evict={s} evict_flush={s} registry_flush_count={s} main={}us ({}%) visited={} evicted={}{s}\n", .{
             labels[0],
             labels[1],
             labels[2],
+            self.count.label(0, &count_buffer),
             self.stages.mainUsPerSample(),
             self.stages.mainPercent(),
             self.visited,

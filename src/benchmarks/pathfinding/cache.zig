@@ -440,6 +440,7 @@ const ShrinkReport = struct {
     step_ns: u128 = 0,
     hold_ns: u128 = 0,
     copy_ns: u128 = 0,
+    count: suite.StageShapes(1) = .{},
     last: ElasticShrink = .{},
 
     fn add(self: *ShrinkReport, shrink: ElasticShrink) void {
@@ -447,6 +448,7 @@ const ShrinkReport = struct {
         self.step_ns += shrink.step_ns;
         self.hold_ns += shrink.hold_ns;
         self.copy_ns += shrink.copy_ns;
+        self.count.add(.{shrink.step_stats.registry_flush_count_batch});
         self.last = shrink;
     }
 
@@ -455,7 +457,8 @@ const ShrinkReport = struct {
         const resize_ns = self.step_ns -| self.hold_ns;
         const resize_main_ns = resize_ns -| self.copy_ns;
         const samples: u128 = self.samples * std.time.ns_per_us;
-        details.print("agents {}->{} cache {}->{} kept={} evicted={} moved={} step={}us hold={}us resize={}us ({}% of step) copy={}us resize_main={}us\n", .{
+        var count_buffer: [48]u8 = undefined;
+        details.print("agents {}->{} cache {}->{} kept={} evicted={} moved={} step={}us hold={}us resize={}us ({}% of step) copy={}us resize_main={}us registry_flush_count={s}\n", .{
             self.last.agent_capacity_before,
             self.last.agent_capacity_after,
             self.last.cache_capacity_before,
@@ -469,6 +472,7 @@ const ShrinkReport = struct {
             @as(u64, @intCast(resize_ns * 100 / self.step_ns)),
             @as(u64, @intCast(self.copy_ns / samples)),
             @as(u64, @intCast(resize_main_ns / samples)),
+            self.count.label(0, &count_buffer),
         });
     }
 };
@@ -583,8 +587,8 @@ fn runElasticShrink(
     // and registry owner heads cut to the new capacity.
     if (system.completed.pendingMoves().len != 0 or system.completed.inline_pages.items.len != system.completed.inline_page_count) return error.ElasticShrinkPagesPending;
     if (system.completed.core.ownerLog().len != 0) return error.ElasticShrinkOpsPending;
-    for (&system.path_index) |*shard| {
-        if (shard.owner_heads.items.len > shrink.cache_capacity_after) return error.ElasticShrinkOwnerHeadsPending;
+    for (&system.path_index.pools) |*pool| {
+        if (pool.owner_heads.items.len > shrink.cache_capacity_after) return error.ElasticShrinkOwnerHeadsPending;
     }
 
     // A shrink keeps an entry's key and moves it only to another owner id.

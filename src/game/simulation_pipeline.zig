@@ -3343,9 +3343,7 @@ fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: AdaptiveW
         }
 
         fn registry(pathfinding: *const PathfindingSystem) usize {
-            var capacity: usize = 0;
-            for (&pathfinding.path_index) |*shard| capacity += shard.slot_keys.len + shard.entries.capacity + shard.owner_heads.capacity;
-            return capacity;
+            return pathfinding_test_support.registryContentBytes(&pathfinding.path_index);
         }
     };
     const seam_before = seam_state.of(&pipeline.pathfinding);
@@ -6877,12 +6875,10 @@ test "a pipeline built over steering agents sizes pathfinding for them, so its f
     const failing = std.testing.failing_allocator;
     system.allocator = failing;
     system.graph.allocator = failing;
-    for (&system.path_index) |*shard| shard.allocator = failing;
     threads.allocator = failing;
     const first = system.update(&stream, agent_count, &threads, .{ .adaptive = false, .items_per_range = 8, .max_solve_admissions_per_step = 0 });
     system.allocator = real_allocator;
     system.graph.allocator = real_allocator;
-    for (&system.path_index) |*shard| shard.allocator = real_allocator;
     threads.allocator = threads_allocator;
     const intake_stats = try first;
     try std.testing.expect(!intake_stats.intake_batch.ran_inline);

@@ -30,9 +30,9 @@ const keyLevel = @import("../chunk_list_map.zig").keyLevel;
 const keyChunk = @import("../chunk_list_map.zig").keyChunk;
 const ChunkGeometry = @import("../../world/terrain.zig").ChunkGeometry;
 const ChunkBits = @import("../../world/terrain.zig").ChunkBits;
-const ChunkListMap = @import("../chunk_list_map.zig").ChunkListMap;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
-const no_entry = @import("../chunk_list_map.zig").no_entry;
+const registrationLen = @import("publish.zig").registrationLen;
+const registrationRun = @import("publish.zig").registrationRun;
 const GroupField = @import("group_field.zig").GroupField;
 const ResultCache = @import("caches.zig").ResultCache;
 const publish = @import("publish.zig");
@@ -44,7 +44,7 @@ const StageTimer = runtime_perf_log.StageTimer;
 const no_owner = @import("types.zig").no_owner;
 const CellCursor = @import("types.zig").CellCursor;
 const registry_shard_count = @import("types.zig").registry_shard_count;
-const registryShard = @import("types.zig").registryShard;
+const RegRecord = @import("types.zig").RegRecord;
 const evict_range_alignment_items = @import("types.zig").evict_range_alignment_items;
 const hit_window_alignment_items = @import("types.zig").hit_window_alignment_items;
 
@@ -62,8 +62,8 @@ pub fn evictLevel(self: *PathfindingSystem, level: u16, stats: *NavUpdateStats) 
     for (0..self.graph.chunkCount()) |chunk| {
         // A level's chunk count stays below 2^31.
         const key = chunkKey(level, @intCast(chunk));
-        var owners = self.path_index[registryShard(key)].iterator(key);
-        while (owners.next()) |owner| {
+        const run = registrationRun(&self.path_index.directory, key);
+        for (run.owner[0..run.len]) |owner| {
             // Another run of the owner may have evicted it already.
             if (!self.completed.core.records.items[owner].live) continue;
             // A live record's key holds its probe slot.
@@ -82,12 +82,9 @@ pub fn evictLevel(self: *PathfindingSystem, level: u16, stats: *NavUpdateStats) 
 /// flush tuner has no profile for, so a tuned dispatch runs at a fixed shape of about one
 /// pair per range, outside the tuner (as a shrink's flush), and the marks batch's flush
 /// stays the stage's one sample of the step.
-pub fn flushRebuildEvictions(self: *PathfindingSystem, thread_system: ?*ThreadSystem) BatchStats {
-    var dispatch = navDispatch(self, thread_system, &self.tuners.evict_flush);
-    if (dispatch) |*stage| {
-        // A flush with no publish weighs each pair at its ops plus one.
-        if (stage.adaptive and stage.items_per_range == null) stage.items_per_range = self.completed.core.ownerLog().len + 1;
-    }
+pub fn flushRebuildEvictions(self: *PathfindingSystem, thread_system: ?*ThreadSystem) error{OutOfMemory}!BatchStats {
+    self.registry_flush_fixed = true;
+    const dispatch = navDispatch(self, thread_system, &self.tuners.evict_flush);
     return publish.flushRegistry(self, dispatch, null);
 }
 
@@ -118,7 +115,7 @@ pub fn prepareEviction(self: *PathfindingSystem, thread_system: ?*ThreadSystem, 
     const count_shape = stageShape(count_dispatch, keys.len, evict_range_alignment_items);
     var job = EvictCountJob{
         .changed_keys = keys,
-        .readers = registryReaders(self),
+        .directory = &self.path_index.directory,
         .geometry = self.graph.chunkGeometry(),
         .items = self.evict_items.items,
         .range_count = count_shape.range_count,
@@ -151,7 +148,7 @@ pub fn prepareEviction(self: *PathfindingSystem, thread_system: ?*ThreadSystem, 
 /// changed cells. It writes the hits into the item's window; the main thread removes them
 /// in item order (paths, then fields), O(1) each, and the flush unlinks their
 /// registrations.
-pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_system: ?*ThreadSystem, stats: *NavUpdateStats) void {
+pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_system: ?*ThreadSystem, stats: *NavUpdateStats) error{OutOfMemory}!void {
     const keys = batch.changed_keys;
     std.debug.assert(keys.len == self.evict_items.items.len and batch.changed_masks.len == keys.len);
     if (keys.len != 0) {
@@ -159,7 +156,7 @@ pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_syste
             .cache = &self.completed,
             .changed_keys = keys,
             .masks = batch.changed_masks,
-            .readers = registryReaders(self),
+            .directory = &self.path_index.directory,
             .fields = self.group_fields.items,
             .geometry = self.graph.chunkGeometry(),
             .items = self.evict_items.items,
@@ -188,11 +185,14 @@ pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_syste
     }
     const flush_dispatch = navDispatch(self, thread_system, &self.tuners.evict_flush);
     const flush_timer = StageTimer.begin();
-    const flush_batch = publish.flushRegistry(self, flush_dispatch, null);
+    const flush_batch = try publish.flushRegistry(self, flush_dispatch, null);
     // The flush's code outside its dispatch, inline or not.
-    stats.addMain(.evict_ns, flush_timer.lap() -| flush_batch.batch_duration_ns);
+    // Both dispatches, inline or not: what remains is the flush's code outside them.
+    stats.addMain(.evict_ns, flush_timer.lap() -| flush_batch.batch_duration_ns -| self.registry_flush_count_batch.batch_duration_ns);
     if (comptime runtime_perf_log.enabled) {
         stats.perf.evict_flush_batch = flush_batch;
+        stats.perf.registry_flush_count_batch = self.registry_flush_count_batch;
+        stats.addStageTime(self.registry_flush_count_batch);
         stats.addStageTime(stats.perf.evict_count_batch);
         stats.addStageTime(stats.evict_batch);
         stats.addStageTime(flush_batch);
@@ -201,13 +201,6 @@ pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_syste
 
 fn countEvictGrowth(self: *PathfindingSystem) void {
     self.evict_growth.record(1, .info, "path eviction scratch grew to {d} keys and {d} hits", .{ self.evict_items.capacity, self.evict_hits.capacity });
-}
-
-// Lookups of every path registry shard, for readers on workers while nothing writes.
-fn registryReaders(self: *const PathfindingSystem) [registry_shard_count]ChunkListMap.Reader {
-    var readers: [registry_shard_count]ChunkListMap.Reader = undefined;
-    for (&readers, &self.path_index) |*reader, *shard| reader.* = shard.reader();
-    return readers;
 }
 
 fn orderKey(key: u64, item: u64) std.math.Order {
@@ -244,14 +237,14 @@ fn chunkAround(geometry: ChunkGeometry, level: u16, x: usize, y: usize, dx: isiz
 const EvictCountJob = struct {
     // The batch's changed keys, sorted.
     changed_keys: []const u64,
-    readers: [registry_shard_count]ChunkListMap.Reader,
+    directory: *const publish.RegistryDirectory,
     geometry: ChunkGeometry,
     items: []EvictItem,
     range_count: usize,
 };
 
-// SIMD verdict: scalar. Binary searches over sorted u64 keys and hash probes; simd.zig has
-// no u64 lanes.
+// SIMD verdict: scalar. Binary searches over sorted u64 keys; the registration count is one
+// slot read. simd.zig has no u64 lanes.
 fn evictCountJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *EvictCountJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
@@ -265,7 +258,7 @@ fn evictCountJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         inline for (.{ -1, 0, 1 }) |dy| inline for (.{ -1, 0, 1 }) |dx| {
             if (chunkAround(job.geometry, level, x, y, dx, dy)) |halo| {
                 // A halo key with no registration has nothing to walk.
-                const registrations = job.readers[registryShard(halo.key)].keyCount(halo.key);
+                const registrations = registrationLen(job.directory, halo.key);
                 if (registrations != 0 and ownsHalo(job.changed_keys[0..index], key, job.geometry, level, halo.x, halo.y)) {
                     item.owned |= haloBit(dx, dy);
                     item.bound += registrations;
@@ -295,7 +288,7 @@ const EvictJob = struct {
     // The batch's changed keys, sorted, and each one's flipped cells.
     changed_keys: []const u64,
     masks: []const ChunkBits,
-    readers: [registry_shard_count]ChunkListMap.Reader,
+    directory: *const publish.RegistryDirectory,
     fields: []const GroupField,
     geometry: ChunkGeometry,
     items: []EvictItem,
@@ -303,8 +296,8 @@ const EvictJob = struct {
     range_count: usize,
 };
 
-// SIMD verdict: the dilation is word-parallel scalar (`dilateChanged3x3`); the list walks
-// are pointer chases and the cell and field tests one bit or word per cell.
+// SIMD verdict: the dilation is word-parallel scalar (`dilateChanged3x3`); the registration
+// columns are contiguous and the cell and field tests are one bit or word per cell.
 fn evictJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *EvictJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
@@ -328,13 +321,11 @@ fn evictJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
                 };
                 const dilated = dilateChanged3x3(job.geometry.chunk_tiles, &around);
                 if (!std.mem.allEqual(u64, &dilated, 0)) {
-                    const reader = job.readers[registryShard(halo.key)];
-                    var entry = reader.head(halo.key);
-                    while (entry != no_entry) : (entry = reader.next_entries[entry]) {
+                    const run = registrationRun(job.directory, halo.key);
+                    for (run.owner[0..run.len], run.order[0..run.len]) |owner, order| {
                         if (comptime runtime_perf_log.enabled) visited += 1;
-                        const owner = reader.owners[entry];
                         if (owner == last_hit) continue;
-                        if (!runHits(job.cache, job.geometry, owner, reader.orders[entry], level, halo.x, halo.y, &dilated)) continue;
+                        if (!runHits(job.cache, job.geometry, owner, order, level, halo.x, halo.y, &dilated)) continue;
                         // Each entry hits once, and the bound counts the owned lists' entries.
                         std.debug.assert(hits < item.bound);
                         job.hits[item.base + hits] = owner;
@@ -699,18 +690,22 @@ fn publishTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: 
     system.completed.core.beginPublish();
     const claimed = system.completed.claim(key, 0, corridor.len, corridor[0].level, corridor[corridor.len - 1], corridor[corridor.len - 1].cell, step, stats);
     types.writeStitched(system.completed.destination(claimed), corridor);
-    _ = publish.flushRegistry(system, null, null);
     const view = types.stitchedView(system.completed.destination(claimed), corridor.len);
     var starts: [64]u16 = undefined;
     var counts: [registry_shard_count]u32 = @splat(0);
     const geometry = system.graph.chunkGeometry();
     const run_count = solve.splitRuns(geometry, view.cells, view.levels, 0, &starts, &counts);
+    var records: std.ArrayList(RegRecord) = .empty;
+    defer records.deinit(std.testing.allocator);
     for (starts[0..run_count]) |start| {
-        const run_key = chunkKey(view.levels[start], geometry.chunkOfCell(view.cells[start]));
-        const shard = &system.path_index[registryShard(run_key)];
-        try shard.reserve(1, 1, system.completed.logicalCapacity());
-        shard.add(claimed.owner, run_key, start);
+        try records.append(std.testing.allocator, .{
+            .key = chunkKey(view.levels[start], geometry.chunkOfCell(view.cells[start])),
+            .owner = claimed.owner,
+            .order = start,
+        });
     }
+    try test_support.stageRegistryRuns(system, records.items);
+    _ = try publish.flushRegistry(system, null, null);
 }
 
 // Flips one cell in each of 20 chunks (a 5 x 4 chunk block) of a 24-tile registry world.
@@ -867,7 +862,7 @@ fn expectHaloOwnedOnce(system: *const PathfindingSystem) !void {
         inline for (.{ -1, 0, 1 }) |dy| inline for (.{ -1, 0, 1 }) |dx| {
             if (chunkAround(chunks, keyLevel(key), x, y, dx, dy)) |halo| {
                 // A key whose runs were all evicted holds none now; it was owned if it held any.
-                if (system.path_index[registryShard(halo.key)].reader().keyCount(halo.key) != 0) try std.testing.expect(owned.contains(halo.key));
+                if (registrationLen(&system.path_index.directory, halo.key) != 0) try std.testing.expect(owned.contains(halo.key));
             }
         };
     }

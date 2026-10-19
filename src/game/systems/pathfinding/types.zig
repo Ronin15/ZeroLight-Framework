@@ -340,9 +340,10 @@ pub const NavUpdateStats = struct {
         plan_batch: BatchStats = .{},
         patch_batch: BatchStats = .{},
         // Path eviction: the pre-commit bound count over the changed keys and the registry
-        // flush of the removals.
+        // flush of the removals. The flush count dispatch is bench output, not a perf-log key.
         evict_count_batch: BatchStats = .{},
         evict_flush_batch: BatchStats = .{},
+        registry_flush_count_batch: BatchStats = .{},
         // Registry entries the halo walk visited, the cached results it evicted, and the group
         // fields a changed cell next to a costed cell dropped.
         evict_entries_visited: usize = 0,
@@ -542,9 +543,10 @@ pub const PathfindingStats = struct {
     solve_batch: BatchStats = .{},
     // Request classification (`path_intake`); inline stages report `ran_inline`.
     intake_batch: BatchStats = .{},
-    // The path registry's owner ops and adds (`registry_flush`) and a shrink's byte moves
-    // (`resize_copy`).
+    // The path registry's owner ops and adds. `registry_flush` is the apply; the count
+    // dispatch is not a perf-log key. A shrink's byte moves are `resize_copy`.
     registry_flush_batch: BatchStats = .{},
+    registry_flush_count_batch: BatchStats = .{},
     resize_copy_batch: BatchStats = .{},
     // Per-phase update timings (ns); zero when perf logging is disabled. Recorded
     // as pathfinding_* sub-stage timers that break down pipeline_pathfinding.
@@ -877,11 +879,12 @@ pub const CellCursor = struct {
     }
 };
 
-/// Path-registry shards. Each key lives in one shard, so a flush threads over shards.
+/// Path-registry shards. Each chunk key lives in one shard, so a flush threads over shards
+/// and a shard worker never writes another shard's chunks or inverse nodes.
 pub const registry_shard_count: usize = 16;
 
-/// The shard of registry key `key`: the top bits of an integer hash that is independent of
-/// the shard tables' Fibonacci homes, so one shard's keys spread over its whole table.
+/// The shard of registry key `key`: the top bits of an integer hash, so one shard's chunks
+/// spread across the directory instead of clustering in one corner of a level.
 pub fn registryShard(key: u64) usize {
     return @intCast(std.hash.int(key) >> registry_shard_shift);
 }

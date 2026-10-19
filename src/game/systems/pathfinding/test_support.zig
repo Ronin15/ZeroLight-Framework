@@ -80,7 +80,8 @@ const span_words = @import("connectivity_closure.zig").span_words;
 const bitSetBytesFor = @import("../chunk_list_map.zig").bitSetBytesFor;
 const OrderedIndexSet = @import("../chunk_list_map.zig").OrderedIndexSet;
 const FieldElem = @import("../chunk_list_map_test_support.zig").FieldElem;
-const chunkListMapResidentBytes = @import("../chunk_list_map_test_support.zig").residentBytes;
+const directoryResidentBytes = @import("../chunk_list_map_test_support.zig").directoryResidentBytes;
+const inversePoolResidentBytes = @import("../chunk_list_map_test_support.zig").inversePoolResidentBytes;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const RegRecord = types.RegRecord;
 const PathSolveResult = types.PathSolveResult;
@@ -1117,17 +1118,52 @@ pub fn publishTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []co
     system.completed.core.beginPublish();
     const claimed = system.completed.claim(key, path.len, 0, 0, .{ .level = 0, .cell = path[path.len - 1] }, path[path.len - 1], step, stats);
     @memcpy(system.completed.destination(claimed)[0..path.len], path);
-    _ = publish.flushRegistry(system, null, null);
     const starts = try std.testing.allocator.alloc(u16, path.len);
     defer std.testing.allocator.free(starts);
     var counts: [registry_shard_count]u32 = @splat(0);
     const geometry = system.graph.chunkGeometry();
     const run_count = solve.splitRuns(geometry, path, null, 0, starts, &counts);
+    var records: std.ArrayList(RegRecord) = .empty;
+    defer records.deinit(std.testing.allocator);
     for (starts[0..run_count]) |start| {
-        const run_key = chunkKey(0, geometry.chunkOfCell(path[start]));
-        const shard = &system.path_index[registryShard(run_key)];
-        try shard.reserve(1, 1, system.completed.logicalCapacity());
-        shard.add(claimed.owner, run_key, start);
+        try records.append(std.testing.allocator, .{
+            .key = chunkKey(0, geometry.chunkOfCell(path[start])),
+            .owner = claimed.owner,
+            .order = start,
+        });
+    }
+    try stageRegistryRuns(system, records.items);
+    _ = try publish.flushRegistry(system, null, null);
+}
+
+/// One publish range of `records`, shard-ordered the way `publish_copy` writes them, with
+/// each shard's inverse pool reserved for the adds. The caller flushes.
+pub fn stageRegistryRuns(system: *PathfindingSystem, records: []const RegRecord) !void {
+    var counts: [registry_shard_count]u32 = @splat(0);
+    for (records) |record| counts[registryShard(record.key)] += 1;
+    if (system.publish_bands.capacity < 1) try system.publish_bands.ensureTotalCapacity(system.allocator, 1);
+    if (system.publish_range_bases.capacity < 1) try system.publish_range_bases.ensureTotalCapacity(system.allocator, 1);
+    if (system.reg_buckets.capacity < records.len) try system.reg_buckets.ensureTotalCapacity(system.allocator, @max(records.len, 1));
+    system.publish_bands.items.len = 1;
+    system.publish_range_bases.items.len = 1;
+    system.publish_range_bases.items[0] = 0;
+    system.reg_buckets.items.len = records.len;
+    var cursors: [registry_shard_count]usize = undefined;
+    var next: usize = 0;
+    for (&cursors, counts) |*cursor, count| {
+        cursor.* = next;
+        next += count;
+    }
+    for (records) |record| {
+        const shard = registryShard(record.key);
+        system.reg_buckets.items[cursors[shard]] = record;
+        cursors[shard] += 1;
+    }
+    system.publish_bands.items[0] = .{ .counts = counts };
+    system.publish_ranges = 1;
+    for (&system.path_index.pools, counts) |*pool, count| {
+        try pool.reserveNodes(system.allocator, count);
+        try pool.reserveOwners(system.allocator, system.completed.logicalCapacity());
     }
 }
 
@@ -1315,26 +1351,35 @@ pub fn expectRegistryMatchesCache(system: *const PathfindingSystem) !void {
         const run_count = solve.splitRuns(geometry, path.cells, path.levels, path.level, starts, &counts);
         for (starts[0..run_count]) |start| try expected.append(allocator, .{ .key = chunkKey(path.levelAt(start), geometry.chunkOfCell(path.cells[start])), .owner = owner, .start = start });
     }
-    for (&system.path_index, 0..) |*shard, shard_index| {
-        for (shard.slot_keys, 0..) |key, slot| {
-            if (key == std.math.maxInt(u64)) continue;
-            try std.testing.expectEqual(shard_index, registryShard(key));
-            var length: u32 = 0;
-            var entry = shard.slot_heads[slot];
-            while (entry != no_entry) : (entry = shard.entry_next[entry]) {
-                length += 1;
-                try actual.append(allocator, .{ .key = key, .owner = shard.entry_owner[entry], .start = shard.entry_order[entry] });
+    const directory = &system.path_index.directory;
+    var level: u32 = 0;
+    while (level < directory.levelCount()) : (level += 1) {
+        var slot: usize = 0;
+        while (slot < directory.slotCount(level)) : (slot += 1) {
+            const key = chunkKey(@intCast(level), @intCast(slot));
+            const run = publish.registrationRun(directory, key);
+            if (run.len == 0) continue;
+            for (run.owner[0..run.len], run.order[0..run.len], run.inverse[0..run.len], 0..) |owner, start, node, index| {
+                try actual.append(allocator, .{ .key = key, .owner = owner, .start = start });
+                const pool = &system.path_index.pools[registryShard(key)];
+                try std.testing.expectEqual(key, pool.node_chunk[node]);
+                try std.testing.expectEqual(@as(u32, @intCast(index)), pool.node_index[node]);
             }
-            try std.testing.expect(length != 0);
-            try std.testing.expectEqual(length, shard.slot_counts[slot]);
         }
-        try std.testing.expect(shard.owner_heads.items.len >= system.completed.logicalCapacity());
-        for (shard.owner_heads.items, 0..) |owner_head, owner| {
-            var entry = owner_head;
-            while (entry != no_entry) : (entry = shard.entry_owner_next[entry]) {
-                try std.testing.expectEqual(@as(u32, @intCast(owner)), shard.entry_owner[entry]);
+    }
+    for (&system.path_index.pools) |*pool| {
+        try std.testing.expect(pool.owner_heads.items.len >= system.completed.logicalCapacity());
+        for (pool.owner_heads.items, 0..) |head, owner| {
+            var node = head.node;
+            var seen: u32 = 0;
+            while (node != no_entry) : (node = pool.node_next[node]) {
+                seen += 1;
+                const key = pool.node_chunk[node];
+                const run = publish.registrationRun(directory, key);
+                try std.testing.expectEqual(@as(u32, @intCast(owner)), run.owner[pool.node_index[node]]);
                 try std.testing.expect(system.completed.core.records.items[owner].live);
             }
+            try std.testing.expectEqual(head.len, seen);
         }
     }
     std.mem.sort(Registration, expected.items, {}, Registration.lessThan);
@@ -1345,19 +1390,19 @@ pub fn expectRegistryMatchesCache(system: *const PathfindingSystem) !void {
 /// Two systems' registries hold the same keys in the same slots and the same lists in the
 /// same order.
 pub fn expectSameRegistry(a: *const PathfindingSystem, b: *const PathfindingSystem) !void {
-    for (&a.path_index, &b.path_index) |*shard_a, *shard_b| {
-        try std.testing.expectEqualSlices(u64, shard_a.slot_keys, shard_b.slot_keys);
-        for (shard_a.slot_keys, 0..) |key, slot| {
-            if (key == std.math.maxInt(u64)) continue;
-            var entry_a = shard_a.slot_heads[slot];
-            var entry_b = shard_b.slot_heads[slot];
-            while (entry_a != no_entry or entry_b != no_entry) {
-                try std.testing.expect(entry_a != no_entry and entry_b != no_entry);
-                try std.testing.expectEqual(shard_a.entry_owner[entry_a], shard_b.entry_owner[entry_b]);
-                try std.testing.expectEqual(shard_a.entry_order[entry_a], shard_b.entry_order[entry_b]);
-                entry_a = shard_a.entry_next[entry_a];
-                entry_b = shard_b.entry_next[entry_b];
-            }
+    const directory_a = &a.path_index.directory;
+    const directory_b = &b.path_index.directory;
+    try std.testing.expectEqual(directory_a.levelCount(), directory_b.levelCount());
+    var level: u32 = 0;
+    while (level < directory_a.levelCount()) : (level += 1) {
+        try std.testing.expectEqual(directory_a.slotCount(level), directory_b.slotCount(level));
+        var slot: usize = 0;
+        while (slot < directory_a.slotCount(level)) : (slot += 1) {
+            const key = chunkKey(@intCast(level), @intCast(slot));
+            const run_a = publish.registrationRun(directory_a, key);
+            const run_b = publish.registrationRun(directory_b, key);
+            try std.testing.expectEqualSlices(u32, run_a.owner[0..run_a.len], run_b.owner[0..run_b.len]);
+            try std.testing.expectEqualSlices(u32, run_a.order[0..run_a.len], run_b.order[0..run_b.len]);
         }
     }
 }
@@ -1390,12 +1435,11 @@ pub fn setRegistryCells(system: *PathfindingSystem, fixture: *RegistryWorld, cel
     }
 }
 
-/// Points every allocator `system` uses (its own, its graph's, and each registry shard's) at
-/// `allocator`.
+/// Points every allocator `system` uses (its own and its graph's) at `allocator`. The
+/// registry's directory and inverse pools allocate through the system allocator.
 pub fn setSystemAllocators(system: *PathfindingSystem, allocator: std.mem.Allocator) void {
     system.allocator = allocator;
     system.graph.allocator = allocator;
-    for (&system.path_index) |*shard| shard.allocator = allocator;
 }
 
 /// A fixed-range threaded control: one item per range, so every stage with two or more items
@@ -1633,8 +1677,36 @@ pub fn requestResidentBytes(system: *const PathfindingSystem) RequestStorage {
     };
     for (system.scratch_slots.items) |*scratch| storage.search += searchScratchResidentBytes(scratch);
     for (system.tier1_scratch.items) |*entry| storage.tier1 += corridorScratchResidentBytes(&entry.corridor);
-    for (&system.path_index) |*shard| storage.registry += chunkListMapResidentBytes(shard);
+    storage.registry += registryResidentBytes(&system.path_index);
     return storage;
+}
+
+fn registryResidentBytes(index: anytype) usize {
+    var bytes = directoryResidentBytes(&index.directory);
+    bytes += index.growth.capacity * @sizeOf(publish.ChunkRef) + index.compact.capacity * @sizeOf(publish.ChunkRef);
+    const Fresh = @typeInfo(@TypeOf(index.fresh.items)).pointer.child;
+    const SlotHead = @typeInfo(@TypeOf(index.retire_slot_heads.items)).pointer.child;
+    bytes += index.fresh.capacity * @sizeOf(Fresh);
+    bytes += index.retire_ids.capacity * @sizeOf(u32) + index.retire_heads.capacity * @sizeOf(u32) + index.retire_slot_heads.capacity * @sizeOf(SlotHead);
+    for (&index.pools) |*pool| bytes += inversePoolResidentBytes(pool);
+    return bytes;
+}
+
+/// Payload bytes plus inverse-pool bytes. Directory slots opened with the nav level are
+/// not included: a publish grows the payloads and the node pools.
+pub fn registryContentBytes(index: anytype) usize {
+    var bytes: usize = 0;
+    var level: u32 = 0;
+    while (level < index.directory.levelCount()) : (level += 1) {
+        var slot: usize = 0;
+        while (slot < index.directory.slotCount(level)) : (slot += 1) {
+            const block = index.directory.slot(level, slot);
+            if (block == std.math.maxInt(u32)) continue;
+            bytes += index.directory.blockBytes(block).len;
+        }
+    }
+    for (&index.pools) |*pool| bytes += inversePoolResidentBytes(pool);
+    return bytes;
 }
 
 /// An over-estimate of `requestResidentBytes` for a system never reserved past
@@ -1671,7 +1743,7 @@ pub fn requestStorageBytesBound(capacity: PathfindingCapacity, shape: RequestSha
         .results = resultCacheStorageBytesBound(limits.cached_results, capacity.max_stored_path_cells, stripe_words, shape.long_results) +|
             listBytesBound(u32, pool_words) +| listBytesBound(u16, pool_words) +| listBytesBound(PathfindingSystem.SolvedPath, solves) +|
             listBytesBound(?ResultCache.Claimed, solves),
-        .registry = pooledStorageBytesBound(registry_shard_count, @min(live_runs, shape.chunks +| step_runs), live_runs, limits.cached_results) +|
+        .registry = pooledStorageBytesBound(registry_shard_count, @min(shape.chunks, live_runs), live_runs, limits.cached_results) +|
             RegRecordList.growCapacity(windows) *| @sizeOf(RegRecord),
         // A resolve past the limit doubles it, so one intent per agent reserves at most twice that.
         .goals = goalTableStorageBytesBound(2 *| limits.pending_requests),

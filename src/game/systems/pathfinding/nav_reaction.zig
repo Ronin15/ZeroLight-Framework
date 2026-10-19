@@ -37,6 +37,7 @@ const ColliderChange = @import("../static_colliders.zig").ColliderChange;
 const NavExtent = @import("nav_graph.zig").NavExtent;
 const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const eviction = @import("eviction.zig");
+const publish = @import("publish.zig");
 const types = @import("types.zig");
 const NavMark = @import("types.zig").NavMark;
 const NavUpdateStats = @import("types.zig").NavUpdateStats;
@@ -117,6 +118,7 @@ pub fn rebuildNavFromColliders(self: *PathfindingSystem, colliders: *const Stati
     // Grid versions are part of query keys. A rebuild invalidates pending
     // work and caches instead of trying to remap old requests onto new cells.
     self.clearRuntimeState();
+    try publish.openRegistryLevels(self, self.graph.levelCount());
     self.nav_marks.clearRetainingCapacity();
     // A rebuild can change cell/chunk counts and thus the per-item work cost, so the
     // adaptive tuners' learned profiles no longer apply: they relearn against the new
@@ -245,21 +247,26 @@ pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const Stati
     const view = colliders.view();
     if (self.graph.world_backed) {
         // Every level build of the step shares one level-sized staging, freed once at the
-        // step's end (`finishStagingStep`), after the marks batch.
+        // step's end (`finishStagingStep`), after the marks batch. Directory slots for the
+        // world's levels open first, so a failed open leaves every level unbuilt.
+        try publish.openRegistryLevels(self, world.levelCount());
         while (self.graph.levelCount() < world.levelCount()) {
             try self.graph.buildLevel(view, world, @intCast(self.graph.levelCount()), threads, &stats);
         }
         if (world.contentRevision() != self.graph.built_world_revision) {
             var rebuilt = false;
-            // A failed level build still flushes the levels evicted before it, so no call
-            // returns with owner ops logged.
-            errdefer if (rebuilt) {
-                _ = eviction.flushRebuildEvictions(self, thread_system);
-            };
             for (0..self.graph.levelCount()) |level_index| {
                 const level: u16 = @intCast(level_index);
                 if (self.graph.level_graphs.items[level].built_revision == world.levelContentRevision(level)) continue;
-                try self.graph.buildLevel(view, world, level, threads, &stats);
+                self.graph.buildLevel(view, world, level, threads, &stats) catch |err| {
+                    // Levels already evicted, and a log a failed flush left behind, flush
+                    // before the error returns. A flush failure is that error. The world
+                    // revision stays unpublished either way.
+                    if (rebuilt or self.completed.core.ownerLog().len != 0) {
+                        _ = try eviction.flushRebuildEvictions(self, thread_system);
+                    }
+                    return err;
+                };
                 rebuilt = true;
                 // The level changed without per-cell changes: no result through it and none
                 // of its fields is known good.
@@ -267,10 +274,13 @@ pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const Stati
                 eviction.evictLevel(self, level, &stats);
                 stats.addMain(.evict_ns, evict_timer.lap());
             }
+            // One flush unlinks every rebuilt level's evictions, including a log left when
+            // the level revisions were stored and the flush then failed. The world revision
+            // is published only after that flush, so the marks batch's eviction starts flushed.
+            if (rebuilt or self.completed.core.ownerLog().len != 0) {
+                stats.addStageTime(try eviction.flushRebuildEvictions(self, thread_system));
+            }
             self.graph.built_world_revision = world.contentRevision();
-            // One flush unlinks every rebuilt level's evictions, so the marks batch's
-            // eviction starts flushed.
-            if (rebuilt) stats.addStageTime(eviction.flushRebuildEvictions(self, thread_system));
         }
     }
     if (try self.graph.prepareMarks(world, view, self.nav_marks.items, threads, &stats)) |prepared| {
@@ -285,7 +295,7 @@ pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const Stati
             // Graph node ids never persist, so cached results stay keyed by cells: evict
             // only those with a cell within one cell of a changed cell, and the fields
             // with a costed cell next to a changed cell.
-            eviction.evictScoped(self, batch, thread_system, &stats);
+            try eviction.evictScoped(self, batch, thread_system, &stats);
         }
     }
     // The step's relocated closure blocks leave the batch tail, whatever built them.

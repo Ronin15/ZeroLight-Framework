@@ -2,12 +2,15 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! `ChunkListMap` byte counts and bounds for tests and benches, built from the
-//! structure's layout. Test-only: no production path imports it.
+//! Directory, registration-payload, and inverse-pool byte counts for tests and benches,
+//! built from the structures' layouts. Test-only: no production path imports it.
 
 const std = @import("std");
-const chunk_list_map = @import("chunk_list_map.zig");
-const ChunkListMap = chunk_list_map.ChunkListMap;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
+const RegChunk = @import("pathfinding/publish.zig").RegChunk;
+const InversePool = @import("pathfinding/publish.zig").InversePool;
+const RegistryDirectory = @import("pathfinding/publish.zig").RegistryDirectory;
 
 /// The element type of `T.field`: a std list's, a `MultiArrayList`'s row, or a slice's.
 pub fn FieldElem(comptime T: type, comptime field: []const u8) type {
@@ -17,38 +20,74 @@ pub fn FieldElem(comptime T: type, comptime field: []const u8) type {
     return @typeInfo(@TypeOf(List.get)).@"fn".return_type.?;
 }
 
-// Bytes one table slot takes: an element of each `slot_*` column.
-const bytes_per_key_slot: usize = blk: {
-    var bytes: usize = 0;
-    for (@typeInfo(ChunkListMap).@"struct".field_names) |name| {
-        if (std.mem.startsWith(u8, name, "slot_")) bytes += @sizeOf(FieldElem(ChunkListMap, name));
-    }
-    break :blk bytes;
-};
+const padded_slot_bytes = @sizeOf(PaddedSlot(struct { block: u32 = 0, pending: u32 = 0 }));
+const reg_stride = 3 * @sizeOf(u32);
 
-/// Bytes `map`'s table, entry pool, free ids, owner heads, and batch scratch hold
-/// (allocated capacity).
-pub fn residentBytes(map: *const ChunkListMap) usize {
-    var bytes = map.slot_keys.len * bytes_per_key_slot + std.MultiArrayList(chunk_list_map.Entry).capacityInBytes(map.entries.capacity) +
-        map.entry_free.capacity * @sizeOf(u32) + map.owner_heads.capacity * @sizeOf(u32) + map.retired_owner_heads.capacity * @sizeOf(u32) +
-        map.claims.capacity * @sizeOf(FieldElem(ChunkListMap, "claims")) + map.touched.capacity * @sizeOf(FieldElem(ChunkListMap, "touched")) +
-        map.splice_records.capacity * @sizeOf(FieldElem(ChunkListMap, "splice_records")) + map.emptied_keys.capacity * @sizeOf(u64);
-    if (map.owner_heads_replacement) |replacement| bytes += replacement.capacity * @sizeOf(u32);
+/// Bytes of one level directory: its slot array, the block pool, and each block's payload.
+pub fn directoryResidentBytes(directory: *const RegistryDirectory) usize {
+    var bytes: usize = directoryLevelBytes(directory.levelCount());
+    var level: u32 = 0;
+    while (level < directory.levelCount()) : (level += 1) {
+        bytes += directory.slotCount(level) * padded_slot_bytes;
+        var slot: usize = 0;
+        while (slot < directory.slotCount(level)) : (slot += 1) {
+            const block = directory.slot(level, slot);
+            if (block == std.math.maxInt(u32)) continue;
+            bytes += directory.blockBytes(block).len;
+        }
+    }
     return bytes;
 }
 
-/// An over-estimate of `residentBytes` summed over `maps` maps grown through `reserve`
-/// alone (no batch scratch, no owner-head truncate pending), each reserved for owner ids
-/// below `owners`, whose own peak reserves, summed over the maps, never pass `keys` keys
-/// and `entries` entries. A map's slots hold its keys at load 1/2 or more, so under four
-/// slots per key; its entry pool grows to at least double past its need, and std's
-/// growth past that. Saturates.
-pub fn pooledStorageBytesBound(maps: usize, keys: usize, entries: usize, owners: usize) usize {
-    const Entries = std.MultiArrayList(chunk_list_map.Entry);
+fn directoryLevelBytes(levels: usize) usize {
+    // The level list and the block pool, each grown by std past the live count. One block
+    // header per occupied slot is charged by the caller through the payload bytes; the pool's
+    // id storage is one u32 per block plus the block record.
+    return std.ArrayList(usize).growCapacity(levels) * @sizeOf(usize);
+}
+
+/// Bytes of one inverse pool: its node columns, free ids, and owner heads, including a
+/// prepared or retired truncation.
+pub fn inversePoolResidentBytes(pool: *const InversePool) usize {
+    var bytes = std.MultiArrayList(InverseNode).capacityInBytes(pool.nodes.capacity) +
+        pool.node_free.capacity * @sizeOf(u32) +
+        pool.owner_heads.capacity * @sizeOf(OwnerHead) +
+        pool.retired.capacity * @sizeOf(OwnerHead);
+    if (pool.replacement) |replacement| bytes += replacement.capacity * @sizeOf(OwnerHead);
+    return bytes;
+}
+
+const InverseNode = struct {
+    next: u32 = 0,
+    chunk: u64 = 0,
+    index: u32 = 0,
+};
+const OwnerHead = struct {
+    node: u32 = 0,
+    len: u32 = 0,
+};
+
+/// An over-estimate of one registry: `chunks` padded directory slots, a geometric payload
+/// for `entries` registrations, and `shards` inverse pools whose nodes sum to `entries`
+/// and whose owner heads hold `owners` ids. Saturates.
+pub fn pooledStorageBytesBound(shards: usize, chunks: usize, entries: usize, owners: usize) usize {
+    const Nodes = std.MultiArrayList(InverseNode);
     const Ids = std.ArrayList(u32);
-    const slots = maps *| chunk_list_map.min_slot_count +| 4 *| keys;
-    const pool = Entries.growCapacity(2 *| entries) +| maps *| Entries.growCapacity(0);
-    const free_ids = Ids.growCapacity(pool) +| maps *| Ids.growCapacity(0);
-    return slots *| bytes_per_key_slot +| Entries.capacityInBytes(pool) +| free_ids *| @sizeOf(u32) +|
-        maps *| Ids.growCapacity(owners) *| @sizeOf(u32);
+    const Heads = std.ArrayList(OwnerHead);
+    const payload = (entries *| 2) *| reg_stride;
+    const slots = chunks *| padded_slot_bytes;
+    const node_pool = Nodes.capacityInBytes(Nodes.growCapacity(entries *| 2)) +| shards *| Nodes.capacityInBytes(Nodes.growCapacity(0));
+    const free_ids = Ids.growCapacity(entries *| 2) *| @sizeOf(u32) +| shards *| Ids.growCapacity(0) *| @sizeOf(u32);
+    const heads = shards *| Heads.growCapacity(owners) *| @sizeOf(OwnerHead);
+    // Count windows: one aligned record per registration, growth and compact.
+    const windows = 2 *| std.mem.alignForward(usize, entries, thread_shared_record_alignment / 8) *| 8;
+    // Retire plan, once: two ids per op and one chain start per op, two ops per owner,
+    // and one head per owner the log can name.
+    const plan = Ids.growCapacity(owners *| 4) *| @sizeOf(u32) +| Ids.growCapacity(shards *| owners *| 2) *| @sizeOf(u32) +| Heads.growCapacity(owners) *| @sizeOf(OwnerHead);
+    return slots +| payload +| node_pool +| free_ids +| heads +| windows +| plan +| directoryLevelBytes(chunks);
+}
+
+comptime {
+    std.debug.assert(@sizeOf(InverseNode) == 24 or @sizeOf(InverseNode) == 16);
+    _ = RegChunk;
 }
