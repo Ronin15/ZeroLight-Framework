@@ -672,7 +672,7 @@ pub const SimulationPipelineStats = struct {
         if (collision_stats.pair_bound_exceeded) perf.recordMetric(.collision_pair_bound_exceeded, 1);
         if (comptime runtime_perf_log.enabled) {
             const sort_batch = collision_stats.perf.sort_batch;
-            // Direct's inline batch is untimed and has no workers, so it is not a sample.
+            // An untimed batch with no workers is not a sample. The inline banded sort is timed.
             if (sort_batch.available_worker_threads != 0 or sort_batch.batch_duration_ns != 0) {
                 perf.recordBatch(.collision_sort, sort_batch);
             }

@@ -228,8 +228,8 @@ pub const BatchStage = enum {
     path_resize_copy,
     movement,
     chunk_derive,
-    // The collision detect sort, inline or on workers. The direct step's untimed batch is
-    // not recorded.
+    // The collision detect sort, inline or on workers. An untimed batch with no workers
+    // is not recorded.
     collision_sort,
     collision_broadphase,
     collision_narrowphase,
