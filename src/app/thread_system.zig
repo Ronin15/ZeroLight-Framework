@@ -1201,12 +1201,6 @@ pub const ThreadSystem = struct {
         const batch_start_ns = nowNs(self.shared.descriptor.io);
         runInline(item_count, selection.items_per_range, context, job_fn, caller, &stats);
         stats.batch_duration_ns = elapsedNs(batch_start_ns, nowNs(self.shared.descriptor.io));
-
-        const control = &self.shared.control;
-        // A load first, so after the warning the flag is only read.
-        if (!control.forced_inline_warned.load(.monotonic) and !control.forced_inline_warned.swap(true, .monotonic)) {
-            log.warn("ThreadSystem: a batch was dispatched from inside one of its batches (participant {d}); it ran inline on its caller", .{caller.index});
-        }
         return stats;
     }
 };
@@ -1222,7 +1216,6 @@ const Shared = struct {
     descriptor: Descriptor align(shared_line),
     claim: Claim align(shared_line) = .{},
     completion: Completion align(shared_line) = .{},
-    control: Control align(shared_line) = .{},
 
     comptime {
         std.debug.assert(@alignOf(Shared) == shared_line);
@@ -1339,11 +1332,6 @@ const Completion = struct {
     // Set by a worker whose decrement ends the batch; main waits on it only when it
     // did not end the batch itself.
     done: std.Io.Event = .unset,
-};
-
-// Recovery-path warning latch, written only by forced-inline batches.
-const Control = struct {
-    forced_inline_warned: std.atomic.Value(bool) = .init(false),
 };
 
 const WorkerRecord = struct {
@@ -4218,17 +4206,7 @@ fn nestedFixedRangeCount(threads: *const ThreadSystem) usize {
     }, threads.workerThreadCount(), 1, false).range_count;
 }
 
-// The test runner prints `.warn`. These tests are the intentional nest, so the
-// recovered-mistake line stays out of the suite. `forced_inline_warned` is the assert.
-fn quietRecoveredBatchWarn() std.log.Level {
-    const previous = std.testing.log_level;
-    std.testing.log_level = .err;
-    return previous;
-}
-
 test "a nested batch from a worker job runs inline on that worker and covers every item once" {
-    const previous_log_level = quietRecoveredBatchWarn();
-    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4248,7 +4226,6 @@ test "a nested batch from a worker job runs inline on that worker and covers eve
         try std.testing.expect(record.caller.index != WorkerId.main.index);
         try record.expectRanInlineOnCaller(nested_inner_items, outer.nested_range_count);
     }
-    try std.testing.expect(threads.shared.control.forced_inline_warned.load(.monotonic));
 }
 
 // Outer job for an inline owner batch: each range dispatches two nested batches.
@@ -4269,9 +4246,7 @@ fn ownerNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId)
     }
 }
 
-test "a nested batch from the owner's own range runs inline on the main id and warns once" {
-    const previous_log_level = quietRecoveredBatchWarn();
-    defer std.testing.log_level = previous_log_level;
+test "a nested batch from the owner's own range runs inline on the main id" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4291,7 +4266,6 @@ test "a nested batch from the owner's own range runs inline on the main id and w
             try record.expectRanInlineOnCaller(nested_inner_items, outer.nested_range_count);
         }
     }
-    try std.testing.expect(threads.shared.control.forced_inline_warned.load(.monotonic));
 
     // The owner left its batch, so the next batch dispatches to workers again.
     try std.testing.expect(!threads.owner_in_batch);
@@ -4339,8 +4313,6 @@ fn shapeNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId)
 }
 
 test "a nested batch keeps a selected profile's range shape and a nested stage selects the untuned shape" {
-    const previous_log_level = quietRecoveredBatchWarn();
-    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4446,8 +4418,6 @@ fn tunerNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId)
 }
 
 test "a nested batch leaves the stage tuner and the shared tuner untouched" {
-    const previous_log_level = quietRecoveredBatchWarn();
-    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4473,8 +4443,6 @@ test "a nested batch leaves the stage tuner and the shared tuner untouched" {
 }
 
 test "forced inline batches allocate nothing on a multi-worker system" {
-    const previous_log_level = quietRecoveredBatchWarn();
-    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4573,8 +4541,6 @@ fn ownerThreadedNestingOuterJob(context: *anyopaque, range: ParallelRange, id: W
 }
 
 test "a nested batch from the owner's range of a threaded batch runs inline on the main id" {
-    const previous_log_level = quietRecoveredBatchWarn();
-    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4618,8 +4584,6 @@ fn selectedNestingOuterJob(context: *anyopaque, range: ParallelRange, _: WorkerI
 }
 
 test "a nested run of an owner's tuned selection keeps its aligned range set" {
-    const previous_log_level = quietRecoveredBatchWarn();
-    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 64 });
     defer threads.deinit();
 
@@ -4695,8 +4659,6 @@ fn roundNestingOuterJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
 }
 
 test "rounds run inside a batch leave the stage tuner unsampled" {
-    const previous_log_level = quietRecoveredBatchWarn();
-    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
 
