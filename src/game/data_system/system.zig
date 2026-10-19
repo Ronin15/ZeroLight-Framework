@@ -433,6 +433,8 @@ pub const DataSystem = struct {
             const level = self.world_levels.get(@intCast(world_level_index));
             self.syncScopeLevelFromWorldLevel(id, level);
         }
+        // An existing body write does not change static membership. A new body can.
+        self.syncDynamicBounds(id);
     }
 
     pub fn movementBodyPtr(self: *DataSystem, id: EntityId) ?MovementBodyPtr {
@@ -627,6 +629,8 @@ pub const DataSystem = struct {
         const dense_index = try self.collision_bounds.append(self.allocator, id, bounds);
         slot.collision_bounds_index = dense_index;
         slot.addComponent(.collision_bounds);
+        // In-place size writes do not change membership. Append can complete a static obstacle.
+        self.syncDynamicBounds(id);
     }
 
     pub fn collisionBoundsConst(self: *const DataSystem, id: EntityId) ?CollisionBounds {
@@ -644,12 +648,14 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.collision_response_index) |index| {
             self.collision_responses.set(@intCast(index), response);
+            self.syncDynamicBounds(id);
             return;
         }
 
         const dense_index = try self.collision_responses.append(self.allocator, id, response);
         slot.collision_response_index = dense_index;
         slot.addComponent(.collision_response);
+        self.syncDynamicBounds(id);
     }
 
     pub fn collisionResponseConst(self: *const DataSystem, id: EntityId) ?CollisionResponse {
@@ -915,10 +921,14 @@ pub const DataSystem = struct {
         // The scope tier row leaves with the movement body, so drop its tier count
         // before the swap overwrites it. The moved tail row keeps its own tier.
         self.tier_counts[@backingInt(self.movement_bodies.tierAt(index))] -= 1;
+        const removed = self.movement_bodies.sliceConst().entities[index];
+        const bounds_index = self.slots.items[@intCast(removed.index)].collision_bounds_index;
         // Store removals swap the tail row into the removed row. If a row moved,
         // the moved entity's slot must be patched immediately.
         const moved = self.movement_bodies.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].movement_body_index = @intCast(index);
+        // Losing the movement body ends a static obstacle. The bounds row stays.
+        if (bounds_index) |dense| self.collision_bounds.addDynamic(dense);
     }
 
     fn removeFacingAt(self: *DataSystem, index: usize) void {
@@ -942,8 +952,27 @@ pub const DataSystem = struct {
     }
 
     fn removeCollisionResponseAt(self: *DataSystem, index: usize) void {
+        const removed = self.collision_responses.sliceConst().entities[index];
         const moved = self.collision_responses.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].collision_response_index = @intCast(index);
+        // Bounds may already have been swap-removed (destroy drops bounds first). Only a row
+        // that still belongs to this entity becomes dynamic.
+        const slot = &self.slots.items[@intCast(removed.index)];
+        const bounds_index = slot.collision_bounds_index orelse return;
+        if (@as(usize, bounds_index) >= self.collision_bounds.len()) return;
+        const bounds_entity = self.collision_bounds.sliceConst().entities[bounds_index];
+        if (!bounds_entity.eql(removed)) return;
+        self.collision_bounds.addDynamic(bounds_index);
+    }
+
+    fn syncDynamicBounds(self: *DataSystem, id: EntityId) void {
+        const slot = self.resolveSlot(id) orelse return;
+        const bounds_index = slot.collision_bounds_index orelse return;
+        if (self.isStaticNavigationObstacle(id)) {
+            self.collision_bounds.removeDynamic(bounds_index);
+        } else {
+            self.collision_bounds.addDynamic(bounds_index);
+        }
     }
 
     fn removeAiAgentAt(self: *DataSystem, index: usize) void {

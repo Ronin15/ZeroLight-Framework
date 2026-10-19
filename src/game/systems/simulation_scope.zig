@@ -225,21 +225,23 @@ pub const SimulationScopeSystem = struct {
 
     // ---- Collision gather (threaded compaction) ------------------------------
 
-    /// Build the collision bounds dense-index list. Returns null indices when all
-    /// collision entities are eligible (full-active shortcut). No chunk filter.
+    /// Build the collision bounds dense-index list from dynamic bounds rows. Returns
+    /// null when no dormant or kinematic body exists (no tier exclusion). Statics are
+    /// not in the list. No chunk filter.
     pub fn gatherCollisionBoundsIndices(
         self: *SimulationScopeSystem,
         data: *const DataSystem,
         thread_system: *ThreadSystem,
         config: ScopeConfig,
     ) !ScopeGatherResult {
-        const bounds = data.collisionBoundsSliceConst();
-        const n = bounds.entities.len;
+        const dynamic_ids = data.collision_bounds.dynamic_ids.items;
+        const n = dynamic_ids.len;
         if (n == 0) return .{ .indices = &[_]u32{} };
         // Fast-path: only .dormant/.kinematic entities lack collision. With none
-        // present, every entity collides → full-active, no per-entity scan.
+        // present, every dynamic row collides → full-active, no per-entity scan.
         if (data.tierCount(.dormant) + data.tierCount(.kinematic) == 0) return .{ .indices = null };
 
+        const bounds = data.collisionBoundsSliceConst();
         const scope = data.scopeColumnsSliceConst();
         const selection = thread_system.selectBatchProfile(&self.collision_gather_tuner, .{
             .item_count = n,
@@ -251,6 +253,7 @@ pub const SimulationScopeSystem = struct {
         try self.prepareRangeWindows(u32, &self.collision_indices, n, selection.range_count);
         var context = CollisionGatherContext{
             .data = data,
+            .dynamic_ids = dynamic_ids,
             .bounds_entities = bounds.entities,
             .tier = scope.tier,
             .out = self.collision_indices.items,
@@ -639,6 +642,7 @@ fn scanTierPolicy(
 
 const CollisionGatherContext = struct {
     data: *const DataSystem,
+    dynamic_ids: []const u32,
     bounds_entities: []const EntityId,
     tier: []const SimulationTier,
     /// Item-count output; range r writes only its own `[range.start, range.end)` window.
@@ -663,9 +667,10 @@ fn collisionGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) vo
     const window = job.out[range.start..range.end];
     var tally: GatherTally = .{};
     for (range.start..range.end) |i| {
-        const di = job.data.movementBodyDenseIndex(job.bounds_entities[i]) orelse continue;
+        const bounds_index = job.dynamic_ids[i];
+        const di = job.data.movementBodyDenseIndex(job.bounds_entities[bounds_index]) orelse continue;
         if (job.tier[di].allowsCollision()) {
-            window[tally.count] = @intCast(i);
+            window[tally.count] = bounds_index;
             tally.count += 1;
         } else {
             tally.any_excluded = true;
@@ -1244,6 +1249,48 @@ test "scoped collision excludes kinematic and dormant bodies from contacts" {
         try std.testing.expect(contact.a.index != kinematic_ent.index);
         try std.testing.expect(contact.b.index != kinematic_ent.index);
     }
+}
+
+test "collision gather skips a locomotion static and keeps a locomotion dynamic" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+
+    const kinematic = try data.createEntity();
+    try data.setMovementBody(kinematic, .{ .position = .{ .x = 1, .y = 1 } });
+    try data.setCollisionBounds(kinematic, .{ .size = .{ .x = 8, .y = 8 } });
+    try data.setCollisionResponse(kinematic, .{});
+    try data.setSimulationTier(kinematic, .kinematic);
+
+    const static_body = try data.createEntity();
+    try data.setMovementBody(static_body, .{ .position = .{ .x = 40, .y = 40 } });
+    try data.setCollisionBounds(static_body, .{ .size = .{ .x = 8, .y = 8 } });
+    try data.setCollisionResponse(static_body, .{ .mobility = .static });
+
+    const dynamic = try data.createEntity();
+    try data.setMovementBody(dynamic, .{ .position = .{ .x = 80, .y = 80 } });
+    try data.setCollisionBounds(dynamic, .{ .size = .{ .x = 8, .y = 8 } });
+    try data.setCollisionResponse(dynamic, .{});
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    const indices = try gatherCollisionInline(&sys, &data);
+    const list = indices orelse return error.ExpectedScopedGather;
+    try std.testing.expectEqual(@as(usize, 1), list.len);
+    const dynamic_bounds = data.resolveSlotConst(dynamic).?.collision_bounds_index.?;
+    try std.testing.expectEqual(dynamic_bounds, list[0]);
+    const static_bounds = data.resolveSlotConst(static_body).?.collision_bounds_index.?;
+    try std.testing.expect(list[0] != static_bounds);
+
+    var plain = DataSystem.init(allocator);
+    defer plain.deinit();
+    for (0..2) |_| {
+        const body = try plain.createEntity();
+        try plain.setMovementBody(body, .{});
+        try plain.setCollisionBounds(body, .{ .size = .{ .x = 8, .y = 8 } });
+    }
+    try std.testing.expect(try gatherCollisionInline(&sys, &plain) == null);
+    try std.testing.expectEqual(plain.collision_bounds.len(), plain.collision_bounds.dynamic_ids.items.len);
 }
 
 /// Test helper: a live entity with a movement body and the given scope metadata.

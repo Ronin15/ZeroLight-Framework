@@ -15,6 +15,7 @@
 //! (nav, steering) take a `ColliderView`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const math = @import("../../core/math.zig");
 const logging = @import("../../core/logging.zig");
@@ -314,6 +315,14 @@ pub const ColliderView = struct {
     coarse: ?*const [max_query_classes]CoarseDir = null,
     query_class_mask: QueryClassMask = .empty,
     query_top_class: u6 = 0,
+    /// Bumps when `rebuild` or a `sync` that applies changes installs rows.
+    revision: u64 = 0,
+    /// Entity index to row pool id, or `no_row`. Valid with the rest of the view.
+    row_of_index: []const u32 = &.{},
+    /// Row pool entity column. Valid with the rest of the view.
+    row_entity: []const EntityId = &.{},
+    /// `changesThisStep` for this revision. Empty after a rebuild.
+    changes: []const ColliderChange = &.{},
 
     /// Whether any span covers a cell of `chunk` on `level`. O(1).
     pub fn chunkHasRows(self: ColliderView, level: u16, chunk: u32) bool {
@@ -366,13 +375,76 @@ pub const ColliderView = struct {
             .limits = limits,
             .hits = hits,
         };
-        var classes = self.query_class_mask.iterator(.{ .direction = .reverse });
-        while (classes.next()) |class| {
-            std.debug.assert(class <= self.query_top_class);
-            if (!walk.walkClass(@intCast(class))) break;
-        }
+        walk.walkClasses();
         return walk.counts;
     }
+
+    /// Every indexed row on `level` meeting the closed `box`, each once, in `queryBox` order.
+    /// Writes `min(hits, out_entity.len)` and returns the full hit count. No hit cap. The
+    /// out slices share one length. Reads only.
+    pub fn collectOverlaps(
+        self: ColliderView,
+        level: u16,
+        box: math.Aabb,
+        out_entity: []u32,
+        out_min_x: []f32,
+        out_min_y: []f32,
+        out_max_x: []f32,
+        out_max_y: []f32,
+    ) usize {
+        return self.collectOverlapsChecked(level, box, out_entity, out_min_x, out_min_y, out_max_x, out_max_y, null, null);
+    }
+
+    /// `collectOverlaps` plus, in Debug, a compare of every row the walk reads against
+    /// `staticObstacleWorldRect`. A mismatch sets `moved`.
+    pub fn collectOverlapsChecked(
+        self: ColliderView,
+        level: u16,
+        box: math.Aabb,
+        out_entity: []u32,
+        out_min_x: []f32,
+        out_min_y: []f32,
+        out_max_x: []f32,
+        out_max_y: []f32,
+        data: ?*const DataSystem,
+        moved: ?*bool,
+    ) usize {
+        std.debug.assert(out_min_x.len == out_entity.len and out_min_y.len == out_entity.len);
+        std.debug.assert(out_max_x.len == out_entity.len and out_max_y.len == out_entity.len);
+        const geometry = self.geometry orelse return 0;
+        var overlaps = OverlapWrite{
+            .entity = out_entity,
+            .min_x = out_min_x,
+            .min_y = out_min_y,
+            .max_x = out_max_x,
+            .max_y = out_max_y,
+            .debug_data = data,
+            .debug_moved = moved,
+        };
+        var unused: [0]f32 = .{};
+        var walk = BoxWalk{
+            .view = &self,
+            .geometry = geometry,
+            .level = level,
+            .box = box,
+            .uncapped = true,
+            .overlaps = &overlaps,
+            .hits = .{ .min_x = &unused, .min_y = &unused, .max_x = &unused, .max_y = &unused },
+        };
+        walk.walkClasses();
+        return overlaps.hits;
+    }
+};
+
+const OverlapWrite = struct {
+    entity: []u32,
+    min_x: []f32,
+    min_y: []f32,
+    max_x: []f32,
+    max_y: []f32,
+    hits: usize = 0,
+    debug_data: ?*const DataSystem = null,
+    debug_moved: ?*bool = null,
 };
 
 // The inclusive class-`class` cells one fine-class chunk visit walks.
@@ -384,12 +456,23 @@ const BoxWalk = struct {
     geometry: ColliderGeometry,
     level: u16,
     box: math.Aabb,
-    limits: BoxQueryLimits,
+    limits: BoxQueryLimits = .{ .max_hits = 0, .max_work = 0 },
     hits: BoxHits,
     counts: BoxQueryCounts = .{},
+    uncapped: bool = false,
+    overlaps: ?*OverlapWrite = null,
 
     fn canStep(self: *const BoxWalk) bool {
+        if (self.uncapped) return true;
         return self.counts.work < self.limits.max_work and self.counts.hits < self.limits.max_hits;
+    }
+
+    fn walkClasses(self: *BoxWalk) void {
+        var classes = self.view.query_class_mask.iterator(.{ .direction = .reverse });
+        while (classes.next()) |class| {
+            std.debug.assert(class <= self.view.query_top_class);
+            if (!self.walkClass(@intCast(class))) break;
+        }
     }
 
     // Walks class `class`'s cells overlapping [box.min - edge, box.max]: every row of the
@@ -448,14 +531,12 @@ const BoxWalk = struct {
         const groups = payload.groups[0..payload.group_len];
         const first_bit: u16 = @intCast(class_offset + @as(usize, @intCast((cells.min_y & cell_mask) << per_chunk_shift)) + @as(usize, @intCast(cells.min_x & cell_mask)));
         var cursor = std.sort.lowerBound(QueryGroup, groups, first_bit, orderGroupBit);
-        const max_work = self.limits.max_work;
-        const max_hits = self.limits.max_hits;
         var cell_y = cells.min_y;
         while (cell_y <= cells.max_y) : (cell_y += 1) {
             const row_bit = class_offset + @as(usize, @intCast((cell_y & cell_mask) << per_chunk_shift));
             var cell_x = cells.min_x;
             while (cell_x <= cells.max_x) : (cell_x += 1) {
-                if (self.counts.work >= max_work or self.counts.hits >= max_hits) return false;
+                if (!self.canStep()) return false;
                 self.counts.work += 1;
                 const bit = row_bit + @as(usize, @intCast(cell_x & cell_mask));
                 if ((words[bit >> 6] >> @intCast(bit & 63)) & 1 == 0) continue;
@@ -489,6 +570,7 @@ const BoxWalk = struct {
     }
 
     fn scanQuery(self: *BoxWalk, payload: StaticChunk, start: u32, count: u32) bool {
+        if (self.uncapped) return self.scanUncapped(payload.query_entity[start..], payload.query_min_x[start..], payload.query_min_y[start..], payload.query_max_x[start..], payload.query_max_y[start..], count);
         const box = self.box;
         const end = start + count;
         var index = start;
@@ -513,6 +595,7 @@ const BoxWalk = struct {
     }
 
     fn scanRun(self: *BoxWalk, run: QueryRun) bool {
+        if (self.uncapped) return self.scanUncapped(run.entity, run.min_x, run.min_y, run.max_x, run.max_y, run.len);
         const box = self.box;
         for (0..run.len) |index| {
             if (!self.canStep()) return false;
@@ -532,6 +615,50 @@ const BoxWalk = struct {
             }
         }
         return true;
+    }
+
+    fn scanUncapped(self: *BoxWalk, entity: []const u32, min_x: []const f32, min_y: []const f32, max_x: []const f32, max_y: []const f32, count: u32) bool {
+        const box = self.box;
+        const over = self.overlaps.?;
+        const end: usize = count;
+        for (0..end) |index| {
+            const row_min_x = min_x[index];
+            const row_min_y = min_y[index];
+            const row_max_x = max_x[index];
+            const row_max_y = max_y[index];
+            if (comptime builtin.mode == .debug) self.noteMoved(over, entity[index], row_min_x, row_min_y, row_max_x, row_max_y);
+            if (!(row_min_x <= box.max_x and row_max_x >= box.min_x and row_min_y <= box.max_y and row_max_y >= box.min_y)) continue;
+            if (over.hits < over.entity.len) {
+                const at = over.hits;
+                over.entity[at] = entity[index];
+                over.min_x[at] = row_min_x;
+                over.min_y[at] = row_min_y;
+                over.max_x[at] = row_max_x;
+                over.max_y[at] = row_max_y;
+            }
+            over.hits += 1;
+        }
+        return true;
+    }
+
+    fn noteMoved(self: *BoxWalk, over: *OverlapWrite, entity_index: u32, min_x: f32, min_y: f32, max_x: f32, max_y: f32) void {
+        const data = over.debug_data orelse return;
+        const moved = over.debug_moved orelse return;
+        const view = self.view;
+        if (entity_index >= view.row_of_index.len) {
+            moved.* = true;
+            return;
+        }
+        const row = view.row_of_index[entity_index];
+        if (row == no_row or row >= view.row_entity.len) {
+            moved.* = true;
+            return;
+        }
+        const rect = data.staticObstacleWorldRect(view.row_entity[row]) orelse {
+            moved.* = true;
+            return;
+        };
+        if (rect.min_x != min_x or rect.min_y != min_y or rect.max_x != max_x or rect.max_y != max_y) moved.* = true;
     }
 };
 
@@ -582,6 +709,7 @@ pub const StaticColliderSystem = struct {
     query_class_rows: [max_query_classes]u32 = @splat(0),
     query_class_mask: QueryClassMask = .empty,
     query_top_class: u6 = 0,
+    revision: u64 = 0,
     // The chunk rewrite: one tuner, the shared range controls (production runs adaptive;
     // benches pin a fixed partition), and the last batch shape.
     chunk_rewrite: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -660,6 +788,10 @@ pub const StaticColliderSystem = struct {
             .coarse = &self.coarse,
             .query_class_mask = self.query_class_mask,
             .query_top_class = self.query_top_class,
+            .revision = self.revision,
+            .row_of_index = self.row_of_index.items,
+            .row_entity = self.row_entity,
+            .changes = self.changes.items,
         };
     }
 
@@ -708,9 +840,11 @@ pub const StaticColliderSystem = struct {
             }
         }.lessThan);
 
+        const next_revision = self.revision +% 1;
         var fresh = StaticColliderSystem.init(self.allocator);
         errdefer fresh.deinit();
         fresh.geometry = geometry;
+        fresh.revision = next_revision;
         fresh.query_top_class = geometry.topQueryClass();
         fresh.row_growth_logged = self.row_growth_logged;
         fresh.payload_growth_logged = self.payload_growth_logged;
@@ -860,6 +994,7 @@ pub const StaticColliderSystem = struct {
         if (self.pending_dirty.items.len == 0) return;
         try self.reserveSync(data);
         self.applySync(thread_system);
+        self.revision +%= 1;
     }
 
     // Plans, opens levels, and allocates fresh payloads. Installed runs stay as they are.
@@ -2701,6 +2836,28 @@ fn randomStaticPosition(random: std.Random) math.Vec2 {
     return .{ .x = -level_edge / 4 + random.float(f32) * level_edge * 1.5, .y = -level_edge / 4 + random.float(f32) * level_edge * 1.5 };
 }
 
+test "rebuild bumps the collider revision and an empty sync does not" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 16, .y = 16 } });
+    try data.setCollisionBounds(entity, .{ .size = .{ .x = 16, .y = 16 } });
+    try data.setCollisionResponse(entity, .{ .mobility = .static });
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try std.testing.expectEqual(@as(u64, 0), colliders.revision);
+    try colliders.rebuild(&data, test_geometry);
+    const revision = colliders.revision;
+    try std.testing.expect(revision != 0);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    try colliders.sync(&data, &threads);
+    try std.testing.expectEqual(revision, colliders.revision);
+    colliders.markDirty(entity);
+    try colliders.sync(&data, &threads);
+    try std.testing.expectEqual(revision +% 1, colliders.revision);
+}
+
 test "the query tier lists every row once at its class and anchor cell, equal to a rebuild" {
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
@@ -2818,6 +2975,15 @@ fn expectQueryMatchesBruteForce(colliders: *const StaticColliderSystem, level: u
     try std.testing.expect(counts.work < unlimited_work);
     try std.testing.expectEqual(expected.items.len, counts.hits);
     for (expected.items, 0..) |hit, index| try std.testing.expectEqual(hit.aabb, hits.at(index));
+    const entities = try std.testing.allocator.alloc(u32, hits.min_x.len);
+    defer std.testing.allocator.free(entities);
+    const view = colliders.view();
+    const full = view.collectOverlaps(level, box, entities, hits.min_x, hits.min_y, hits.max_x, hits.max_y);
+    try std.testing.expectEqual(expected.items.len, full);
+    for (expected.items, 0..) |hit, index| {
+        try std.testing.expectEqual(hit.entity, entities[index]);
+        try std.testing.expectEqual(hit.aabb, hits.at(index));
+    }
 }
 
 // Boxes around every row (touching each edge from outside), random boxes, and boxes

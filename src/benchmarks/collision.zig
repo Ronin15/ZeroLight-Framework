@@ -27,8 +27,9 @@
 //!   through the commit seam (`fixtures.CommitSeam`: reserve, budgeted commit, collider
 //!   capture, and sync) and then runs one collision step. Pass shape: flat in statics.
 //! Asserts check fixture invariants only: the analytic contact count (one per overlapping
-//! dynamic) in every static group; in `collision-static-index-change` also the collider row
-//! count, and that each move commits, syncs, and changes chunks.
+//! dynamic) in every static group; sweep `body_count` and `entry_count` follow the dynamic
+//! bodies (one strip each on this fixture), not the statics; in `collision-static-index-change`
+//! also the collider row count, and that each move commits, syncs, and changes chunks.
 //!
 //! Every group prints `candidate_pairs=` and `contacts=`, the shape groups `per_body=`
 //! (mean time per body), the static groups `per_dynamic=`; `--details` adds each stage's
@@ -54,6 +55,7 @@ const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const ColliderGeometry = @import("../game/systems/static_colliders.zig").ColliderGeometry;
+const ColliderView = @import("../game/systems/static_colliders.zig").ColliderView;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const tile_size = @import("../assets/world_tileset_meta.zig").required_tile_size;
@@ -267,7 +269,7 @@ fn runShapeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const shape = try gridShapeFor(item_count);
     var data = try createGridFixture(allocator, shape);
     defer data.deinit();
-    var stats = try measureCase(allocator, io, options, case, shape.bodies(), &data, null);
+    var stats = try measureCase(allocator, io, options, case, shape.bodies(), &data, null, null);
     std.debug.assert(stats.output_count == shape.contacts());
     const stages = stats.collision_stages.?;
     if (stages.entries > shape.bodies() * denseStripsPerBodyBound()) return error.CollisionEntriesPastStripBound;
@@ -282,7 +284,7 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     var data = try createFixtureWithMode(allocator, item_count, mode);
     defer data.deinit();
-    const stats = try measureCase(allocator, io, options, case, item_count, &data, null);
+    const stats = try measureCase(allocator, io, options, case, item_count, &data, null, null);
     if (stats.iterations > 0 and stats.output_count != fixtureContacts(item_count, mode)) return error.CollisionContactCountMismatch;
     // A dense strip's rows overlap in x past one lane group, so the sweep runs its lanes.
     if (mode == .dense and stats.iterations > 0 and stats.collision_stages.?.simd_groups == 0) return error.CollisionSweepRanNoLanes;
@@ -394,8 +396,14 @@ fn runStaticCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Option
     defer fixture.data.deinit();
     var mover: ?StaticMover = if (move_static) try StaticMover.init(allocator, &fixture, case) else null;
     defer if (mover) |*static_mover| static_mover.deinit();
+    var colliders = StaticColliderSystem.init(allocator);
+    defer colliders.deinit();
+    if (!move_static) {
+        const cells: u32 = @intCast(2 * fixture.side);
+        try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles));
+    }
 
-    var stats = try measureCase(allocator, io, options, case, static_dynamic_count, &fixture.data, if (mover) |*static_mover| static_mover else null);
+    var stats = try measureCase(allocator, io, options, case, static_dynamic_count, &fixture.data, if (mover) |*static_mover| static_mover else null, if (move_static) null else &colliders);
     std.debug.assert(stats.output_count == static_fixture_contacts);
     // The header names the static count; throughput and `per_dynamic=` stay per dynamic.
     stats.item_count = static_count;
@@ -463,7 +471,7 @@ const StaticMover = struct {
 
 // Warms up, settles the stage tuners, and times one step per iteration: `mover`'s static
 // move through the commit seam when set, then the collision update over `data`.
-fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, data: *DataSystem, mover: ?*StaticMover) !suite.RunStats {
+fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, data: *DataSystem, mover: ?*StaticMover, colliders: ?*StaticColliderSystem) !suite.RunStats {
     var system = CollisionSystem.init(allocator);
     defer system.deinit();
     useCaseTuners(&system, case);
@@ -476,7 +484,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(stageTunersSettled(&system))) {
-        _ = try runOnce(&system, data, mover, &contacts, thread_ptr, case);
+        _ = try runOnce(&system, data, mover, colliders, &contacts, thread_ptr, case);
     }
     const fill_settled_before_measurement = case.adaptive and (system.fill_tuner.phase == .settled);
     const sort_settled_before_measurement = case.adaptive and (system.sort_tuner.phase == .settled);
@@ -491,14 +499,19 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     const stage_range = case.stageItemsPerRange(collision_range_alignment_items);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        last_collision_stats = try runOnce(&system, data, mover, &contacts, thread_ptr, case);
+        last_collision_stats = try runOnce(&system, data, mover, colliders, &contacts, thread_ptr, case);
         const end_ns = suite.nowNs(io);
-        try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ last_collision_stats.perf.fill_batch, last_collision_stats.perf.sort_batch, last_collision_stats.broadphase_batch, last_collision_stats.narrowphase_batch });
+        if (mover != null or colliders != null) {
+            std.debug.assert(last_collision_stats.body_count == item_count);
+            std.debug.assert(last_collision_stats.entry_count == last_collision_stats.body_count);
+        }
+        try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ last_collision_stats.perf.fill_batch, last_collision_stats.perf.sort_batch, last_collision_stats.broadphase_batch, last_collision_stats.narrowphase_batch, last_collision_stats.perf.static_pairs_batch, last_collision_stats.perf.static_sort_batch });
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_collision_stats.broadphase_batch);
         const mover_off_main_ns = if (mover) |static_mover| static_mover.spliceOffMainNs() else 0;
         const off_main_ns = offMainNs(last_collision_stats.perf.fill_batch) + offMainNs(last_collision_stats.perf.sort_batch) +
-            offMainNs(last_collision_stats.broadphase_batch) + offMainNs(last_collision_stats.narrowphase_batch);
+            offMainNs(last_collision_stats.broadphase_batch) + offMainNs(last_collision_stats.narrowphase_batch) +
+            offMainNs(last_collision_stats.perf.static_pairs_batch) + offMainNs(last_collision_stats.perf.static_sort_batch);
         main_total += elapsed_ns -| off_main_ns -| mover_off_main_ns;
     }
 
@@ -527,7 +540,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
 /// Gives each of `system`'s stage tuners the case's own tuner (an adaptive case only).
 pub fn useCaseTuners(system: *CollisionSystem, case: suite.BenchmarkCase) void {
-    for ([_]*AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner }) |tuner| {
+    for ([_]*AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner, &system.static_pair_tuner, &system.static_sort_tuner }) |tuner| {
         tuner.* = suite.adaptiveTunerForCase(case, collision_range_alignment_items) orelse return;
     }
 }
@@ -535,23 +548,33 @@ pub fn useCaseTuners(system: *CollisionSystem, case: suite.BenchmarkCase) void {
 /// Every stage tuner of `system` settled.
 pub fn stageTunersSettled(system: *const CollisionSystem) bool {
     return (system.fill_tuner.phase == .settled) and (system.sort_tuner.phase == .settled) and
-        (system.broadphase_tuner.phase == .settled) and (system.narrowphase_tuner.phase == .settled);
+        (system.broadphase_tuner.phase == .settled) and (system.narrowphase_tuner.phase == .settled) and
+        (system.static_pair_tuner.sample_count == 0 or system.static_pair_tuner.phase == .settled) and
+        (system.static_sort_tuner.sample_count == 0 or system.static_sort_tuner.phase == .settled);
 }
 
 fn runOnce(
     system: *CollisionSystem,
     data: *DataSystem,
     mover: ?*StaticMover,
+    colliders: ?*StaticColliderSystem,
     contacts: *RangeOutputStream(CollisionContact),
     thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) !CollisionStats {
     if (mover) |static_mover| try static_mover.moveAndSync(data, thread_system);
+    const view: ColliderView = if (mover) |static_mover|
+        static_mover.colliders.view()
+    else if (colliders) |static_colliders|
+        static_colliders.view()
+    else
+        .{};
 
     return try system.update(data, contacts, thread_system, .{
         .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .static_colliders = view,
     });
 }
 

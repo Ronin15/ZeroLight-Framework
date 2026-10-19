@@ -233,6 +233,8 @@ pub const BatchStage = enum {
     collision_sort,
     collision_broadphase,
     collision_narrowphase,
+    // Dynamic×static overlap query. The cost driver of a step with statics at rest.
+    collision_static_pairs,
     static_collider_splice,
     nav_remask,
     // The nav reaction's connectivity flood, its rounds summed: the removal-shaped share of a

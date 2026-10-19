@@ -50,6 +50,8 @@ const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const pdqSort = @import("../../core/sort.zig").pdq;
 const CollisionContact = @import("../simulation.zig").CollisionContact;
 const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
+const ColliderView = @import("static_colliders.zig").ColliderView;
+const ColliderChange = @import("static_colliders.zig").ColliderChange;
 
 pub const collision_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -107,7 +109,8 @@ const ProxyRow = struct {
     /// not yet zeroed.
     velocity_x: f32,
     velocity_y: f32,
-    // The fill input the slot read: an index into the scope list, or into the bounds rows.
+    level: u16 = 0,
+    // The fill input the slot read: an index into the scope list, or into `dynamic_ids`.
     source: u32,
 };
 
@@ -120,6 +123,7 @@ const ProxyColumns = struct {
     max_y: []f32,
     velocity_x: []f32,
     velocity_y: []f32,
+    level: []u16,
     source: []u32,
 
     fn of(rows: std.MultiArrayList(ProxyRow).Slice) ProxyColumns {
@@ -132,6 +136,7 @@ const ProxyColumns = struct {
             .max_y = rows.items(.max_y),
             .velocity_x = rows.items(.velocity_x),
             .velocity_y = rows.items(.velocity_y),
+            .level = rows.items(.level),
             .source = rows.items(.source),
         };
     }
@@ -146,6 +151,7 @@ const ConstProxyColumns = struct {
     max_y: []const f32,
     velocity_x: []const f32,
     velocity_y: []const f32,
+    level: []const u16,
     source: []const u32,
 
     fn of(rows: std.MultiArrayList(ProxyRow).Slice) ConstProxyColumns {
@@ -158,6 +164,7 @@ const ConstProxyColumns = struct {
             .max_y = rows.items(.max_y),
             .velocity_x = rows.items(.velocity_x),
             .velocity_y = rows.items(.velocity_y),
+            .level = rows.items(.level),
             .source = rows.items(.source),
         };
     }
@@ -331,8 +338,11 @@ pub const CollisionConfig = struct {
     adaptive: bool = true,
     strips: CollisionStrips = .default,
     /// When non-null, only these dense collision-bounds indices generate contacts
-    /// this step (the scope system excludes dormant/kinematic entities). Null = all.
+    /// this step (the scope system excludes dormant/kinematic entities). Null = the
+    /// dynamic bounds index: no tier exclusion, and static obstacles are not swept.
     scope_dense_indices: ?[]const u32 = null,
+    /// Static query columns from the previous commit. Empty until a rebuild.
+    static_colliders: ColliderView = .{},
 };
 
 const Threads = StageThreads(CollisionConfig);
@@ -348,6 +358,8 @@ pub const CollisionStats = struct {
     broadphase_simd_groups: usize = 0,
     broadphase_batch: BatchStats = .{},
     narrowphase_batch: BatchStats = .{},
+    /// Dynamic×static query. Present in every build; the perf log copies it when enabled.
+    static_pairs_batch: BatchStats = .{},
     /// This step outgrew the reserved pair bound, so a main-thread grow path ran: the
     /// candidate pairs exceeded `CollisionSystem.reserved_pair_bound`, or a broadphase
     /// range held more than `broadphase_pairs_per_item` pairs per entry its slot was
@@ -361,6 +373,8 @@ pub const CollisionStats = struct {
         broadphase_visits: usize = 0,
         fill_batch: BatchStats = .{},
         sort_batch: BatchStats = .{},
+        static_pairs_batch: BatchStats = .{},
+        static_sort_batch: BatchStats = .{},
     } else struct {};
 };
 
@@ -407,11 +421,19 @@ const BroadphaseRangeSlot = struct {
 
 const BroadphaseRangeSlotList = std.array_list.Aligned(BroadphaseRangeSlot, .fromByteUnits(thread_shared_record_alignment));
 
+const KeyedContact = struct {
+    key: u256,
+    contact: CollisionContact,
+};
+
 /// Narrowphase emits at most one contact per candidate pair, so it needs no per-range
 /// buffers: range r writes only its own `[range.start, range.end)` window of one
-/// candidate-pair-count staging list and its count into a padded tally; the main
-/// thread streams the windows in range order.
+/// candidate-pair-count staging list and its count into a padded tally. When a
+/// static pair is in the merge, the same window of `narrowphase_keys` holds the
+/// order key taken from the proxy columns. The main thread streams the windows
+/// in range order.
 const ContactStagingList = std.array_list.Aligned(CollisionContact, .fromByteUnits(thread_shared_record_alignment));
+const NarrowphaseKeyList = std.array_list.Aligned(u256, .fromByteUnits(thread_shared_record_alignment));
 
 /// One narrowphase range's contact count, written once by the range's job.
 const ContactCountTally = struct {
@@ -423,9 +445,67 @@ const ContactCountTally = struct {
 comptime {
     std.debug.assert(@sizeOf(ContactCountTally) % thread_shared_record_alignment == 0);
     std.debug.assert(@sizeOf(PaddedSlot(SpillCopies)) % thread_shared_record_alignment == 0);
+    // One narrowphase range starts on a cache line when the previous one does.
+    std.debug.assert(collision_range_alignment_items * @sizeOf(CollisionContact) % thread_shared_record_alignment == 0);
+    std.debug.assert(collision_range_alignment_items * @sizeOf(u256) % thread_shared_record_alignment == 0);
 }
 
 const ContactCountTallyList = std.array_list.Aligned(ContactCountTally, .fromByteUnits(thread_shared_record_alignment));
+
+const HitScratch = struct {
+    entity: std.ArrayList(u32) = .empty,
+    min_x: std.ArrayList(f32) = .empty,
+    min_y: std.ArrayList(f32) = .empty,
+    max_x: std.ArrayList(f32) = .empty,
+    max_y: std.ArrayList(f32) = .empty,
+
+    fn deinit(self: *HitScratch, allocator: std.mem.Allocator) void {
+        self.entity.deinit(allocator);
+        self.min_x.deinit(allocator);
+        self.min_y.deinit(allocator);
+        self.max_x.deinit(allocator);
+        self.max_y.deinit(allocator);
+    }
+
+    fn ensure(self: *HitScratch, allocator: std.mem.Allocator, n: usize) !void {
+        try self.entity.ensureTotalCapacityPrecise(allocator, n);
+        try self.min_x.ensureTotalCapacityPrecise(allocator, n);
+        try self.min_y.ensureTotalCapacityPrecise(allocator, n);
+        try self.max_x.ensureTotalCapacityPrecise(allocator, n);
+        try self.max_y.ensureTotalCapacityPrecise(allocator, n);
+        self.entity.items.len = n;
+        self.min_x.items.len = n;
+        self.min_y.items.len = n;
+        self.max_x.items.len = n;
+        self.max_y.items.len = n;
+    }
+};
+
+const StaticPairBuffer = struct {
+    pairs: std.ArrayList(KeyedContact) = .empty,
+    hits: HitScratch = .{},
+    required: usize = 0,
+    moved: bool = false,
+
+    fn clear(self: *StaticPairBuffer) void {
+        self.pairs.clearRetainingCapacity();
+        self.required = 0;
+        self.moved = false;
+    }
+
+    fn deinit(self: *StaticPairBuffer, allocator: std.mem.Allocator) void {
+        self.pairs.deinit(allocator);
+        self.hits.deinit(allocator);
+    }
+};
+
+const TriggerHead = struct {
+    entity_index: u32,
+    start: u32,
+    count: u32,
+};
+
+const no_static_row: u32 = std.math.maxInt(u32);
 
 // A fill's band starts: band b's entries are `[entry_start[b], entry_start[b + 1])`.
 // Its first copies rank `[first_start[b], first_start[b + 1])` among all first copies,
@@ -465,11 +545,29 @@ pub const CollisionSystem = struct {
     broadphase_ranges: BroadphaseRangeSlotList = .empty,
     candidate_pairs: std.ArrayList(CandidatePair) = .empty,
     narrowphase_staging: ContactStagingList = .empty,
+    // Order keys for `narrowphase_staging`, same index. Written only when this step
+    // merges static pairs; a dynamic-only step leaves it unused.
+    narrowphase_keys: NarrowphaseKeyList = .empty,
     narrowphase_tallies: ContactCountTallyList = .empty,
     fill_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     broadphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     narrowphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    static_pair_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    static_sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    strips: CollisionStrips = .default,
+    static_pair_slots: SlotList(StaticPairBuffer) = .empty,
+    static_pairs: std.ArrayList(KeyedContact) = .empty,
+    ordered: std.ArrayList(KeyedContact) = .empty,
+    sort_staging: std.ArrayList(KeyedContact) = .empty,
+    sort_offsets: SlotList(BandOffsets) = .empty,
+    triggers: std.ArrayList(TriggerHead) = .empty,
+    trigger_pairs: std.ArrayList(KeyedContact) = .empty,
+    trigger_rows: std.ArrayList(u32) = .empty,
+    change_mark: std.ArrayList(u32) = .empty,
+    change_generation: u32 = 1,
+    seen_revision: u64 = 0,
+    triggers_ready: bool = false,
     /// The pair bound `reserve` declared (`broadphasePairBound(body_capacity)`, grow-only);
     /// 0 until `reserve` runs. Telemetry compares against this logical limit, never a
     /// list's `.capacity`, which `ensureTotalCapacity` rounds past it.
@@ -503,7 +601,18 @@ pub const CollisionSystem = struct {
     }
 
     pub fn deinit(self: *CollisionSystem) void {
+        self.change_mark.deinit(self.allocator);
+        self.trigger_rows.deinit(self.allocator);
+        self.trigger_pairs.deinit(self.allocator);
+        self.triggers.deinit(self.allocator);
+        self.sort_offsets.deinit(self.allocator);
+        self.sort_staging.deinit(self.allocator);
+        self.ordered.deinit(self.allocator);
+        self.static_pairs.deinit(self.allocator);
+        for (self.static_pair_slots.items) |*slot| slot.value.deinit(self.allocator);
+        self.static_pair_slots.deinit(self.allocator);
         self.narrowphase_tallies.deinit(self.allocator);
+        self.narrowphase_keys.deinit(self.allocator);
         self.narrowphase_staging.deinit(self.allocator);
         self.candidate_pairs.deinit(self.allocator);
         for (self.broadphase_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
@@ -565,7 +674,19 @@ pub const CollisionSystem = struct {
             try slot.buffer.pairs.ensureTotalCapacityPrecise(self.allocator, broadphasePairBound(@divCeil(entry_capacity, range_index + 1)));
         }
         try self.narrowphase_staging.ensureTotalCapacityPrecise(self.allocator, pair_capacity);
+        try self.narrowphase_keys.ensureTotalCapacityPrecise(self.allocator, pair_capacity);
         try self.narrowphase_tallies.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(pair_capacity, collision_range_alignment_items));
+        const static_ranges = maxRangeCount(body_capacity, collision_range_alignment_items);
+        try self.prepareStaticPairSlots(static_ranges);
+        for (self.static_pair_slots.items[0..static_ranges], 0..) |*slot, range_index| {
+            const bound = broadphasePairBound(@divCeil(body_capacity, range_index + 1));
+            try slot.value.pairs.ensureTotalCapacityPrecise(self.allocator, bound);
+            try slot.value.hits.ensure(self.allocator, bound);
+        }
+        try self.static_pairs.ensureTotalCapacity(self.allocator, pair_capacity);
+        try self.ordered.ensureTotalCapacity(self.allocator, pair_capacity);
+        try self.sort_staging.ensureTotalCapacity(self.allocator, pair_capacity);
+        try self.sort_offsets.ensureTotalCapacity(self.allocator, static_ranges);
         self.reserved_pair_bound = @max(self.reserved_pair_bound, pair_capacity);
         self.reserved_entry_bound = @max(self.reserved_entry_bound, entry_capacity);
     }
@@ -580,6 +701,18 @@ pub const CollisionSystem = struct {
         try contacts.reserve(maxRangeCount(contact_capacity, collision_range_alignment_items), contact_capacity);
     }
 
+    /// Brings the trigger store up to `view` after a collider sync. A contiguous revision
+    /// with changes patches; anything else rebuilds. Growth is the patch's, on this thread.
+    /// The requery uses `thread_system` and runs inline below its gate. Strips are the last
+    /// collision step's, the engine tile until one has run. The next `update` with this
+    /// revision does not run the patch. An error leaves the stored revision unchanged.
+    pub fn refreshCommittedTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, thread_system: *ThreadSystem) !void {
+        try self.refreshTriggers(data, view, .{
+            .thread_system = thread_system,
+            .config = .{ .strips = self.strips, .static_colliders = view },
+        });
+    }
+
     /// One collision step over the bounds rows (or `config.scope_dense_indices`): the fill,
     /// sort, broadphase, and narrowphase, each on workers under its own tuner or inline as
     /// it selects. With no worker the same functions run inline. Allocates only past
@@ -591,41 +724,63 @@ pub const CollisionSystem = struct {
         thread_system: *ThreadSystem,
         config: CollisionConfig,
     ) !CollisionStats {
+        self.strips = config.strips;
+        const view = config.static_colliders;
+        if (comptime builtin.mode == .debug) {
+            if (view.geometry == null) {
+                std.debug.assert(data.collision_bounds.dynamic_ids.items.len == data.collision_bounds.len());
+            }
+        }
         const threads: Threads = .{ .thread_system = thread_system, .config = config };
         var stats = CollisionStats{};
-        if (!try self.buildBanded(data, config.scope_dense_indices, config.strips, threads, &stats)) {
-            contacts.clearRetainingCapacity();
-            return stats;
+        const sweep = try self.buildBanded(data, config.scope_dense_indices, config.strips, threads, &stats);
+        // The query reads proxies only, so it runs before the narrowphase and the
+        // narrowphase writes order keys only when a static pair will be merged.
+        const moved = try self.gatherStaticPairs(data, view, threads, &stats);
+        if (moved) return error.StaticMovedOutsideCommit;
+        const write_keys = self.static_pairs.items.len != 0;
+        var narrow_items: usize = 0;
+        var narrow_ran = false;
+        if (sweep) {
+            const broadphase_stage = threads.stage(&self.broadphase_tuner);
+            const broadphase_selection = broadphase_stage.select(stats.entry_count, collision_range_alignment_items);
+            const broadphase = try self.buildBroadphaseCandidatesThreaded(thread_system, broadphase_selection, stats.entry_count);
+            if (broadphase_selection.active_tuner) |tuner| tuner.record(broadphase.batch);
+            stats.broadphase_batch = broadphase.batch;
+            if (comptime runtime_perf_log.enabled) {
+                stats.broadphase_simd_groups = broadphase.perf.simd_groups;
+                stats.perf.broadphase_visits = broadphase.perf.visits;
+            }
+            const candidate_pair_count = self.candidate_pairs.items.len;
+            stats.candidate_pair_count = candidate_pair_count;
+            stats.pair_bound_exceeded = self.countPairBoundOverflow(candidate_pair_count, broadphase.grew);
+            if (candidate_pair_count != 0) {
+                const narrowphase_stage = threads.stage(&self.narrowphase_tuner);
+                const narrowphase_selection = narrowphase_stage.select(candidate_pair_count, collision_range_alignment_items);
+                try self.prepareNarrowphaseStaging(candidate_pair_count, narrowphase_selection.range_count, write_keys);
+                var context = NarrowphaseJobContext{
+                    .system = self,
+                    .range_count = narrowphase_selection.range_count,
+                    .candidate_pair_count = candidate_pair_count,
+                    .items_per_range = narrowphase_selection.items_per_range,
+                    .write_keys = write_keys,
+                };
+                stats.narrowphase_batch = narrowphase_stage.run(narrowphase_selection, candidate_pair_count, collision_range_alignment_items, &context, narrowphaseContactsJob);
+                narrow_items = narrowphase_selection.items_per_range;
+                narrow_ran = true;
+            }
         }
 
-        const broadphase_stage = threads.stage(&self.broadphase_tuner);
-        const broadphase_selection = broadphase_stage.select(stats.entry_count, collision_range_alignment_items);
-        const broadphase = try self.buildBroadphaseCandidatesThreaded(thread_system, broadphase_selection, stats.entry_count);
-        if (broadphase_selection.active_tuner) |tuner| tuner.record(broadphase.batch);
-        stats.broadphase_batch = broadphase.batch;
-        if (comptime runtime_perf_log.enabled) {
-            stats.broadphase_simd_groups = broadphase.perf.simd_groups;
-            stats.perf.broadphase_visits = broadphase.perf.visits;
-        }
-        const candidate_pair_count = self.candidate_pairs.items.len;
-        stats.candidate_pair_count = candidate_pair_count;
-        if (candidate_pair_count == 0) {
-            contacts.clearRetainingCapacity();
+        if (!write_keys) {
+            if (narrow_ran) {
+                stats.contact_count = try self.mergeNarrowphaseContacts(contacts, narrow_items);
+            } else {
+                contacts.clearRetainingCapacity();
+            }
             return stats;
         }
-        stats.pair_bound_exceeded = self.countPairBoundOverflow(candidate_pair_count, broadphase.grew);
-
-        const narrowphase_stage = threads.stage(&self.narrowphase_tuner);
-        const narrowphase_selection = narrowphase_stage.select(candidate_pair_count, collision_range_alignment_items);
-        try self.prepareNarrowphaseStaging(candidate_pair_count, narrowphase_selection.range_count);
-        var context = NarrowphaseJobContext{
-            .system = self,
-            .range_count = narrowphase_selection.range_count,
-            .candidate_pair_count = candidate_pair_count,
-            .items_per_range = narrowphase_selection.items_per_range,
-        };
-        stats.narrowphase_batch = narrowphase_stage.run(narrowphase_selection, candidate_pair_count, collision_range_alignment_items, &context, narrowphaseContactsJob);
-        stats.contact_count = try self.mergeNarrowphaseContacts(contacts, narrowphase_selection.items_per_range);
+        try self.sortStaticPairs(threads, &stats);
+        stats.contact_count = try self.mergeWithStatics(contacts, narrow_ran, narrow_items);
         return stats;
     }
 
@@ -660,6 +815,7 @@ pub const CollisionSystem = struct {
             .movement = data.movementBodySliceConst(),
             .levels = data.worldLevelSliceConst().levels,
             .scope = scope_dense_indices,
+            .dynamic_ids = data.collision_bounds.dynamic_ids.items,
             .warm_sources = if (self.warm_count == input_count) self.warm_sources.items[0..input_count] else null,
             .strips = strips,
             .proxies = ProxyColumns.of(self.proxies.slice()),
@@ -805,9 +961,13 @@ pub const CollisionSystem = struct {
     /// `range_count` tallies. Main thread, before dispatch. Grow-only safety nets: after
     /// `reserve` they allocate only when candidate pairs outgrow the reserved pair
     /// capacity (the kept pair-density path), never for a partition change.
-    fn prepareNarrowphaseStaging(self: *CollisionSystem, candidate_pair_count: usize, range_count: usize) !void {
+    fn prepareNarrowphaseStaging(self: *CollisionSystem, candidate_pair_count: usize, range_count: usize, write_keys: bool) !void {
         try self.narrowphase_staging.ensureTotalCapacity(self.allocator, candidate_pair_count);
         self.narrowphase_staging.items.len = candidate_pair_count;
+        if (write_keys) {
+            try self.narrowphase_keys.ensureTotalCapacity(self.allocator, candidate_pair_count);
+            self.narrowphase_keys.items.len = candidate_pair_count;
+        }
         try self.narrowphase_tallies.ensureTotalCapacity(self.allocator, range_count);
         self.narrowphase_tallies.items.len = range_count;
         for (self.narrowphase_tallies.items) |*slot| slot.count = 0;
@@ -1021,13 +1181,701 @@ pub const CollisionSystem = struct {
             return result;
         }
     }
+
+    fn prepareStaticPairSlots(self: *CollisionSystem, range_count: usize) !void {
+        try self.static_pair_slots.ensureTotalCapacity(self.allocator, range_count);
+        while (self.static_pair_slots.items.len < range_count) self.static_pair_slots.appendAssumeCapacity(.{});
+    }
+
+    fn growStaticPairSlots(self: *CollisionSystem, range_count: usize) !bool {
+        var grew = false;
+        for (self.static_pair_slots.items[0..range_count]) |*slot| {
+            if (slot.value.required <= slot.value.hits.entity.items.len) continue;
+            const n = slot.value.required;
+            try slot.value.hits.ensure(self.allocator, n);
+            try slot.value.pairs.ensureTotalCapacity(self.allocator, n);
+            grew = true;
+        }
+        return grew;
+    }
+
+    // Trigger patch, then one query over the filled dynamics. `static_pairs` is the
+    // static-involving contacts. Returns the Debug out-of-band flag.
+    fn gatherStaticPairs(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, stats: *CollisionStats) !bool {
+        self.static_pairs.clearRetainingCapacity();
+        if (view.geometry == null) return false;
+        try self.refreshTriggers(data, view, threads);
+        const input_count = self.proxies.len;
+        if (input_count != 0) {
+            const stage = threads.stage(&self.static_pair_tuner);
+            const selection = stage.select(input_count, collision_range_alignment_items);
+            try self.prepareStaticPairSlots(selection.range_count);
+            const slots = self.static_pair_slots.items[0..selection.range_count];
+            var job = StaticQueryJob{
+                .data = data,
+                .view = view,
+                .proxies = ConstProxyColumns.of(self.proxies.slice()),
+                .strips = self.strips,
+                .slots = slots,
+                .exclude_tiers = data.tierCount(.dormant) + data.tierCount(.kinematic) != 0,
+                .items_per_range = selection.items_per_range,
+                .range_count = selection.range_count,
+                .input_count = input_count,
+            };
+            var grew = false;
+            var batch = BatchStats{};
+            while (true) {
+                for (slots) |*slot| slot.value.clear();
+                // An overflow returns before the range is finished. Record only the
+                // batch that actually wrote its pairs, or a short replay teaches the
+                // tuner the query is cheap and it settles inline.
+                batch = threads.thread_system.parallelForWithOptions(input_count, &job, staticQueryJob, .{
+                    .items_per_range = threads.config.items_per_range,
+                    .max_worker_threads = threads.config.max_worker_threads,
+                    .range_alignment_items = collision_range_alignment_items,
+                    .adaptive = threads.config.adaptive,
+                    .adaptive_tuner = null,
+                    .selected_profile = selection.profile,
+                });
+                if (try self.growStaticPairSlots(selection.range_count)) {
+                    grew = true;
+                    continue;
+                }
+                break;
+            }
+            if (selection.active_tuner) |tuner| tuner.record(batch);
+            if (grew) stats.pair_bound_exceeded = self.countPairBoundOverflow(0, true) or stats.pair_bound_exceeded;
+            stats.static_pairs_batch = batch;
+            if (comptime runtime_perf_log.enabled) stats.perf.static_pairs_batch = batch;
+            for (slots) |*slot| {
+                try self.static_pairs.ensureTotalCapacity(self.allocator, self.static_pairs.items.len + slot.value.pairs.items.len);
+                self.static_pairs.appendSliceAssumeCapacity(slot.value.pairs.items);
+            }
+            if (comptime builtin.mode == .debug) {
+                for (slots) |slot| if (slot.value.moved) return true;
+            }
+        }
+        try self.appendTriggerContacts(data);
+        return false;
+    }
+
+    fn refreshTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
+        if (view.revision == self.seen_revision) return;
+        const warm = self.triggers_ready and view.revision == self.seen_revision +% 1 and view.changes.len != 0;
+        if (warm) try self.patchTriggers(data, view, threads) else try self.rebuildTriggers(data, view, threads);
+        self.seen_revision = view.revision;
+        self.triggers_ready = true;
+    }
+
+    fn rebuildTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
+        self.trigger_pairs.clearRetainingCapacity();
+        self.triggers.clearRetainingCapacity();
+        self.trigger_rows.clearRetainingCapacity();
+        try self.trigger_rows.ensureTotalCapacity(self.allocator, view.row_of_index.len);
+        for (view.row_of_index) |row| {
+            if (row == no_static_row) continue;
+            self.trigger_rows.appendAssumeCapacity(row);
+        }
+        try self.dispatchTriggerRows(data, view, threads);
+        try self.groupTriggerHeads();
+    }
+
+    fn patchTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
+        try self.markChanges(view.changes);
+        self.dropChangedPairs();
+        const kept = self.trigger_pairs.items.len;
+        self.trigger_rows.clearRetainingCapacity();
+        try self.collectRequeryRows(data, view);
+        try self.dispatchTriggerRows(data, view, threads);
+        try self.attachTriggerPairs(kept);
+    }
+
+    fn dispatchTriggerRows(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
+        const items = self.trigger_rows.items.len;
+        if (items == 0) return;
+        // A null tuner: this rebuild must not call `selectProfile` on `static_pair_tuner`.
+        // The shape is the config's fixed profile.
+        const selection = threads.thread_system.selectBatchProfile(null, .{
+            .item_count = items,
+            .items_per_range = threads.config.items_per_range,
+            .max_worker_threads = threads.config.max_worker_threads,
+            .range_alignment_items = collision_range_alignment_items,
+            .adaptive = threads.config.adaptive,
+        });
+        try self.prepareStaticPairSlots(selection.range_count);
+        const slots = self.static_pair_slots.items[0..selection.range_count];
+        var job = TriggerJob{
+            .data = data,
+            .view = view,
+            .strips = self.strips,
+            .rows = self.trigger_rows.items,
+            .slots = slots,
+            .items_per_range = selection.items_per_range,
+            .range_count = selection.range_count,
+        };
+        while (true) {
+            for (slots) |*slot| slot.value.clear();
+            _ = threads.thread_system.parallelForWithOptions(items, &job, triggerJob, .{
+                .items_per_range = threads.config.items_per_range,
+                .max_worker_threads = threads.config.max_worker_threads,
+                .range_alignment_items = collision_range_alignment_items,
+                .adaptive = threads.config.adaptive,
+                .adaptive_tuner = null,
+                .selected_profile = selection.profile,
+            });
+            if (!try self.growStaticPairSlots(selection.range_count)) break;
+        }
+        for (slots) |*slot| {
+            try self.trigger_pairs.ensureTotalCapacity(self.allocator, self.trigger_pairs.items.len + slot.value.pairs.items.len);
+            self.trigger_pairs.appendSliceAssumeCapacity(slot.value.pairs.items);
+        }
+    }
+
+    fn collectRequeryRows(self: *CollisionSystem, data: *const DataSystem, view: ColliderView) !void {
+        self.change_generation +%= 1;
+        if (self.change_generation == 0) {
+            @memset(self.change_mark.items, 0);
+            self.change_generation = 1;
+        }
+        for (view.changes) |change| {
+            if (!data.isStaticNavigationObstacle(change.entity)) continue;
+            const index = change.entity.index;
+            if (index >= view.row_of_index.len) continue;
+            const row = view.row_of_index[index];
+            if (row == no_static_row) continue;
+            try self.pushRequeryRow(row, index);
+            const rect = data.staticObstacleWorldRect(change.entity) orelse continue;
+            const level = data.worldLevelConst(change.entity) orelse 0;
+            var entity_buf: [8]u32 = undefined;
+            var min_x: [8]f32 = undefined;
+            var min_y: [8]f32 = undefined;
+            var max_x: [8]f32 = undefined;
+            var max_y: [8]f32 = undefined;
+            const hits = view.collectOverlaps(level, rect, &entity_buf, &min_x, &min_y, &max_x, &max_y);
+            if (hits > entity_buf.len) {
+                try self.noteRequeryOverflow(data, view, level, rect, hits);
+                continue;
+            }
+            try self.noteRequeryHits(data, view, entity_buf[0..hits]);
+        }
+    }
+
+    fn noteRequeryOverflow(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, level: u16, rect: math.Aabb, hits: usize) !void {
+        const entities = try self.allocator.alloc(u32, hits);
+        defer self.allocator.free(entities);
+        const min_x = try self.allocator.alloc(f32, hits);
+        defer self.allocator.free(min_x);
+        const min_y = try self.allocator.alloc(f32, hits);
+        defer self.allocator.free(min_y);
+        const max_x = try self.allocator.alloc(f32, hits);
+        defer self.allocator.free(max_x);
+        const max_y = try self.allocator.alloc(f32, hits);
+        defer self.allocator.free(max_y);
+        const full = view.collectOverlaps(level, rect, entities, min_x, min_y, max_x, max_y);
+        try self.noteRequeryHits(data, view, entities[0..full]);
+    }
+
+    fn noteRequeryHits(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, entities: []const u32) !void {
+        for (entities) |entity_index| {
+            if (entity_index >= view.row_of_index.len) continue;
+            const row = view.row_of_index[entity_index];
+            if (row == no_static_row or row >= view.row_entity.len) continue;
+            const other = view.row_entity[row];
+            const response = data.collisionResponseConst(other) orelse continue;
+            if (response.mode != .trigger) continue;
+            try self.pushRequeryRow(row, other.index);
+        }
+    }
+
+    fn pushRequeryRow(self: *CollisionSystem, row: u32, entity_index: u32) !void {
+        if (entity_index >= self.change_mark.items.len) {
+            try self.change_mark.ensureTotalCapacity(self.allocator, entity_index + 1);
+            self.change_mark.appendNTimesAssumeCapacity(0, entity_index + 1 - self.change_mark.items.len);
+        }
+        if (self.change_mark.items[entity_index] == self.change_generation) return;
+        self.change_mark.items[entity_index] = self.change_generation;
+        try self.trigger_rows.append(self.allocator, row);
+    }
+
+    fn markChanges(self: *CollisionSystem, changes: []const ColliderChange) !void {
+        self.change_generation +%= 1;
+        if (self.change_generation == 0) {
+            @memset(self.change_mark.items, 0);
+            self.change_generation = 1;
+        }
+        var max_index: usize = self.change_mark.items.len;
+        for (changes) |change| max_index = @max(max_index, @as(usize, change.entity.index) + 1);
+        if (self.change_mark.items.len < max_index) {
+            try self.change_mark.ensureTotalCapacity(self.allocator, max_index);
+            self.change_mark.appendNTimesAssumeCapacity(0, max_index - self.change_mark.items.len);
+        }
+        for (changes) |change| self.change_mark.items[change.entity.index] = self.change_generation;
+    }
+
+    fn dropChangedPairs(self: *CollisionSystem) void {
+        var write: usize = 0;
+        for (self.trigger_pairs.items) |pair| {
+            if (self.entityChanged(pair.contact.a) or self.entityChanged(pair.contact.b)) continue;
+            self.trigger_pairs.items[write] = pair;
+            write += 1;
+        }
+        self.trigger_pairs.items.len = write;
+    }
+
+    fn entityChanged(self: *const CollisionSystem, id: EntityId) bool {
+        const index = id.index;
+        return index < self.change_mark.items.len and self.change_mark.items[index] == self.change_generation;
+    }
+
+    // Cold roster: every stored pair is new, so one sort groups them by head.
+    fn groupTriggerHeads(self: *CollisionSystem) !void {
+        std.mem.sort(KeyedContact, self.trigger_pairs.items, {}, keyedHeadLess);
+        try self.rebuildTriggerHeads(self.trigger_pairs.items);
+    }
+
+    // The kept prefix is already grouped. Sort only the pairs the requery appended
+    // and merge them onto those heads. A pair already stored on its head is not copied.
+    fn attachTriggerPairs(self: *CollisionSystem, kept: usize) !void {
+        const total = self.trigger_pairs.items.len;
+        if (kept == 0) {
+            try self.groupTriggerHeads();
+            return;
+        }
+        if (kept == total) {
+            try self.rebuildTriggerHeads(self.trigger_pairs.items);
+            return;
+        }
+        std.mem.sort(KeyedContact, self.trigger_pairs.items[kept..], {}, keyedHeadLess);
+        try self.rebuildTriggerHeads(self.trigger_pairs.items[0..kept]);
+        try self.ordered.ensureTotalCapacity(self.allocator, total);
+        self.ordered.clearRetainingCapacity();
+        var head_index: usize = 0;
+        var fresh_index: usize = 0;
+        const fresh = self.trigger_pairs.items[kept..];
+        while (head_index < self.triggers.items.len or fresh_index < fresh.len) {
+            const head_entity: ?u32 = if (head_index < self.triggers.items.len) self.triggers.items[head_index].entity_index else null;
+            const fresh_entity: ?u32 = if (fresh_index < fresh.len) fresh[fresh_index].contact.a.index else null;
+            if (head_entity != null and (fresh_entity == null or head_entity.? <= fresh_entity.?)) {
+                const head = self.triggers.items[head_index];
+                const start: usize = head.start;
+                const end = start + head.count;
+                self.ordered.appendSliceAssumeCapacity(self.trigger_pairs.items[start..end]);
+                head_index += 1;
+                if (fresh_entity != null and fresh_entity.? == head.entity_index) {
+                    fresh_index = self.appendFreshHead(fresh, fresh_index, self.trigger_pairs.items[start..end]);
+                }
+            } else {
+                fresh_index = self.appendFreshHead(fresh, fresh_index, &.{});
+            }
+        }
+        self.trigger_pairs.items.len = self.ordered.items.len;
+        @memcpy(self.trigger_pairs.items, self.ordered.items);
+        try self.rebuildTriggerHeads(self.trigger_pairs.items);
+    }
+
+    fn appendFreshHead(self: *CollisionSystem, fresh: []const KeyedContact, start: usize, kept: []const KeyedContact) usize {
+        var index = start;
+        if (index >= fresh.len) return index;
+        const entity = fresh[index].contact.a.index;
+        while (index < fresh.len and fresh[index].contact.a.index == entity) : (index += 1) {
+            if (storedPair(kept, fresh[index].contact)) continue;
+            self.ordered.appendAssumeCapacity(fresh[index]);
+        }
+        return index;
+    }
+
+    fn rebuildTriggerHeads(self: *CollisionSystem, pairs: []const KeyedContact) !void {
+        self.triggers.clearRetainingCapacity();
+        try self.triggers.ensureTotalCapacity(self.allocator, pairs.len);
+        var index: usize = 0;
+        while (index < pairs.len) {
+            const head = pairs[index].contact.a.index;
+            const start = index;
+            while (index < pairs.len and pairs[index].contact.a.index == head) index += 1;
+            self.triggers.appendAssumeCapacity(.{
+                .entity_index = head,
+                .start = @intCast(start),
+                .count = @intCast(index - start),
+            });
+        }
+    }
+
+    fn appendTriggerContacts(self: *CollisionSystem, data: *const DataSystem) !void {
+        const exclude = data.tierCount(.dormant) + data.tierCount(.kinematic) != 0;
+        for (self.trigger_pairs.items) |pair| {
+            if (exclude and !pairTiersAllow(data, pair.contact)) continue;
+            try self.static_pairs.append(self.allocator, pair);
+        }
+    }
+
+    fn sortStaticPairs(self: *CollisionSystem, threads: Threads, stats: *CollisionStats) !void {
+        const count = self.static_pairs.items.len;
+        if (count == 0) return;
+        const stage = threads.stage(&self.static_sort_tuner);
+        const place = stage.select(count, collision_range_alignment_items);
+        try self.sort_staging.ensureTotalCapacity(self.allocator, count);
+        self.sort_staging.items.len = count;
+        try self.sort_offsets.ensureTotalCapacity(self.allocator, place.range_count);
+        while (self.sort_offsets.items.len < place.range_count) self.sort_offsets.appendAssumeCapacity(.{});
+        var place_job = PairPlaceJob{
+            .pairs = self.static_pairs.items,
+            .staging = self.sort_staging.items,
+            .splitters = pairSplitters(self.static_pairs.items),
+            .items_per_range = place.items_per_range,
+            .offsets = self.sort_offsets.items,
+        };
+        _ = threads.thread_system.parallelForWithOptions(count, &place_job, pairPlaceJob, .{
+            .max_worker_threads = place.worker_threads,
+            .range_alignment_items = collision_range_alignment_items,
+            .selected_profile = place.profile,
+        });
+        const starts = pairBandStarts(self.sort_offsets.items[0..place.range_count]);
+        try self.ordered.ensureTotalCapacity(self.allocator, count);
+        self.ordered.items.len = count;
+        const sort_selection = stage.select(count, collision_range_alignment_items);
+        var sort_job = PairSortJob{
+            .source = .{ .staging = self.sort_staging.items, .band_offsets = self.sort_offsets.items[0..place.range_count], .window_stride = place.items_per_range },
+            .dest = self.ordered.items,
+            .starts = starts,
+            .range_count = sort_selection.range_count,
+        };
+        const batch = stage.run(sort_selection, count, collision_range_alignment_items, &sort_job, pairSortJob);
+        if (comptime runtime_perf_log.enabled) stats.perf.static_sort_batch = batch;
+        self.static_pairs.clearRetainingCapacity();
+        try self.static_pairs.ensureTotalCapacity(self.allocator, count);
+        self.static_pairs.appendSliceAssumeCapacity(self.ordered.items[0..count]);
+    }
+
+    fn mergeWithStatics(self: *CollisionSystem, contacts: *RangeOutputStream(CollisionContact), narrow_ran: bool, items_per_range: usize) !usize {
+        const static_count = self.static_pairs.items.len;
+        var dynamic_count: usize = 0;
+        if (narrow_ran) dynamic_count = try self.compactDynamicKeys(items_per_range);
+        const total = dynamic_count + static_count;
+        try self.ordered.ensureTotalCapacity(self.allocator, total);
+        self.ordered.items.len = total;
+        if (static_count != 0) {
+            try self.sort_staging.ensureTotalCapacity(self.allocator, static_count);
+            self.sort_staging.items.len = static_count;
+            @memcpy(self.sort_staging.items, self.static_pairs.items);
+            if (dynamic_count == 0) {
+                @memcpy(self.ordered.items, self.sort_staging.items);
+            } else {
+                mergeIntoSorted(KeyedContact, keyedGreater, self.ordered.items, dynamic_count, self.sort_staging.items);
+            }
+        }
+        return self.writeOrderedContacts(contacts, self.ordered.items[0..total]);
+    }
+
+    // Copies the narrowphase windows, keys included, to the front of `ordered`.
+    fn compactDynamicKeys(self: *CollisionSystem, items_per_range: usize) !usize {
+        const tallies = self.narrowphase_tallies.items;
+        var count: usize = 0;
+        for (tallies) |slot| count += slot.count;
+        try self.ordered.ensureTotalCapacity(self.allocator, count + self.static_pairs.items.len);
+        self.ordered.items.len = count;
+        const staging = self.narrowphase_staging.items;
+        const keys = self.narrowphase_keys.items;
+        var cursor: usize = 0;
+        for (tallies, 0..) |slot, range_index| {
+            const window_start = range_index * items_per_range;
+            const window = staging[window_start..][0..slot.count];
+            for (window, 0..) |contact, offset| {
+                self.ordered.items[cursor] = .{ .key = keys[window_start + offset], .contact = contact };
+                cursor += 1;
+            }
+        }
+        return count;
+    }
+
+    fn writeOrderedContacts(self: *CollisionSystem, contacts: *RangeOutputStream(CollisionContact), items: []const KeyedContact) !usize {
+        _ = self;
+        if (items.len == 0) {
+            contacts.clearRetainingCapacity();
+            return 0;
+        }
+        try contacts.prepareRangeCounts(1);
+        contacts.addCount(0, items.len);
+        try contacts.prefix();
+        var writer = contacts.rangeWriter(0);
+        for (items) |item| writer.write(item.contact);
+        writer.finish();
+        contacts.finishWrite();
+        return items.len;
+    }
 };
+
+// ---- Static pairs --------------------------------------------------------------------
+
+const StaticQueryJob = struct {
+    data: *const DataSystem,
+    view: ColliderView,
+    proxies: ConstProxyColumns,
+    strips: CollisionStrips,
+    slots: []PaddedSlot(StaticPairBuffer),
+    exclude_tiers: bool,
+    items_per_range: usize,
+    range_count: usize,
+    input_count: usize,
+};
+
+fn staticQueryJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *StaticQueryJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.range_count and range.index < job.slots.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.input_count);
+    const slot = &job.slots[range.index].value;
+    const proxies = job.proxies;
+    var slot_index = range.start;
+    while (slot_index < range.end) : (slot_index += 1) {
+        const entity = proxies.entity[slot_index];
+        if (!entity.isValid()) continue;
+        const movement: usize = proxies.movement_index[slot_index];
+        if (job.exclude_tiers and !job.data.movement_bodies.tierAt(movement).allowsCollision()) continue;
+        const box = math.Aabb{
+            .min_x = proxies.min_x[slot_index],
+            .min_y = proxies.min_y[slot_index],
+            .max_x = proxies.max_x[slot_index],
+            .max_y = proxies.max_y[slot_index],
+        };
+        const cap = slot.hits.entity.items.len;
+        const full = if (comptime builtin.mode == .debug)
+            job.view.collectOverlapsChecked(proxies.level[slot_index], box, slot.hits.entity.items, slot.hits.min_x.items, slot.hits.min_y.items, slot.hits.max_x.items, slot.hits.max_y.items, job.data, &slot.moved)
+        else
+            job.view.collectOverlaps(proxies.level[slot_index], box, slot.hits.entity.items, slot.hits.min_x.items, slot.hits.min_y.items, slot.hits.max_x.items, slot.hits.max_y.items);
+        if (full > cap or slot.pairs.items.len + full > slot.pairs.capacity) {
+            slot.required = @max(slot.required, @max(full, slot.pairs.items.len + full));
+            return;
+        }
+        const level = proxies.level[slot_index];
+        for (0..full) |hit| writeDynamicStaticPair(job, slot, slot_index, box, level, hit);
+    }
+}
+
+fn writeDynamicStaticPair(job: *const StaticQueryJob, slot: *StaticPairBuffer, slot_index: usize, box: math.Aabb, level: u16, hit: usize) void {
+    const entity_index = slot.hits.entity.items[hit];
+    const view = job.view;
+    if (entity_index >= view.row_of_index.len) return;
+    const row = view.row_of_index[entity_index];
+    if (row == no_static_row or row >= view.row_entity.len) return;
+    const other = view.row_entity[row];
+    const dynamic = job.proxies.entity[slot_index];
+    if (other.eql(dynamic)) return;
+    const other_move = job.data.movementBodyDenseIndex(other) orelse return;
+    if (job.exclude_tiers and !job.data.movement_bodies.tierAt(other_move).allowsCollision()) return;
+    const other_body = job.data.movementBodyConst(other) orelse return;
+    const other_box = math.Aabb{
+        .min_x = slot.hits.min_x.items[hit],
+        .min_y = slot.hits.min_y.items[hit],
+        .max_x = slot.hits.max_x.items[hit],
+        .max_y = slot.hits.max_y.items[hit],
+    };
+    if (!positiveOverlap(box, other_box)) return;
+    const proxies = job.proxies;
+    const key_dynamic = bodyRunKey(box.min_x, box.min_y, dynamic.index);
+    const key_static = bodyRunKey(other_box.min_x, other_box.min_y, other.index);
+    const strip = math.worldPosToCell(@max(box.min_y, other_box.min_y), job.strips.height, strip_count);
+    const dynamic_move: u32 = proxies.movement_index[slot_index];
+    const static_move: u32 = @intCast(other_move);
+    const contact = if (key_dynamic <= key_static)
+        contactForAabbs(dynamic, other, dynamic_move, static_move, box, other_box, proxies.velocity_x[slot_index], proxies.velocity_y[slot_index], other_body.velocity.x, other_body.velocity.y)
+    else
+        contactForAabbs(other, dynamic, static_move, dynamic_move, other_box, box, other_body.velocity.x, other_body.velocity.y, proxies.velocity_x[slot_index], proxies.velocity_y[slot_index]);
+    const key = if (key_dynamic <= key_static)
+        contactOrderKey(level, strip, key_dynamic, key_static)
+    else
+        contactOrderKey(level, strip, key_static, key_dynamic);
+    slot.pairs.appendAssumeCapacity(.{ .key = key, .contact = contact });
+}
+
+const TriggerJob = struct {
+    data: *const DataSystem,
+    view: ColliderView,
+    strips: CollisionStrips,
+    rows: []const u32,
+    slots: []PaddedSlot(StaticPairBuffer),
+    items_per_range: usize,
+    range_count: usize,
+};
+
+fn triggerJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *TriggerJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.range_count and range.index < job.slots.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.end <= job.rows.len);
+    const slot = &job.slots[range.index].value;
+    for (range.start..range.end) |item| writeTriggerRow(job, slot, job.rows[item]);
+}
+
+fn writeTriggerRow(job: *const TriggerJob, slot: *StaticPairBuffer, row: u32) void {
+    const view = job.view;
+    if (row >= view.row_entity.len) return;
+    const entity = view.row_entity[row];
+    const response = job.data.collisionResponseConst(entity) orelse return;
+    if (response.mode != .trigger) return;
+    const rect = job.data.staticObstacleWorldRect(entity) orelse return;
+    const level = job.data.worldLevelConst(entity) orelse 0;
+    const self_body = job.data.movementBodyConst(entity) orelse return;
+    const self_move = job.data.movementBodyDenseIndex(entity) orelse return;
+    const cap = slot.hits.entity.items.len;
+    const full = job.view.collectOverlaps(level, rect, slot.hits.entity.items, slot.hits.min_x.items, slot.hits.min_y.items, slot.hits.max_x.items, slot.hits.max_y.items);
+    if (full > cap or slot.pairs.items.len + full > slot.pairs.capacity) {
+        slot.required = @max(slot.required, @max(full, slot.pairs.items.len + full));
+        return;
+    }
+    const self_box = rect;
+    for (0..full) |hit| {
+        const entity_index = slot.hits.entity.items[hit];
+        if (entity_index >= view.row_of_index.len) continue;
+        const other_row = view.row_of_index[entity_index];
+        if (other_row == no_static_row or other_row >= view.row_entity.len) continue;
+        const other = view.row_entity[other_row];
+        if (other.eql(entity)) continue;
+        const other_response = job.data.collisionResponseConst(other) orelse continue;
+        const other_box = math.Aabb{
+            .min_x = slot.hits.min_x.items[hit],
+            .min_y = slot.hits.min_y.items[hit],
+            .max_x = slot.hits.max_x.items[hit],
+            .max_y = slot.hits.max_y.items[hit],
+        };
+        if (!positiveOverlap(self_box, other_box)) continue;
+        const key_self = bodyRunKey(self_box.min_x, self_box.min_y, entity.index);
+        const key_other = bodyRunKey(other_box.min_x, other_box.min_y, other.index);
+        if (other_response.mode == .trigger and key_other < key_self) continue;
+        const other_body = job.data.movementBodyConst(other) orelse continue;
+        const other_move = job.data.movementBodyDenseIndex(other) orelse continue;
+        const strip = math.worldPosToCell(@max(self_box.min_y, other_box.min_y), job.strips.height, strip_count);
+        const self_move_u: u32 = @intCast(self_move);
+        const other_move_u: u32 = @intCast(other_move);
+        const contact = if (key_self <= key_other)
+            contactForAabbs(entity, other, self_move_u, other_move_u, self_box, other_box, self_body.velocity.x, self_body.velocity.y, other_body.velocity.x, other_body.velocity.y)
+        else
+            contactForAabbs(other, entity, other_move_u, self_move_u, other_box, self_box, other_body.velocity.x, other_body.velocity.y, self_body.velocity.x, self_body.velocity.y);
+        const key = if (key_self <= key_other)
+            contactOrderKey(level, strip, key_self, key_other)
+        else
+            contactOrderKey(level, strip, key_other, key_self);
+        slot.pairs.appendAssumeCapacity(.{ .key = key, .contact = contact });
+    }
+}
+
+const PairSort = banded_sort.BandedSort(KeyedContact, keyedKeyOf);
+
+fn keyedKeyOf(item: KeyedContact) u256 {
+    return item.key;
+}
+
+fn keyedGreater(a: KeyedContact, b: KeyedContact) bool {
+    return a.key > b.key;
+}
+
+fn keyedHeadLess(_: void, a: KeyedContact, b: KeyedContact) bool {
+    return a.contact.a.index < b.contact.a.index;
+}
+
+fn storedPair(kept: []const KeyedContact, contact: CollisionContact) bool {
+    for (kept) |pair| {
+        if (pair.contact.a.eql(contact.a) and pair.contact.b.eql(contact.b)) return true;
+    }
+    return false;
+}
+
+fn keyedLess(_: void, a: KeyedContact, b: KeyedContact) bool {
+    return a.key < b.key;
+}
+
+const PairPlaceJob = struct {
+    pairs: []const KeyedContact,
+    staging: []KeyedContact,
+    splitters: PairSort.Splitters,
+    items_per_range: usize,
+    offsets: []PaddedSlot(BandOffsets),
+};
+
+fn pairPlaceJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *PairPlaceJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.offsets.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.end <= job.pairs.len and range.end <= job.staging.len);
+    const elements = job.pairs[range.start..range.end];
+    job.offsets[range.index].value = PairSort.placeByBand(&job.splitters, elements, job.staging[range.start..range.end]);
+}
+
+const PairSortJob = struct {
+    source: PairSort.WindowSource,
+    dest: []KeyedContact,
+    starts: [band_count + 1]u32,
+    range_count: usize,
+};
+
+fn pairSortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *PairSortJob = @ptrCast(@alignCast(context));
+    const total = job.starts[band_count];
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.end <= total and total <= job.dest.len);
+    var owned = OwnedBands.init(&job.starts, range.start, range.end);
+    while (owned.next()) |band| {
+        const start = job.starts[band];
+        const end = job.starts[band + 1];
+        const gathered = PairSort.gatherBand(job.dest[start..end], band, .{job.source});
+        std.debug.assert(gathered == end - start);
+        pdqSort(KeyedContact, job.dest[start..end], {}, keyedLess);
+    }
+}
+
+fn pairSplitters(pairs: []const KeyedContact) PairSort.Splitters {
+    var samples: [banded_sort.splitter_sample_count]u256 = undefined;
+    var valid: usize = 0;
+    for (0..banded_sort.sampleCount(pairs.len)) |sample| {
+        samples[valid] = pairs[banded_sort.sampleSlot(sample, pairs.len)].key;
+        valid += 1;
+    }
+    return PairSort.splittersFromSamples(samples[0..valid]);
+}
+
+fn pairBandStarts(offsets: []const PaddedSlot(BandOffsets)) [band_count + 1]u32 {
+    var starts: [band_count + 1]u32 = @splat(0);
+    for (offsets) |slot| {
+        for (&starts, slot.value.offsets) |*start, offset| start.* += offset;
+    }
+    return starts;
+}
+
+fn pairTiersAllow(data: *const DataSystem, contact: CollisionContact) bool {
+    const tier_a = data.movement_bodies.tierAt(contact.a_movement_index);
+    const tier_b = data.movement_bodies.tierAt(contact.b_movement_index);
+    return tier_a.allowsCollision() and tier_b.allowsCollision();
+}
+
+// The reference run key: ordered min_x, ordered min_y, entity. Level and the contact
+// strip stay in the contact key's high word, not here.
+fn bodyRunKey(min_x: f32, min_y: f32, entity_index: u32) u128 {
+    return packKey(0, math.orderedBits(min_x), math.orderedBits(min_y), entity_index);
+}
+
+fn reducedRunKey(key: u128) u96 {
+    return @truncate(key);
+}
+
+fn contactOrderKey(level: u16, strip: u32, key_a: u128, key_b: u128) u256 {
+    // High word is the contact run. Each tail is the 96-bit reference run key, a then b.
+    return (@as(u256, runOf(level, strip)) << 224) | (@as(u256, reducedRunKey(key_a)) << 96) | reducedRunKey(key_b);
+}
+
+fn contactKeyFromProxies(strips: CollisionStrips, proxies: ConstProxyColumns, a: usize, b: usize) u256 {
+    const strip = math.worldPosToCell(@max(proxies.min_y[a], proxies.min_y[b]), strips.height, strip_count);
+    return contactOrderKey(
+        proxies.level[a],
+        strip,
+        bodyRunKey(proxies.min_x[a], proxies.min_y[a], proxies.entity[a].index),
+        bodyRunKey(proxies.min_x[b], proxies.min_y[b], proxies.entity[b].index),
+    );
+}
 
 // ---- Fill ---------------------------------------------------------------------------
 
-// The fill's input count: the scoped bounds rows, or every bounds row.
+// The fill's input count: the scoped bounds rows, or the dynamic bounds index.
 fn fillInputCount(data: *const DataSystem, scope_dense_indices: ?[]const u32) usize {
-    return if (scope_dense_indices) |indices| indices.len else data.collisionBoundsSliceConst().entities.len;
+    return if (scope_dense_indices) |indices| indices.len else data.collision_bounds.dynamic_ids.items.len;
 }
 
 // One fill input as resolved this step.
@@ -1052,6 +1900,8 @@ const FillContext = struct {
     // The world-level store's level column.
     levels: []const u16,
     scope: ?[]const u32,
+    // Bounds indexes of the dynamic rows, used when `scope` is null.
+    dynamic_ids: []const u32,
     // Slot p reads input `warm_sources[p]` when set, else input p.
     warm_sources: ?[]const u32,
     strips: CollisionStrips,
@@ -1066,7 +1916,7 @@ const FillContext = struct {
     // Scalar: one dense-index point lookup per input, with a skip. A missing world level is
     // the surface (0).
     fn resolve(self: *const FillContext, input: u32) ?ResolvedSlot {
-        const row: usize = if (self.scope) |indices| indices[input] else input;
+        const row: usize = if (self.scope) |indices| indices[input] else self.dynamic_ids[input];
         const entity = self.bounds.entities[row];
         const found = self.data.collisionBodyRefs(entity, self.levels) orelse return null;
         const body = found.movement_body;
@@ -1149,11 +1999,13 @@ fn fillSlots(fill: *const FillContext, start: usize, end: usize, firsts: []SortE
                     entity_index[lane] = row.entity.index;
                     proxies.entity[slot] = row.entity;
                     proxies.movement_index[slot] = row.movement_index;
+                    proxies.level[slot] = row.level;
                     proxies.velocity_x[slot] = row.velocity_x;
                     proxies.velocity_y[slot] = row.velocity_y;
                 } else {
                     proxies.entity[slot] = EntityId.invalid;
                     proxies.movement_index[slot] = 0;
+                    proxies.level[slot] = 0;
                     proxies.velocity_x[slot] = 0;
                     proxies.velocity_y[slot] = 0;
                 }
@@ -1324,8 +2176,8 @@ const EntryWriter = struct {
         pdqSort(SortEntry, self.keys[second_end..end], {}, entryLessThan);
         @memcpy(scratch[first_end..second_end], self.keys[first_end..second_end]);
         @memcpy(scratch[second_end..end], self.keys[second_end..end]);
-        mergeIntoSorted(self.keys[start..second_end], first_len, scratch[first_end..second_end]);
-        mergeIntoSorted(self.keys[start..end], second_end - start, scratch[second_end..end]);
+        mergeIntoSorted(SortEntry, entryGreater, self.keys[start..second_end], first_len, scratch[first_end..second_end]);
+        mergeIntoSorted(SortEntry, entryGreater, self.keys[start..end], second_end - start, scratch[second_end..end]);
         self.writeSorted(start, end, first_rank);
     }
 
@@ -1365,14 +2217,18 @@ const EntryWriter = struct {
 // Merges the sorted `tail` into `keys`, whose first `head_len` entries are sorted, from the
 // back: one move per entry and no buffer. Hand-written: std has no merge of sorted runs.
 // Scalar: a merge is one compare per entry.
-fn mergeIntoSorted(keys: []SortEntry, head_len: usize, tail: []const SortEntry) void {
+fn entryGreater(a: SortEntry, b: SortEntry) bool {
+    return a.key > b.key;
+}
+
+fn mergeIntoSorted(comptime T: type, comptime greater: fn (T, T) bool, keys: []T, head_len: usize, tail: []const T) void {
     std.debug.assert(keys.len == head_len + tail.len);
     var head = head_len;
     var rest = tail.len;
     var out = keys.len;
     while (rest > 0) {
         out -= 1;
-        if (head > 0 and keys[head - 1].key > tail[rest - 1].key) {
+        if (head > 0 and greater(keys[head - 1], tail[rest - 1])) {
             head -= 1;
             keys[out] = keys[head];
         } else {
@@ -1454,6 +2310,8 @@ const NarrowphaseJobContext = struct {
     range_count: usize,
     candidate_pair_count: usize,
     items_per_range: usize,
+    // Set when this step merges static pairs. Dynamic-only steps leave keys unwritten.
+    write_keys: bool = false,
 };
 
 fn narrowphaseContactsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -1465,16 +2323,18 @@ fn narrowphaseContactsJob(context: *anyopaque, range: ParallelRange, _: WorkerId
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.candidate_pair_count);
     std.debug.assert(range.start == range.index * job.items_per_range);
-    writeNarrowphaseContactsSimd(job.system, range);
+    writeNarrowphaseContactsSimd(job.system, range, job.write_keys);
 }
 
 /// Writes range `range`'s contacts into its own staging window
 /// (`narrowphase_staging.items[range.start..range.end]`, at most one contact per
-/// candidate pair) and its count into its tally.
-fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) void {
+/// candidate pair) and its count into its tally. When `write_keys` is set, the
+/// same slots of `narrowphase_keys` receive the proxy order key.
+fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange, write_keys: bool) void {
     const proxies = ConstProxyColumns.of(system.proxies.slice());
     std.debug.assert(range.index < system.narrowphase_tallies.items.len);
     std.debug.assert(range.end <= system.narrowphase_staging.items.len);
+    if (write_keys) std.debug.assert(range.end <= system.narrowphase_keys.items.len);
     const window = system.narrowphase_staging.items[range.start..range.end];
     var count: usize = 0;
     var index = range.start;
@@ -1518,14 +2378,13 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) 
 
         inline for (0..simd.lane_count) |lane| {
             if (valid[lane]) {
-                window[count] = contactForResolved(
-                    proxies,
-                    a_indices[lane],
-                    b_indices[lane],
-                    normal_x[lane],
-                    normal_y[lane],
-                    penetration[lane],
-                );
+                const a = a_indices[lane];
+                const b = b_indices[lane];
+                if (write_keys) {
+                    // Scalar: the lane loop already drains one valid contact at a time.
+                    system.narrowphase_keys.items[range.start + count] = contactKeyFromProxies(system.strips, proxies, a, b);
+                }
+                window[count] = contactForResolved(proxies, a, b, normal_x[lane], normal_y[lane], penetration[lane]);
                 count += 1;
             }
         }
@@ -1534,6 +2393,9 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) 
     while (index < range.end) : (index += 1) {
         const pair = system.candidate_pairs.items[index];
         if (contactForCandidate(proxies, pair.a, pair.b)) |contact| {
+            if (write_keys) {
+                system.narrowphase_keys.items[range.start + count] = contactKeyFromProxies(system.strips, proxies, pair.a, pair.b);
+            }
             window[count] = contact;
             count += 1;
         }
@@ -1549,22 +2411,18 @@ fn contactForCandidate(proxies: ConstProxyColumns, a: usize, b: usize) ?Collisio
     const overlap_bottom = proxies.max_y[b] - proxies.min_y[a];
     const overlap_y = @min(overlap_top, overlap_bottom);
     if (overlap_x <= 0 or overlap_y <= 0) return null;
-
-    var normal_x: f32 = 0;
-    var normal_y: f32 = 0;
-    var penetration = overlap_x;
-    if (overlap_x <= overlap_y) {
-        const center_a = (proxies.min_x[a] + proxies.max_x[a]) * 0.5;
-        const center_b = (proxies.min_x[b] + proxies.max_x[b]) * 0.5;
-        normal_x = if (center_a <= center_b) -1 else 1;
-    } else {
-        const center_a = (proxies.min_y[a] + proxies.max_y[a]) * 0.5;
-        const center_b = (proxies.min_y[b] + proxies.max_y[b]) * 0.5;
-        normal_y = if (center_a <= center_b) -1 else 1;
-        penetration = overlap_y;
-    }
-
-    return contactForResolved(proxies, a, b, normal_x, normal_y, penetration);
+    return contactForAabbs(
+        proxies.entity[a],
+        proxies.entity[b],
+        proxies.movement_index[a],
+        proxies.movement_index[b],
+        .{ .min_x = proxies.min_x[a], .min_y = proxies.min_y[a], .max_x = proxies.max_x[a], .max_y = proxies.max_y[a] },
+        .{ .min_x = proxies.min_x[b], .min_y = proxies.min_y[b], .max_x = proxies.max_x[b], .max_y = proxies.max_y[b] },
+        proxies.velocity_x[a],
+        proxies.velocity_y[a],
+        proxies.velocity_x[b],
+        proxies.velocity_y[b],
+    );
 }
 
 fn contactForResolved(
@@ -1575,19 +2433,80 @@ fn contactForResolved(
     normal_y: f32,
     penetration: f32,
 ) CollisionContact {
-    const va_x = proxies.velocity_x[a];
-    const va_y = proxies.velocity_y[a];
-    const vb_x = proxies.velocity_x[b];
-    const vb_y = proxies.velocity_y[b];
-    const speed_a_sq = va_x * va_x + va_y * va_y;
-    const speed_b_sq = vb_x * vb_x + vb_y * vb_y;
-    const rel_x = va_x - vb_x;
-    const rel_y = va_y - vb_y;
+    return contactFields(
+        proxies.entity[a],
+        proxies.entity[b],
+        proxies.movement_index[a],
+        proxies.movement_index[b],
+        proxies.velocity_x[a],
+        proxies.velocity_y[a],
+        proxies.velocity_x[b],
+        proxies.velocity_y[b],
+        normal_x,
+        normal_y,
+        penetration,
+    );
+}
+
+// Both axes overlap by a positive amount. A shared edge is not a contact.
+fn positiveOverlap(a: math.Aabb, b: math.Aabb) bool {
+    const overlap_x = @min(a.max_x - b.min_x, b.max_x - a.min_x);
+    const overlap_y = @min(a.max_y - b.min_y, b.max_y - a.min_y);
+    return overlap_x > 0 and overlap_y > 0;
+}
+
+fn contactForAabbs(
+    a: EntityId,
+    b: EntityId,
+    a_move: u32,
+    b_move: u32,
+    a_box: math.Aabb,
+    b_box: math.Aabb,
+    a_vx: f32,
+    a_vy: f32,
+    b_vx: f32,
+    b_vy: f32,
+) CollisionContact {
+    const overlap_x = @min(a_box.max_x - b_box.min_x, b_box.max_x - a_box.min_x);
+    const overlap_y = @min(a_box.max_y - b_box.min_y, b_box.max_y - a_box.min_y);
+    var normal_x: f32 = 0;
+    var normal_y: f32 = 0;
+    var penetration = overlap_x;
+    if (overlap_x <= overlap_y) {
+        const center_a = (a_box.min_x + a_box.max_x) * 0.5;
+        const center_b = (b_box.min_x + b_box.max_x) * 0.5;
+        normal_x = if (center_a <= center_b) -1 else 1;
+    } else {
+        const center_a = (a_box.min_y + a_box.max_y) * 0.5;
+        const center_b = (b_box.min_y + b_box.max_y) * 0.5;
+        normal_y = if (center_a <= center_b) -1 else 1;
+        penetration = overlap_y;
+    }
+    return contactFields(a, b, a_move, b_move, a_vx, a_vy, b_vx, b_vy, normal_x, normal_y, penetration);
+}
+
+fn contactFields(
+    a: EntityId,
+    b: EntityId,
+    a_move: u32,
+    b_move: u32,
+    a_vx: f32,
+    a_vy: f32,
+    b_vx: f32,
+    b_vy: f32,
+    normal_x: f32,
+    normal_y: f32,
+    penetration: f32,
+) CollisionContact {
+    const speed_a_sq = a_vx * a_vx + a_vy * a_vy;
+    const speed_b_sq = b_vx * b_vx + b_vy * b_vy;
+    const rel_x = a_vx - b_vx;
+    const rel_y = a_vy - b_vy;
     return .{
-        .a = proxies.entity[a],
-        .b = proxies.entity[b],
-        .a_movement_index = proxies.movement_index[a],
-        .b_movement_index = proxies.movement_index[b],
+        .a = a,
+        .b = b,
+        .a_movement_index = a_move,
+        .b_movement_index = b_move,
         .normal_x = normal_x,
         .normal_y = normal_y,
         .penetration = penetration,
@@ -2325,10 +3244,10 @@ test "narrowphase range buffers merge deterministic contacts and skip rejected c
     try system.candidate_pairs.append(std.testing.allocator, .{ .a = 0, .b = 1 });
     try system.candidate_pairs.append(std.testing.allocator, .{ .a = 0, .b = 2 });
     try system.candidate_pairs.append(std.testing.allocator, .{ .a = 0, .b = 3 });
-    try system.prepareNarrowphaseStaging(system.candidate_pairs.items.len, 2);
+    try system.prepareNarrowphaseStaging(system.candidate_pairs.items.len, 2, false);
 
-    writeNarrowphaseContactsSimd(&system, .{ .index = 0, .start = 0, .end = 2 });
-    writeNarrowphaseContactsSimd(&system, .{ .index = 1, .start = 2, .end = 3 });
+    writeNarrowphaseContactsSimd(&system, .{ .index = 0, .start = 0, .end = 2 }, false);
+    writeNarrowphaseContactsSimd(&system, .{ .index = 1, .start = 2, .end = 3 }, false);
 
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
@@ -2352,7 +3271,7 @@ test "thread-written collision range scratch uses cache-line sized slots" {
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(64);
-    try system.prepareNarrowphaseStaging(8, 2);
+    try system.prepareNarrowphaseStaging(8, 2, false);
 
     for ([_]usize{
         @intFromPtr(system.broadphase_ranges.items.ptr),
@@ -3050,8 +3969,8 @@ test "narrowphase simd contacts match scalar contactForCandidate" {
 
     // One range over a non-multiple-of-lane-count pair list exercises both the
     // SIMD chunk loop and the scalar tail inside writeNarrowphaseContactsSimd.
-    try system.prepareNarrowphaseStaging(pairs.len, 1);
-    writeNarrowphaseContactsSimd(&system, .{ .index = 0, .start = 0, .end = pairs.len });
+    try system.prepareNarrowphaseStaging(pairs.len, 1, false);
+    writeNarrowphaseContactsSimd(&system, .{ .index = 0, .start = 0, .end = pairs.len }, false);
 
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
@@ -3102,8 +4021,8 @@ test "merging sorted runs equals sorting their concatenation" {
         const second_end = first_len + second_len;
         @memcpy(scratch[first_len..second_end], keys[first_len..second_end]);
         @memcpy(scratch[second_end..total], keys[second_end..total]);
-        mergeIntoSorted(keys[0..second_end], first_len, scratch[first_len..second_end]);
-        mergeIntoSorted(keys[0..total], second_end, scratch[second_end..total]);
+        mergeIntoSorted(SortEntry, entryGreater, keys[0..second_end], first_len, scratch[first_len..second_end]);
+        mergeIntoSorted(SortEntry, entryGreater, keys[0..total], second_end, scratch[second_end..total]);
         for (expected[0..total], keys[0..total]) |want, got| try std.testing.expectEqual(want, got);
     }
 
@@ -3115,7 +4034,7 @@ test "merging sorted runs equals sorting their concatenation" {
     const tied_tail = [_]SortEntry{
         .{ .key = 4, .slot = 2, .first = false },
     };
-    mergeIntoSorted(&tied, 1, &tied_tail);
+    mergeIntoSorted(SortEntry, entryGreater, &tied, 1, &tied_tail);
     try std.testing.expectEqual(@as(u32, 1), tied[0].slot);
     try std.testing.expectEqual(@as(u32, 2), tied[1].slot);
     try std.testing.expect(tied[0].first);
@@ -3127,4 +4046,285 @@ test "strips are the tile size rounded down to a power of two" {
     try std.testing.expectEqual(@as(f32, 16), CollisionStrips.ofTileSize(24).height);
     try std.testing.expectEqual(@as(f32, 0.5), CollisionStrips.ofTileSize(0.75).height);
     try std.testing.expectEqual(required_tile_size, CollisionStrips.default.height);
+}
+
+const StaticColliderSystem = @import("static_colliders.zig").StaticColliderSystem;
+const ColliderGeometry = @import("static_colliders.zig").ColliderGeometry;
+const SimulationFrame = @import("../simulation.zig").SimulationFrame;
+
+fn testGeometry() ColliderGeometry {
+    return ColliderGeometry.init(32, 64, 64, 4);
+}
+
+fn addObstacle(data: *DataSystem, box: TestBox, mobility: @import("../data_system.zig").CollisionResponseMobility, mode: @import("../data_system.zig").CollisionResponseMode) !EntityId {
+    const entity = try addBox(data, box);
+    try data.setCollisionResponse(entity, .{ .mobility = mobility, .mode = mode, .restitution = 0 });
+    return entity;
+}
+
+fn isSolidStatic(data: *const DataSystem, id: EntityId) bool {
+    if (!data.isStaticNavigationObstacle(id)) return false;
+    const response = data.collisionResponseConst(id).?;
+    return response.mode != .trigger;
+}
+
+fn filteredReference(data: *const DataSystem, strips: CollisionStrips) ![]CollisionContact {
+    const all = try referenceContacts(std.testing.allocator, data, strips);
+    defer std.testing.allocator.free(all);
+    var kept: std.ArrayList(CollisionContact) = .empty;
+    errdefer kept.deinit(std.testing.allocator);
+    for (all) |contact| {
+        if (isSolidStatic(data, contact.a) and isSolidStatic(data, contact.b)) continue;
+        try kept.append(std.testing.allocator, contact);
+    }
+    return try kept.toOwnedSlice(std.testing.allocator);
+}
+
+fn updateView(system: *CollisionSystem, data: *const DataSystem, contacts: *RangeOutputStream(CollisionContact), view: ColliderView, workers: usize, items_per_range: ?usize) !CollisionStats {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers });
+    defer threads.deinit();
+    return system.update(data, contacts, &threads, .{
+        .static_colliders = view,
+        .max_worker_threads = workers,
+        .items_per_range = items_per_range,
+        .adaptive = false,
+    });
+}
+
+fn expectDynamicIndex(data: *const DataSystem, want: []const u32) !void {
+    const ids = data.collision_bounds.dynamic_ids.items;
+    const pos = data.collision_bounds.dynamic_pos.items;
+    try std.testing.expectEqual(data.collision_bounds.len(), pos.len);
+    try std.testing.expectEqual(want.len, ids.len);
+    for (want) |bounds_index| {
+        try std.testing.expect(bounds_index < pos.len);
+        const slot = pos[bounds_index];
+        try std.testing.expect(slot != std.math.maxInt(u32));
+        try std.testing.expectEqual(bounds_index, ids[slot]);
+    }
+    for (pos, 0..) |slot, bounds_index| {
+        const listed = for (want) |want_index| {
+            if (want_index == bounds_index) break true;
+        } else false;
+        if (!listed) try std.testing.expectEqual(std.math.maxInt(u32), slot);
+    }
+}
+
+test "static split contacts match the filtered reference" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // Solid wall, coarse class: larger than a 4-tile chunk.
+    _ = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 300, .h = 300 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 20, .h = 20 }, .dynamic, .solid);
+    // Trigger over a solid, and trigger over trigger. Two solids that overlap each
+    // other produce no contact; the trigger pairs stay.
+    const beside = try addObstacle(&data, .{ .x = 800, .y = 0, .w = 40, .h = 40 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 810, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 820, .y = 20, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 0, .y = 800, .w = 40, .h = 40 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 10, .y = 810, .w = 40, .h = 40 }, .static, .solid);
+    // A shared edge is not a contact, for a dynamic or a trigger.
+    _ = try addObstacle(&data, .{ .x = 200, .y = 800, .w = 32, .h = 32 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 232, .y = 804, .w = 16, .h = 16 }, .dynamic, .solid);
+    _ = try addObstacle(&data, .{ .x = 400, .y = 800, .w = 32, .h = 32 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 432, .y = 800, .w = 32, .h = 32 }, .static, .solid);
+    // mins in different strips: the lower strip has the larger min_x, so a/b follows x.
+    _ = try addObstacle(&data, .{ .x = 600, .y = 840, .w = 20, .h = 20 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 610, .y = 820, .w = 20, .h = 30 }, .dynamic, .solid);
+    // Cell and chunk boundary (128) straddled once.
+    _ = try addObstacle(&data, .{ .x = 120, .y = 400, .w = 20, .h = 20 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 124, .y = 404, .w = 10, .h = 10 }, .dynamic, .solid);
+    // Equal min_x, order follows min_y then entity index.
+    _ = try addObstacle(&data, .{ .x = 500, .y = 100, .w = 16, .h = 16 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 500, .y = 108, .w = 16, .h = 16 }, .dynamic, .solid);
+    // Negative mins clamp into cell 0; contact fields keep the real floats.
+    _ = try addObstacle(&data, .{ .x = -20, .y = -20, .w = 40, .h = 40 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = -10, .y = -10, .w = 16, .h = 16 }, .dynamic, .solid);
+    // Cross-level overlap is not a contact.
+    const below = try addObstacle(&data, .{ .x = 1400, .y = 0, .w = 20, .h = 20, .level = 1 }, .static, .solid);
+    _ = below;
+    _ = try addObstacle(&data, .{ .x = 1402, .y = 2, .w = 20, .h = 20, .level = 0 }, .dynamic, .solid);
+    // Two dynamics still overlap each other.
+    _ = try addObstacle(&data, .{ .x = 1600, .y = 0, .w = 20, .h = 20 }, .dynamic, .solid);
+    _ = try addObstacle(&data, .{ .x = 1610, .y = 4, .w = 20, .h = 20 }, .dynamic, .solid);
+    // Enough dynamics that a 16-wide range alignment covers more than one range.
+    for (0..24) |index| {
+        _ = try addObstacle(&data, .{ .x = 2000 + @as(f32, @floatFromInt(index)) * 40, .y = 2000, .w = 8, .h = 8 }, .dynamic, .solid);
+    }
+
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry());
+    const expected = try filteredReference(&data, .default);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expect(expected.len > 0);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    const serial = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+    try expectSameContacts(expected, contacts.mergedItems());
+
+    var threaded = CollisionSystem.init(std.testing.allocator);
+    defer threaded.deinit();
+    var threaded_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer threaded_contacts.deinit();
+    const parallel = try updateView(&threaded, &data, &threaded_contacts, colliders.view(), 2, 1);
+    try std.testing.expect(parallel.static_pairs_batch.range_count > 1);
+    try expectSameContacts(expected, threaded_contacts.mergedItems());
+    try std.testing.expectEqual(serial.contact_count, parallel.contact_count);
+
+    var tuned_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer tuned_threads.deinit();
+    var tuned = CollisionSystem.init(std.testing.allocator);
+    defer tuned.deinit();
+    var tuned_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer tuned_contacts.deinit();
+    const tuned_stats = try tuned.update(&data, &tuned_contacts, &tuned_threads, .{ .static_colliders = colliders.view() });
+    try expectSameContacts(expected, tuned_contacts.mergedItems());
+    var static_rows: usize = 0;
+    for (colliders.view().row_of_index) |row| {
+        if (row != std.math.maxInt(u32)) static_rows += 1;
+    }
+    try std.testing.expect(static_rows != tuned.proxies.len);
+    try std.testing.expectEqual(tuned.proxies.len, tuned.static_pair_tuner.learned_item_count);
+    try std.testing.expect(tuned_stats.body_count > 0);
+
+    var relocated = data.movementBodyConst(beside).?;
+    relocated.position.x = 802;
+    relocated.previous_position = relocated.position;
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    frame.beginStep();
+    try colliders.reserveForCommit(&data, 1);
+    try frame.structural_commands.prepareRangeCounts(1);
+    frame.structural_commands.addCount(0, 1);
+    try frame.structural_commands.prefix();
+    var writer = frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .set_movement_body = .{ .entity = beside, .body = relocated } });
+    writer.finish();
+    frame.structural_commands.finishWrite();
+    _ = try frame.applyStructuralCommands(&data);
+    colliders.capture(&frame);
+    try colliders.sync(&data, &tuned_threads);
+    try std.testing.expect(colliders.view().changes.len != 0);
+    const expected_after = try filteredReference(&data, .default);
+    defer std.testing.allocator.free(expected_after);
+    _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+    try expectSameContacts(expected_after, contacts.mergedItems());
+}
+
+test "a kinematic static drops its contact only when scope excludes" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const wall = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 32, .h = 32 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 8, .y = 8, .w = 16, .h = 16 }, .dynamic, .solid);
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry());
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    const open = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+    try std.testing.expectEqual(@as(usize, 1), open.contact_count);
+
+    try data.setSimulationTier(wall, .kinematic);
+    const closed = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+    try std.testing.expectEqual(@as(usize, 0), closed.contact_count);
+}
+
+test "an unsynced static move is out of band" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const wall = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 32, .h = 32 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 8, .y = 8, .w = 16, .h = 16 }, .dynamic, .solid);
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry());
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+
+    const body = data.movementBodyConst(wall).?;
+    try data.setMovementBody(wall, .{
+        .position = .{ .x = 4, .y = 4 },
+        .previous_position = body.previous_position,
+        .velocity = body.velocity,
+    });
+    if (comptime builtin.mode == .debug) {
+        try std.testing.expectError(error.StaticMovedOutsideCommit, updateView(&system, &data, &contacts, colliders.view(), 0, null));
+    }
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    frame.beginStep();
+    try colliders.reserveForCommit(&data, 1);
+    try frame.structural_commands.prepareRangeCounts(1);
+    frame.structural_commands.addCount(0, 1);
+    try frame.structural_commands.prefix();
+    var writer = frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .set_movement_body = .{ .entity = wall, .body = data.movementBodyConst(wall).? } });
+    writer.finish();
+    frame.structural_commands.finishWrite();
+    _ = try frame.applyStructuralCommands(&data);
+    colliders.capture(&frame);
+    try colliders.sync(&data, &threads);
+    _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+}
+
+test "dynamic bounds index tracks static membership through removal" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const dynamic = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 8, .h = 8 }, .dynamic, .solid);
+    const wall = try addObstacle(&data, .{ .x = 40, .y = 0, .w = 8, .h = 8 }, .static, .solid);
+    const other = try addObstacle(&data, .{ .x = 80, .y = 0, .w = 8, .h = 8 }, .dynamic, .solid);
+    const dynamic_index = data.resolveSlotConst(dynamic).?.collision_bounds_index.?;
+    const wall_index = data.resolveSlotConst(wall).?.collision_bounds_index.?;
+    const other_index = data.resolveSlotConst(other).?.collision_bounds_index.?;
+    try expectDynamicIndex(&data, &.{ dynamic_index, other_index });
+
+    try data.setCollisionResponse(wall, .{ .mobility = .dynamic, .mode = .solid });
+    try expectDynamicIndex(&data, &.{ dynamic_index, wall_index, other_index });
+    try data.setCollisionResponse(wall, .{ .mobility = .static, .mode = .solid });
+    try expectDynamicIndex(&data, &.{ dynamic_index, other_index });
+
+    try std.testing.expect(data.destroyEntity(dynamic));
+    const other_now = data.resolveSlotConst(other).?.collision_bounds_index.?;
+    try expectDynamicIndex(&data, &.{other_now});
+}
+
+test "a reserved warm static step allocates nothing" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 40, .h = 40 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 4, .y = 4, .w = 16, .h = 16 }, .dynamic, .solid);
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry());
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(8);
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    try CollisionSystem.reserveContactStream(&contacts, 8);
+    _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+    try std.testing.expect(system.triggers_ready);
+    try std.testing.expect(contacts.mergedItems().len > 0);
+
+    const allocator = system.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    system.allocator = failing.allocator();
+    defer system.allocator = allocator;
+    _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }

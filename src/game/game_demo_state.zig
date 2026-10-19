@@ -1292,7 +1292,7 @@ fn ambientAudioCommandCount(audio: *const AudioCommandBuffer) usize {
     return count;
 }
 
-fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId) void {
+fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId, threads: *ThreadSystem) !void {
     const isolate_x: f32 = demo.bounds_width + 64;
     const isolate_y: f32 = demo.bounds_height + 64;
     for (demo.test_squares) |entity| {
@@ -1305,15 +1305,9 @@ fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId) void {
         body.velocity_x.* = 0;
         body.velocity_y.* = 0;
     }
-    for (demo.obstacles) |entity| {
-        const body = demo.data.movementBodyPtr(entity).?;
-        body.position_x.* = isolate_x;
-        body.position_y.* = isolate_y;
-        body.previous_x.* = isolate_x;
-        body.previous_y.* = isolate_y;
-        body.velocity_x.* = 0;
-        body.velocity_y.* = 0;
-    }
+    var obstacle_positions: [obstacle_count]math.Vec2 = undefined;
+    for (&obstacle_positions) |*position| position.* = .{ .x = isolate_x, .y = isolate_y };
+    try commitStaticPositionsForTest(demo, threads, &demo.obstacles, &obstacle_positions);
     const player_body = demo.data.movementBodyPtr(demo.player.entity).?;
     player_body.position_x.* = isolate_x;
     player_body.position_y.* = isolate_y;
@@ -1321,6 +1315,29 @@ fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId) void {
     player_body.previous_y.* = isolate_y;
     player_body.velocity_x.* = 0;
     player_body.velocity_y.* = 0;
+}
+
+// Places static obstacles through the commit seam so the collider rows match the bodies.
+fn commitStaticPositionsForTest(demo: *GameDemoState, threads: *ThreadSystem, entities: []const EntityId, positions: []const math.Vec2) !void {
+    std.debug.assert(entities.len == positions.len);
+    demo.simulation_frame.beginStep();
+    const colliders = &demo.pipeline.static_colliders;
+    try colliders.reserveForCommit(&demo.data, entities.len);
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, entities.len);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    for (entities, positions) |entity, position| {
+        writer.write(.{ .set_movement_body = .{
+            .entity = entity,
+            .body = .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 },
+        } });
+    }
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+    _ = try demo.simulation_frame.applyStructuralCommands(&demo.data);
+    colliders.capture(&demo.simulation_frame);
+    try colliders.sync(&demo.data, threads);
 }
 
 const data_test_support = @import("data_system/test_support.zig");
@@ -2021,13 +2038,11 @@ test "demo collision response handles player contacts with moving entities" {
         body.previous_x.* = body.position_x.*;
         body.previous_y.* = body.position_y.*;
     }
-    for (demo.obstacles, 0..) |obstacle, index| {
-        const body = demo.data.movementBodyPtr(obstacle).?;
-        body.position_x.* = 620 + @as(f32, @floatFromInt(index)) * 80;
-        body.position_y.* = 330;
-        body.previous_x.* = body.position_x.*;
-        body.previous_y.* = body.position_y.*;
+    var obstacle_positions: [obstacle_count]math.Vec2 = undefined;
+    for (&obstacle_positions, 0..) |*position, index| {
+        position.* = .{ .x = 620 + @as(f32, @floatFromInt(index)) * 80, .y = 330 };
     }
+    try commitStaticPositionsForTest(&demo, &threads, &demo.obstacles, &obstacle_positions);
     const player_body = demo.data.movementBodyPtr(demo.player.entity).?;
     const square_body = demo.data.movementBodyPtr(square).?;
     player_body.position_x.* = 200;
@@ -2076,7 +2091,7 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     // Pick an ai square (index 0 is wander ai), park in the top-left corner, then
     // push out of bounds so clamp runs without post-clamp collision shoving it back out.
     const ai_ent = demo.test_squares[0];
-    isolateDemoBodiesAwayFrom(&demo, ai_ent);
+    try isolateDemoBodiesAwayFrom(&demo, ai_ent, &threads);
     const visual = demo.data.primitiveVisualConst(ai_ent).?;
     const body = demo.data.movementBodyPtr(ai_ent).?;
     body.position_x.* = -10;

@@ -44,8 +44,15 @@ const CollisionResponseRow = struct {
     restitution: f32,
 };
 
+/// `dynamic_pos` slot for a bounds row that is a static navigation obstacle.
+pub const no_dynamic: u32 = std.math.maxInt(u32);
+
 pub const CollisionBoundsStore = struct {
     rows: std.MultiArrayList(CollisionBoundsRow) = .{},
+    /// Bounds dense indexes that are not static navigation obstacles.
+    dynamic_ids: std.ArrayList(u32) = .empty,
+    /// Parallel to `rows`. Slot in `dynamic_ids`, or `no_dynamic`.
+    dynamic_pos: std.ArrayList(u32) = .empty,
 
     pub fn len(self: *const CollisionBoundsStore) usize {
         return self.rows.len;
@@ -62,7 +69,32 @@ pub const CollisionBoundsStore = struct {
             .size_x = bounds.size.x,
             .size_y = bounds.size.y,
         });
+        // A new bounds row is dynamic until the caller drops it for a static obstacle.
+        const slot: u32 = @intCast(self.dynamic_ids.items.len);
+        self.dynamic_pos.appendAssumeCapacity(slot);
+        self.dynamic_ids.appendAssumeCapacity(index);
         return index;
+    }
+
+    /// O(1). No-op when the row is already dynamic. Capacity comes from `ensureCapacity`.
+    pub fn addDynamic(self: *CollisionBoundsStore, bounds_index: u32) void {
+        if (self.dynamic_pos.items[bounds_index] != no_dynamic) return;
+        std.debug.assert(self.dynamic_ids.capacity >= self.rows.len);
+        std.debug.assert(self.dynamic_ids.items.len < self.dynamic_ids.capacity);
+        const slot: u32 = @intCast(self.dynamic_ids.items.len);
+        self.dynamic_ids.appendAssumeCapacity(bounds_index);
+        self.dynamic_pos.items[bounds_index] = slot;
+    }
+
+    /// O(1). No-op when the row is already a static obstacle.
+    pub fn removeDynamic(self: *CollisionBoundsStore, bounds_index: u32) void {
+        const slot = self.dynamic_pos.items[bounds_index];
+        if (slot == no_dynamic) return;
+        const dyn_last = self.dynamic_ids.items.len - 1;
+        const swapped_bounds = self.dynamic_ids.items[dyn_last];
+        _ = self.dynamic_ids.swapRemove(slot);
+        self.dynamic_pos.items[bounds_index] = no_dynamic;
+        if (slot != dyn_last) self.dynamic_pos.items[swapped_bounds] = slot;
     }
 
     pub fn set(self: *CollisionBoundsStore, index: usize, bounds: CollisionBounds) void {
@@ -85,8 +117,31 @@ pub const CollisionBoundsStore = struct {
         const s = self.rows.slice();
         const last = self.rows.len - 1;
         const moved_entity = if (index != last) s.items(.entity)[last] else null;
+        const removed_dyn = self.dynamic_pos.items[index];
+        const tail_dyn = if (index != last) self.dynamic_pos.items[last] else no_dynamic;
         self.rows.swapRemove(index);
+        self.swapRemoveDynamic(index, last, removed_dyn, tail_dyn);
         return moved_entity;
+    }
+
+    // Follows the bounds swapRemove. Rewrites the moved tail's stored bounds index.
+    fn swapRemoveDynamic(self: *CollisionBoundsStore, index: usize, last: usize, removed_dyn: u32, tail_dyn: u32) void {
+        _ = self.dynamic_pos.swapRemove(index);
+        var relocated_tail = false;
+        if (removed_dyn != no_dynamic) {
+            const dyn_last = self.dynamic_ids.items.len - 1;
+            const swapped_bounds = self.dynamic_ids.items[dyn_last];
+            _ = self.dynamic_ids.swapRemove(removed_dyn);
+            if (removed_dyn != dyn_last) {
+                const pos_at: usize = if (swapped_bounds == last) index else swapped_bounds;
+                self.dynamic_pos.items[pos_at] = removed_dyn;
+            }
+            relocated_tail = swapped_bounds == last;
+        }
+        if (index != last and tail_dyn != no_dynamic) {
+            const slot: usize = if (relocated_tail) removed_dyn else tail_dyn;
+            self.dynamic_ids.items[slot] = @intCast(index);
+        }
     }
 
     pub fn sliceConst(self: *const CollisionBoundsStore) ConstCollisionBoundsSlice {
@@ -102,10 +157,14 @@ pub const CollisionBoundsStore = struct {
 
     pub fn clearRetainingCapacity(self: *CollisionBoundsStore) void {
         self.rows.clearRetainingCapacity();
+        self.dynamic_ids.clearRetainingCapacity();
+        self.dynamic_pos.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *CollisionBoundsStore, allocator: std.mem.Allocator) void {
         self.rows.deinit(allocator);
+        self.dynamic_ids.deinit(allocator);
+        self.dynamic_pos.deinit(allocator);
         self.* = .{};
     }
 
@@ -114,7 +173,10 @@ pub const CollisionBoundsStore = struct {
     }
 
     pub fn ensureCapacity(self: *CollisionBoundsStore, allocator: std.mem.Allocator, capacity: usize) !void {
-        try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
+        const rows_capacity = hotStoreCapacity(capacity);
+        try self.rows.ensureTotalCapacity(allocator, rows_capacity);
+        try self.dynamic_ids.ensureTotalCapacity(allocator, rows_capacity);
+        try self.dynamic_pos.ensureTotalCapacity(allocator, rows_capacity);
     }
 };
 
@@ -207,6 +269,23 @@ test "CollisionBoundsStore append is allocation-free after ensureCapacity reserv
     }
     try std.testing.expectEqual(@as(usize, reserved), store.len());
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "dynamic index follows bounds swapRemove" {
+    var store: CollisionBoundsStore = .{};
+    defer store.deinit(std.testing.allocator);
+    const bounds: CollisionBounds = .{ .size = .{ .x = 8, .y = 8 } };
+    _ = try store.append(std.testing.allocator, try EntityId.init(1, 1), bounds);
+    const second = try store.append(std.testing.allocator, try EntityId.init(2, 1), bounds);
+    _ = try store.append(std.testing.allocator, try EntityId.init(3, 1), bounds);
+    store.removeDynamic(second);
+    _ = store.removeAt(0);
+    try std.testing.expectEqual(@as(usize, 2), store.len());
+    try std.testing.expectEqual(@as(usize, 1), store.dynamic_ids.items.len);
+    try std.testing.expectEqual(@as(u32, 0), store.dynamic_ids.items[0]);
+    try std.testing.expectEqual(@as(u32, 0), store.dynamic_pos.items[0]);
+    try std.testing.expectEqual(no_dynamic, store.dynamic_pos.items[1]);
+    try std.testing.expectEqual(@as(u32, 3), store.sliceConst().entities[0].index);
 }
 
 test "CollisionResponseStore append is allocation-free after ensureCapacity reserves" {

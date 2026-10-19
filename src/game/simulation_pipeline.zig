@@ -138,6 +138,8 @@ const PipelineResource = enum {
     perception_sensed,
     ai_memory,
     affect_drives,
+    /// Static collider query columns. The commit seam writes them; no stage does.
+    static_colliders,
 };
 
 const ResourceSet = std.EnumSet(PipelineResource);
@@ -181,7 +183,7 @@ const StageContract = struct {
 
 /// Resources produced outside `stage_order`: input capture, world authoring, or
 /// the post-`update` structural commit.
-const external_resources = resources(&.{ .action_intents, .interest_markers, .structural_events });
+const external_resources = resources(&.{ .action_intents, .interest_markers, .structural_events, .static_colliders });
 
 /// Declares each stage's resource reads/writes against `stage_order` below.
 /// Checked at comptime: a stage cannot read a resource no earlier stage in
@@ -233,7 +235,11 @@ fn stageContract(stage: StageId) StageContract {
         // One projection per distinct blocked goal of this step's intents, before every
         // reader of a live goal.
         .path_goal_resolve => .{ .reads = resources(&.{.navigation_intents}), .writes = resources(&.{.path_goals}) },
-        .steering_update => .{ .reads = resources(&.{ .navigation_intents, .path_goals }), .writes = resources(&.{ .movement_intents, .path_requests }) },
+        .steering_update => .{
+            .reads = resources(&.{ .navigation_intents, .path_goals }),
+            .writes = resources(&.{ .movement_intents, .path_requests }),
+            .carried = resources(&.{.static_colliders}),
+        },
         .pathfinding_update => .{ .reads = resources(&.{ .path_requests, .path_goals }), .writes = .empty },
         .apply_ai_movement_intents => .{ .reads = resources(&.{.movement_intents}), .writes = resources(&.{.movement_positions}) },
         // Movement integrates the full contiguous range (non-moving rows are
@@ -255,7 +261,7 @@ fn stageContract(stage: StageId) StageContract {
         .collision_detect => .{
             .reads = resources(&.{ .movement_positions, .collision_scope_indices }),
             .writes = resources(&.{.contacts}),
-            .carried = resources(&.{.world_level}),
+            .carried = resources(&.{ .world_level, .static_colliders }),
         },
         .collision_respond => .{ .reads = resources(&.{.contacts}), .writes = resources(&.{ .movement_positions, .collision_triggers }) },
         // Reads hole/ramp walkability from world_tiles; may carve landing cells
@@ -675,6 +681,10 @@ pub const SimulationPipelineStats = struct {
             // An untimed batch with no workers is not a sample. The inline banded sort is timed.
             if (sort_batch.available_worker_threads != 0 or sort_batch.batch_duration_ns != 0) {
                 perf.recordBatch(.collision_sort, sort_batch);
+            }
+            const static_pairs = collision_stats.static_pairs_batch;
+            if (static_pairs.available_worker_threads != 0 or static_pairs.batch_duration_ns != 0) {
+                perf.recordBatch(.collision_static_pairs, static_pairs);
             }
         }
         perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
@@ -1122,14 +1132,16 @@ pub const SimulationPipeline = struct {
         self.static_colliders.capture(frame);
     }
 
-    /// Applies the captured static changes to the collider rows, then records them for nav
-    /// into the marks `reserveStaticColliders` reserved, whether or not nav applies this
-    /// step. Main is O(1) per dirty static and per footprint chunk, and the rewrite of
-    /// those chunks threads under `thread_system`. On error the rows are unchanged, nothing
-    /// is recorded, and the changes stay for the next sync.
+    /// Applies the captured static changes, records them for nav, then refreshes collision's
+    /// triggers to this revision so the next step's patch does not allocate. The chunk
+    /// rewrite and the trigger requery thread under `thread_system`. A warm patch's main
+    /// work is O(1) per dirty static and per stored trigger pair. A sync error leaves the
+    /// rows unchanged and keeps the changes. A refresh error leaves the synced rows and
+    /// nav marks in place; the next sync retries the refresh.
     pub fn syncStaticColliders(self: *SimulationPipeline, data: *const DataSystem, thread_system: *ThreadSystem) !void {
         try self.static_colliders.sync(data, thread_system);
         self.pathfinding.recordStaticColliderChanges(self.static_colliders.changesThisStep());
+        try self.collision.refreshCommittedTriggers(data, self.static_colliders.view(), thread_system);
     }
 
     /// Records the last collider sync's chunk-list splice batch. Every sync resets it, so
@@ -1588,6 +1600,7 @@ pub const SimulationPipeline = struct {
         step.collision = try self.collision.update(context.data, &context.frame.contacts, context.thread_system, .{
             .strips = CollisionStrips.ofWorld(context.world),
             .scope_dense_indices = step.collision_scope_indices,
+            .static_colliders = self.static_colliders.view(),
         });
         collision_timer.stop(context.perf, .pipeline_collision);
     }
