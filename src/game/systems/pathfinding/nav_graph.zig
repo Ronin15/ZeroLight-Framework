@@ -2866,8 +2866,8 @@ test "a static obstacle move costs the same at 10 and 10k statics" {
         // Rows the remask visited: those listed at the remasked chunks.
         var visited: usize = 0;
         for (nav.system.graph.changed_keys.items) |key| {
-            var rows = nav.colliders.view().chunkRows(keyLevel(key), keyChunk(key));
-            while (rows.next()) |_| visited += 1;
+            const spans = nav.colliders.view().chunkRows(keyLevel(key), keyChunk(key));
+            visited += spans.entity.len;
         }
         listed[run] = visited;
     }

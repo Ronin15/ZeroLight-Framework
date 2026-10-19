@@ -4,35 +4,39 @@
 
 //! Shared static-collider rows: one row per static navigation obstacle (an entity with a
 //! movement body, collision bounds, and a static collision response), holding its
-//! committed world AABB, its level, and the cell span it covers, listed per (level, chunk)
-//! in entity-index order. A second, query tier lists each row once more, in the cell of its
-//! size class that holds its min-corner cell, for box queries; per chunk, an anchor block
-//! marks which cells of the classes no larger than a chunk hold such an entry, so a query
-//! probes only those. Rows change only at the
-//! structural-commit seam: the step's entity changes are captured into a persistent dirty
-//! list right after the commit and applied by `sync` from the entities' final state, so
-//! each changed entity costs its own footprint chunks (none when its chunks are unchanged)
-//! and at most one query entry, never the static count. Readers (nav, steering) take a
-//! `ColliderView`.
+//! committed world AABB, its level, and the cell span it covers. Each chunk of a level
+//! that has held a static owns one payload: nav span columns in entity-index order, and,
+//! for classes no larger than a chunk, the query AABBs of statics anchored in that chunk.
+//! Coarser classes keep one directory per class, a cell's float run in its slot. Anchor
+//! words live on the chunk payload. Rows change only at the structural-commit seam: the
+//! step's entity changes are captured into a persistent dirty list right after the commit
+//! and applied by `sync` from the entities' final state, so each changed entity costs the
+//! chunks and query cells it enters, leaves, or rewrites, never the static count. Readers
+//! (nav, steering) take a `ColliderView`.
 
 const std = @import("std");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const math = @import("../../core/math.zig");
 const logging = @import("../../core/logging.zig");
+const pdq = @import("../../core/sort.zig").pdq;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const Dispatch = @import("../../app/thread_system.zig").Dispatch;
+const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const StageControls = @import("../../app/thread_system.zig").StageControls;
+const runShaped = @import("../../app/thread_system.zig").runShaped;
+const stageShape = @import("../../app/thread_system.zig").stageShape;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
-const ChunkListMap = @import("chunk_list_map.zig").ChunkListMap;
+const ChunkDirectory = @import("chunk_list_map.zig").ChunkDirectory;
 const chunkKey = @import("chunk_list_map.zig").chunkKey;
 const keyChunk = @import("chunk_list_map.zig").keyChunk;
 const keyLevel = @import("chunk_list_map.zig").keyLevel;
-const no_entry = @import("chunk_list_map.zig").no_entry;
-const no_value = @import("chunk_list_map.zig").no_value;
+const empty_block = @import("chunk_list_map.zig").empty_block;
+const splice_range_alignment_items = @import("chunk_list_map.zig").splice_range_alignment_items;
 const max_chunk_size_tiles = @import("../world/system.zig").max_chunk_size_tiles;
 const ChunkGeometry = @import("../world/terrain.zig").ChunkGeometry;
 
@@ -118,6 +122,10 @@ pub const ColliderGeometry = struct {
         return (@as(u64, self.grid.width) + (@as(u64, 1) << class) - 1) >> class;
     }
 
+    fn classCellsY(self: ColliderGeometry, class: u6) u64 {
+        return (@as(u64, self.grid.height) + (@as(u64, 1) << class) - 1) >> class;
+    }
+
     /// The smallest class below `top` whose cell edge covers `aabb` on both axes, tested
     /// in f32 exactly as `ColliderView.queryBox` bounds its walk; otherwise `top`
     /// (non-finite extents included). At most `top + 1` iterations.
@@ -171,8 +179,7 @@ pub const ColliderGeometry = struct {
     }
 };
 
-// The inclusive chunk rectangle a placement covers on its level; `contains` tests a
-// `chunkKey` for `ChunkListMap.unlinkOwnerOutside`.
+// The inclusive chunk rectangle a placement covers on its level.
 const ChunkRect = struct {
     level: u16,
     chunks_x: u32,
@@ -185,28 +192,8 @@ const ChunkRect = struct {
         return (@as(usize, self.max_x) - self.min_x + 1) * (@as(usize, self.max_y) - self.min_y + 1);
     }
 
-    fn holds(self: ChunkRect, chunk_x: u32, chunk_y: u32) bool {
-        return chunk_x >= self.min_x and chunk_x <= self.max_x and chunk_y >= self.min_y and chunk_y <= self.max_y;
-    }
-
-    pub fn contains(self: ChunkRect, key: u64) bool {
-        const chunk = keyChunk(key);
-        return keyLevel(key) == self.level and self.holds(chunk % self.chunks_x, chunk / self.chunks_x);
-    }
-
     fn eql(self: ChunkRect, other: ChunkRect) bool {
         return self.level == other.level and self.min_x == other.min_x and self.min_y == other.min_y and self.max_x == other.max_x and self.max_y == other.max_y;
-    }
-
-    // Chunks `self` and `other` share (zero across levels).
-    fn overlap(self: ChunkRect, other: ChunkRect) usize {
-        if (self.level != other.level) return 0;
-        const min_x = @max(self.min_x, other.min_x);
-        const min_y = @max(self.min_y, other.min_y);
-        const max_x = @min(self.max_x, other.max_x);
-        const max_y = @min(self.max_y, other.max_y);
-        if (min_x > max_x or min_y > max_y) return 0;
-        return (@as(usize, max_x) - min_x + 1) * (@as(usize, max_y) - min_y + 1);
     }
 };
 
@@ -219,18 +206,9 @@ pub fn queryCellKey(level: u16, class: u6, cell: u32) u64 {
 // Clears a query key's class bits, leaving its `chunkKey`.
 const query_class_clear_mask: u64 = ~(@as(u64, 0x3f) << 48);
 
-// Appends a query key to an anchor-edit list the sync's reserve sized.
-fn appendAnchorEdit(edits: *std.ArrayList(u64), key: u64) void {
-    std.debug.assert(edits.items.len < edits.capacity);
-    edits.appendAssumeCapacity(key);
+fn queryKeyLevel(key: u64) u16 {
+    return keyLevel(key & query_class_clear_mask);
 }
-
-// `ChunkListMap.unlinkOwnerOutside` keep set that keeps nothing.
-const KeepNone = struct {
-    pub fn contains(_: KeepNone, _: u64) bool {
-        return false;
-    }
-};
 
 // A row's query class and query-tier key.
 const QueryPlacement = struct { class: u6, key: u64 };
@@ -276,41 +254,91 @@ pub const BoxHits = struct { min_x: []f32, min_y: []f32, max_x: []f32, max_y: []
 /// One `queryBox` walk's hits written, entries read, and steps taken.
 pub const BoxQueryCounts = struct { hits: u16 = 0, entries: u16 = 0, work: u16 = 0 };
 
-/// Read-only rows and chunk lists for readers between seams, safe for concurrent reads:
-/// nothing here mutates. Valid until the next `sync` or `rebuild`.
+/// One query cell's records inside a chunk: `bit` order, then entity index. `start` indexes
+/// the chunk's query columns.
+const QueryGroup = struct { bit: u16, start: u32, count: u32 };
+
+/// Span columns and query columns of one chunk, plus the anchor words. Slices are the
+/// allocated columns; `nav_len` and `query_len` are the live prefixes.
+const StaticChunk = struct {
+    nav_len: u32 = 0,
+    nav_cap: u32 = 0,
+    query_len: u32 = 0,
+    query_cap: u32 = 0,
+    group_len: u32 = 0,
+    anchors: AnchorBlock = empty_anchor_block,
+    nav_entity: []u32 = &.{},
+    nav_min_x: []u32 = &.{},
+    nav_min_y: []u32 = &.{},
+    nav_max_x: []u32 = &.{},
+    nav_max_y: []u32 = &.{},
+    query_entity: []u32 = &.{},
+    query_bit: []u16 = &.{},
+    query_min_x: []f32 = &.{},
+    query_min_y: []f32 = &.{},
+    query_max_x: []f32 = &.{},
+    query_max_y: []f32 = &.{},
+    groups: []QueryGroup = &.{},
+};
+
+/// One coarse cell's query AABBs, entity-index order. Slices are the allocated columns;
+/// `len` is the live prefix.
+const QueryRun = struct {
+    len: u32 = 0,
+    cap: u32 = 0,
+    entity: []u32 = &.{},
+    min_x: []f32 = &.{},
+    min_y: []f32 = &.{},
+    max_x: []f32 = &.{},
+    max_y: []f32 = &.{},
+};
+
+const ChunkDir = ChunkDirectory(StaticChunk, false);
+const CoarseDir = ChunkDirectory(QueryRun, false);
+
+/// The nav spans listed on one chunk, entity-index order. Empty when the chunk has none.
+pub const ChunkSpans = struct {
+    entity: []const u32 = &.{},
+    min_x: []const u32 = &.{},
+    min_y: []const u32 = &.{},
+    max_x: []const u32 = &.{},
+    max_y: []const u32 = &.{},
+};
+
+/// Read-only chunk runs for readers between seams, safe for concurrent reads: nothing here
+/// mutates. Valid until the next `sync` or `rebuild`.
 pub const ColliderView = struct {
     /// Null for a system never rebuilt (it holds no rows).
     geometry: ?ColliderGeometry = null,
-    lists: ?*const ChunkListMap = null,
-    chunk_reader: ChunkListMap.Reader = .{},
-    query_reader: ChunkListMap.Reader = .{},
+    chunks: ?*const ChunkDir = null,
+    coarse: ?*const [max_query_classes]CoarseDir = null,
     query_class_mask: QueryClassMask = .empty,
     query_top_class: u6 = 0,
-    /// Anchor blocks by the id a chunk-tier key holds as its value.
-    anchor_blocks: []const AnchorBlock = &.{},
-    level: []const u16 = &.{},
-    min_x: []const f32 = &.{},
-    min_y: []const f32 = &.{},
-    max_x: []const f32 = &.{},
-    max_y: []const f32 = &.{},
-    cell_min_x: []const u32 = &.{},
-    cell_min_y: []const u32 = &.{},
-    cell_max_x: []const u32 = &.{},
-    cell_max_y: []const u32 = &.{},
 
-    /// Whether any row covers a cell of `chunk` on `level`. O(1) expected.
+    /// Whether any span covers a cell of `chunk` on `level`. O(1).
     pub fn chunkHasRows(self: ColliderView, level: u16, chunk: u32) bool {
-        return self.chunk_reader.head(chunkKey(level, chunk)) != no_entry;
+        const payload = self.chunkPayload(level, chunk) orelse return false;
+        return payload.nav_len != 0;
     }
 
-    /// The rows covering a cell of `chunk` on `level`, in entity-index order.
-    pub fn chunkRows(self: ColliderView, level: u16, chunk: u32) ChunkListMap.Iterator {
-        const lists = self.lists orelse return .{ .owners = &.{}, .next_entries = &.{}, .entry = no_entry };
-        return lists.iterator(chunkKey(level, chunk));
+    /// The spans covering a cell of `chunk` on `level`, in entity-index order.
+    pub fn chunkRows(self: ColliderView, level: u16, chunk: u32) ChunkSpans {
+        const payload = self.chunkPayload(level, chunk) orelse return .{};
+        const count: usize = payload.nav_len;
+        return .{
+            .entity = payload.nav_entity[0..count],
+            .min_x = payload.nav_min_x[0..count],
+            .min_y = payload.nav_min_y[0..count],
+            .max_x = payload.nav_max_x[0..count],
+            .max_y = payload.nav_max_y[0..count],
+        };
     }
 
-    pub fn rowCells(self: ColliderView, row: u32) CellSpan {
-        return .{ .min_x = self.cell_min_x[row], .min_y = self.cell_min_y[row], .max_x = self.cell_max_x[row], .max_y = self.cell_max_y[row] };
+    fn chunkPayload(self: ColliderView, level: u16, chunk: u32) ?StaticChunk {
+        const chunks = self.chunks orelse return null;
+        const block = chunks.slot(level, chunk);
+        if (block == empty_block) return null;
+        return chunks.payload(block);
     }
 
     /// Writes into `hits`, in query order, the AABB of every row on `level` that meets the
@@ -323,8 +351,9 @@ pub const ColliderView = struct {
     /// entry read is one step; the walk stops before a step once it has taken `max_work`
     /// steps or written `max_hits` hits. Reads only: no allocation, safe on workers. Work
     /// depends on the box and the rows near it, never on the row count.
-    // SIMD verdict: scalar. One bit test per cell, hash probes only on set bits, and
-    // pointer-chasing list walks; the four-compare reject is fused into the walk.
+    // SIMD verdict: scalar. One bit test per cell and one binary search per chunk visit.
+    // A cell run is short and the hit cap drains into the packed hit buffer one box at a
+    // time, so a lane batch would scalar-drain. Contiguous columns are the win.
     pub fn queryBox(self: ColliderView, level: u16, box: math.Aabb, limits: BoxQueryLimits, hits: BoxHits) BoxQueryCounts {
         std.debug.assert(hits.min_x.len >= limits.max_hits and hits.min_y.len >= limits.max_hits);
         std.debug.assert(hits.max_x.len >= limits.max_hits and hits.max_y.len >= limits.max_hits);
@@ -376,8 +405,8 @@ const BoxWalk = struct {
         const cells_x = geometry.classCellsX(class);
         const chunk_shift: u6 = geometry.grid.shift;
         if (class > chunk_shift) return self.walkCells(class, cells_x, min_x, min_y, max_x, max_y);
-        // A class cell lies in one chunk, whose anchor block (the chunk-tier key's value)
-        // marks the class cells holding a query entry; a chunk without one holds none.
+        // A class cell lies in one chunk. The chunk's anchor words mark the class cells
+        // that hold a query record; a chunk with none set holds none.
         const per_chunk_shift = chunk_shift - class;
         const chunks_x = geometry.grid.chunks_x;
         const class_offset = anchorClassOffset(chunk_shift, class);
@@ -389,8 +418,8 @@ const BoxWalk = struct {
                 self.counts.work += 1;
                 // Chunk indices stay below the level's chunk count, under 2^32.
                 const chunk: u32 = @intCast(chunk_y * chunks_x + chunk_x);
-                const block = self.view.chunk_reader.value(chunkKey(self.level, chunk));
-                if (block == no_value) continue;
+                const payload = self.view.chunkPayload(self.level, chunk) orelse continue;
+                if (payload.anchors.set_bits == 0) continue;
                 const first_x = chunk_x << per_chunk_shift;
                 const first_y = chunk_y << per_chunk_shift;
                 const last_x = first_x + (@as(u64, 1) << per_chunk_shift) - 1;
@@ -403,21 +432,26 @@ const BoxWalk = struct {
                     .max_x = @min(max_x, last_x),
                     .max_y = @min(max_y, last_y),
                 };
-                if (!self.walkAnchoredCells(cells, &self.view.anchor_blocks[block].words, class_offset, per_chunk_shift)) return false;
+                if (!self.walkAnchoredCells(cells, payload, class_offset, per_chunk_shift)) return false;
             }
         }
         return true;
     }
 
-    // Steps each cell of `cells` (inside one chunk) and walks the query list only of a cell
-    // whose bit is set in the chunk's anchor `words`: a clear bit means an absent key.
-    fn walkAnchoredCells(self: *BoxWalk, cells: ClassCells, words: *const [anchor_block_words]u64, class_offset: usize, per_chunk_shift: u6) bool {
+    // Steps each cell of `cells` (inside one chunk). A clear anchor bit skips. A set bit
+    // scans that bit's query columns. One binary search per chunk visit finds the first
+    // group at or after the walk's first cell; the cursor then only moves forward. The
+    // search is not a work step.
+    fn walkAnchoredCells(self: *BoxWalk, cells: ClassCells, payload: StaticChunk, class_offset: usize, per_chunk_shift: u6) bool {
         const cell_mask = (@as(u64, 1) << per_chunk_shift) - 1;
+        const words = &payload.anchors.words;
+        const groups = payload.groups[0..payload.group_len];
+        const first_bit: u16 = @intCast(class_offset + @as(usize, @intCast((cells.min_y & cell_mask) << per_chunk_shift)) + @as(usize, @intCast(cells.min_x & cell_mask)));
+        var cursor = std.sort.lowerBound(QueryGroup, groups, first_bit, orderGroupBit);
         const max_work = self.limits.max_work;
         const max_hits = self.limits.max_hits;
         var cell_y = cells.min_y;
         while (cell_y <= cells.max_y) : (cell_y += 1) {
-            // A class cell's bit is below the block's bit count, so it fits usize.
             const row_bit = class_offset + @as(usize, @intCast((cell_y & cell_mask) << per_chunk_shift));
             var cell_x = cells.min_x;
             while (cell_x <= cells.max_x) : (cell_x += 1) {
@@ -425,15 +459,18 @@ const BoxWalk = struct {
                 self.counts.work += 1;
                 const bit = row_bit + @as(usize, @intCast(cell_x & cell_mask));
                 if ((words[bit >> 6] >> @intCast(bit & 63)) & 1 == 0) continue;
-                // Class cell indices stay below the level's cell count, under 2^32.
-                const cell: u32 = @intCast(cell_y * cells.cells_x + cell_x);
-                if (!self.walkList(self.view.query_reader.head(queryCellKey(self.level, cells.class, cell)))) return false;
+                const bit_id: u16 = @intCast(bit);
+                while (cursor < groups.len and groups[cursor].bit < bit_id) cursor += 1;
+                std.debug.assert(cursor < groups.len and groups[cursor].bit == bit_id);
+                if (!self.scanQuery(payload, groups[cursor].start, groups[cursor].count)) return false;
+                cursor += 1;
             }
         }
         return true;
     }
 
     fn walkCells(self: *BoxWalk, class: u6, cells_x: u64, min_x: u64, min_y: u64, max_x: u64, max_y: u64) bool {
+        const coarse = self.view.coarse orelse return true;
         var cell_y = min_y;
         while (cell_y <= max_y) : (cell_y += 1) {
             var cell_x = min_x;
@@ -442,26 +479,49 @@ const BoxWalk = struct {
                 self.counts.work += 1;
                 // Class cell indices stay below the level's cell count, under 2^32.
                 const cell: u32 = @intCast(cell_y * cells_x + cell_x);
-                if (!self.walkList(self.view.query_reader.head(queryCellKey(self.level, class, cell)))) return false;
+                const block = coarse[class].slot(self.level, cell);
+                if (block == empty_block) continue;
+                const run = coarse[class].payload(block);
+                if (!self.scanRun(run)) return false;
             }
         }
         return true;
     }
 
-    fn walkList(self: *BoxWalk, first: u32) bool {
-        const view = self.view;
-        const reader = &view.query_reader;
+    fn scanQuery(self: *BoxWalk, payload: StaticChunk, start: u32, count: u32) bool {
         const box = self.box;
-        var entry = first;
-        while (entry != no_entry) : (entry = reader.next_entries[entry]) {
+        const end = start + count;
+        var index = start;
+        while (index < end) : (index += 1) {
             if (!self.canStep()) return false;
             self.counts.work += 1;
             self.counts.entries += 1;
-            const row = reader.owners[entry];
-            const row_min_x = view.min_x[row];
-            const row_min_y = view.min_y[row];
-            const row_max_x = view.max_x[row];
-            const row_max_y = view.max_y[row];
+            const row_min_x = payload.query_min_x[index];
+            const row_min_y = payload.query_min_y[index];
+            const row_max_x = payload.query_max_x[index];
+            const row_max_y = payload.query_max_y[index];
+            if (row_min_x <= box.max_x and row_max_x >= box.min_x and row_min_y <= box.max_y and row_max_y >= box.min_y) {
+                const at = self.counts.hits;
+                self.hits.min_x[at] = row_min_x;
+                self.hits.min_y[at] = row_min_y;
+                self.hits.max_x[at] = row_max_x;
+                self.hits.max_y[at] = row_max_y;
+                self.counts.hits += 1;
+            }
+        }
+        return true;
+    }
+
+    fn scanRun(self: *BoxWalk, run: QueryRun) bool {
+        const box = self.box;
+        for (0..run.len) |index| {
+            if (!self.canStep()) return false;
+            self.counts.work += 1;
+            self.counts.entries += 1;
+            const row_min_x = run.min_x[index];
+            const row_min_y = run.min_y[index];
+            const row_max_x = run.max_x[index];
+            const row_max_y = run.max_y[index];
             if (row_min_x <= box.max_x and row_max_x >= box.min_x and row_min_y <= box.max_y and row_max_y >= box.min_y) {
                 const at = self.counts.hits;
                 self.hits.min_x[at] = row_min_x;
@@ -474,6 +534,10 @@ const BoxWalk = struct {
         return true;
     }
 };
+
+fn orderGroupBit(bit: u16, group: QueryGroup) std.math.Order {
+    return std.math.order(bit, group.bit);
+}
 
 pub const StaticColliderSystem = struct {
     allocator: std.mem.Allocator,
@@ -491,30 +555,36 @@ pub const StaticColliderSystem = struct {
     dirty_stamp: std.ArrayList(u32) = .empty,
     dirty_entity: std.ArrayList(EntityId) = .empty,
     dirty_generation: u32 = 1,
+    // Set for a dirty index whose runs must be rewritten. A chunk fill drops records whose
+    // entity carries this generation and merges the planned inserts; an index whose bytes
+    // did not change is left out, so another static rewriting the chunk keeps the record.
+    relink_stamp: std.ArrayList(u32) = .empty,
+    relink_generation: u32 = 1,
     changes: std.ArrayList(ColliderChange) = .empty,
-    // Per pending index, in order: its row after the sync. Sync scratch, high-water.
-    sync_plan: std.ArrayList(?PlannedRow) = .empty,
-    chunk_lists: ChunkListMap,
-    // One entry per row, at `ColliderGeometry.queryKey` of its level, class, and footprint.
-    query_lists: ChunkListMap,
+    // Per pending index, in order. Sync scratch, high-water.
+    sync_plan: std.ArrayList(SyncPlan) = .empty,
+    chunks: ChunkDir = .{},
+    coarse: [max_query_classes]CoarseDir = @splat(.{}),
+    // Per opened level, one stamp per slot. `generation` matches the directory's generation
+    // only for slots listed in this sync; `item` is the index in the fresh-item list.
+    chunk_stamps: std.ArrayList([]SlotStamp) = .empty,
+    coarse_stamps: [max_query_classes]std.ArrayList([]SlotStamp) = @splat(.empty),
+    chunk_stamp_generation: u32 = 1,
+    coarse_stamp_generation: u32 = 1,
+    chunk_items: std.ArrayList(ChunkItem) = .empty,
+    coarse_items: std.ArrayList(CoarseItem) = .empty,
+    nav_inserts: std.ArrayList(SpanInsert) = .empty,
+    query_inserts: std.ArrayList(AabbInsert) = .empty,
+    coarse_inserts: std.ArrayList(AabbInsert) = .empty,
+    unit_starts: std.ArrayList(usize) = .empty,
     // Rows per query class, and the classes holding any row (refreshed after every sync
     // and rebuild).
     query_class_rows: [max_query_classes]u32 = @splat(0),
     query_class_mask: QueryClassMask = .empty,
     query_top_class: u6 = 0,
-    // Per chunk holding a query entry of a class no larger than a chunk, its anchor block,
-    // by the id its chunk-tier key holds as its value. A block is released, all-zero, when
-    // its last bit clears; `anchor_free`'s capacity covers every pooled block.
-    anchor_blocks: std.ArrayList(AnchorBlock) = .empty,
-    anchor_free: std.ArrayList(u32) = .empty,
-    // Sync scratch, high-water: query keys of those classes gained and left this sync.
-    anchor_sets: std.ArrayList(u64) = .empty,
-    anchor_clears: std.ArrayList(u64) = .empty,
-    // The chunk and query lists' splice stages: each its own tuner, sharing the range
-    // controls (production runs adaptive; benches pin a fixed partition), and their last
-    // batch shapes (the query lists' only with `runtime_perf_log.enabled`).
-    splice_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    query_splice_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // The chunk rewrite: one tuner, the shared range controls (production runs adaptive;
+    // benches pin a fixed partition), and the last batch shape.
+    chunk_rewrite: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     splice_controls: StageControls = .{},
     last_splice_batch: BatchStats = .{},
     perf: Perf = .{},
@@ -531,34 +601,34 @@ pub const StaticColliderSystem = struct {
     row_cell_max_y: []u32 = &.{},
     /// The first row-pool growth is logged once.
     row_growth_logged: bool = false,
-    /// The first anchor-block pool or anchor-edit scratch growth is logged once.
-    anchor_growth_logged: bool = false,
+    /// The first chunk-directory or payload-pool growth is logged once.
+    payload_growth_logged: bool = false,
 
-    /// Kept only with `runtime_perf_log.enabled`: the query lists' last splice batch, and the
-    /// row-pool and anchor growths so far.
+    /// Kept only with `runtime_perf_log.enabled`: row-pool and payload-pool growths so far.
     pub const Perf = if (runtime_perf_log.enabled) struct {
-        last_query_splice_batch: BatchStats = .{},
         row_grows: u64 = 0,
-        anchor_grows: u64 = 0,
+        payload_grows: u64 = 0,
     } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) StaticColliderSystem {
-        return .{
-            .allocator = allocator,
-            .chunk_lists = ChunkListMap.init(allocator, "static collider chunk lists"),
-            .query_lists = ChunkListMap.init(allocator, "static collider query lists"),
-        };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *StaticColliderSystem) void {
-        self.anchor_clears.deinit(self.allocator);
-        self.anchor_sets.deinit(self.allocator);
-        self.anchor_free.deinit(self.allocator);
-        self.anchor_blocks.deinit(self.allocator);
-        self.query_lists.deinit();
-        self.chunk_lists.deinit();
+        self.discardFresh();
+        self.freeStampList(&self.chunk_stamps);
+        for (&self.coarse_stamps) |*stamps| self.freeStampList(stamps);
+        for (&self.coarse) |*dir| dir.deinit(self.allocator);
+        self.chunks.deinit(self.allocator);
+        self.unit_starts.deinit(self.allocator);
+        self.coarse_inserts.deinit(self.allocator);
+        self.query_inserts.deinit(self.allocator);
+        self.nav_inserts.deinit(self.allocator);
+        self.coarse_items.deinit(self.allocator);
+        self.chunk_items.deinit(self.allocator);
         self.sync_plan.deinit(self.allocator);
         self.changes.deinit(self.allocator);
+        self.relink_stamp.deinit(self.allocator);
         self.dirty_entity.deinit(self.allocator);
         self.dirty_stamp.deinit(self.allocator);
         self.pending_dirty.deinit(self.allocator);
@@ -586,21 +656,10 @@ pub const StaticColliderSystem = struct {
     pub fn view(self: *const StaticColliderSystem) ColliderView {
         return .{
             .geometry = self.geometry,
-            .lists = &self.chunk_lists,
-            .chunk_reader = self.chunk_lists.reader(),
-            .query_reader = self.query_lists.reader(),
+            .chunks = &self.chunks,
+            .coarse = &self.coarse,
             .query_class_mask = self.query_class_mask,
             .query_top_class = self.query_top_class,
-            .anchor_blocks = self.anchor_blocks.items,
-            .level = self.row_level,
-            .min_x = self.row_min_x,
-            .min_y = self.row_min_y,
-            .max_x = self.row_max_x,
-            .max_y = self.row_max_y,
-            .cell_min_x = self.row_cell_min_x,
-            .cell_min_y = self.row_cell_min_y,
-            .cell_max_x = self.row_cell_max_x,
-            .cell_max_y = self.row_cell_max_y,
         };
     }
 
@@ -628,12 +687,13 @@ pub const StaticColliderSystem = struct {
         } };
     }
 
-    /// Replaces every row with the statics `data` holds now, placed on `geometry`, built
-    /// into fresh storage with both list tiers: an error leaves the system unchanged. Drops
-    /// pending changes. O(S log S) for S statics; cold (pipeline init, world replace).
+    /// Replaces every row with the statics `data` holds now, placed on `geometry`, and
+    /// builds each footprint chunk's span and query columns. An error leaves the system
+    /// unchanged. Drops pending changes. O(S log S) for S statics; cold (pipeline init,
+    /// world replace). Not threaded.
     pub fn rebuild(self: *StaticColliderSystem, data: *const DataSystem, geometry: ColliderGeometry) error{OutOfMemory}!void {
         std.debug.assert(geometry.grid.chunk_tiles != 0 and std.math.isPowerOfTwo(geometry.grid.chunk_tiles));
-        // Anchor blocks hold the fine classes of a chunk up to this edge.
+        // Anchor words hold the fine classes of a chunk up to this edge.
         std.debug.assert(geometry.grid.chunk_tiles <= max_chunk_size_tiles);
         var statics: std.ArrayList(EntityId) = .empty;
         defer statics.deinit(self.allocator);
@@ -642,7 +702,7 @@ pub const StaticColliderSystem = struct {
             if (mobility != .static or !data.isStaticNavigationObstacle(entity)) continue;
             try statics.append(self.allocator, entity);
         }
-        std.sort.pdq(EntityId, statics.items, {}, struct {
+        pdq(EntityId, statics.items, {}, struct {
             fn lessThan(_: void, a: EntityId, b: EntityId) bool {
                 return a.index < b.index;
             }
@@ -652,54 +712,25 @@ pub const StaticColliderSystem = struct {
         errdefer fresh.deinit();
         fresh.geometry = geometry;
         fresh.query_top_class = geometry.topQueryClass();
-        // Growth telemetry spans rebuilds: a growth already logged stays logged.
         fresh.row_growth_logged = self.row_growth_logged;
-        fresh.chunk_lists.growth_logged = self.chunk_lists.growth_logged;
-        fresh.query_lists.growth_logged = self.query_lists.growth_logged;
-        fresh.anchor_growth_logged = self.anchor_growth_logged;
+        fresh.payload_growth_logged = self.payload_growth_logged;
+        if (comptime runtime_perf_log.enabled) fresh.perf = self.perf;
         var index_count: usize = 0;
-        var footprint_chunks: usize = 0;
-        for (statics.items) |entity| {
-            index_count = @max(index_count, @as(usize, entity.index) + 1);
-            footprint_chunks += geometry.chunkRect(fresh.placementOf(data, entity).?).count();
-        }
+        for (statics.items) |entity| index_count = @max(index_count, @as(usize, entity.index) + 1);
         try fresh.reserveIndices(index_count);
         try fresh.ensureFreeRows(statics.items.len);
-        try fresh.chunk_lists.reserve(footprint_chunks, footprint_chunks, fresh.rows.len);
-        try fresh.query_lists.reserve(statics.items.len, statics.items.len, fresh.rows.len);
-        // Ascending entity index, so every row appends at its lists' tails.
         for (statics.items) |entity| {
             const placement = fresh.placementOf(data, entity).?;
             const aabb = data.staticObstacleWorldRect(entity).?;
             const row = fresh.claimRow(entity.index);
             fresh.writeRow(row, entity, placement, aabb);
-            const rect = geometry.chunkRect(placement);
-            var chunk_y = rect.min_y;
-            while (chunk_y <= rect.max_y) : (chunk_y += 1) {
-                var chunk_x = rect.min_x;
-                while (chunk_x <= rect.max_x) : (chunk_x += 1) fresh.chunk_lists.appendTail(row, chunkKey(rect.level, chunk_y * rect.chunks_x + chunk_x), entity.index);
-            }
             const class = geometry.queryClass(fresh.query_top_class, aabb);
-            const query_key = geometry.queryKey(placement.level, class, placement.cells);
-            fresh.query_lists.appendTail(row, query_key, entity.index);
             fresh.query_class_rows[class] += 1;
-            if (class <= geometry.grid.shift) {
-                // The row's chunk entries are listed, so its anchor chunk's key exists.
-                const anchor = geometry.anchorBit(query_key);
-                if (fresh.chunk_lists.value(anchor.chunk_key) == no_value) try fresh.ensureFreeAnchorBlocks(1);
-                fresh.setAnchor(anchor);
-            }
         }
         fresh.refreshQueryClassMask();
-        fresh.splice_tuner = self.splice_tuner;
-        fresh.query_splice_tuner = self.query_splice_tuner;
+        try fresh.buildAllRuns();
+        fresh.chunk_rewrite = self.chunk_rewrite;
         fresh.splice_controls = self.splice_controls;
-        if (comptime runtime_perf_log.enabled) {
-            fresh.perf.row_grows += self.perf.row_grows;
-            fresh.perf.anchor_grows += self.perf.anchor_grows;
-            fresh.chunk_lists.perf.grows += self.chunk_lists.perf.grows;
-            fresh.query_lists.perf.grows += self.query_lists.perf.grows;
-        }
         self.deinit();
         self.* = fresh;
     }
@@ -728,11 +759,13 @@ pub const StaticColliderSystem = struct {
         try self.row_of_index.ensureTotalCapacity(self.allocator, index_count);
         try self.dirty_stamp.ensureTotalCapacity(self.allocator, index_count);
         try self.dirty_entity.ensureTotalCapacity(self.allocator, index_count);
+        try self.relink_stamp.ensureTotalCapacity(self.allocator, index_count);
         try self.pending_dirty.ensureTotalCapacity(self.allocator, index_count);
         const added = index_count - self.row_of_index.items.len;
         self.row_of_index.appendNTimesAssumeCapacity(no_row, added);
         self.dirty_stamp.appendNTimesAssumeCapacity(0, added);
         self.dirty_entity.appendNTimesAssumeCapacity(EntityId.invalid, added);
+        self.relink_stamp.appendNTimesAssumeCapacity(0, added);
     }
 
     // Grows the free row list to at least `needed` ids. Geometric and counted.
@@ -767,95 +800,11 @@ pub const StaticColliderSystem = struct {
         if (comptime logging.enabled(.info)) logging.game.info("static collider rows grew", .{});
     }
 
-    fn countAnchorGrowth(self: *StaticColliderSystem) void {
-        if (comptime runtime_perf_log.enabled) self.perf.anchor_grows += 1;
-        if (self.anchor_growth_logged) return;
-        self.anchor_growth_logged = true;
-        if (comptime logging.enabled(.info)) logging.game.info("static collider anchor blocks grew", .{});
-    }
-
-    // Grows the free anchor-block list to at least `needed` ids, new blocks all-zero.
-    // Geometric and counted.
-    fn ensureFreeAnchorBlocks(self: *StaticColliderSystem, needed: usize) !void {
-        if (self.anchor_free.items.len >= needed) return;
-        const added = needed - self.anchor_free.items.len;
-        const total = self.anchor_blocks.items.len + added;
-        // Block ids stay below `no_value`: exhausting them needs 2^32 - 1 live blocks, so it
-        // fails as the allocator does.
-        if (total >= no_value) return error.OutOfMemory;
-        if (total > self.anchor_blocks.capacity) {
-            try self.anchor_blocks.ensureTotalCapacity(self.allocator, @max(total, self.anchor_blocks.capacity *| 2));
-            self.countAnchorGrowth();
-        }
-        try self.anchor_free.ensureTotalCapacity(self.allocator, self.anchor_blocks.capacity);
-        // Pushed in descending id order so pops hand out ascending ids.
-        const first: u32 = @intCast(self.anchor_blocks.items.len);
-        self.anchor_blocks.appendNTimesAssumeCapacity(empty_anchor_block, added);
-        var id: u32 = @intCast(self.anchor_blocks.items.len);
-        while (id > first) {
-            id -= 1;
-            self.anchor_free.appendAssumeCapacity(id);
-        }
-    }
-
-    // Sizes the sync's anchor-edit scratch for `sets` and `clears` edits. Geometric and
-    // counted.
-    fn reserveAnchorEdits(self: *StaticColliderSystem, sets: usize, clears: usize) !void {
-        if (self.anchor_sets.capacity >= sets and self.anchor_clears.capacity >= clears) return;
-        try self.anchor_sets.ensureTotalCapacity(self.allocator, sets);
-        try self.anchor_clears.ensureTotalCapacity(self.allocator, clears);
-        self.countAnchorGrowth();
-    }
-
-    // Sets `anchor`'s bit, claiming a free block for its chunk when the chunk has none; the
-    // chunk's key exists. O(1).
-    fn setAnchor(self: *StaticColliderSystem, anchor: AnchorBit) void {
-        var block_id = self.chunk_lists.value(anchor.chunk_key);
-        if (block_id == no_value) {
-            // The reserve kept a free block for every chunk gaining its first anchor.
-            std.debug.assert(self.anchor_free.items.len != 0);
-            block_id = self.anchor_free.pop().?;
-            std.debug.assert(self.anchor_blocks.items[block_id].set_bits == 0);
-            self.chunk_lists.setValue(anchor.chunk_key, block_id);
-        }
-        const block = &self.anchor_blocks.items[block_id];
-        const word = &block.words[anchor.bit >> 6];
-        const bit_mask = @as(u64, 1) << @intCast(anchor.bit & 63);
-        if (word.* & bit_mask != 0) return;
-        word.* |= bit_mask;
-        block.set_bits += 1;
-    }
-
-    // Clears fine query key `key`'s bit when its list is empty, releasing its chunk's block
-    // and value when no bit stays set. A key cleared twice, or left and refilled, comes out
-    // exact: emptiness is read from the committed query lists. O(1).
-    fn clearAnchor(self: *StaticColliderSystem, key: u64) void {
-        if (self.query_lists.head(key) != no_entry) return;
-        const anchor = self.geometry.?.anchorBit(key);
-        const block_id = self.chunk_lists.value(anchor.chunk_key);
-        if (block_id == no_value) return;
-        const block = &self.anchor_blocks.items[block_id];
-        const word = &block.words[anchor.bit >> 6];
-        const bit_mask = @as(u64, 1) << @intCast(anchor.bit & 63);
-        if (word.* & bit_mask == 0) return;
-        word.* &= ~bit_mask;
-        block.set_bits -= 1;
-        if (block.set_bits != 0) return;
-        std.debug.assert(self.anchor_free.items.len < self.anchor_free.capacity);
-        self.anchor_free.appendAssumeCapacity(block_id);
-        self.chunk_lists.setValue(anchor.chunk_key, no_value);
-    }
-
-    // After the query commit, before the chunk commit (the chunk tier's keys still stand):
-    // sets, then clears, so a set never needs a block a later clear frees. O(1) per edit.
-    fn applyAnchorEdits(self: *StaticColliderSystem) void {
-        const geometry = self.geometry.?;
-        for (self.anchor_sets.items) |key| {
-            // Each pending index stages once, so a gained key's list holds its row.
-            if (std.debug.runtime_safety) std.debug.assert(self.query_lists.head(key) != no_entry);
-            self.setAnchor(geometry.anchorBit(key));
-        }
-        for (self.anchor_clears.items) |key| self.clearAnchor(key);
+    fn countPayloadGrowth(self: *StaticColliderSystem) void {
+        if (comptime runtime_perf_log.enabled) self.perf.payload_grows += 1;
+        if (self.payload_growth_logged) return;
+        self.payload_growth_logged = true;
+        if (comptime logging.enabled(.info)) logging.game.info("static collider chunk payloads grew", .{});
     }
 
     /// The commit seam's reserve, before the structural commit: sizes the dirty list and the
@@ -897,153 +846,600 @@ pub const StaticColliderSystem = struct {
         self.pending_dirty.appendAssumeCapacity(index);
     }
 
-    /// Applies every captured change from `data`'s final state: per dirty index, its row
-    /// follows its last captured id (kept, moved, freed, or claimed), is listed in exactly
-    /// the chunks it covers, and has one query entry at its class and anchor cell, marked in
-    /// its chunk's anchor block when its class is no larger than a chunk. Records one
-    /// `ColliderChange` per dirty index. The main thread does O(1) per change (at most two
-    /// anchor edits among it), plus O(1) per footprint chunk of a row whose level or chunks
-    /// changed (its unlinks and staged inserts); a row whose level and chunks are unchanged
-    /// touches no chunk list, and one whose query key is unchanged touches no query list or
-    /// anchor block. The sorted list placement runs in each tier's splice stage, threaded
-    /// under `thread_system`; lists and blocks are identical for any partition. Every
-    /// reserve runs first: on error nothing changes and the dirty list stays for the next
-    /// sync. The change list resets on every call.
-    // SIMD verdict: scalar. Per changed entity, gather-bound placement reads
-    // (`isStaticNavigationObstacle`, the obstacle rect) and branchy row and list edits.
+    /// Applies every captured change from `data`'s final state. Main is O(1) per dirty
+    /// static and per footprint chunk: it plans the chunks and coarse cells to rewrite,
+    /// reserves a fresh payload for each, then one `chunk_rewrite` dispatch fills those
+    /// payloads. A row whose chunks, AABB, and query key are unchanged is written in place
+    /// and rewrites nothing. On error nothing is installed and the dirty list stays for the
+    /// next sync. The change list resets on every call.
+    // SIMD verdict: scalar. Per changed entity, gather-bound placement reads, then a merge
+    // and a sort of that chunk's inserts on the worker.
     pub fn sync(self: *StaticColliderSystem, data: *const DataSystem, thread_system: *ThreadSystem) error{OutOfMemory}!void {
         self.changes.clearRetainingCapacity();
         self.last_splice_batch = .{};
-        if (comptime runtime_perf_log.enabled) self.perf.last_query_splice_batch = .{};
-        const pending = self.pending_dirty.items;
-        if (pending.len == 0) return;
-        const geometry = self.geometry.?;
+        if (self.pending_dirty.items.len == 0) return;
+        try self.reserveSync(data);
+        self.applySync(thread_system);
+    }
 
-        // Plan each dirty index's row and count what the sync claims: rows for adds, chunk
-        // entries for chunks entered, removals for chunks left, query entries for keys
-        // gained and left, anchor edits for those keys of the classes no larger than a
-        // chunk, and anchor blocks for chunks with none (an upper bound).
+    // Plans, opens levels, and allocates fresh payloads. Installed runs stay as they are.
+    // On error the fresh payloads are freed and any blocks claimed for them return to the pool.
+    fn reserveSync(self: *StaticColliderSystem, data: *const DataSystem) error{OutOfMemory}!void {
+        errdefer self.discardFresh();
+        self.changes.clearRetainingCapacity();
+        const counts = try self.planPending(data);
+        try self.ensureFreeRows(counts.adds);
+        try self.changes.ensureTotalCapacity(self.allocator, self.pending_dirty.items.len);
+        try self.reserveRewriteScratch(counts);
+        self.touchPending();
+        self.assignInsertRanges();
+        self.writePendingInserts();
+        try self.allocFreshPayloads();
+        try self.claimFreshBlocks();
+        self.buildUnits();
+    }
+
+    fn applySync(self: *StaticColliderSystem, thread_system: *ThreadSystem) void {
+        self.applyRows();
+        const chunk_count = self.chunk_items.items.len;
+        const item_count = chunk_count + self.coarse_items.items.len;
+        if (item_count != 0) {
+            const total = self.unit_starts.items[item_count];
+            var job = RewriteJob{
+                .colliders = self,
+                .range_count = 0,
+                .unit_starts = self.unit_starts.items,
+                .chunk_count = chunk_count,
+            };
+            const dispatch = Dispatch.init(thread_system, &self.chunk_rewrite, self.splice_controls);
+            const shape = stageShape(dispatch, total, splice_range_alignment_items);
+            job.range_count = shape.range_count;
+            self.last_splice_batch = runShaped(dispatch, shape, total, splice_range_alignment_items, &job, rewriteJob);
+            self.installFresh();
+        }
+        self.finishPending();
+        self.clearItems();
+    }
+
+    // Every live row, as a create into empty directories. Cold; fills inline, no tuner sample.
+    fn buildAllRuns(self: *StaticColliderSystem) error{OutOfMemory}!void {
+        errdefer self.discardFresh();
+        var counts = PlanCounts{};
+        for (self.row_of_index.items) |row| {
+            if (row == no_row) continue;
+            const added = try self.countLiveRow(row);
+            counts.chunk_touches += added.chunk_touches;
+            counts.nav_inserts += added.nav_inserts;
+            counts.query_inserts += added.query_inserts;
+            counts.coarse_inserts += added.coarse_inserts;
+            counts.coarse_touches += added.coarse_touches;
+        }
+        try self.reserveRewriteScratch(counts);
+        for (self.row_of_index.items) |row| {
+            if (row == no_row) continue;
+            const placement = self.rowPlacement(row);
+            const aabb = self.rowAabb(row);
+            self.touchPlacement(placement, self.queryPlacement(placement, aabb));
+        }
+        self.assignInsertRanges();
+        for (self.row_of_index.items, 0..) |row, index| {
+            if (row == no_row) continue;
+            const placement = self.rowPlacement(row);
+            const aabb = self.rowAabb(row);
+            self.writePlacementInserts(@intCast(index), placement, aabb, self.queryPlacement(placement, aabb));
+        }
+        self.finishInsertCursors();
+        try self.allocFreshPayloads();
+        try self.claimFreshBlocks();
+        self.buildUnits();
+        for (0..self.chunk_items.items.len) |index| self.fillChunkItem(index);
+        for (0..self.coarse_items.items.len) |index| self.fillCoarseItem(index);
+        self.installFresh();
+        self.bumpStamps();
+        self.clearItems();
+    }
+
+    fn countLiveRow(self: *StaticColliderSystem, row: u32) !PlanCounts {
+        const placement = self.rowPlacement(row);
+        const aabb = self.rowAabb(row);
+        const rect = self.geometry.?.chunkRect(placement);
+        const query = self.queryPlacement(placement, aabb);
+        var counts = PlanCounts{
+            .chunk_touches = rect.count(),
+            .nav_inserts = rect.count(),
+        };
+        if (query.class <= self.geometry.?.grid.shift) counts.query_inserts = 1 else {
+            counts.coarse_inserts = 1;
+            counts.coarse_touches = 1;
+        }
+        try self.ensureChunkLevel(placement.level);
+        if (query.class > self.geometry.?.grid.shift) try self.ensureCoarseLevel(query.class, placement.level);
+        return counts;
+    }
+
+    fn planPending(self: *StaticColliderSystem, data: *const DataSystem) !PlanCounts {
+        const pending = self.pending_dirty.items;
         try self.sync_plan.ensureTotalCapacity(self.allocator, pending.len);
         self.sync_plan.clearRetainingCapacity();
-        var adds: usize = 0;
-        var inserts: usize = 0;
-        var removals: usize = 0;
-        var query_inserts: usize = 0;
-        var query_removals: usize = 0;
-        var anchor_sets: usize = 0;
-        var anchor_clears: usize = 0;
-        var new_blocks: usize = 0;
-        const chunk_shift = geometry.grid.shift;
+        const geometry = self.geometry.?;
+        var counts = PlanCounts{};
         for (pending) |index| {
             const entity = self.dirty_entity.items[index];
             const old_row = self.row_of_index.items[index];
             const old_placement: ?Placement = if (old_row != no_row) self.rowPlacement(old_row) else null;
             const old_rect: ?ChunkRect = if (old_placement) |old| geometry.chunkRect(old) else null;
-            const old_query: ?QueryPlacement = if (old_placement) |old| self.queryPlacement(old, self.rowAabb(old_row)) else null;
-            const old_query_key: ?u64 = if (old_query) |old| old.key else null;
-            const planned: ?PlannedRow = if (self.placementOf(data, entity)) |placement| blk: {
+            const old_aabb: ?math.Aabb = if (old_row != no_row) self.rowAabb(old_row) else null;
+            const old_query: ?QueryPlacement = if (old_placement) |old| self.queryPlacement(old, old_aabb.?) else null;
+            const next: ?PlannedRow = if (self.placementOf(data, entity)) |placement| blk: {
                 const aabb = data.staticObstacleWorldRect(entity).?;
                 const query = self.queryPlacement(placement, aabb);
                 break :blk .{ .placement = placement, .aabb = aabb, .query_class = query.class, .query_key = query.key };
             } else null;
-            if (planned) |next| {
-                const new_rect = geometry.chunkRect(next.placement);
-                if (old_rect == null) adds += 1;
-                inserts += new_rect.count() - if (old_rect) |old| new_rect.overlap(old) else 0;
-                if (old_query_key != next.query_key) {
-                    query_inserts += 1;
-                    if (next.query_class <= chunk_shift) {
-                        anchor_sets += 1;
-                        if (self.chunk_lists.value(geometry.anchorBit(next.query_key).chunk_key) == no_value) new_blocks += 1;
+            const relink = if (next) |planned| blk: {
+                if (old_rect) |old| if (old_query) |query| {
+                    const new_rect = geometry.chunkRect(planned.placement);
+                    if (old.eql(new_rect) and query.key == planned.query_key and aabbEql(old_aabb.?, planned.aabb)) break :blk false;
+                };
+                break :blk true;
+            } else old_row != no_row;
+            if (old_row == no_row and next != null) counts.adds += 1;
+            if (relink) {
+                self.relink_stamp.items[index] = self.relink_generation;
+                if (old_rect) |old| {
+                    counts.chunk_touches += old.count();
+                    try self.ensureChunkLevel(old.level);
+                }
+                if (old_query) |old| if (old.class > geometry.grid.shift) {
+                    counts.coarse_touches += 1;
+                    try self.ensureCoarseLevel(old.class, queryKeyLevel(old.key));
+                };
+                if (next) |planned| {
+                    const new_rect = geometry.chunkRect(planned.placement);
+                    counts.chunk_touches += new_rect.count();
+                    counts.nav_inserts += new_rect.count();
+                    try self.ensureChunkLevel(new_rect.level);
+                    if (planned.query_class <= geometry.grid.shift) counts.query_inserts += 1 else {
+                        counts.coarse_inserts += 1;
+                        counts.coarse_touches += 1;
+                        try self.ensureCoarseLevel(planned.query_class, planned.placement.level);
                     }
                 }
             }
-            if (old_rect) |old| removals += old.count() - if (planned) |next| old.overlap(geometry.chunkRect(next.placement)) else 0;
-            if (old_query) |old| {
-                if (planned == null or planned.?.query_key != old.key) {
-                    query_removals += 1;
-                    if (old.class <= chunk_shift) anchor_clears += 1;
-                }
-            }
-            self.sync_plan.appendAssumeCapacity(planned);
+            self.sync_plan.appendAssumeCapacity(.{
+                .next = next,
+                .relink = relink,
+                .old_rect = old_rect,
+                .old_query = old_query,
+            });
         }
-        try self.ensureFreeRows(adds);
-        try self.chunk_lists.reserve(inserts, inserts, self.rows.len);
-        try self.chunk_lists.reserveBatch(inserts, removals);
-        try self.query_lists.reserve(query_inserts, query_inserts, self.rows.len);
-        try self.query_lists.reserveBatch(query_inserts, query_removals);
-        try self.ensureFreeAnchorBlocks(new_blocks);
-        try self.reserveAnchorEdits(anchor_sets, anchor_clears);
-        try self.changes.ensureTotalCapacity(self.allocator, pending.len);
+        return counts;
+    }
 
-        self.chunk_lists.beginBatch();
-        self.query_lists.beginBatch();
-        self.anchor_sets.clearRetainingCapacity();
-        self.anchor_clears.clearRetainingCapacity();
-        for (pending, self.sync_plan.items) |index, planned| {
+    fn reserveRewriteScratch(self: *StaticColliderSystem, counts: PlanCounts) !void {
+        try self.chunk_items.ensureTotalCapacity(self.allocator, counts.chunk_touches);
+        try self.coarse_items.ensureTotalCapacity(self.allocator, counts.coarse_touches);
+        try self.nav_inserts.ensureTotalCapacity(self.allocator, counts.nav_inserts);
+        try self.query_inserts.ensureTotalCapacity(self.allocator, counts.query_inserts);
+        try self.coarse_inserts.ensureTotalCapacity(self.allocator, counts.coarse_inserts);
+        try self.unit_starts.ensureTotalCapacity(self.allocator, counts.chunk_touches + counts.coarse_touches + 1);
+        std.debug.assert(self.chunk_items.capacity >= counts.chunk_touches);
+        std.debug.assert(self.coarse_items.capacity >= counts.coarse_touches);
+        std.debug.assert(self.nav_inserts.capacity >= counts.nav_inserts);
+        std.debug.assert(self.query_inserts.capacity >= counts.query_inserts);
+        std.debug.assert(self.coarse_inserts.capacity >= counts.coarse_inserts);
+        std.debug.assert(self.unit_starts.capacity >= counts.chunk_touches + counts.coarse_touches + 1);
+    }
+
+    fn touchPending(self: *StaticColliderSystem) void {
+        const geometry = self.geometry.?;
+        for (self.pending_dirty.items, self.sync_plan.items) |_, plan| {
+            if (!plan.relink) continue;
+            if (plan.old_rect) |old| self.touchRect(old, false, null);
+            if (plan.old_query) |old| if (old.class > geometry.grid.shift) {
+                self.touchCoarse(old.class, queryKeyLevel(old.key), keyChunk(old.key), false);
+            };
+            if (plan.next) |next| {
+                const query = QueryPlacement{ .class = next.query_class, .key = next.query_key };
+                self.touchPlacement(next.placement, query);
+            }
+        }
+    }
+
+    fn touchPlacement(self: *StaticColliderSystem, placement: Placement, query: QueryPlacement) void {
+        const geometry = self.geometry.?;
+        const rect = geometry.chunkRect(placement);
+        const anchor_chunk: ?u32 = if (query.class <= geometry.grid.shift) keyChunk(geometry.anchorBit(query.key).chunk_key) else null;
+        self.touchRect(rect, true, anchor_chunk);
+        if (query.class > geometry.grid.shift) self.touchCoarse(query.class, placement.level, keyChunk(query.key), true);
+    }
+
+    fn touchRect(self: *StaticColliderSystem, rect: ChunkRect, nav_insert: bool, anchor_chunk: ?u32) void {
+        var chunk_y = rect.min_y;
+        while (chunk_y <= rect.max_y) : (chunk_y += 1) {
+            var chunk_x = rect.min_x;
+            while (chunk_x <= rect.max_x) : (chunk_x += 1) {
+                const chunk = chunk_y * rect.chunks_x + chunk_x;
+                const query_insert = if (anchor_chunk) |anchor| anchor == chunk else false;
+                self.touchChunk(rect.level, chunk, nav_insert, query_insert);
+            }
+        }
+    }
+
+    fn touchChunk(self: *StaticColliderSystem, level: u16, chunk: u32, nav_insert: bool, query_insert: bool) void {
+        const stamps = self.chunk_stamps.items[level];
+        const stamp = &stamps[chunk];
+        if (stamp.generation == self.chunk_stamp_generation) {
+            const item = &self.chunk_items.items[stamp.item];
+            if (nav_insert) item.nav_insert_count += 1;
+            if (query_insert) item.query_insert_count += 1;
+            return;
+        }
+        const block = self.chunks.slot(level, chunk);
+        if (!nav_insert and !query_insert and block == empty_block) return;
+        const old_nav: u32 = if (block == empty_block) 0 else self.chunks.payload(block).nav_len;
+        const old_query: u32 = if (block == empty_block) 0 else self.chunks.payload(block).query_len;
+        stamp.generation = self.chunk_stamp_generation;
+        stamp.item = @intCast(self.chunk_items.items.len);
+        self.chunk_items.appendAssumeCapacity(.{
+            .level = level,
+            .slot = chunk,
+            .old_block = block,
+            .old_nav = old_nav,
+            .old_query = old_query,
+            .nav_insert_count = @intFromBool(nav_insert),
+            .query_insert_count = @intFromBool(query_insert),
+        });
+    }
+
+    fn touchCoarse(self: *StaticColliderSystem, class: u6, level: u16, cell: u32, insert: bool) void {
+        const stamps = self.coarse_stamps[class].items[level];
+        const stamp = &stamps[cell];
+        if (stamp.generation == self.coarse_stamp_generation) {
+            if (insert) self.coarse_items.items[stamp.item].insert_count += 1;
+            return;
+        }
+        const block = self.coarse[class].slot(level, cell);
+        if (!insert and block == empty_block) return;
+        const old_len: u32 = if (block == empty_block) 0 else self.coarse[class].payload(block).len;
+        stamp.generation = self.coarse_stamp_generation;
+        stamp.item = @intCast(self.coarse_items.items.len);
+        self.coarse_items.appendAssumeCapacity(.{
+            .class = class,
+            .level = level,
+            .slot = cell,
+            .old_block = block,
+            .old_len = old_len,
+            .insert_count = @intFromBool(insert),
+        });
+    }
+
+    fn assignInsertRanges(self: *StaticColliderSystem) void {
+        var nav_at: u32 = 0;
+        var query_at: u32 = 0;
+        for (self.chunk_items.items) |*item| {
+            item.nav_insert_at = nav_at;
+            item.nav_cursor = nav_at;
+            nav_at += item.nav_insert_count;
+            item.query_insert_at = query_at;
+            item.query_cursor = query_at;
+            query_at += item.query_insert_count;
+        }
+        var coarse_at: u32 = 0;
+        for (self.coarse_items.items) |*item| {
+            item.insert_at = coarse_at;
+            item.cursor = coarse_at;
+            coarse_at += item.insert_count;
+        }
+        self.nav_inserts.clearRetainingCapacity();
+        self.query_inserts.clearRetainingCapacity();
+        self.coarse_inserts.clearRetainingCapacity();
+        self.nav_inserts.appendNTimesAssumeCapacity(undefined, nav_at);
+        self.query_inserts.appendNTimesAssumeCapacity(undefined, query_at);
+        self.coarse_inserts.appendNTimesAssumeCapacity(undefined, coarse_at);
+    }
+
+    fn writePendingInserts(self: *StaticColliderSystem) void {
+        for (self.pending_dirty.items, self.sync_plan.items) |index, plan| {
+            if (!plan.relink) continue;
+            const next = plan.next orelse continue;
+            const query = QueryPlacement{ .class = next.query_class, .key = next.query_key };
+            self.writePlacementInserts(index, next.placement, next.aabb, query);
+        }
+        self.finishInsertCursors();
+    }
+
+    fn writePlacementInserts(self: *StaticColliderSystem, entity: u32, placement: Placement, aabb: math.Aabb, query: QueryPlacement) void {
+        const geometry = self.geometry.?;
+        const rect = geometry.chunkRect(placement);
+        const span = SpanInsert{
+            .entity = entity,
+            .min_x = placement.cells.min_x,
+            .min_y = placement.cells.min_y,
+            .max_x = placement.cells.max_x,
+            .max_y = placement.cells.max_y,
+        };
+        const anchor = if (query.class <= geometry.grid.shift) geometry.anchorBit(query.key) else null;
+        var chunk_y = rect.min_y;
+        while (chunk_y <= rect.max_y) : (chunk_y += 1) {
+            var chunk_x = rect.min_x;
+            while (chunk_x <= rect.max_x) : (chunk_x += 1) {
+                const chunk = chunk_y * rect.chunks_x + chunk_x;
+                const item = self.chunkItem(rect.level, chunk);
+                self.nav_inserts.items[item.nav_cursor] = span;
+                item.nav_cursor += 1;
+                if (anchor) |bit| if (keyChunk(bit.chunk_key) == chunk) {
+                    self.query_inserts.items[item.query_cursor] = .{
+                        .entity = entity,
+                        .bit = @intCast(bit.bit),
+                        .min_x = aabb.min_x,
+                        .min_y = aabb.min_y,
+                        .max_x = aabb.max_x,
+                        .max_y = aabb.max_y,
+                    };
+                    item.query_cursor += 1;
+                };
+            }
+        }
+        if (query.class > geometry.grid.shift) {
+            const item = self.coarseItem(query.class, placement.level, keyChunk(query.key));
+            self.coarse_inserts.items[item.cursor] = .{
+                .entity = entity,
+                .min_x = aabb.min_x,
+                .min_y = aabb.min_y,
+                .max_x = aabb.max_x,
+                .max_y = aabb.max_y,
+            };
+            item.cursor += 1;
+        }
+    }
+
+    fn finishInsertCursors(self: *const StaticColliderSystem) void {
+        for (self.chunk_items.items) |item| {
+            std.debug.assert(item.nav_cursor == item.nav_insert_at + item.nav_insert_count);
+            std.debug.assert(item.query_cursor == item.query_insert_at + item.query_insert_count);
+        }
+        for (self.coarse_items.items) |item| std.debug.assert(item.cursor == item.insert_at + item.insert_count);
+    }
+
+    fn chunkItem(self: *StaticColliderSystem, level: u16, chunk: u32) *ChunkItem {
+        const stamp = self.chunk_stamps.items[level][chunk];
+        std.debug.assert(stamp.generation == self.chunk_stamp_generation);
+        return &self.chunk_items.items[stamp.item];
+    }
+
+    fn coarseItem(self: *StaticColliderSystem, class: u6, level: u16, cell: u32) *CoarseItem {
+        const stamp = self.coarse_stamps[class].items[level][cell];
+        std.debug.assert(stamp.generation == self.coarse_stamp_generation);
+        return &self.coarse_items.items[stamp.item];
+    }
+
+    fn allocFreshPayloads(self: *StaticColliderSystem) !void {
+        for (self.chunk_items.items) |*item| {
+            const nav_cap = try geometric(@as(usize, item.old_nav) + item.nav_insert_count);
+            const query_cap = try geometric(@as(usize, item.old_query) + item.query_insert_count);
+            item.bytes = try allocPayload(self.allocator, chunkPayloadBytes(nav_cap, query_cap));
+            item.payload = splitChunk(item.bytes, nav_cap, query_cap);
+        }
+        for (self.coarse_items.items) |*item| {
+            const cap = try geometric(@as(usize, item.old_len) + item.insert_count);
+            item.bytes = try allocPayload(self.allocator, queryRunBytes(cap));
+            item.payload = splitQueryRun(item.bytes, cap);
+        }
+    }
+
+    fn claimFreshBlocks(self: *StaticColliderSystem) !void {
+        for (self.chunk_items.items) |*item| {
+            if (item.old_block != empty_block) continue;
+            if (item.nav_insert_count + item.query_insert_count == 0) continue;
+            const before = self.chunks.blocks.capacity;
+            item.block = try self.chunks.claim(self.allocator);
+            item.claimed_new = true;
+            if (self.chunks.blocks.capacity > before) self.countPayloadGrowth();
+        }
+        for (self.coarse_items.items) |*item| {
+            if (item.old_block != empty_block) continue;
+            if (item.insert_count == 0) continue;
+            const before = self.coarse[item.class].blocks.capacity;
+            item.block = try self.coarse[item.class].claim(self.allocator);
+            item.claimed_new = true;
+            if (self.coarse[item.class].blocks.capacity > before) self.countPayloadGrowth();
+        }
+    }
+
+    fn buildUnits(self: *StaticColliderSystem) void {
+        self.unit_starts.clearRetainingCapacity();
+        var units: usize = 0;
+        self.unit_starts.appendAssumeCapacity(units);
+        for (self.chunk_items.items) |item| {
+            units += @as(usize, item.old_nav) + item.nav_insert_count + item.old_query + item.query_insert_count + 1;
+            self.unit_starts.appendAssumeCapacity(units);
+        }
+        for (self.coarse_items.items) |item| {
+            units += @as(usize, item.old_len) + item.insert_count + 1;
+            self.unit_starts.appendAssumeCapacity(units);
+        }
+    }
+
+    fn fillChunkItem(self: *StaticColliderSystem, index: usize) void {
+        const item = &self.chunk_items.items[index];
+        const old = if (item.old_block == empty_block) StaticChunk{} else self.chunks.payload(item.old_block);
+        const nav = self.nav_inserts.items[item.nav_insert_at..][0..item.nav_insert_count];
+        const query = self.query_inserts.items[item.query_insert_at..][0..item.query_insert_count];
+        pdq(SpanInsert, nav, {}, spanLess);
+        pdq(AabbInsert, query, {}, aabbLess);
+        mergeNav(&item.payload, old, nav, self.relink_stamp.items, self.relink_generation);
+        mergeQuery(&item.payload, old, query, self.relink_stamp.items, self.relink_generation);
+        emitGroups(&item.payload);
+    }
+
+    fn fillCoarseItem(self: *StaticColliderSystem, index: usize) void {
+        const item = &self.coarse_items.items[index];
+        const old = if (item.old_block == empty_block) QueryRun{} else self.coarse[item.class].payload(item.old_block);
+        const inserts = self.coarse_inserts.items[item.insert_at..][0..item.insert_count];
+        pdq(AabbInsert, inserts, {}, entityLess);
+        mergeRun(&item.payload, old, inserts, self.relink_stamp.items, self.relink_generation);
+    }
+
+    fn installFresh(self: *StaticColliderSystem) void {
+        for (self.chunk_items.items) |*item| self.installChunk(item);
+        for (self.coarse_items.items) |*item| self.installCoarse(item);
+    }
+
+    fn installChunk(self: *StaticColliderSystem, item: *ChunkItem) void {
+        if (item.payload.nav_len == 0 and item.payload.query_len == 0) {
+            freePayload(self.allocator, item.bytes);
+            item.bytes = &.{};
+            if (item.old_block != empty_block) {
+                self.chunks.setSlot(item.level, item.slot, empty_block);
+                self.chunks.release(self.allocator, item.old_block);
+            }
+            if (item.claimed_new) self.chunks.release(self.allocator, item.block);
+            return;
+        }
+        if (item.old_block != empty_block) {
+            const old_bytes = self.chunks.blockBytes(item.old_block);
+            self.chunks.setPayload(item.old_block, item.bytes, item.payload);
+            freePayload(self.allocator, old_bytes);
+        } else {
+            self.chunks.setPayload(item.block, item.bytes, item.payload);
+            self.chunks.setSlot(item.level, item.slot, item.block);
+        }
+        item.bytes = &.{};
+    }
+
+    fn installCoarse(self: *StaticColliderSystem, item: *CoarseItem) void {
+        const dir = &self.coarse[item.class];
+        if (item.payload.len == 0) {
+            freePayload(self.allocator, item.bytes);
+            item.bytes = &.{};
+            if (item.old_block != empty_block) {
+                dir.setSlot(item.level, item.slot, empty_block);
+                dir.release(self.allocator, item.old_block);
+            }
+            if (item.claimed_new) dir.release(self.allocator, item.block);
+            return;
+        }
+        if (item.old_block != empty_block) {
+            const old_bytes = dir.blockBytes(item.old_block);
+            dir.setPayload(item.old_block, item.bytes, item.payload);
+            freePayload(self.allocator, old_bytes);
+        } else {
+            dir.setPayload(item.block, item.bytes, item.payload);
+            dir.setSlot(item.level, item.slot, item.block);
+        }
+        item.bytes = &.{};
+    }
+
+    fn applyRows(self: *StaticColliderSystem) void {
+        for (self.pending_dirty.items, self.sync_plan.items) |index, plan| {
             const entity = self.dirty_entity.items[index];
             const old_row = self.row_of_index.items[index];
             var change = ColliderChange{ .entity = entity, .old = null, .new = null };
-            // The old row's query class and key, read before `writeRow` replaces its columns.
-            var old_query: ?QueryPlacement = null;
-            if (old_row != no_row) {
-                change.old = self.rowPlacement(old_row);
-                old_query = self.queryPlacement(change.old.?, self.rowAabb(old_row));
+            if (old_row != no_row) change.old = self.rowPlacement(old_row);
+            if (plan.old_query) |old| {
+                const leaving = plan.next == null or plan.next.?.query_class != old.class;
+                if (leaving) {
+                    std.debug.assert(self.query_class_rows[old.class] > 0);
+                    self.query_class_rows[old.class] -= 1;
+                }
             }
-            if (planned) |next| {
+            if (plan.next) |next| {
                 const row = if (old_row != no_row) old_row else self.claimRow(index);
-                const new_rect = geometry.chunkRect(next.placement);
-                if (change.old) |old| {
-                    const old_rect = geometry.chunkRect(old);
-                    if (!new_rect.eql(old_rect)) {
-                        if (new_rect.level == old_rect.level) self.chunk_lists.unlinkOwnerOutside(row, new_rect) else self.chunk_lists.unlinkOwnerOutside(row, KeepNone{});
-                        self.stageRowChunks(row, entity.index, new_rect, old_rect);
-                    }
-                } else {
-                    self.stageRowChunks(row, entity.index, new_rect, null);
-                }
-                if (old_query == null or old_query.?.key != next.query_key) {
-                    if (old_query) |old| {
-                        self.query_lists.unlinkOwnerOutside(row, KeepNone{});
-                        self.query_class_rows[old.class] -= 1;
-                        if (old.class <= chunk_shift) appendAnchorEdit(&self.anchor_clears, old.key);
-                    }
-                    self.query_lists.stageInsert(row, next.query_key, entity.index);
-                    self.query_class_rows[next.query_class] += 1;
-                    if (next.query_class <= chunk_shift) appendAnchorEdit(&self.anchor_sets, next.query_key);
-                }
+                const entering = plan.old_query == null or plan.old_query.?.class != next.query_class;
+                if (entering) self.query_class_rows[next.query_class] += 1;
                 self.writeRow(row, entity, next.placement, next.aabb);
                 change.new = next.placement;
             } else if (old_row != no_row) {
-                self.chunk_lists.unlinkOwnerOutside(old_row, KeepNone{});
-                self.query_lists.unlinkOwnerOutside(old_row, KeepNone{});
-                self.query_class_rows[old_query.?.class] -= 1;
-                if (old_query.?.class <= chunk_shift) appendAnchorEdit(&self.anchor_clears, old_query.?.key);
                 std.debug.assert(self.row_free.items.len < self.row_free.capacity);
                 self.row_free.appendAssumeCapacity(old_row);
                 self.row_of_index.items[index] = no_row;
             }
             self.changes.appendAssumeCapacity(change);
         }
-        // Query lists first: the anchor edits read their emptiness, and run while the chunk
-        // tier still holds every key a block can sit on (its commit drops emptied keys).
-        const query_splice_batch = self.query_lists.commitBatch(self.spliceThreads(thread_system, &self.query_splice_tuner));
-        if (comptime runtime_perf_log.enabled) self.perf.last_query_splice_batch = query_splice_batch;
-        self.applyAnchorEdits();
-        self.last_splice_batch = self.chunk_lists.commitBatch(self.spliceThreads(thread_system, &self.splice_tuner));
         self.refreshQueryClassMask();
+    }
 
+    fn finishPending(self: *StaticColliderSystem) void {
         self.pending_dirty.clearRetainingCapacity();
         self.dirty_generation +%= 1;
         if (self.dirty_generation == 0) {
             @memset(self.dirty_stamp.items, 0);
             self.dirty_generation = 1;
         }
+        self.bumpStamps();
     }
 
-    // A splice stage's threading under `thread_system`, with its own `tuner`.
-    fn spliceThreads(self: *const StaticColliderSystem, thread_system: *ThreadSystem, tuner: *AdaptiveWorkTuner) Dispatch {
-        return Dispatch.init(thread_system, tuner, self.splice_controls);
+    fn clearItems(self: *StaticColliderSystem) void {
+        self.chunk_items.clearRetainingCapacity();
+        self.coarse_items.clearRetainingCapacity();
+        self.nav_inserts.clearRetainingCapacity();
+        self.query_inserts.clearRetainingCapacity();
+        self.coarse_inserts.clearRetainingCapacity();
+        self.unit_starts.clearRetainingCapacity();
+    }
+
+    fn discardFresh(self: *StaticColliderSystem) void {
+        for (self.chunk_items.items) |item| {
+            freePayload(self.allocator, item.bytes);
+            if (item.claimed_new) self.chunks.release(self.allocator, item.block);
+        }
+        for (self.coarse_items.items) |item| {
+            freePayload(self.allocator, item.bytes);
+            if (item.claimed_new) self.coarse[item.class].release(self.allocator, item.block);
+        }
+        self.clearItems();
+        self.bumpStamps();
+    }
+
+    fn bumpStamps(self: *StaticColliderSystem) void {
+        bumpSliceGeneration(&self.chunk_stamp_generation, self.chunk_stamps.items);
+        self.coarse_stamp_generation +%= 1;
+        if (self.coarse_stamp_generation == 0) {
+            for (&self.coarse_stamps) |stamps| for (stamps.items) |slice| @memset(slice, .{});
+            self.coarse_stamp_generation = 1;
+        }
+        self.relink_generation +%= 1;
+        if (self.relink_generation == 0) {
+            @memset(self.relink_stamp.items, 0);
+            self.relink_generation = 1;
+        }
+    }
+
+    fn ensureChunkLevel(self: *StaticColliderSystem, level: u16) !void {
+        const slot_count = self.geometry.?.grid.chunkCount();
+        const before = self.chunks.slotCount(level);
+        try self.chunks.openLevel(self.allocator, level, slot_count);
+        if (self.chunks.slotCount(level) != before) self.countPayloadGrowth();
+        try self.ensureStamps(&self.chunk_stamps, level, slot_count);
+    }
+
+    fn ensureCoarseLevel(self: *StaticColliderSystem, class: u6, level: u16) !void {
+        const geometry = self.geometry.?;
+        const count_u = geometry.classCellsX(class) * geometry.classCellsY(class);
+        if (count_u >= empty_block) return error.OutOfMemory;
+        const slot_count: usize = @intCast(count_u);
+        const before = self.coarse[class].slotCount(level);
+        try self.coarse[class].openLevel(self.allocator, level, slot_count);
+        if (self.coarse[class].slotCount(level) != before) self.countPayloadGrowth();
+        try self.ensureStamps(&self.coarse_stamps[class], level, slot_count);
+    }
+
+    fn ensureStamps(self: *StaticColliderSystem, lists: *std.ArrayList([]SlotStamp), level: u16, slot_count: usize) !void {
+        const index: usize = level;
+        if (lists.items.len <= index) {
+            try lists.ensureTotalCapacity(self.allocator, index + 1);
+            lists.appendNTimesAssumeCapacity(&.{}, index + 1 - lists.items.len);
+        }
+        if (lists.items[index].len == slot_count) return;
+        std.debug.assert(lists.items[index].len == 0);
+        const stamps = try self.allocator.alloc(SlotStamp, slot_count);
+        @memset(stamps, .{});
+        lists.items[index] = stamps;
+    }
+
+    fn freeStampList(self: *StaticColliderSystem, lists: *std.ArrayList([]SlotStamp)) void {
+        for (lists.items) |stamps| if (stamps.len != 0) self.allocator.free(stamps);
+        lists.deinit(self.allocator);
     }
 
     // `entity`'s placement when it is a live static navigation obstacle.
@@ -1074,21 +1470,328 @@ pub const StaticColliderSystem = struct {
         self.row_cell_max_x[row] = placement.cells.max_x;
         self.row_cell_max_y[row] = placement.cells.max_y;
     }
-
-    // Stages `row` into every chunk of `rect` outside `listed` (the chunks it already sits
-    // in on the same level, or null). O(1) per chunk of `rect`.
-    fn stageRowChunks(self: *StaticColliderSystem, row: u32, order: u32, rect: ChunkRect, listed: ?ChunkRect) void {
-        const skip = if (listed) |old| (if (old.level == rect.level) old else null) else null;
-        var chunk_y = rect.min_y;
-        while (chunk_y <= rect.max_y) : (chunk_y += 1) {
-            var chunk_x = rect.min_x;
-            while (chunk_x <= rect.max_x) : (chunk_x += 1) {
-                if (skip) |old| if (old.holds(chunk_x, chunk_y)) continue;
-                self.chunk_lists.stageInsert(row, chunkKey(rect.level, chunk_y * rect.chunks_x + chunk_x), order);
-            }
-        }
-    }
 };
+
+const PlanCounts = struct {
+    adds: usize = 0,
+    chunk_touches: usize = 0,
+    coarse_touches: usize = 0,
+    nav_inserts: usize = 0,
+    query_inserts: usize = 0,
+    coarse_inserts: usize = 0,
+};
+
+const SyncPlan = struct {
+    next: ?PlannedRow = null,
+    relink: bool = false,
+    old_rect: ?ChunkRect = null,
+    old_query: ?QueryPlacement = null,
+};
+
+const SlotStamp = struct { generation: u32 = 0, item: u32 = 0 };
+
+const SpanInsert = struct {
+    entity: u32,
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
+};
+
+const AabbInsert = struct {
+    entity: u32,
+    bit: u16 = 0,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+};
+
+const ChunkItem = struct {
+    level: u16,
+    slot: u32,
+    old_block: u32 = empty_block,
+    block: u32 = empty_block,
+    claimed_new: bool = false,
+    old_nav: u32 = 0,
+    old_query: u32 = 0,
+    nav_insert_at: u32 = 0,
+    nav_insert_count: u32 = 0,
+    nav_cursor: u32 = 0,
+    query_insert_at: u32 = 0,
+    query_insert_count: u32 = 0,
+    query_cursor: u32 = 0,
+    bytes: []align(4) u8 = &.{},
+    payload: StaticChunk = .{},
+};
+
+const CoarseItem = struct {
+    class: u6,
+    level: u16,
+    slot: u32,
+    old_block: u32 = empty_block,
+    block: u32 = empty_block,
+    claimed_new: bool = false,
+    old_len: u32 = 0,
+    insert_at: u32 = 0,
+    insert_count: u32 = 0,
+    cursor: u32 = 0,
+    bytes: []align(4) u8 = &.{},
+    payload: QueryRun = .{},
+};
+
+const RewriteJob = struct {
+    colliders: *StaticColliderSystem,
+    range_count: usize,
+    unit_starts: []const usize,
+    chunk_count: usize,
+};
+
+fn rewriteJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *RewriteJob = @ptrCast(@alignCast(context));
+    const colliders = job.colliders;
+    const item_count = colliders.chunk_items.items.len + colliders.coarse_items.items.len;
+    const starts = job.unit_starts[0..item_count];
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end and range.end <= job.unit_starts[item_count]);
+    var item = std.sort.lowerBound(usize, starts, range.start, orderUnit);
+    while (item < item_count and starts[item] < range.end) : (item += 1) {
+        if (item < job.chunk_count) colliders.fillChunkItem(item) else colliders.fillCoarseItem(item - job.chunk_count);
+    }
+}
+
+fn orderUnit(unit: usize, start: usize) std.math.Order {
+    return std.math.order(unit, start);
+}
+
+fn bumpSliceGeneration(generation: *u32, slices: []const []SlotStamp) void {
+    generation.* +%= 1;
+    if (generation.* != 0) return;
+    for (slices) |stamps| @memset(stamps, .{});
+    generation.* = 1;
+}
+
+fn aabbEql(a: math.Aabb, b: math.Aabb) bool {
+    return a.min_x == b.min_x and a.min_y == b.min_y and a.max_x == b.max_x and a.max_y == b.max_y;
+}
+
+fn spanLess(_: void, a: SpanInsert, b: SpanInsert) bool {
+    return a.entity < b.entity;
+}
+
+fn aabbLess(_: void, a: AabbInsert, b: AabbInsert) bool {
+    if (a.bit != b.bit) return a.bit < b.bit;
+    return a.entity < b.entity;
+}
+
+fn entityLess(_: void, a: AabbInsert, b: AabbInsert) bool {
+    return a.entity < b.entity;
+}
+
+fn isRelinked(stamps: []const u32, entity: u32, generation: u32) bool {
+    return entity < stamps.len and stamps[entity] == generation;
+}
+
+fn mergeNav(out: *StaticChunk, old: StaticChunk, inserts: []const SpanInsert, stamps: []const u32, generation: u32) void {
+    var old_index: usize = 0;
+    var new_index: usize = 0;
+    var write: usize = 0;
+    while (old_index < old.nav_len or new_index < inserts.len) {
+        while (old_index < old.nav_len and isRelinked(stamps, old.nav_entity[old_index], generation)) old_index += 1;
+        if (old_index >= old.nav_len and new_index >= inserts.len) break;
+        const take_insert = old_index >= old.nav_len or (new_index < inserts.len and inserts[new_index].entity < old.nav_entity[old_index]);
+        if (take_insert) {
+            const span = inserts[new_index];
+            out.nav_entity[write] = span.entity;
+            out.nav_min_x[write] = span.min_x;
+            out.nav_min_y[write] = span.min_y;
+            out.nav_max_x[write] = span.max_x;
+            out.nav_max_y[write] = span.max_y;
+            new_index += 1;
+        } else {
+            std.debug.assert(new_index >= inserts.len or inserts[new_index].entity != old.nav_entity[old_index]);
+            out.nav_entity[write] = old.nav_entity[old_index];
+            out.nav_min_x[write] = old.nav_min_x[old_index];
+            out.nav_min_y[write] = old.nav_min_y[old_index];
+            out.nav_max_x[write] = old.nav_max_x[old_index];
+            out.nav_max_y[write] = old.nav_max_y[old_index];
+            old_index += 1;
+        }
+        write += 1;
+    }
+    std.debug.assert(write <= out.nav_cap);
+    out.nav_len = @intCast(write);
+}
+
+fn mergeQuery(out: *StaticChunk, old: StaticChunk, inserts: []const AabbInsert, stamps: []const u32, generation: u32) void {
+    var old_index: usize = 0;
+    var new_index: usize = 0;
+    var write: usize = 0;
+    while (old_index < old.query_len or new_index < inserts.len) {
+        while (old_index < old.query_len and isRelinked(stamps, old.query_entity[old_index], generation)) old_index += 1;
+        if (old_index >= old.query_len and new_index >= inserts.len) break;
+        const take_insert = if (old_index >= old.query_len) true else if (new_index >= inserts.len) false else queryBefore(inserts[new_index], old.query_bit[old_index], old.query_entity[old_index]);
+        if (take_insert) {
+            writeAabb(out, write, inserts[new_index]);
+            new_index += 1;
+        } else {
+            if (new_index < inserts.len) std.debug.assert(!(inserts[new_index].bit == old.query_bit[old_index] and inserts[new_index].entity == old.query_entity[old_index]));
+            out.query_entity[write] = old.query_entity[old_index];
+            out.query_bit[write] = old.query_bit[old_index];
+            out.query_min_x[write] = old.query_min_x[old_index];
+            out.query_min_y[write] = old.query_min_y[old_index];
+            out.query_max_x[write] = old.query_max_x[old_index];
+            out.query_max_y[write] = old.query_max_y[old_index];
+            old_index += 1;
+        }
+        write += 1;
+    }
+    std.debug.assert(write <= out.query_cap);
+    out.query_len = @intCast(write);
+}
+
+fn queryBefore(insert: AabbInsert, bit: u16, entity: u32) bool {
+    return insert.bit < bit or (insert.bit == bit and insert.entity < entity);
+}
+
+fn writeAabb(out: *StaticChunk, write: usize, insert: AabbInsert) void {
+    out.query_entity[write] = insert.entity;
+    out.query_bit[write] = insert.bit;
+    out.query_min_x[write] = insert.min_x;
+    out.query_min_y[write] = insert.min_y;
+    out.query_max_x[write] = insert.max_x;
+    out.query_max_y[write] = insert.max_y;
+}
+
+fn mergeRun(out: *QueryRun, old: QueryRun, inserts: []const AabbInsert, stamps: []const u32, generation: u32) void {
+    var old_index: usize = 0;
+    var new_index: usize = 0;
+    var write: usize = 0;
+    while (old_index < old.len or new_index < inserts.len) {
+        while (old_index < old.len and isRelinked(stamps, old.entity[old_index], generation)) old_index += 1;
+        if (old_index >= old.len and new_index >= inserts.len) break;
+        const take_insert = old_index >= old.len or (new_index < inserts.len and inserts[new_index].entity < old.entity[old_index]);
+        if (take_insert) {
+            out.entity[write] = inserts[new_index].entity;
+            out.min_x[write] = inserts[new_index].min_x;
+            out.min_y[write] = inserts[new_index].min_y;
+            out.max_x[write] = inserts[new_index].max_x;
+            out.max_y[write] = inserts[new_index].max_y;
+            new_index += 1;
+        } else {
+            std.debug.assert(new_index >= inserts.len or inserts[new_index].entity != old.entity[old_index]);
+            out.entity[write] = old.entity[old_index];
+            out.min_x[write] = old.min_x[old_index];
+            out.min_y[write] = old.min_y[old_index];
+            out.max_x[write] = old.max_x[old_index];
+            out.max_y[write] = old.max_y[old_index];
+            old_index += 1;
+        }
+        write += 1;
+    }
+    std.debug.assert(write <= out.cap);
+    out.len = @intCast(write);
+}
+
+fn emitGroups(payload: *StaticChunk) void {
+    var anchors = empty_anchor_block;
+    var group_len: usize = 0;
+    var index: usize = 0;
+    const len: usize = payload.query_len;
+    while (index < len) {
+        const bit = payload.query_bit[index];
+        const start = index;
+        while (index < len and payload.query_bit[index] == bit) index += 1;
+        payload.groups[group_len] = .{ .bit = bit, .start = @intCast(start), .count = @intCast(index - start) };
+        const word = bit >> 6;
+        anchors.words[word] |= @as(u64, 1) << @intCast(bit & 63);
+        anchors.set_bits += 1;
+        group_len += 1;
+    }
+    payload.group_len = @intCast(group_len);
+    payload.anchors = anchors;
+}
+
+fn geometric(needed: usize) error{OutOfMemory}!u32 {
+    if (needed == 0) return 0;
+    if (needed >= empty_block) return error.OutOfMemory;
+    // `needed` is below 2^32, so the ceil log fits a usize shift.
+    const shift: u6 = @intCast(std.math.log2_int_ceil(usize, needed));
+    const cap = @as(usize, 1) << shift;
+    if (cap >= empty_block) return error.OutOfMemory;
+    return @intCast(cap);
+}
+
+fn allocPayload(allocator: std.mem.Allocator, size: usize) error{OutOfMemory}![]align(4) u8 {
+    if (size == 0) return &.{};
+    return try allocator.alignedAlloc(u8, .@"4", size);
+}
+
+fn freePayload(allocator: std.mem.Allocator, bytes: []align(4) u8) void {
+    if (bytes.len == 0) return;
+    allocator.free(bytes);
+}
+
+fn chunkPayloadBytes(nav_cap: u32, query_cap: u32) usize {
+    const nav: usize = nav_cap;
+    const query: usize = query_cap;
+    var offset: usize = 0;
+    offset = std.mem.alignForward(usize, offset, @alignOf(u32)) + nav * 5 * @sizeOf(u32);
+    offset = std.mem.alignForward(usize, offset, @alignOf(u32)) + query * @sizeOf(u32);
+    offset = std.mem.alignForward(usize, offset, @alignOf(u16)) + query * @sizeOf(u16);
+    offset = std.mem.alignForward(usize, offset, @alignOf(f32)) + query * 4 * @sizeOf(f32);
+    offset = std.mem.alignForward(usize, offset, @alignOf(QueryGroup)) + query * @sizeOf(QueryGroup);
+    return offset;
+}
+
+fn queryRunBytes(cap: u32) usize {
+    const count: usize = cap;
+    var offset: usize = 0;
+    offset = std.mem.alignForward(usize, offset, @alignOf(u32)) + count * @sizeOf(u32);
+    offset = std.mem.alignForward(usize, offset, @alignOf(f32)) + count * 4 * @sizeOf(f32);
+    return offset;
+}
+
+fn splitChunk(bytes: []align(4) u8, nav_cap: u32, query_cap: u32) StaticChunk {
+    var offset: usize = 0;
+    var payload = StaticChunk{ .nav_cap = nav_cap, .query_cap = query_cap };
+    payload.nav_entity = take(u32, bytes, &offset, nav_cap);
+    payload.nav_min_x = take(u32, bytes, &offset, nav_cap);
+    payload.nav_min_y = take(u32, bytes, &offset, nav_cap);
+    payload.nav_max_x = take(u32, bytes, &offset, nav_cap);
+    payload.nav_max_y = take(u32, bytes, &offset, nav_cap);
+    payload.query_entity = take(u32, bytes, &offset, query_cap);
+    payload.query_bit = take(u16, bytes, &offset, query_cap);
+    payload.query_min_x = take(f32, bytes, &offset, query_cap);
+    payload.query_min_y = take(f32, bytes, &offset, query_cap);
+    payload.query_max_x = take(f32, bytes, &offset, query_cap);
+    payload.query_max_y = take(f32, bytes, &offset, query_cap);
+    payload.groups = take(QueryGroup, bytes, &offset, query_cap);
+    std.debug.assert(offset <= bytes.len);
+    return payload;
+}
+
+fn splitQueryRun(bytes: []align(4) u8, cap: u32) QueryRun {
+    var offset: usize = 0;
+    return .{
+        .cap = cap,
+        .entity = take(u32, bytes, &offset, cap),
+        .min_x = take(f32, bytes, &offset, cap),
+        .min_y = take(f32, bytes, &offset, cap),
+        .max_x = take(f32, bytes, &offset, cap),
+        .max_y = take(f32, bytes, &offset, cap),
+    };
+}
+
+fn take(comptime T: type, bytes: []align(4) u8, offset: *usize, count: u32) []T {
+    if (count == 0) return &.{};
+    offset.* = std.mem.alignForward(usize, offset.*, @alignOf(T));
+    const start = offset.*;
+    const byte_len = @as(usize, count) * @sizeOf(T);
+    offset.* = start + byte_len;
+    const aligned: []align(@alignOf(T)) u8 = @alignCast((@as([*]u8, @ptrCast(bytes.ptr)) + start)[0..byte_len]);
+    return std.mem.bytesAsSlice(T, aligned);
+}
 
 // ----------------------------------------------------------------------------
 // Tests
@@ -1108,9 +1811,33 @@ fn placementOfIndex(colliders: *const StaticColliderSystem, index: u32) ?Placeme
     return colliders.rowPlacement(row);
 }
 
-// Entries held in the chunk lists.
+// Span records held on every opened chunk.
 fn listEntryCount(colliders: *const StaticColliderSystem) usize {
-    return colliders.chunk_lists.entries.len - colliders.chunk_lists.entry_free.items.len;
+    var total: usize = 0;
+    for (0..colliders.chunks.levelCount()) |level| {
+        for (0..colliders.chunks.slotCount(@intCast(level))) |chunk| {
+            const block = colliders.chunks.slot(@intCast(level), chunk);
+            if (block == empty_block) continue;
+            total += colliders.chunks.payload(block).nav_len;
+        }
+    }
+    return total;
+}
+
+fn occupiedChunkCount(colliders: *const StaticColliderSystem) usize {
+    var total: usize = 0;
+    for (0..colliders.chunks.levelCount()) |level| {
+        for (0..colliders.chunks.slotCount(@intCast(level))) |chunk| {
+            if (colliders.chunks.slot(@intCast(level), chunk) != empty_block) total += 1;
+        }
+    }
+    return total;
+}
+
+fn chunkPayloadOf(colliders: *const StaticColliderSystem, level: u16, chunk: u32) ?StaticChunk {
+    const block = colliders.chunks.slot(level, chunk);
+    if (block == empty_block) return null;
+    return colliders.chunks.payload(block);
 }
 
 fn staticTemplate(position: math.Vec2, size: math.Vec2) EntityTemplate {
@@ -1149,151 +1876,193 @@ fn levelChunkCount(geometry: ColliderGeometry) usize {
     return geometry.grid.chunkCount();
 }
 
-// A map's empty table slot (no valid key sets both tier bits).
-const test_empty_key: u64 = std.math.maxInt(u64);
-
-// Whether `a` and `b` hold identical rows, change lists, list entries (entry ids included)
-// of both tiers over `levels` levels, and anchor blocks (block ids included).
+// Whether `a` and `b` hold identical rows, change lists, and chunk bytes (block ids
+// included) over `levels` levels.
 fn expectIdenticalLayout(a: *const StaticColliderSystem, b: *const StaticColliderSystem, levels: u16) !void {
     try std.testing.expectEqualSlices(u32, a.row_of_index.items, b.row_of_index.items);
     try std.testing.expectEqual(a.changes.items.len, b.changes.items.len);
     for (a.changes.items, b.changes.items) |change_a, change_b| try std.testing.expectEqual(change_a, change_b);
     const chunk_count = levelChunkCount(a.geometry.?);
     for (0..levels) |level| for (0..chunk_count) |chunk| {
-        const key = chunkKey(@intCast(level), @intCast(chunk));
-        try expectSameEntries(&a.chunk_lists, &b.chunk_lists, key);
-        const block_a = a.chunk_lists.value(key);
-        try std.testing.expectEqual(block_a, b.chunk_lists.value(key));
-        if (block_a != no_value) try std.testing.expectEqual(a.anchor_blocks.items[block_a], b.anchor_blocks.items[block_a]);
+        const block_a = a.chunks.slot(@intCast(level), chunk);
+        try std.testing.expectEqual(block_a, b.chunks.slot(@intCast(level), chunk));
+        if (block_a != empty_block) try expectSameChunkBytes(a.chunks.payload(block_a), b.chunks.payload(block_a));
     };
-    try std.testing.expectEqual(a.query_lists.live_keys, b.query_lists.live_keys);
-    for (a.query_lists.slot_keys) |key| {
-        if (key != test_empty_key) try expectSameEntries(&a.query_lists, &b.query_lists, key);
+    for (0..max_query_classes) |class| {
+        const class_id: u6 = @intCast(class);
+        for (0..levels) |level| {
+            const slots = @max(a.coarse[class_id].slotCount(@intCast(level)), b.coarse[class_id].slotCount(@intCast(level)));
+            for (0..slots) |cell| {
+                const block_a = a.coarse[class_id].slot(@intCast(level), cell);
+                const block_b = b.coarse[class_id].slot(@intCast(level), cell);
+                try std.testing.expectEqual(block_a == empty_block, block_b == empty_block);
+                if (block_a == empty_block) continue;
+                try std.testing.expectEqual(block_a, block_b);
+                try expectSameRun(a.coarse[class_id].payload(block_a), b.coarse[class_id].payload(block_b));
+            }
+        }
     }
-    try std.testing.expectEqual(a.anchor_blocks.items.len, b.anchor_blocks.items.len);
-    try std.testing.expectEqualSlices(u32, a.anchor_free.items, b.anchor_free.items);
 }
 
-// Whether `key`'s list in `a` and `b` holds the same entries (ids included) and owners.
-fn expectSameEntries(a: *const ChunkListMap, b: *const ChunkListMap, key: u64) !void {
-    var entry_a = a.head(key);
-    var entry_b = b.head(key);
-    while (entry_a != no_entry or entry_b != no_entry) {
-        try std.testing.expectEqual(entry_a, entry_b);
-        try std.testing.expectEqual(a.entry_owner[entry_a], b.entry_owner[entry_b]);
-        entry_a = a.entry_next[entry_a];
-        entry_b = b.entry_next[entry_b];
-    }
+fn expectSameChunkBytes(a: StaticChunk, b: StaticChunk) !void {
+    try std.testing.expectEqual(a.nav_len, b.nav_len);
+    try std.testing.expectEqual(a.query_len, b.query_len);
+    try std.testing.expectEqual(a.group_len, b.group_len);
+    try std.testing.expectEqual(a.anchors, b.anchors);
+    const nav: usize = a.nav_len;
+    const query: usize = a.query_len;
+    const groups: usize = a.group_len;
+    try std.testing.expectEqualSlices(u32, a.nav_entity[0..nav], b.nav_entity[0..nav]);
+    try std.testing.expectEqualSlices(u32, a.nav_min_x[0..nav], b.nav_min_x[0..nav]);
+    try std.testing.expectEqualSlices(u32, a.nav_min_y[0..nav], b.nav_min_y[0..nav]);
+    try std.testing.expectEqualSlices(u32, a.nav_max_x[0..nav], b.nav_max_x[0..nav]);
+    try std.testing.expectEqualSlices(u32, a.nav_max_y[0..nav], b.nav_max_y[0..nav]);
+    try std.testing.expectEqualSlices(u32, a.query_entity[0..query], b.query_entity[0..query]);
+    try std.testing.expectEqualSlices(u16, a.query_bit[0..query], b.query_bit[0..query]);
+    try std.testing.expectEqualSlices(f32, a.query_min_x[0..query], b.query_min_x[0..query]);
+    try std.testing.expectEqualSlices(f32, a.query_min_y[0..query], b.query_min_y[0..query]);
+    try std.testing.expectEqualSlices(f32, a.query_max_x[0..query], b.query_max_x[0..query]);
+    try std.testing.expectEqualSlices(f32, a.query_max_y[0..query], b.query_max_y[0..query]);
+    try std.testing.expectEqualSlices(QueryGroup, a.groups[0..groups], b.groups[0..groups]);
+}
+
+fn expectSameRun(a: QueryRun, b: QueryRun) !void {
+    try std.testing.expectEqual(a.len, b.len);
+    const count: usize = a.len;
+    try std.testing.expectEqualSlices(u32, a.entity[0..count], b.entity[0..count]);
+    try std.testing.expectEqualSlices(f32, a.min_x[0..count], b.min_x[0..count]);
+    try std.testing.expectEqualSlices(f32, a.min_y[0..count], b.min_y[0..count]);
+    try std.testing.expectEqualSlices(f32, a.max_x[0..count], b.max_x[0..count]);
+    try std.testing.expectEqualSlices(f32, a.max_y[0..count], b.max_y[0..count]);
 }
 
 // Rows listed at (level, chunk), as entity indices in list order.
 fn listedIndices(colliders: *const StaticColliderSystem, level: u16, chunk: u32, out: *std.ArrayList(u32)) !void {
     out.clearRetainingCapacity();
-    var rows = colliders.view().chunkRows(level, chunk);
-    while (rows.next()) |row| try out.append(std.testing.allocator, colliders.row_entity[row].index);
+    const spans = colliders.view().chunkRows(level, chunk);
+    try out.appendSlice(std.testing.allocator, spans.entity);
 }
 
-// The query tier holds each live row once, at its class and anchor cell, every list
-// ascending in entity index; the class counts and mask equal a recount.
+// The query runs hold each live row once, at its class and anchor cell, every run
+// ascending in (bit, entity); the class counts and mask equal a recount. A chunk's anchor
+// words are exactly the bits of its query groups.
 fn expectQueryTier(colliders: *const StaticColliderSystem) !void {
-    const lists = &colliders.query_lists;
+    const geometry = colliders.geometry.?;
+    const shift = geometry.grid.shift;
+    var seen = try std.DynamicBitSet.initEmpty(std.testing.allocator, colliders.rows.len);
+    defer seen.deinit();
     var class_rows: [max_query_classes]u32 = @splat(0);
+    for (0..colliders.chunks.levelCount()) |level| {
+        for (0..colliders.chunks.slotCount(@intCast(level))) |chunk| {
+            const payload = chunkPayloadOf(colliders, @intCast(level), @intCast(chunk)) orelse continue;
+            try expectGroupsMatchAnchors(payload);
+            var previous_bit: ?u16 = null;
+            var previous_entity: ?u32 = null;
+            for (0..payload.query_len) |index| {
+                const bit = payload.query_bit[index];
+                const entity = payload.query_entity[index];
+                if (previous_bit) |before| {
+                    try std.testing.expect(bit > before or (bit == before and entity > previous_entity.?));
+                }
+                previous_bit = bit;
+                previous_entity = entity;
+                try markQueryRow(colliders, &seen, &class_rows, entity, @intCast(level), @intCast(chunk), bit);
+            }
+        }
+    }
+    for (0..max_query_classes) |class| {
+        const class_id: u6 = @intCast(class);
+        if (class_id <= shift) continue;
+        const dir = &colliders.coarse[class_id];
+        for (0..dir.levelCount()) |level| {
+            for (0..dir.slotCount(@intCast(level))) |cell| {
+                const block = dir.slot(@intCast(level), cell);
+                if (block == empty_block) continue;
+                const run = dir.payload(block);
+                var previous: ?u32 = null;
+                for (0..run.len) |index| {
+                    const entity = run.entity[index];
+                    if (previous) |before| try std.testing.expect(before < entity);
+                    previous = entity;
+                    try markQueryRow(colliders, &seen, &class_rows, entity, @intCast(level), @intCast(cell), null);
+                }
+            }
+        }
+    }
     for (colliders.row_of_index.items) |row| {
         if (row == no_row) continue;
-        const query = colliders.queryPlacement(colliders.rowPlacement(row), colliders.rowAabb(row));
-        class_rows[query.class] += 1;
-        const entry = lists.owner_heads.items[row];
-        try std.testing.expect(entry != no_entry);
-        try std.testing.expectEqual(no_entry, lists.entry_owner_next[entry]);
-        try std.testing.expectEqual(query.key, lists.entry_key[entry]);
+        try std.testing.expect(seen.isSet(row));
     }
     try std.testing.expectEqualSlices(u32, &class_rows, &colliders.query_class_rows);
     for (class_rows, 0..) |rows, class| try std.testing.expectEqual(rows != 0, colliders.query_class_mask.isSet(class));
-    var entries: usize = 0;
-    for (lists.slot_keys, lists.slot_heads) |key, head| {
-        if (key == test_empty_key) continue;
-        try std.testing.expect(head != no_entry);
-        var previous: ?u32 = null;
-        var entry = head;
-        while (entry != no_entry) : (entry = lists.entry_next[entry]) {
-            const index = colliders.row_entity[lists.entry_owner[entry]].index;
-            if (previous) |before| try std.testing.expect(before < index);
-            previous = index;
-            entries += 1;
-        }
-    }
-    try std.testing.expectEqual(static_colliders_test_support.liveRowCount(colliders), entries);
+    try std.testing.expectEqual(static_colliders_test_support.liveRowCount(colliders), seen.count());
 }
 
-const AnchorWords = [anchor_block_words]u64;
-
-// The anchor bits the present query keys of classes no larger than a chunk imply, per
-// chunk-tier key.
-fn expectedAnchors(colliders: *const StaticColliderSystem) !std.AutoHashMap(u64, AnchorWords) {
+fn markQueryRow(colliders: *const StaticColliderSystem, seen: *std.DynamicBitSet, class_rows: *[max_query_classes]u32, entity: u32, level: u16, slot: u32, bit: ?u16) !void {
+    try std.testing.expect(entity < colliders.row_of_index.items.len);
+    const row = colliders.row_of_index.items[entity];
+    try std.testing.expect(row != no_row and !seen.isSet(row));
+    seen.set(row);
+    const query = colliders.queryPlacement(colliders.rowPlacement(row), colliders.rowAabb(row));
+    class_rows[query.class] += 1;
     const geometry = colliders.geometry.?;
-    var expected = std.AutoHashMap(u64, AnchorWords).init(std.testing.allocator);
-    errdefer expected.deinit();
-    for (colliders.query_lists.slot_keys) |key| {
-        if (key == test_empty_key) continue;
-        const class: u6 = @intCast((key >> 48) & 0x3f);
-        if (class > geometry.grid.shift) continue;
-        const anchor = geometry.anchorBit(key);
-        const words = try expected.getOrPut(anchor.chunk_key);
-        if (!words.found_existing) words.value_ptr.* = @splat(0);
-        words.value_ptr[anchor.bit >> 6] |= @as(u64, 1) << @intCast(anchor.bit & 63);
+    if (query.class <= geometry.grid.shift) {
+        const anchor = geometry.anchorBit(query.key);
+        try std.testing.expectEqual(level, keyLevel(anchor.chunk_key));
+        try std.testing.expectEqual(slot, keyChunk(anchor.chunk_key));
+        try std.testing.expectEqual(bit.?, @as(u16, @intCast(anchor.bit)));
+    } else {
+        try std.testing.expect(bit == null);
+        try std.testing.expectEqual(level, queryKeyLevel(query.key));
+        try std.testing.expectEqual(slot, keyChunk(query.key));
     }
-    return expected;
 }
 
-// I1: a chunk-tier key holds a block exactly when a fine-class query key sits in its
-// chunk, with exactly those bits and their count; every pooled block is live once or free
-// and all-zero.
+fn expectGroupsMatchAnchors(payload: StaticChunk) !void {
+    var anchors = empty_anchor_block;
+    var covered: usize = 0;
+    var previous: ?u16 = null;
+    for (payload.groups[0..payload.group_len]) |group| {
+        if (previous) |before| try std.testing.expect(group.bit > before);
+        previous = group.bit;
+        try std.testing.expectEqual(covered, group.start);
+        covered += group.count;
+        anchors.words[group.bit >> 6] |= @as(u64, 1) << @intCast(group.bit & 63);
+        anchors.set_bits += 1;
+    }
+    try std.testing.expectEqual(payload.query_len, covered);
+    try std.testing.expectEqual(anchors, payload.anchors);
+}
+
+// A chunk's anchor words equal its query groups, and every pooled block is installed or free.
 fn expectAnchors(colliders: *const StaticColliderSystem) !void {
-    var expected = try expectedAnchors(colliders);
-    defer expected.deinit();
-    const blocks = colliders.anchor_blocks.items;
-    var seen = try std.DynamicBitSet.initEmpty(std.testing.allocator, blocks.len);
+    var seen = try std.DynamicBitSet.initEmpty(std.testing.allocator, colliders.chunks.blocks.items.len);
     defer seen.deinit();
-    var live_blocks: usize = 0;
-    for (colliders.chunk_lists.slot_keys, colliders.chunk_lists.slot_values) |key, block_id| {
-        if (key == test_empty_key) continue;
-        const words = expected.get(key) orelse {
-            try std.testing.expectEqual(no_value, block_id);
-            continue;
-        };
-        try std.testing.expect(block_id < blocks.len and !seen.isSet(block_id));
-        seen.set(block_id);
-        try std.testing.expectEqualSlices(u64, &words, &blocks[block_id].words);
-        var bits: usize = 0;
-        for (words) |word| bits += @popCount(word);
-        try std.testing.expectEqual(bits, blocks[block_id].set_bits);
-        live_blocks += 1;
-    }
-    // Every anchored chunk has its chunk-tier key.
-    try std.testing.expectEqual(expected.count(), live_blocks);
-    for (colliders.anchor_free.items) |block_id| {
-        try std.testing.expect(block_id < blocks.len and !seen.isSet(block_id));
-        seen.set(block_id);
-        try std.testing.expectEqual(empty_anchor_block, blocks[block_id]);
-    }
-    try std.testing.expectEqual(blocks.len, live_blocks + colliders.anchor_free.items.len);
-}
-
-// Whether `a` and `b` hold the same anchor bits per chunk (block ids may differ).
-fn expectSameAnchors(a: *const StaticColliderSystem, b: *const StaticColliderSystem) !void {
-    var valued: [2]usize = .{ 0, 0 };
-    for ([_]*const StaticColliderSystem{ a, b }, &valued) |colliders, *count| {
-        for (colliders.chunk_lists.slot_keys, colliders.chunk_lists.slot_values) |key, block_id| {
-            if (key != test_empty_key and block_id != no_value) count.* += 1;
+    for (0..colliders.chunks.levelCount()) |level| {
+        for (0..colliders.chunks.slotCount(@intCast(level))) |chunk| {
+            const block = colliders.chunks.slot(@intCast(level), chunk);
+            if (block == empty_block) continue;
+            try std.testing.expect(block < colliders.chunks.blocks.items.len and !seen.isSet(block));
+            seen.set(block);
+            try expectGroupsMatchAnchors(colliders.chunks.payload(block));
         }
     }
-    try std.testing.expectEqual(valued[0], valued[1]);
-    for (a.chunk_lists.slot_keys, a.chunk_lists.slot_values) |key, block_a| {
-        if (key == test_empty_key or block_a == no_value) continue;
-        const block_b = b.chunk_lists.value(key);
-        try std.testing.expect(block_b != no_value);
-        try std.testing.expectEqual(a.anchor_blocks.items[block_a], b.anchor_blocks.items[block_b]);
+    for (colliders.chunks.block_free.items) |block| {
+        try std.testing.expect(block < colliders.chunks.blocks.items.len and !seen.isSet(block));
+        seen.set(block);
+        try std.testing.expectEqual(@as(usize, 0), colliders.chunks.blockBytes(block).len);
     }
+    try std.testing.expectEqual(colliders.chunks.blocks.items.len, seen.count());
+}
+
+// Whether `a` and `b` hold the same anchor words per chunk over `levels` (block ids may differ).
+fn expectSameAnchors(a: *const StaticColliderSystem, b: *const StaticColliderSystem, levels: u16) !void {
+    const chunk_count = levelChunkCount(a.geometry.?);
+    for (0..levels) |level| for (0..chunk_count) |chunk| {
+        const anchors_a = if (chunkPayloadOf(a, @intCast(level), @intCast(chunk))) |payload| payload.anchors else empty_anchor_block;
+        const anchors_b = if (chunkPayloadOf(b, @intCast(level), @intCast(chunk))) |payload| payload.anchors else empty_anchor_block;
+        try std.testing.expectEqual(anchors_a, anchors_b);
+    };
 }
 
 // Whether `a` and `b` hold the same rows, the same lists over `levels` levels, the same
@@ -1319,18 +2088,48 @@ fn expectSameRows(a: *const StaticColliderSystem, b: *const StaticColliderSystem
         try expectQueryTier(colliders);
         try expectAnchors(colliders);
     }
-    try std.testing.expectEqual(a.query_lists.live_keys, b.query_lists.live_keys);
-    for (a.query_lists.slot_keys) |key| {
-        if (key == test_empty_key) continue;
-        var owners_a = a.query_lists.iterator(key);
-        var owners_b = b.query_lists.iterator(key);
-        while (owners_a.next()) |row_a| {
-            const row_b = owners_b.next() orelse return error.TestExpectedEqual;
-            try std.testing.expectEqual(a.row_entity[row_a].index, b.row_entity[row_b].index);
+    try expectSameQueries(a, b, levels);
+    try expectSameAnchors(a, b, levels);
+}
+
+fn expectSameQueries(a: *const StaticColliderSystem, b: *const StaticColliderSystem, levels: u16) !void {
+    const chunk_count = levelChunkCount(a.geometry.?);
+    for (0..levels) |level| for (0..chunk_count) |chunk| {
+        const payload_a = chunkPayloadOf(a, @intCast(level), @intCast(chunk));
+        const payload_b = chunkPayloadOf(b, @intCast(level), @intCast(chunk));
+        const query_a: usize = if (payload_a) |payload| payload.query_len else 0;
+        const query_b: usize = if (payload_b) |payload| payload.query_len else 0;
+        try std.testing.expectEqual(query_a, query_b);
+        if (query_a == 0) continue;
+        try std.testing.expectEqualSlices(u32, payload_a.?.query_entity[0..query_a], payload_b.?.query_entity[0..query_b]);
+        try std.testing.expectEqualSlices(f32, payload_a.?.query_min_x[0..query_a], payload_b.?.query_min_x[0..query_b]);
+        try std.testing.expectEqualSlices(f32, payload_a.?.query_min_y[0..query_a], payload_b.?.query_min_y[0..query_b]);
+        try std.testing.expectEqualSlices(f32, payload_a.?.query_max_x[0..query_a], payload_b.?.query_max_x[0..query_b]);
+        try std.testing.expectEqualSlices(f32, payload_a.?.query_max_y[0..query_a], payload_b.?.query_max_y[0..query_b]);
+    };
+    const shift = a.geometry.?.grid.shift;
+    for (0..max_query_classes) |class| {
+        const class_id: u6 = @intCast(class);
+        if (class_id <= shift) continue;
+        for (0..levels) |level| {
+            const slots = @max(a.coarse[class_id].slotCount(@intCast(level)), b.coarse[class_id].slotCount(@intCast(level)));
+            for (0..slots) |cell| {
+                const block_a = a.coarse[class_id].slot(@intCast(level), cell);
+                const block_b = b.coarse[class_id].slot(@intCast(level), cell);
+                const len_a: usize = if (block_a == empty_block) 0 else a.coarse[class_id].payload(block_a).len;
+                const len_b: usize = if (block_b == empty_block) 0 else b.coarse[class_id].payload(block_b).len;
+                try std.testing.expectEqual(len_a, len_b);
+                if (len_a == 0) continue;
+                const run_a = a.coarse[class_id].payload(block_a);
+                const run_b = b.coarse[class_id].payload(block_b);
+                try std.testing.expectEqualSlices(u32, run_a.entity[0..len_a], run_b.entity[0..len_b]);
+                try std.testing.expectEqualSlices(f32, run_a.min_x[0..len_a], run_b.min_x[0..len_b]);
+                try std.testing.expectEqualSlices(f32, run_a.min_y[0..len_a], run_b.min_y[0..len_b]);
+                try std.testing.expectEqualSlices(f32, run_a.max_x[0..len_a], run_b.max_x[0..len_b]);
+                try std.testing.expectEqualSlices(f32, run_a.max_y[0..len_a], run_b.max_y[0..len_b]);
+            }
         }
-        try std.testing.expect(owners_b.next() == null);
     }
-    try expectSameAnchors(a, b);
 }
 
 const SeamFixture = struct {
@@ -1412,7 +2211,7 @@ test "destroying a template-created static frees every footprint entry" {
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .destroy_entity = entity }});
     try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(fixture.colliders));
     try std.testing.expectEqual(@as(usize, 0), listEntryCount(&fixture.colliders));
-    try std.testing.expectEqual(@as(usize, 0), fixture.colliders.chunk_lists.live_keys);
+    try std.testing.expectEqual(@as(usize, 0), occupiedChunkCount(&fixture.colliders));
     const change = fixture.colliders.changesThisStep()[0];
     try std.testing.expect(change.old != null and change.new == null);
 }
@@ -1534,20 +2333,16 @@ fn expectSyncOutOfMemorySafe(thread_system: *ThreadSystem) !void {
         _ = try fixture.frame.applyStructuralCommands(&fixture.data);
         fixture.colliders.capture(&fixture.frame);
 
-        const blocks_before = fixture.colliders.anchor_blocks.items.len;
+        const blocks_before = fixture.colliders.chunks.blocks.items.len;
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
         fixture.colliders.allocator = failing.allocator();
-        fixture.colliders.chunk_lists.allocator = failing.allocator();
-        fixture.colliders.query_lists.allocator = failing.allocator();
         const result = fixture.colliders.sync(&fixture.data, thread_system);
         fixture.colliders.allocator = std.testing.allocator;
-        fixture.colliders.chunk_lists.allocator = std.testing.allocator;
-        fixture.colliders.query_lists.allocator = std.testing.allocator;
         if (result) |_| {
             try std.testing.expect(!failing.has_induced_failure);
             if (thread_system.workerThreadCount() != 0) try std.testing.expect(!fixture.colliders.last_splice_batch.ran_inline);
-            // The swept sync grew the anchor-block pool.
-            try std.testing.expect(fixture.colliders.anchor_blocks.items.len > blocks_before);
+            // The swept sync grew the block pool.
+            try std.testing.expect(fixture.colliders.chunks.blocks.items.len > blocks_before);
             var after = try fixture.rebuilt();
             defer after.deinit();
             try expectSameRows(&fixture.colliders, &after, 1);
@@ -1576,18 +2371,19 @@ test "sync after reserve allocates nothing (FailingAllocator)" {
     // A static alone in its chunk, destroyed by the measured commit.
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 40, .y = 1000 }, .{ .x = 8, .y = 8 }) }});
     const kept = fixture.colliders.changesThisStep()[0].entity;
-    const kept_chunk = chunkKey(0, 7 * test_geometry.grid.chunks_x);
-    // Warm: create, then destroy, so rows, lists, anchor blocks, and the change list hold
+    const kept_chunk: u32 = 7 * test_geometry.grid.chunks_x;
+    // Warm: create, then destroy, so rows, the block pool, and the change list hold
     // their high-water.
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &templates);
     var destroys: [16]StructuralCommand = undefined;
     for (fixture.colliders.changesThisStep(), &destroys) |change, *command| command.* = .{ .destroy_entity = change.entity };
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &destroys);
-    try std.testing.expect(fixture.colliders.chunk_lists.value(kept_chunk) != no_value);
+    try std.testing.expect(fixture.colliders.chunks.slot(0, kept_chunk) != empty_block);
 
     // The seam's reserve runs with the real allocator before the commit, as the pipeline
-    // does; the commit reuses the freed slots, and capture and sync allocate nothing while
-    // claiming blocks for the new chunks and releasing the destroyed static's.
+    // does. Fresh payloads allocate inside the sync's reserve; the fill after that
+    // allocates nothing while claiming blocks for the new chunks and releasing the
+    // destroyed static's.
     var commands: [17]StructuralCommand = undefined;
     @memcpy(commands[0..16], &templates);
     commands[16] = .{ .destroy_entity = kept };
@@ -1601,20 +2397,19 @@ test "sync after reserve allocates nothing (FailingAllocator)" {
     writer.finish();
     fixture.frame.structural_commands.finishWrite();
     _ = try fixture.frame.applyStructuralCommands(&fixture.data);
+    fixture.colliders.capture(&fixture.frame);
+    try fixture.colliders.reserveSync(&fixture.data);
     {
-        fixture.colliders.allocator = std.testing.failing_allocator;
-        fixture.colliders.chunk_lists.allocator = std.testing.failing_allocator;
-        fixture.colliders.query_lists.allocator = std.testing.failing_allocator;
-        defer {
-            fixture.colliders.allocator = std.testing.allocator;
-            fixture.colliders.chunk_lists.allocator = std.testing.allocator;
-            fixture.colliders.query_lists.allocator = std.testing.allocator;
-        }
-        fixture.colliders.capture(&fixture.frame);
-        try fixture.colliders.sync(&fixture.data, &serial_threads);
+        // Frees of the payloads the reserve just allocated still belong to the testing
+        // allocator. Any new allocation fails.
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        fixture.colliders.allocator = failing.allocator();
+        defer fixture.colliders.allocator = std.testing.allocator;
+        fixture.colliders.applySync(&serial_threads);
+        try std.testing.expect(!failing.has_induced_failure);
     }
     try std.testing.expectEqual(@as(usize, 16), static_colliders_test_support.liveRowCount(fixture.colliders));
-    try std.testing.expectEqual(no_value, fixture.colliders.chunk_lists.value(kept_chunk));
+    try std.testing.expectEqual(empty_block, fixture.colliders.chunks.slot(0, kept_chunk));
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
@@ -1735,12 +2530,10 @@ test "a splice worker cap of zero keeps the chunk splice inline on a multi-worke
 // Every growth counter's once-only log flag is set.
 fn expectGrowthsLogged(colliders: *const StaticColliderSystem) !void {
     try std.testing.expect(colliders.row_growth_logged);
-    try std.testing.expect(colliders.chunk_lists.growth_logged);
-    try std.testing.expect(colliders.query_lists.growth_logged);
-    try std.testing.expect(colliders.anchor_growth_logged);
+    try std.testing.expect(colliders.payload_growth_logged);
 }
 
-test "a rebuild keeps the row, chunk-list, query-list, and anchor-block growth logs' flags" {
+test "a rebuild keeps the row and payload growth logs' flags" {
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
     var prng = std.Random.DefaultPrng.init(0x9e0);
@@ -1750,8 +2543,6 @@ test "a rebuild keeps the row, chunk-list, query-list, and anchor-block growth l
     for (0..60) |_| try commands.append(std.testing.allocator, randomStatic(random));
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, commands.items);
     try expectGrowthsLogged(&fixture.colliders);
-    // The two list tiers log under distinct names.
-    try std.testing.expect(!std.mem.eql(u8, fixture.colliders.chunk_lists.name, fixture.colliders.query_lists.name));
 
     // A rebuild of the same statics keeps the logged flags.
     try fixture.colliders.rebuild(&fixture.data, test_geometry);
@@ -1765,22 +2556,20 @@ test "a rebuild keeps the row, chunk-list, query-list, and anchor-block growth l
     try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(fixture.colliders));
 }
 
-test "a move inside its footprint chunks touches no list" {
+test "a move inside its footprint chunks rewrites those spans and no other chunk" {
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
-    // A 3-chunk-wide static, then a move that keeps its chunk rect.
+    // A 3-chunk-wide static, then a move that keeps its chunk rect but changes the cells.
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 140, .y = 140 }, .{ .x = 300, .y = 20 }) }});
     const entity = fixture.colliders.changesThisStep()[0].entity;
-    var heads_before: [16 * 16]u32 = undefined;
-    for (&heads_before, 0..) |*head, chunk| head.* = fixture.colliders.chunk_lists.head(chunkKey(0, @intCast(chunk)));
     const live_before = listEntryCount(&fixture.colliders);
     const position = math.Vec2{ .x = 150, .y = 150 };
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .set_movement_body = .{ .entity = entity, .body = .{ .position = position, .previous_position = position } } }});
     const change = fixture.colliders.changesThisStep()[0];
     try std.testing.expect(!std.meta.eql(change.old.?.cells, change.new.?.cells));
-    try std.testing.expectEqual(@as(usize, 0), fixture.colliders.last_splice_batch.item_count);
+    try std.testing.expect(fixture.colliders.last_splice_batch.item_count > 0);
     try std.testing.expectEqual(live_before, listEntryCount(&fixture.colliders));
-    for (heads_before, 0..) |head, chunk| try std.testing.expectEqual(head, fixture.colliders.chunk_lists.head(chunkKey(0, @intCast(chunk))));
+    try std.testing.expect(chunkPayloadOf(&fixture.colliders, 0, 15 * 16 + 15) == null);
     try std.testing.expectEqual(change.new.?, placementOfIndex(&fixture.colliders, entity.index).?);
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
@@ -1837,23 +2626,17 @@ test "a threaded sync after its reserves allocates nothing on a multi-worker Thr
         writer.finish();
         fixture.frame.structural_commands.finishWrite();
         _ = try fixture.frame.applyStructuralCommands(&fixture.data);
-        fixture.colliders.allocator = std.testing.failing_allocator;
-        fixture.colliders.chunk_lists.allocator = std.testing.failing_allocator;
-        fixture.colliders.query_lists.allocator = std.testing.failing_allocator;
-        defer {
-            fixture.colliders.allocator = std.testing.allocator;
-            fixture.colliders.chunk_lists.allocator = std.testing.allocator;
-            fixture.colliders.query_lists.allocator = std.testing.allocator;
-        }
         fixture.colliders.capture(&fixture.frame);
-        try fixture.colliders.sync(&fixture.data, &threads);
+        try fixture.colliders.reserveSync(&fixture.data);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        fixture.colliders.allocator = failing.allocator();
+        defer fixture.colliders.allocator = std.testing.allocator;
+        fixture.colliders.applySync(&threads);
+        try std.testing.expect(!failing.has_induced_failure);
         try std.testing.expect(!fixture.colliders.last_splice_batch.ran_inline and fixture.colliders.last_splice_batch.range_count > 1);
-        // Every static's anchor moved: 48 sets and 48 clears ran.
-        try std.testing.expectEqual(@as(usize, 48), fixture.colliders.anchor_sets.items.len);
-        try std.testing.expectEqual(@as(usize, 48), fixture.colliders.anchor_clears.items.len);
     }
     try std.testing.expectEqual(@as(usize, 48), static_colliders_test_support.liveRowCount(fixture.colliders));
-    try std.testing.expect(fixture.colliders.anchor_blocks.items.len != 0);
+    try std.testing.expect(fixture.colliders.chunks.blocks.items.len != 0);
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
@@ -2251,27 +3034,34 @@ test "a row whose extent equals its class edge is reached from a box touching it
     }
 }
 
-test "a move across a tile inside its chunks touches only the query tier" {
+test "a move across a tile inside its chunk rewrites that chunk's query bit" {
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
     // A one-tile static in chunk 0, moved one tile over inside the chunk, then inside its
     // tile.
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 40, .y = 40 }, .{ .x = 8, .y = 8 }) }});
     const entity = fixture.colliders.changesThisStep()[0].entity;
-    const block = fixture.colliders.chunk_lists.value(chunkKey(0, 0));
-    try std.testing.expect(block != no_value);
-    const heads_before = fixture.colliders.chunk_lists.head(chunkKey(0, 0));
+    const block = fixture.colliders.chunks.slot(0, 0);
+    try std.testing.expect(block != empty_block);
+    const bits_before = fixture.colliders.chunks.payload(block).anchors;
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(entity, .{ .x = 72, .y = 40 })});
-    try std.testing.expectEqual(@as(usize, 0), fixture.colliders.last_splice_batch.item_count);
-    try std.testing.expectEqual(heads_before, fixture.colliders.chunk_lists.head(chunkKey(0, 0)));
-    // The chunk keeps its block, the bit moved one cell over.
-    try std.testing.expectEqual(block, fixture.colliders.chunk_lists.value(chunkKey(0, 0)));
-    try std.testing.expectEqual(@as(u16, 1), fixture.colliders.anchor_blocks.items[block].set_bits);
+    try std.testing.expect(fixture.colliders.last_splice_batch.item_count > 0);
+    // The chunk keeps its block; the anchor bit moved one cell over.
+    try std.testing.expectEqual(block, fixture.colliders.chunks.slot(0, 0));
+    const bits_after = fixture.colliders.chunks.payload(block).anchors;
+    try std.testing.expectEqual(@as(u16, 1), bits_after.set_bits);
+    try std.testing.expect(!std.meta.eql(bits_before, bits_after));
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
+    const cells_before = fixture.colliders.view().chunkRows(0, 0);
+    const nav_before = cells_before.min_x[0];
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(entity, .{ .x = 73, .y = 41 })});
-    try std.testing.expectEqual(@as(usize, 0), fixture.colliders.last_splice_batch.item_count);
+    try std.testing.expect(fixture.colliders.last_splice_batch.item_count > 0);
+    try std.testing.expectEqual(nav_before, fixture.colliders.view().chunkRows(0, 0).min_x[0]);
+    var rebuilt_again = try fixture.rebuilt();
+    defer rebuilt_again.deinit();
+    try expectSameRows(&fixture.colliders, &rebuilt_again, 1);
 }
 
 test "the class mask clears when its last row leaves the class" {
@@ -2357,12 +3147,12 @@ test "anchor blocks equal a rebuild after random incremental syncs, serial and t
     try Step.run(&serial, &threaded, &threads, &.{ moveCommand(a, .{ .x = 200, .y = 40 }), moveCommand(c, .{ .x = 520, .y = 40 }) });
     // a leaves tile (6, 1) and b enters it in one sync.
     try Step.run(&serial, &threaded, &threads, &.{ moveCommand(a, .{ .x = 230, .y = 100 }), moveCommand(b, .{ .x = 200, .y = 40 }) });
-    // d's chunk empties: its block is released and its value cleared.
-    const d_chunk = chunkKey(0, 2 * test_geometry.grid.chunks_x + 2);
-    try std.testing.expect(serial.colliders.chunk_lists.value(d_chunk) != no_value);
+    // d's chunk empties: its block is released and its slot cleared.
+    const d_chunk: u32 = 2 * test_geometry.grid.chunks_x + 2;
+    try std.testing.expect(serial.colliders.chunks.slot(0, d_chunk) != empty_block);
     try Step.run(&serial, &threaded, &threads, &.{.{ .set_world_level = .{ .entity = d, .level = 2 } }});
-    try std.testing.expectEqual(no_value, serial.colliders.chunk_lists.value(d_chunk));
-    try std.testing.expectEqual(no_entry, serial.colliders.chunk_lists.head(d_chunk));
+    try std.testing.expectEqual(empty_block, serial.colliders.chunks.slot(0, d_chunk));
+    try std.testing.expect(!serial.colliders.view().chunkHasRows(0, d_chunk));
     // b grows coarse and e shrinks fine; then a moves inside its tile.
     try Step.run(&serial, &threaded, &threads, &.{ resizeCommand(b, .{ .x = 300, .y = 300 }), resizeCommand(e, .{ .x = 8, .y = 8 }) });
     try Step.run(&serial, &threaded, &threads, &.{moveCommand(a, .{ .x = 231, .y = 101 })});
@@ -2381,7 +3171,7 @@ test "anchor blocks equal a rebuild after random incremental syncs, serial and t
         try anchorChurnCommands(random, &serial.data, live.items, &commands);
         try Step.run(&serial, &threaded, &threads, commands.items);
     }
-    try std.testing.expect(serial.colliders.anchor_blocks.items.len != 0);
+    try std.testing.expect(serial.colliders.chunks.blocks.items.len != 0);
 }
 
 test "a chunk's anchor block is released when its last anchor leaves and reused by the next" {
@@ -2391,22 +3181,22 @@ test "a chunk's anchor block is released when its last anchor leaves and reused 
     const entity = fixture.colliders.changesThisStep()[0].entity;
     // The first move claims a second block before the old one is released.
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(entity, .{ .x = 168, .y = 40 })});
-    const pooled = fixture.colliders.anchor_blocks.items.len;
-    const capacity = fixture.colliders.anchor_blocks.capacity;
+    const pooled = fixture.colliders.chunks.blocks.items.len;
+    const capacity = fixture.colliders.chunks.blocks.capacity;
     try std.testing.expectEqual(@as(usize, 2), pooled);
     var from_chunk: u32 = 1;
     for (0..8) |step| {
         const to_chunk: u32 = if (step % 2 == 0) 2 else 1;
-        const freed = fixture.colliders.anchor_free.items[0];
+        const freed = fixture.colliders.chunks.block_free.items[0];
         try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(entity, .{ .x = @as(f32, @floatFromInt(to_chunk)) * 128 + 40, .y = 40 })});
-        // The emptied chunk lost its value and key; the new chunk took the free block.
-        try std.testing.expectEqual(no_value, fixture.colliders.chunk_lists.value(chunkKey(0, from_chunk)));
-        try std.testing.expectEqual(no_entry, fixture.colliders.chunk_lists.head(chunkKey(0, from_chunk)));
-        try std.testing.expectEqual(freed, fixture.colliders.chunk_lists.value(chunkKey(0, to_chunk)));
-        try std.testing.expectEqual(pooled, fixture.colliders.anchor_blocks.items.len);
+        // The emptied chunk lost its slot; the new chunk took the free block.
+        try std.testing.expectEqual(empty_block, fixture.colliders.chunks.slot(0, from_chunk));
+        try std.testing.expect(!fixture.colliders.view().chunkHasRows(0, from_chunk));
+        try std.testing.expectEqual(freed, fixture.colliders.chunks.slot(0, to_chunk));
+        try std.testing.expectEqual(pooled, fixture.colliders.chunks.blocks.items.len);
         from_chunk = to_chunk;
     }
-    try std.testing.expectEqual(capacity, fixture.colliders.anchor_blocks.capacity);
+    try std.testing.expectEqual(capacity, fixture.colliders.chunks.blocks.capacity);
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
@@ -2419,7 +3209,8 @@ test "queryBox skips a covered chunk without anchors" {
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 100, .y = 10 }, .{ .x = 100, .y = 20 }) }});
     const view = fixture.colliders.view();
     try std.testing.expect(view.chunkHasRows(0, 1));
-    try std.testing.expectEqual(no_value, fixture.colliders.chunk_lists.value(chunkKey(0, 1)));
+    const covered = fixture.colliders.chunks.payload(fixture.colliders.chunks.slot(0, 1));
+    try std.testing.expectEqual(@as(u16, 0), covered.anchors.set_bits);
     const hits = try TestHits.init(4);
     defer hits.deinit();
     // The box lies in chunk 1; the class-2 walk visits chunks 0 and 1. Chunk 0: a visit,
@@ -2442,10 +3233,10 @@ test "a static whose clamped min corner sits in a level's last partial chunk is 
         .{ .create_entity = staticTemplate(.{ .x = 500, .y = 700 }, .{ .x = 8, .y = 8 }) },
         .{ .create_entity = staticTemplate(.{ .x = 260, .y = 260 }, .{ .x = 50, .y = 50 }) },
     });
-    const corner_chunk = chunkKey(0, 2 * partial.grid.chunks_x + 2);
-    const block = fixture.colliders.chunk_lists.value(corner_chunk);
-    try std.testing.expect(block != no_value);
-    try std.testing.expectEqual(@as(u16, 2), fixture.colliders.anchor_blocks.items[block].set_bits);
+    const corner_chunk: u32 = 2 * partial.grid.chunks_x + 2;
+    const block = fixture.colliders.chunks.slot(0, corner_chunk);
+    try std.testing.expect(block != empty_block);
+    try std.testing.expectEqual(@as(u16, 2), fixture.colliders.chunks.payload(block).anchors.set_bits);
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
@@ -2465,7 +3256,7 @@ test "a static whose clamped min corner sits in a level's last partial chunk is 
     }
 }
 
-test "an anchor-block reserve fails as OutOfMemory at 2^32 - 1 blocks before asking the allocator, and one block short of it reaches the allocator" {
+test "a block reserve fails as OutOfMemory at 2^32 - 1 blocks before asking the allocator, and one block short of it reaches the allocator" {
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
@@ -2474,16 +3265,131 @@ test "an anchor-block reserve fails as OutOfMemory at 2^32 - 1 blocks before ask
     // The pool reads `held` blocks with room for them all and no free id: the reserve reads
     // only its length and capacity, so no block memory backs the count. Restored before
     // deinit.
-    var spare: [1]AnchorBlock = undefined;
-    const real_blocks = colliders.anchor_blocks;
-    defer colliders.anchor_blocks = real_blocks;
-    for ([_]usize{ no_value - 1, no_value - 2 }) |held| {
-        colliders.anchor_blocks.items = (&spare).ptr[0..held];
-        colliders.anchor_blocks.capacity = no_value - 1;
-        try std.testing.expectError(error.OutOfMemory, colliders.ensureFreeAnchorBlocks(1));
-        try std.testing.expectEqual(held, colliders.anchor_blocks.items.len);
-        try std.testing.expectEqual(@as(usize, 0), colliders.anchor_free.items.len);
+    const Block = @typeInfo(@TypeOf(colliders.chunks.blocks.items)).pointer.child;
+    var spare: [1]Block = undefined;
+    const real_blocks = colliders.chunks.blocks;
+    defer colliders.chunks.blocks = real_blocks;
+    for ([_]usize{ empty_block - 1, empty_block - 2 }) |held| {
+        colliders.chunks.blocks.items = (&spare).ptr[0..held];
+        colliders.chunks.blocks.capacity = empty_block - 1;
+        try std.testing.expectError(error.OutOfMemory, colliders.chunks.ensureFree(colliders.allocator, 1));
+        try std.testing.expectEqual(held, colliders.chunks.blocks.items.len);
+        try std.testing.expectEqual(@as(usize, 0), colliders.chunks.block_free.items.len);
         // At the limit nothing is asked of the allocator; one short, the free list's growth is.
-        try std.testing.expectEqual(held == no_value - 2, failing.has_induced_failure);
+        try std.testing.expectEqual(held == empty_block - 2, failing.has_induced_failure);
+    }
+}
+
+test "chunk-ordered, shuffled, and churned statics share per-cell floats and query hits" {
+    const positions = [_]math.Vec2{
+        .{ .x = 4, .y = 4 },     .{ .x = 36, .y = 4 },   .{ .x = 68, .y = 4 },   .{ .x = 100, .y = 4 },
+        .{ .x = 4, .y = 132 },   .{ .x = 36, .y = 132 }, .{ .x = 68, .y = 132 }, .{ .x = 100, .y = 132 },
+        .{ .x = 400, .y = 400 }, .{ .x = 520, .y = 80 },
+    };
+    var ordered_commands: [positions.len]StructuralCommand = undefined;
+    for (&ordered_commands, positions) |*command, position| command.* = .{ .create_entity = staticTemplate(position, .{ .x = 8, .y = 8 }) };
+    var shuffled_commands = ordered_commands;
+    var prng = std.Random.DefaultPrng.init(0x51c);
+    prng.random().shuffle(StructuralCommand, &shuffled_commands);
+
+    var ordered = try SeamFixture.init();
+    defer ordered.deinit();
+    var shuffled = try SeamFixture.init();
+    defer shuffled.deinit();
+    try commitForTest(&ordered.frame, &ordered.data, &ordered.colliders, &ordered_commands);
+    try commitForTest(&shuffled.frame, &shuffled.data, &shuffled.colliders, &shuffled_commands);
+
+    var churned = try SeamFixture.init();
+    defer churned.deinit();
+    try commitForTest(&churned.frame, &churned.data, &churned.colliders, &ordered_commands);
+    var destroys: [4]StructuralCommand = undefined;
+    var recreates: [4]StructuralCommand = undefined;
+    for (churned.colliders.changesThisStep()[0..4], &destroys, &recreates) |change, *destroy, *recreate| {
+        destroy.* = .{ .destroy_entity = change.entity };
+        const body = churned.data.movementBodyConst(change.entity).?;
+        recreate.* = .{ .create_entity = staticTemplate(body.position, .{ .x = 8, .y = 8 }) };
+    }
+    try commitForTest(&churned.frame, &churned.data, &churned.colliders, &destroys);
+    try commitForTest(&churned.frame, &churned.data, &churned.colliders, &recreates);
+
+    const box = math.Aabb{ .min_x = 0, .min_y = 0, .max_x = 2000, .max_y = 2000 };
+    var expected: std.ArrayList(BruteHit) = .empty;
+    defer expected.deinit(std.testing.allocator);
+    const hits = try TestHits.init(32);
+    defer hits.deinit();
+    try expectQueryMatchesBruteForce(&ordered.colliders, 0, box, &expected, hits);
+    const ordered_hits = try std.testing.allocator.alloc(math.Aabb, expected.items.len);
+    defer std.testing.allocator.free(ordered_hits);
+    for (expected.items, ordered_hits) |hit, *aabb| aabb.* = hit.aabb;
+    try expectQueryMatchesBruteForce(&shuffled.colliders, 0, box, &expected, hits);
+    for (expected.items, ordered_hits) |hit, aabb| try std.testing.expectEqual(aabb, hit.aabb);
+    try expectQueryMatchesBruteForce(&churned.colliders, 0, box, &expected, hits);
+    for (expected.items, ordered_hits) |hit, aabb| try std.testing.expectEqual(aabb, hit.aabb);
+    // Entity indices differ across the three builds. Each cell holds one static, so the
+    // float runs match.
+    try expectSameQueryFloats(&ordered.colliders, &shuffled.colliders, 1);
+    try expectSameQueryFloats(&ordered.colliders, &churned.colliders, 1);
+}
+
+fn expectSameQueryFloats(a: *const StaticColliderSystem, b: *const StaticColliderSystem, levels: u16) !void {
+    const chunk_count = levelChunkCount(a.geometry.?);
+    for (0..levels) |level| for (0..chunk_count) |chunk| {
+        const payload_a = chunkPayloadOf(a, @intCast(level), @intCast(chunk));
+        const payload_b = chunkPayloadOf(b, @intCast(level), @intCast(chunk));
+        const query_a: usize = if (payload_a) |payload| payload.query_len else 0;
+        const query_b: usize = if (payload_b) |payload| payload.query_len else 0;
+        try std.testing.expectEqual(query_a, query_b);
+        if (query_a == 0) continue;
+        try std.testing.expectEqualSlices(f32, payload_a.?.query_min_x[0..query_a], payload_b.?.query_min_x[0..query_b]);
+        try std.testing.expectEqualSlices(f32, payload_a.?.query_min_y[0..query_a], payload_b.?.query_min_y[0..query_b]);
+        try std.testing.expectEqualSlices(f32, payload_a.?.query_max_x[0..query_a], payload_b.?.query_max_x[0..query_b]);
+        try std.testing.expectEqualSlices(f32, payload_a.?.query_max_y[0..query_a], payload_b.?.query_max_y[0..query_b]);
+    };
+}
+
+test "a sync that drops a middle static leaves the survivors contiguous" {
+    var fixture = try SeamFixture.init();
+    defer fixture.deinit();
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{
+        .{ .create_entity = staticTemplate(.{ .x = 40, .y = 40 }, .{ .x = 8, .y = 8 }) },
+        .{ .create_entity = staticTemplate(.{ .x = 44, .y = 44 }, .{ .x = 8, .y = 8 }) },
+        .{ .create_entity = staticTemplate(.{ .x = 48, .y = 48 }, .{ .x = 8, .y = 8 }) },
+    });
+    const middle = fixture.colliders.changesThisStep()[1].entity;
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .destroy_entity = middle }});
+    const spans = fixture.colliders.view().chunkRows(0, 0);
+    try std.testing.expectEqual(@as(usize, 2), spans.entity.len);
+    try std.testing.expectEqual(@intFromPtr(spans.entity.ptr) + @sizeOf(u32), @intFromPtr(&spans.entity[1]));
+    try std.testing.expectEqual(@intFromPtr(spans.min_x.ptr) + @sizeOf(u32), @intFromPtr(&spans.min_x[1]));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2 }, spans.entity);
+    const payload = chunkPayloadOf(&fixture.colliders, 0, 0).?;
+    const query_len: usize = payload.query_len;
+    try std.testing.expectEqual(@as(usize, 2), query_len);
+    const query_min_x = payload.query_min_x[0..query_len];
+    const query_entity = payload.query_entity[0..query_len];
+    try std.testing.expectEqual(@intFromPtr(query_min_x.ptr) + @sizeOf(f32), @intFromPtr(&query_min_x[1]));
+    try std.testing.expectEqual(@intFromPtr(query_entity.ptr) + @sizeOf(u32), @intFromPtr(&query_entity[1]));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2 }, query_entity);
+}
+
+test "a chunk rewrite matches across range sizes and worker counts" {
+    var prng = std.Random.DefaultPrng.init(0xd00d);
+    const random = prng.random();
+    var commands: std.ArrayList(StructuralCommand) = .empty;
+    defer commands.deinit(std.testing.allocator);
+    for (0..40) |_| try commands.append(std.testing.allocator, randomStatic(random));
+    var baseline = try SeamFixture.init();
+    defer baseline.deinit();
+    try commitForTest(&baseline.frame, &baseline.data, &baseline.colliders, commands.items);
+    const ranges = [_]usize{ 1, 8, 64 };
+    for (ranges) |items_per_range| {
+        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+        defer threads.deinit();
+        var threaded = try SeamFixture.init();
+        defer threaded.deinit();
+        threaded.colliders.splice_controls = .{ .adaptive = false, .items_per_range = items_per_range };
+        try commitForTestWith(&threaded.frame, &threaded.data, &threaded.colliders, commands.items, &threads);
+        try expectIdenticalLayout(&baseline.colliders, &threaded.colliders, 1);
+        if (items_per_range < 64) try std.testing.expect(!threaded.colliders.last_splice_batch.ran_inline);
     }
 }

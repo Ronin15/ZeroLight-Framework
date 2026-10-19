@@ -1639,6 +1639,4 @@ fn runRekeyScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, churn
 
 fn setCollidersAllocator(colliders: *StaticColliderSystem, allocator: std.mem.Allocator) void {
     colliders.allocator = allocator;
-    colliders.chunk_lists.allocator = allocator;
-    colliders.query_lists.allocator = allocator;
 }

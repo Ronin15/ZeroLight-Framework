@@ -175,11 +175,10 @@ pub const StaticMove = struct {
     }
 };
 
-/// Gives the static colliders' chunk-list and query-list splice stages fresh tuners and the
-/// range controls for `case`.
+/// Gives the static colliders' chunk-rewrite stage a fresh tuner and the range controls
+/// for `case`.
 pub fn setSpliceTuners(colliders: *StaticColliderSystem, case: suite.BenchmarkCase) void {
-    colliders.splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-    colliders.query_splice_tuner = suite.adaptiveTunerForCase(case, splice_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    colliders.chunk_rewrite = suite.adaptiveTunerForCase(case, splice_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
 }
 

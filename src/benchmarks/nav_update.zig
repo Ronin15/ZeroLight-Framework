@@ -22,8 +22,8 @@
 //! `nav-update-static-dense`: 64, 1,024, or 16,384 statics changed in one commit through the
 //! same seam, half moved one chunk over and half destroyed and recreated there at reused
 //! entity indices, among 64 statics per chunk. Passes when linear in the change count, with
-//! the sorted list splices threaded. `nav-update-static-dense-tail`: every insert lands past
-//! its list's tail (32 statics per chunk, created after the 64 residents, moved one chunk over
+//! the chunk rewrite threaded. `nav-update-static-dense-tail`: every insert lands past
+//! its run's tail (32 statics per chunk, created after the 64 residents, moved one chunk over
 //! and back each step in (chunk, slot) order). Passes when linear in the change count.
 //!
 //! Every group runs serial and threaded; `--details` prints the reaction's mark, plan,
@@ -604,8 +604,7 @@ const StaticDenseFixture = struct {
         if (recreated_at != self.recreated.items.len) return error.StaticRecreatesMissing;
         self.shifted = !self.shifted;
         const splice = self.colliders.last_splice_batch;
-        const query_splice = self.colliders.perf.last_query_splice_batch;
-        const splice_off_main_ns = offMainNs(splice) + offMainNs(query_splice);
+        const splice_off_main_ns = offMainNs(splice);
         return .{
             .ns = suite.elapsedNs(start_ns, end_ns),
             .commit_ns = suite.elapsedNs(start_ns, sync_start_ns),
@@ -745,7 +744,7 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     fixtures.setSpliceTuners(&fixture.colliders, case);
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next((fixture.colliders.splice_tuner.phase == .settled) and (fixture.colliders.query_splice_tuner.phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.plan).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled))) _ = try fixture.changeAndReact(io, thread_ptr);
+    while (warm.next((fixture.colliders.chunk_rewrite.phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.plan).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled))) _ = try fixture.changeAndReact(io, thread_ptr);
     const remask_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) else false;
     const patch_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled) else false;
 
@@ -776,7 +775,6 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
     stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_splice_batch);
-    stats.query_splice_batch = suite.batchSummaryFromBatch(fixture.colliders.perf.last_query_splice_batch);
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         // Plan: the commit; write: the collider sync and record; nav: the reaction.
@@ -803,13 +801,10 @@ fn writeStaticMoveWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: 
 
 fn writeStaticDenseWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     const splice = stats.splice_batch orelse suite.BatchSummary{};
-    const query_splice = stats.query_splice_batch orelse suite.BatchSummary{};
-    try writer.print("statics={} keys={} qkeys={} patched={}", .{ stats.candidate_pairs, splice.item_count, query_splice.item_count, stats.output_count });
+    try writer.print("statics={} units={} patched={}", .{ stats.candidate_pairs, splice.item_count, stats.output_count });
     if (view == .summary) return;
-    try writer.writeAll(" splice=");
+    try writer.writeAll(" rewrite=");
     try suite.writeStageShape(writer, splice);
-    try writer.writeAll(" qsplice=");
-    try suite.writeStageShape(writer, query_splice);
     try writer.writeByte(' ');
     try suite.writeNavStages(writer, stats);
     const phases = stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{};

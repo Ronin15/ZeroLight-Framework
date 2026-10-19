@@ -2431,14 +2431,10 @@ test "a collider sync that runs out of memory leaves steering on the pre-commit 
     frame.beginStep();
     try writeBoxMoveForTest(frame, scene.box, scene.beside, &.{});
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    const allocators = .{ colliders.allocator, colliders.chunk_lists.allocator, colliders.query_lists.allocator };
+    const allocator = colliders.allocator;
     colliders.allocator = failing.allocator();
-    colliders.chunk_lists.allocator = failing.allocator();
-    colliders.query_lists.allocator = failing.allocator();
     const result = commitStructuralAndReact(&fixture.pipeline, frame, &fixture.data, &fixture.world, &inline_threads);
-    colliders.allocator = allocators[0];
-    colliders.chunk_lists.allocator = allocators[1];
-    colliders.query_lists.allocator = allocators[2];
+    colliders.allocator = allocator;
     try std.testing.expectError(error.OutOfMemory, result);
     // The commit applied; the sync kept the change for the next seam.
     try std.testing.expectEqual(scene.beside, fixture.data.movementBodyConst(scene.box).?.position);

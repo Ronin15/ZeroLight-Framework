@@ -257,22 +257,21 @@ pub const NavGrid = struct {
     }
 
     /// Composes `chunk`'s blocked bits: the world's composed bits for this level (null
-    /// world: none) OR the cells of every static collider listed at the chunk, clipped to
-    /// it. Out-of-level bits stay clear. Reads only the world and the colliders, so chunks
-    /// compose in parallel. O(rows listed at the chunk).
-    // SIMD verdict: word-parallel scalar. The world's bits copy as four words and each row
+    /// world: none) OR the cells of every static span listed at the chunk, clipped to it.
+    /// Out-of-level bits stay clear. Reads only the world and the colliders, so chunks
+    /// compose in parallel. O(spans listed at the chunk).
+    // SIMD verdict: word-parallel scalar. The world's bits copy as four words and each span
     // ORs in as one `rectMask`; no per-cell loop is left to vectorize.
     pub fn composeChunk(self: *const NavGrid, chunk: u32, world: ?*const WorldSystem, colliders: ColliderView) ChunkBits {
         const b = self.chunkBounds(chunk);
         var bits = self.worldChunkBits(chunk, world);
-        var rows = colliders.chunkRows(self.level, chunk);
-        while (rows.next()) |row| {
-            const cells = colliders.rowCells(row);
-            // Listed rows overlap the chunk; clip to its in-level cells.
-            const x0 = @max(@as(usize, cells.min_x), b.x0);
-            const y0 = @max(@as(usize, cells.min_y), b.y0);
-            const x1 = @min(@as(usize, cells.max_x) + 1, b.x1);
-            const y1 = @min(@as(usize, cells.max_y) + 1, b.y1);
+        const spans = colliders.chunkRows(self.level, chunk);
+        for (0..spans.entity.len) |index| {
+            // Listed spans overlap the chunk; clip to its in-level cells.
+            const x0 = @max(@as(usize, spans.min_x[index]), b.x0);
+            const y0 = @max(@as(usize, spans.min_y[index]), b.y0);
+            const x1 = @min(@as(usize, spans.max_x[index]) + 1, b.x1);
+            const y1 = @min(@as(usize, spans.max_y[index]) + 1, b.y1);
             if (x0 >= x1 or y0 >= y1) continue;
             const mask = world_terrain.rectMask(self.geometry, @intCast(x0 - b.x0), @intCast(y0 - b.y0), @intCast(x1 - b.x0), @intCast(y1 - b.y0));
             for (&bits, mask) |*word, row_bits| word.* |= row_bits;

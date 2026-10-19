@@ -1124,9 +1124,9 @@ pub const SimulationPipeline = struct {
 
     /// Applies the captured static changes to the collider rows, then records them for nav
     /// into the marks `reserveStaticColliders` reserved, whether or not nav applies this
-    /// step. Main work is O(1) per changed static and per footprint chunk entering or
-    /// leaving; the per-chunk sorted placement threads under `thread_system`. On error the
-    /// rows are unchanged, nothing is recorded, and the changes stay for the next sync.
+    /// step. Main is O(1) per dirty static and per footprint chunk, and the rewrite of
+    /// those chunks threads under `thread_system`. On error the rows are unchanged, nothing
+    /// is recorded, and the changes stay for the next sync.
     pub fn syncStaticColliders(self: *SimulationPipeline, data: *const DataSystem, thread_system: *ThreadSystem) !void {
         try self.static_colliders.sync(data, thread_system);
         self.pathfinding.recordStaticColliderChanges(self.static_colliders.changesThisStep());
@@ -2883,8 +2883,8 @@ fn countPerceptionEvents(frame: *const SimulationFrame) struct { perceived: usiz
 }
 
 /// The allocators of everything a pipeline step can reach: frame streams, data, world,
-/// pipeline systems, pathfinding, the static colliders and both their list tiers, dig
-/// scratch, and the thread system. `install` swaps
+/// pipeline systems, pathfinding, the static colliders, dig scratch, and the thread
+/// system. `install` swaps
 /// them all (to one failing allocator for a zero-allocation proof, or per-owner
 /// counters to see which owner allocated) and returns the originals for `restore`.
 /// Test-only fixture.
@@ -2908,8 +2908,6 @@ const TestAllocatorSwap = struct {
     pathfinding: std.mem.Allocator = undefined,
     graph: std.mem.Allocator = undefined,
     static_colliders: std.mem.Allocator = undefined,
-    collider_chunk_lists: std.mem.Allocator = undefined,
-    collider_query_lists: std.mem.Allocator = undefined,
     scope: std.mem.Allocator = undefined,
     spatial_index: std.mem.Allocator = undefined,
     perception: std.mem.Allocator = undefined,
@@ -2967,8 +2965,6 @@ const TestAllocatorSwap = struct {
             .pathfinding = t.pipeline.pathfinding.allocator,
             .graph = t.pipeline.pathfinding.graph.allocator,
             .static_colliders = t.pipeline.static_colliders.allocator,
-            .collider_chunk_lists = t.pipeline.static_colliders.chunk_lists.allocator,
-            .collider_query_lists = t.pipeline.static_colliders.query_lists.allocator,
             .scope = t.pipeline.scope.allocator,
             .spatial_index = t.pipeline.spatial_index.allocator,
             .perception = t.pipeline.perception.allocator,
@@ -3000,8 +2996,6 @@ const TestAllocatorSwap = struct {
         t.pipeline.pathfinding.allocator = to.pathfinding;
         t.pipeline.pathfinding.graph.allocator = to.graph;
         t.pipeline.static_colliders.allocator = to.static_colliders;
-        t.pipeline.static_colliders.chunk_lists.allocator = to.collider_chunk_lists;
-        t.pipeline.static_colliders.query_lists.allocator = to.collider_query_lists;
         t.pipeline.scope.allocator = to.scope;
         t.pipeline.spatial_index.allocator = to.spatial_index;
         t.pipeline.perception.allocator = to.perception;
@@ -6962,12 +6956,8 @@ test "a collider sync that runs out of memory keeps its change and the next step
     try pipeline.reserveStaticColliders(&frame, &data);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     pipeline.static_colliders.allocator = failing.allocator();
-    pipeline.static_colliders.chunk_lists.allocator = failing.allocator();
-    pipeline.static_colliders.query_lists.allocator = failing.allocator();
     const failed = commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
     pipeline.static_colliders.allocator = std.testing.allocator;
-    pipeline.static_colliders.chunk_lists.allocator = std.testing.allocator;
-    pipeline.static_colliders.query_lists.allocator = std.testing.allocator;
     try std.testing.expectError(error.OutOfMemory, failed);
     try std.testing.expect(!pipeline.pathfinding.graph.grid(0).?.isBlockedCell(.{ .x = 0, .y = 0 }));
 
@@ -7166,12 +7156,8 @@ test "a collider-sync OOM in a dig step still applies the dig the next step" {
     try fixture.pipeline.reserveStaticColliders(&fixture.frame, &fixture.data);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     fixture.pipeline.static_colliders.allocator = failing.allocator();
-    fixture.pipeline.static_colliders.chunk_lists.allocator = failing.allocator();
-    fixture.pipeline.static_colliders.query_lists.allocator = failing.allocator();
     const failed = fixture.seam();
     fixture.pipeline.static_colliders.allocator = std.testing.allocator;
-    fixture.pipeline.static_colliders.chunk_lists.allocator = std.testing.allocator;
-    fixture.pipeline.static_colliders.query_lists.allocator = std.testing.allocator;
     try std.testing.expectError(error.OutOfMemory, failed);
     try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(fixture.pipeline.static_colliders));
     try std.testing.expect(fixture.navBlocked(1, 6, 3));

@@ -457,7 +457,7 @@ const StaticMover = struct {
     }
 
     fn spliceOffMainNs(self: *const StaticMover) u64 {
-        return offMainNs(self.colliders.last_splice_batch) + offMainNs(self.colliders.perf.last_query_splice_batch);
+        return offMainNs(self.colliders.last_splice_batch);
     }
 };
 

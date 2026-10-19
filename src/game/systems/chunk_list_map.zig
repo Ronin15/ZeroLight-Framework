@@ -14,6 +14,8 @@
 //! Only the reserves allocate. Reads never mutate, so workers read lists while nothing
 //! writes. `OrderedIndexSet` beside it is the one ordered set chunk-key users (nav's plan
 //! merge, the world's batch grouping) drain chunk and level indices through in order.
+//! `ChunkDirectory` beside that is a dense per-level slot array into a block pool: an
+//! occupied slot's payload is one byte allocation the owner splits into columns.
 
 const std = @import("std");
 const logging = @import("../../core/logging.zig");
@@ -28,12 +30,15 @@ const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const runShaped = @import("../../app/thread_system.zig").runShaped;
 const stageShape = @import("../../app/thread_system.zig").stageShape;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 
 /// End of a list or owner chain, and "no entry" from a lookup.
 pub const no_entry: u32 = std.math.maxInt(u32);
 /// A key's value when none is set, and the value of an absent key.
 pub const no_value: u32 = std.math.maxInt(u32);
+/// An empty directory slot, and a block id no live block holds.
+pub const empty_block: u32 = std.math.maxInt(u32);
 // No valid key sets both of bits 62-63, so all-ones marks an empty table slot.
 const empty_key: u64 = std.math.maxInt(u64);
 pub const min_slot_count: usize = 16;
@@ -177,6 +182,159 @@ pub fn bitSetBytes(set: std.bit_set.Dynamic) usize {
 pub fn bitSetBytesFor(bits: usize) usize {
     if (bits == 0) return 0;
     return (OrderedIndexSet.maskCount(bits) + 1) * @sizeOf(OrderedIndexSet.Word);
+}
+
+/// One level's chunk slots and a free-list pool of payloads. A slot holds a block id, or
+/// `empty_block`. The block's bytes are one allocation; `Payload` is the owner's column
+/// split of those bytes, stored beside them so freeing the block frees the allocation.
+/// Methods take the caller's allocator; the directory does not store one. `padded` stores
+/// each slot as a cache-line `PaddedSlot` of `{ block, pending }` so workers writing
+/// `pending` on adjacent chunks do not share a line. Unpadded slots are plain block ids
+/// and only the main thread writes them.
+pub fn ChunkDirectory(comptime Payload: type, comptime padded: bool) type {
+    return struct {
+        const Self = @This();
+        const SlotValue = struct { block: u32 = empty_block, pending: u32 = 0 };
+        const Slot = if (padded) PaddedSlot(SlotValue) else u32;
+        const Level = struct { slots: []Slot = &.{} };
+        const Block = struct {
+            bytes: []align(4) u8 = &.{},
+            payload: Payload = .{},
+        };
+
+        levels: std.ArrayList(Level) = .empty,
+        blocks: std.ArrayList(Block) = .empty,
+        block_free: std.ArrayList(u32) = .empty,
+
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            var index: u32 = 0;
+            while (index < self.levels.items.len) : (index += 1) self.closeLevel(allocator, index);
+            self.levels.deinit(allocator);
+            for (self.blocks.items) |block| if (block.bytes.len != 0) allocator.free(block.bytes);
+            self.blocks.deinit(allocator);
+            self.block_free.deinit(allocator);
+            self.* = .{};
+        }
+
+        /// Allocates `level`'s slots once. A level already open at `slot_count` is left
+        /// alone. A different count is only legal once every slot is empty: the old slots
+        /// are freed after the new ones exist.
+        pub fn openLevel(self: *Self, allocator: std.mem.Allocator, level: u32, slot_count: usize) error{OutOfMemory}!void {
+            const index: usize = level;
+            if (self.levels.items.len <= index) {
+                try self.levels.ensureTotalCapacity(allocator, index + 1);
+                self.levels.appendNTimesAssumeCapacity(.{}, index + 1 - self.levels.items.len);
+            }
+            const slots = &self.levels.items[index].slots;
+            if (slots.len == slot_count) return;
+            if (slots.len != 0) {
+                for (slots.*) |held| std.debug.assert(slotBlock(held) == empty_block);
+            }
+            const fresh = try allocator.alloc(Slot, slot_count);
+            if (comptime padded) {
+                for (fresh) |*held| held.* = .{};
+            } else {
+                @memset(fresh, empty_block);
+            }
+            if (slots.len != 0) allocator.free(slots.*);
+            slots.* = fresh;
+        }
+
+        /// Frees `level`'s slots and releases every block they hold.
+        pub fn closeLevel(self: *Self, allocator: std.mem.Allocator, level: u32) void {
+            if (level >= self.levels.items.len) return;
+            const slots = self.levels.items[level].slots;
+            for (slots) |held| {
+                const block = slotBlock(held);
+                if (block != empty_block) self.release(allocator, block);
+            }
+            if (slots.len != 0) allocator.free(slots);
+            self.levels.items[level].slots = &.{};
+        }
+
+        pub fn levelCount(self: *const Self) usize {
+            return self.levels.items.len;
+        }
+
+        pub fn slotCount(self: *const Self, level: u32) usize {
+            if (level >= self.levels.items.len) return 0;
+            return self.levels.items[level].slots.len;
+        }
+
+        /// The block id at `level`'s `index`, or `empty_block` when that slot was never opened.
+        pub fn slot(self: *const Self, level: u32, index: usize) u32 {
+            if (level >= self.levels.items.len) return empty_block;
+            const slots = self.levels.items[level].slots;
+            if (index >= slots.len) return empty_block;
+            return slotBlock(slots[index]);
+        }
+
+        pub fn setSlot(self: *Self, level: u32, index: usize, block: u32) void {
+            const slots = self.levels.items[level].slots;
+            std.debug.assert(index < slots.len);
+            setSlotBlock(&slots[index], block);
+        }
+
+        /// Grows the free block list to at least `needed` ids. A block id would pass
+        /// `empty_block` only at 2^32 live blocks, which fails as `OutOfMemory` before the
+        /// allocator is asked. Geometric, and the free list's capacity covers every block.
+        pub fn ensureFree(self: *Self, allocator: std.mem.Allocator, needed: usize) error{OutOfMemory}!void {
+            if (self.block_free.items.len >= needed) return;
+            const added = needed - self.block_free.items.len;
+            const total = self.blocks.items.len + added;
+            if (total >= empty_block) return error.OutOfMemory;
+            if (total > self.blocks.capacity) {
+                try self.blocks.ensureTotalCapacity(allocator, @max(total, self.blocks.capacity *| 2));
+            }
+            try self.block_free.ensureTotalCapacity(allocator, self.blocks.capacity);
+            const first: u32 = @intCast(self.blocks.items.len);
+            self.blocks.appendNTimesAssumeCapacity(.{}, added);
+            var id: u32 = @intCast(self.blocks.items.len);
+            while (id > first) {
+                id -= 1;
+                self.block_free.appendAssumeCapacity(id);
+            }
+        }
+
+        /// Takes a free block. Its bytes are empty until `setPayload`.
+        pub fn claim(self: *Self, allocator: std.mem.Allocator) error{OutOfMemory}!u32 {
+            if (self.block_free.items.len == 0) try self.ensureFree(allocator, 1);
+            return self.block_free.pop().?;
+        }
+
+        /// Returns `block` to the pool and frees its bytes.
+        pub fn release(self: *Self, allocator: std.mem.Allocator, block: u32) void {
+            const bytes = self.blocks.items[block].bytes;
+            self.blocks.items[block] = .{};
+            if (bytes.len != 0) allocator.free(bytes);
+            std.debug.assert(self.block_free.items.len < self.block_free.capacity);
+            self.block_free.appendAssumeCapacity(block);
+        }
+
+        /// Installs `bytes` and the column split `payload`. Does not free a previous
+        /// allocation; the caller does, after this returns.
+        pub fn setPayload(self: *Self, block: u32, bytes: []align(4) u8, columns: Payload) void {
+            self.blocks.items[block].bytes = bytes;
+            self.blocks.items[block].payload = columns;
+        }
+
+        pub fn payload(self: *const Self, block: u32) Payload {
+            return self.blocks.items[block].payload;
+        }
+
+        pub fn blockBytes(self: *const Self, block: u32) []align(4) u8 {
+            return self.blocks.items[block].bytes;
+        }
+
+        fn slotBlock(held: Slot) u32 {
+            if (comptime padded) return held.value.block;
+            return held;
+        }
+
+        fn setSlotBlock(held: *Slot, block: u32) void {
+            if (comptime padded) held.value.block = block else held.* = block;
+        }
+    };
 }
 
 pub const Entry = struct {
