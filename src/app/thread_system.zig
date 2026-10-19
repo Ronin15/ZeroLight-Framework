@@ -4218,7 +4218,17 @@ fn nestedFixedRangeCount(threads: *const ThreadSystem) usize {
     }, threads.workerThreadCount(), 1, false).range_count;
 }
 
+// The test runner prints `.warn`. These tests are the intentional nest, so the
+// recovered-mistake line stays out of the suite. `forced_inline_warned` is the assert.
+fn quietRecoveredBatchWarn() std.log.Level {
+    const previous = std.testing.log_level;
+    std.testing.log_level = .err;
+    return previous;
+}
+
 test "a nested batch from a worker job runs inline on that worker and covers every item once" {
+    const previous_log_level = quietRecoveredBatchWarn();
+    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4260,6 +4270,8 @@ fn ownerNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId)
 }
 
 test "a nested batch from the owner's own range runs inline on the main id and warns once" {
+    const previous_log_level = quietRecoveredBatchWarn();
+    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4327,6 +4339,8 @@ fn shapeNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId)
 }
 
 test "a nested batch keeps a selected profile's range shape and a nested stage selects the untuned shape" {
+    const previous_log_level = quietRecoveredBatchWarn();
+    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4432,6 +4446,8 @@ fn tunerNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId)
 }
 
 test "a nested batch leaves the stage tuner and the shared tuner untouched" {
+    const previous_log_level = quietRecoveredBatchWarn();
+    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4457,6 +4473,8 @@ test "a nested batch leaves the stage tuner and the shared tuner untouched" {
 }
 
 test "forced inline batches allocate nothing on a multi-worker system" {
+    const previous_log_level = quietRecoveredBatchWarn();
+    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4555,6 +4573,8 @@ fn ownerThreadedNestingOuterJob(context: *anyopaque, range: ParallelRange, id: W
 }
 
 test "a nested batch from the owner's range of a threaded batch runs inline on the main id" {
+    const previous_log_level = quietRecoveredBatchWarn();
+    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
@@ -4598,6 +4618,8 @@ fn selectedNestingOuterJob(context: *anyopaque, range: ParallelRange, _: WorkerI
 }
 
 test "a nested run of an owner's tuned selection keeps its aligned range set" {
+    const previous_log_level = quietRecoveredBatchWarn();
+    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 64 });
     defer threads.deinit();
 
@@ -4673,6 +4695,8 @@ fn roundNestingOuterJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
 }
 
 test "rounds run inside a batch leave the stage tuner unsampled" {
+    const previous_log_level = quietRecoveredBatchWarn();
+    defer std.testing.log_level = previous_log_level;
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
 
