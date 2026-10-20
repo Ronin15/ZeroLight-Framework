@@ -411,18 +411,19 @@ a design open for this slice):
       `buildLevel` shrinks its staging before it returns, so `checkNavBytes` never
       sees the peak its bound charges (`639f55d`).
 - [ ] Result-cache size, hit/miss, and eviction follow capacity history (the
-      per-step gates do not since `78f4f90`): the logical size is
-      `4 × effective_agent_capacity` (`system.zig` `deriveLimits`, reserved in
-      `reserve`), the victim is a round-robin over physical probe slots whose
-      layout depends on the last resize's size (`caches.zig:410-419`, cursor
-      reset at `:449`, `:538`), and shrink eviction follows the shrink window
-      (`caches.zig:506`, `system.zig` `adjustCapacityForAgentCount`).
-      Scenario: 40 agents grown to capacity 64 vs freshly sized to 40 (a
-      save/load); after 200 distinct results one has evicted 40, the other
-      none, so later hits and re-solves differ. Admission and deferral are
-      identical and a miss re-solves correctly. Needs a live-count logical
-      limit and a layout-independent victim order (new eviction machinery, about
-      200–300 production lines; `.claude/reports/64g-capacity-gates-design.md`).
+      per-step gates do not since `78f4f90`). Confirmed 2026-10-19 on that
+      commit: `deriveLimits` sets `cached_results` from the held pool,
+      `growForAgentCount` stores at least double, and
+      `adjustCapacityForAgentCount` shrinks only after the low-load window,
+      never below the live queue. `claim` evicts when `len` reaches
+      `logical_capacity`; `evictVictim` walks `next_evict` over the physical
+      probe slots. A crowd that spiked and is still inside the shrink window
+      keeps and evicts different paths than a fresh system with the same live
+      agents. The history tests stop before the cache fills. Admission and
+      deferral are identical and a miss re-solves correctly. Pass: the logical
+      cap follows the live agent count, and the victim order does not depend
+      on the last resize's probe layout. This follow-up stays on 64G. It is
+      not a `core_systems` redo.
 - [x] Docs: `docs/architecture.md` terrain and pathfinding sections; 65B, 46,
       and 64B checked against chunk storage.
 
