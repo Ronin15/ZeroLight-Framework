@@ -16,11 +16,9 @@
 //! time linear in bodies; asserts check the analytic contact count (the 512-wide grid's
 //! neighbour pairs; one pair per group of 20 sparse bodies).
 //!
-//! The static groups hold the item count of statics on a two-tile pitch, so the
-//! world grows with that count, plus a fixed 2,048 dynamic bodies. Each pitch cell
-//! holds one query run of statics on that tile: one tile the overlapping dynamic
-//! hits, and the rest in the corner it misses. The collision scan reads that run.
-//! Half the dynamics hit the one tile and half sit in the free tile:
+//! The static groups hold the item count of one-tile statics on a two-tile pitch, so the
+//! world grows with the static count, plus a fixed 2,048 dynamic bodies, half of them
+//! overlapping one static each and half in the free tiles:
 //! - `collision-static-heavy-sap`: the dynamics clustered in a fixed 64 x 64-tile region.
 //!   Pass shape: tuned time and main flat in statics.
 //! - `collision-static-heavy`: the dynamics spread uniformly over the world. Pass shape:
@@ -319,12 +317,10 @@ fn fixtureContacts(count: usize, mode: FixtureMode) usize {
 // Static-heavy: a fixed dynamic population among a growing static grid.
 // ----------------------------------------------------------------------------
 
-const static_item_counts = [_]usize{ 65_536, 262_144, 1_048_576 };
+const static_item_counts = [_]usize{ 4_096, 16_384, 65_536 };
 const static_dynamic_count: usize = 2_048;
-// Each pitch cell is one tile on a two-tile pitch, and that tile's query group is a
-// run the scan streams: one full tile, plus the rest packed in the corner.
-const query_run_len: usize = 16;
-const bystander_size: f32 = 2;
+// Statics are one tile on a two-tile pitch; their grid's side is the square root of the
+// static count, so the world grows with it.
 const static_size: f32 = tile_size;
 const static_pitch: f32 = 2 * tile_size;
 // Dynamic slot offsets inside a static's pitch cell: slot 0 overlaps the static, slot 1
@@ -348,15 +344,13 @@ fn pitchCellOrigin(cell_x: usize, cell_y: usize) math.Vec2 {
     return .{ .x = @as(f32, @floatFromInt(cell_x)) * static_pitch, .y = @as(f32, @floatFromInt(cell_y)) * static_pitch };
 }
 
-// `static_count` statics, one query run per pitch cell, row-major, then the
-// dynamics by `placement`: dynamic k in slot k % 2 of its pitch cell.
+// `static_count` solid statics, row-major on the pitch grid, then the dynamics by
+// `placement`: dynamic k in slot k % 2 of its pitch cell, (cell, slot) distinct.
 fn createStaticHeavyFixture(allocator: std.mem.Allocator, static_count: usize, placement: DynamicPlacement) !StaticHeavyFixture {
-    if (static_count % query_run_len != 0) return error.StaticCountNotSquare;
-    const cell_count = static_count / query_run_len;
-    const side = std.math.sqrt(cell_count);
-    if (side * side != cell_count) return error.StaticCountNotSquare;
+    const side = std.math.sqrt(static_count);
+    if (side * side != static_count) return error.StaticCountNotSquare;
     if (side < cluster_cells_side + 1) return error.StaticGridSmallerThanCluster;
-    if (cell_count % static_dynamic_count != 0) return error.StaticCountNotDynamicMultiple;
+    if (static_count % static_dynamic_count != 0) return error.StaticCountNotDynamicMultiple;
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
@@ -364,18 +358,9 @@ fn createStaticHeavyFixture(allocator: std.mem.Allocator, static_count: usize, p
     for (0..side) |cell_y| for (0..side) |cell_x| {
         const position = pitchCellOrigin(cell_x, cell_y);
         last_static = try fixtures.addBody(&data, position, .{ .x = static_size, .y = static_size }, .static);
-        for (1..query_run_len) |index| {
-            const column = (index - 1) % 4;
-            const row = (index - 1) / 4;
-            const corner = math.Vec2{
-                .x = position.x + @as(f32, @floatFromInt(column)) * (bystander_size + 1),
-                .y = position.y + @as(f32, @floatFromInt(row)) * (bystander_size + 1),
-            };
-            last_static = try fixtures.addBody(&data, corner, .{ .x = bystander_size, .y = bystander_size }, .static);
-        }
     };
 
-    const spread_step = cell_count / static_dynamic_count;
+    const spread_step = static_count / static_dynamic_count;
     for (0..static_dynamic_count) |index| {
         const cell = switch (placement) {
             .clustered => index / 2,
@@ -390,7 +375,7 @@ fn createStaticHeavyFixture(allocator: std.mem.Allocator, static_count: usize, p
     return .{ .data = data, .side = side, .last_static = last_static };
 }
 
-// Every slot-0 dynamic overlaps the one full tile in its cell. The corner rows miss it.
+// Every slot-0 dynamic overlaps its static and nothing else overlaps.
 const static_fixture_contacts = static_dynamic_count / 2;
 
 fn runStaticHeavySapCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
