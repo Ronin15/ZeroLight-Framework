@@ -125,11 +125,12 @@
   consumer; draining them into per-item scalar calls or branches fails the
   loop's shape.
 - Leave scalar only irreducible loops (A*/BFS frontier, compaction, rare
-  setup), stating why.
+  setup, a data dependency on the same address), stating why. Do not force
+  SIMD onto a loop whose shape cannot use it.
 - SIMD or scalar is decided by the loop's shape, never by Debug timings (SIMD
   gains come with scale and release builds; benches run in Debug), so a Debug
-  slowdown never reverts a SIMD-shaped loop. A choice that needs a number
-  gets the targeted ReleaseFast run (`build-validation.md`), with the reason
-  at the site.
+  slowdown never reverts a SIMD-shaped loop. A SIMD-shaped loop that is only
+  a little slower stays. A choice that needs a number gets the targeted
+  ReleaseFast run (`build-validation.md`), with the reason at the site.
 - A new or restructured hot float loop ships scalar/SIMD and serial/threaded
   parity tests.

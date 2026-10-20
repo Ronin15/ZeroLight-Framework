@@ -99,8 +99,11 @@ section with nothing new is omitted.
   and § SIMD and core math. These are not a verdict column. A hot loop
   fails the design, and the layout is fixed, when it reads through an
   index permutation, a pointer chase, or a per-row lookup into another
-  store, or when dense float columns stay scalar inside a population
-  loop, or when lane results drain into per-item scalar calls. The fix
+  store, or when dense uniform float columns whose shape can take lanes
+  stay scalar inside a population loop, or when lane results drain into
+  per-item scalar calls. An irreducible loop stays scalar and says why.
+  Do not force SIMD onto it, and do not drop a SIMD-shaped loop because
+  Debug is only a little slower. The fix
   is the layout: the columns in the consumer's read order, packed once,
   then one lane path with a mask for the tail. Inherited code the change
   keeps on the hot path is in the table. "Same as the old loop" is not

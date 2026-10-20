@@ -81,8 +81,10 @@ scope only where the diff relies on it.
    and the keys it filters on, and check them against `memory-performance.md`
    § Data-oriented design and § SIMD and core math. A read through an index
    permutation, a pointer chase, or a per-row lookup into another store is
-   a High structural finding, as is dense float work left scalar inside a
-   population loop, or lane results drained into per-item scalar calls.
+   a High structural finding, as is dense uniform float work whose shape
+   can take lanes left scalar inside a population loop, or lane results
+   drained into per-item scalar calls. An irreducible loop stays scalar.
+   A SIMD-shaped loop that is only a little slower in Debug is not a finding.
    "Same as the old loop" is not a pass. The only exemptions are search
    frontiers, pair streams, and hash point lookups, named in the plan.
    Another store's columns are packed once before the lane path. Also
