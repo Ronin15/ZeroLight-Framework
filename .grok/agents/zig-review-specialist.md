@@ -77,9 +77,11 @@ scope only where the diff relies on it.
    table covers every loop the change adds or changes and every inherited
    loop whose cost, thread placement, or access order it changes.
    **Data layout**, every review: for each hot loop, store, or index the
-   change adds or touches, name the data it reads, the order it reads it,
-   and the keys it filters on, and check them against `memory-performance.md`
-   § Data-oriented design and § SIMD and core math. A read through an index
+   change adds or touches, and for each hot loop a path the diff keeps
+   still runs, name the data it reads, the order it reads it, and the keys
+   it filters on, and check them against `memory-performance.md`
+   § Data-oriented design and § SIMD and core math. A loop the diff did
+   not edit is still in this check. A read through an index
    permutation, a pointer chase, or a per-row lookup into another store is
    a High structural finding, as is dense uniform float work whose shape
    can take lanes left scalar inside a population loop, or lane results
