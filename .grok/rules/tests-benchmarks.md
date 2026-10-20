@@ -94,6 +94,9 @@ The standard Zig layout; every change, plan, and review follows it.
 - Benches read production defaults, constants, layouts, and byte bounds
   (§ Test and production code, 3), never copies; a memory estimate is checked
   whole against live bytes.
+- A bench runs the production function on the shape that function hits in
+  play. A fixture that never reaches that shape is not a measure of the
+  path and is changed or removed.
 - Each group's doc states what it measures and its pass shape, and its
   asserts check that shape; exception: a branch's measuring landing states
   each finding's pass shape in the group doc and asserts only fixture
