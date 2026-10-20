@@ -521,6 +521,8 @@ pub const CollisionSystem = struct {
     allocator: std.mem.Allocator,
     // By fill slot.
     proxies: std.MultiArrayList(ProxyRow) = .{},
+    // Packed inputs for the fill's lane kernel, by fill slot. Reserved with `proxies`.
+    fill_inputs: std.MultiArrayList(FillInput) = .{},
     // Sort elements in sweep order; the fill first writes each range's first copies
     // into its window.
     keys: SortEntryList = .empty,
@@ -628,6 +630,7 @@ pub const CollisionSystem = struct {
         self.staging.deinit(self.allocator);
         self.merge_scratch.deinit(self.allocator);
         self.keys.deinit(self.allocator);
+        self.fill_inputs.deinit(self.allocator);
         self.proxies.deinit(self.allocator);
         self.* = undefined;
     }
@@ -655,6 +658,7 @@ pub const CollisionSystem = struct {
         const entry_capacity = body_capacity * entries_per_body;
         const pair_capacity = broadphasePairBound(body_capacity);
         try self.proxies.ensureTotalCapacity(self.allocator, hotStoreCapacity(body_capacity));
+        try self.fill_inputs.ensureTotalCapacity(self.allocator, hotStoreCapacity(body_capacity));
         try self.keys.ensureTotalCapacity(self.allocator, entry_capacity);
         try self.merge_scratch.ensureTotalCapacity(self.allocator, entry_capacity);
         try self.staging.ensureTotalCapacity(self.allocator, body_capacity);
@@ -786,13 +790,16 @@ pub const CollisionSystem = struct {
 
     // ---- Fill and sort ------------------------------------------------------------
 
-    // Sizes the step's slot buffers for `input_count` fill inputs: the proxies, the keys
-    // as the fill's first-copy output, and the warm order's capacity.
+    // Sizes the step's slot buffers for `input_count` fill inputs: the proxies, the packed
+    // fill columns, the keys as the fill's first-copy output, and the warm order's capacity.
     fn beginStep(self: *CollisionSystem, input_count: usize) !void {
         // u32 slots and sources: the bounds rows are indexed by u32 entity rows.
         std.debug.assert(input_count <= std.math.maxInt(u32));
-        try self.proxies.ensureTotalCapacity(self.allocator, hotStoreCapacity(input_count));
+        const slot_capacity = hotStoreCapacity(input_count);
+        try self.proxies.ensureTotalCapacity(self.allocator, slot_capacity);
+        try self.fill_inputs.ensureTotalCapacity(self.allocator, slot_capacity);
         setRowCount(ProxyRow, &self.proxies, input_count);
+        setRowCount(FillInput, &self.fill_inputs, input_count);
         try self.keys.ensureTotalCapacity(self.allocator, input_count);
         self.keys.items.len = input_count;
         try self.second_scratch.ensureTotalCapacity(self.allocator, input_count);
@@ -803,6 +810,7 @@ pub const CollisionSystem = struct {
     // A step with no fill input: no entries and no warm order.
     fn finishEmpty(self: *CollisionSystem) void {
         self.proxies.clearRetainingCapacity();
+        self.fill_inputs.clearRetainingCapacity();
         self.keys.clearRetainingCapacity();
         self.entries.clearRetainingCapacity();
         self.warm_count = 0;
@@ -819,6 +827,7 @@ pub const CollisionSystem = struct {
             .warm_sources = if (self.warm_count == input_count) self.warm_sources.items[0..input_count] else null,
             .strips = strips,
             .proxies = ProxyColumns.of(self.proxies.slice()),
+            .inputs = FillColumns.of(self.fill_inputs.slice()),
         };
     }
 
@@ -1893,6 +1902,51 @@ const ResolvedSlot = struct {
     velocity_y: f32,
 };
 
+// One slot's packed fill inputs. The fill job writes its range; `fillSlots` only loads
+// these columns. `filled` is 0 or 1, and u32 so one fill range of the column is a cache line.
+const FillInput = struct {
+    x: f32,
+    y: f32,
+    offset_x: f32,
+    offset_y: f32,
+    size_x: f32,
+    size_y: f32,
+    level: u32,
+    entity_index: u32,
+    filled: u32,
+};
+
+comptime {
+    std.debug.assert(collision_range_alignment_items * @sizeOf(f32) % hot_soa_column_alignment == 0);
+    std.debug.assert(collision_range_alignment_items * @sizeOf(u32) % hot_soa_column_alignment == 0);
+}
+
+const FillColumns = struct {
+    x: []f32,
+    y: []f32,
+    offset_x: []f32,
+    offset_y: []f32,
+    size_x: []f32,
+    size_y: []f32,
+    level: []u32,
+    entity_index: []u32,
+    filled: []u32,
+
+    fn of(rows: std.MultiArrayList(FillInput).Slice) FillColumns {
+        return .{
+            .x = rows.items(.x),
+            .y = rows.items(.y),
+            .offset_x = rows.items(.offset_x),
+            .offset_y = rows.items(.offset_y),
+            .size_x = rows.items(.size_x),
+            .size_y = rows.items(.size_y),
+            .level = rows.items(.level),
+            .entity_index = rows.items(.entity_index),
+            .filled = rows.items(.filled),
+        };
+    }
+};
+
 const FillContext = struct {
     data: *const DataSystem,
     bounds: ConstCollisionBoundsSlice,
@@ -1905,8 +1959,10 @@ const FillContext = struct {
     // Slot p reads input `warm_sources[p]` when set, else input p.
     warm_sources: ?[]const u32,
     strips: CollisionStrips,
-    // Written at the filled slots only.
+    // Identity columns for every slot in the range; min and max from the lane kernel.
     proxies: ProxyColumns,
+    // Lane inputs for every slot in the range, packed before `fillSlots`.
+    inputs: FillColumns,
 
     fn source(self: *const FillContext, slot: usize) u32 {
         // A slot is below the input count <= maxInt(u32).
@@ -1959,62 +2015,95 @@ const FillCounts = struct {
     seconds: usize = 0,
 };
 
-// Resolves slots `[start, end)` into their proxies, writes each filled slot's first copy to
-// `firsts` and its second-strip copy to `seconds`, both in slot order, and spills its
-// copies in later strips to `spill`. Bounds, strips, ordered coordinates, and key words in
-// lanes over the packed inputs, the last group one masked batch; resolve and copy
-// compaction scalar (a point lookup per input, a data-dependent copy count).
+// A full group, or the masked tail's live prefix with zeros in the inactive lanes.
+inline fn loadFillFloat4(column: []const f32, group: usize, count: usize) simd.Float4 {
+    if (count >= simd.lane_count) return simd.loadFloat4(column[group..]);
+    return simd.loadFloat4Prefix(column[group..], count);
+}
+
+inline fn loadFillUint4(column: []const u32, group: usize, count: usize) simd.Uint4 {
+    if (count >= simd.lane_count) return simd.loadUint4(column[group..]);
+    return simd.loadUint4Prefix(column[group..], count);
+}
+
+// One scalar pass over `[start, end)`: the warm-order input, then that input's bounds and
+// movement row. Writes the proxy identity columns and the packed lane inputs. An unresolved
+// slot stores an invalid entity and zeros, so the lane kernel's min and max stay zero.
+fn packFillRange(fill: *const FillContext, start: usize, end: usize) void {
+    const proxies = fill.proxies;
+    const inputs = fill.inputs;
+    std.debug.assert(start <= end and end <= proxies.entity.len and end <= inputs.x.len);
+    var slot = start;
+    while (slot < end) : (slot += 1) {
+        const input = fill.source(slot);
+        proxies.source[slot] = input;
+        if (fill.resolve(input)) |row| {
+            inputs.x[slot] = row.x;
+            inputs.y[slot] = row.y;
+            inputs.offset_x[slot] = row.offset_x;
+            inputs.offset_y[slot] = row.offset_y;
+            inputs.size_x[slot] = row.size_x;
+            inputs.size_y[slot] = row.size_y;
+            inputs.level[slot] = row.level;
+            inputs.entity_index[slot] = row.entity.index;
+            inputs.filled[slot] = 1;
+            proxies.entity[slot] = row.entity;
+            proxies.movement_index[slot] = row.movement_index;
+            proxies.level[slot] = row.level;
+            proxies.velocity_x[slot] = row.velocity_x;
+            proxies.velocity_y[slot] = row.velocity_y;
+        } else {
+            inputs.x[slot] = 0;
+            inputs.y[slot] = 0;
+            inputs.offset_x[slot] = 0;
+            inputs.offset_y[slot] = 0;
+            inputs.size_x[slot] = 0;
+            inputs.size_y[slot] = 0;
+            inputs.level[slot] = 0;
+            inputs.entity_index[slot] = 0;
+            inputs.filled[slot] = 0;
+            proxies.entity[slot] = EntityId.invalid;
+            proxies.movement_index[slot] = 0;
+            proxies.level[slot] = 0;
+            proxies.velocity_x[slot] = 0;
+            proxies.velocity_y[slot] = 0;
+        }
+    }
+}
+
+// Writes each filled slot's first copy to `firsts` and its second-strip copy to `seconds`,
+// both in slot order, and spills its copies in later strips to `spill`. Bounds, strips,
+// ordered coordinates, and key words in lanes over the packed inputs, the last group one
+// masked batch; copy compaction scalar (a data-dependent copy count).
 fn fillSlots(fill: *const FillContext, start: usize, end: usize, firsts: []SortEntry, seconds: []SortEntry, spill: *SpillCopies) FillCounts {
     comptime std.debug.assert(entries_per_body == 2);
     const proxies = fill.proxies;
-    std.debug.assert(start <= end and end <= proxies.entity.len and firsts.len >= end - start and seconds.len >= end - start);
+    const inputs = fill.inputs;
+    std.debug.assert(start <= end and end <= proxies.entity.len and end <= inputs.x.len);
+    std.debug.assert(firsts.len >= end - start and seconds.len >= end - start);
     const height = fill.strips.height;
     var counts = FillCounts{};
     var group = start;
     while (group < end) : (group += simd.lane_count) {
-        const lanes = simd.lanesBelow(end - group);
-        var x: [simd.lane_count]f32 = @splat(0);
-        var y: [simd.lane_count]f32 = @splat(0);
-        var offset_x: [simd.lane_count]f32 = @splat(0);
-        var offset_y: [simd.lane_count]f32 = @splat(0);
-        var size_x: [simd.lane_count]f32 = @splat(0);
-        var size_y: [simd.lane_count]f32 = @splat(0);
-        var level: [simd.lane_count]u32 = @splat(0);
-        var entity_index: [simd.lane_count]u32 = @splat(0);
+        const count = end - group;
+        const lanes = simd.lanesBelow(count);
+        const x = loadFillFloat4(inputs.x, group, count);
+        const y = loadFillFloat4(inputs.y, group, count);
+        const offset_x = loadFillFloat4(inputs.offset_x, group, count);
+        const offset_y = loadFillFloat4(inputs.offset_y, group, count);
+        const size_x = loadFillFloat4(inputs.size_x, group, count);
+        const size_y = loadFillFloat4(inputs.size_y, group, count);
+        const level = loadFillUint4(inputs.level, group, count);
+        const entity_index = loadFillUint4(inputs.entity_index, group, count);
+        const filled_words = loadFillUint4(inputs.filled, group, count);
         var filled: simd.MaskBits = 0;
         inline for (0..simd.lane_count) |lane| {
-            if (lanes & (1 << lane) != 0) {
-                const slot = group + lane;
-                const input = fill.source(slot);
-                proxies.source[slot] = input;
-                if (fill.resolve(input)) |row| {
-                    filled |= 1 << lane;
-                    x[lane] = row.x;
-                    y[lane] = row.y;
-                    offset_x[lane] = row.offset_x;
-                    offset_y[lane] = row.offset_y;
-                    size_x[lane] = row.size_x;
-                    size_y[lane] = row.size_y;
-                    level[lane] = row.level;
-                    entity_index[lane] = row.entity.index;
-                    proxies.entity[slot] = row.entity;
-                    proxies.movement_index[slot] = row.movement_index;
-                    proxies.level[slot] = row.level;
-                    proxies.velocity_x[slot] = row.velocity_x;
-                    proxies.velocity_y[slot] = row.velocity_y;
-                } else {
-                    proxies.entity[slot] = EntityId.invalid;
-                    proxies.movement_index[slot] = 0;
-                    proxies.level[slot] = 0;
-                    proxies.velocity_x[slot] = 0;
-                    proxies.velocity_y[slot] = 0;
-                }
-            }
+            if (filled_words[lane] != 0) filled |= 1 << lane;
         }
-        const min_x = simd.loadFloat4(&x) + simd.loadFloat4(&offset_x);
-        const min_y = simd.loadFloat4(&y) + simd.loadFloat4(&offset_y);
-        const max_x = min_x + simd.loadFloat4(&size_x);
-        const max_y = min_y + simd.loadFloat4(&size_y);
+        const min_x = x + offset_x;
+        const min_y = y + offset_y;
+        const max_x = min_x + size_x;
+        const max_y = min_y + size_y;
         storeFloatLanes(proxies.min_x, group, min_x, lanes);
         storeFloatLanes(proxies.min_y, group, min_y, lanes);
         storeFloatLanes(proxies.max_x, group, max_x, lanes);
@@ -2024,7 +2113,7 @@ fn fillSlots(fill: *const FillContext, start: usize, end: usize, firsts: []SortE
         const last_strip: simd.Uint4 = @bitCast(simd.lastCellOfSpan4(min_y, max_y, height, strip_count));
         const ordered_x = simd.orderedBitsFloat4(min_x);
         const ordered_y = simd.orderedBitsFloat4(min_y);
-        const level_words = simd.shiftLeftUint4(simd.loadUint4(&level), 16);
+        const level_words = simd.shiftLeftUint4(level, 16);
         inline for (0..simd.lane_count) |lane| {
             if (filled & (1 << lane) != 0) {
                 // A slot is below the input count <= maxInt(u32).
@@ -2083,9 +2172,11 @@ fn fillJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start == range.index * job.items_per_range);
     std.debug.assert(range.start <= range.end and range.end <= job.scratch.len and range.end <= job.staging.len);
     std.debug.assert(range.end <= job.second_scratch.len and range.end <= job.second_staging.len);
+    std.debug.assert(range.end <= job.fill.inputs.x.len and range.end <= job.fill.proxies.entity.len);
     const spill = &job.spill_slots[range.index].value;
     const firsts = job.scratch[range.start..range.end];
     const seconds = job.second_scratch[range.start..range.end];
+    packFillRange(&job.fill, range.start, range.end);
     const counts = fillSlots(&job.fill, range.start, range.end, firsts, seconds, spill);
     job.first_offsets[range.index].value = EntrySort.placeByBand(&job.splitters, firsts[0..counts.firsts], job.staging[range.start..range.end]);
     job.second_offsets[range.index].value = EntrySort.placeByBand(&job.splitters, seconds[0..counts.seconds], job.second_staging[range.start..range.end]);
@@ -2926,6 +3017,226 @@ test "fill lanes write the scalar key for every copy of every body" {
     // 1 + 2 + 3 + 1 + 5 + 1 copies, the signed zero's key the positive zero's.
     try std.testing.expectEqual(@as(usize, 13), copies);
     try std.testing.expectEqual(math.orderedBits(0), @as(u32, @truncate(firstKey(.default, fill.resolve(0).?) >> 64)));
+}
+
+fn expectSamePackedFill(serial: *const CollisionSystem, threaded: *const CollisionSystem) !void {
+    try std.testing.expectEqual(serial.fill_inputs.len, threaded.fill_inputs.len);
+    try std.testing.expectEqual(serial.proxies.len, threaded.proxies.len);
+    const packed_serial = FillColumns.of(serial.fill_inputs.slice());
+    const packed_threaded = FillColumns.of(threaded.fill_inputs.slice());
+    const proxies_serial = ConstProxyColumns.of(serial.proxies.slice());
+    const proxies_threaded = ConstProxyColumns.of(threaded.proxies.slice());
+    for (0..packed_serial.x.len) |slot| {
+        try std.testing.expectEqual(packed_serial.x[slot], packed_threaded.x[slot]);
+        try std.testing.expectEqual(packed_serial.y[slot], packed_threaded.y[slot]);
+        try std.testing.expectEqual(packed_serial.offset_x[slot], packed_threaded.offset_x[slot]);
+        try std.testing.expectEqual(packed_serial.offset_y[slot], packed_threaded.offset_y[slot]);
+        try std.testing.expectEqual(packed_serial.size_x[slot], packed_threaded.size_x[slot]);
+        try std.testing.expectEqual(packed_serial.size_y[slot], packed_threaded.size_y[slot]);
+        try std.testing.expectEqual(packed_serial.level[slot], packed_threaded.level[slot]);
+        try std.testing.expectEqual(packed_serial.entity_index[slot], packed_threaded.entity_index[slot]);
+        try std.testing.expectEqual(packed_serial.filled[slot], packed_threaded.filled[slot]);
+        try std.testing.expect(proxies_serial.entity[slot].eql(proxies_threaded.entity[slot]));
+        try std.testing.expectEqual(proxies_serial.movement_index[slot], proxies_threaded.movement_index[slot]);
+        try std.testing.expectEqual(proxies_serial.min_x[slot], proxies_threaded.min_x[slot]);
+        try std.testing.expectEqual(proxies_serial.min_y[slot], proxies_threaded.min_y[slot]);
+        try std.testing.expectEqual(proxies_serial.max_x[slot], proxies_threaded.max_x[slot]);
+        try std.testing.expectEqual(proxies_serial.max_y[slot], proxies_threaded.max_y[slot]);
+        try std.testing.expectEqual(proxies_serial.velocity_x[slot], proxies_threaded.velocity_x[slot]);
+        try std.testing.expectEqual(proxies_serial.velocity_y[slot], proxies_threaded.velocity_y[slot]);
+        try std.testing.expectEqual(proxies_serial.level[slot], proxies_threaded.level[slot]);
+        try std.testing.expectEqual(proxies_serial.source[slot], proxies_threaded.source[slot]);
+    }
+}
+
+fn expectUnresolvedFillSlot(columns: FillColumns, proxies: ConstProxyColumns, slot: usize) !void {
+    try std.testing.expectEqual(@as(f32, 0), columns.x[slot]);
+    try std.testing.expectEqual(@as(f32, 0), columns.y[slot]);
+    try std.testing.expectEqual(@as(f32, 0), columns.offset_x[slot]);
+    try std.testing.expectEqual(@as(f32, 0), columns.offset_y[slot]);
+    try std.testing.expectEqual(@as(f32, 0), columns.size_x[slot]);
+    try std.testing.expectEqual(@as(f32, 0), columns.size_y[slot]);
+    try std.testing.expectEqual(@as(u32, 0), columns.level[slot]);
+    try std.testing.expectEqual(@as(u32, 0), columns.entity_index[slot]);
+    try std.testing.expectEqual(@as(u32, 0), columns.filled[slot]);
+    try std.testing.expect(proxies.entity[slot].eql(EntityId.invalid));
+    try std.testing.expectEqual(@as(u32, 0), proxies.movement_index[slot]);
+    try std.testing.expectEqual(@as(u16, 0), proxies.level[slot]);
+    try std.testing.expectEqual(@as(f32, 0), proxies.velocity_x[slot]);
+    try std.testing.expectEqual(@as(f32, 0), proxies.velocity_y[slot]);
+    try std.testing.expectEqual(@as(f32, 0), proxies.min_x[slot]);
+    try std.testing.expectEqual(@as(f32, 0), proxies.min_y[slot]);
+    try std.testing.expectEqual(@as(f32, 0), proxies.max_x[slot]);
+    try std.testing.expectEqual(@as(f32, 0), proxies.max_y[slot]);
+}
+
+test "collision warm fill reads packed columns not the stores" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // Five bodies, not in sweep order: one full lane group and a masked tail.
+    const xs = [_]f32{ 40, 0, 30, 10, 20 };
+    var entities: [xs.len]EntityId = undefined;
+    for (xs, &entities) |x, *entity| {
+        entity.* = try addBox(&data, .{
+            .x = x,
+            .y = 4,
+            .w = 6,
+            .h = 6,
+            .offset_x = 1,
+            .offset_y = 2,
+            .velocity_x = x,
+            .velocity_y = 3,
+            .level = 1,
+        });
+    }
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    _ = try updateInline(&system, &data, &contacts);
+    _ = try updateInline(&system, &data, &contacts);
+    try std.testing.expectEqual(xs.len, system.warm_count);
+
+    // Sweep order by min_x: inputs 1, 3, 4, 2, 0.
+    const warm_inputs = [_]u32{ 1, 3, 4, 2, 0 };
+    const columns = FillColumns.of(system.fill_inputs.slice());
+    const proxies = ConstProxyColumns.of(system.proxies.slice());
+    const bounds = data.collisionBoundsSliceConst();
+    const movement = data.movementBodySliceConst();
+    for (warm_inputs, 0..) |input, slot| {
+        try std.testing.expectEqual(input, system.warm_sources.items[slot]);
+        try std.testing.expectEqual(input, proxies.source[slot]);
+        const bounds_row = data.collision_bounds.dynamic_ids.items[input];
+        const entity = bounds.entities[bounds_row];
+        try std.testing.expect(entity.eql(entities[input]));
+        const body = data.movementBodyDenseIndex(entity).?;
+        try std.testing.expectEqual(movement.position_x[body], columns.x[slot]);
+        try std.testing.expectEqual(movement.position_y[body], columns.y[slot]);
+        try std.testing.expectEqual(bounds.offset_x[bounds_row], columns.offset_x[slot]);
+        try std.testing.expectEqual(bounds.offset_y[bounds_row], columns.offset_y[slot]);
+        try std.testing.expectEqual(bounds.size_x[bounds_row], columns.size_x[slot]);
+        try std.testing.expectEqual(bounds.size_y[bounds_row], columns.size_y[slot]);
+        try std.testing.expectEqual(@as(u32, data.worldLevelConst(entity) orelse 0), columns.level[slot]);
+        try std.testing.expectEqual(entity.index, columns.entity_index[slot]);
+        try std.testing.expectEqual(@as(u32, 1), columns.filled[slot]);
+        try std.testing.expect(proxies.entity[slot].eql(entity));
+        try std.testing.expectEqual(@as(u32, @intCast(body)), proxies.movement_index[slot]);
+        try std.testing.expectEqual(@as(u16, 1), proxies.level[slot]);
+        try std.testing.expectEqual(movement.velocity_x[body], proxies.velocity_x[slot]);
+        try std.testing.expectEqual(movement.velocity_y[body], proxies.velocity_y[slot]);
+    }
+    try std.testing.expect(columns.x[0] != xs[0]);
+
+    // The lane kernel must keep the packed mins after the stores move.
+    const moved = data.movementBodySlice();
+    for (moved.position_x) |*x| x.* += 1000;
+    try std.testing.expect(moved.position_x[data.movementBodyDenseIndex(entities[warm_inputs[0]]).?] != columns.x[0]);
+
+    var firsts: [xs.len]SortEntry = undefined;
+    var seconds: [xs.len]SortEntry = undefined;
+    var spill = SpillCopies{};
+    defer spill.deinit(std.testing.allocator);
+    const fill = system.fillContext(&data, null, .default, xs.len);
+    const counts = fillSlots(&fill, 0, xs.len, &firsts, &seconds, &spill);
+    try std.testing.expectEqual(xs.len, counts.firsts);
+    try std.testing.expectEqual(@as(usize, 0), counts.seconds);
+
+    const proxies_after = ConstProxyColumns.of(system.proxies.slice());
+    for (0..xs.len) |slot| {
+        const min_x = columns.x[slot] + columns.offset_x[slot];
+        const min_y = columns.y[slot] + columns.offset_y[slot];
+        try std.testing.expectEqual(min_x, proxies_after.min_x[slot]);
+        try std.testing.expectEqual(min_y, proxies_after.min_y[slot]);
+        try std.testing.expectEqual(min_x + columns.size_x[slot], proxies_after.max_x[slot]);
+        try std.testing.expectEqual(min_y + columns.size_y[slot], proxies_after.max_y[slot]);
+        try std.testing.expectEqual(math.orderedBits(min_x), @as(u32, @truncate(firsts[slot].key >> 64)));
+        try std.testing.expectEqual(math.orderedBits(min_y), @as(u32, @truncate(firsts[slot].key >> 32)));
+        try std.testing.expectEqual(columns.entity_index[slot], @as(u32, @truncate(firsts[slot].key)));
+        try std.testing.expectEqual(@as(u32, 1), keyRun(firsts[slot].key) >> 16);
+        try std.testing.expect(firsts[slot].first);
+        try std.testing.expectEqual(@as(u32, @intCast(slot)), firsts[slot].slot);
+    }
+}
+
+test "collision unresolved fill slots stay empty across threads" {
+    const input_count = collision_range_alignment_items * 4 + 1;
+    // Inside a full lane group, inside a later range, and the one-slot tail range.
+    const bare_slots = [_]usize{ 1, 20, input_count - 1 };
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..input_count) |index| {
+        const bare = index == bare_slots[0] or index == bare_slots[1] or index == bare_slots[2];
+        if (bare) {
+            const entity = try data.createEntity();
+            try data.setCollisionBounds(entity, .{ .size = .{ .x = 4, .y = 4 } });
+        } else {
+            _ = try addBox(&data, .{ .x = @floatFromInt(index * 8), .y = 2, .w = 4, .h = 4, .velocity_x = 1.5, .velocity_y = -2 });
+        }
+    }
+
+    var serial = CollisionSystem.init(std.testing.allocator);
+    defer serial.deinit();
+    var threaded = CollisionSystem.init(std.testing.allocator);
+    defer threaded.deinit();
+    var serial_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer serial_contacts.deinit();
+    var threaded_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer threaded_contacts.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    const config: CollisionConfig = .{
+        .items_per_range = collision_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    };
+
+    const serial_stats = try updateInline(&serial, &data, &serial_contacts);
+    const threaded_stats = try threaded.update(&data, &threaded_contacts, &threads, config);
+    try std.testing.expectEqual(input_count - bare_slots.len, serial_stats.body_count);
+    try std.testing.expectEqual(serial_stats.body_count, threaded_stats.body_count);
+    try std.testing.expect(!threaded_stats.broadphase_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 0), serial.warm_count);
+    try std.testing.expectEqual(@as(usize, 0), threaded.warm_count);
+    try expectSameContacts(serial_contacts.mergedItems(), threaded_contacts.mergedItems());
+    try expectSamePackedFill(&serial, &threaded);
+
+    const movement = data.movementBodySlice();
+    for (movement.position_x) |*position_x| position_x.* += 50;
+    const serial_again = try updateInline(&serial, &data, &serial_contacts);
+    const threaded_again = try threaded.update(&data, &threaded_contacts, &threads, config);
+    try std.testing.expectEqual(serial_stats.body_count, serial_again.body_count);
+    try std.testing.expectEqual(serial_again.body_count, threaded_again.body_count);
+    try std.testing.expectEqual(serial_again.entry_count, threaded_again.entry_count);
+    try std.testing.expect(!threaded_again.broadphase_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 0), serial.warm_count);
+    try std.testing.expectEqual(@as(usize, 0), threaded.warm_count);
+    try expectSameContacts(serial_contacts.mergedItems(), threaded_contacts.mergedItems());
+    try expectSamePackedFill(&serial, &threaded);
+
+    const columns = FillColumns.of(serial.fill_inputs.slice());
+    const proxies = ConstProxyColumns.of(serial.proxies.slice());
+    for (bare_slots) |slot| try expectUnresolvedFillSlot(columns, proxies, slot);
+    for ([_]*const CollisionSystem{ &serial, &threaded }) |system| {
+        for (system.keys.items[0..serial_again.entry_count]) |entry| {
+            for (bare_slots) |bare| try std.testing.expect(entry.slot != bare);
+        }
+    }
+    // Cold order: slot 0 is still input 0 after the move. Slot 21 is the live row after the bare at 20.
+    try std.testing.expectEqual(@as(u32, 0), proxies.source[0]);
+    try std.testing.expectEqual(@as(u32, 1), proxies.source[bare_slots[0]]);
+    try std.testing.expectEqual(@as(f32, 50), columns.x[0]);
+    try std.testing.expectEqual(@as(f32, 2), columns.y[0]);
+    try std.testing.expectEqual(@as(u32, 1), columns.filled[0]);
+    try std.testing.expectEqual(@as(f32, 50), proxies.min_x[0]);
+    try std.testing.expectEqual(@as(f32, 2), proxies.min_y[0]);
+    try std.testing.expectEqual(@as(f32, 54), proxies.max_x[0]);
+    try std.testing.expectEqual(@as(f32, 6), proxies.max_y[0]);
+    try std.testing.expectEqual(@as(f32, 1.5), proxies.velocity_x[0]);
+    try std.testing.expectEqual(@as(f32, -2), proxies.velocity_y[0]);
+    try std.testing.expect(proxies.entity[0].isValid());
+    try std.testing.expectEqual(@as(f32, 21 * 8 + 50), columns.x[21]);
+    try std.testing.expectEqual(@as(f32, 21 * 8 + 50), proxies.min_x[21]);
 }
 
 test "warm and cold steps write identical contacts" {
@@ -3821,6 +4132,8 @@ test "collision proxies and entries round capacity for cache-line range splittin
     try std.testing.expectEqual(@as(usize, 0), (collision_range_alignment_items * @sizeOf(f32)) % hot_soa_column_alignment);
     try std.testing.expectEqual(@as(usize, collision_range_alignment_items * 3 + 1), system.proxies.len);
     try std.testing.expectEqual(@as(usize, collision_range_alignment_items * 4), hotStoreCapacity(system.proxies.len));
+    try std.testing.expectEqual(system.proxies.len, system.fill_inputs.len);
+    try std.testing.expect(system.fill_inputs.capacity >= hotStoreCapacity(system.fill_inputs.len));
     try std.testing.expectEqual(stats.entry_count + simd.lane_count, system.entries.len);
 }
 
