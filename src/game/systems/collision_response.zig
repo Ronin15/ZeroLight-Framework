@@ -2,30 +2,27 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Collision response over the step's merged contact stream, in two thread-system
-//! stages, each with an inline path. `gather` (over contacts) classifies each contact,
-//! resolves the movement row of each response intent, writes its range's windows of
-//! intents, triggers, and observer contacts, and runs the intent math. When the gather
-//! ran on workers, it also places its resolved intents by movement-row band, and the
-//! `apply` stage (over bands) applies, for the rows each band owns, every gather range's
-//! band segment in range order. Otherwise each gather range applies its own window
-//! before it returns, so an inline gather's timing covers the apply its choice keeps on
-//! the calling thread. Either way each movement row receives its intents in contact order,
-//! so the result is independent of the partition. The main thread streams the trigger
-//! windows and compacts the observer windows in range order.
+//! Collision response over the step's merged contact stream. `gather` (over contacts)
+//! classifies each contact, resolves the movement row of each response intent, writes
+//! its range's windows of intents, triggers, and observer contacts, and runs the intent
+//! math. When the gather runs on workers, each range groups its placed intents into
+//! 16-row movement blocks on that worker's direct block table, and one place range
+//! merges those runs; `apply` then writes each occupied block on one worker. When the
+//! gather runs inline, including no worker threads, each range applies its own window
+//! before it returns. Either way each movement row receives its intents in contact
+//! order, so the result is independent of the partition. The main thread streams the
+//! trigger windows and compacts the observer windows in range order.
 
 const std = @import("std");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
-const BandPartition = @import("../../app/thread_system.zig").BandPartition;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const band_tuner_config = @import("../../app/thread_system.zig").band_tuner_config;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const setRowCount = @import("../../app/thread_system.zig").setRowCount;
@@ -41,6 +38,7 @@ const CollisionContact = @import("../simulation.zig").CollisionContact;
 const CollisionTriggerEvent = @import("../simulation.zig").CollisionTriggerEvent;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const math = @import("../../core/math.zig");
+const pdq = @import("../../core/sort.zig").pdq;
 const simd = @import("../../core/simd.zig");
 
 const collision_response_range_alignment_items: usize = hot_soa_column_alignment / @sizeOf(f32);
@@ -51,14 +49,40 @@ const no_row: u32 = std.math.maxInt(u32);
 // each. Exhausting them needs 2^31 live contacts in one step, so `beginStep` fails it as the
 // allocator does.
 const max_step_intents: usize = std.math.maxInt(u32);
-// Partition width of the band apply, not a capacity: results are independent of the band
-// count, and a gather range's band histogram stays on the worker stack.
-const max_bands: usize = 64;
-// Movement rows per band block; a band owns whole blocks.
-const band_block_rows: usize = collision_response_range_alignment_items;
+/// Movement rows one apply item owns. A block is never split across workers.
+pub const block_rows: usize = collision_response_range_alignment_items;
+const block_row_shift: u6 = 4;
+// `BlockSlot` is 16 bytes so a worker region can start on a cache line.
+const block_slots_per_line: usize = thread_shared_record_alignment / 16;
 
 fn hotStoreCapacity(min_len: usize) usize {
     return std.mem.alignForwardAnyAlign(usize, min_len, collision_response_range_alignment_items);
+}
+
+fn blockId(movement_row: u32) u32 {
+    return movement_row >> block_row_shift;
+}
+
+fn blockCount(movement_rows: usize) usize {
+    // `block_rows >= 1`, so the result fits `usize`.
+    return @intCast((@as(u128, movement_rows) + (block_rows - 1)) / block_rows);
+}
+
+// Slots per worker so the next worker's first slot does not share a cache line.
+fn tableStride(blocks: usize) usize {
+    return std.mem.alignForward(usize, blocks, block_slots_per_line);
+}
+
+// Main plus one worker per extra cpu: the most participants a pool sized to this
+// machine has. A step whose pool is larger grows the table before it dispatches.
+fn participantCeiling() usize {
+    const cpu = std.Thread.getCpuCount() catch 1;
+    return @max(cpu, 1);
+}
+
+comptime {
+    std.debug.assert(block_rows == 16 and std.math.isPowerOfTwo(block_rows));
+    std.debug.assert((1 << block_row_shift) == block_rows);
 }
 
 const ResponseIntentKind = enum(u32) {
@@ -136,8 +160,8 @@ const ApplyColumns = struct {
 };
 
 /// The response's stage-threads value: null `items_per_range` with `adaptive` trains each
-/// stage's own tuner; an explicit `items_per_range` pins the gather range size and gives
-/// the apply one band per range.
+/// stage's own tuner; an explicit `items_per_range` pins both stages' range size. Apply
+/// items are whole blocks, so a range size never splits one.
 pub const CollisionResponseConfig = struct {
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
@@ -155,9 +179,10 @@ pub const CollisionResponseStats = struct {
     observer_contact_count: usize = 0,
     perf: Perf = .{},
 
-    /// The gather and apply batches, kept only with `runtime_perf_log.enabled`.
+    /// The gather, place, and apply batches, kept only with `runtime_perf_log.enabled`.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         gather_batch: BatchStats = .{},
+        place_batch: BatchStats = .{},
         apply_batch: BatchStats = .{},
     } else struct {};
 };
@@ -171,20 +196,66 @@ pub fn estimateTriggerCapacity(contact_capacity: usize) usize {
 }
 
 const IndexList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
+// One index per intent. A gather range records the block ids it claimed; place reuses
+// the front as one cursor per gather range.
+const ClaimedList = std.array_list.Aligned(usize, .fromByteUnits(thread_shared_record_alignment));
 const TriggerList = std.array_list.Aligned(CollisionTriggerEvent, .fromByteUnits(thread_shared_record_alignment));
+const BlockSlotList = std.array_list.Aligned(BlockSlot, .fromByteUnits(thread_shared_record_alignment));
 
-// One gather range's counts, and, when the gather ran on workers, the per-band start
-// offsets of its placed intents within its order window; entry `band_count` is the
-// range's placed count.
+// One gather range's counts. When the gather ran on workers, `run_count` is the occupied
+// blocks in that range; their `{block_id, begin, count}` runs sit at the range's intent
+// window in `range_runs`.
 const GatherRow = struct {
-    offsets: [max_bands + 1]u32 = @splat(0),
+    run_count: u32 = 0,
     intents: u32 = 0,
     triggers: u32 = 0,
     observer: u32 = 0,
 };
 
+// One gather range's placed intents for one movement block. `begin` is absolute into
+// `intent_order`; the `count` indices are that block's intents in contact order.
+const Run = struct {
+    block_id: u32,
+    begin: u32,
+    count: u32,
+};
+
+const RunList = std.array_list.Aligned(Run, .fromByteUnits(thread_shared_record_alignment));
+
+// One worker's generation, padded so adjacent workers do not share a cache line.
+const WorkerGeneration = struct { value: u32 = 0 };
+
+// One occupied block: the grouped runs `[run_begin, run_begin + run_count)` are its
+// gather ranges in range order.
+const BlockItem = struct {
+    block_id: u32,
+    run_begin: u32,
+    run_count: u32,
+};
+
+// One direct block slot, indexed by `block_id`. `stamp` equal to the range generation
+// means this range already claimed it. The next range on the same worker uses the next
+// generation, so it does not clear the table. `std.HashMap` is not used: it allocates,
+// and gather runs on a worker. `pad` keeps the slot 16 bytes so worker regions can
+// start on a cache line.
+const BlockSlot = struct {
+    count: u32 = 0,
+    cursor: u32 = 0,
+    stamp: u32 = 0,
+    pad: u32 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(BlockSlot) == 16);
+    std.debug.assert(thread_shared_record_alignment % @sizeOf(BlockSlot) == 0);
+    std.debug.assert(block_slots_per_line == thread_shared_record_alignment / @sizeOf(BlockSlot));
+}
+
 comptime {
     std.debug.assert(@sizeOf(PaddedSlot(GatherRow)) % thread_shared_record_alignment == 0);
+    // A gather range's claim window starts at twice its first contact. Range starts are
+    // multiples of the contact alignment, so adjacent windows do not share a cache line.
+    std.debug.assert((2 * collision_response_range_alignment_items * @sizeOf(usize)) % thread_shared_record_alignment == 0);
 }
 
 fn setListCount(list: anytype, count: usize) void {
@@ -192,23 +263,36 @@ fn setListCount(list: anytype, count: usize) void {
     list.items.len = count;
 }
 
-// The partition of movement rows into bands of whole `band_block_rows` blocks.
-const RowBands = BandPartition(band_block_rows, max_bands);
-
 pub const CollisionResponseSystem = struct {
     allocator: std.mem.Allocator,
     // Gather range r's intents start at `2 * r * items_per_range`; its trigger and observer
     // windows at `r * items_per_range`.
     intent_rows: std.MultiArrayList(IntentRow) = .{},
-    // Band-ordered absolute intent indices, in the intent windows; written only when the
+    // Block-grouped absolute intent indices, in the intent windows; written only when the
     // gather ran on workers.
     intent_order: IndexList = .empty,
+    // Per-range runs at the intent-window base, then those runs grouped by block.
+    range_runs: RunList = .empty,
+    grouped_runs: std.ArrayList(Run) = .empty,
+    block_items: std.ArrayList(BlockItem) = .empty,
+    // `table_participants` regions of `table_stride` slots. A region is that worker's
+    // direct block table; `table_blocks` is how many leading slots are real blocks.
+    block_slots: BlockSlotList = .empty,
+    worker_generation: SlotList(WorkerGeneration) = .empty,
+    // Cached by the first reserve. Later steps do not call getCpuCount.
+    participant_ceiling: usize = 0,
+    table_participants: usize = 0,
+    table_blocks: usize = 0,
+    table_stride: usize = 0,
+    // Block ids a gather range claimed, in its intent window. Place reuses the front
+    // as cursors after the gather joins.
+    claimed_slots: ClaimedList = .empty,
     trigger_staging: TriggerList = .empty,
     // Observer windows; compacted after the gather into this step's observer contacts.
     observer_staging: IndexList = .empty,
     gather_rows: SlotList(GatherRow) = .empty,
     gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    apply_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(band_tuner_config),
+    apply_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     // The observer and the contact count of the stream the observer contacts index.
     observer: EntityId = EntityId.invalid,
     observer_source_contacts: usize = 0,
@@ -221,6 +305,12 @@ pub const CollisionResponseSystem = struct {
         self.gather_rows.deinit(self.allocator);
         self.observer_staging.deinit(self.allocator);
         self.trigger_staging.deinit(self.allocator);
+        self.claimed_slots.deinit(self.allocator);
+        self.worker_generation.deinit(self.allocator);
+        self.block_slots.deinit(self.allocator);
+        self.block_items.deinit(self.allocator);
+        self.grouped_runs.deinit(self.allocator);
+        self.range_runs.deinit(self.allocator);
         self.intent_order.deinit(self.allocator);
         self.intent_rows.deinit(self.allocator);
         self.* = undefined;
@@ -264,54 +354,73 @@ pub const CollisionResponseSystem = struct {
         const contact_count = input.contacts.len;
 
         var stats = CollisionResponseStats{ .contact_count = contact_count };
-        var gather_items_per_range = contact_count;
-        // With no bands, the gather ranges apply their own windows.
-        var bands_used = false;
-        if (ResponseThreads.withWorkers(threads)) |stage| {
-            const gather_stage = stage.stage(&self.gather_tuner);
-            const selection = gather_stage.select(contact_count, collision_response_range_alignment_items);
-            setSlotCount(GatherRow, &self.gather_rows, selection.range_count);
-            // Placement and the band apply only pay off with workers; an inline gather
-            // applies each window inside its timed range instead.
-            const bands: ?RowBands = if (selection.worker_threads > 0) RowBands.init(columns.position_x.len) else null;
-            var gather = GatherJob{
-                .input = input,
-                .order = self.intent_order.items,
-                .bands = bands,
-                .apply = if (selection.worker_threads == 0) columns else null,
-                .items_per_range = selection.items_per_range,
-                .gather_rows = self.gather_rows.items,
-            };
-            const gather_batch = gather_stage.run(selection, contact_count, collision_response_range_alignment_items, &gather, gatherJob);
-            if (comptime runtime_perf_log.enabled) stats.perf.gather_batch = gather_batch;
-            gather_items_per_range = selection.items_per_range;
+        // Zero workers and a tuner that stays inline take this same select. One range
+        // then applies inside the gather, so there is no second walk of the contacts.
+        const gather_stage = threads.stage(&self.gather_tuner);
+        const selection = gather_stage.select(contact_count, collision_response_range_alignment_items);
+        setSlotCount(GatherRow, &self.gather_rows, selection.range_count);
+        const inline_apply = selection.worker_threads == 0;
+        const blocks = blockCount(input.movement_entities.len);
+        if (!inline_apply and blocks != 0) {
+            try self.ensureDirectTables(threads.thread_system.participantSlotCount(), blocks);
+        }
+        var gather = GatherJob{
+            .input = input,
+            .order = self.intent_order.items,
+            .runs = self.range_runs.items,
+            .block_slots = self.block_slots.items,
+            .table_blocks = if (inline_apply) 0 else blocks,
+            .table_stride = self.table_stride,
+            .generations = self.worker_generation.items,
+            .claimed = self.claimed_slots.items,
+            .apply = if (inline_apply) columns else null,
+            .items_per_range = selection.items_per_range,
+            .gather_rows = self.gather_rows.items,
+        };
+        const gather_batch = gather_stage.run(selection, contact_count, collision_response_range_alignment_items, &gather, gatherJob);
+        if (comptime runtime_perf_log.enabled) stats.perf.gather_batch = gather_batch;
 
-            if (bands) |row_bands| {
-                bands_used = true;
-                // No placed intent leaves nothing to apply.
-                if (placedIntentCount(self.gather_rows.items, row_bands) > 0) {
-                    // A fixed shape (an explicit range size) applies one band per range.
-                    var apply_stage = stage.stage(&self.apply_tuner);
-                    if (stage.config.items_per_range != null) apply_stage.items_per_range = 1;
-                    const apply_selection = apply_stage.select(row_bands.band_count, 1);
-                    var apply = ApplyBandJob{
-                        .intents = input.intents,
-                        .columns = columns,
-                        .row_count = columns.position_x.len,
-                        .order = self.intent_order.items,
-                        .gather_rows = self.gather_rows.items,
-                        .gather_items_per_range = gather_items_per_range,
-                        .bands = row_bands,
-                        .range_count = apply_selection.range_count,
-                    };
-                    const apply_batch = apply_stage.run(apply_selection, row_bands.band_count, 1, &apply, applyBandJob);
-                    if (comptime runtime_perf_log.enabled) stats.perf.apply_batch = apply_batch;
-                }
+        if (!inline_apply) {
+            const run_count = runTotal(self.gather_rows.items);
+            if (run_count > 0) {
+                // One range for every run. A one-item batch is the caller's; the merge is
+                // not split across workers. Worker 0's table is free after the gather join.
+                std.debug.assert(self.table_blocks > 0 and self.worker_generation.items.len > 0);
+                std.debug.assert(self.table_stride <= self.block_slots.items.len);
+                const region = self.block_slots.items[0..self.table_stride];
+                const generation = bumpGeneration(&self.worker_generation.items[0].value.value, region);
+                var place = PlaceJob{
+                    .gather_rows = self.gather_rows.items,
+                    .range_runs = self.range_runs.items,
+                    .grouped = self.grouped_runs.items,
+                    .block_slots = region[0..self.table_blocks],
+                    .claimed = self.claimed_slots.items,
+                    .generation = generation,
+                    .gather_items_per_range = selection.items_per_range,
+                    .run_count = run_count,
+                };
+                const place_batch = threads.thread_system.parallelForWithOptions(1, &place, placeJob, .{
+                    .items_per_range = 1,
+                    .max_worker_threads = selection.worker_threads,
+                    .range_alignment_items = 1,
+                    .adaptive = false,
+                });
+                if (comptime runtime_perf_log.enabled) stats.perf.place_batch = place_batch;
+
+                const block_count = scanBlockItems(self.grouped_runs.items[0..run_count], self.block_items.items);
+                var apply_stage = threads.stage(&self.apply_tuner);
+                const apply_selection = apply_stage.select(block_count, 1);
+                var apply = ApplyBlockJob{
+                    .intents = input.intents,
+                    .columns = columns,
+                    .order = self.intent_order.items,
+                    .runs = self.grouped_runs.items,
+                    .blocks = self.block_items.items[0..block_count],
+                    .range_count = apply_selection.range_count,
+                };
+                const apply_batch = apply_stage.run(apply_selection, block_count, 1, &apply, applyBlockJob);
+                if (comptime runtime_perf_log.enabled) stats.perf.apply_batch = apply_batch;
             }
-        } else {
-            setSlotCount(GatherRow, &self.gather_rows, 1);
-            self.gather_rows.items[0].value = gatherApplyRange(&input, columns, 0, contact_count);
-            if (comptime runtime_perf_log.enabled) stats.perf.gather_batch = inlineBatch(contact_count, collision_response_range_alignment_items);
         }
 
         for (self.gather_rows.items) |slot| {
@@ -321,10 +430,10 @@ pub const CollisionResponseSystem = struct {
         }
         // The apply's time is absorbed by the gather's inline range.
         if (comptime runtime_perf_log.enabled) {
-            if (!bands_used) stats.perf.apply_batch = inlineBatch(stats.intent_count, 1);
+            if (inline_apply) stats.perf.apply_batch = inlineBatch(stats.intent_count, 1);
         }
-        self.streamTriggers(frame, stats.trigger_count, gather_items_per_range);
-        self.compactObserverWindows(gather_items_per_range);
+        self.streamTriggers(frame, stats.trigger_count, selection.items_per_range);
+        self.compactObserverWindows(selection.items_per_range);
         std.debug.assert(self.observer_staging.items.len == stats.observer_contact_count);
         return stats;
     }
@@ -349,6 +458,10 @@ pub const CollisionResponseSystem = struct {
         const intent_capacity = 2 * contact_count;
         setRowCount(IntentRow, &self.intent_rows, intent_capacity);
         setListCount(&self.intent_order, intent_capacity);
+        setListCount(&self.claimed_slots, intent_capacity);
+        setListCount(&self.range_runs, intent_capacity);
+        setListCount(&self.grouped_runs, intent_capacity);
+        setListCount(&self.block_items, intent_capacity);
         setListCount(&self.trigger_staging, contact_count);
         setListCount(&self.observer_staging, contact_count);
 
@@ -405,16 +518,81 @@ pub const CollisionResponseSystem = struct {
         const intent_capacity = 2 * contact_capacity;
         try self.intent_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(intent_capacity));
         try self.intent_order.ensureTotalCapacity(self.allocator, intent_capacity);
+        try self.claimed_slots.ensureTotalCapacity(self.allocator, intent_capacity);
+        try self.range_runs.ensureTotalCapacity(self.allocator, intent_capacity);
+        try self.grouped_runs.ensureTotalCapacity(self.allocator, intent_capacity);
+        try self.block_items.ensureTotalCapacity(self.allocator, intent_capacity);
+        try self.ensureDirectTableReserve(contact_capacity);
         try self.trigger_staging.ensureTotalCapacity(self.allocator, contact_capacity);
         try self.observer_staging.ensureTotalCapacity(self.allocator, contact_capacity);
         try self.gather_rows.ensureTotalCapacity(self.allocator, @max(maxRangeCount(contact_capacity, collision_response_range_alignment_items), 1));
     }
+
+    // Capacity for one direct table per machine participant, long enough for a block
+    // per `block_rows` contacts. The step commits the live length from its movement
+    // rows and its thread system's participants; this keeps that commit from allocating
+    // when the contact bound covers the bodies.
+    fn ensureDirectTableReserve(self: *CollisionResponseSystem, contact_capacity: usize) !void {
+        if (contact_capacity == 0) return;
+        const blocks = blockCount(contact_capacity);
+        const participants = self.participantCeilingCached();
+        const slots = std.math.mul(usize, participants, tableStride(blocks)) catch return error.OutOfMemory;
+        try self.ensureBlockSlotCapacity(slots);
+        try self.worker_generation.ensureTotalCapacity(self.allocator, participants);
+    }
+
+    // The machine's participant count, read once. A step whose pool is already
+    // reserved does not call getCpuCount.
+    fn participantCeilingCached(self: *CollisionResponseSystem) usize {
+        if (self.participant_ceiling == 0) self.participant_ceiling = participantCeiling();
+        return self.participant_ceiling;
+    }
+
+    // New slots are zero, so a stamp of zero stays empty. A grow copies the old stamps.
+    fn ensureBlockSlotCapacity(self: *CollisionResponseSystem, slot_count: usize) !void {
+        const old_capacity = self.block_slots.capacity;
+        try self.block_slots.ensureTotalCapacity(self.allocator, slot_count);
+        if (self.block_slots.capacity != old_capacity) {
+            @memset(self.block_slots.allocatedSlice()[old_capacity..], .{});
+        }
+    }
+
+    // One region per participant, `blocks` long, stride-padded to a cache line. A
+    // larger layout clears the slots. Generations already stored stay, and new
+    // workers start at zero. A layout that already fits does not change. Failure
+    // leaves the committed layout unchanged.
+    fn ensureDirectTables(self: *CollisionResponseSystem, participants: usize, blocks: usize) !void {
+        std.debug.assert(participants > 0 and blocks > 0);
+        if (participants <= self.table_participants and blocks <= self.table_blocks) return;
+        const new_participants = @max(self.table_participants, participants);
+        const new_blocks = @max(self.table_blocks, blocks);
+        const stride = tableStride(new_blocks);
+        const slot_count = std.math.mul(usize, new_participants, stride) catch return error.OutOfMemory;
+        const old_slot_capacity = self.block_slots.capacity;
+        try self.block_slots.ensureTotalCapacity(self.allocator, slot_count);
+        try self.worker_generation.ensureTotalCapacity(self.allocator, new_participants);
+        if (self.block_slots.capacity != old_slot_capacity) {
+            @memset(self.block_slots.allocatedSlice()[old_slot_capacity..], .{});
+        }
+        self.block_slots.items.len = slot_count;
+        @memset(self.block_slots.items, .{});
+        // Keep generations already stored. Resetting one to 0 makes the next
+        // bump (1) match a stamp left in a region this clear did not cover.
+        const old_generations = self.worker_generation.items.len;
+        self.worker_generation.items.len = new_participants;
+        if (new_participants > old_generations) {
+            @memset(self.worker_generation.items[old_generations..], .{});
+        }
+        self.table_participants = new_participants;
+        self.table_blocks = new_blocks;
+        self.table_stride = stride;
+    }
 };
 
-fn placedIntentCount(gather_rows: []const PaddedSlot(GatherRow), bands: RowBands) usize {
-    var placed: usize = 0;
-    for (gather_rows) |slot| placed += slot.value.offsets[bands.band_count];
-    return placed;
+fn runTotal(gather_rows: []const PaddedSlot(GatherRow)) usize {
+    var total: usize = 0;
+    for (gather_rows) |slot| total += slot.value.run_count;
+    return total;
 }
 
 // One nonempty step's gather inputs and the movement columns its apply writes.
@@ -436,6 +614,9 @@ const GatherInput = struct {
 
 // Contacts `[start, end)`: observer contacts, triggers, and response intents written
 // compactly from their window starts, then the window's intent math.
+// Scalar. Each contact is two slot resolves and a compact tail that is missing, a
+// trigger, a static pair, one dynamic, or both. `computeIntentMath` already consumes
+// that tail in lanes; masking the classify would drain the lanes back into it.
 fn gatherRange(input: *const GatherInput, start: usize, end: usize) GatherRow {
     const intent_start = 2 * start;
     var intent_count: usize = 0;
@@ -556,19 +737,40 @@ fn computeIntentMath(intents: IntentColumns, start: usize, end: usize) void {
 // `gather`: one range of contacts.
 const GatherJob = struct {
     input: GatherInput,
-    // Range r's order window starts at `2 * r * items_per_range`.
+    // Range r's order and run windows start at `2 * r * items_per_range`.
     order: []u32,
-    // Set when the gather runs on workers: place the intents for the band apply.
-    bands: ?RowBands,
+    runs: []Run,
+    // Worker `w`'s table is `block_slots[w * table_stride ..][0 .. table_blocks]`.
+    // `table_blocks == 0` skips the table (no movement rows, or the gather applies inline).
+    block_slots: []BlockSlot,
+    table_blocks: usize,
+    table_stride: usize,
+    generations: []PaddedSlot(WorkerGeneration),
+    // Block ids, one slot per intent. Range r writes `[2 * range.start, 2 * range.start + intents)`.
+    claimed: []usize,
     // Set when the gather runs inline: each range applies its own window.
     apply: ?ApplyColumns,
     items_per_range: usize,
     gather_rows: []PaddedSlot(GatherRow),
 };
 
-// Gathers the range's contacts. Inline, then applies the range's window; on workers,
-// places each resolved intent's index in the range's order window by movement band, in
-// source order within a band, and records the band offsets for the band apply.
+// The next generation for this worker. The wrap clears that worker's region so generation
+// 1 cannot match a slot stamped in the previous cycle. Any other value leaves the
+// region as the previous range wrote it.
+fn bumpGeneration(generation: *u32, region: []BlockSlot) u32 {
+    if (generation.* == std.math.maxInt(u32)) {
+        @memset(region, .{});
+        generation.* = 1;
+    } else {
+        generation.* += 1;
+    }
+    return generation.*;
+}
+
+// Gathers the range's contacts. Inline, then applies the range's window. On workers,
+// groups the resolved intents by 16-row block: one direct load per intent, a prefix of
+// the claimed blocks, one scatter in intent order. No digit passes and no sort of the
+// intent indexes.
 fn gatherJob(context: *anyopaque, range: ParallelRange, worker: WorkerId) void {
     const job: *GatherJob = @ptrCast(@alignCast(context));
     const input = &job.input;
@@ -576,11 +778,11 @@ fn gatherJob(context: *anyopaque, range: ParallelRange, worker: WorkerId) void {
     std.debug.assert(range.start == range.index * job.items_per_range);
     std.debug.assert(range.start <= range.end and range.end <= input.contacts.len);
     std.debug.assert(2 * range.end <= input.intents.movement_row.len and 2 * range.end <= job.order.len);
+    std.debug.assert(2 * range.end <= job.runs.len);
     std.debug.assert(range.end <= input.triggers.len and range.end <= input.observers.len);
     if (job.apply) |columns| {
         // Inline ranges run in range order on the calling thread, so each window's apply
         // keeps every movement row's intents in contact order.
-        std.debug.assert(job.bands == null);
         std.debug.assert(worker.index == WorkerId.main.index);
         const row_count = input.movement_entities.len;
         std.debug.assert(columns.position_x.len == row_count and columns.position_y.len == row_count);
@@ -589,58 +791,229 @@ fn gatherJob(context: *anyopaque, range: ParallelRange, worker: WorkerId) void {
         return;
     }
     var row = gatherRange(input, range.start, range.end);
-    if (job.bands) |bands| {
-        const window_start = 2 * range.start;
-        const window_end = window_start + row.intents;
-        const movement_rows = input.intents.movement_row;
-        for (movement_rows[window_start..window_end]) |movement_row| {
-            if (movement_row != no_row) row.offsets[bands.bandOfRow(movement_row) + 1] += 1;
+    const span = range.end - range.start;
+    std.debug.assert(row.intents <= 2 * span);
+    const window_start = 2 * range.start;
+    std.debug.assert(window_start + row.intents <= job.claimed.len);
+    // The window is this range's alone, and it starts on a cache line.
+    if (row.intents != 0) std.debug.assert(@intFromPtr(&job.claimed[window_start]) % thread_shared_record_alignment == 0);
+    if (job.table_blocks == 0) {
+        if (row.intents != 0) {
+            for (input.intents.movement_row[window_start..][0..row.intents]) |movement_row| {
+                std.debug.assert(movement_row == no_row);
+            }
         }
-        for (1..bands.band_count + 1) |band| row.offsets[band] += row.offsets[band - 1];
-        var cursor = row.offsets;
-        for (window_start..window_end) |intent_index| {
-            const movement_row = movement_rows[intent_index];
-            if (movement_row == no_row) continue;
-            const band = bands.bandOfRow(movement_row);
-            // Intent indices fit u32 (`max_step_intents`).
-            job.order[window_start + cursor[band]] = @intCast(intent_index);
-            cursor[band] += 1;
-        }
+        row.run_count = 0;
+        job.gather_rows[range.index].value = row;
+        return;
     }
+    std.debug.assert(worker.index < job.generations.len);
+    std.debug.assert(job.table_stride >= job.table_blocks);
+    const base = worker.index * job.table_stride;
+    std.debug.assert(base + job.table_stride <= job.block_slots.len);
+    const region = job.block_slots[base..][0..job.table_stride];
+    const generation = bumpGeneration(&job.generations[worker.index].value.value, region);
+    row.run_count = groupRangeIntents(
+        input.intents.movement_row[window_start..][0..row.intents],
+        window_start,
+        job.order,
+        job.runs[window_start..],
+        region[0..job.table_blocks],
+        job.claimed[window_start..][0..row.intents],
+        generation,
+    );
     job.gather_rows[range.index].value = row;
 }
 
-// `apply`: one range of bands.
-const ApplyBandJob = struct {
+fn runBlockLess(_: void, lhs: Run, rhs: Run) bool {
+    return lhs.block_id < rhs.block_id;
+}
+
+// The window's placed intents. One load of `table[block_id]` claims the block; the
+// claimed ids become the runs, ordered by block id. The bin is the block id. Empty
+// slots are not visited. Returns the run count.
+fn groupRangeIntents(
+    movement_rows: []const u32,
+    window_start: usize,
+    order: []u32,
+    runs: []Run,
+    table: []BlockSlot,
+    claimed: []usize,
+    generation: u32,
+) u32 {
+    if (movement_rows.len == 0) return 0;
+    std.debug.assert(generation != 0);
+    std.debug.assert(runs.len >= movement_rows.len);
+    // One claim per intent, not one entry per block in the population.
+    std.debug.assert(claimed.len == movement_rows.len);
+    std.debug.assert(window_start + movement_rows.len <= order.len);
+    var distinct: usize = 0;
+    for (movement_rows) |movement_row| {
+        if (movement_row == no_row) continue;
+        const block_id = blockId(movement_row);
+        std.debug.assert(block_id < table.len);
+        const slot = &table[block_id];
+        if (slot.stamp != generation) {
+            std.debug.assert(distinct < claimed.len);
+            claimed[distinct] = block_id;
+            distinct += 1;
+            slot.* = .{ .stamp = generation };
+        }
+        slot.count += 1;
+    }
+    if (distinct == 0) return 0;
+
+    for (claimed[0..distinct], 0..) |block_index, index| {
+        const slot = &table[block_index];
+        std.debug.assert(slot.stamp == generation and slot.count != 0);
+        runs[index] = .{
+            .block_id = @intCast(block_index),
+            .begin = 0,
+            .count = slot.count,
+        };
+    }
+    // One run per claimed block. Not a sort of the intents.
+    pdq(Run, runs[0..distinct], {}, runBlockLess);
+    var local: u32 = 0;
+    const window_base: u32 = @intCast(window_start);
+    for (runs[0..distinct], 0..) |*run, index| {
+        if (index > 0) std.debug.assert(runs[index - 1].block_id < run.block_id);
+        run.begin = window_base + local;
+        table[run.block_id].cursor = run.begin;
+        local += run.count;
+    }
+
+    var scattered: u32 = 0;
+    for (movement_rows, 0..) |movement_row, offset| {
+        if (movement_row == no_row) continue;
+        const slot = &table[blockId(movement_row)];
+        std.debug.assert(slot.stamp == generation);
+        // Intent indices fit u32 (`max_step_intents`).
+        order[slot.cursor] = @intCast(window_start + offset);
+        slot.cursor += 1;
+        scattered += 1;
+    }
+    std.debug.assert(scattered == local);
+    return @intCast(distinct);
+}
+
+// `place`: one range, on the caller. One load of `table[block_id]` per run, then a
+// prefix of the blocks claimed here and a scatter in range order, so the earlier
+// range stays first. The runs are already in block-id order. No probe.
+const PlaceJob = struct {
+    gather_rows: []const PaddedSlot(GatherRow),
+    range_runs: []const Run,
+    grouped: []Run,
+    block_slots: []BlockSlot,
+    // Block ids claimed here, one slot per run. Place writes `[0, run_count)`.
+    claimed: []usize,
+    generation: u32,
+    gather_items_per_range: usize,
+    run_count: usize,
+};
+
+fn placeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *PlaceJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index == 0 and range.start == 0 and range.end == 1);
+    std.debug.assert(job.run_count <= job.grouped.len);
+    std.debug.assert(job.run_count <= job.claimed.len);
+    std.debug.assert(job.generation != 0);
+    const table = job.block_slots;
+    const claimed = job.claimed[0..job.run_count];
+    var distinct: usize = 0;
+    var seen: usize = 0;
+    for (job.gather_rows, 0..) |slot, range_index| {
+        const run_count = slot.value.run_count;
+        if (run_count == 0) continue;
+        const window_start = 2 * range_index * job.gather_items_per_range;
+        std.debug.assert(window_start + run_count <= job.range_runs.len);
+        var previous: u32 = 0;
+        for (job.range_runs[window_start..][0..run_count], 0..) |run, index| {
+            if (index > 0) std.debug.assert(previous < run.block_id);
+            previous = run.block_id;
+            std.debug.assert(run.block_id < table.len);
+            const block_slot = &table[run.block_id];
+            if (block_slot.stamp != job.generation) {
+                std.debug.assert(distinct < claimed.len);
+                claimed[distinct] = run.block_id;
+                distinct += 1;
+                block_slot.* = .{ .stamp = job.generation };
+            }
+            block_slot.count += 1;
+            seen += 1;
+        }
+    }
+    std.debug.assert(seen == job.run_count);
+    var cursor: u32 = 0;
+    for (claimed[0..distinct]) |block_index| {
+        const block_slot = &table[block_index];
+        std.debug.assert(block_slot.stamp == job.generation and block_slot.count != 0);
+        block_slot.cursor = cursor;
+        cursor += block_slot.count;
+    }
+    std.debug.assert(@as(usize, cursor) == job.run_count);
+    for (job.gather_rows, 0..) |slot, range_index| {
+        const run_count = slot.value.run_count;
+        if (run_count == 0) continue;
+        const window_start = 2 * range_index * job.gather_items_per_range;
+        for (job.range_runs[window_start..][0..run_count]) |run| {
+            const block_slot = &table[run.block_id];
+            std.debug.assert(block_slot.stamp == job.generation);
+            job.grouped[block_slot.cursor] = run;
+            block_slot.cursor += 1;
+        }
+    }
+}
+
+// One block item per occupied block. Runs of one block are already contiguous.
+fn scanBlockItems(runs: []const Run, items: []BlockItem) usize {
+    std.debug.assert(items.len >= runs.len);
+    var index: usize = 0;
+    var count: usize = 0;
+    while (index < runs.len) {
+        const block_id = runs[index].block_id;
+        const begin = index;
+        index += 1;
+        while (index < runs.len and runs[index].block_id == block_id) : (index += 1) {}
+        items[count] = .{
+            .block_id = block_id,
+            .run_begin = @intCast(begin),
+            .run_count = @intCast(index - begin),
+        };
+        count += 1;
+    }
+    return count;
+}
+
+// `apply`: one range of occupied blocks. A block is one item, so it is never split.
+const ApplyBlockJob = struct {
     intents: IntentColumns,
     columns: ApplyColumns,
-    row_count: usize,
     order: []const u32,
-    gather_rows: []const PaddedSlot(GatherRow),
-    gather_items_per_range: usize,
-    bands: RowBands,
+    runs: []const Run,
+    blocks: []const BlockItem,
     range_count: usize,
 };
 
-// Each band applies, to the movement rows it owns, every gather range's band segment in
-// range order, which is contact order.
-fn applyBandJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *ApplyBandJob = @ptrCast(@alignCast(context));
+fn applyBlockJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *ApplyBlockJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.start <= range.end and range.end <= job.bands.band_count);
-    // The bands partition exactly the movement rows the columns hold.
-    std.debug.assert(job.bands.row_count == job.row_count);
-    std.debug.assert(job.columns.position_x.len == job.row_count and job.columns.position_y.len == job.row_count);
-    std.debug.assert(job.columns.velocity_x.len == job.row_count and job.columns.velocity_y.len == job.row_count);
+    std.debug.assert(range.start <= range.end and range.end <= job.blocks.len);
+    const row_count = job.columns.position_x.len;
+    std.debug.assert(job.columns.position_y.len == row_count);
+    std.debug.assert(job.columns.velocity_x.len == row_count and job.columns.velocity_y.len == row_count);
     var lanes = ApplyLanes{};
-    for (range.start..range.end) |band| {
-        const first_row = job.bands.firstRow(band);
-        const end_row = job.bands.firstRow(band + 1);
-        for (job.gather_rows, 0..) |slot, gather_range| {
-            const window = job.order[2 * gather_range * job.gather_items_per_range ..];
-            for (window[slot.value.offsets[band]..slot.value.offsets[band + 1]]) |intent_index| {
-                const movement_row = job.intents.movement_row[intent_index];
-                std.debug.assert(movement_row >= first_row and movement_row < end_row);
+    for (job.blocks[range.start..range.end]) |block| {
+        const first_row = @as(usize, block.block_id) * block_rows;
+        std.debug.assert(block.run_begin + block.run_count <= job.runs.len);
+        for (job.runs[block.run_begin..][0..block.run_count]) |run| {
+            std.debug.assert(run.block_id == block.block_id);
+            std.debug.assert(@as(usize, run.begin) + run.count <= job.order.len);
+            for (job.order[run.begin..][0..run.count]) |intent_index| {
+                const movement_row_u = job.intents.movement_row[intent_index];
+                const movement_row: usize = movement_row_u;
+                std.debug.assert(movement_row_u != no_row and blockId(movement_row_u) == block.block_id);
+                std.debug.assert(movement_row >= first_row and movement_row < row_count);
                 lanes.push(job.columns, job.intents, intent_index, movement_row);
             }
         }
@@ -1272,13 +1645,14 @@ fn expectRingResultsEqual(expected: RingResult, actual: RingResult) !void {
 
 const contactsNaming = @import("collision_response_test_support.zig").contactsNaming;
 
-test "threaded response matches serial bit for bit across range sizes, worker counts and band counts" {
+test "threaded response matches serial bit for bit across range sizes, worker counts and block counts" {
     const allocator = std.testing.allocator;
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 3 });
     defer threads.deinit();
 
-    for ([_]usize{ 40, 1100 }, [_]usize{ 3, max_bands }) |movement_rows, band_count| {
-        try std.testing.expectEqual(band_count, RowBands.init(movement_rows).band_count);
+    // 40 and 1,100 movement rows are 3 and 69 blocks of 16. Matching serial means a block
+    // is never split and contact order does not follow the partition.
+    for ([_]usize{ 40, 1100 }) |movement_rows| {
         var fixture = try buildRingFixture(allocator, movement_rows);
         defer fixture.deinit(allocator);
         var serial_system = CollisionResponseSystem.init(allocator);
@@ -1303,7 +1677,7 @@ test "threaded response matches serial bit for bit across range sizes, worker co
             }
         }
 
-        // Tuner-driven apply shapes: several bands per range, and the band apply inline.
+        // Tuner-driven apply shapes: several blocks per range, and the block apply inline.
         for ([_]usize{ 1, 2, 3 }) |workers| {
             for ([_]AdaptiveWorkProfile{
                 .{ .worker_threads = workers, .items_per_range = 4 },
@@ -1320,7 +1694,7 @@ test "threaded response matches serial bit for bit across range sizes, worker co
         }
 
         // The gather settled inline: each range applies its own window, timed by the
-        // gather, and the band apply never runs or learns.
+        // gather, and the block apply never runs or learns.
         for ([_]usize{ 1, 2, 3 }) |workers| {
             var system = CollisionResponseSystem.init(allocator);
             defer system.deinit();
@@ -1352,7 +1726,12 @@ test "an inline gather job applies its window before it returns" {
     var job = GatherJob{
         .input = step.input,
         .order = system.intent_order.items,
-        .bands = null,
+        .runs = system.range_runs.items,
+        .block_slots = &.{},
+        .table_blocks = 0,
+        .table_stride = 0,
+        .generations = &.{},
+        .claimed = system.claimed_slots.items,
         .apply = step.columns,
         .items_per_range = step.input.contacts.len,
         .gather_rows = system.gather_rows.items,
@@ -1366,6 +1745,107 @@ test "an inline gather job applies its window before it returns" {
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial.movement.velocity_x), std.mem.sliceAsBytes(movement.velocity_x));
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial.movement.velocity_y), std.mem.sliceAsBytes(movement.velocity_y));
     try std.testing.expectEqual(serial.stats.intent_count, system.gather_rows.items[0].value.intents);
+}
+
+test "a gather range groups placed intents by block in contact order, and place keeps the earlier range first" {
+    const generation: u32 = 1;
+    // Blocks 0, skip, 1, 0, 1, 1, 2. Slot 3 is stamped and not claimed; a table scan would emit it.
+    const rows = [_]u32{ 0, no_row, 16, 1, 31, 16, 32 };
+    var order: [rows.len]u32 = undefined;
+    var runs: [rows.len]Run = undefined;
+    var claimed: [rows.len]usize = undefined;
+    var slots: [4]BlockSlot = @splat(.{});
+    slots[3] = .{ .count = 5, .stamp = generation };
+    const run_count = groupRangeIntents(&rows, 0, &order, &runs, &slots, &claimed, generation);
+    try std.testing.expectEqual(@as(u32, 3), run_count);
+    try std.testing.expectEqual(@as(u32, 0), runs[0].block_id);
+    try std.testing.expectEqual(@as(u32, 2), runs[0].count);
+    try std.testing.expectEqual(@as(u32, 1), runs[1].block_id);
+    try std.testing.expectEqual(@as(u32, 3), runs[1].count);
+    try std.testing.expectEqual(@as(u32, 2), runs[2].block_id);
+    try std.testing.expectEqual(@as(u32, 1), runs[2].count);
+    try std.testing.expectEqual(@as(u32, 0), order[runs[0].begin]);
+    try std.testing.expectEqual(@as(u32, 3), order[runs[0].begin + 1]);
+    try std.testing.expectEqual(@as(u32, 2), order[runs[1].begin]);
+    try std.testing.expectEqual(@as(u32, 4), order[runs[1].begin + 1]);
+    try std.testing.expectEqual(@as(u32, 5), order[runs[1].begin + 2]);
+    try std.testing.expectEqual(@as(u32, 6), order[runs[2].begin]);
+    for (runs[0..run_count]) |run| try std.testing.expect(run.block_id != 3);
+    try std.testing.expectEqual(@as(u32, 5), slots[3].count);
+
+    // Range windows sit at `2 * range_index * items_per_range` with items_per_range 2.
+    var range_runs: [8]Run = undefined;
+    range_runs[0] = .{ .block_id = 0, .begin = 0, .count = 1 };
+    range_runs[1] = .{ .block_id = 4, .begin = 1, .count = 1 };
+    range_runs[4] = .{ .block_id = 0, .begin = 4, .count = 2 };
+    var gather_rows = [_]PaddedSlot(GatherRow){
+        .{ .value = .{ .run_count = 2 } },
+        .{ .value = .{ .run_count = 1 } },
+    };
+    var grouped: [3]Run = undefined;
+    var place_claimed: [3]usize = undefined;
+    var place_slots: [5]BlockSlot = @splat(.{});
+    // Stamped this generation and not claimed. A table scan would add its count.
+    place_slots[2] = .{ .count = 5, .stamp = generation };
+    var place = PlaceJob{
+        .gather_rows = &gather_rows,
+        .range_runs = &range_runs,
+        .grouped = &grouped,
+        .block_slots = &place_slots,
+        .claimed = &place_claimed,
+        .generation = generation,
+        .gather_items_per_range = 2,
+        .run_count = 3,
+    };
+    placeJob(&place, .{ .index = 0, .start = 0, .end = 1 }, WorkerId.main);
+    var items: [3]BlockItem = undefined;
+    const blocks = scanBlockItems(grouped[0..3], &items);
+    try std.testing.expectEqual(@as(usize, 2), blocks);
+    var found_block = false;
+    for (items[0..blocks]) |block| {
+        if (block.block_id != 0) continue;
+        found_block = true;
+        try std.testing.expectEqual(@as(u32, 2), block.run_count);
+        const block_runs = grouped[block.run_begin..][0..block.run_count];
+        try std.testing.expectEqual(@as(u32, 0), block_runs[0].begin);
+        try std.testing.expectEqual(@as(u32, 1), block_runs[0].count);
+        try std.testing.expectEqual(@as(u32, 4), block_runs[1].begin);
+        try std.testing.expectEqual(@as(u32, 2), block_runs[1].count);
+    }
+    try std.testing.expect(found_block);
+    try std.testing.expectEqual(@as(u32, 4), grouped[2].block_id);
+}
+
+test "the next range on a worker table does not see the previous range and does not clear it" {
+    var slots: [4]BlockSlot = @splat(.{});
+    const first_rows = [_]u32{ 0, 16 };
+    const second_rows = [_]u32{0};
+    var order: [2]u32 = undefined;
+    var runs: [2]Run = undefined;
+    var claimed: [2]usize = undefined;
+    const first = groupRangeIntents(&first_rows, 0, &order, &runs, &slots, &claimed, 1);
+    try std.testing.expectEqual(@as(u32, 2), first);
+    try std.testing.expectEqual(@as(u32, 1), slots[0].stamp);
+    try std.testing.expectEqual(@as(u32, 1), slots[1].stamp);
+    const second = groupRangeIntents(&second_rows, 0, order[0..1], runs[0..1], &slots, claimed[0..1], 2);
+    try std.testing.expectEqual(@as(u32, 1), second);
+    try std.testing.expectEqual(@as(u32, 0), runs[0].block_id);
+    try std.testing.expectEqual(@as(u32, 1), runs[0].count);
+    // Generation 2 rewrote block 0. Block 1 still holds generation 1.
+    try std.testing.expectEqual(@as(u32, 2), slots[0].stamp);
+    try std.testing.expectEqual(@as(u32, 1), slots[0].count);
+    try std.testing.expectEqual(@as(u32, 1), slots[1].stamp);
+    try std.testing.expectEqual(@as(u32, 1), slots[1].count);
+
+    var generation: u32 = 4;
+    const bumped = bumpGeneration(&generation, &slots);
+    try std.testing.expectEqual(@as(u32, 5), bumped);
+    try std.testing.expectEqual(@as(u32, 2), slots[0].stamp);
+    generation = std.math.maxInt(u32);
+    const wrapped = bumpGeneration(&generation, &slots);
+    try std.testing.expectEqual(@as(u32, 1), wrapped);
+    try std.testing.expectEqual(@as(u32, 0), slots[0].stamp);
+    try std.testing.expectEqual(@as(u32, 0), slots[1].stamp);
 }
 
 // Pins `tuner` settled on `profile` (inline when it has no workers) with no reprobe,
@@ -1473,6 +1953,7 @@ test "threaded multi-worker response allocates nothing after reserveForContacts"
     var system = CollisionResponseSystem.init(allocator);
     defer system.deinit();
     try system.reserveForContacts(contact_count);
+    try system.ensureDirectTables(threads.participantSlotCount(), blockCount(fixture.data.movementBodySliceConst().entities.len));
     try fixture.frame.collision_triggers.reserve(1, estimateTriggerCapacity(contact_count));
 
     var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });

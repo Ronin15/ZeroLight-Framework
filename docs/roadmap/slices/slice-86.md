@@ -177,7 +177,10 @@ order stay deterministic for the order-sensitive consumers.
       blocks they hold, with results independent of the item count (the
       `max_bands` comment states they already are); `collision-response-stage`
       shows apply items per range tracking intents at 1,024, 4,096, and 16,384;
-      serial == threaded across range sizes.
+      serial == threaded across range sizes. A 4-pass radix per gather range
+      was measured and rejected. The landing groups on a direct block-id
+      table. Tuned Debug at 16,384 contacts was 699 µs to 980 µs, inside the
+      base spread, and stands as noise.
 - [ ] Collision's banded fill and sort fails the cost model when it runs
       inline (lands before the response and contiguity landings, with the
       item after it: every later collision A/B and the static gate measure

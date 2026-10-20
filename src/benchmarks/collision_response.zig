@@ -11,6 +11,7 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const movement_range_alignment_items = @import("../game/data_system.zig").movement_range_alignment_items;
 const CollisionResponseStats = @import("../game/systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("../game/systems/collision_response.zig").CollisionResponseSystem;
+const block_rows = @import("../game/systems/collision_response.zig").block_rows;
 const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const fixtures = @import("fixtures.zig");
@@ -19,8 +20,11 @@ const suite = @import("suite.zig");
 // `collision-response-stage`: one response step over a contact stream where every body
 // sits in several contacts as `a` and as `b`, written once in a scattered order. Timed:
 // one `update`; the movement columns are restored untimed before each run so every run
-// takes the same branch mix. `--details` reports intents, triggers, the gather and
-// apply shapes, and the time and share on main outside the stage batches.
+// takes the same branch mix. `--details` reports intents, triggers, apply item counts,
+// the gather, place, and apply shapes and times, and the time on main outside the
+// stage batches. A worker gather's apply items are the occupied 16-row blocks
+// (`ceil((contacts / 2 + 2) / 16)` in this fixture). An inline gather reports the
+// intent count, because that apply stayed inside the gather.
 pub const stage_group = suite.BenchmarkGroup{
     .name = "collision-response-stage",
     .item_label = "contacts",
@@ -227,8 +231,7 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     try system.reserveForContacts(item_count);
     if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
         system.gather_tuner = tuner;
-        // Apply: one band per range, so the fixed control dispatches the bands rather than
-        // keeping them in one inline range.
+        // Fixed-adaptive apply: one block per range. The tuned case keeps the system's tuner.
         system.apply_tuner = suite.adaptiveTunerForPartition(case, 1, 1).?;
     }
 
@@ -244,25 +247,45 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
+    var place_total: u128 = 0;
+    var apply_total: u128 = 0;
     var last_stats = CollisionResponseStats{};
     for (0..options.iterations) |_| {
         fixture.restoreMovement();
         const start_ns = suite.nowNs(io);
         last_stats = try stageRunOnce(&system, &fixture, thread_ptr, case);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        place_total += last_stats.perf.place_batch.batch_duration_ns;
+        apply_total += last_stats.perf.apply_batch.batch_duration_ns;
         std.debug.assert(!expect_dispatch or (last_stats.perf.gather_batch.range_count > 1 and !last_stats.perf.gather_batch.ran_inline));
+        // Occupied blocks of this fixture when the gather ran on workers; the inline
+        // gather's recorded apply count is the intent count.
+        const occupied_blocks = @divCeil(item_count / 2 + 2, block_rows);
+        if (last_stats.perf.gather_batch.ran_inline) {
+            std.debug.assert(last_stats.perf.apply_batch.item_count == last_stats.intent_count);
+        } else {
+            std.debug.assert(last_stats.perf.apply_batch.item_count == occupied_blocks);
+        }
         accumulator.record(elapsed_ns, last_stats.perf.gather_batch);
         try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(movement_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.perf.apply_batch });
         // Main outside the stage batches: the main thread's own ranges inside a
-        // dispatched batch are not counted (see the batch's `main_ranges`).
-        main_total += elapsed_ns -| offMainNs(last_stats.perf.gather_batch) -| offMainNs(last_stats.perf.apply_batch);
+        // dispatched batch are not counted (see the batch's `main_ranges`). The place
+        // range is one item, so it stays on the caller and in this remainder.
+        main_total += elapsed_ns -| offMainNs(last_stats.perf.gather_batch) -| offMainNs(last_stats.perf.apply_batch) -| offMainNs(last_stats.perf.place_batch);
     }
 
     var stats = accumulator.finish();
     stats.candidate_pairs = last_stats.trigger_count;
     stats.output_count = last_stats.intent_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.apply_batch);
-    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    // The place merge. Not a collider splice; this group has no other batch slot.
+    stats.splice_batch = suite.batchSummaryFromBatch(last_stats.perf.place_batch);
+    if (stats.iterations > 0) {
+        const iterations: u128 = stats.iterations;
+        stats.main_ns = @intCast(main_total / iterations);
+        if (stats.secondary_batch) |*apply| apply.batch_duration_ns = @intCast(apply_total / iterations);
+        if (stats.splice_batch) |*place| place.batch_duration_ns = @intCast(place_total / iterations);
+    }
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.gather_tuner), settled_before_measurement);
         stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.apply_tuner), settled_before_measurement);
@@ -271,11 +294,18 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 }
 
 fn writeResponseStageWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
-    try writer.print("intents={} triggers={}", .{ stats.output_count, stats.candidate_pairs });
+    const apply = stats.secondary_batch orelse suite.BatchSummary{};
+    const place = stats.splice_batch orelse suite.BatchSummary{};
+    try writer.print("intents={} triggers={} apply_items={}", .{ stats.output_count, stats.candidate_pairs, apply.item_count });
     if (view == .summary) return;
     try writer.writeAll(" gather=");
     try suite.writeStageShape(writer, stats.batch);
+    try writer.print("({f})", .{suite.formatDuration(stats.batch.batch_duration_ns)});
+    try writer.writeAll(" place=");
+    try suite.writeStageShape(writer, place);
+    try writer.print("({f})", .{suite.formatDuration(place.batch_duration_ns)});
     try writer.writeAll(" apply=");
-    try suite.writeStageShape(writer, stats.secondary_batch orelse .{});
+    try suite.writeStageShape(writer, apply);
+    try writer.print("({f})", .{suite.formatDuration(apply.batch_duration_ns)});
     try suite.writeShare(writer, "main_outside_stage_batches", stats.main_ns orelse 0, stats.mean_ns);
 }
