@@ -141,6 +141,13 @@ sized to today's four drives and five behaviors:
 - [ ] Persistence: classified for 49/64B; included in 46's v1; content
       fingerprint; relative version bumps; stages and components stated for
       Tables T4/T5.
+- [ ] Appraisal and memory decay use one masked kernel. Failure: the four
+      drive loops (`affect.zig:466`, `:509`, `:558`, `:605`) and the memory
+      decay (`ai_memory.zig:537`) run the lane kernel, then repeat that
+      math one row at a time (`memory-performance.md` § SIMD and core math).
+      The per-drive loops go away with the content appraisal. Pass: each
+      loop that remains ends in that kernel with a mask. Inactive lanes do
+      not write past the range.
 - [ ] Tests: strict catalog validation, parity, serial == threaded, SIMD ==
       scalar, missing-signal zero, `FailingAllocator` proofs.
 - [ ] Docs: `docs/architecture.md`, `docs/simulation-tiers-and-pipeline.md`,
