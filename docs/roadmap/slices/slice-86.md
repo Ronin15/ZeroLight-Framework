@@ -2,10 +2,14 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 83](../archive/slice-83.md) (layout and tuners), [Slice 84](../archive/slice-84.md) (branch order) · Related: [Slice 71B](slice-71b.md) (the static structure's 64B row), [Slice 72](slice-72.md) D1 (destructible resolve), [Slice 75](slice-75.md) (collision fidelity per band) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: not started.** Owner direction 2026-10-11: collision as a whole
+**Status: in progress.** Owner direction 2026-10-11: collision as a whole
 subsystem against the current cost model and rules. 71B.1's collision queries
 and 71B.2's static split moved here (owner 2026-10-16). Its inert-row item
-lands after 88 (index, merged order 9b).
+lands after 88 (index, merged order 9b). Landed on `core_systems` through
+`65aa77d`: banded sweep merge, one collision path, contiguous static and
+path-registry runs, statics out of the per-step sweep, and response apply
+items as occupied 16-row blocks. The response consumer still reads through
+`order[]`. That layout item is next. Rows at rest stay after slice 88.
 
 Goal: each body's broadphase work follows its local same-level density,
 never column height or level count. Gather and sort leave the main thread.
@@ -16,21 +20,24 @@ order stay deterministic for the order-sensitive consumers.
 
 ### Current foundation
 
-- `CollisionSystem` (`src/game/systems/collision.zig`):
-  - Every step, `gatherBodies` (`:473`, called at `:327`) and the warm
-    insertion `sortWarm` (`:684`, called at `:336`) run scalar on main.
-  - The sweep orders on `(min_x, min_y, entity)`. Candidates on other levels
-    or outside the body's y span are rejected only after the x sweep visits
-    them (`:760`, `:772`, `:885`, `:897`).
-  - The broadphase is SIMD and threaded; the narrowphase is threaded.
-  - The consumers are order-sensitive: response, audio, and the sensory bus.
-- `CollisionResponseSystem.gatherRange` (`collision_response.zig:436`)
-  states no SIMD verdict.
+Landed behavior. The measured block below is the pre-slice baseline, not
+the current bench.
+
+- `CollisionSystem` fills, sorts, and sweeps on the banded path. With no
+  workers those same functions run inline. The sweep key includes level and
+  strip. Statics are not sweep entries. Dynamic×static pairs come from
+  `StaticColliderSystem` query columns. Solid static×static pairs are
+  dropped. A static trigger over a static is stored until the collider
+  revision changes, and that refresh runs at the collider sync.
+- `CollisionResponseSystem.gatherRange` stays scalar. `computeIntentMath`
+  streams the intent columns in lanes. With workers, each range groups
+  placed intents on a direct table keyed by `movement_row >> 4`. Apply
+  items are the occupied 16-row blocks. The consumer still loads intent
+  columns through `order[]` and gathers movement columns in the flush.
 - Collision runs on `locomotion` and `cognition` tier rows.
-- `StaticColliderSystem` (`src/game/systems/static_colliders.zig:478`, 64G)
-  lists static rows per (level, chunk), synced at the commit seam; steering
-  queries it through `ColliderView.queryBox` (`:281`, `:328`; `173cc17`).
-  Collision still gathers, sorts, and sweeps its statics every step.
+- `StaticColliderSystem` stores statics as contiguous per-chunk runs.
+  Steering still queries through `ColliderView.queryBox`. Path
+  registrations are contiguous per-chunk runs. `ChunkListMap` is gone.
 - Destructible cell resolve is 72 D1.
 - Measured (Debug, 23 workers, `5d5a089` unless noted):
   - `collision-tall`, serial: 2.9 → 26.2 µs per body as the grid's aspect
@@ -74,7 +81,10 @@ order stay deterministic for the order-sensitive consumers.
 
 ### Checklist
 
-- [ ] Broadphase work follows local same-level density. Failure scenario: in a
+- [x] Broadphase work follows local same-level density. The live sweep
+      already keys level and strip. Confirmed by the collision benches:
+      visits per body stay bounded on the tall, stacked, and thin shapes.
+      No separate sweep rewrite. Failure scenario: in a
       tall or deep world the x sweep visits every body in the column and on
       every level before it rejects them (`:760`, `:772`, `:885`, `:897`). The
       sweep order is a `usize` permutation (`order`, `collision.zig:201`)
@@ -100,7 +110,10 @@ order stay deterministic for the order-sensitive consumers.
       collision tier. Measured: the inert axis above. Pass: `production-step`
       collision cost flat in inert rows; static colliders through the two
       items below.
-- [ ] Static-collider lists read as contiguous runs (contiguity audit H3).
+- [x] Static-collider lists read as contiguous runs (contiguity audit H3).
+      Landed in `dfc6ad8`. The chunk owns the runs. `steering-static-dense`
+      stayed within noise. The entity-obstacle case was a flat gap of about
+      10 µs and was not retuned.
       Failure: `query_lists` and `chunk_lists`
       (`static_colliders.zig:497-499`) are `ChunkListMap`s, a hashed key →
       head table over a free-list entry pool linked per key
@@ -128,12 +141,15 @@ order stay deterministic for the order-sensitive consumers.
       cost matches the chunk-ordered one. Steering (85) and nav are the
       consumers; the path registry item and the two items below build on this
       structure.
-- [ ] Collision's static queries read `StaticColliderSystem`
+- [x] Collision's static queries read `StaticColliderSystem`
       (`static_colliders.zig:478`, `:580`) instead of gathering statics every
       step (moved from 71B.1). Failure scenario: every static row is
       gathered and sorted each step (`collision.zig:473`, `:684`). Pass:
       `collision-static-index-change` flat in static count.
-- [ ] Static split (moved from 71B.2), gate first: control benches
+- [x] Static split (moved from 71B.2), gate first. The gate passed. Landed
+      in `b126599`. Tuned Debug time is flat in the static count. The two
+      points over 1 ms (SAP at 16,384, index-change at 4,096) are accepted.
+      ReleaseFast at 65,536 is 94–151 µs on the split. control benches
       `collision-static-heavy-sap`, `collision-static-heavy`, and
       `collision-static-index-change` at three static counts. If the gate
       passes: statics leave the per-step sweep; contacts equal today's minus
@@ -144,14 +160,16 @@ order stay deterministic for the order-sensitive consumers.
       straddling, ties, negative coordinates), serial == threaded, an
       out-of-band move caught; `FailingAllocator` proofs; contact reserves
       unchanged.
-- [ ] A SIMD verdict at `gatherRange` (`collision_response.zig:436`).
+- [x] A SIMD verdict at `gatherRange`. The loop stays scalar: two slot
+      resolves and a variable-length write. `computeIntentMath` is the
+      lane consumer and streams the intent columns.
 - [ ] The rest of the subsystem checked against the cost model and the rules:
       narrowphase, response, contact streams, level handling, and scope tiers,
       over every file it owns (`systems/collision.zig`,
       `collision_response.zig`, `static_colliders.zig`, `contact_query.zig`,
       `destructible_controller.zig`, `data_system/collision.zig`,
       `data_system/destructible.zig`). Each finding becomes an item here.
-- [ ] Path registry lists read as contiguous runs per key (contiguity audit
+- [x] Path registry lists read as contiguous runs per key (contiguity audit
       L1). Failure: the `path_index` shards are `ChunkListMap`s keyed by
       (level, chunk) (`pathfinding/system.zig:150`), and the threaded
       `nav_evict` jobs (`pathfinding/eviction.zig:250`, `:303`) and the cold
@@ -163,7 +181,10 @@ order stay deterministic for the order-sensitive consumers.
       reads each key's registrations as one contiguous run; it lands with the
       static-collider item, whose lists use the same `ChunkListMap`
       (`src/game/systems/chunk_list_map.zig`).
-- [ ] Collision response's `apply` stage dispatches items that track its work.
+- [x] Collision response's `apply` stage dispatches items that track its work.
+      Landed in `65aa77d`. Occupied 16-row blocks: 33 / 129 / 513 at
+      1,024 / 4,096 / 16,384 contacts. The separate no-worker path is gone.
+      The consumer layout is the next item, not this one.
       Failure: it dispatches one item per fixed band (`collision_response.zig:296`,
       `:307`; at most `max_bands` 64, `:56`), a fixed partition count whose work
       varies behind it (`.grok/rules/threading.md`: "A stage's items are units
@@ -191,7 +212,7 @@ order stay deterministic for the order-sensitive consumers.
       movement columns the consumer uses are packed once in its read order,
       and the tail is a masked lane batch. Contact order stays. The 16-row
       block ownership stays.
-- [ ] Collision's banded fill and sort fails the cost model when it runs
+- [x] Collision's banded fill and sort fails the cost model when it runs
       inline (lands before the response and contiguity landings, with the
       item after it: every later collision A/B and the static gate measure
       this path), and production runs it inline whenever the tuner keeps collision
@@ -206,7 +227,7 @@ order stay deterministic for the order-sensitive consumers.
       sorts each run and merges them (a merge buffer with its reserve and a
       `FailingAllocator` proof), measured by the collision bench groups at warm
       shapes, serial and threaded.
-- [ ] After the item above, collision has one path
+- [x] After the item above, collision has one path. Landed in `5595275`.
       (`.grok/rules/tests-benchmarks.md` § Test and production code, point
       1). Delete `updateDirect` (`collision.zig:628`), `buildDirect` (`:704`),
       `buildBroadphaseCandidatesDirect` (`:1045`), the no-worker branch in
@@ -214,7 +235,9 @@ order stay deterministic for the order-sensitive consumers.
       calls `buildDirect`; its callers at `:2031`, `:2388`, `:3101` move to the
       one path). Pass: no `*Direct` collision entry remains; the collision
       benches and tests run the production path.
-- [ ] `CollisionResponseSystem.run` has a separate no-worker serial path
+- [x] `CollisionResponseSystem.run` has a separate no-worker serial path.
+      Landed with `65aa77d`. Zero workers run the same gather and apply
+      their own window.
       (lands with the response gather rework, which edits the same run;
       `collision_response.zig:270`, the `else` of `withWorkers`;
       `.grok/rules/tests-benchmarks.md` § Test and production code, point
@@ -235,8 +258,9 @@ order stay deterministic for the order-sensitive consumers.
       regression beyond run-to-run spread.
 - [ ] `production-step`: collision main time is the ordered merge only, and
       flat in inert rows.
-- [ ] Static split (if the gate passes): identical filtered contacts and
+- [x] Static split (if the gate passes): identical filtered contacts and
       response outcomes across every fixture and worker configuration;
       static-heavy collision cost no longer grows with static count;
-      `collision` and `collision-sparse` unchanged.
+      `collision` and `collision-sparse` unchanged. Landed in `b126599`.
+      The tuned Debug table is accepted. ReleaseFast at 65,536 is 94–151 µs.
 - [ ] `zig build verify` passes.
