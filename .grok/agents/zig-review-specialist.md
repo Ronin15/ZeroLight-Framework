@@ -79,9 +79,16 @@ scope only where the diff relies on it.
    **Data layout**, every review: for each hot loop, store, or index the
    change adds or touches, name the data it reads, the order it reads it,
    and the keys it filters on, and check them against `memory-performance.md`
-   § Data-oriented design, and whether requesters repeat identical
-   intermediate work (`engine-design.md` § Cost model, shared results). A
-   failure is a High structural finding.
+   § Data-oriented design and § SIMD and core math. A read through an index
+   permutation, a pointer chase, or a per-row lookup into another store is
+   a High structural finding, as is dense float work left scalar inside a
+   population loop, or lane results drained into per-item scalar calls.
+   "Same as the old loop" is not a pass. The only exemptions are search
+   frontiers, pair streams, and hash point lookups, named in the plan.
+   Another store's columns are packed once before the lane path. Also
+   check whether requesters repeat identical intermediate work
+   (`engine-design.md` § Cost model, shared results). A failure is a High
+   structural finding.
    Each claimed order is measured by a scaling bench at three or more sizes
    (`tests-benchmarks.md`) or marked derived; a flat-cost claim for a local
    change with no such bench is a finding.

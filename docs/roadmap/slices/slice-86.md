@@ -181,6 +181,16 @@ order stay deterministic for the order-sensitive consumers.
       was measured and rejected. The landing groups on a direct block-id
       table. Tuned Debug at 16,384 contacts was 699 µs to 980 µs, inside the
       base spread, and stands as noise.
+- [ ] Response apply reads intent columns through `order[]`
+      (`src/game/systems/collision_response.zig` `ApplyLanes.push`) and
+      gathers movement columns inside the flush. A partial lane group then
+      calls `applyIntentScalar` per row. Failure: the hot read is an index
+      permutation, and a short group leaves the lane path
+      (`memory-performance.md` § Data-oriented design, § SIMD and core math).
+      The movement gather is not exempt. Pass: the intent fields and the
+      movement columns the consumer uses are packed once in its read order,
+      and the tail is a masked lane batch. Contact order stays. The 16-row
+      block ownership stays.
 - [ ] Collision's banded fill and sort fails the cost model when it runs
       inline (lands before the response and contiguity landings, with the
       item after it: every later collision A/B and the static gate measure

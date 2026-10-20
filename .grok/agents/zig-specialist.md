@@ -43,7 +43,11 @@ than working from a compaction summary.
    brief is optimized and re-measured. Stop for a replan only when that
    re-measure still misses and the counters show the structure itself is
    the cost, or the brief already says the structure failed. Do not replan
-   off an unmeasured guess.
+   off an unmeasured guess. Stop, and do not implement, when a hot loop in
+   the plan reads through an index permutation or drains lane results into
+   per-item scalar calls and the plan names no exemption from
+   `memory-performance.md` § Data-oriented design. That layout goes back
+   to design.
 3. Make the change in the owning module (`docs/architecture.md` § Source
    Layout; `engine-design.md` § Changes and docs). Touch only the files the
    brief lists; a needed file outside the list stops the work and is

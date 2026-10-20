@@ -4,7 +4,8 @@ description: >-
   Writes a decision-complete plan, right before implementation, for a change
   whose design is open or whose structure fails the cost model. Starts from
   the brief's files. The plan opens with the chosen design, the cost model,
-  and the file list. Never edits code.
+  and the file list. A hot loop that does not stream, or that drains lanes
+  into scalar calls, fails the plan and is redesigned. Never edits code.
 tools:
   - read_file
   - grep
@@ -94,6 +95,19 @@ section with nothing new is omitted.
   The suite also runs the serial baseline for that case. Serial is not the
   verdict. A loop the table shows failing `threading.md` fails the design,
   and the design fixes it.
+  The same fail applies to `memory-performance.md` § Data-oriented design
+  and § SIMD and core math. These are not a verdict column. A hot loop
+  fails the design, and the layout is fixed, when it reads through an
+  index permutation, a pointer chase, or a per-row lookup into another
+  store, or when dense float columns stay scalar inside a population
+  loop, or when lane results drain into per-item scalar calls. The fix
+  is the layout: the columns in the consumer's read order, packed once,
+  then one lane path with a mask for the tail. Inherited code the change
+  keeps on the hot path is in the table. "Same as the old loop" is not
+  a pass. The only exemptions are the ones that section names (search
+  frontiers, pair streams, hash point lookups), and the row names the
+  exemption. A movement-column gather is not exempt: those columns are
+  packed once into the consumer's scratch before the lane path.
 - **Stage shape on today's `ThreadSystem`**: each threaded stage fits the
   thread system and tuner as they are, never a change to them (owner). State
   the item unit and why its count tracks the work, with the dispatch figures
