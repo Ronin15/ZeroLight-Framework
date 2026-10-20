@@ -18,6 +18,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const math = @import("../../core/math.zig");
+const simd = @import("../../core/simd.zig");
 const logging = @import("../../core/logging.zig");
 const pdq = @import("../../core/sort.zig").pdq;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -360,9 +361,9 @@ pub const ColliderView = struct {
     /// entry read is one step; the walk stops before a step once it has taken `max_work`
     /// steps or written `max_hits` hits. Reads only: no allocation, safe on workers. Work
     /// depends on the box and the rows near it, never on the row count.
-    // SIMD verdict: scalar. One bit test per cell and one binary search per chunk visit.
-    // A cell run is short and the hit cap drains into the packed hit buffer one box at a
-    // time, so a lane batch would scalar-drain. Contiguous columns are the win.
+    // SIMD verdict: the anchor walk and the chunk search stay scalar. The row
+    // overlap test is the masked compare. The compact stays scalar because the
+    // stop depends on the mask.
     pub fn queryBox(self: ColliderView, level: u16, box: math.Aabb, limits: BoxQueryLimits, hits: BoxHits) BoxQueryCounts {
         std.debug.assert(hits.min_x.len >= limits.max_hits and hits.min_y.len >= limits.max_hits);
         std.debug.assert(hits.max_x.len >= limits.max_hits and hits.max_y.len >= limits.max_hits);
@@ -543,6 +544,22 @@ const BoxWalk = struct {
                 const bit_id: u16 = @intCast(bit);
                 while (cursor < groups.len and groups[cursor].bit < bit_id) cursor += 1;
                 std.debug.assert(cursor < groups.len and groups[cursor].bit == bit_id);
+                if (self.uncapped) {
+                    const row_last: u16 = @intCast(row_bit + @as(usize, @intCast(cells.max_x & cell_mask)));
+                    var end_cursor = cursor;
+                    while (end_cursor + 1 < groups.len and groups[end_cursor + 1].bit <= row_last and groups[end_cursor + 1].start == groups[end_cursor].start + groups[end_cursor].count) {
+                        end_cursor += 1;
+                    }
+                    const first = groups[cursor];
+                    const last = groups[end_cursor];
+                    const span: u32 = last.start + last.count - first.start;
+                    if (!self.scanUncapped(payload.query_entity[first.start..], payload.query_min_x[first.start..], payload.query_min_y[first.start..], payload.query_max_x[first.start..], payload.query_max_y[first.start..], span)) return false;
+                    const extra: u64 = groups[end_cursor].bit - bit_id;
+                    self.counts.work += @intCast(extra);
+                    cell_x += extra;
+                    cursor = end_cursor + 1;
+                    continue;
+                }
                 if (!self.scanQuery(payload, groups[cursor].start, groups[cursor].count)) return false;
                 cursor += 1;
             }
@@ -571,74 +588,121 @@ const BoxWalk = struct {
 
     fn scanQuery(self: *BoxWalk, payload: StaticChunk, start: u32, count: u32) bool {
         if (self.uncapped) return self.scanUncapped(payload.query_entity[start..], payload.query_min_x[start..], payload.query_min_y[start..], payload.query_max_x[start..], payload.query_max_y[start..], count);
-        const box = self.box;
-        const end = start + count;
-        var index = start;
-        while (index < end) : (index += 1) {
-            if (!self.canStep()) return false;
-            self.counts.work += 1;
-            self.counts.entries += 1;
-            const row_min_x = payload.query_min_x[index];
-            const row_min_y = payload.query_min_y[index];
-            const row_max_x = payload.query_max_x[index];
-            const row_max_y = payload.query_max_y[index];
-            if (row_min_x <= box.max_x and row_max_x >= box.min_x and row_min_y <= box.max_y and row_max_y >= box.min_y) {
-                const at = self.counts.hits;
-                self.hits.min_x[at] = row_min_x;
-                self.hits.min_y[at] = row_min_y;
-                self.hits.max_x[at] = row_max_x;
-                self.hits.max_y[at] = row_max_y;
-                self.counts.hits += 1;
-            }
-        }
-        return true;
+        return self.scanCapped(payload.query_min_x[start..], payload.query_min_y[start..], payload.query_max_x[start..], payload.query_max_y[start..], count);
     }
 
     fn scanRun(self: *BoxWalk, run: QueryRun) bool {
         if (self.uncapped) return self.scanUncapped(run.entity, run.min_x, run.min_y, run.max_x, run.max_y, run.len);
-        const box = self.box;
-        for (0..run.len) |index| {
+        return self.scanCapped(run.min_x, run.min_y, run.max_x, run.max_y, run.len);
+    }
+
+    fn scanUncapped(self: *BoxWalk, entity: []const u32, min_x: []const f32, min_y: []const f32, max_x: []const f32, max_y: []const f32, count: u32) bool {
+        if (count == 0) return true;
+        return self.scanUncappedLanes(entity, min_x, min_y, max_x, max_y, count);
+    }
+
+    // The capped walk (`queryBox`). Same overlap kernel. The group stops at the work
+    // budget, and a hit that fills the cap drops the later lanes.
+    fn scanCapped(self: *BoxWalk, min_x: []const f32, min_y: []const f32, max_x: []const f32, max_y: []const f32, count: u32) bool {
+        const bounds = splatBox(self.box);
+        var index: usize = 0;
+        const end: usize = count;
+        while (index < end) {
             if (!self.canStep()) return false;
-            self.counts.work += 1;
-            self.counts.entries += 1;
-            const row_min_x = run.min_x[index];
-            const row_min_y = run.min_y[index];
-            const row_max_x = run.max_x[index];
-            const row_max_y = run.max_y[index];
-            if (row_min_x <= box.max_x and row_max_x >= box.min_x and row_min_y <= box.max_y and row_max_y >= box.min_y) {
+            const room: usize = self.limits.max_work - self.counts.work;
+            if (room == 0) return false;
+            const group = @min(simd.lane_count, end - index, room);
+            const row_min_x = if (group == simd.lane_count) simd.loadFloat4(min_x[index..]) else simd.loadFloat4Prefix(min_x[index..], group);
+            const row_min_y = if (group == simd.lane_count) simd.loadFloat4(min_y[index..]) else simd.loadFloat4Prefix(min_y[index..], group);
+            const row_max_x = if (group == simd.lane_count) simd.loadFloat4(max_x[index..]) else simd.loadFloat4Prefix(max_x[index..], group);
+            const row_max_y = if (group == simd.lane_count) simd.loadFloat4(max_y[index..]) else simd.loadFloat4Prefix(max_y[index..], group);
+            const mask = overlapMaskLanes(row_min_x, row_min_y, row_max_x, row_max_y, bounds, group);
+            for (0..group) |lane| {
+                if (!self.canStep()) return false;
+                self.counts.work += 1;
+                self.counts.entries += 1;
+                if (!laneSet(mask, lane)) continue;
+                const row_min_x_lane = laneFloat(row_min_x, lane);
+                const row_min_y_lane = laneFloat(row_min_y, lane);
+                const row_max_x_lane = laneFloat(row_max_x, lane);
+                const row_max_y_lane = laneFloat(row_max_y, lane);
                 const at = self.counts.hits;
-                self.hits.min_x[at] = row_min_x;
-                self.hits.min_y[at] = row_min_y;
-                self.hits.max_x[at] = row_max_x;
-                self.hits.max_y[at] = row_max_y;
+                self.hits.min_x[at] = row_min_x_lane;
+                self.hits.min_y[at] = row_min_y_lane;
+                self.hits.max_x[at] = row_max_x_lane;
+                self.hits.max_y[at] = row_max_y_lane;
                 self.counts.hits += 1;
             }
+            index += group;
         }
         return true;
     }
 
-    fn scanUncapped(self: *BoxWalk, entity: []const u32, min_x: []const f32, min_y: []const f32, max_x: []const f32, max_y: []const f32, count: u32) bool {
-        const box = self.box;
+    fn scanUncappedLanes(self: *BoxWalk, entity: []const u32, min_x: []const f32, min_y: []const f32, max_x: []const f32, max_y: []const f32, count: u32) bool {
         const over = self.overlaps.?;
+        const bounds = splatBox(self.box);
+        var index: usize = 0;
         const end: usize = count;
-        for (0..end) |index| {
-            const row_min_x = min_x[index];
-            const row_min_y = min_y[index];
-            const row_max_x = max_x[index];
-            const row_max_y = max_y[index];
-            if (comptime builtin.mode == .debug) self.noteMoved(over, entity[index], row_min_x, row_min_y, row_max_x, row_max_y);
-            if (!(row_min_x <= box.max_x and row_max_x >= box.min_x and row_min_y <= box.max_y and row_max_y >= box.min_y)) continue;
+        while (index + simd.lane_count <= end) : (index += simd.lane_count) {
+            const row_min_x = simd.loadFloat4(min_x[index..]);
+            const row_min_y = simd.loadFloat4(min_y[index..]);
+            const row_max_x = simd.loadFloat4(max_x[index..]);
+            const row_max_y = simd.loadFloat4(max_y[index..]);
+            const ids = simd.loadUint4(entity[index..]);
+            const mask = overlapMaskLanes(row_min_x, row_min_y, row_max_x, row_max_y, bounds, simd.lane_count);
+            if (comptime builtin.mode == .debug) self.noteMovedLanes(over, ids, row_min_x, row_min_y, row_max_x, row_max_y, simd.lane_count);
+            if (mask == 0) continue;
+            if (mask == simd.lanesBelow(simd.lane_count) and over.hits + simd.lane_count <= over.entity.len) {
+                const at = over.hits;
+                simd.storeUint4Slice(over.entity[at..], ids);
+                simd.storeFloat4Slice(over.min_x[at..], row_min_x);
+                simd.storeFloat4Slice(over.min_y[at..], row_min_y);
+                simd.storeFloat4Slice(over.max_x[at..], row_max_x);
+                simd.storeFloat4Slice(over.max_y[at..], row_max_y);
+                over.hits += simd.lane_count;
+            } else self.storeMaskedHits(over, ids, row_min_x, row_min_y, row_max_x, row_max_y, mask, simd.lane_count);
+        }
+        if (index == end) return true;
+        const group = end - index;
+        const row_min_x = simd.loadFloat4Prefix(min_x[index..], group);
+        const row_min_y = simd.loadFloat4Prefix(min_y[index..], group);
+        const row_max_x = simd.loadFloat4Prefix(max_x[index..], group);
+        const row_max_y = simd.loadFloat4Prefix(max_y[index..], group);
+        const ids = simd.loadUint4Prefix(entity[index..], group);
+        const mask = overlapMaskLanes(row_min_x, row_min_y, row_max_x, row_max_y, bounds, group);
+        if (comptime builtin.mode == .debug) self.noteMovedLanes(over, ids, row_min_x, row_min_y, row_max_x, row_max_y, group);
+        if (mask != 0) self.storeMaskedHits(over, ids, row_min_x, row_min_y, row_max_x, row_max_y, mask, group);
+        return true;
+    }
+
+    fn noteMovedLanes(self: *BoxWalk, over: *OverlapWrite, ids: simd.Uint4, row_min_x: simd.Float4, row_min_y: simd.Float4, row_max_x: simd.Float4, row_max_y: simd.Float4, count: usize) void {
+        const entity = simd.toUintArray(ids);
+        const min_x = simd.toFloatArray(row_min_x);
+        const min_y = simd.toFloatArray(row_min_y);
+        const max_x = simd.toFloatArray(row_max_x);
+        const max_y = simd.toFloatArray(row_max_y);
+        for (0..count) |lane| self.noteMoved(over, entity[lane], min_x[lane], min_y[lane], max_x[lane], max_y[lane]);
+    }
+
+    fn storeMaskedHits(self: *BoxWalk, over: *OverlapWrite, ids: simd.Uint4, row_min_x: simd.Float4, row_min_y: simd.Float4, row_max_x: simd.Float4, row_max_y: simd.Float4, mask: simd.MaskBits, count: usize) void {
+        _ = self;
+        const entity = simd.toUintArray(ids);
+        const min_x = simd.toFloatArray(row_min_x);
+        const min_y = simd.toFloatArray(row_min_y);
+        const max_x = simd.toFloatArray(row_max_x);
+        const max_y = simd.toFloatArray(row_max_y);
+        for (0..count) |lane| {
+            if (!laneSet(mask, lane)) continue;
             if (over.hits < over.entity.len) {
                 const at = over.hits;
-                over.entity[at] = entity[index];
-                over.min_x[at] = row_min_x;
-                over.min_y[at] = row_min_y;
-                over.max_x[at] = row_max_x;
-                over.max_y[at] = row_max_y;
+                over.entity[at] = entity[lane];
+                over.min_x[at] = min_x[lane];
+                over.min_y[at] = min_y[lane];
+                over.max_x[at] = max_x[lane];
+                over.max_y[at] = max_y[lane];
             }
             over.hits += 1;
         }
-        return true;
     }
 
     fn noteMoved(self: *BoxWalk, over: *OverlapWrite, entity_index: u32, min_x: f32, min_y: f32, max_x: f32, max_y: f32) void {
@@ -661,6 +725,38 @@ const BoxWalk = struct {
         if (rect.min_x != min_x or rect.min_y != min_y or rect.max_x != max_x or rect.max_y != max_y) moved.* = true;
     }
 };
+
+fn laneFloat(vector: simd.Float4, lane: usize) f32 {
+    return switch (lane) {
+        0 => vector[0],
+        1 => vector[1],
+        2 => vector[2],
+        else => vector[3],
+    };
+}
+
+fn laneSet(mask: simd.MaskBits, lane: usize) bool {
+    return mask & (@as(simd.MaskBits, 1) << @as(simd.LaneIndex, @intCast(lane))) != 0;
+}
+
+const BoxLanes = struct { max_x: simd.Float4, min_x: simd.Float4, max_y: simd.Float4, min_y: simd.Float4 };
+
+fn splatBox(box: math.Aabb) BoxLanes {
+    return .{
+        .max_x = simd.splatFloat4(box.max_x),
+        .min_x = simd.splatFloat4(box.min_x),
+        .max_y = simd.splatFloat4(box.max_y),
+        .min_y = simd.splatFloat4(box.min_y),
+    };
+}
+
+fn overlapMaskLanes(row_min_x: simd.Float4, row_min_y: simd.Float4, row_max_x: simd.Float4, row_max_y: simd.Float4, box: BoxLanes, count: usize) simd.MaskBits {
+    const inside = simd.lessEqualFloat4(row_min_x, box.max_x) &
+        simd.greaterEqualFloat4(row_max_x, box.min_x) &
+        simd.lessEqualFloat4(row_min_y, box.max_y) &
+        simd.greaterEqualFloat4(row_max_y, box.min_y);
+    return simd.maskBits(inside) & simd.lanesBelow(count);
+}
 
 fn orderGroupBit(bit: u16, group: QueryGroup) std.math.Order {
     return std.math.order(bit, group.bit);

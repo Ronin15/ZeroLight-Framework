@@ -98,6 +98,10 @@ pub inline fn toFloatArray(vector: Float4) [lane_count]f32 {
     return .{ vector[0], vector[1], vector[2], vector[3] };
 }
 
+pub inline fn toUintArray(vector: Uint4) [lane_count]u32 {
+    return .{ vector[0], vector[1], vector[2], vector[3] };
+}
+
 pub inline fn toIntArray(vector: Int4) [lane_count]i32 {
     return .{ vector[0], vector[1], vector[2], vector[3] };
 }
@@ -231,6 +235,14 @@ pub inline fn lessThanInt4(lhs: Int4, rhs: Int4) Mask4 {
 
 pub inline fn greaterThanFloat4(lhs: Float4, rhs: Float4) Mask4 {
     return lhs > rhs;
+}
+
+pub inline fn lessEqualFloat4(lhs: Float4, rhs: Float4) Mask4 {
+    return lhs <= rhs;
+}
+
+pub inline fn greaterEqualFloat4(lhs: Float4, rhs: Float4) Mask4 {
+    return lhs >= rhs;
 }
 
 pub inline fn greaterThanInt4(lhs: Int4, rhs: Int4) Mask4 {
@@ -864,7 +876,7 @@ test "loadFloat4Prefix and scatterFloat4Masked match their scalar forms bit for 
         const uint_prefix = loadUint4Prefix(uints[0..count], count);
         const uint_scalar = loadUint4PrefixScalar(uints[0..count], count);
         const float_lanes = toFloatArray(float_prefix);
-        const uint_lanes = [_]u32{ uint_prefix[0], uint_prefix[1], uint_prefix[2], uint_prefix[3] };
+        const uint_lanes = toUintArray(uint_prefix);
         for (0..lane_count) |lane| {
             try std.testing.expectEqual(@as(u32, @bitCast(float_scalar[lane])), @as(u32, @bitCast(float_lanes[lane])));
             try std.testing.expectEqual(uint_scalar[lane], uint_lanes[lane]);
@@ -1159,6 +1171,8 @@ test "compare-to-bits matches each lane's scalar compare for every lane pattern,
             const bit = @as(MaskBits, 1) << @intCast(lane);
             try std.testing.expectEqual(lhs[lane] < rhs[lane], less & bit != 0);
             try std.testing.expectEqual(lhs[lane] > rhs[lane], greater & bit != 0);
+            try std.testing.expectEqual(lhs[lane] <= rhs[lane], maskBits(lessEqualFloat4(loadFloat4(&lhs), loadFloat4(&rhs))) & bit != 0);
+            try std.testing.expectEqual(lhs[lane] >= rhs[lane], maskBits(greaterEqualFloat4(loadFloat4(&lhs), loadFloat4(&rhs))) & bit != 0);
             try std.testing.expectEqual(lhs_words[lane] == rhs_words[lane], equal & bit != 0);
         }
     }
