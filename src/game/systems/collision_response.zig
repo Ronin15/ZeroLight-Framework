@@ -764,7 +764,9 @@ fn movementRowFor(data: *const DataSystem, movement_entities: []const EntityId, 
     return @intCast(row);
 }
 
-// Correction and velocity scale of intents `[start, end)`, in lanes with a scalar tail.
+// Correction and velocity scale of intents `[start, end)`. Full groups are a
+// vector load and store. The remainder is that same math on a prefix, so it
+// does not read or write past `end`.
 fn computeIntentMath(intents: IntentColumns, start: usize, end: usize) void {
     var index = start;
     const negative_one = simd.splatFloat4(-1);
@@ -777,12 +779,15 @@ fn computeIntentMath(intents: IntentColumns, start: usize, end: usize) void {
         simd.storeFloat4Slice(intents.correction_y[index..], simd.mulFloat4(normal_y_lanes, penetration_lanes));
         simd.storeFloat4Slice(intents.velocity_scale[index..], simd.mulFloat4(restitution_lanes, negative_one));
     }
-
-    while (index < end) : (index += 1) {
-        intents.correction_x[index] = intents.normal_x[index] * intents.penetration[index];
-        intents.correction_y[index] = intents.normal_y[index] * intents.penetration[index];
-        intents.velocity_scale[index] = -intents.restitution[index];
-    }
+    if (index == end) return;
+    const group = end - index;
+    const normal_x_lanes = simd.loadFloat4Prefix(intents.normal_x[index..], group);
+    const normal_y_lanes = simd.loadFloat4Prefix(intents.normal_y[index..], group);
+    const penetration_lanes = simd.loadFloat4Prefix(intents.penetration[index..], group);
+    const restitution_lanes = simd.loadFloat4Prefix(intents.restitution[index..], group);
+    simd.storeFloat4Prefix(intents.correction_x[index..], simd.mulFloat4(normal_x_lanes, penetration_lanes), group);
+    simd.storeFloat4Prefix(intents.correction_y[index..], simd.mulFloat4(normal_y_lanes, penetration_lanes), group);
+    simd.storeFloat4Prefix(intents.velocity_scale[index..], simd.mulFloat4(restitution_lanes, negative_one), group);
 }
 
 // `gather`: one range of contacts.

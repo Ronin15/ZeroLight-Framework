@@ -65,6 +65,22 @@ pub inline fn storeFloat4Slice(values: []f32, vector: Float4) void {
     }
 }
 
+/// Writes the first `count` lanes. `count <= lane_count`. Does not write past
+/// `values[0..count]`.
+pub fn storeFloat4Prefix(values: []f32, vector: Float4, count: usize) void {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    const stored = toFloatArray(vector);
+    for (0..count) |lane| values[lane] = stored[lane];
+}
+
+/// Scalar form of `storeFloat4Prefix`.
+fn storeFloat4PrefixScalar(values: []f32, lanes: [lane_count]f32, count: usize) void {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    for (0..count) |lane| values[lane] = lanes[lane];
+}
+
 /// Stores the four lanes of `vector` into the first four values of `values`, in lane order;
 /// the rest of `values` is left as it was.
 pub inline fn storeUint4Slice(values: []u32, vector: Uint4) void {
@@ -873,6 +889,17 @@ test "loadFloat4Prefix and scatterFloat4Masked match their scalar forms bit for 
     try std.testing.expectEqual(@as(f32, 3), alias_simd[2]);
     try std.testing.expectEqual(@as(f32, 4), alias_simd[3]);
     try std.testing.expectEqual(@as(f32, 5), alias_simd[4]);
+
+    const prefix_vector = float4(-0.0, 1.5, -2.5, 3.5);
+    for (0..lane_count + 1) |count| {
+        var prefix_simd = [_]f32{ 7, 7, 7, 7, 8, 9 };
+        var prefix_scalar = prefix_simd;
+        storeFloat4Prefix(prefix_simd[0..], prefix_vector, count);
+        storeFloat4PrefixScalar(prefix_scalar[0..], toFloatArray(prefix_vector), count);
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&prefix_scalar), std.mem.asBytes(&prefix_simd));
+        try std.testing.expectEqual(@as(f32, 8), prefix_simd[4]);
+        try std.testing.expectEqual(@as(f32, 9), prefix_simd[5]);
+    }
 
     const full_indices = [_]usize{ 5, 0, 3, 1 };
     const full_vector = float4(-0.0, 10, 13, 11);
