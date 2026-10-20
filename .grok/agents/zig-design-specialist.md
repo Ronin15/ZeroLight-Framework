@@ -109,7 +109,10 @@ section with nothing new is omitted.
   order is read where it sits. Do not copy it into a side group to fill
   lanes. Name the common call's length. A call shorter than a lane stays
   scalar; the mask is only the remainder of a run that already fills a
-  lane. Inherited code the change
+  lane. A design that replaces a hot loop keeps a pattern that is already
+  the right shape and replaces one that is not. It lands only when
+  ReleaseFast on that path is faster than the code it replaces. Within
+  spread is not a win. Inherited code the change
   keeps on the hot path is in the table. "Same as the old loop" is not
   a pass. The only exemptions are the ones that section names (search
   frontiers, pair streams, hash point lookups), and the row names the

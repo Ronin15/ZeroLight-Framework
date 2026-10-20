@@ -220,13 +220,13 @@ the current bench.
       dense hit buffer that the next body reuses
       (`memory-performance.md` § SIMD and core math). Pass: the overlap math
       on that buffer is one masked lane loop. The search stays scalar.
-- [ ] Static query overlap stays scalar (`static_colliders.zig:577`,
-      `:600`, `:624`). Failure: unit-stride AABB columns are tested one row
-      at a time from collision's per-body query and steering's per-agent
-      `queryBox` (`memory-performance.md` § SIMD and core math). Pass: the
-      predicate is one masked `simd.zig` lane loop, short runs included.
-      Several short runs in one query are packed once in walk order.
-      `queryBox` stops on the same row as today. Hit compact stays scalar.
+- [ ] Static query overlap. The collision query is uncapped and a cell
+      holds one static, so that compare stays the tight scalar loop
+      (`scanUncapped`). A lane kernel replaces it only when ReleaseFast
+      `collision-static-heavy` is faster than that loop. A copy of short
+      runs into a side group is not that kernel. Measured against
+      `d9e5f13`: the copy and the in-place prefix were slower or inside a
+      wide spread, and the change did not land.
 - [ ] Debug static scan chases `DataSystem` per row
       (`static_colliders.zig:629`). Failure: in Debug every tested row
       resolves `row_of_index`, the slot, the body, and the bounds.
