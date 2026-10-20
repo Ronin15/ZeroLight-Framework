@@ -2272,34 +2272,21 @@ const EntryWriter = struct {
         self.writeSorted(start, end, first_rank);
     }
 
-    // Writes the sorted keys `[start, end)`'s entries, and their first copies' fill inputs to
-    // the warm order from `first_rank`. Entry bounds gathered by slot in lanes, the last group
-    // masked; the run, first, and slot columns and the warm order are scalar copies.
+    // Scalar: the slot read is the sort permutation, so the columns are not a dense run.
+    // A first copy writes its fill input into the warm order in the same pass.
     fn writeSorted(self: EntryWriter, start: u32, end: u32, first_rank: u32) void {
-        const band = self.keys[start..end];
-        var group: usize = start;
-        while (group < end) : (group += simd.lane_count) {
-            const lanes = simd.lanesBelow(end - group);
-            var slots: [simd.lane_count]usize = undefined;
-            inline for (0..simd.lane_count) |lane| {
-                // Absent lanes repeat the band's last entry.
-                const entry = self.keys[@min(group + lane, end - 1)];
-                slots[lane] = entry.slot;
-                if (lanes & (1 << lane) != 0) {
-                    self.entries.run[group + lane] = keyRun(entry.key);
-                    self.entries.first[group + lane] = @intFromBool(entry.first);
-                    self.entries.slot[group + lane] = entry.slot;
-                }
-            }
-            storeFloatLanes(self.entries.min_x, group, simd.gatherFloat4(self.proxies.min_x, slots), lanes);
-            storeFloatLanes(self.entries.min_y, group, simd.gatherFloat4(self.proxies.min_y, slots), lanes);
-            storeFloatLanes(self.entries.max_x, group, simd.gatherFloat4(self.proxies.max_x, slots), lanes);
-            storeFloatLanes(self.entries.max_y, group, simd.gatherFloat4(self.proxies.max_y, slots), lanes);
-        }
         var rank = first_rank;
-        for (band) |entry| {
+        for (self.keys[start..end], start..) |entry, index| {
+            const slot: usize = entry.slot;
+            self.entries.min_x[index] = self.proxies.min_x[slot];
+            self.entries.min_y[index] = self.proxies.min_y[slot];
+            self.entries.max_x[index] = self.proxies.max_x[slot];
+            self.entries.max_y[index] = self.proxies.max_y[slot];
+            self.entries.run[index] = keyRun(entry.key);
+            self.entries.first[index] = @intFromBool(entry.first);
+            self.entries.slot[index] = entry.slot;
             if (!entry.first) continue;
-            self.warm_sources[rank] = self.proxies.source[entry.slot];
+            self.warm_sources[rank] = self.proxies.source[slot];
             rank += 1;
         }
     }
