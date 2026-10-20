@@ -99,9 +99,13 @@ the current bench.
       the new contact order is stated for response, audio, and the sensory
       bus, and contacts are otherwise unchanged.
 - [ ] Gather and sort off main. Failure scenario: main time grows with
-      collision bodies every step (`:327`, `:336`). Measured: the gather is
-      2.75 ms of the 2.95 ms main at spread, and the gather plus sort are
-      11.4 ms at crowd P 16,384. Pass: in `collision` and `production-step
+      collision bodies every step (`:327`, `:336`). The pre-slice baseline was
+      gather 2.75 ms of 2.95 ms main at spread, and gather plus sort 11.4 ms
+      at crowd P 16,384. Tuned `production-step` on current code, with the
+      fill batch recorded: fill and sort are on workers for all 30 steps.
+      Collision main is 92 µs at 1,537 bodies and 104 µs at 6,145 bodies,
+      both with no contacts, and 127 µs / 417 µs at 1,272 / 5,424 contacts.
+      Pass: in `collision` and `production-step
       --details` the main share is the ordered merge only; serial == threaded
       across range sizes and worker counts; `FailingAllocator` proof on a
       multi-worker step; a pipeline test proves the stages ran on workers.

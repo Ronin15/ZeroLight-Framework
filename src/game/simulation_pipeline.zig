@@ -677,6 +677,11 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
         if (collision_stats.pair_bound_exceeded) perf.recordMetric(.collision_pair_bound_exceeded, 1);
         if (comptime runtime_perf_log.enabled) {
+            const fill_batch = collision_stats.perf.fill_batch;
+            // An untimed batch with no workers is not a sample. The inline banded fill is timed.
+            if (fill_batch.available_worker_threads != 0 or fill_batch.batch_duration_ns != 0) {
+                perf.recordBatch(.collision_fill, fill_batch);
+            }
             const sort_batch = collision_stats.perf.sort_batch;
             // An untimed batch with no workers is not a sample. The inline banded sort is timed.
             if (sort_batch.available_worker_threads != 0 or sort_batch.batch_duration_ns != 0) {
