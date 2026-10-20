@@ -105,7 +105,11 @@ section with nothing new is omitted.
   Do not force SIMD onto it, and do not drop a SIMD-shaped loop because
   Debug is only a little slower. The fix
   is the layout: the columns in the consumer's read order, packed once,
-  then one lane path with a mask for the tail. Inherited code the change
+  then one lane path with a mask for the tail. A column already in that
+  order is read where it sits. Do not copy it into a side group to fill
+  lanes. Name the common call's length. A call shorter than a lane stays
+  scalar; the mask is only the remainder of a run that already fills a
+  lane. Inherited code the change
   keeps on the hot path is in the table. "Same as the old loop" is not
   a pass. The only exemptions are the ones that section names (search
   frontiers, pair streams, hash point lookups), and the row names the
