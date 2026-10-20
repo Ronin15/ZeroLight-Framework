@@ -2408,6 +2408,8 @@ fn narrowphaseContactsJob(context: *anyopaque, range: ParallelRange, _: WorkerId
 /// (`narrowphase_staging.items[range.start..range.end]`, at most one contact per
 /// candidate pair) and its count into its tally. When `write_keys` is set, the
 /// same slots of `narrowphase_keys` receive the proxy order key.
+/// A group shorter than a lane repeats the last in-range pair index; the store
+/// mask drops those lanes, so a gather never reads past `range.end`.
 fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange, write_keys: bool) void {
     const proxies = ConstProxyColumns.of(system.proxies.slice());
     std.debug.assert(range.index < system.narrowphase_tallies.items.len);
@@ -2420,11 +2422,14 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange, 
     const one = simd.splatFloat4(1);
     const negative_one = simd.splatFloat4(-1);
 
-    while (index + simd.lane_count <= range.end) : (index += simd.lane_count) {
+    while (index < range.end) {
+        const group = @min(simd.lane_count, range.end - index);
+        const active = simd.lanesBelow(group);
         var a_indices: [simd.lane_count]usize = undefined;
         var b_indices: [simd.lane_count]usize = undefined;
         inline for (0..simd.lane_count) |lane| {
-            const pair = system.candidate_pairs.items[index + lane];
+            const offset = if (lane < group) lane else group - 1;
+            const pair = system.candidate_pairs.items[index + offset];
             a_indices[lane] = pair.a;
             b_indices[lane] = pair.b;
         }
@@ -2437,6 +2442,10 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange, 
         const b_max_x = simd.gatherFloat4(proxies.max_x, b_indices);
         const b_min_y = simd.gatherFloat4(proxies.min_y, b_indices);
         const b_max_y = simd.gatherFloat4(proxies.max_y, b_indices);
+        const a_vx = simd.gatherFloat4(proxies.velocity_x, a_indices);
+        const a_vy = simd.gatherFloat4(proxies.velocity_y, a_indices);
+        const b_vx = simd.gatherFloat4(proxies.velocity_x, b_indices);
+        const b_vy = simd.gatherFloat4(proxies.velocity_y, b_indices);
 
         const overlap_left = a_max_x - b_min_x;
         const overlap_right = b_max_x - a_min_x;
@@ -2453,30 +2462,36 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange, 
         const normal_x = simd.selectFloat4(use_x_axis, simd.selectFloat4(a_center_x <= b_center_x, negative_one, one), zero);
         const normal_y = simd.selectFloat4(use_x_axis, zero, simd.selectFloat4(a_center_y <= b_center_y, negative_one, one));
         const penetration = simd.selectFloat4(use_x_axis, overlap_x, overlap_y);
+        const speed_a_sq = simd.addFloat4(simd.mulFloat4(a_vx, a_vx), simd.mulFloat4(a_vy, a_vy));
+        const speed_b_sq = simd.addFloat4(simd.mulFloat4(b_vx, b_vx), simd.mulFloat4(b_vy, b_vy));
+        const rel_x = simd.subFloat4(a_vx, b_vx);
+        const rel_y = simd.subFloat4(a_vy, b_vy);
+        const max_speed_sq = simd.maxFloat4(speed_a_sq, speed_b_sq);
+        const rel_speed_sq = simd.addFloat4(simd.mulFloat4(rel_x, rel_x), simd.mulFloat4(rel_y, rel_y));
 
+        const emit = simd.maskBits(valid) & active;
         inline for (0..simd.lane_count) |lane| {
-            if (valid[lane]) {
+            if (emit & (1 << lane) != 0) {
                 const a = a_indices[lane];
                 const b = b_indices[lane];
                 if (write_keys) {
-                    // Scalar: the lane loop already drains one valid contact at a time.
                     system.narrowphase_keys.items[range.start + count] = contactKeyFromProxies(system.strips, proxies, a, b);
                 }
-                window[count] = contactForResolved(proxies, a, b, normal_x[lane], normal_y[lane], penetration[lane]);
+                window[count] = .{
+                    .a = proxies.entity[a],
+                    .b = proxies.entity[b],
+                    .a_movement_index = proxies.movement_index[a],
+                    .b_movement_index = proxies.movement_index[b],
+                    .normal_x = normal_x[lane],
+                    .normal_y = normal_y[lane],
+                    .penetration = penetration[lane],
+                    .pre_response_max_speed_sq = max_speed_sq[lane],
+                    .pre_response_relative_speed_sq = rel_speed_sq[lane],
+                };
                 count += 1;
             }
         }
-    }
-
-    while (index < range.end) : (index += 1) {
-        const pair = system.candidate_pairs.items[index];
-        if (contactForCandidate(proxies, pair.a, pair.b)) |contact| {
-            if (write_keys) {
-                system.narrowphase_keys.items[range.start + count] = contactKeyFromProxies(system.strips, proxies, pair.a, pair.b);
-            }
-            window[count] = contact;
-            count += 1;
-        }
+        index += group;
     }
     system.narrowphase_tallies.items[range.index].count = count;
 }
@@ -2500,29 +2515,6 @@ fn contactForCandidate(proxies: ConstProxyColumns, a: usize, b: usize) ?Collisio
         proxies.velocity_y[a],
         proxies.velocity_x[b],
         proxies.velocity_y[b],
-    );
-}
-
-fn contactForResolved(
-    proxies: ConstProxyColumns,
-    a: usize,
-    b: usize,
-    normal_x: f32,
-    normal_y: f32,
-    penetration: f32,
-) CollisionContact {
-    return contactFields(
-        proxies.entity[a],
-        proxies.entity[b],
-        proxies.movement_index[a],
-        proxies.movement_index[b],
-        proxies.velocity_x[a],
-        proxies.velocity_y[a],
-        proxies.velocity_x[b],
-        proxies.velocity_y[b],
-        normal_x,
-        normal_y,
-        penetration,
     );
 }
 
@@ -4226,14 +4218,15 @@ test "scope_dense_indices limits collision fill to scoped bounds rows" {
 test "narrowphase simd contacts match scalar contactForCandidate" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
-    // Mix of overlaps, near-misses, axis ties (equal x/y penetration), and
-    // multi-lane counts so both the SIMD chunk and scalar tail are exercised.
-    _ = try addBody(&data, 0, 0, 10); // 0
-    _ = try addBody(&data, 8, 0, 10); // 1: x-axis overlap with 0
-    _ = try addBody(&data, 0, 8, 10); // 2: y-axis overlap with 0
-    _ = try addBody(&data, 5, 5, 10); // 3: equal-ish x/y penetration with 0
-    _ = try addBody(&data, 50, 50, 4); // 4: non-overlap vs others
-    _ = try addBody(&data, 9, 1, 10); // 5: overlap with 0 and 1
+    // Overlaps, a shared-edge miss, and an axis tie. Nonzero velocities make the
+    // speed squares part of the oracle. The counts below are every short-group length.
+    _ = try addBox(&data, .{ .x = 0, .y = 0, .w = 10, .h = 10, .velocity_x = 4, .velocity_y = 0 }); // 0
+    _ = try addBox(&data, .{ .x = 8, .y = 0, .w = 10, .h = 10, .velocity_x = -2, .velocity_y = 3 }); // 1: x-axis overlap with 0
+    _ = try addBox(&data, .{ .x = 0, .y = 8, .w = 10, .h = 10, .velocity_x = 0, .velocity_y = 5 }); // 2: y-axis overlap with 0
+    _ = try addBox(&data, .{ .x = 5, .y = 5, .w = 10, .h = 10, .velocity_x = 1, .velocity_y = 1 }); // 3: equal-ish x/y penetration with 0
+    _ = try addBox(&data, .{ .x = 50, .y = 50, .w = 4, .h = 4, .velocity_x = 9, .velocity_y = -4 }); // 4: non-overlap vs others
+    _ = try addBox(&data, .{ .x = 10, .y = 0, .w = 10, .h = 10, .velocity_x = 7, .velocity_y = 2 }); // 5: shared edge with 0, not a contact
+    _ = try addBox(&data, .{ .x = 9, .y = 1, .w = 10, .h = 10, .velocity_x = -3, .velocity_y = -2 }); // 6: overlap with 0 and 1
 
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
@@ -4247,37 +4240,39 @@ test "narrowphase simd contacts match scalar contactForCandidate" {
         .{ .a = 0, .b = 3 },
         .{ .a = 0, .b = 4 },
         .{ .a = 0, .b = 5 },
-        .{ .a = 1, .b = 5 },
+        .{ .a = 0, .b = 6 },
+        .{ .a = 1, .b = 6 },
         .{ .a = 1, .b = 4 },
         .{ .a = 2, .b = 3 },
-        .{ .a = 3, .b = 5 },
+        .{ .a = 3, .b = 6 },
     };
     try system.candidate_pairs.ensureTotalCapacity(std.testing.allocator, pairs.len);
     for (pairs) |pair| {
         system.candidate_pairs.appendAssumeCapacity(pair);
     }
 
-    // Scalar reference: one optional contact per candidate, in pair order.
-    var expected: std.ArrayList(CollisionContact) = .empty;
-    defer expected.deinit(std.testing.allocator);
-    try expected.ensureTotalCapacity(std.testing.allocator, pairs.len);
-    for (pairs) |pair| {
-        if (contactForCandidate(proxies, pair.a, pair.b)) |contact| {
-            expected.appendAssumeCapacity(contact);
+    // One range per count. A count that is not a multiple of the lane width uses the
+    // same kernel with a store mask; zero overlap, including a shared edge, is no contact.
+    for ([_]usize{ 1, 2, 3, 4, 5, 6, pairs.len }) |count| {
+        var expected: std.ArrayList(CollisionContact) = .empty;
+        defer expected.deinit(std.testing.allocator);
+        try expected.ensureTotalCapacity(std.testing.allocator, count);
+        for (pairs[0..count]) |pair| {
+            if (contactForCandidate(proxies, pair.a, pair.b)) |contact| {
+                expected.appendAssumeCapacity(contact);
+            }
         }
+
+        try system.prepareNarrowphaseStaging(count, 1, false);
+        writeNarrowphaseContactsSimd(&system, .{ .index = 0, .start = 0, .end = count }, false);
+
+        var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+        defer contacts.deinit();
+        const contact_count = try system.mergeNarrowphaseContacts(&contacts, count);
+
+        try std.testing.expectEqual(expected.items.len, contact_count);
+        try expectSameContacts(expected.items, contacts.mergedItems());
     }
-
-    // One range over a non-multiple-of-lane-count pair list exercises both the
-    // SIMD chunk loop and the scalar tail inside writeNarrowphaseContactsSimd.
-    try system.prepareNarrowphaseStaging(pairs.len, 1, false);
-    writeNarrowphaseContactsSimd(&system, .{ .index = 0, .start = 0, .end = pairs.len }, false);
-
-    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
-    defer contacts.deinit();
-    const contact_count = try system.mergeNarrowphaseContacts(&contacts, pairs.len);
-
-    try std.testing.expectEqual(expected.items.len, contact_count);
-    try expectSameContacts(expected.items, contacts.mergedItems());
 }
 
 test "merging sorted runs equals sorting their concatenation" {
