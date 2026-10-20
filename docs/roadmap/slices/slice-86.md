@@ -163,12 +163,71 @@ the current bench.
 - [x] A SIMD verdict at `gatherRange`. The loop stays scalar: two slot
       resolves and a variable-length write. `computeIntentMath` is the
       lane consumer and streams the intent columns.
-- [ ] The rest of the subsystem checked against the cost model and the rules:
+- [x] The rest of the subsystem checked against the cost model and the rules:
       narrowphase, response, contact streams, level handling, and scope tiers,
       over every file it owns (`systems/collision.zig`,
       `collision_response.zig`, `static_colliders.zig`, `contact_query.zig`,
       `destructible_controller.zig`, `data_system/collision.zig`,
       `data_system/destructible.zig`). Each finding becomes an item here.
+      `contact_query.zig` and `destructible_controller.zig` live under
+      `src/game/`, not `systems/`. Response apply had no new hit. The hits
+      are the items below.
+- [ ] Warm fill resolves each input through other stores inside the lane
+      group (`collision.zig:1984`, `FillContext.resolve` at `:1918`).
+      Failure: a warm step reads `warm_sources`, bounds, and movement
+      position and velocity per lane (`memory-performance.md` § Data-oriented
+      design, § SIMD and core math). Pass: the fill job packs those columns
+      once in slot order, and `fillSlots` loads that scratch with the lane
+      kernel and a masked tail.
+- [ ] `writeSorted` gathers proxy columns through `entry.slot`
+      (`collision.zig:2203`). Failure: after the band is in key order, each
+      lane group gathers `min_x/min_y/max_x/max_y` and the warm source by
+      slot (`memory-performance.md` § Data-oriented design). Pass: those
+      values are stored in entry order and `writeSorted` loads them
+      unit-stride. Where the values ride (the sort record, or one pack) is
+      open.
+- [ ] Narrowphase drains lane contacts into scalar calls
+      (`collision.zig:2379`). Failure: overlap, normal, and penetration are
+      lanes, then each valid lane calls `contactForResolved`
+      (`memory-performance.md` § SIMD and core math). Pass: velocity and the
+      speed squares stay in that lane loop. Compaction into the window may
+      stay scalar.
+- [ ] Static-pair materialization looks up entity slots per hit
+      (`collision.zig:1654`, `tierAt` at `:1633`). Failure: after the search,
+      every hit indexes `row_of_index`, tier, and the movement row
+      (`memory-performance.md` § Data-oriented design). Pass: the contact
+      loop streams hit columns that already hold entity, movement index,
+      allow bit, and velocity. Where those columns are packed is open.
+- [ ] Stored trigger pairs re-check tiers on the caller of `update`
+      (`collision.zig:1503`). Failure: every step walks every stored pair
+      and slices the movement store per pair (`memory-performance.md`
+      § Data-oriented design; `threading.md` § What runs where). Pass: main
+      does not call `tierAt`. The allow bit is packed before that pass, and
+      main reserves once. Where the bit is stored is open.
+- [ ] Static hit contacts stay scalar over packed float columns
+      (`collision.zig:1650`). Failure: each hit runs `contactForAabbs` on a
+      dense hit buffer that the next body reuses
+      (`memory-performance.md` § SIMD and core math). Pass: the overlap math
+      on that buffer is one masked lane loop. The search stays scalar.
+- [ ] Static query overlap stays scalar (`static_colliders.zig:577`,
+      `:600`, `:624`). Failure: unit-stride AABB columns are tested one row
+      at a time from collision's per-body query and steering's per-agent
+      `queryBox` (`memory-performance.md` § SIMD and core math). Pass: the
+      predicate is one masked `simd.zig` lane loop, short runs included.
+      Several short runs in one query are packed once in walk order.
+      `queryBox` stops on the same row as today. Hit compact stays scalar.
+- [ ] Debug static scan chases `DataSystem` per row
+      (`static_colliders.zig:629`). Failure: in Debug every tested row
+      resolves `row_of_index`, the slot, the body, and the bounds.
+      ReleaseFast compiles the call out (`memory-performance.md`
+      § Data-oriented design). Pass: the scan does not read `DataSystem`.
+      Where a rect compare moves is open.
+- [ ] Destructible cell scan chases other stores
+      (`src/game/destructible_controller.zig:297`). Failure: up to 256 rows
+      per cell-targeted intent each resolve the slot, level, body, and
+      bounds (`memory-performance.md` § Data-oriented design). Pass: the
+      scan reads alive, level, and the world AABB in row order, then one
+      masked overlap. Which store owns those columns is open.
 - [x] Path registry lists read as contiguous runs per key (contiguity audit
       L1). Failure: the `path_index` shards are `ChunkListMap`s keyed by
       (level, chunk) (`pathfinding/system.zig:150`), and the threaded
