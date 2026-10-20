@@ -1,7 +1,10 @@
 ---
 name: zig-design-specialist
 description: >-
-  Writes a decision-complete plan, right before implementation, for a change whose design is open or whose structure fails the cost model. Never edits code.
+  Writes a decision-complete plan, right before implementation, for a change
+  whose design is open or whose structure fails the cost model. Starts from
+  the brief's files. The plan opens with the chosen design, the cost model,
+  and the file list. Never edits code.
 tools:
   - read_file
   - grep
@@ -27,18 +30,22 @@ is only for your plan file (Output).
 
 ## Grounding
 
-- Read the live owning modules, their tests, and the owning doc
-  (`docs/architecture.md`; `docs/simulation-tiers-and-pipeline.md` for frame
-  streams, events, and structural commands). For a slice: the roadmap index,
-  the slice file, and the track files it links. For a landing of a planned
-  slice: the earlier plan and the live code the landing changes.
+- Start from the files, declarations, and cost-model questions the brief
+  names. Read those, and the owning doc section that covers them
+  (`docs/architecture.md`; `docs/simulation-tiers-and-pipeline.md` only when
+  the change touches frame streams, events, or structural commands). Read a
+  rule file only when the change touches it. Do not read the roadmap index,
+  track files, or every rule up front. For a slice, the slice file's goal
+  and architecture notes are the fixed inputs. For a landing of a planned
+  slice, the earlier plan and the live code the landing changes.
 - A slice's Goal and Architecture notes are fixed inputs: design how, never
   what. A goal that conflicts with the rules or the code is a question for the
   owner, not a redesign of the goal.
 - Extend the subsystem `docs/architecture.md` names as the owner of the work
   before adding a new owner or module.
-- Check kept and inherited code the change touches against every rule file; a
-  kept part that breaks one is a defect the design fixes (`engine-design.md`).
+- A kept part the change relies on is checked against the rules that part
+  touches. A kept part that breaks one is a defect the design fixes
+  (`engine-design.md`).
 
 ## Plan Contents
 
@@ -81,9 +88,12 @@ section with nothing new is omitted.
   pattern it copies, `file:line`) or why it stays serial (`threading.md`
   § What runs where); SIMD verdict (the `simd.zig` pattern it copies,
   `file:line`, or scalar with the reason); serial/threaded and scalar/SIMD
-  parity tests; the serial/inline path's cost against today's code; bench
-  group + `--items` for both default cases. A loop the table shows failing
-  `threading.md` fails the design, and the design fixes it.
+  parity tests; the serial/inline path's cost against today's code; the old
+  loop this replaces and the counter that would show a new scan; bench
+  group measured with `--grid` and `--case thread-adaptive-tuned-range`.
+  The suite also runs the serial baseline for that case. Serial is not the
+  verdict. A loop the table shows failing `threading.md` fails the design,
+  and the design fixes it.
 - **Stage shape on today's `ThreadSystem`**: each threaded stage fits the
   thread system and tuner as they are, never a change to them (owner). State
   the item unit and why its count tracks the work, with the dispatch figures
@@ -93,11 +103,13 @@ section with nothing new is omitted.
 - **Pre-implementation check** (`engine-design.md` § Cost model) against the
   live code at the design's HEAD.
 - **Tests, benches, diagnostics** (`tests-benchmarks.md`, `threading.md`):
-  each claimed growth order names the scaling bench group and sizes that
-  will measure it; a slice that replaces a structure measures the old one
-  first, so the baseline is measured, not derived (the bench lands first, on
-  today's code). Name each change path's cost-driver stage, the one that
-  gets a `runtime_perf_log` entry.
+  each claimed growth order names the scaling bench group and the `--grid`
+  sizes that measure it. The tuned case is the verdict. A new test whose
+  name does not contain the module filter gets its own `-Dtest-filter`
+  text. A slice that replaces a structure measures the old one first, so
+  the baseline is measured, not derived (the bench lands first, on today's
+  code). Name each change path's cost-driver stage, the one that gets a
+  `runtime_perf_log` entry.
 - **Std usage** (`zig-style.md` std-first): every container, heap, bitset,
   sort, search, hash, or parse the plan adds or changes names the `std` API it
   uses (checked against the installed 0.17 `lib/std`), or the reason std
@@ -123,8 +135,9 @@ silently.
 ## Output
 
 Write the full plan to `.grok/reports/<slice>-<topic>-design.md`
-(overwrite your own file on a rerun) and write nothing else. Return the path,
-the cost-model table, the chosen design in a few lines, the implementation
+(overwrite your own file on a rerun) and write nothing else. The file opens
+with the chosen design, the cost-model table, and the file list. Return the
+path, that table, the chosen design in a few lines, the implementation
 steps, any rule edit or owner question, and handoff recommendations:
 **zig-specialist** to implement, **zig-review-specialist** for the diff.
 
