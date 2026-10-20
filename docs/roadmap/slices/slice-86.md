@@ -191,6 +191,12 @@ the current bench.
       values are stored in entry order and `writeSorted` loads them
       unit-stride. Where the values ride (the sort record, or one pack) is
       open.
+- [ ] Intent math keeps a scalar tail (`collision_response.zig:781`).
+      Failure: `computeIntentMath` runs the correction and velocity scale
+      in lanes, then repeats that math one intent at a time
+      (`memory-performance.md` § SIMD and core math). Pass: the remainder
+      is that kernel with a mask. Inactive lanes do not write past the
+      window.
 - [ ] Narrowphase drains lane contacts into scalar calls
       (`collision.zig:2379`). Failure: overlap, normal, and penetration are
       lanes, then each valid lane calls `contactForResolved`

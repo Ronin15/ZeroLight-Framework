@@ -108,6 +108,12 @@ keeps the apply local.
       the apply walks its intents in row order with no per-intent row lookup;
       `movement-apply-intents` within spread of `-sorted`, with the ordering
       cost counted in steering.
+- [ ] Movement and particle updates drop the scalar remainder. Failure:
+      `processRange` (`movement.zig:261`) and the particle update
+      (`particle.zig:507`) run the lane kernel, then repeat that math one
+      row at a time (`memory-performance.md` § SIMD and core math). Pass:
+      the remainder is that kernel with a mask. Inactive lanes do not
+      write past the range.
 - [ ] `steering_update` declares its carried inputs (84's audit). Failure:
       steering reads the previous step's positions and levels
       (`steering/system.zig:350`) before `apply_ai_movement_intents` writes

@@ -85,7 +85,10 @@ scope only where the diff relies on it.
    permutation, a pointer chase, or a per-row lookup into another store is
    a High structural finding, as is dense uniform float work whose shape
    can take lanes left scalar inside a population loop, or lane results
-   drained into per-item scalar calls. An irreducible loop stays scalar.
+   drained into per-item scalar calls. A lane kernel with a separate scalar
+   remainder of the same math is a finding. The tail is that kernel with a
+   mask. A remainder that is not the same math stays scalar and says why.
+   An irreducible loop stays scalar.
    A SIMD-shaped loop that is only a little slower in Debug is not a finding.
    "Same as the old loop" is not a pass. The only exemptions are search
    frontiers, pair streams, and hash point lookups, named in the plan.
