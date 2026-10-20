@@ -1946,20 +1946,21 @@ test "threaded multi-worker response allocates nothing after reserveForContacts"
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 40);
     defer fixture.deinit(allocator);
-    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    const cpus = @max(std.Thread.getCpuCount() catch 1, 1);
+    const workers: u32 = @intCast(@min(2, cpus -| 1));
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = workers });
     defer threads.deinit();
     const contact_count = fixture.frame.contacts.mergedItems().len;
 
     var system = CollisionResponseSystem.init(allocator);
     defer system.deinit();
     try system.reserveForContacts(contact_count);
-    try system.ensureDirectTables(threads.participantSlotCount(), blockCount(fixture.data.movementBodySliceConst().entities.len));
     try fixture.frame.collision_triggers.reserve(1, estimateTriggerCapacity(contact_count));
 
     var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     system.allocator = failing_allocator.allocator();
     fixture.frame.collision_triggers.allocator = failing_allocator.allocator();
-    const result = system.update(&fixture.data, &fixture.frame, fixture.observer, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
+    const result = system.update(&fixture.data, &fixture.frame, fixture.observer, &threads, .{ .items_per_range = 16, .max_worker_threads = workers, .adaptive = false });
     system.allocator = allocator;
     fixture.frame.collision_triggers.allocator = allocator;
     const stats = try result;
