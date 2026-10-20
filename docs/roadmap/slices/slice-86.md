@@ -170,8 +170,9 @@ the current bench.
       `destructible_controller.zig`, `data_system/collision.zig`,
       `data_system/destructible.zig`). Each finding becomes an item here.
       `contact_query.zig` and `destructible_controller.zig` live under
-      `src/game/`, not `systems/`. Response apply had no new hit. The hits
-      are the items below.
+      `src/game/`, not `systems/`. Response apply had no new hit. The
+      destructible cell scan is 72 D1, which replaces that scan. The other
+      hits are the items below.
 - [ ] Warm fill resolves each input through other stores inside the lane
       group (`collision.zig:1984`, `FillContext.resolve` at `:1918`).
       Failure: a warm step reads `warm_sources`, bounds, and movement
@@ -222,12 +223,6 @@ the current bench.
       ReleaseFast compiles the call out (`memory-performance.md`
       § Data-oriented design). Pass: the scan does not read `DataSystem`.
       Where a rect compare moves is open.
-- [ ] Destructible cell scan chases other stores
-      (`src/game/destructible_controller.zig:297`). Failure: up to 256 rows
-      per cell-targeted intent each resolve the slot, level, body, and
-      bounds (`memory-performance.md` § Data-oriented design). Pass: the
-      scan reads alive, level, and the world AABB in row order, then one
-      masked overlap. Which store owns those columns is open.
 - [x] Path registry lists read as contiguous runs per key (contiguity audit
       L1). Failure: the `path_index` shards are `ChunkListMap`s keyed by
       (level, chunk) (`pathfinding/system.zig:150`), and the threaded

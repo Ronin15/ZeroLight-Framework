@@ -96,6 +96,8 @@ content across world sizes.
       step fails the cost model). Failure scenario: the resolve scans only the
       first 256 dense rows (`destructible_controller.zig:36`, `:294`), so a
       destructible at row 257 or later is never hit (derived; contract test).
+      Each scanned row also resolves the slot, level, body, and bounds
+      (`:297`). That chase goes away with the scan, not as a packed copy of it.
       Today's tie-break kept; `destructible-resolve` flat in destructible
       count at three counts; 61, 63, and 71D resolve text updated.
 - [x] D3 · LOS visit limit from the ray's own length.
