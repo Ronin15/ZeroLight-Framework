@@ -6,12 +6,13 @@
 //! classifies each contact, resolves the movement row of each response intent, writes
 //! its range's windows of intents, triggers, and observer contacts, and runs the intent
 //! math. When the gather runs on workers, each range groups its placed intents into
-//! 16-row movement blocks on that worker's direct block table, and one place range
-//! merges those runs; `apply` then writes each occupied block on one worker. When the
-//! gather runs inline, including no worker threads, each range applies its own window
-//! before it returns. Either way each movement row receives its intents in contact
-//! order, so the result is independent of the partition. The main thread streams the
-//! trigger windows and compacts the observer windows in range order.
+//! 16-row movement blocks on that worker's direct block table and packs the apply
+//! columns in contact order; one place range merges those runs, and `apply` streams
+//! each packed run. When the gather runs inline, including no worker threads, each
+//! range applies its own window before it returns. Either way each movement row
+//! receives its intents in contact order, so the result is independent of the
+//! partition. The main thread streams the trigger windows and compacts the observer
+//! windows in range order.
 
 const std = @import("std");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
@@ -112,9 +113,58 @@ comptime {
     for (@typeInfo(IntentRow).@"struct".field_types) |T| {
         std.debug.assert((2 * collision_response_range_alignment_items * @sizeOf(T)) % thread_shared_record_alignment == 0);
     }
+    for (@typeInfo(PackedIntent).@"struct".field_types) |T| {
+        std.debug.assert((2 * collision_response_range_alignment_items * @sizeOf(T)) % thread_shared_record_alignment == 0);
+    }
     std.debug.assert((collision_response_range_alignment_items * @sizeOf(CollisionTriggerEvent)) % thread_shared_record_alignment == 0);
     std.debug.assert((collision_response_range_alignment_items * @sizeOf(u32)) % thread_shared_record_alignment == 0);
 }
+
+const PackedIntent = struct {
+    correction_x: f32,
+    correction_y: f32,
+    normal_x: f32,
+    normal_y: f32,
+    velocity_scale: f32,
+    kind: u32,
+    movement_row: u32,
+};
+
+// One `slice()` of `packed_intents`, captured before dispatch. Apply reads a run's
+// window; the scatter writes it. No `slice()` on a worker or in a per-intent loop.
+const PackedColumns = struct {
+    correction_x: []f32,
+    correction_y: []f32,
+    normal_x: []f32,
+    normal_y: []f32,
+    velocity_scale: []f32,
+    kind: []u32,
+    movement_row: []u32,
+
+    fn of(rows: std.MultiArrayList(PackedIntent).Slice) PackedColumns {
+        return .{
+            .correction_x = rows.items(.correction_x),
+            .correction_y = rows.items(.correction_y),
+            .normal_x = rows.items(.normal_x),
+            .normal_y = rows.items(.normal_y),
+            .velocity_scale = rows.items(.velocity_scale),
+            .kind = rows.items(.kind),
+            .movement_row = rows.items(.movement_row),
+        };
+    }
+
+    fn window(self: PackedColumns, start: usize, end: usize) PackedColumns {
+        return .{
+            .correction_x = self.correction_x[start..end],
+            .correction_y = self.correction_y[start..end],
+            .normal_x = self.normal_x[start..end],
+            .normal_y = self.normal_y[start..end],
+            .velocity_scale = self.velocity_scale[start..end],
+            .kind = self.kind[start..end],
+            .movement_row = self.movement_row[start..end],
+        };
+    }
+};
 
 const IntentColumns = struct {
     movement_row: []u32,
@@ -213,7 +263,7 @@ const GatherRow = struct {
 };
 
 // One gather range's placed intents for one movement block. `begin` is absolute into
-// `intent_order`; the `count` indices are that block's intents in contact order.
+// the packed columns; the `count` slots are that block's intents in contact order.
 const Run = struct {
     block_id: u32,
     begin: u32,
@@ -268,9 +318,9 @@ pub const CollisionResponseSystem = struct {
     // Gather range r's intents start at `2 * r * items_per_range`; its trigger and observer
     // windows at `r * items_per_range`.
     intent_rows: std.MultiArrayList(IntentRow) = .{},
-    // Block-grouped absolute intent indices, in the intent windows; written only when the
-    // gather ran on workers.
-    intent_order: IndexList = .empty,
+    // Apply columns in block order, in the intent windows. Written only when the gather
+    // ran on workers. The inline path does not write them.
+    packed_intents: std.MultiArrayList(PackedIntent) = .{},
     // Per-range runs at the intent-window base, then those runs grouped by block.
     range_runs: RunList = .empty,
     grouped_runs: std.ArrayList(Run) = .empty,
@@ -311,7 +361,7 @@ pub const CollisionResponseSystem = struct {
         self.block_items.deinit(self.allocator);
         self.grouped_runs.deinit(self.allocator);
         self.range_runs.deinit(self.allocator);
-        self.intent_order.deinit(self.allocator);
+        self.packed_intents.deinit(self.allocator);
         self.intent_rows.deinit(self.allocator);
         self.* = undefined;
     }
@@ -366,7 +416,7 @@ pub const CollisionResponseSystem = struct {
         }
         var gather = GatherJob{
             .input = input,
-            .order = self.intent_order.items,
+            .packed_columns = step.packed_columns,
             .runs = self.range_runs.items,
             .block_slots = self.block_slots.items,
             .table_blocks = if (inline_apply) 0 else blocks,
@@ -411,9 +461,8 @@ pub const CollisionResponseSystem = struct {
                 var apply_stage = threads.stage(&self.apply_tuner);
                 const apply_selection = apply_stage.select(block_count, 1);
                 var apply = ApplyBlockJob{
-                    .intents = input.intents,
                     .columns = columns,
-                    .order = self.intent_order.items,
+                    .packed_columns = step.packed_columns,
                     .runs = self.grouped_runs.items,
                     .blocks = self.block_items.items[0..block_count],
                     .range_count = apply_selection.range_count,
@@ -457,7 +506,7 @@ pub const CollisionResponseSystem = struct {
         try frame.collision_triggers.reserve(1, contact_count);
         const intent_capacity = 2 * contact_count;
         setRowCount(IntentRow, &self.intent_rows, intent_capacity);
-        setListCount(&self.intent_order, intent_capacity);
+        setRowCount(PackedIntent, &self.packed_intents, intent_capacity);
         setListCount(&self.claimed_slots, intent_capacity);
         setListCount(&self.range_runs, intent_capacity);
         setListCount(&self.grouped_runs, intent_capacity);
@@ -477,6 +526,7 @@ pub const CollisionResponseSystem = struct {
                 .observers = self.observer_staging.items,
             },
             .columns = ApplyColumns.of(movement),
+            .packed_columns = PackedColumns.of(self.packed_intents.slice()),
         };
     }
 
@@ -517,7 +567,7 @@ pub const CollisionResponseSystem = struct {
     fn ensureContactCapacity(self: *CollisionResponseSystem, contact_capacity: usize) !void {
         const intent_capacity = 2 * contact_capacity;
         try self.intent_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(intent_capacity));
-        try self.intent_order.ensureTotalCapacity(self.allocator, intent_capacity);
+        try self.packed_intents.ensureTotalCapacity(self.allocator, hotStoreCapacity(intent_capacity));
         try self.claimed_slots.ensureTotalCapacity(self.allocator, intent_capacity);
         try self.range_runs.ensureTotalCapacity(self.allocator, intent_capacity);
         try self.grouped_runs.ensureTotalCapacity(self.allocator, intent_capacity);
@@ -599,6 +649,7 @@ fn runTotal(gather_rows: []const PaddedSlot(GatherRow)) usize {
 const ResponseStep = struct {
     input: GatherInput,
     columns: ApplyColumns,
+    packed_columns: PackedColumns,
 };
 
 // What one gather reads, and the buffers its ranges write their windows of.
@@ -737,8 +788,8 @@ fn computeIntentMath(intents: IntentColumns, start: usize, end: usize) void {
 // `gather`: one range of contacts.
 const GatherJob = struct {
     input: GatherInput,
-    // Range r's order and run windows start at `2 * r * items_per_range`.
-    order: []u32,
+    // Range r's packed-intent and run windows start at `2 * r * items_per_range`.
+    packed_columns: PackedColumns,
     runs: []Run,
     // Worker `w`'s table is `block_slots[w * table_stride ..][0 .. table_blocks]`.
     // `table_blocks == 0` skips the table (no movement rows, or the gather applies inline).
@@ -769,15 +820,15 @@ fn bumpGeneration(generation: *u32, region: []BlockSlot) u32 {
 
 // Gathers the range's contacts. Inline, then applies the range's window. On workers,
 // groups the resolved intents by 16-row block: one direct load per intent, a prefix of
-// the claimed blocks, one scatter in intent order. No digit passes and no sort of the
-// intent indexes.
+// the claimed blocks, one scatter of the apply columns in intent order. No digit passes
+// and no sort of the intent indexes.
 fn gatherJob(context: *anyopaque, range: ParallelRange, worker: WorkerId) void {
     const job: *GatherJob = @ptrCast(@alignCast(context));
     const input = &job.input;
     std.debug.assert(range.index < job.gather_rows.len);
     std.debug.assert(range.start == range.index * job.items_per_range);
     std.debug.assert(range.start <= range.end and range.end <= input.contacts.len);
-    std.debug.assert(2 * range.end <= input.intents.movement_row.len and 2 * range.end <= job.order.len);
+    std.debug.assert(2 * range.end <= input.intents.movement_row.len and 2 * range.end <= job.packed_columns.movement_row.len);
     std.debug.assert(2 * range.end <= job.runs.len);
     std.debug.assert(range.end <= input.triggers.len and range.end <= input.observers.len);
     if (job.apply) |columns| {
@@ -814,9 +865,10 @@ fn gatherJob(context: *anyopaque, range: ParallelRange, worker: WorkerId) void {
     const region = job.block_slots[base..][0..job.table_stride];
     const generation = bumpGeneration(&job.generations[worker.index].value.value, region);
     row.run_count = groupRangeIntents(
-        input.intents.movement_row[window_start..][0..row.intents],
+        input.intents,
         window_start,
-        job.order,
+        row.intents,
+        job.packed_columns,
         job.runs[window_start..],
         region[0..job.table_blocks],
         job.claimed[window_start..][0..row.intents],
@@ -833,20 +885,23 @@ fn runBlockLess(_: void, lhs: Run, rhs: Run) bool {
 // claimed ids become the runs, ordered by block id. The bin is the block id. Empty
 // slots are not visited. Returns the run count.
 fn groupRangeIntents(
-    movement_rows: []const u32,
+    intents: IntentColumns,
     window_start: usize,
-    order: []u32,
+    intent_count: usize,
+    packed_columns: PackedColumns,
     runs: []Run,
     table: []BlockSlot,
     claimed: []usize,
     generation: u32,
 ) u32 {
-    if (movement_rows.len == 0) return 0;
+    if (intent_count == 0) return 0;
+    const movement_rows = intents.movement_row[window_start..][0..intent_count];
     std.debug.assert(generation != 0);
     std.debug.assert(runs.len >= movement_rows.len);
     // One claim per intent, not one entry per block in the population.
     std.debug.assert(claimed.len == movement_rows.len);
-    std.debug.assert(window_start + movement_rows.len <= order.len);
+    std.debug.assert(window_start + movement_rows.len <= packed_columns.movement_row.len);
+    std.debug.assert(window_start + movement_rows.len <= intents.correction_x.len);
     var distinct: usize = 0;
     for (movement_rows) |movement_row| {
         if (movement_row == no_row) continue;
@@ -888,8 +943,15 @@ fn groupRangeIntents(
         if (movement_row == no_row) continue;
         const slot = &table[blockId(movement_row)];
         std.debug.assert(slot.stamp == generation);
-        // Intent indices fit u32 (`max_step_intents`).
-        order[slot.cursor] = @intCast(window_start + offset);
+        const index = window_start + offset;
+        const dest = slot.cursor;
+        packed_columns.correction_x[dest] = intents.correction_x[index];
+        packed_columns.correction_y[dest] = intents.correction_y[index];
+        packed_columns.normal_x[dest] = intents.normal_x[index];
+        packed_columns.normal_y[dest] = intents.normal_y[index];
+        packed_columns.velocity_scale[dest] = intents.velocity_scale[index];
+        packed_columns.kind[dest] = @backingInt(intents.kind[index]);
+        packed_columns.movement_row[dest] = movement_row;
         slot.cursor += 1;
         scattered += 1;
     }
@@ -985,11 +1047,50 @@ fn scanBlockItems(runs: []const Run, items: []BlockItem) usize {
     return count;
 }
 
+// At most `lane_count - 1` open rows. A hit flushes before this intent joins them.
+fn rowRepeats(open_rows: []const u32, row: u32) bool {
+    for (open_rows) |pending| {
+        if (pending == row) return true;
+    }
+    return false;
+}
+
+// Lane math for the first `count` slots of `packed`. A zero normal makes
+// `velocity * normal` zero, so `±0 < 0` is false and this matches the scalar normal
+// test bit for bit. Inactive lanes gather `rows[0]` and the store mask drops them.
+fn applyGroup(columns: ApplyColumns, rows: *const [simd.lane_count]u32, packed_columns: PackedColumns, count: usize) void {
+    std.debug.assert(count > 0 and count <= simd.lane_count);
+    const pad_row: usize = rows[0];
+    var indices: [simd.lane_count]usize = .{ pad_row, pad_row, pad_row, pad_row };
+    for (0..count) |lane| indices[lane] = rows[lane];
+
+    const mask = simd.lanesBelow(count);
+    const correction_x = simd.loadFloat4Prefix(packed_columns.correction_x, count);
+    const correction_y = simd.loadFloat4Prefix(packed_columns.correction_y, count);
+    const position_x = simd.gatherFloat4(columns.position_x, indices);
+    const position_y = simd.gatherFloat4(columns.position_y, indices);
+    simd.scatterFloat4Masked(columns.position_x, indices, simd.addFloat4(position_x, correction_x), mask);
+    simd.scatterFloat4Masked(columns.position_y, indices, simd.addFloat4(position_y, correction_y), mask);
+
+    const zero = simd.splatFloat4(0);
+    const bounce = simd.equalUint4(simd.loadUint4Prefix(packed_columns.kind, count), simd.splatUint4(bounce_kind));
+    const scale = simd.loadFloat4Prefix(packed_columns.velocity_scale, count);
+    const normal_x = simd.loadFloat4Prefix(packed_columns.normal_x, count);
+    const normal_y = simd.loadFloat4Prefix(packed_columns.normal_y, count);
+    const velocity_x = simd.gatherFloat4(columns.velocity_x, indices);
+    const velocity_y = simd.gatherFloat4(columns.velocity_y, indices);
+    const approach_x = simd.lessThanFloat4(simd.mulFloat4(velocity_x, normal_x), zero);
+    const approach_y = simd.lessThanFloat4(simd.mulFloat4(velocity_y, normal_y), zero);
+    const response_x = simd.selectFloat4(bounce, simd.mulFloat4(velocity_x, scale), zero);
+    const response_y = simd.selectFloat4(bounce, simd.mulFloat4(velocity_y, scale), zero);
+    simd.scatterFloat4Masked(columns.velocity_x, indices, simd.selectFloat4(approach_x, response_x, velocity_x), mask);
+    simd.scatterFloat4Masked(columns.velocity_y, indices, simd.selectFloat4(approach_y, response_y, velocity_y), mask);
+}
+
 // `apply`: one range of occupied blocks. A block is one item, so it is never split.
 const ApplyBlockJob = struct {
-    intents: IntentColumns,
     columns: ApplyColumns,
-    order: []const u32,
+    packed_columns: PackedColumns,
     runs: []const Run,
     blocks: []const BlockItem,
     range_count: usize,
@@ -1002,49 +1103,65 @@ fn applyBlockJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const row_count = job.columns.position_x.len;
     std.debug.assert(job.columns.position_y.len == row_count);
     std.debug.assert(job.columns.velocity_x.len == row_count and job.columns.velocity_y.len == row_count);
-    var lanes = ApplyLanes{};
     for (job.blocks[range.start..range.end]) |block| {
         const first_row = @as(usize, block.block_id) * block_rows;
         std.debug.assert(block.run_begin + block.run_count <= job.runs.len);
         for (job.runs[block.run_begin..][0..block.run_count]) |run| {
             std.debug.assert(run.block_id == block.block_id);
-            std.debug.assert(@as(usize, run.begin) + run.count <= job.order.len);
-            for (job.order[run.begin..][0..run.count]) |intent_index| {
-                const movement_row_u = job.intents.movement_row[intent_index];
-                const movement_row: usize = movement_row_u;
-                std.debug.assert(movement_row_u != no_row and blockId(movement_row_u) == block.block_id);
-                std.debug.assert(movement_row >= first_row and movement_row < row_count);
-                lanes.push(job.columns, job.intents, intent_index, movement_row);
+            const begin: usize = run.begin;
+            const run_count: usize = run.count;
+            std.debug.assert(begin + run_count <= job.packed_columns.movement_row.len);
+            // This run's slots end at `run_count`. The next run is another window.
+            const run_packed = job.packed_columns.window(begin, begin + run_count);
+            var open_rows: [simd.lane_count]u32 = undefined;
+            var open: usize = 0;
+            var group_start: usize = 0;
+            for (0..run_count) |index| {
+                const movement_row = run_packed.movement_row[index];
+                std.debug.assert(movement_row != no_row and blockId(movement_row) == block.block_id);
+                const movement_index: usize = movement_row;
+                std.debug.assert(movement_index >= first_row and movement_index < row_count);
+                if (rowRepeats(open_rows[0..open], movement_row)) {
+                    applyGroup(job.columns, &open_rows, run_packed.window(group_start, run_count), open);
+                    open = 0;
+                }
+                if (open == 0) group_start = index;
+                open_rows[open] = movement_row;
+                open += 1;
+                if (open == simd.lane_count) {
+                    applyGroup(job.columns, &open_rows, run_packed.window(group_start, run_count), open);
+                    open = 0;
+                }
             }
+            if (open != 0) applyGroup(job.columns, &open_rows, run_packed.window(group_start, run_count), open);
         }
     }
-    lanes.flush(job.columns);
 }
 
 // Contacts `[start, end)` gathered, then their intent window applied in order.
 fn gatherApplyRange(input: *const GatherInput, columns: ApplyColumns, start: usize, end: usize) GatherRow {
     const row = gatherRange(input, start, end);
-    var lanes = ApplyLanes{};
-    applyWindow(&lanes, columns, input.intents, 2 * start, row.intents);
-    lanes.flush(columns);
+    applyWindow(columns, input.intents, 2 * start, row.intents);
     return row;
 }
 
-// The `count` intents from `window_start` in order, skipping those with no movement row.
-fn applyWindow(lanes: *ApplyLanes, columns: ApplyColumns, intents: IntentColumns, window_start: usize, count: usize) void {
+// The `count` intents from `window_start` in order. A `no_row` writes nothing and does
+// not flush. The tail flushes here.
+fn applyWindow(columns: ApplyColumns, intents: IntentColumns, window_start: usize, count: usize) void {
+    var lanes = ApplyLanes{};
     for (window_start..window_start + count) |intent_index| {
         const movement_row = intents.movement_row[intent_index];
         if (movement_row == no_row) continue;
         std.debug.assert(movement_row < columns.position_x.len);
         lanes.push(columns, intents, intent_index, movement_row);
     }
+    lanes.flush(columns);
 }
 
-// Up to one lane block of intents on distinct movement rows awaiting their apply. An
-// intent whose row is already pending flushes the block first, so each row still takes
-// its intents in order.
+// Inline scratch for at most four lanes. A hole is not a prefix of the intent window,
+// so the fields are copied here and `applyGroup` prefix-loads this scratch.
 const ApplyLanes = struct {
-    rows: [simd.lane_count]usize = undefined,
+    rows: [simd.lane_count]u32 = undefined,
     correction_x: [simd.lane_count]f32 = undefined,
     correction_y: [simd.lane_count]f32 = undefined,
     normal_x: [simd.lane_count]f32 = undefined,
@@ -1053,13 +1170,8 @@ const ApplyLanes = struct {
     kinds: [simd.lane_count]u32 = undefined,
     count: usize = 0,
 
-    fn push(self: *ApplyLanes, columns: ApplyColumns, intents: IntentColumns, intent_index: usize, row: usize) void {
-        for (self.rows[0..self.count]) |pending_row| {
-            if (pending_row == row) {
-                self.flush(columns);
-                break;
-            }
-        }
+    fn push(self: *ApplyLanes, columns: ApplyColumns, intents: IntentColumns, intent_index: usize, row: u32) void {
+        if (rowRepeats(self.rows[0..self.count], row)) self.flush(columns);
         const lane = self.count;
         self.rows[lane] = row;
         self.correction_x[lane] = intents.correction_x[intent_index];
@@ -1072,58 +1184,21 @@ const ApplyLanes = struct {
         if (self.count == simd.lane_count) self.flush(columns);
     }
 
-    // A full block in lanes, a partial block per intent. Both add, multiply, and compare
-    // once per value; with a zero normal `velocity * normal` is never negative, so the
-    // lane test matches the scalar one bit for bit.
     fn flush(self: *ApplyLanes, columns: ApplyColumns) void {
-        if (self.count == simd.lane_count) {
-            const zero = simd.splatFloat4(0);
-            const position_x = simd.gatherFloat4(columns.position_x, self.rows);
-            const position_y = simd.gatherFloat4(columns.position_y, self.rows);
-            simd.scatterFloat4(columns.position_x, self.rows, simd.addFloat4(position_x, simd.loadFloat4(&self.correction_x)));
-            simd.scatterFloat4(columns.position_y, self.rows, simd.addFloat4(position_y, simd.loadFloat4(&self.correction_y)));
-            const bounce = simd.equalUint4(simd.loadUint4(&self.kinds), simd.splatUint4(bounce_kind));
-            const scale = simd.loadFloat4(&self.velocity_scale);
-            const velocity_x = simd.gatherFloat4(columns.velocity_x, self.rows);
-            const velocity_y = simd.gatherFloat4(columns.velocity_y, self.rows);
-            const approach_x = simd.lessThanFloat4(simd.mulFloat4(velocity_x, simd.loadFloat4(&self.normal_x)), zero);
-            const approach_y = simd.lessThanFloat4(simd.mulFloat4(velocity_y, simd.loadFloat4(&self.normal_y)), zero);
-            const response_x = simd.selectFloat4(bounce, simd.mulFloat4(velocity_x, scale), zero);
-            const response_y = simd.selectFloat4(bounce, simd.mulFloat4(velocity_y, scale), zero);
-            simd.scatterFloat4(columns.velocity_x, self.rows, simd.selectFloat4(approach_x, response_x, velocity_x));
-            simd.scatterFloat4(columns.velocity_y, self.rows, simd.selectFloat4(approach_y, response_y, velocity_y));
-        } else {
-            for (0..self.count) |lane| {
-                applyIntentScalar(columns, self.rows[lane], self.correction_x[lane], self.correction_y[lane], self.normal_x[lane], self.normal_y[lane], self.velocity_scale[lane], self.kinds[lane]);
-            }
-        }
+        if (self.count == 0) return;
+        const packed_columns = PackedColumns{
+            .correction_x = &self.correction_x,
+            .correction_y = &self.correction_y,
+            .normal_x = &self.normal_x,
+            .normal_y = &self.normal_y,
+            .velocity_scale = &self.velocity_scale,
+            .kind = &self.kinds,
+            .movement_row = &self.rows,
+        };
+        applyGroup(columns, &self.rows, packed_columns, self.count);
         self.count = 0;
     }
 };
-
-fn applyIntentScalar(
-    columns: ApplyColumns,
-    row: usize,
-    correction_x: f32,
-    correction_y: f32,
-    normal_x: f32,
-    normal_y: f32,
-    velocity_scale: f32,
-    kind: u32,
-) void {
-    columns.position_x[row] += correction_x;
-    columns.position_y[row] += correction_y;
-    if (shouldApplyNormalVelocityResponse(columns.velocity_x[row], normal_x)) {
-        columns.velocity_x[row] = if (kind == bounce_kind) columns.velocity_x[row] * velocity_scale else 0;
-    }
-    if (shouldApplyNormalVelocityResponse(columns.velocity_y[row], normal_y)) {
-        columns.velocity_y[row] = if (kind == bounce_kind) columns.velocity_y[row] * velocity_scale else 0;
-    }
-}
-
-fn shouldApplyNormalVelocityResponse(velocity: f32, normal: f32) bool {
-    return normal != 0 and velocity * normal < 0;
-}
 fn addEntity(
     data: *DataSystem,
     position_x: f32,
@@ -1725,7 +1800,7 @@ test "an inline gather job applies its window before it returns" {
     setSlotCount(GatherRow, &system.gather_rows, 1);
     var job = GatherJob{
         .input = step.input,
-        .order = system.intent_order.items,
+        .packed_columns = PackedColumns.of(system.packed_intents.slice()),
         .runs = system.range_runs.items,
         .block_slots = &.{},
         .table_blocks = 0,
@@ -1747,29 +1822,87 @@ test "an inline gather job applies its window before it returns" {
     try std.testing.expectEqual(serial.stats.intent_count, system.gather_rows.items[0].value.intents);
 }
 
+fn intentColumns(movement_row: []u32, correction_x: []f32, zero: []f32, kind: []ResponseIntentKind) IntentColumns {
+    return .{
+        .movement_row = movement_row,
+        .normal_x = zero,
+        .normal_y = zero,
+        .penetration = zero,
+        .restitution = zero,
+        .correction_x = correction_x,
+        .correction_y = zero,
+        .velocity_scale = zero,
+        .kind = kind,
+    };
+}
+
+fn packedColumns(floats: []f32, kind: []u32, movement_row: []u32) PackedColumns {
+    return .{
+        .correction_x = floats,
+        .correction_y = floats,
+        .normal_x = floats,
+        .normal_y = floats,
+        .velocity_scale = floats,
+        .kind = kind,
+        .movement_row = movement_row,
+    };
+}
+
 test "a gather range groups placed intents by block in contact order, and place keeps the earlier range first" {
     const generation: u32 = 1;
     // Blocks 0, skip, 1, 0, 1, 1, 2. Slot 3 is stamped and not claimed; a table scan would emit it.
     const rows = [_]u32{ 0, no_row, 16, 1, 31, 16, 32 };
-    var order: [rows.len]u32 = undefined;
+    var movement_row = rows;
+    var correction_x: [rows.len]f32 = undefined;
+    for (&correction_x, 0..) |*value, index| value.* = @floatFromInt(index);
+    var zero_f: [rows.len]f32 = @splat(0);
+    var kind: [rows.len]ResponseIntentKind = @splat(.solid);
+    const intents = intentColumns(&movement_row, &correction_x, &zero_f, &kind);
+    var packed_correction_x: [rows.len]f32 = undefined;
+    var packed_correction_y: [rows.len]f32 = undefined;
+    var packed_normal_x: [rows.len]f32 = undefined;
+    var packed_normal_y: [rows.len]f32 = undefined;
+    var packed_velocity_scale: [rows.len]f32 = undefined;
+    var packed_kind: [rows.len]u32 = undefined;
+    var packed_movement_row: [rows.len]u32 = undefined;
+    const packed_columns = PackedColumns{
+        .correction_x = &packed_correction_x,
+        .correction_y = &packed_correction_y,
+        .normal_x = &packed_normal_x,
+        .normal_y = &packed_normal_y,
+        .velocity_scale = &packed_velocity_scale,
+        .kind = &packed_kind,
+        .movement_row = &packed_movement_row,
+    };
     var runs: [rows.len]Run = undefined;
     var claimed: [rows.len]usize = undefined;
     var slots: [4]BlockSlot = @splat(.{});
     slots[3] = .{ .count = 5, .stamp = generation };
-    const run_count = groupRangeIntents(&rows, 0, &order, &runs, &slots, &claimed, generation);
+    const run_count = groupRangeIntents(intents, 0, rows.len, packed_columns, &runs, &slots, &claimed, generation);
     try std.testing.expectEqual(@as(u32, 3), run_count);
     try std.testing.expectEqual(@as(u32, 0), runs[0].block_id);
+    try std.testing.expectEqual(@as(u32, 0), runs[0].begin);
     try std.testing.expectEqual(@as(u32, 2), runs[0].count);
     try std.testing.expectEqual(@as(u32, 1), runs[1].block_id);
     try std.testing.expectEqual(@as(u32, 3), runs[1].count);
     try std.testing.expectEqual(@as(u32, 2), runs[2].block_id);
     try std.testing.expectEqual(@as(u32, 1), runs[2].count);
-    try std.testing.expectEqual(@as(u32, 0), order[runs[0].begin]);
-    try std.testing.expectEqual(@as(u32, 3), order[runs[0].begin + 1]);
-    try std.testing.expectEqual(@as(u32, 2), order[runs[1].begin]);
-    try std.testing.expectEqual(@as(u32, 4), order[runs[1].begin + 1]);
-    try std.testing.expectEqual(@as(u32, 5), order[runs[1].begin + 2]);
-    try std.testing.expectEqual(@as(u32, 6), order[runs[2].begin]);
+    // Block 0 → (0, 1) / (0, 3); block 1 → (16, 31, 16) / (2, 4, 5); block 2 → (32,) / (6,).
+    // Offset 1 (`no_row`, correction 1) is in neither column.
+    try std.testing.expectEqual(@as(u32, 0), packed_movement_row[runs[0].begin]);
+    try std.testing.expectEqual(@as(u32, 1), packed_movement_row[runs[0].begin + 1]);
+    try std.testing.expectEqual(@as(f32, 0), packed_correction_x[runs[0].begin]);
+    try std.testing.expectEqual(@as(f32, 3), packed_correction_x[runs[0].begin + 1]);
+    try std.testing.expectEqual(@as(u32, 16), packed_movement_row[runs[1].begin]);
+    try std.testing.expectEqual(@as(u32, 31), packed_movement_row[runs[1].begin + 1]);
+    try std.testing.expectEqual(@as(u32, 16), packed_movement_row[runs[1].begin + 2]);
+    try std.testing.expectEqual(@as(f32, 2), packed_correction_x[runs[1].begin]);
+    try std.testing.expectEqual(@as(f32, 4), packed_correction_x[runs[1].begin + 1]);
+    try std.testing.expectEqual(@as(f32, 5), packed_correction_x[runs[1].begin + 2]);
+    try std.testing.expectEqual(@as(u32, 32), packed_movement_row[runs[2].begin]);
+    try std.testing.expectEqual(@as(f32, 6), packed_correction_x[runs[2].begin]);
+    for (packed_movement_row[0..6]) |packed_row| try std.testing.expect(packed_row != no_row);
+    for (packed_correction_x[0..6]) |correction| try std.testing.expect(correction != 1);
     for (runs[0..run_count]) |run| try std.testing.expect(run.block_id != 3);
     try std.testing.expectEqual(@as(u32, 5), slots[3].count);
 
@@ -1818,16 +1951,38 @@ test "a gather range groups placed intents by block in contact order, and place 
 
 test "the next range on a worker table does not see the previous range and does not clear it" {
     var slots: [4]BlockSlot = @splat(.{});
-    const first_rows = [_]u32{ 0, 16 };
-    const second_rows = [_]u32{0};
-    var order: [2]u32 = undefined;
+    var first_rows = [_]u32{ 0, 16 };
+    var second_rows = [_]u32{0};
+    var zero_f = [_]f32{ 0, 0 };
+    var kind = [_]ResponseIntentKind{ .solid, .solid };
+    var packed_f = [_]f32{ 0, 0 };
+    var packed_kind = [_]u32{ 0, 0 };
+    var packed_row = [_]u32{ 0, 0 };
     var runs: [2]Run = undefined;
     var claimed: [2]usize = undefined;
-    const first = groupRangeIntents(&first_rows, 0, &order, &runs, &slots, &claimed, 1);
+    const first = groupRangeIntents(
+        intentColumns(&first_rows, &zero_f, &zero_f, &kind),
+        0,
+        first_rows.len,
+        packedColumns(&packed_f, &packed_kind, &packed_row),
+        &runs,
+        &slots,
+        &claimed,
+        1,
+    );
     try std.testing.expectEqual(@as(u32, 2), first);
     try std.testing.expectEqual(@as(u32, 1), slots[0].stamp);
     try std.testing.expectEqual(@as(u32, 1), slots[1].stamp);
-    const second = groupRangeIntents(&second_rows, 0, order[0..1], runs[0..1], &slots, claimed[0..1], 2);
+    const second = groupRangeIntents(
+        intentColumns(&second_rows, zero_f[0..1], zero_f[0..1], kind[0..1]),
+        0,
+        second_rows.len,
+        packedColumns(packed_f[0..1], packed_kind[0..1], packed_row[0..1]),
+        runs[0..1],
+        &slots,
+        claimed[0..1],
+        2,
+    );
     try std.testing.expectEqual(@as(u32, 1), second);
     try std.testing.expectEqual(@as(u32, 0), runs[0].block_id);
     try std.testing.expectEqual(@as(u32, 1), runs[0].count);
@@ -1860,6 +2015,12 @@ fn pinTunerProfile(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void
     tuner.best_profile = profile;
     tuner.candidate_profile = null;
     tuner.learned_item_count = 0;
+}
+
+// `normal != 0`, then the product. A zero normal's product is zero, so the lane
+// compare of that product alone matches this test, including `+0` and `-0`.
+fn shouldApplyNormalVelocityResponse(velocity: f32, normal: f32) bool {
+    return normal != 0 and velocity * normal < 0;
 }
 
 // Today's per-intent apply, kept as the reference for the lane blocks.
@@ -1934,9 +2095,7 @@ test "apply lanes match the scalar apply bit for bit" {
         const lanes_out = ApplyColumns{ .position_x = &lane_columns[0], .position_y = &lane_columns[1], .velocity_x = &lane_columns[2], .velocity_y = &lane_columns[3] };
 
         applyIntentsReference(reference, rows[0..count], intents);
-        var lanes = ApplyLanes{};
-        for (rows[0..count], 0..) |row, index| lanes.push(lanes_out, intents, index, row);
-        lanes.flush(lanes_out);
+        applyWindow(lanes_out, intents, 0, count);
 
         try std.testing.expectEqualSlices(u8, std.mem.asBytes(&reference_columns), std.mem.asBytes(&lane_columns));
     }

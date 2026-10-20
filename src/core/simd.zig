@@ -439,6 +439,81 @@ pub fn scatterFloat4(values: []f32, indices: [lane_count]usize, vector: Float4) 
     }
 }
 
+/// The first `count` values, and `+0` in the other lanes. `count <= lane_count`.
+/// Reads only `values[0..count]`. A vector load would read past that prefix.
+pub fn loadFloat4Prefix(values: []const f32, count: usize) Float4 {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    var lanes = [_]f32{ 0, 0, 0, 0 };
+    for (0..count) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// Scalar form of `loadFloat4Prefix`.
+fn loadFloat4PrefixScalar(values: []const f32, count: usize) [lane_count]f32 {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    var lanes = [_]f32{ 0, 0, 0, 0 };
+    for (0..count) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// The first `count` values, and zero in the other lanes. `count <= lane_count`.
+/// Reads only `values[0..count]`. A vector load would read past that prefix.
+pub fn loadUint4Prefix(values: []const u32, count: usize) Uint4 {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    var lanes = [_]u32{ 0, 0, 0, 0 };
+    for (0..count) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// Scalar form of `loadUint4Prefix`.
+fn loadUint4PrefixScalar(values: []const u32, count: usize) [lane_count]u32 {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    var lanes = [_]u32{ 0, 0, 0, 0 };
+    for (0..count) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// Writes the lanes set in `lanes`. Distinctness is asserted only for those lanes,
+/// so an inactive index may alias a live one.
+pub fn scatterFloat4Masked(values: []f32, indices: [lane_count]usize, vector: Float4, lanes: MaskBits) void {
+    inline for (0..lane_count) |i| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(i)) != 0) {
+            inline for (i + 1..lane_count) |j| {
+                if (lanes & (@as(MaskBits, 1) << @intCast(j)) != 0) {
+                    std.debug.assert(indices[i] != indices[j]);
+                }
+            }
+        }
+    }
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) {
+            values[indices[lane]] = vector[lane];
+        }
+    }
+}
+
+/// Scalar form of `scatterFloat4Masked`.
+fn scatterFloat4MaskedScalar(values: []f32, indices: [lane_count]usize, vector: [lane_count]f32, lanes: MaskBits) void {
+    inline for (0..lane_count) |i| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(i)) != 0) {
+            inline for (i + 1..lane_count) |j| {
+                if (lanes & (@as(MaskBits, 1) << @intCast(j)) != 0) {
+                    std.debug.assert(indices[i] != indices[j]);
+                }
+            }
+        }
+    }
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) {
+            values[indices[lane]] = vector[lane];
+        }
+    }
+}
+
 /// Per-lane reciprocal square root, `1 / sqrt(values)`. Lanes that are zero or
 /// negative produce inf/NaN; guard the input when that is possible.
 pub inline fn reciprocalSqrtFloat4(values: Float4) Float4 {
@@ -762,6 +837,53 @@ test "gather and scatter move lanes through sparse indices" {
     var dest = [_]f32{ 0, 0, 0, 0, 0, 0 };
     scatterFloat4(&dest, .{ 5, 0, 3, 1 }, float4(15, 10, 13, 11));
     try std.testing.expectEqual([_]f32{ 10, 11, 0, 13, 0, 15 }, dest);
+}
+
+test "loadFloat4Prefix and scatterFloat4Masked match their scalar forms bit for bit" {
+    const floats = [_]f32{ 1.25, -2.5, -0.0, 3.5 };
+    const uints = [_]u32{ 0, 1, 0x8000_0000, 0xffff_ffff };
+    for (0..lane_count + 1) |count| {
+        const float_prefix = loadFloat4Prefix(floats[0..count], count);
+        const float_scalar = loadFloat4PrefixScalar(floats[0..count], count);
+        const uint_prefix = loadUint4Prefix(uints[0..count], count);
+        const uint_scalar = loadUint4PrefixScalar(uints[0..count], count);
+        const float_lanes = toFloatArray(float_prefix);
+        const uint_lanes = [_]u32{ uint_prefix[0], uint_prefix[1], uint_prefix[2], uint_prefix[3] };
+        for (0..lane_count) |lane| {
+            try std.testing.expectEqual(@as(u32, @bitCast(float_scalar[lane])), @as(u32, @bitCast(float_lanes[lane])));
+            try std.testing.expectEqual(uint_scalar[lane], uint_lanes[lane]);
+            if (lane >= count) {
+                try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(float_lanes[lane])));
+                try std.testing.expectEqual(@as(u32, 0), uint_lanes[lane]);
+            }
+        }
+    }
+
+    // Inactive indices alias the live one. The mask must not store them back.
+    const alias = [_]usize{ 1, 1, 1, 1 };
+    const alias_vector = float4(-0.0, 9, 9, 9);
+    const alias_bits: MaskBits = 0b0001;
+    var alias_simd = [_]f32{ 1, 2, 3, 4, 5 };
+    var alias_scalar = alias_simd;
+    scatterFloat4Masked(&alias_simd, alias, alias_vector, alias_bits);
+    scatterFloat4MaskedScalar(&alias_scalar, alias, toFloatArray(alias_vector), alias_bits);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&alias_scalar), std.mem.asBytes(&alias_simd));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -0.0))), @as(u32, @bitCast(alias_simd[1])));
+    try std.testing.expectEqual(@as(f32, 1), alias_simd[0]);
+    try std.testing.expectEqual(@as(f32, 3), alias_simd[2]);
+    try std.testing.expectEqual(@as(f32, 4), alias_simd[3]);
+    try std.testing.expectEqual(@as(f32, 5), alias_simd[4]);
+
+    const full_indices = [_]usize{ 5, 0, 3, 1 };
+    const full_vector = float4(-0.0, 10, 13, 11);
+    var full_masked = [_]f32{ 0, 0, 0, 0, 0, 0 };
+    var full_scatter = full_masked;
+    var full_scalar = full_masked;
+    scatterFloat4Masked(&full_masked, full_indices, full_vector, lanesBelow(lane_count));
+    scatterFloat4(&full_scatter, full_indices, full_vector);
+    scatterFloat4MaskedScalar(&full_scalar, full_indices, toFloatArray(full_vector), lanesBelow(lane_count));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&full_scatter), std.mem.asBytes(&full_masked));
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&full_scatter), std.mem.asBytes(&full_scalar));
 }
 
 test "reciprocal sqrt matches scalar reference" {
