@@ -60,11 +60,20 @@ How the thread system works: `docs/architecture.md` § Thread System.
   before the cap, with parity tests that cross ranges and hit the cap.
 - Hot loops iterate dense columns; membership masks never become dynamic
   joins.
-- Worker ranges never share a writable cache line. Pad only records with real
-  false-sharing risk: per-range and per-row slots to the cache-line quantum, a
-  contended shared record to the platform cache line. Disjoint but scattered
-  writes are allowed when a scattered-order bench is within spread of the same
-  work in row order.
+- Worker ranges never share a writable cache line, and the range shape
+  guarantees it, not padding. A stage's `range_alignment_items` is at least
+  one lane batch and puts every range boundary on a cache line in each column
+  the stage writes (64 B / the narrowest written element). Rows stay dense,
+  each range streams whole lane batches, and only the stage's last range ends
+  in the masked tail.
+- Pad only per-range and per-worker records (slots, cursors, counters) to the
+  cache-line quantum, and a contended shared record to the platform cache
+  line. Never pad rows or column elements.
+- Writes that land outside a range's own window (keyed by chunk, owner, or
+  cell) are first bucketed by destination in range order, so each range then
+  writes a contiguous window it owns. Exempt: sparse index maintenance that
+  visits only changed items may write disjoint scattered records directly
+  (`memory-performance.md` § Data-oriented design).
 
 ## Verification and diagnostics
 
