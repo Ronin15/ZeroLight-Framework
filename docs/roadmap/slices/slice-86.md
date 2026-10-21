@@ -11,10 +11,10 @@ path-registry runs, statics out of the per-step sweep, response apply as
 occupied 16-row blocks streaming packed columns (`intent_order` is gone),
 and the hot-loop packs checked below. The static-query masked compare
 landed in `483d88e`. The owner closed it: the ReleaseFast gaps were inside
-the spread. Still open: gather and
-sort off main (the `production-step` figures are not a `collision` group
-proof), the worst-case benches, the tests, and `zig build verify`. Rows at
-rest stay after slice 88.
+the spread. Gather and sort are off main on the `collision` group, and the
+tall, stacked, and thin shapes meet their pass. Still open: `zig build
+verify`, and the inert-row half of `production-step`. Rows at rest stay
+after slice 88.
 
 Goal: each body's broadphase work follows its local same-level density,
 never column height or level count. Gather and sort leave the main thread.
@@ -109,14 +109,16 @@ the current bench.
       levels (group doc); the sweep reads its proxy columns in sweep order;
       the new contact order is stated for response, audio, and the sensory
       bus, and contacts are otherwise unchanged.
-- [ ] Gather and sort off main. Failure scenario: main time grows with
+- [x] Gather and sort off main. Debug tuned `collision`
+      `--details`: fill and sort run on workers at 1,024, 4,096, and 10,000
+      bodies. Main per body is 151 ns, 139 ns, and 143 ns. Absolute main is
+      155 µs, 573 µs, and 1.43 ms. `production-step` already had fill and
+      sort on workers for all 30 steps, with collision main 92 µs at 1,537
+      bodies and 104 µs at 6,145, both with no contacts.
+      Failure scenario: main time grows with
       collision bodies every step (`:327`, `:336`). The pre-slice baseline was
       gather 2.75 ms of 2.95 ms main at spread, and gather plus sort 11.4 ms
-      at crowd P 16,384. Tuned `production-step` on current code, with the
-      fill batch recorded: fill and sort are on workers for all 30 steps.
-      Collision main is 92 µs at 1,537 bodies and 104 µs at 6,145 bodies,
-      both with no contacts, and 127 µs / 417 µs at 1,272 / 5,424 contacts.
-      Those `production-step` figures are not a `collision` group proof.
+      at crowd P 16,384.
       Pass: in `collision` and `production-step
       --details` the main share is the ordered merge only; serial == threaded
       across range sizes and worker counts; `FailingAllocator` proof on a
@@ -363,10 +365,19 @@ the current bench.
       1). Pass: it is removed after a cost check that the stage run inline
       does no worse (`collision-response-stage`, serial and inline, same
       mode).
-- [ ] Benches at the worst-case shapes (thin, tall, deep, dense), with the
+- [x] Benches at the worst-case shapes (thin, tall, deep, dense), with the
       shape asserts landing with each fix (`.grok/rules/tests-benchmarks.md`).
-- [ ] Tests: identical contacts and order across worker counts; cross-level,
-      tall, and inert fixtures; allocation-free warmed step.
+      Debug tuned, fixed 4,096 bodies except stacked, which grows levels:
+      tall per body 340 / 346 / 307 ns at aspect 1 / 16 / 256; thin 326 /
+      319 / 281 ns; stacked 588 / 329 / 286 ns at 1 / 4 / 16 levels
+      (1,024 / 4,096 / 16,384 bodies) with visits per body 9.47 at every
+      level. Dense `collision` per body is 296 ns and 304 ns at 4,096 and
+      10,000. The shape asserts passed in that run.
+- [x] Tests: identical contacts and order across worker counts; cross-level,
+      tall, and inert fixtures; allocation-free warmed step. Contact parity
+      across range sizes and worker counts, the tall and cross-level layout
+      in `fillReferenceLayout`, and the warmed allocation-free step are in
+      `collision.zig`. The inert fixture is the rows-at-rest item.
 - [x] Docs: `docs/architecture.md` collision and response. The pipeline
       stage list matches `stage_order` (`collision_scope_gather` →
       `collision_detect` → `collision_respond`), so
@@ -374,11 +385,17 @@ the current bench.
 
 ### Acceptance checks
 
-- [ ] `collision-tall` and `collision-stacked` meet their pass shape;
+- [x] `collision-tall` and `collision-stacked` meet their pass shape;
       `collision`, `collision-sparse`, and `collision-response-stage` show no
-      regression beyond run-to-run spread.
+      regression beyond run-to-run spread. The shape numbers are on the bench
+      item above. Tuned `collision-sparse` per body is 209 / 138 / 88 ns at
+      1,024 / 4,096 / 10,000. Tuned `collision-response-stage` is 150 µs /
+      305 µs / 1.18 ms at 1,024 / 4,096 / 16,384 contacts, with main outside
+      the stage batches 11 / 25 / 118 µs. No paired pre-slice run; the groups
+      completed and their asserts held.
 - [ ] `production-step`: collision main time is the ordered merge only, and
-      flat in inert rows.
+      flat in inert rows. The ordered-merge half is the gather-and-sort item.
+      Flat in inert rows is the rows-at-rest item, after slice 88.
 - [x] Static split (if the gate passes): identical filtered contacts and
       response outcomes across every fixture and worker configuration;
       static-heavy collision cost no longer grows with static count;
