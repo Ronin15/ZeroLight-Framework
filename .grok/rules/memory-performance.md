@@ -111,11 +111,12 @@
 - Add a missing primitive to `core` as a paired scalar and SIMD form with
   parity tests. A one-system kernel built from `core` primitives may stay
   local until reused.
-- Dense uniform float math over SoA columns uses `simd.zig` helpers with a
-  scalar tail; a loop whose results feed a lane consumer ends in one masked
-  lane batch instead, so the consumer has one lane path. Prefer scalar for
-  tiny fixed-size batches; short runs inside a population loop are a layout
-  problem, fixed in the layout.
+- Dense uniform float math over SoA columns uses `simd.zig` helpers, and its
+  tail is the same kernel run on one masked lane batch, never a separate
+  scalar remainder of the same math, so every consumer has one lane path. A
+  remainder that is not the same math stays scalar and says why. Prefer scalar
+  for tiny fixed-size batches; short runs inside a population loop are a
+  layout problem, fixed in the layout.
 - Prefer scalar-to-`@Vector` loads unless an aligned load is measured and
   owned.
 - Judge per-agent and per-neighbor loops at target scale, never as "low count".
