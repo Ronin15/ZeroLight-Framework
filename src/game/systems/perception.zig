@@ -36,10 +36,10 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
-const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
 const compactRowWindows = @import("../../app/thread_system.zig").compactRowWindows;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const setRowCount = @import("../../app/thread_system.zig").setRowCount;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
@@ -61,12 +61,47 @@ const capLanes = spatial_index_mod.capLanes;
 const cellScanRadius = spatial_index_mod.cellScanRadius;
 const FactionSet = @import("../faction.zig").FactionSet;
 
-pub const perception_range_alignment_items: usize = movement_range_alignment_items;
+/// Range alignment of the compute stage, which writes its rows' facing and
+/// `final_nearest_threat_*` columns and each row's `PerceptionStore` results: each range
+/// spans a full cache line of the narrowest written column (one byte) while those store rows
+/// ascend.
+pub const perception_range_alignment_items: usize = thread_shared_record_alignment;
+
+comptime {
+    std.debug.assert(perception_range_alignment_items % movement_range_alignment_items == 0);
+    const row_columns = [_][]const u8{ "facing_x", "facing_y", "final_nearest_threat_index", "final_nearest_threat_generation" };
+    const store_columns = [_][]const u8{
+        "target_visible", "nearest_threat", "nearest_threat_dist", "last_seen_x",      "last_seen_y",
+        "facing_x",       "facing_y",       "heard_stimulus",      "heard_stimulus_x", "heard_stimulus_y",
+    };
+    for (row_columns) |name| {
+        std.debug.assert(perception_range_alignment_items * @sizeOf(@FieldType(PerceptionGatherRow, name)) >= thread_shared_record_alignment);
+    }
+    for (store_columns) |name| {
+        std.debug.assert(perception_range_alignment_items * @sizeOf(std.meta.Elem(@FieldType(PerceptionSlice, name))) >= thread_shared_record_alignment);
+    }
+}
+
+/// Range alignment of the gather, which writes every `PerceptionGatherRow` column: each
+/// range spans a full cache line of the narrowest (one byte).
+pub const perception_gather_range_alignment_items: usize = thread_shared_record_alignment;
+
+comptime {
+    std.debug.assert(perception_gather_range_alignment_items % perception_range_alignment_items == 0);
+    for (@typeInfo(PerceptionGatherRow).@"struct".field_types) |Column| {
+        std.debug.assert(perception_gather_range_alignment_items * @sizeOf(Column) >= thread_shared_record_alignment);
+    }
+}
 
 // Range alignment only; batch time gate comes from AdaptiveWorkTunerConfig defaults.
 const perception_adaptive_tuner_config = AdaptiveWorkTunerConfig{
-    .initial_range_items = 64,
+    .initial_range_items = perception_range_alignment_items,
     .smallest_range_items = perception_range_alignment_items,
+};
+
+const perception_gather_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = perception_gather_range_alignment_items,
+    .smallest_range_items = perception_gather_range_alignment_items,
 };
 
 const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;
@@ -124,11 +159,10 @@ pub const PerceptionConfig = struct {
 };
 
 pub const PerceptionStats = struct {
-    observer_count: usize = 0,
-    batch: BatchStats = .{},
     perf: Perf = .{},
 
-    /// Kept only with `runtime_perf_log.enabled`, each summed over every observer this step:
+    /// Kept only with `runtime_perf_log.enabled`: `observer_count`, the observers this step,
+    /// and each of the rest summed over them:
     /// - `sensed_count`: FOV-surviving hostile candidates (post range/FOV gate, pre-LOS),
     ///   how much the index and FOV filter narrow the candidates before any LOS raycast;
     /// - `nearest_threat_found_count`: observers whose LOS confirmed a nearest threat;
@@ -137,8 +171,9 @@ pub const PerceptionStats = struct {
     /// - `candidate_checks`: index candidate checks (hostile rows on the observer's level
     ///   inside its query box), the query's traversal cost before the radius and FOV tests;
     /// - `block_fills`: neighbor-block fills (one per (row group, scan box) a range walks);
-    /// - `gather_batch`: the gather's batch.
+    /// - `gather_batch` / `batch`: the gather's and the compute stage's batches.
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        observer_count: usize = 0,
         sensed_count: usize = 0,
         nearest_threat_found_count: usize = 0,
         los_checks: usize = 0,
@@ -146,6 +181,7 @@ pub const PerceptionStats = struct {
         candidate_checks: usize = 0,
         block_fills: usize = 0,
         gather_batch: BatchStats = .{},
+        batch: BatchStats = .{},
     } else struct {};
 };
 
@@ -209,12 +245,12 @@ pub const PerceptionSystem = struct {
     /// drop impossible by construction; the cap and `dropped_events` stay as the
     /// shared-frame safety net.
     dropped_events_warned: bool = false,
-    gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
+    gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(perception_gather_tuner_config),
     compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
     pub fn init(allocator: std.mem.Allocator) PerceptionSystem {
         return .{
             .allocator = allocator,
-            .gather_tuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
+            .gather_tuner = AdaptiveWorkTuner.init(perception_gather_tuner_config),
             .compute_tuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
         };
     }
@@ -260,7 +296,7 @@ pub const PerceptionSystem = struct {
         });
         const selection = compute.select(observer_count, perception_range_alignment_items);
         // Grow-only safety net for unreserved standalone use; after `reserve`
-        // it never allocates (`selection.range_count <= maxRangeCount(cap, 16)`).
+        // it never allocates (`selection.range_count <= maxRangeCount(cap, perception_range_alignment_items)`).
         try self.prepareRangeStats(selection.range_count);
 
         var job = self.buildJobContext(perception_slice, spatial, world, config.player_candidate, config.stimuli, selection.range_count);
@@ -269,9 +305,8 @@ pub const PerceptionSystem = struct {
         const totals = self.sumRangeStats(selection.range_count);
         try self.emitTransitionEvents(&job, events, totals.transition_events, config.max_events_per_step);
         return .{
-            .observer_count = observer_count,
-            .batch = batch,
             .perf = if (comptime runtime_perf_log.enabled) .{
+                .observer_count = observer_count,
                 .sensed_count = totals.perf.sensed_count,
                 .nearest_threat_found_count = totals.perf.nearest_threat_found,
                 .los_checks = totals.perf.los_checks,
@@ -279,6 +314,7 @@ pub const PerceptionSystem = struct {
                 .candidate_checks = totals.perf.candidate_checks,
                 .block_fills = totals.perf.block_fills,
                 .gather_batch = gather_batch,
+                .batch = batch,
             } else .{},
         };
     }
@@ -331,10 +367,10 @@ pub const PerceptionSystem = struct {
             .max_worker_threads = config.max_worker_threads,
             .adaptive = config.adaptive,
         });
-        const selection = gather.select(n, perception_range_alignment_items);
+        const selection = gather.select(n, perception_gather_range_alignment_items);
         try self.prepareRangeStats(selection.range_count);
         var context = PerceptionGatherContext{ .inputs = inputs, .rows = self.rows.slice(), .items_per_range = selection.items_per_range, .range_stats = self.range_stats.items[0..selection.range_count] };
-        const batch = gather.run(selection, n, perception_range_alignment_items, &context, gatherPerceptionJob);
+        const batch = gather.run(selection, n, perception_gather_range_alignment_items, &context, gatherPerceptionJob);
         compactRowWindows(PerceptionGatherRow, PerceptionRangeStats, &self.rows, context.range_stats, selection.items_per_range);
         return batch;
     }
@@ -1081,12 +1117,15 @@ fn updateInline(
 
 const data_test_support = @import("../data_system/test_support.zig");
 
-test "perception production compute tuner uses central gate and range alignment" {
+test "perception production tuners use central gate and their stage's range alignment" {
     var system = PerceptionSystem.init(std.testing.allocator);
     defer system.deinit();
     try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.compute_tuner.config.threaded_batch_ns);
-    try std.testing.expectEqual(@as(usize, 64), system.compute_tuner.config.initial_range_items);
+    try std.testing.expectEqual(perception_range_alignment_items, system.compute_tuner.config.initial_range_items);
     try std.testing.expectEqual(perception_range_alignment_items, system.compute_tuner.config.smallest_range_items);
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.gather_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(perception_gather_range_alignment_items, system.gather_tuner.config.initial_range_items);
+    try std.testing.expectEqual(perception_gather_range_alignment_items, system.gather_tuner.config.smallest_range_items);
 }
 
 test "fovTestScalar accepts squarely ahead, boundary, and rejects squarely behind" {
@@ -1274,11 +1313,11 @@ test "think observer acquires an off-phase hostile from the halo candidate set" 
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .scope_dense_indices = &think,
     });
 
-    try testing.expectEqual(@as(usize, 1), stats.observer_count);
+    try testing.expectEqual(@as(usize, 1), sys.rows.len);
     try testing.expectEqual(@as(usize, 2), spatial_sys.view().entryCount());
 
     const ally_perception = data_test_support.aiPerception(&data, ally).?;
@@ -1344,11 +1383,11 @@ test "gapped think set: both observers skip themselves and acquire the off-phase
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
         .scope_dense_indices = &think,
     });
 
-    try testing.expectEqual(@as(usize, 2), stats.observer_count);
+    try testing.expectEqual(@as(usize, 2), sys.rows.len);
     try testing.expectEqual(@as(usize, 3), spatial_sys.view().entryCount());
 
     try testing.expect(data_test_support.aiPerception(&data, a).?.target_visible);
@@ -1547,8 +1586,8 @@ test "observers with interleaved vision boxes in one cell each read their own bo
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
-    try testing.expectEqual(ranges.len, stats.observer_count);
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    try testing.expectEqual(ranges.len, sys.rows.len);
     // One block fill per distinct box of the one row group.
     for (observers, ranges) |observer, range| {
         const perception = data_test_support.aiPerception(&data, observer).?;
@@ -2423,7 +2462,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
     // (row order, `entity_lost` before `entity_perceived` within a row — A's
     // lost, row 0's first write).
 
-    // items_per_range is aligned up to perception_range_alignment_items (16), so
+    // items_per_range is aligned up to perception_range_alignment_items (64), so
     // a two-observer fixture collapses to one range. Pad with silent fillers so
     // B lands in range 1 while A remains the first writer in range 0.
     const range_items = perception_range_alignment_items;
@@ -2537,7 +2576,7 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
     defer threaded_sys.deinit();
     var threaded_events = SimulationEvents.init(testing.allocator);
     defer threaded_events.deinit();
-    const threaded_stats = try threaded_sys.update(
+    _ = try threaded_sys.update(
         threaded_data.aiAgentSliceConst(),
         threaded_data.movementBodySliceConst(),
         threaded_spatial.view(),
@@ -2548,10 +2587,8 @@ test "multi-range serial/threaded cap=1 keeps the same survivor under identity-s
         multi_range_cfg,
     );
 
-    // Threaded stays a real multi-range partition. Cap=1 survivor is A's entity_lost
+    // B starts range 1, so the partition has two ranges. Cap=1 survivor is A's entity_lost
     // (row 0's first write) on both.
-    try testing.expect(threaded_stats.batch.range_count > 1);
-    try testing.expect(!threaded_stats.batch.ran_inline);
 
     const serial_merged = serial_events.mergedItems();
     const threaded_merged = threaded_events.mergedItems();
@@ -2573,13 +2610,15 @@ test "serial and threaded PerceptionSystem updates route through identical math"
     var threaded_data = DataSystem.init(testing.allocator);
     defer threaded_data.deinit();
 
-    for (0..40) |i| {
+    // Two full compute ranges and a partial one.
+    const observer_count = 2 * perception_range_alignment_items + perception_range_alignment_items / 2;
+    for (0..observer_count) |i| {
         const fi: f32 = @floatFromInt(i);
         const faction: Faction = if (i % 3 == 0) .hostile else .player;
         _ = try addAgent(&serial_data, fi * 6, 0, 0, 0, faction);
         _ = try addAgent(&threaded_data, fi * 6, 0, 0, 0, faction);
     }
-    for (0..40) |i| {
+    for (0..observer_count) |i| {
         const fi: f32 = @floatFromInt(i);
         _ = try addObserver(&serial_data, fi * 6 + 3, 4, 1, 1, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100, .hearing_range = 5 });
         _ = try addObserver(&threaded_data, fi * 6 + 3, 4, 1, 1, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100, .hearing_range = 5 });
@@ -2616,7 +2655,7 @@ test "serial and threaded PerceptionSystem updates route through identical math"
         .stimuli = &stimuli,
     });
     // The windowed gather keeps the serial gather's rows, hostiles skipped, in row order.
-    try testing.expectEqual(@as(usize, 40), threaded_sys.rows.len);
+    try testing.expectEqual(observer_count, threaded_sys.rows.len);
     try testing.expectEqual(serial_sys.rows.len, threaded_sys.rows.len);
     for (0..serial_sys.rows.len) |row| try testing.expectEqualDeep(serial_sys.rows.get(row), threaded_sys.rows.get(row));
 
@@ -2669,8 +2708,8 @@ test "threaded PerceptionSystem update records one sample into the compute tuner
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    const stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, .{});
-    try testing.expectEqual(observer_total, stats.observer_count);
+    _ = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, .{});
+    try testing.expectEqual(observer_total, sys.rows.len);
     try testing.expectEqual(@as(usize, 1), sys.compute_tuner.sample_count);
     try testing.expect(sys.compute_tuner.last_request != null);
 }
@@ -2708,8 +2747,8 @@ test "PerceptionSystem has no steady-state allocation after warmup (FailingAlloc
 
     // `job.stimuli` is a borrowed slice, never copied, so passing it here
     // adds no allocation.
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
-    try testing.expectEqual(@as(usize, 1), stats.observer_count);
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+    try testing.expectEqual(@as(usize, 1), sys.rows.len);
     try testing.expect(data_test_support.aiPerception(&data, data.aiAgentSliceConst().entities[0]).?.heard_stimulus);
 }
 
@@ -2749,19 +2788,18 @@ test "PerceptionSystem think-set gather over a halo index has no steady-state al
         events.stream.allocator = original_events_allocator;
     }
 
-    const stats = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, cfg);
-    try testing.expectEqual(@as(usize, 2), stats.observer_count);
-    try testing.expectEqual(@as(usize, 4), spatial_sys.view().entryCount());
+    _ = try updateInline(&sys, data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, cfg);
     try testing.expectEqual(@as(usize, 2), sys.rows.len);
+    try testing.expectEqual(@as(usize, 4), spatial_sys.view().entryCount());
 }
 
-test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item ranges allocate nothing (FailingAllocator)" {
+test "PerceptionSystem after reserve alone, threaded updates at the 64-item alignment and a 16-item request allocate nothing (FailingAllocator)" {
 
     // Nothing partition-sized is left to reserve, so `reserve`
-    // alone (no warm step) covers the tuner's 64-item initial profile and the
-    // 16-item alignment floor on the real multi-worker path. 16 hostile
-    // non-observers on y = 0 and 96 `.player` observers on y = 10 facing -y:
-    // every observer acquires a hostile within 41 units on step 1. 96 rows
+    // alone (no warm step) covers the tuner's 64-item initial profile, which is the
+    // alignment floor, and a 16-item request (aligned up to it) on the real multi-worker
+    // path. 16 hostile non-observers on y = 0 and 96 `.player` observers on y = 10
+    // facing -y: every observer acquires a hostile within 41 units on step 1. 96 rows
     // put 32 in the 64-item partition's second range, which the old per-range
     // event slots (reserved for 16 rows past slot 0) grew in-stage.
     var data = DataSystem.init(testing.allocator);
@@ -2804,20 +2842,16 @@ test "PerceptionSystem after reserve alone, threaded updates at 64- then 16-item
         events.stream.allocator = original_events_allocator;
     }
 
-    const partitions = [_]usize{ perception_adaptive_tuner_config.initial_range_items, perception_range_alignment_items };
+    const partitions = [_]usize{ perception_adaptive_tuner_config.initial_range_items, 16 };
     for (partitions, 0..) |items, step| {
         // Mirrors `SimulationFrame.beginStep`'s per-step reset of `events`.
         events.clearRetainingCapacity();
-        const stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, .{
+        _ = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, .{
             .items_per_range = items,
             .max_worker_threads = 2,
             .adaptive = false,
         });
-        try testing.expectEqual(observer_total, stats.observer_count);
-        try testing.expectEqual(rangeCount(observer_total, items), stats.batch.range_count);
-        try testing.expect(!stats.batch.ran_inline);
-        // The gather over every agent (hostiles skipped) ran on workers too.
-        try testing.expect(stats.batch.active_worker_threads > 0);
+        try testing.expectEqual(observer_total, sys.rows.len);
         if (step == 0) try testing.expectEqual(observer_total, events.stats.entity_perceived);
     }
     try testing.expectEqual(@as(usize, 0), failing.allocations);

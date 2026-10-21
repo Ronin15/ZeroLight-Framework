@@ -66,7 +66,7 @@ const PlaneEntrySystem = @import("systems/plane_entry.zig").PlaneEntrySystem;
 const SteeringStats = @import("systems/steering/system.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering/system.zig").SteeringSystem;
 const steering_range_alignment_items = @import("systems/steering/system.zig").steering_range_alignment_items;
-const ai_range_alignment_items = @import("systems/ai.zig").ai_range_alignment_items;
+const ai_intent_range_alignment_items = @import("systems/ai.zig").ai_intent_range_alignment_items;
 const scope_range_alignment_items = @import("systems/simulation_scope.zig").scope_range_alignment_items;
 const StaticColliderSystem = @import("systems/static_colliders.zig").StaticColliderSystem;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
@@ -591,25 +591,23 @@ pub const SimulationPipelineStats = struct {
         // The sort is the build's cost driver; the bucket and link stages stay bench-only.
         perf.recordBatch(.spatial_index_build, spatial_index_stats.sort_batch);
 
-        perf.recordMetric(.perception_observers, metric(perception_stats.observer_count));
         if (comptime runtime_perf_log.enabled) {
+            perf.recordMetric(.perception_observers, metric(perception_stats.perf.observer_count));
             perf.recordMetric(.perception_sensed, metric(perception_stats.perf.sensed_count));
             perf.recordMetric(.perception_los_checks, metric(perception_stats.perf.los_checks));
             perf.recordMetric(.perception_los_blocked, metric(perception_stats.perf.los_blocked));
             perf.recordMetric(.perception_nearest_threat_found, metric(perception_stats.perf.nearest_threat_found_count));
             perf.recordMetric(.perception_candidate_checks, metric(perception_stats.perf.candidate_checks));
+            perf.recordBenchBatch(.perception, perception_stats.perf.batch);
         }
-        perf.recordBenchBatch(.perception, perception_stats.batch);
 
-        perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
-        perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));
-        perf.recordMetric(.ai_navigation_intents, metric(ai_stats.navigation_intent_count));
         if (comptime runtime_perf_log.enabled) {
+            perf.recordMetric(.ai_entities, metric(ai_stats.perf.entity_count));
             perf.recordMetric(.ai_separation_candidate_checks, metric(ai_stats.perf.separation_candidate_checks));
             perf.recordMetric(.ai_separation_neighbor_samples, metric(ai_stats.perf.separation_neighbor_samples));
+            perf.recordBenchBatch(.ai_separation, ai_stats.perf.separation_batch);
+            perf.recordBenchBatch(.ai_intent, ai_stats.perf.intent_batch);
         }
-        perf.recordBenchBatch(.ai_separation, ai_stats.separation_batch);
-        perf.recordBenchBatch(.ai_intent, ai_stats.intent_batch);
 
         perf.recordMetric(.steering_navigation_intents, metric(steering_stats.navigation_intent_count));
         perf.recordMetric(.steering_selected_intents, metric(steering_stats.selected_intent_count));
@@ -626,8 +624,8 @@ pub const SimulationPipelineStats = struct {
             perf.recordMetric(.steering_obstacle_samples, metric(steering_stats.perf.obstacle_samples));
             perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.perf.agent_candidate_checks));
             perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.perf.obstacle_candidate_checks));
+            perf.recordBenchBatch(.steering, steering_stats.perf.batch);
         }
-        perf.recordBenchBatch(.steering, steering_stats.batch);
         perf.recordTiming(.steering_select, steering_stats.select_ns);
         perf.recordTiming(.steering_snapshot, steering_stats.snapshot_ns);
         perf.recordTiming(.steering_directions, steering_stats.directions_ns);
@@ -960,7 +958,7 @@ pub const SimulationPipeline = struct {
     // The most ranges `ai_decide` appends to `frame.navigation_intents` in one step at the
     // tracked population.
     fn navigationIntentRangeCount(self: *const SimulationPipeline) usize {
-        return maxRangeCount(self.movement_body_capacity, ai_range_alignment_items);
+        return maxRangeCount(self.movement_body_capacity, ai_intent_range_alignment_items);
     }
 
     // The most ranges one step appends to `frame.structural_commands` at the tracked
@@ -1810,7 +1808,7 @@ test "pipeline updates full active player-only state through serial path" {
 
     try std.testing.expectEqual(@as(usize, 1), stats.scope.stats.total_entities);
     try std.testing.expectEqual(@as(usize, 1), stats.scope.stats.movement_stage_entities);
-    try std.testing.expectEqual(@as(usize, 0), stats.ai.entity_count);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.ai.rows.len);
     try std.testing.expectEqual(@as(usize, 1), stats.movement.body_count);
     try std.testing.expectEqual(@as(usize, 0), frame.contacts.mergedItems().len);
 }
@@ -2096,7 +2094,7 @@ test "pipeline resamples AI wander direction across fixed steps" {
     // region and the AI gather falls back to full-active with no stagger gating —
     // the wanderer runs every step.
     frame.beginStep();
-    const stats1 = try pipeline.update(.{
+    _ = try pipeline.update(.{
         .data = &data,
         .frame = &frame,
         .world = &world,
@@ -2107,7 +2105,7 @@ test "pipeline resamples AI wander direction across fixed steps" {
         .bounds_height = 450,
         .sim_view = fullWorldSimView(&world),
     });
-    try std.testing.expectEqual(@as(usize, 1), stats1.ai.entity_count);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.ai.rows.len);
     const step1 = frame.navigation_intents.mergedItems()[0];
 
     // Wander direction holds steady for `wander_resample_period_steps` (300
@@ -2197,7 +2195,7 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     defer pipeline.deinit();
 
     frame.beginStep();
-    const stats = try pipeline.update(.{
+    _ = try pipeline.update(.{
         .data = &data,
         .frame = &frame,
         .world = &world,
@@ -2212,7 +2210,7 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     // Both stages ran over the same scoped agent this step (observable stage
     // order: ai_memory processes after perception and before ai reads it).
     try std.testing.expectEqual(@as(usize, 1), pipeline.ai_memory.memory_dense_indices.items.len);
-    try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.ai.rows.len);
 
     // Perception never saw the player (out of vision range) and AiMemory's
     // fresh last-known position survived AiMemorySystem's decay, so AI's
@@ -2345,7 +2343,7 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
     defer pipeline.deinit();
 
     frame.beginStep();
-    const stats = try pipeline.update(.{
+    _ = try pipeline.update(.{
         .data = &data,
         .frame = &frame,
         .world = &world,
@@ -2359,9 +2357,9 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
 
     // Both perception and affect ran this step over the observer (the only
     // entity carrying AiAffect); both agents (observer + hostile) reach AI.
-    try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.perception.rows.len);
     try std.testing.expectEqual(@as(usize, 1), pipeline.affect.rows.len);
-    try std.testing.expectEqual(@as(usize, 2), stats.ai.entity_count);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.ai.rows.len);
 
     // Affect observed this step's perception output (hostile visible, close),
     // proving it ran after perception -- a stale/previous-step read would
@@ -2836,7 +2834,7 @@ fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
         });
         out.* = .{
             .cognition_region = stats.scope.active_region,
-            .ai_entity_count = stats.ai.entity_count,
+            .ai_entity_count = pipeline.ai.rows.len,
             .halo_entity_count = pipeline.scope.ai_halo_indices.items.len,
             .tier_commands = @splat(null),
         };
@@ -4186,8 +4184,8 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     // matching AI's own scoped population (both read the same think list)
     // even though two entities in `DataSystem` carry `AiPerception`. With a
     // struct-literal world (`cognition_region == null`) halo == think.
-    try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
-    try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.ai.rows.len);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.perception.rows.len);
     try std.testing.expectEqual(@as(usize, 1), pipeline.spatial_index.view().entryCount());
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.entity_perceived);
     try std.testing.expectEqual(@as(usize, 0), frame.events.stats.entity_lost);
@@ -4304,8 +4302,8 @@ test "pipeline dual-list perception: think observer acquires off-phase halo host
         .max_exclusive = .{ .x = 1 + h, .y = 1 + h },
     }, stats.scope.active_region.?);
     try std.testing.expectEqual(@as(usize, 2), pipeline.spatial_index.view().entryCount());
-    try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
-    try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.perception.rows.len);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.ai.rows.len);
 
     const ally_perception = data_test_support.aiPerception(&data, ally).?;
     try std.testing.expect(ally_perception.target_visible);
@@ -6448,7 +6446,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     const first_stats = try first_result;
     // The zero-allocation proof covers perception and affect only if they ran: the
     // 5 observers' stagger phases cover all four, so every step thinks at least one.
-    try std.testing.expect(first_stats.perception.observer_count >= 1);
+    try std.testing.expect(pipeline.perception.rows.len >= 1);
     try std.testing.expect(pipeline.affect.rows.len >= 1);
     if (max_worker_threads > 0) {
         try std.testing.expect(!first_stats.movement.batch.ran_inline);
@@ -6470,7 +6468,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
         if (prove_zero_alloc) retune_swap.restore(targets);
         const retune_stats = try retune_result;
         try std.testing.expectEqual(rangeCount(37, profile.items_per_range), retune_stats.movement.batch.range_count);
-        try std.testing.expect(retune_stats.perception.observer_count >= 1);
+        try std.testing.expect(pipeline.perception.rows.len >= 1);
         try std.testing.expect(pipeline.affect.rows.len >= 1);
         try std.testing.expectEqual(@as(usize, 0), retune_failing.allocations);
     }
@@ -6715,9 +6713,6 @@ test "a production step pinned onto workers runs every threaded pipeline stage o
     const stats = try pipeline.update(context);
     const stage_batches = [_]BatchStats{
         stats.spatial_index.sort_batch,
-        stats.perception.batch,
-        stats.ai.separation_batch,
-        stats.ai.intent_batch,
         stats.movement.batch,
         stats.chunk_derive,
         stats.collision.broadphase_batch,
@@ -7564,7 +7559,7 @@ test "the think set reaches AI in the index's cell-major order, not AI index ord
     defer pipeline.deinit();
 
     frame.beginStep();
-    const stats = try pipeline.update(.{
+    _ = try pipeline.update(.{
         .data = &data,
         .frame = &frame,
         .world = &world,
@@ -7575,7 +7570,7 @@ test "the think set reaches AI in the index's cell-major order, not AI index ord
         .bounds_height = 2048,
         .sim_view = fullWorldSimView(&world),
     });
-    try std.testing.expectEqual(@as(usize, 3), stats.ai.entity_count);
+    try std.testing.expectEqual(@as(usize, 3), pipeline.ai.rows.len);
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 0 }, pipeline.scope.ai_cognition_indices.items);
     const intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 3), intents.len);

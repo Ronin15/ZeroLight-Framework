@@ -26,11 +26,6 @@ pub fn updateSteeringInline(steering: *SteeringSystem, data: *const DataSystem, 
     return steering.update(data, frame, &threads, pathfinding, colliders, .{});
 }
 
-pub fn expectEveryStageThreaded(stats: SteeringStats) !void {
-    try std.testing.expect(!stats.batch.ran_inline);
-    try std.testing.expect(stats.batch.active_worker_threads > 0);
-}
-
 // An intent for `agent` (the `agent_index`th) whose direct direction is unique to the
 // agent and `variant`.
 pub fn selectionIntent(agent: EntityId, agent_index: usize, variant: usize, priority: i16) NavigationIntent {

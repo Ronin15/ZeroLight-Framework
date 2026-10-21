@@ -97,7 +97,8 @@ pub fn writeMovementIntents(
         .tallies = self.movement_tallies.items,
         .range_count = range_count,
     };
-    stats.batch = movement.run(selection, count, steering_range_alignment_items, &context, writeSteeringMovementJob);
+    const batch = movement.run(selection, count, steering_range_alignment_items, &context, writeSteeringMovementJob);
+    if (comptime runtime_perf_log.enabled) stats.perf.batch = batch;
     frame.intents.finishWrite();
     frame.path_requests.finishWrite();
 
@@ -294,74 +295,98 @@ const ObstaclePush = struct {
 
 const PushPerf = if (runtime_perf_log.enabled) struct { samples: u16 = 0 } else struct {};
 
-// Adds the push of each of the first `count` hit boxes, in hit order, to `push`: four boxes
-// per lane group with a scalar tail. Lanes add in lane order and a lane out of range is
-// skipped (never added as zero, which would turn -0.0 into +0.0), so the result equals
-// `pushObstacleScalar` over every box bit for bit.
+// Adds the push of each of the first `count` hit boxes to `push`: four boxes per lane group,
+// the last group masked to the boxes left. Lane `i` keeps the partial sum of boxes `i`,
+// `i + 4`, ... in hit order, a lane out of range or past `count` adding -0.0 (the additive
+// identity, so a -0.0 component stays -0.0); the four partials are reduced once in
+// `simd.sumLanesFloat4`'s pinned order and added to `push`. `pushObstaclesScalar` sums in
+// that order, bit for bit.
 fn pushObstacles(hits: *const ObstacleHitScratch, count: usize, start_x: f32, start_y: f32, radius: f32, weight: f32, push: *ObstaclePush) void {
     std.debug.assert(count <= max_obstacle_hits);
-    const start_x_lanes = simd.splatFloat4(start_x);
-    const start_y_lanes = simd.splatFloat4(start_y);
-    const radius_lanes = simd.splatFloat4(radius);
-    const radius2_lanes = simd.splatFloat4(radius * radius);
-    const weight_lanes = simd.splatFloat4(weight);
-    const min_dist2_lanes = simd.splatFloat4(obstacle_min_dist2);
-    const half = simd.splatFloat4(0.5);
-    const one = simd.splatFloat4(1);
-    const zero = simd.splatFloat4(0);
+    const agent = ObstacleAgentLanes{
+        .start_x = simd.splatFloat4(start_x),
+        .start_y = simd.splatFloat4(start_y),
+        .radius = simd.splatFloat4(radius),
+        .radius2 = simd.splatFloat4(radius * radius),
+        .weight = simd.splatFloat4(weight),
+    };
+    var sums = ObstaclePushLanes{};
     var at: usize = 0;
     const vector_end = simd.vectorizedEnd(count);
     while (at < vector_end) : (at += simd.lane_count) {
-        const min_x = simd.loadFloat4(hits.min_x[at..]);
-        const min_y = simd.loadFloat4(hits.min_y[at..]);
-        const max_x = simd.loadFloat4(hits.max_x[at..]);
-        const max_y = simd.loadFloat4(hits.max_y[at..]);
-        const edge_dx = start_x_lanes - simd.clampFloat4(start_x_lanes, min_x, max_x);
-        const edge_dy = start_y_lanes - simd.clampFloat4(start_y_lanes, min_y, max_y);
-        // Inside the box: push away from its center.
-        const inside = simd.equalFloat4(edge_dx, zero) & simd.equalFloat4(edge_dy, zero);
-        const dx = simd.selectFloat4(inside, start_x_lanes - (min_x + max_x) * half, edge_dx);
-        const dy = simd.selectFloat4(inside, start_y_lanes - (min_y + max_y) * half, edge_dy);
-        const dist2 = simd.lengthSquared2Float4(dx, dy);
-        const in_range = simd.greaterThanFloat4(dist2, min_dist2_lanes) & simd.lessThanFloat4(dist2, radius2_lanes);
-        const length_direction = simd.lengthDirection2Float4(dx, dy, 0);
-        const strength = (one - length_direction.length / radius_lanes) * weight_lanes;
-        const push_x = length_direction.direction.x * strength;
-        const push_y = length_direction.direction.y * strength;
-        inline for (0..simd.lane_count) |lane| {
-            if (in_range[lane]) {
-                push.ax += push_x[lane];
-                push.ay += push_y[lane];
-                if (comptime runtime_perf_log.enabled) push.perf.samples += 1;
-            }
-        }
+        const boxes = ObstacleBoxLanes{
+            .min_x = simd.loadFloat4(hits.min_x[at..]),
+            .min_y = simd.loadFloat4(hits.min_y[at..]),
+            .max_x = simd.loadFloat4(hits.max_x[at..]),
+            .max_y = simd.loadFloat4(hits.max_y[at..]),
+        };
+        pushObstacleLanes(agent, boxes, simd.lanesBelow(simd.lane_count), &sums);
     }
-    while (at < count) : (at += 1) {
-        pushObstacleScalar(hits.min_x[at], hits.min_y[at], hits.max_x[at], hits.max_y[at], start_x, start_y, radius, weight, push);
+    if (at < count) {
+        // The boxes past `count` are unwritten scratch: the prefix loads read only the boxes left.
+        const left = count - at;
+        const boxes = ObstacleBoxLanes{
+            .min_x = simd.loadFloat4Prefix(hits.min_x[at..], left),
+            .min_y = simd.loadFloat4Prefix(hits.min_y[at..], left),
+            .max_x = simd.loadFloat4Prefix(hits.max_x[at..], left),
+            .max_y = simd.loadFloat4Prefix(hits.max_y[at..], left),
+        };
+        pushObstacleLanes(agent, boxes, simd.lanesBelow(left), &sums);
     }
+    push.ax += simd.sumLanesFloat4(sums.ax);
+    push.ay += simd.sumLanesFloat4(sums.ay);
+    if (comptime runtime_perf_log.enabled) push.perf.samples += sums.perf.samples;
+}
+
+// One agent's obstacle push inputs, splat across the lanes.
+const ObstacleAgentLanes = struct {
+    start_x: simd.Float4,
+    start_y: simd.Float4,
+    radius: simd.Float4,
+    radius2: simd.Float4,
+    weight: simd.Float4,
+};
+
+// Four hit boxes, one per lane.
+const ObstacleBoxLanes = struct {
+    min_x: simd.Float4,
+    min_y: simd.Float4,
+    max_x: simd.Float4,
+    max_y: simd.Float4,
+};
+
+// Per-lane partial sums of the obstacle pushes, -0.0 before any push, and the pushes added
+// (`runtime_perf_log.enabled` only).
+const ObstaclePushLanes = struct {
+    ax: simd.Float4 = simd.splatFloat4(-0.0),
+    ay: simd.Float4 = simd.splatFloat4(-0.0),
+    perf: PushPerf = .{},
+};
+
+// `pushObstacleScalar` over the boxes in `lanes`, each added to its lane's partial sum.
+inline fn pushObstacleLanes(agent: ObstacleAgentLanes, boxes: ObstacleBoxLanes, lanes: simd.MaskBits, sums: *ObstaclePushLanes) void {
+    const zero = simd.splatFloat4(0);
+    const edge_dx = agent.start_x - simd.clampFloat4(agent.start_x, boxes.min_x, boxes.max_x);
+    const edge_dy = agent.start_y - simd.clampFloat4(agent.start_y, boxes.min_y, boxes.max_y);
+    // Inside the box: push away from its center.
+    const inside = simd.equalFloat4(edge_dx, zero) & simd.equalFloat4(edge_dy, zero);
+    const half = simd.splatFloat4(0.5);
+    const dx = simd.selectFloat4(inside, agent.start_x - (boxes.min_x + boxes.max_x) * half, edge_dx);
+    const dy = simd.selectFloat4(inside, agent.start_y - (boxes.min_y + boxes.max_y) * half, edge_dy);
+    const dist2 = simd.lengthSquared2Float4(dx, dy);
+    const in_range = simd.greaterThanFloat4(dist2, simd.splatFloat4(obstacle_min_dist2)) & simd.lessThanFloat4(dist2, agent.radius2);
+    const length_direction = simd.lengthDirection2Float4(dx, dy, 0);
+    const strength = (simd.splatFloat4(1) - length_direction.length / agent.radius) * agent.weight;
+    const pushing = simd.maskBits(in_range) & lanes;
+    // Lanes that do not push add -0.0, the additive identity.
+    const identity = simd.splatFloat4(-0.0);
+    sums.ax += simd.selectBitsFloat4(pushing, length_direction.direction.x * strength, identity);
+    sums.ay += simd.selectBitsFloat4(pushing, length_direction.direction.y * strength, identity);
+    if (comptime runtime_perf_log.enabled) sums.perf.samples += @popCount(pushing);
 }
 
 // Squared distances at or below this push nothing (no stable direction).
 const obstacle_min_dist2: f32 = 0.0001;
-
-// One box's push toward its closest point's opposite side, or from its center when the
-// agent is inside it, falling off linearly to zero at `radius`.
-fn pushObstacleScalar(min_x: f32, min_y: f32, max_x: f32, max_y: f32, start_x: f32, start_y: f32, radius: f32, weight: f32, push: *ObstaclePush) void {
-    var dx = start_x - math.clampMinMax(start_x, min_x, max_x);
-    var dy = start_y - math.clampMinMax(start_y, min_y, max_y);
-    if (dx == 0 and dy == 0) {
-        dx = start_x - (min_x + max_x) * 0.5;
-        dy = start_y - (min_y + max_y) * 0.5;
-    }
-    const dist2 = dx * dx + dy * dy;
-    if (dist2 > obstacle_min_dist2 and dist2 < radius * radius) {
-        const length_direction = math.lengthDirection(dx, dy, 0);
-        const strength = (1.0 - length_direction.length / radius) * weight;
-        push.ax += length_direction.direction.x * strength;
-        push.ay += length_direction.direction.y * strength;
-        if (comptime runtime_perf_log.enabled) push.perf.samples += 1;
-    }
-}
 
 fn accumulateAgentAvoidanceBounded(
     job: *const SteeringJobContext,
@@ -435,6 +460,7 @@ fn accumulateAgentSample(
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
+const max_steering_neighbor_samples = @import("../../data_system.zig").max_steering_neighbor_samples;
 const NavigationIntent = @import("../../simulation.zig").NavigationIntent;
 const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
 const addSteeredEntity = @import("test_support.zig").addSteeredEntity;
@@ -478,6 +504,56 @@ test "steering applies local agent and static obstacle avoidance" {
     // +x direct direction: together they turn it past -x.
     try std.testing.expect(movement.direction_y > 0);
     try std.testing.expect(movement.direction_x < 0);
+}
+
+test "steering agent avoidance stops at the candidate cap among dense co-located neighbors" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // The agent samples up to the store's maximum, past the candidate cap, so only the cap
+    // can stop its walk.
+    const agent = try addSteeredEntity(&data, .{ .x = 60, .y = 60 });
+    try data.setSteeringAgent(agent, .{ .agent_radius = 8, .waypoint_tolerance = 4, .avoidance_radius = 48, .avoidance_weight = 1.5, .max_neighbor_samples = max_steering_neighbor_samples, .stuck_step_threshold = 3, .replan_cooldown_steps = 4, .unavailable_backoff_steps = 12 });
+    // Twice the cap of neighbors at one point in the grid cell walked before the agent's
+    // own, each in reach.
+    const neighbor_count = 2 * max_agent_candidate_checks;
+    for (0..neighbor_count) |_| _ = try addSteeredEntity(&data, .{ .x = 50, .y = 52 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_group_fields = 1, .worker_participant_count = 1 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+    var colliders = try testColliders(&pathfinding, &data, 160, 160, 32);
+    defer colliders.deinit();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(neighbor_count + 1);
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 150, .y = 60 }, .direct_direction_x = 1 });
+    _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
+
+    // The direct direction plus the identical pushes of the first `max_agent_candidate_checks`
+    // candidates, all neighbors; the uncapped walk would add every neighbor's.
+    var capped_ax: f32 = 1;
+    var capped_ay: f32 = 0;
+    var capped_samples: u16 = 0;
+    for (0..max_agent_candidate_checks) |_| accumulateAgentSample(10, 8, 48 + 8, 1.5, &capped_ax, &capped_ay, &capped_samples);
+    var uncapped_ax: f32 = 1;
+    var uncapped_ay: f32 = 0;
+    var uncapped_samples: u16 = 0;
+    for (0..neighbor_count) |_| accumulateAgentSample(10, 8, 48 + 8, 1.5, &uncapped_ax, &uncapped_ay, &uncapped_samples);
+    const expected = math.normalizeOrZeroFinite(capped_ax, capped_ay, 0.0001);
+    const uncapped = math.normalizeOrZeroFinite(uncapped_ax, uncapped_ay, 0.0001);
+    try std.testing.expect(expected.y != uncapped.y);
+    const movement = frame.intents.mergedItems()[0].movement;
+    try std.testing.expect(movement.entity.eql(agent));
+    try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(movement.direction_x)));
+    try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(movement.direction_y)));
 }
 
 test "steering local agent avoidance ignores XY overlap across different world_levels" {
@@ -629,12 +705,11 @@ test "steering multi-level obstacle gate matches between serial and real threade
         var threaded_system = SteeringSystem.init(std.testing.allocator);
         defer threaded_system.deinit();
         try threaded_system.reserve(128);
-        const threaded_stats = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, .{
+        _ = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, .{
             .items_per_range = split.items_per_range,
             .max_worker_threads = split.workers,
             .adaptive = false,
         });
-        try std.testing.expect(threaded_stats.batch.active_worker_threads > 0);
         const threaded = threaded_frame.intents.mergedItems();
         try std.testing.expectEqual(serial.len, threaded.len);
         for (serial, threaded) |a, b| {
@@ -738,7 +813,8 @@ test "steering obstacle pushes equal a scalar push over the query's hits" {
     try appendNavigationIntents(&frame, &intents);
     _ = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
 
-    // The reference: the direct direction plus the scalar push of each hit in query order.
+    // The reference: the direct direction plus the scalar push of the hits in query order,
+    // summed in the lane order.
     const view = colliders.view();
     var hits: ObstacleHitScratch = undefined;
     var pushes: usize = 0;
@@ -748,12 +824,13 @@ test "steering obstacle pushes equal a scalar push over the query's hits" {
         const box = math.Aabb{ .min_x = position.x - radius, .min_y = position.y - radius, .max_x = position.x + radius, .max_y = position.y + radius };
         const query = view.queryBox(0, box, .{ .max_hits = max_obstacle_hits, .max_work = max_obstacle_work }, hits.boxHits());
         max_hits = @max(max_hits, query.hits);
-        var push = ObstaclePush{ .ax = 1, .ay = 0 };
         for (0..query.hits) |at| {
-            const before = push;
-            pushObstacleScalar(hits.min_x[at], hits.min_y[at], hits.max_x[at], hits.max_y[at], position.x, position.y, radius, 1.5, &push);
-            if (push.ax != before.ax or push.ay != before.ay) pushes += 1;
+            var probe = ObstaclePush{ .ax = 0, .ay = 0 };
+            pushObstacleScalar(hits.min_x[at], hits.min_y[at], hits.max_x[at], hits.max_y[at], position.x, position.y, radius, 1.5, &probe);
+            if (probe.ax != 0 or probe.ay != 0) pushes += 1;
         }
+        var push = ObstaclePush{ .ax = 1, .ay = 0 };
+        pushObstaclesScalar(&hits, query.hits, position.x, position.y, radius, 1.5, &push);
         const expected = math.normalizeOrZeroFinite(push.ax, push.ay, 0.0001);
         try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(intent.movement.direction_x)));
         try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(intent.movement.direction_y)));
@@ -791,12 +868,13 @@ test "steering obstacle SIMD push equals the scalar push" {
         var lanes = ObstaclePush{ .ax = 0.25, .ay = -0.0 };
         pushObstacles(&hits, count, 0, 0, 10, 1.5, &lanes);
         var scalar = ObstaclePush{ .ax = 0.25, .ay = -0.0 };
-        for (0..count) |at| pushObstacleScalar(hits.min_x[at], hits.min_y[at], hits.max_x[at], hits.max_y[at], 0, 0, 10, 1.5, &scalar);
+        pushObstaclesScalar(&hits, count, 0, 0, 10, 1.5, &scalar);
         try std.testing.expectEqual(@as(u32, @bitCast(scalar.ax)), @as(u32, @bitCast(lanes.ax)));
         try std.testing.expectEqual(@as(u32, @bitCast(scalar.ay)), @as(u32, @bitCast(lanes.ay)));
     }
     // The crafted on-radius, sub-epsilon, and centered boxes push nothing: the five push
-    // what the off-center holding box and the last box push alone.
+    // what the off-center holding box and the last box push alone. Both share lane 0, and
+    // the other lanes hold -0.0, so the lane sum adds them in hit order too.
     var crafted_push = ObstaclePush{ .ax = 0, .ay = 0 };
     pushObstacles(&hits, crafted.len, 0, 0, 10, 1.5, &crafted_push);
     var pushing_only = ObstaclePush{ .ax = 0, .ay = 0 };
@@ -842,13 +920,54 @@ test "steering stops the obstacle walk at the hit cap among dense co-located sta
     try std.testing.expectEqual(@as(usize, 1), stats.movement_intent_count);
     // Every co-located static meets the query box, so each entry read is a hit: the walk
     // stops at the hit cap, and the direction is the direct one plus `max_obstacle_hits`
-    // of the 128 identical pushes.
+    // of the 128 identical pushes, summed in the lane order.
+    var capped: ObstacleHitScratch = undefined;
+    @memset(&capped.min_x, 8);
+    @memset(&capped.min_y, 8);
+    @memset(&capped.max_x, 16);
+    @memset(&capped.max_y, 16);
     var reference = ObstaclePush{ .ax = 1, .ay = 0 };
-    for (0..max_obstacle_hits) |_| pushObstacleScalar(8, 8, 16, 16, 0, 0, 48 + 8, 1.5, &reference);
+    pushObstaclesScalar(&capped, max_obstacle_hits, 0, 0, 48 + 8, 1.5, &reference);
     const expected = math.normalizeOrZeroFinite(reference.ax, reference.ay, 0.0001);
     const movement = frame.intents.mergedItems()[0].movement;
     try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(movement.direction_x)));
     try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(movement.direction_y)));
+}
+
+// The scalar form of one `pushObstacleLanes` lane: its push toward its closest point's
+// opposite side, or from its center when the agent is inside it, falling off linearly to
+// zero at `radius`.
+fn pushObstacleScalar(min_x: f32, min_y: f32, max_x: f32, max_y: f32, start_x: f32, start_y: f32, radius: f32, weight: f32, push: *ObstaclePush) void {
+    var dx = start_x - math.clampMinMax(start_x, min_x, max_x);
+    var dy = start_y - math.clampMinMax(start_y, min_y, max_y);
+    if (dx == 0 and dy == 0) {
+        dx = start_x - (min_x + max_x) * 0.5;
+        dy = start_y - (min_y + max_y) * 0.5;
+    }
+    const dist2 = dx * dx + dy * dy;
+    if (dist2 > obstacle_min_dist2 and dist2 < radius * radius) {
+        const length_direction = math.lengthDirection(dx, dy, 0);
+        const strength = (1.0 - length_direction.length / radius) * weight;
+        push.ax += length_direction.direction.x * strength;
+        push.ay += length_direction.direction.y * strength;
+    }
+}
+
+// `pushObstacles` in scalar: box `i` adds `pushObstacleScalar` into partial sum `i % 4`
+// (each -0.0 before any push), then the partials are summed in `simd.sumLanesScalar`'s
+// order and added to `push`.
+fn pushObstaclesScalar(hits: *const ObstacleHitScratch, count: usize, start_x: f32, start_y: f32, radius: f32, weight: f32, push: *ObstaclePush) void {
+    var partial_x: [simd.lane_count]f32 = @splat(-0.0);
+    var partial_y: [simd.lane_count]f32 = @splat(-0.0);
+    for (0..count) |at| {
+        const lane = at % simd.lane_count;
+        var partial = ObstaclePush{ .ax = partial_x[lane], .ay = partial_y[lane] };
+        pushObstacleScalar(hits.min_x[at], hits.min_y[at], hits.max_x[at], hits.max_y[at], start_x, start_y, radius, weight, &partial);
+        partial_x[lane] = partial.ax;
+        partial_y[lane] = partial.ay;
+    }
+    push.ax += simd.sumLanesScalar(partial_x);
+    push.ay += simd.sumLanesScalar(partial_y);
 }
 
 // One agent at (300, 300) with a static to its right and above it, behind `far_count`

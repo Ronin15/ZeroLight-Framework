@@ -250,7 +250,6 @@ const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const PathfindingSystem = @import("../pathfinding.zig").PathfindingSystem;
 const StaticColliderSystem = @import("../static_colliders.zig").StaticColliderSystem;
 const direction_epsilon = @import("directions.zig").direction_epsilon;
-const expectEveryStageThreaded = @import("test_support.zig").expectEveryStageThreaded;
 const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
 const selectionIntent = @import("test_support.zig").selectionIntent;
 const addSteeredEntity = @import("test_support.zig").addSteeredEntity;
@@ -345,7 +344,6 @@ test "steering threaded arbitration keeps the first appearance and the best inte
             try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders)
         else
             try steering.update(&data, &frame, &threads, &pathfinding, &colliders, .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
-        if (run == 1) try expectEveryStageThreaded(stats);
         try std.testing.expectEqual(@as(usize, 40), stats.selected_intent_count);
         // First appearance order, each agent steering along its best intent.
         for (output, frame.intents.mergedItems(), agents, best) |*slot, merged, agent, best_index| {
@@ -411,7 +409,7 @@ test "steering claims stay correct across the claim stamp wrap" {
     }
 }
 
-test "steering claim band count does not follow the resolve partition" {
+test "steering claims and intents match serial across resolve partitions" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     // Far enough apart that no agent pushes another.

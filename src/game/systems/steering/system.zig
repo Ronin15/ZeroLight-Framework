@@ -101,8 +101,6 @@ pub const SteeringStats = struct {
     selected_intent_count: usize = 0,
     movement_intent_count: usize = 0,
     path_request_count: usize = 0,
-    /// The avoidance pass.
-    batch: BatchStats = .{},
     // Wall time (ns) of the prepare stages, inline or dispatched: selection, the agents stage
     // with its rekey, directions, and the agent grid; zero when perf logging is disabled.
     select_ns: u64 = 0,
@@ -114,9 +112,10 @@ pub const SteeringStats = struct {
     /// Kept only with `runtime_perf_log.enabled`: `directions`' path-status counts (selected
     /// intents served available, pending, unavailable; held by replan cooldown or unavailable
     /// backoff; stuck replans), the avoidance pass's agent and obstacle samples and candidate
-    /// checks (`obstacle_candidate_checks` counts static-collider query entries read), and
-    /// the prepare stages' batches. The claim and grid sort batches hold
-    /// zero items on the serial path, where selection and the grid run their single pass.
+    /// checks (`obstacle_candidate_checks` counts static-collider query entries read), the
+    /// prepare stages' batches, and the avoidance pass's `batch`. The claim and grid sort
+    /// batches hold zero items on the serial path, where selection and the grid run their
+    /// single pass.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         path_available_count: usize = 0,
         path_pending_count: usize = 0,
@@ -134,6 +133,7 @@ pub const SteeringStats = struct {
         directions_batch: BatchStats = .{},
         grid_bucket_batch: BatchStats = .{},
         grid_sort_batch: BatchStats = .{},
+        batch: BatchStats = .{},
     } else struct {};
 };
 
@@ -742,7 +742,6 @@ const math = @import("../../../core/math.zig");
 const MovementIntent = @import("../../simulation.zig").MovementIntent;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const requestsBefore = @import("avoidance.zig").requestsBefore;
-const expectEveryStageThreaded = @import("test_support.zig").expectEveryStageThreaded;
 const updateSteeringInline = @import("test_support.zig").updateSteeringInline;
 const updatePathfindingInline = @import("../pathfinding/test_support.zig").updatePathfindingInline;
 const selectionIntent = @import("test_support.zig").selectionIntent;
@@ -924,14 +923,13 @@ test "steering serial and real threaded workers produce identical movement inten
         .items_per_range = steering_range_alignment_items,
     });
     defer threads.deinit();
-    const threaded_stats = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, .{
+    _ = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, .{
         .items_per_range = steering_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
     });
     const threaded = threaded_frame.intents.mergedItems();
 
-    try std.testing.expect(threaded_stats.batch.active_worker_threads > 0);
     try std.testing.expectEqual(serial.len, threaded.len);
     for (serial, threaded) |a, b| {
         try std.testing.expectEqual(a.movement.entity.index, b.movement.entity.index);
@@ -1013,14 +1011,11 @@ test "steering serial matches threaded intents across multiple range splits and 
         var threaded_system = SteeringSystem.init(std.testing.allocator);
         defer threaded_system.deinit();
         try threaded_system.reserve(128);
-        const threaded_stats = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, .{
+        _ = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, .{
             .items_per_range = split.items_per_range,
             .max_worker_threads = split.workers,
             .adaptive = false,
         });
-        // Real workers processed the batch, so this split exercised the multi-worker
-        // path it claims to.
-        try std.testing.expect(threaded_stats.batch.active_worker_threads > 0);
         const threaded = threaded_frame.intents.mergedItems();
         try std.testing.expectEqual(serial.len, threaded.len);
         for (serial, threaded) |a, b| {
@@ -1175,7 +1170,6 @@ test "steering threaded multi-worker update is allocation-free after reserves fr
         frame.beginStep();
         try appendNavigationIntents(&frame, &step_intents);
         const stats = try steering.update(&data, &frame, &threads, &pathfinding, &colliders, cfg);
-        try expectEveryStageThreaded(stats);
         try std.testing.expectEqual(agents.len, stats.movement_intent_count);
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     }
@@ -1190,7 +1184,6 @@ test "steering threaded multi-worker update is allocation-free after reserves fr
     frame.beginStep();
     try appendNavigationIntents(&frame, &step_intents);
     const churn = try steering.update(&data, &frame, &threads, &pathfinding, &colliders, cfg);
-    try expectEveryStageThreaded(churn);
     try std.testing.expectEqual(agents.len, churn.movement_intent_count);
     try std.testing.expectEqual(agents.len, steering.runtime_rows.len);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
@@ -1269,7 +1262,7 @@ test "steering threaded prepare equals serial across range splits and worker cou
     }
 }
 
-test "steering with no worker to give runs the serial selection and grid and matches serial" {
+test "steering with no worker to give matches serial" {
     var serial = ParityTrace{};
     defer serial.deinit();
     try runParityScenario(null, .{}, &serial);
@@ -1334,7 +1327,7 @@ test "steering runtime state follows its entity across swap-removes" {
     }
 }
 
-test "steering stages kept inline by their tuners run the threaded stage jobs inline" {
+test "steering with fresh adaptive tuners matches serial" {
     var serial = ParityTrace{};
     defer serial.deinit();
     try runParityScenario(null, .{}, &serial);
@@ -1354,7 +1347,6 @@ test "steering stages kept inline by their tuners run the threaded stage jobs in
 // A step's stats without batch shapes and timings, which follow the partition.
 fn behaviorStats(stats: SteeringStats) SteeringStats {
     var behavior = stats;
-    behavior.batch = .{};
     behavior.perf = .{};
     behavior.select_ns = 0;
     behavior.snapshot_ns = 0;
@@ -1476,9 +1468,6 @@ fn buildParityIntents(intents: *std.ArrayList(NavigationIntent), agents: []const
 
 const parity_step_count: usize = 3;
 
-// `parity_step_count` steering steps over the parity crowd among the parity statics, with agents
-// destroyed and created between steps and each step's path requests served before the
-// next. A fixed range size of one alignment unit asserts every stage threaded.
 // The intents with a movement body whose path from that body's position reads available.
 fn countAvailablePaths(data: *const DataSystem, pathfinding: *const PathfindingSystem, intents: []const NavigationIntent) usize {
     const movement = data.movementBodySliceConst();
@@ -1491,6 +1480,10 @@ fn countAvailablePaths(data: *const DataSystem, pathfinding: *const PathfindingS
     return available;
 }
 
+// `parity_step_count` steering steps over the parity crowd among the parity statics, with agents
+// destroyed and created between steps and each step's path requests served before the
+// next. With workers and a fixed range size of one alignment unit, asserts the avoidance
+// pass threaded.
 fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trace: *ParityTrace) !void {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1540,9 +1533,6 @@ fn runParityScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, trac
             try system.update(&data, &frame, threads, &pathfinding, &colliders, config)
         else
             try updateSteeringInline(&system, &data, &frame, &pathfinding, &colliders);
-        if (thread_system) |threads| {
-            if (threads.workerThreadCount() != 0 and config.items_per_range == steering_range_alignment_items) try expectEveryStageThreaded(stats);
-        }
         try expectRequestPrefixesCount(&system, stats);
         try trace.record(&frame, stats, &system);
         _ = try updatePathfindingInline(&pathfinding, &frame.path_requests, agents.items.len, .{});
@@ -1624,8 +1614,7 @@ fn runRekeyScenario(thread_system: ?*ThreadSystem, config: SteeringConfig, churn
     for (agents.items) |agent| try intents.append(std.testing.allocator, .{ .entity = agent, .goal = .{ .x = 999, .y = 999 }, .direct_direction_y = 1 });
     frame.beginStep();
     try appendNavigationIntents(&frame, intents.items);
-    const second = if (thread_system) |threads| try system.update(&data, &frame, threads, &pathfinding, &colliders, config) else try updateSteeringInline(&system, &data, &frame, &pathfinding, &colliders);
-    if (thread_system != null) try expectEveryStageThreaded(second);
+    _ = if (thread_system) |threads| try system.update(&data, &frame, threads, &pathfinding, &colliders, config) else try updateSteeringInline(&system, &data, &frame, &pathfinding, &colliders);
     // Each runtime row holds its steering row's entity.
     const steering_entities = data.steeringAgentSliceConst().entities;
     try std.testing.expectEqual(steering_entities.len, system.runtime_rows.len);

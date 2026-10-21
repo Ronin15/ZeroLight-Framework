@@ -246,7 +246,7 @@ const MeasuredCase = struct {
 // Off-main time of one steering step's stages.
 fn stagesOffMainNs(stats: SteeringStats) u64 {
     return offMainNs(stats.perf.agents_batch) + offMainNs(stats.perf.select_resolve_batch) + offMainNs(stats.perf.select_claim_batch) + offMainNs(stats.perf.directions_batch) +
-        offMainNs(stats.perf.grid_bucket_batch) + offMainNs(stats.perf.grid_sort_batch) + offMainNs(stats.batch);
+        offMainNs(stats.perf.grid_bucket_batch) + offMainNs(stats.perf.grid_sort_batch) + offMainNs(stats.perf.batch);
 }
 
 // Every steering stage tuner has settled.
@@ -321,10 +321,10 @@ fn measureCase(
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         const off_main_ns = stagesOffMainNs(last_stats) + offMainNs(steering.colliders.last_splice_batch);
         main_total += elapsed_ns -| off_main_ns;
-        accumulator.record(elapsed_ns, last_stats.batch);
+        accumulator.record(elapsed_ns, last_stats.perf.batch);
         try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(steering_range_alignment_items), &.{
             last_stats.perf.agents_batch,      last_stats.perf.select_resolve_batch, last_stats.perf.select_claim_batch, last_stats.perf.directions_batch,
-            last_stats.perf.grid_bucket_batch, last_stats.perf.grid_sort_batch,      last_stats.batch,
+            last_stats.perf.grid_bucket_batch, last_stats.perf.grid_sort_batch,      last_stats.perf.batch,
         });
     }
 

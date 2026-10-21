@@ -47,6 +47,7 @@ const perception_mod = @import("../game/systems/perception.zig");
 const PerceptionStats = perception_mod.PerceptionStats;
 const PerceptionSystem = perception_mod.PerceptionSystem;
 const perception_range_alignment_items = perception_mod.perception_range_alignment_items;
+const perception_gather_range_alignment_items = perception_mod.perception_gather_range_alignment_items;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const SimulationScopeSystem = @import("../game/systems/simulation_scope.zig").SimulationScopeSystem;
 const fixtures = @import("fixtures.zig");
@@ -377,7 +378,7 @@ fn runCaseImpl(
 
     var system = PerceptionSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, perception_range_alignment_items)) |tuner| {
+    if (suite.adaptiveTunerForCase(case, perception_gather_range_alignment_items)) |tuner| {
         system.gather_tuner = tuner;
         system.compute_tuner = suite.adaptiveTunerForCase(case, perception_range_alignment_items).?;
     }
@@ -412,12 +413,12 @@ fn runCaseImpl(
         last_stats = try runOnce(&system, &fixture, spatial_view, think_set, &events, &threads, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        accumulator.record(elapsed_ns, last_stats.batch);
-        try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(perception_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.batch });
-        main_total += elapsed_ns -| (offMainNs(last_stats.perf.gather_batch) + offMainNs(last_stats.batch));
+        accumulator.record(elapsed_ns, last_stats.perf.batch);
+        try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(perception_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.perf.batch });
+        main_total += elapsed_ns -| (offMainNs(last_stats.perf.gather_batch) + offMainNs(last_stats.perf.batch));
     }
 
-    std.debug.assert(last_stats.perf.block_fills <= observerCellRuns(&fixture.data, &system, spatial_view) + last_stats.batch.range_count);
+    std.debug.assert(last_stats.perf.block_fills <= observerCellRuns(&fixture.data, &system, spatial_view) + last_stats.perf.batch.range_count);
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.output_count = last_stats.perf.nearest_threat_found_count;
@@ -563,7 +564,7 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     var system = PerceptionSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, perception_range_alignment_items)) |tuner| {
+    if (suite.adaptiveTunerForCase(case, perception_gather_range_alignment_items)) |tuner| {
         system.gather_tuner = tuner;
         system.compute_tuner = suite.adaptiveTunerForCase(case, perception_range_alignment_items).?;
     }
@@ -594,16 +595,16 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         const start_ns = suite.nowNs(io);
         last_stats = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.batch);
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.perf.batch);
     }
-    std.debug.assert(last_stats.observer_count == crowd_observers);
+    std.debug.assert(last_stats.perf.observer_count == crowd_observers);
     std.debug.assert(last_stats.perf.nearest_threat_found_count == crowd_observers);
     std.debug.assert(last_stats.perf.sensed_count == crowd_observers);
     std.debug.assert(last_stats.perf.candidate_checks <= crowd_observers * crowd_max_checks_per_observer);
 
     var stats = accumulator.finish();
-    stats.items_per_second = suite.itemsPerSecond(last_stats.observer_count, stats.mean_ns);
-    stats.deferred_count = last_stats.observer_count;
+    stats.items_per_second = suite.itemsPerSecond(last_stats.perf.observer_count, stats.mean_ns);
+    stats.deferred_count = last_stats.perf.observer_count;
     stats.output_count = last_stats.perf.nearest_threat_found_count;
     stats.sample_count = last_stats.perf.sensed_count;
     stats.candidate_pairs = last_stats.perf.candidate_checks;

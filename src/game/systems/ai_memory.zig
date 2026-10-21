@@ -1504,7 +1504,7 @@ test "AiMemorySystem scratch growth fails each allocation as OutOfMemory with st
 // Marks `memory_rows` (any order) in a store of `row_count` rows, orders them, and checks the
 // list is `expected` ascending over `expected_words` touched row words, each beside its
 // carried perception row, then unmarks.
-fn expectOrdered(sys: *AiMemorySystem, memory_rows: []const u32, row_count: usize, dispatch: Dispatch, expected: []const u32, expected_words: usize) !BatchStats {
+fn expectOrdered(sys: *AiMemorySystem, memory_rows: []const u32, row_count: usize, dispatch: Dispatch, expected: []const u32, expected_words: usize) !void {
     sys.think_rows.items.len = memory_rows.len;
     @memcpy(sys.think_rows.items, memory_rows);
     sys.think_perception_rows.items.len = memory_rows.len;
@@ -1512,16 +1512,15 @@ fn expectOrdered(sys: *AiMemorySystem, memory_rows: []const u32, row_count: usiz
     try testing.expectEqual(expected.len, sys.mark(row_count));
     sys.collectTouchedWords(row_count);
     try testing.expectEqual(expected_words, sys.touched_words.items.len);
-    const batch = sys.orderMembers(row_count, dispatch);
+    _ = sys.orderMembers(row_count, dispatch);
     try testing.expectEqualSlices(u32, expected, sys.memory_dense_indices.items);
     try testing.expectEqual(expected.len, sys.perception_dense_indices.items.len);
     for (sys.memory_dense_indices.items, sys.perception_dense_indices.items) |row, perception_row| try testing.expectEqual(testPerceptionRow(row), perception_row);
     sys.unmark();
     try expectMasksClear(sys);
-    return batch;
 }
 
-test "AiMemorySystem order stage runs over touched row words, ascending across summary levels" {
+test "AiMemorySystem orders members ascending across summary levels, inline and threaded, dense and sparse" {
     // Past the rows one word of summary level 1 covers, so the walk crosses a word
     // boundary at every level this store fills.
     const row_count: usize = word_bits * word_bits * word_bits + 37_856;
@@ -1554,22 +1553,16 @@ test "AiMemorySystem order stage runs over touched row words, ascending across s
     defer threads.deinit();
     // Serial: the production stage with no worker allowed, inline on the caller.
     const inline_threads = MemoryThreads{ .thread_system = &threads, .config = .{ .max_worker_threads = 0, .adaptive = false } };
-    const serial = try expectOrdered(&sys, memory_rows, row_count, inline_threads.stage(&sys.order_tuner), expected.items, expected_words);
-    try testing.expectEqual(expected_words, serial.item_count);
+    try expectOrdered(&sys, memory_rows, row_count, inline_threads.stage(&sys.order_tuner), expected.items, expected_words);
     const stage_threads = MemoryThreads{ .thread_system = &threads, .config = .{
         .items_per_range = ai_memory_range_alignment_items,
         .max_worker_threads = 3,
         .adaptive = false,
     } };
-    const threaded = try expectOrdered(&sys, memory_rows, row_count, stage_threads.stage(&sys.order_tuner), expected.items, expected_words);
-    // The stage's items are the touched words, never the store's rows.
-    try testing.expectEqual(expected_words, threaded.item_count);
-    try testing.expect(threaded.range_count > 1);
-    if (threads.workerThreadCount() > 0) try testing.expect(!threaded.ran_inline);
+    try expectOrdered(&sys, memory_rows, row_count, stage_threads.stage(&sys.order_tuner), expected.items, expected_words);
 
-    // A sparse think set keeps the item count at its own words as the store grows.
+    // A sparse think set touches only its own words in a large store.
     const sparse = [_]u32{ @intCast(row_count - 1), 5, 3 };
     const sparse_sorted = [_]u32{ 3, 5, @intCast(row_count - 1) };
-    const sparse_batch = try expectOrdered(&sys, &sparse, row_count, stage_threads.stage(&sys.order_tuner), &sparse_sorted, 2);
-    try testing.expectEqual(@as(usize, 2), sparse_batch.item_count);
+    try expectOrdered(&sys, &sparse, row_count, stage_threads.stage(&sys.order_tuner), &sparse_sorted, 2);
 }

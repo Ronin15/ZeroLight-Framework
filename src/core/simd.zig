@@ -354,6 +354,13 @@ pub inline fn selectOrZeroFloat4(bits: MaskBits, values: Float4) Float4 {
     return @bitCast(@as(Uint4, @bitCast(values)) & lane_words[bits]);
 }
 
+/// The lanes of `values` set in `bits` and the lanes of `fill` in the rest, bit for bit.
+pub inline fn selectBitsFloat4(bits: MaskBits, values: Float4, fill: Float4) Float4 {
+    // Lane-word AND/OR: no bool vector, which Debug lowers lane by lane.
+    const keep = lane_words[bits];
+    return @bitCast((@as(Uint4, @bitCast(values)) & keep) | (@as(Uint4, @bitCast(fill)) & ~keep));
+}
+
 /// `(lanes[0] + lanes[1]) + (lanes[2] + lanes[3])`: one order in every backend and mode,
 /// which `@reduce` does not pin.
 pub inline fn sumLanesFloat4(lanes: Float4) f32 {
@@ -1283,6 +1290,21 @@ test "lanesBelow and keepLowestSetBits match a reference loop for every mask and
                 }
             }
             try std.testing.expectEqual(kept, keepLowestSetBits(bits, count));
+        }
+    }
+}
+
+test "selectBitsFloat4 takes masked lanes from values and the rest from fill bit for bit" {
+    const values = float4(std.math.nan(f32), -0.0, std.math.inf(f32), -3.25);
+    const fill = float4(1.5, 0.0, -0.0, -std.math.inf(f32));
+    const value_lanes = toFloatArray(values);
+    const fill_lanes = toFloatArray(fill);
+    for (0..1 << lane_count) |pattern| {
+        const bits: MaskBits = @intCast(pattern);
+        const selected = toFloatArray(selectBitsFloat4(bits, values, fill));
+        for (0..lane_count) |lane| {
+            const want = if (bits & (@as(MaskBits, 1) << @intCast(lane)) != 0) value_lanes[lane] else fill_lanes[lane];
+            try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(selected[lane])));
         }
     }
 }

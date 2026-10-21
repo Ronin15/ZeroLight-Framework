@@ -555,12 +555,33 @@ test "steering requests missing paths then follows available path results" {
 
     _ = try updatePathfindingInline(&pathfinding, &frame.path_requests, 1, .{});
 
+    // The first step had no path: the direct +x direction is the row's previous direction.
+    const first = frame.intents.mergedItems()[0].movement;
+    try std.testing.expectEqual(@as(f32, 1), first.direction_x);
+    try std.testing.expectEqual(@as(f32, 0), first.direction_y);
+
+    // A -y direct direction, which the waypoint direction (+x, non-negative y) never matches.
     frame.beginStep();
-    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 0, .direct_direction_y = 1 });
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 0, .direct_direction_y = -1 });
     const available_stats = try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
     try std.testing.expectEqual(@as(usize, 0), available_stats.path_request_count);
     try expectPathStatus(&pathfinding, .{ .x = 0, .y = 0 }, .{ .x = 96, .y = 0 }, .available);
-    try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
+    // The next waypoint's direction blended from the previous one, bit for bit; falling back
+    // to the direct direction blends toward -y instead.
+    const start = math.Vec2{ .x = 0, .y = 0 };
+    const goal = math.Vec2{ .x = 96, .y = 0 };
+    const waypoint = pathfinding.statusForWorld(0, start, 0, goal, .default, null).next_waypoint;
+    const path = followWaypoint(waypoint, start, goal, 4, distance(start, goal)).direction;
+    const tail = DirectionTailInput{ .has_path = true, .path_x = path.x, .path_y = path.y, .direct_x = 0, .direct_y = -1, .prev_x = 1, .prev_y = 0, .has_prev = true };
+    const smoothed = smoothDirectionScalar(tail);
+    // The avoidance pass's final normalize, with no neighbor or static to push.
+    const expected = math.normalizeOrZeroFinite(smoothed.x, smoothed.y, 0.0001);
+    var direct_tail = tail;
+    direct_tail.has_path = false;
+    try std.testing.expect(smoothDirectionScalar(direct_tail).y < 0 and expected.y >= 0);
+    const movement = frame.intents.mergedItems()[0].movement;
+    try std.testing.expectEqual(@as(u32, @bitCast(expected.x)), @as(u32, @bitCast(movement.direction_x)));
+    try std.testing.expectEqual(@as(u32, @bitCast(expected.y)), @as(u32, @bitCast(movement.direction_y)));
 }
 
 test "steering follows a partial path, requests the next hop inside its end window, and holds at its end without a stuck replan" {

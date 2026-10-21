@@ -50,8 +50,6 @@ pub const Metric = enum {
     sprite_draw_groups,
     sprite_command_overflow_grows,
     ai_entities,
-    ai_intents,
-    ai_navigation_intents,
     ai_separation_candidate_checks,
     ai_separation_neighbor_samples,
     perception_observers,
@@ -671,13 +669,11 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} ai_intents={} ai_nav={} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} stimuli_live_dropped={} stimuli_deferred_dropped={} stimuli_sticky_dropped={} stimuli_promoted={} action_intents_consumed={} action_intents_dropped={} destructibles_destroyed={} destructibles_hit={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={}",
+            "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} stimuli_live_dropped={} stimuli_deferred_dropped={} stimuli_sticky_dropped={} stimuli_promoted={} action_intents_consumed={} action_intents_dropped={} destructibles_destroyed={} destructibles_hit={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={}",
             .{
                 elapsed_s,
                 self.metricValue(.ai_entities),
                 averagePer(self.metricValue(.ai_entities), update_count),
-                self.metricValue(.ai_intents),
-                self.metricValue(.ai_navigation_intents),
                 self.metricValue(.steering_selected_intents),
                 self.metricValue(.steering_movement_intents),
                 self.metricValue(.movement_bodies),

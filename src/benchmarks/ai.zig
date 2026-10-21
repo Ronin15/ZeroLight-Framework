@@ -30,6 +30,8 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const AiStats = @import("../game/systems/ai.zig").AiStats;
 const AiSystem = @import("../game/systems/ai.zig").AiSystem;
 const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
+const ai_gather_range_alignment_items = @import("../game/systems/ai.zig").ai_gather_range_alignment_items;
+const ai_intent_range_alignment_items = @import("../game/systems/ai.zig").ai_intent_range_alignment_items;
 const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
 const max_separation_neighbors = @import("../game/systems/ai.zig").max_separation_neighbors;
 const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
@@ -217,10 +219,10 @@ pub fn runCellOrderedCase(allocator: std.mem.Allocator, io: std.Io, options: sui
 fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *Fixture, think_ascends: bool) !suite.RunStats {
     var system = AiSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, ai_range_alignment_items)) |tuner| {
+    if (suite.adaptiveTunerForCase(case, ai_gather_range_alignment_items)) |tuner| {
         system.gather_tuner = tuner;
         system.separation_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
-        system.intent_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
+        system.intent_tuner = suite.adaptiveTunerForCase(case, ai_intent_range_alignment_items).?;
     }
 
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
@@ -254,24 +256,24 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         last_ai_stats = try runOnce(&system, fixture, spatial_view, think_set, &threads, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        accumulator.record(elapsed_ns, last_ai_stats.separation_batch);
-        try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(ai_range_alignment_items), &.{ last_ai_stats.perf.gather_batch, last_ai_stats.separation_batch, last_ai_stats.intent_batch });
-        main_total += elapsed_ns -| (offMainNs(last_ai_stats.perf.gather_batch) + offMainNs(last_ai_stats.separation_batch) + offMainNs(last_ai_stats.intent_batch));
+        accumulator.record(elapsed_ns, last_ai_stats.perf.separation_batch);
+        try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(ai_range_alignment_items), &.{ last_ai_stats.perf.gather_batch, last_ai_stats.perf.separation_batch, last_ai_stats.perf.intent_batch });
+        main_total += elapsed_ns -| (offMainNs(last_ai_stats.perf.gather_batch) + offMainNs(last_ai_stats.perf.separation_batch) + offMainNs(last_ai_stats.perf.intent_batch));
     }
 
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
-    std.debug.assert(last_ai_stats.perf.separation_candidate_checks <= last_ai_stats.entity_count * max_separation_candidate_checks);
-    std.debug.assert(last_ai_stats.perf.separation_neighbor_samples <= last_ai_stats.entity_count * max_separation_neighbors);
+    std.debug.assert(last_ai_stats.perf.separation_candidate_checks <= last_ai_stats.perf.entity_count * max_separation_candidate_checks);
+    std.debug.assert(last_ai_stats.perf.separation_neighbor_samples <= last_ai_stats.perf.entity_count * max_separation_neighbors);
     // A fill per key a range's rows change to: at most the rows' cell runs plus the ranges.
-    const ranges = last_ai_stats.separation_batch.range_count;
+    const ranges = last_ai_stats.perf.separation_batch.range_count;
     std.debug.assert(last_ai_stats.perf.separation_block_fills <= cellRuns(fixture, spatial_view, think_set, false) + ranges);
     std.debug.assert(last_ai_stats.perf.cohere_block_fills <= cellRuns(fixture, spatial_view, think_set, true) + ranges);
     stats.neighbor_block_fills = last_ai_stats.perf.separation_block_fills;
     stats.secondary_neighbor_block_fills = last_ai_stats.perf.cohere_block_fills;
     stats.candidate_pairs = last_ai_stats.perf.separation_candidate_checks;
-    stats.output_count = last_ai_stats.intent_count;
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_ai_stats.intent_batch);
+    stats.output_count = last_ai_stats.perf.entity_count;
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_ai_stats.perf.intent_batch);
     stats.splice_batch = suite.batchSummaryFromBatch(last_ai_stats.perf.gather_batch);
     stats.ai_behavior_histogram = behaviorHistogram(fixture.data.aiAgentSliceConst().behaviors);
     if (case.adaptive) {
