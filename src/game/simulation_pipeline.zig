@@ -1154,7 +1154,9 @@ pub const SimulationPipeline = struct {
     pub fn syncStaticColliders(self: *SimulationPipeline, data: *const DataSystem, thread_system: *ThreadSystem) !void {
         try self.static_colliders.sync(data, thread_system);
         self.pathfinding.recordStaticColliderChanges(self.static_colliders.changesThisStep());
-        try self.collision.refreshCommittedTriggers(data, self.static_colliders.view(), thread_system);
+        const view = self.static_colliders.view();
+        try self.collision.reserveDebugRects(view.row_of_index.len);
+        try self.collision.refreshCommittedTriggers(data, view, thread_system);
     }
 
     /// Records the last collider sync's chunk-list splice batch. Every sync resets it, so

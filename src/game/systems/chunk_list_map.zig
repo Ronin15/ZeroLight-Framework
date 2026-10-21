@@ -332,7 +332,6 @@ pub fn ChunkDirectory(comptime Payload: type, comptime padded: bool) type {
     };
 }
 
-
 // The tier counts the set reserves at each capacity: one word, past one word, a full and past
 // a full second tier, and four tiers.
 const ordered_set_capacities = [_]struct { bits: usize, tiers: usize }{

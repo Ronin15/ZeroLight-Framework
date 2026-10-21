@@ -1337,16 +1337,29 @@ pub const CollisionSystem = struct {
         return false;
     }
 
-    // One integer stamp per recorded id, in range order. No DataSystem read.
-    fn compactDistinctIds(self: *CollisionSystem, view: ColliderView, slots: []const PaddedSlot(StaticPairBuffer)) !void {
-        const index_len = view.row_of_index.len;
-        if (self.rect_stamp.len < index_len) {
-            const next = try self.allocator.alloc(u32, index_len);
+    // Sizes the Debug rect stamp, the distinct-id list, and the compare scratch to the
+    // collider index space. The collider seam calls this after `row_of_index` grows, so
+    // the next detect does not allocate. ReleaseFast does not keep this state.
+    pub fn reserveDebugRects(self: *CollisionSystem, index_count: usize) !void {
+        if (comptime builtin.mode != .debug) return;
+        if (index_count == 0) return;
+        if (self.rect_stamp.len < index_count) {
+            const next = try self.allocator.alloc(u32, index_count);
             @memcpy(next[0..self.rect_stamp.len], self.rect_stamp);
             @memset(next[self.rect_stamp.len..], 0);
             if (self.rect_stamp.len != 0) self.allocator.free(self.rect_stamp);
             self.rect_stamp = next;
         }
+        var id_cap: usize = index_count;
+        for (self.static_pair_slots.items) |slot| id_cap += slot.value.ids.capacity;
+        try self.distinct_ids.ensureTotalCapacity(self.allocator, id_cap);
+        try self.prepareRectSlots(maxRangeCount(index_count, collision_range_alignment_items), index_count);
+    }
+
+    // One integer stamp per recorded id, in range order. No DataSystem read.
+    fn compactDistinctIds(self: *CollisionSystem, view: ColliderView, slots: []const PaddedSlot(StaticPairBuffer)) !void {
+        const index_len = view.row_of_index.len;
+        try self.reserveDebugRects(index_len);
         var listed: usize = 0;
         for (slots) |slot| listed += slot.value.ids.items.len;
         try self.distinct_ids.ensureTotalCapacity(self.allocator, listed);

@@ -13,8 +13,8 @@ and the hot-loop packs checked below. The static-query masked compare
 landed in `483d88e`. The owner closed it: the ReleaseFast gaps were inside
 the spread. Gather and sort are off main on the `collision` group, and the
 tall, stacked, and thin shapes meet their pass. Still open: `zig build
-verify`, and the inert-row half of `production-step`. Rows at rest stay
-after slice 88.
+the inert-row half of `production-step`. `zig build verify` passed. Rows at
+rest stay after slice 88.
 
 Goal: each body's broadphase work follows its local same-level density,
 never column height or level count. Gather and sort leave the main thread.
@@ -401,4 +401,4 @@ the current bench.
       static-heavy collision cost no longer grows with static count;
       `collision` and `collision-sparse` unchanged. Landed in `b126599`.
       The tuned Debug table is accepted. ReleaseFast at 65,536 is 94–151 µs.
-- [ ] `zig build verify` passes.
+- [x] `zig build verify` passes.
