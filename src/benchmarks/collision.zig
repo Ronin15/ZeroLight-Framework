@@ -505,13 +505,14 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
             std.debug.assert(last_collision_stats.body_count == item_count);
             std.debug.assert(last_collision_stats.entry_count == last_collision_stats.body_count);
         }
-        try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ last_collision_stats.perf.fill_batch, last_collision_stats.perf.sort_batch, last_collision_stats.broadphase_batch, last_collision_stats.narrowphase_batch, last_collision_stats.perf.static_pairs_batch, last_collision_stats.perf.static_sort_batch });
+        try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ last_collision_stats.perf.fill_batch, last_collision_stats.perf.sort_batch, last_collision_stats.broadphase_batch, last_collision_stats.narrowphase_batch, last_collision_stats.perf.static_pairs_batch, last_collision_stats.perf.static_rect_batch, last_collision_stats.perf.static_sort_batch });
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_collision_stats.broadphase_batch);
         const mover_off_main_ns = if (mover) |static_mover| static_mover.spliceOffMainNs() else 0;
         const off_main_ns = offMainNs(last_collision_stats.perf.fill_batch) + offMainNs(last_collision_stats.perf.sort_batch) +
             offMainNs(last_collision_stats.broadphase_batch) + offMainNs(last_collision_stats.narrowphase_batch) +
-            offMainNs(last_collision_stats.perf.static_pairs_batch) + offMainNs(last_collision_stats.perf.static_sort_batch);
+            offMainNs(last_collision_stats.perf.static_pairs_batch) + offMainNs(last_collision_stats.perf.static_rect_batch) +
+            offMainNs(last_collision_stats.perf.static_sort_batch);
         main_total += elapsed_ns -| off_main_ns -| mover_off_main_ns;
     }
 
@@ -540,7 +541,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
 /// Gives each of `system`'s stage tuners the case's own tuner (an adaptive case only).
 pub fn useCaseTuners(system: *CollisionSystem, case: suite.BenchmarkCase) void {
-    for ([_]*AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner, &system.static_pair_tuner, &system.static_sort_tuner }) |tuner| {
+    for ([_]*AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner, &system.static_pair_tuner, &system.static_rect_tuner, &system.static_sort_tuner }) |tuner| {
         tuner.* = suite.adaptiveTunerForCase(case, collision_range_alignment_items) orelse return;
     }
 }
@@ -550,6 +551,7 @@ pub fn stageTunersSettled(system: *const CollisionSystem) bool {
     return (system.fill_tuner.phase == .settled) and (system.sort_tuner.phase == .settled) and
         (system.broadphase_tuner.phase == .settled) and (system.narrowphase_tuner.phase == .settled) and
         (system.static_pair_tuner.sample_count == 0 or system.static_pair_tuner.phase == .settled) and
+        (system.static_rect_tuner.sample_count == 0 or system.static_rect_tuner.phase == .settled) and
         (system.static_sort_tuner.sample_count == 0 or system.static_sort_tuner.phase == .settled);
 }
 

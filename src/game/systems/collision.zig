@@ -53,6 +53,8 @@ const CollisionContact = @import("../simulation.zig").CollisionContact;
 const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
 const ColliderView = @import("static_colliders.zig").ColliderView;
 const ColliderChange = @import("static_colliders.zig").ColliderChange;
+const SpanIds = @import("static_colliders.zig").SpanIds;
+const idleSpanIds = @import("static_colliders.zig").idleSpanIds;
 
 pub const collision_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -361,6 +363,8 @@ pub const CollisionStats = struct {
     narrowphase_batch: BatchStats = .{},
     /// Dynamic×static query. Present in every build; the perf log copies it when enabled.
     static_pairs_batch: BatchStats = .{},
+    /// Debug stored-rect compare. Zero when that batch did not run, including every ReleaseFast step.
+    static_rect_batch: BatchStats = .{},
     /// Stored-trigger allow pack. Zero when that pack did not run.
     trigger_allow_batch: BatchStats = .{},
     /// This step outgrew the reserved pair bound, so a main-thread grow path ran: the
@@ -377,6 +381,7 @@ pub const CollisionStats = struct {
         fill_batch: BatchStats = .{},
         sort_batch: BatchStats = .{},
         static_pairs_batch: BatchStats = .{},
+        static_rect_batch: BatchStats = .{},
         static_sort_batch: BatchStats = .{},
     } else struct {};
 };
@@ -511,17 +516,23 @@ const StaticPairBuffer = struct {
     pairs: std.ArrayList(KeyedContact) = .empty,
     hits: std.MultiArrayList(HitRow) = .{},
     required: usize = 0,
-    moved: bool = false,
+    // Debug: entity indices the range's uncapped walks read. ReleaseFast leaves both empty.
+    ids: std.ArrayList(u32) = .empty,
+    ids_required: usize = 0,
 
     fn clear(self: *StaticPairBuffer) void {
         self.pairs.clearRetainingCapacity();
         self.required = 0;
-        self.moved = false;
+        if (comptime builtin.mode == .debug) {
+            self.ids.clearRetainingCapacity();
+            self.ids_required = 0;
+        }
     }
 
     fn deinit(self: *StaticPairBuffer, allocator: std.mem.Allocator) void {
         self.pairs.deinit(allocator);
         self.hits.deinit(allocator);
+        self.ids.deinit(allocator);
     }
 };
 
@@ -582,11 +593,19 @@ pub const CollisionSystem = struct {
     broadphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     narrowphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     static_pair_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // Debug stored-rect compare. A query replay must not teach it, and it must not teach
+    // `static_pair_tuner`. ReleaseFast never selects it, so `sample_count` stays 0.
+    static_rect_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     trigger_allow_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     static_sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     strips: CollisionStrips = .default,
     static_pair_slots: SlotList(StaticPairBuffer) = .empty,
     static_pairs: std.ArrayList(KeyedContact) = .empty,
+    // Debug distinct entity indices and the compare's per-range scratch. ReleaseFast does not touch them.
+    distinct_ids: std.ArrayList(u32) = .empty,
+    rect_slots: SlotList(RectScratch) = .empty,
+    rect_stamp: []u32 = &.{},
+    rect_generation: u32 = 1,
     ordered: std.ArrayList(KeyedContact) = .empty,
     sort_staging: std.ArrayList(KeyedContact) = .empty,
     sort_offsets: SlotList(BandOffsets) = .empty,
@@ -643,6 +662,10 @@ pub const CollisionSystem = struct {
         self.sort_staging.deinit(self.allocator);
         self.ordered.deinit(self.allocator);
         self.static_pairs.deinit(self.allocator);
+        self.distinct_ids.deinit(self.allocator);
+        if (self.rect_stamp.len != 0) self.allocator.free(self.rect_stamp);
+        for (self.rect_slots.items) |*slot| slot.value.deinit(self.allocator);
+        self.rect_slots.deinit(self.allocator);
         for (self.static_pair_slots.items) |*slot| slot.value.deinit(self.allocator);
         self.static_pair_slots.deinit(self.allocator);
         self.narrowphase_tallies.deinit(self.allocator);
@@ -718,6 +741,8 @@ pub const CollisionSystem = struct {
             const bound = broadphasePairBound(@divCeil(body_capacity, range_index + 1));
             try slot.value.pairs.ensureTotalCapacityPrecise(self.allocator, bound);
             try ensureHitRows(&slot.value.hits, self.allocator, bound);
+            // Same bound as the hit rows: a step inside it does not grow the id buffer.
+            if (comptime builtin.mode == .debug) try slot.value.ids.ensureTotalCapacityPrecise(self.allocator, bound);
         }
         try self.static_pairs.ensureTotalCapacity(self.allocator, pair_capacity);
         try self.ordered.ensureTotalCapacity(self.allocator, pair_capacity);
@@ -1231,11 +1256,20 @@ pub const CollisionSystem = struct {
     fn growStaticPairSlots(self: *CollisionSystem, range_count: usize) !bool {
         var grew = false;
         for (self.static_pair_slots.items[0..range_count]) |*slot| {
-            if (slot.value.required <= slot.value.hits.len) continue;
-            const n = slot.value.required;
-            try ensureHitRows(&slot.value.hits, self.allocator, n);
-            try slot.value.pairs.ensureTotalCapacity(self.allocator, n);
-            grew = true;
+            if (slot.value.required > slot.value.hits.len) {
+                const n = slot.value.required;
+                try ensureHitRows(&slot.value.hits, self.allocator, n);
+                try slot.value.pairs.ensureTotalCapacity(self.allocator, n);
+                grew = true;
+            }
+            if (comptime builtin.mode == .debug) {
+                if (slot.value.ids_required > slot.value.ids.capacity) {
+                    // Geometric, not the exact id count: the next step's walk can read
+                    // one more row without another allocation.
+                    try slot.value.ids.ensureTotalCapacity(self.allocator, slot.value.ids_required);
+                    grew = true;
+                }
+            }
         }
         return grew;
     }
@@ -1294,12 +1328,82 @@ pub const CollisionSystem = struct {
                 self.static_pairs.appendSliceAssumeCapacity(slot.value.pairs.items);
             }
             if (comptime builtin.mode == .debug) {
-                for (slots) |slot| if (slot.value.moved) return true;
+                try self.compactDistinctIds(view, slots);
+                if (try self.dispatchRectCompare(data, view, threads, stats)) return true;
             }
         }
         try self.packTriggerAllow(data, threads, exclude_tiers, stats);
         try self.appendTriggerContacts(exclude_tiers);
         return false;
+    }
+
+    // One integer stamp per recorded id, in range order. No DataSystem read.
+    fn compactDistinctIds(self: *CollisionSystem, view: ColliderView, slots: []const PaddedSlot(StaticPairBuffer)) !void {
+        const index_len = view.row_of_index.len;
+        if (self.rect_stamp.len < index_len) {
+            const next = try self.allocator.alloc(u32, index_len);
+            @memcpy(next[0..self.rect_stamp.len], self.rect_stamp);
+            @memset(next[self.rect_stamp.len..], 0);
+            if (self.rect_stamp.len != 0) self.allocator.free(self.rect_stamp);
+            self.rect_stamp = next;
+        }
+        var listed: usize = 0;
+        for (slots) |slot| listed += slot.value.ids.items.len;
+        try self.distinct_ids.ensureTotalCapacity(self.allocator, listed);
+        self.rect_generation +%= 1;
+        if (self.rect_generation == 0) {
+            @memset(self.rect_stamp, 0);
+            self.rect_generation = 1;
+        }
+        self.distinct_ids.clearRetainingCapacity();
+        const stamp = self.rect_stamp;
+        const generation = self.rect_generation;
+        for (slots) |slot| {
+            for (slot.value.ids.items) |entity_index| {
+                if (entity_index >= stamp.len) {
+                    self.distinct_ids.appendAssumeCapacity(entity_index);
+                    continue;
+                }
+                if (stamp[entity_index] == generation) continue;
+                stamp[entity_index] = generation;
+                self.distinct_ids.appendAssumeCapacity(entity_index);
+            }
+        }
+    }
+
+    // One compare over the distinct ids. Below the tuner gate the same job runs inline.
+    fn dispatchRectCompare(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, stats: *CollisionStats) !bool {
+        const count = self.distinct_ids.items.len;
+        if (count == 0) return false;
+        const stage = threads.stage(&self.static_rect_tuner);
+        const selection = stage.select(count, collision_range_alignment_items);
+        try self.prepareRectSlots(selection.range_count, selection.items_per_range);
+        const slots = self.rect_slots.items[0..selection.range_count];
+        var job = RectCompareJob{
+            .data = data,
+            .view = view,
+            .movement = data.movement_bodies.sliceConst(),
+            .bounds = data.collision_bounds.sliceConst(),
+            .distinct = self.distinct_ids.items,
+            .slots = slots,
+            .items_per_range = selection.items_per_range,
+            .range_count = selection.range_count,
+        };
+        const batch = stage.run(selection, count, collision_range_alignment_items, &job, compareStoredRects);
+        stats.static_rect_batch = batch;
+        if (comptime runtime_perf_log.enabled) stats.perf.static_rect_batch = batch;
+        var moved = false;
+        for (slots) |slot| moved = moved or slot.value.moved;
+        return moved;
+    }
+
+    fn prepareRectSlots(self: *CollisionSystem, range_count: usize, items_per_range: usize) !void {
+        try self.rect_slots.ensureTotalCapacity(self.allocator, range_count);
+        while (self.rect_slots.items.len < range_count) self.rect_slots.appendAssumeCapacity(.{});
+        for (self.rect_slots.items[0..range_count]) |*slot| {
+            try slot.value.ensure(self.allocator, items_per_range);
+            slot.value.moved = false;
+        }
     }
 
     fn refreshTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
@@ -1396,7 +1500,7 @@ pub const CollisionSystem = struct {
             var min_y: [8]f32 = undefined;
             var max_x: [8]f32 = undefined;
             var max_y: [8]f32 = undefined;
-            const hits = view.collectOverlaps(level, rect, &entity_buf, &min_x, &min_y, &max_x, &max_y);
+            const hits = view.collectOverlaps(level, rect, &entity_buf, &min_x, &min_y, &max_x, &max_y, idleSpanIds());
             if (hits > entity_buf.len) {
                 try self.noteRequeryOverflow(data, view, level, rect, hits);
                 continue;
@@ -1416,7 +1520,7 @@ pub const CollisionSystem = struct {
         defer self.allocator.free(max_x);
         const max_y = try self.allocator.alloc(f32, hits);
         defer self.allocator.free(max_y);
-        const full = view.collectOverlaps(level, rect, entities, min_x, min_y, max_x, max_y);
+        const full = view.collectOverlaps(level, rect, entities, min_x, min_y, max_x, max_y, idleSpanIds());
         try self.noteRequeryHits(data, view, entities[0..full]);
     }
 
@@ -1720,10 +1824,12 @@ fn staticQueryJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             .max_y = proxies.max_y[slot_index],
         };
         const cap = hits.entity.len;
-        const full = if (comptime builtin.mode == .debug)
-            job.view.collectOverlapsChecked(proxies.level[slot_index], box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, job.data, &slot.moved)
-        else
-            job.view.collectOverlaps(proxies.level[slot_index], box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y);
+        const full = if (comptime builtin.mode == .debug) blk: {
+            var span_ids = SpanIds{ .ids = &slot.ids, .required = &slot.ids_required };
+            const found = job.view.collectOverlaps(proxies.level[slot_index], box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, &span_ids);
+            if (span_ids.overflowed) return;
+            break :blk found;
+        } else job.view.collectOverlaps(proxies.level[slot_index], box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, {});
         if (full > cap or slot.pairs.items.len + full > slot.pairs.capacity) {
             slot.required = @max(slot.required, @max(full, slot.pairs.items.len + full));
             return;
@@ -1894,6 +2000,198 @@ fn writeStaticHitContacts(
     }
 }
 
+// Per-range scratch for the stored-rect compare. One 64-byte-aligned block so a range's
+// columns do not share a writable line with another range. Not a row pool.
+const RectScratch = struct {
+    block: []align(64) u8 = &.{},
+    stored_min_x: []f32 = &.{},
+    stored_min_y: []f32 = &.{},
+    stored_max_x: []f32 = &.{},
+    stored_max_y: []f32 = &.{},
+    live_min_x: []f32 = &.{},
+    live_min_y: []f32 = &.{},
+    live_max_x: []f32 = &.{},
+    live_max_y: []f32 = &.{},
+    bad: []u32 = &.{},
+    moved: bool = false,
+
+    fn ensure(self: *RectScratch, allocator: std.mem.Allocator, n: usize) !void {
+        if (self.stored_min_x.len >= n) return;
+        const stride = hotStoreCapacity(n);
+        const float_bytes = 8 * stride * @sizeOf(f32);
+        const bad_bytes = stride * @sizeOf(u32);
+        const block = try allocator.alignedAlloc(u8, .@"64", float_bytes + bad_bytes);
+        errdefer allocator.free(block);
+        const floats = std.mem.bytesAsSlice(f32, block[0..float_bytes]);
+        // `float_bytes` is a multiple of 64 and `block` is align(64), so the tail is too.
+        const bad_tail: []align(4) u8 = @alignCast(block[float_bytes..]);
+        const bad = std.mem.bytesAsSlice(u32, bad_tail);
+        if (self.block.len != 0) allocator.free(self.block);
+        self.block = block;
+        self.stored_min_x = floats[0 * stride ..][0..stride];
+        self.stored_min_y = floats[1 * stride ..][0..stride];
+        self.stored_max_x = floats[2 * stride ..][0..stride];
+        self.stored_max_y = floats[3 * stride ..][0..stride];
+        self.live_min_x = floats[4 * stride ..][0..stride];
+        self.live_min_y = floats[5 * stride ..][0..stride];
+        self.live_max_x = floats[6 * stride ..][0..stride];
+        self.live_max_y = floats[7 * stride ..][0..stride];
+        self.bad = bad[0..stride];
+    }
+
+    fn deinit(self: *RectScratch, allocator: std.mem.Allocator) void {
+        if (self.block.len != 0) allocator.free(self.block);
+        self.* = .{};
+    }
+};
+
+const RectCompareJob = struct {
+    data: *const DataSystem,
+    view: ColliderView,
+    movement: ConstMovementBodySlice,
+    bounds: ConstCollisionBoundsSlice,
+    distinct: []const u32,
+    slots: []PaddedSlot(RectScratch),
+    items_per_range: usize,
+    range_count: usize,
+};
+
+fn compareStoredRects(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *RectCompareJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.range_count and range.index < job.slots.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.distinct.len);
+    const slot = &job.slots[range.index].value;
+    const count = range.end - range.start;
+    std.debug.assert(slot.stored_min_x.len >= count and slot.bad.len >= count);
+    const ids = job.distinct[range.start..range.end];
+    for (ids, 0..) |entity_index, at| {
+        storeComparedRect(job.data, job.movement, job.bounds, job.view, entity_index, slot, at);
+    }
+    slot.moved = rectsMismatch(slot.stored_min_x, slot.stored_min_y, slot.stored_max_x, slot.stored_max_y, slot.live_min_x, slot.live_min_y, slot.live_max_x, slot.live_max_y, slot.bad, count);
+}
+
+fn storeComparedRect(
+    data: *const DataSystem,
+    movement: ConstMovementBodySlice,
+    bounds: ConstCollisionBoundsSlice,
+    view: ColliderView,
+    entity_index: u32,
+    slot: *RectScratch,
+    at: usize,
+) void {
+    const indexed = entity_index < view.row_of_index.len and blk: {
+        const row = view.row_of_index[entity_index];
+        break :blk row != no_static_row and row < view.row_entity.len and row < view.row_min_x.len and row < view.row_min_y.len and row < view.row_max_x.len and row < view.row_max_y.len;
+    };
+    if (!indexed) {
+        slot.stored_min_x[at] = 0;
+        slot.stored_min_y[at] = 0;
+        slot.stored_max_x[at] = 0;
+        slot.stored_max_y[at] = 0;
+        slot.live_min_x[at] = 0;
+        slot.live_min_y[at] = 0;
+        slot.live_max_x[at] = 0;
+        slot.live_max_y[at] = 0;
+        slot.bad[at] = 1;
+        return;
+    }
+    const row = view.row_of_index[entity_index];
+    slot.stored_min_x[at] = view.row_min_x[row];
+    slot.stored_min_y[at] = view.row_min_y[row];
+    slot.stored_max_x[at] = view.row_max_x[row];
+    slot.stored_max_y[at] = view.row_max_y[row];
+    const live = liveObstacleRect(data, movement, bounds, view.row_entity[row]);
+    if (live) |rect| {
+        slot.live_min_x[at] = rect.min_x;
+        slot.live_min_y[at] = rect.min_y;
+        slot.live_max_x[at] = rect.max_x;
+        slot.live_max_y[at] = rect.max_y;
+        slot.bad[at] = 0;
+    } else {
+        slot.live_min_x[at] = 0;
+        slot.live_min_y[at] = 0;
+        slot.live_max_x[at] = 0;
+        slot.live_max_y[at] = 0;
+        slot.bad[at] = 1;
+    }
+}
+
+// One slot resolve, then the movement and bounds columns. Null when either component is absent.
+fn liveObstacleRect(data: *const DataSystem, movement: ConstMovementBodySlice, bounds: ConstCollisionBoundsSlice, entity: EntityId) ?math.Aabb {
+    const slot = data.resolveSlotConst(entity) orelse return null;
+    const move = slot.movement_body_index orelse return null;
+    const bounds_index = slot.collision_bounds_index orelse return null;
+    if (move >= movement.position_x.len or bounds_index >= bounds.offset_x.len) return null;
+    return math.aabbFromOffsetSize(
+        .{ .x = movement.position_x[move], .y = movement.position_y[move] },
+        .{ .x = bounds.offset_x[bounds_index], .y = bounds.offset_y[bounds_index] },
+        .{ .x = bounds.size_x[bounds_index], .y = bounds.size_y[bounds_index] },
+    );
+}
+
+fn loadCompareFloat(values: []const f32, group: usize) simd.Float4 {
+    return if (group == simd.lane_count) simd.loadFloat4(values) else simd.loadFloat4Prefix(values, group);
+}
+
+fn loadCompareUint(values: []const u32, group: usize) simd.Uint4 {
+    return if (group == simd.lane_count) simd.loadUint4(values) else simd.loadUint4Prefix(values, group);
+}
+
+// Lanes below `count` that are not four equal edges with `bad == 0`.
+fn rectMismatchMask(
+    stored_min_x: simd.Float4,
+    stored_min_y: simd.Float4,
+    stored_max_x: simd.Float4,
+    stored_max_y: simd.Float4,
+    live_min_x: simd.Float4,
+    live_min_y: simd.Float4,
+    live_max_x: simd.Float4,
+    live_max_y: simd.Float4,
+    bad: simd.Uint4,
+    count: usize,
+) simd.MaskBits {
+    const same = simd.equalFloat4(stored_min_x, live_min_x) &
+        simd.equalFloat4(stored_min_y, live_min_y) &
+        simd.equalFloat4(stored_max_x, live_max_x) &
+        simd.equalFloat4(stored_max_y, live_max_y) &
+        simd.equalUint4(bad, simd.splatUint4(0));
+    return simd.lanesBelow(count) & ~simd.maskBits(same);
+}
+
+fn rectsMismatch(
+    stored_min_x: []const f32,
+    stored_min_y: []const f32,
+    stored_max_x: []const f32,
+    stored_max_y: []const f32,
+    live_min_x: []const f32,
+    live_min_y: []const f32,
+    live_max_x: []const f32,
+    live_max_y: []const f32,
+    bad: []const u32,
+    count: usize,
+) bool {
+    var index: usize = 0;
+    while (index < count) {
+        const group = @min(simd.lane_count, count - index);
+        const mask = rectMismatchMask(
+            loadCompareFloat(stored_min_x[index..], group),
+            loadCompareFloat(stored_min_y[index..], group),
+            loadCompareFloat(stored_max_x[index..], group),
+            loadCompareFloat(stored_max_y[index..], group),
+            loadCompareFloat(live_min_x[index..], group),
+            loadCompareFloat(live_min_y[index..], group),
+            loadCompareFloat(live_max_x[index..], group),
+            loadCompareFloat(live_max_y[index..], group),
+            loadCompareUint(bad[index..], group),
+            group,
+        );
+        if (mask != 0) return true;
+        index += group;
+    }
+    return false;
+}
+
 const TriggerJob = struct {
     data: *const DataSystem,
     view: ColliderView,
@@ -1925,7 +2223,7 @@ fn writeTriggerRow(job: *const TriggerJob, slot: *StaticPairBuffer, row: u32) vo
     const self_move = job.data.movementBodyDenseIndex(entity) orelse return;
     const hits = HitColumns.of(slot.hits.slice());
     const cap = hits.entity.len;
-    const full = job.view.collectOverlaps(level, rect, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y);
+    const full = job.view.collectOverlaps(level, rect, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, idleSpanIds());
     if (full > cap or slot.pairs.items.len + full > slot.pairs.capacity) {
         slot.required = @max(slot.required, @max(full, slot.pairs.items.len + full));
         return;
@@ -4946,6 +5244,212 @@ test "an unsynced static move is out of band" {
     _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
 }
 
+fn placeBody(data: *DataSystem, entity: EntityId, x: f32, y: f32) !void {
+    const body = data.movementBodyConst(entity).?;
+    try data.setMovementBody(entity, .{
+        .position = .{ .x = x, .y = y },
+        .previous_position = body.previous_position,
+        .velocity = body.velocity,
+    });
+}
+
+fn commitBody(data: *DataSystem, colliders: *StaticColliderSystem, entity: EntityId) !void {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    frame.beginStep();
+    try colliders.reserveForCommit(data, 1);
+    try frame.structural_commands.prepareRangeCounts(1);
+    frame.structural_commands.addCount(0, 1);
+    try frame.structural_commands.prefix();
+    var writer = frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .set_movement_body = .{ .entity = entity, .body = data.movementBodyConst(entity).? } });
+    writer.finish();
+    frame.structural_commands.finishWrite();
+    _ = try frame.applyStructuralCommands(data);
+    colliders.capture(&frame);
+    try colliders.sync(data, &threads);
+}
+
+test "collision debug seam check flags a walked non-hit and ignores a static outside the walk" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const near = try addObstacle(&data, .{ .x = 20, .y = 0, .w = 8, .h = 8 }, .static, .solid);
+    const far = try addObstacle(&data, .{ .x = 1000, .y = 1000, .w = 8, .h = 8 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 16, .h = 16 }, .dynamic, .solid);
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry());
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+
+    try placeBody(&data, near, 24, 4);
+    if (comptime builtin.mode == .debug) {
+        try std.testing.expectError(error.StaticMovedOutsideCommit, updateView(&system, &data, &contacts, colliders.view(), 0, null));
+    } else {
+        _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+    }
+    try placeBody(&data, near, 20, 0);
+    _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+
+    try placeBody(&data, far, 1004, 1004);
+    _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+}
+
+test "collision debug seam check matches across workers" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 16, .h = 16 }, .static, .solid);
+    const near = try addObstacle(&data, .{ .x = 20, .y = 0, .w = 8, .h = 8 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 16, .h = 16 }, .dynamic, .solid);
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry());
+
+    var serial = CollisionSystem.init(std.testing.allocator);
+    defer serial.deinit();
+    var serial_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer serial_contacts.deinit();
+    var parallel = CollisionSystem.init(std.testing.allocator);
+    defer parallel.deinit();
+    var parallel_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer parallel_contacts.deinit();
+
+    try placeBody(&data, near, 24, 4);
+    if (comptime builtin.mode == .debug) {
+        try std.testing.expectError(error.StaticMovedOutsideCommit, updateView(&serial, &data, &serial_contacts, colliders.view(), 0, null));
+        try std.testing.expectError(error.StaticMovedOutsideCommit, updateView(&parallel, &data, &parallel_contacts, colliders.view(), 2, collision_range_alignment_items));
+    } else {
+        _ = try updateView(&serial, &data, &serial_contacts, colliders.view(), 0, null);
+        _ = try updateView(&parallel, &data, &parallel_contacts, colliders.view(), 2, collision_range_alignment_items);
+        try expectSameContacts(serial_contacts.mergedItems(), parallel_contacts.mergedItems());
+    }
+
+    try commitBody(&data, &colliders, near);
+    _ = try updateView(&serial, &data, &serial_contacts, colliders.view(), 0, null);
+    _ = try updateView(&parallel, &data, &parallel_contacts, colliders.view(), 2, collision_range_alignment_items);
+    try expectSameContacts(serial_contacts.mergedItems(), parallel_contacts.mergedItems());
+    try std.testing.expect(serial_contacts.mergedItems().len > 0);
+}
+
+test "collision stored-rect lanes match scalar inequality" {
+    var stored_min_x = [_]f32{ 0, 0, 0, 0 };
+    var stored_min_y = [_]f32{ 1, 1, 1, 1 };
+    var stored_max_x = [_]f32{ 4, 4, 4, 4 };
+    var stored_max_y = [_]f32{ 5, 5, 5, 5 };
+    var live_min_x = [_]f32{ 0, 0, 0, 0 };
+    var live_min_y = [_]f32{ 1, 1, 1, 1 };
+    var live_max_x = [_]f32{ 4, 4, 4, 4 };
+    var live_max_y = [_]f32{ 5, 5, 5, 5 };
+    var bad = [_]u32{ 0, 0, 0, 0 };
+    const expect = struct {
+        fn check(
+            stored_min_x_all: []const f32,
+            stored_min_y_all: []const f32,
+            stored_max_x_all: []const f32,
+            stored_max_y_all: []const f32,
+            live_min_x_all: []const f32,
+            live_min_y_all: []const f32,
+            live_max_x_all: []const f32,
+            live_max_y_all: []const f32,
+            bad_all: []const u32,
+            count: usize,
+        ) !void {
+            var scalar = false;
+            for (0..count) |lane| {
+                if (bad_all[lane] != 0 or stored_min_x_all[lane] != live_min_x_all[lane] or stored_min_y_all[lane] != live_min_y_all[lane] or stored_max_x_all[lane] != live_max_x_all[lane] or stored_max_y_all[lane] != live_max_y_all[lane]) scalar = true;
+            }
+            try std.testing.expectEqual(scalar, rectsMismatch(
+                stored_min_x_all[0..count],
+                stored_min_y_all[0..count],
+                stored_max_x_all[0..count],
+                stored_max_y_all[0..count],
+                live_min_x_all[0..count],
+                live_min_y_all[0..count],
+                live_max_x_all[0..count],
+                live_max_y_all[0..count],
+                bad_all[0..count],
+                count,
+            ));
+        }
+    };
+    for (1..5) |count| {
+        try expect.check(&stored_min_x, &stored_min_y, &stored_max_x, &stored_max_y, &live_min_x, &live_min_y, &live_max_x, &live_max_y, &bad, count);
+        stored_min_x[count - 1] = 9;
+        try expect.check(&stored_min_x, &stored_min_y, &stored_max_x, &stored_max_y, &live_min_x, &live_min_y, &live_max_x, &live_max_y, &bad, count);
+        stored_min_x[count - 1] = 0;
+        stored_min_y[count - 1] = 8;
+        try expect.check(&stored_min_x, &stored_min_y, &stored_max_x, &stored_max_y, &live_min_x, &live_min_y, &live_max_x, &live_max_y, &bad, count);
+        stored_min_y[count - 1] = 1;
+        stored_max_x[count - 1] = 11;
+        try expect.check(&stored_min_x, &stored_min_y, &stored_max_x, &stored_max_y, &live_min_x, &live_min_y, &live_max_x, &live_max_y, &bad, count);
+        stored_max_x[count - 1] = 4;
+        stored_max_y[count - 1] = 2;
+        try expect.check(&stored_min_x, &stored_min_y, &stored_max_x, &stored_max_y, &live_min_x, &live_min_y, &live_max_x, &live_max_y, &bad, count);
+        stored_max_y[count - 1] = 5;
+        bad[count - 1] = 1;
+        try expect.check(&stored_min_x, &stored_min_y, &stored_max_x, &stored_max_y, &live_min_x, &live_min_y, &live_max_x, &live_max_y, &bad, count);
+        bad[count - 1] = 0;
+    }
+    stored_min_x[0] = std.math.nan(f32);
+    live_min_x[0] = std.math.nan(f32);
+    try expect.check(&stored_min_x, &stored_min_y, &stored_max_x, &stored_max_y, &live_min_x, &live_min_y, &live_max_x, &live_max_y, &bad, 1);
+    try expect.check(&stored_min_x, &stored_min_y, &stored_max_x, &stored_max_y, &live_min_x, &live_min_y, &live_max_x, &live_max_y, &bad, 4);
+}
+
+test "collision debug rect compare dispatches on workers" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const static_count = collision_range_alignment_items + 1;
+    var statics: [static_count]EntityId = undefined;
+    for (0..static_count) |index| {
+        statics[index] = try addObstacle(&data, .{
+            .x = @as(f32, @floatFromInt(index)) * 32,
+            .y = 0,
+            .w = 16,
+            .h = 16,
+        }, .static, .solid);
+    }
+    _ = try addObstacle(&data, .{ .x = 0, .y = 0, .w = @as(f32, @floatFromInt(static_count)) * 32, .h = 16 }, .dynamic, .solid);
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry());
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    const stats = try updateView(&system, &data, &contacts, colliders.view(), 2, collision_range_alignment_items);
+    if (comptime builtin.mode == .debug) {
+        try std.testing.expect(stats.static_rect_batch.range_count > 1);
+        try std.testing.expectEqual(collision_range_alignment_items, stats.static_rect_batch.items_per_range);
+        try std.testing.expect(stats.static_rect_batch.active_worker_threads > 0);
+        // The second compare range holds this id. A dropped flag there must fail both worker counts.
+        const second = system.distinct_ids.items[collision_range_alignment_items];
+        const moved = for (statics) |entity| {
+            if (entity.index == second) break entity;
+        } else unreachable;
+        try placeBody(&data, moved, data.movementBodyConst(moved).?.position.x + 4, 4);
+        try std.testing.expectError(error.StaticMovedOutsideCommit, updateView(&system, &data, &contacts, colliders.view(), 0, collision_range_alignment_items));
+        try std.testing.expectError(error.StaticMovedOutsideCommit, updateView(&system, &data, &contacts, colliders.view(), 2, collision_range_alignment_items));
+        try commitBody(&data, &colliders, moved);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), stats.static_rect_batch.item_count);
+        const moved = statics[static_count - 1];
+        try placeBody(&data, moved, data.movementBodyConst(moved).?.position.x + 4, 4);
+        _ = try updateView(&system, &data, &contacts, colliders.view(), 0, collision_range_alignment_items);
+        try commitBody(&data, &colliders, moved);
+    }
+    var serial_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer serial_contacts.deinit();
+    _ = try updateView(&system, &data, &serial_contacts, colliders.view(), 0, collision_range_alignment_items);
+    _ = try updateView(&system, &data, &contacts, colliders.view(), 2, collision_range_alignment_items);
+    try expectSameContacts(serial_contacts.mergedItems(), contacts.mergedItems());
+}
+
 test "dynamic bounds index tracks static membership through removal" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -5025,7 +5529,7 @@ fn expectStaticHitLanes(dynamic_box: TestBox, statics: []const LaneStatic) !void
         .min_y = dynamic_box.y,
         .max_x = dynamic_box.x + dynamic_box.w,
         .max_y = dynamic_box.y + dynamic_box.h,
-    }, &out_entity, &out_min_x, &out_min_y, &out_max_x, &out_max_y);
+    }, &out_entity, &out_min_x, &out_min_y, &out_max_x, &out_max_y, idleSpanIds());
     // One cell, so query order is creation order. A later case relies on that.
     try std.testing.expectEqual(statics.len, queried);
     try std.testing.expectEqualSlices(u32, static_index[0..statics.len], out_entity[0..queried]);

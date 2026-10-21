@@ -238,6 +238,8 @@ pub const BatchStage = enum {
     collision_narrowphase,
     // Dynamic×static overlap query. The cost driver of a step with statics at rest.
     collision_static_pairs,
+    // Debug stored-rect compare. Recorded only when that batch ran.
+    collision_static_rect,
     // Stored-trigger allow pack. Recorded only on the step that packs a stale column.
     collision_trigger_allow,
     static_collider_splice,
