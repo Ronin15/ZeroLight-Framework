@@ -42,6 +42,29 @@
 //!   row count, a fill of at least two units per static, and the fill on workers in every
 //!   threaded case, the tuned case's fresh system included (a rebuild fills at a fixed
 //!   shape, outside the `chunk_rewrite` tuner, so it reports no tuner).
+//! - `collision-static-rebuild-sparse`: the same rebuild on a fixed world of 256 x 256
+//!   chunks, one one-tile static at the middle tile of each occupied chunk and no other body;
+//!   the item count of chunks is occupied on an even stride (every fourth, second, or each
+//!   chunk a side), so every static is its chunk's only record, the worst case for per-chunk
+//!   main work. Pass shape: time and main per static flat in statics; a per-level-extent term
+//!   shows as an intercept, falling per static as the occupied count grows. Asserts as
+//!   `collision-static-rebuild`.
+//! - `collision-static-dense-change`: a fixed world of 65,536 statics (the static groups'
+//!   grid, 1,024 chunks of 64, no dynamics); each step moves every static of a square region
+//!   of chunks whose count grows with the change count (16, 64, 256 chunks), an explosion's
+//!   shape, as one structural commit through the commit seam. Moves pair-swap across chunks:
+//!   a static in an even chunk column (row) moves ahead one chunk and one tile, one in an odd
+//!   column (row) back one chunk less one tile, so every destination is a free tile, no two
+//!   coincide, every region chunk gets its own count of inserts in both directions, and the
+//!   next step moves each back. One sample times the collider sync
+//!   (`StaticColliderSystem.sync`, capture to synced), its chunk rewrite on the case's thread
+//!   system under the `chunk_rewrite` tuner, which the tuned case settles first. Pass shape:
+//!   main per changed static flat in the change count, the chunks outside the region a
+//!   control: a term in the world's chunk count shows as a per-change intercept falling with
+//!   the change count. A move is a remove and an insert across chunks, a superset of an
+//!   explosion's per-change destroys. Asserts check fixture invariants only: every move
+//!   commits, and the sync records one change per moved static, each leaving its chunk, with
+//!   the changes touching exactly the region's chunks.
 //!
 //! `collision-static-triggers` holds the item count of stored trigger pairs: two overlapping
 //! one-tile triggers per pitch cell, 512 dynamics on the first cells (half on a trigger), and
@@ -66,8 +89,11 @@
 //! outside the stages' worker dispatches. The `--details` line under each row gives the
 //! measured steps' static query, Debug rect compare, static sort, and trigger allow pack
 //! shapes, and in `collision-static-index-change` the collider sync's splice shape and its
-//! `row_grows=` and `payload_grows=` counts. `collision-static-rebuild` prints `per_static=`,
-//! and with `--details` the fill stage and the main share per static.
+//! `row_grows=` and `payload_grows=` counts. `collision-static-rebuild` and
+//! `collision-static-rebuild-sparse` print `per_static=`, and with `--details` the fill stage
+//! and the main share per static; `collision-static-dense-change` prints `per_change=`, and
+//! with `--details` the rewrite stage (its tuner in the tuned case), the main share per
+//! changed static, and the timed syncs' `row_grows=` and `payload_grows=` counts.
 
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
@@ -85,6 +111,8 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const structuralEventHeadroom = @import("../game/simulation.zig").structuralEventHeadroom;
+const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const ColliderGeometry = @import("../game/systems/static_colliders.zig").ColliderGeometry;
 const ColliderView = @import("../game/systems/static_colliders.zig").ColliderView;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
@@ -165,6 +193,22 @@ pub const static_rebuild_group = suite.BenchmarkGroup{
     .item_counts = &static_item_counts,
     .runCase = runStaticRebuildCase,
     .write_workload = writeRebuildWorkload,
+};
+
+pub const static_rebuild_sparse_group = suite.BenchmarkGroup{
+    .name = "collision-static-rebuild-sparse",
+    .item_label = "static bodies (one per chunk)",
+    .item_counts = &static_item_counts,
+    .runCase = runStaticRebuildSparseCase,
+    .write_workload = writeRebuildWorkload,
+};
+
+pub const static_dense_change_group = suite.BenchmarkGroup{
+    .name = "collision-static-dense-change",
+    .item_label = "statics changed in one commit",
+    .item_counts = &dense_change_counts,
+    .runCase = runStaticDenseChangeCase,
+    .write_workload = writeDenseChangeWorkload,
 };
 
 pub const static_triggers_group = suite.BenchmarkGroup{
@@ -640,10 +684,41 @@ fn runStaticRebuildCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var fixture = try createStaticHeavyFixture(allocator, static_count, .clustered);
     defer fixture.data.deinit();
-    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer threads.deinit();
     const cells: u32 = @intCast(2 * fixture.side);
     const geometry = ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles);
+    return measureRebuild(allocator, io, options, case, &fixture.data, geometry, static_count);
+}
+
+// The sparse rebuild's fixed world: chunks a side, whatever the occupied count.
+const sparse_world_chunks_side: usize = 256;
+
+// One one-tile static at the middle tile of `static_count` chunks of the fixed world, a
+// square on an even stride, and nothing else: every static is its chunk's only record.
+fn runStaticRebuildSparseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, static_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const side = std.math.sqrt(static_count);
+    if (side * side != static_count) return error.SparseChunkCountNotSquare;
+    if (side == 0 or sparse_world_chunks_side % side != 0) return error.SparseChunkCountNotStride;
+    const stride = sparse_world_chunks_side / side;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const middle = default_chunk_size_tiles / 2;
+    for (0..side) |row| for (0..side) |column| {
+        const tile_x = column * stride * default_chunk_size_tiles + middle;
+        const tile_y = row * stride * default_chunk_size_tiles + middle;
+        const position = math.Vec2{ .x = @as(f32, @floatFromInt(tile_x)) * tile_size, .y = @as(f32, @floatFromInt(tile_y)) * tile_size };
+        _ = try fixtures.addBody(&data, position, .{ .x = static_size, .y = static_size }, .static);
+    };
+    const cells: u32 = @intCast(sparse_world_chunks_side * default_chunk_size_tiles);
+    const geometry = ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles);
+    return measureRebuild(allocator, io, options, case, &data, geometry, static_count);
+}
+
+// Times `rebuild` of `data`'s `static_count` statics on `geometry`, each timed rebuild into a
+// fresh system.
+fn measureRebuild(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *const DataSystem, geometry: ColliderGeometry, static_count: usize) !suite.RunStats {
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
 
     // Warmup rebuilds warm the caches and the allocator, never a tuner: each is a fresh
     // system too, as world create builds it.
@@ -651,7 +726,7 @@ fn runStaticRebuildCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     while (warm.next(true)) {
         var colliders = freshRebuildSystem(allocator, case);
         defer colliders.deinit();
-        try colliders.rebuild(&fixture.data, geometry, &threads);
+        try colliders.rebuild(data, geometry, &threads);
     }
 
     var accumulator = suite.StatsAccumulator.init(static_count);
@@ -661,7 +736,7 @@ fn runStaticRebuildCase(allocator: std.mem.Allocator, io: std.Io, options: suite
         var colliders = freshRebuildSystem(allocator, case);
         defer colliders.deinit();
         const start_ns = suite.nowNs(io);
-        try colliders.rebuild(&fixture.data, geometry, &threads);
+        try colliders.rebuild(data, geometry, &threads);
         const end_ns = suite.nowNs(io);
         if (static_colliders_test_support.liveRowCount(colliders) != static_count) return error.WrongStaticCount;
         const batch = colliders.last_splice_batch;
@@ -703,6 +778,203 @@ fn writeRebuildWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: sui
     if (view == .summary) return;
     try writeStage(writer, "fill", stats.batch, stats.work_tuning);
     try suite.writeMainShare(writer, stats, statics);
+}
+
+// ----------------------------------------------------------------------------
+// Static dense change: one structural commit moves many statics across chunks, and the
+// commit seam's collider sync applies them.
+// ----------------------------------------------------------------------------
+
+const dense_change_counts = [_]usize{ 1_024, 4_096, 16_384 };
+// The fixed world: the static grid's side in pitch cells (65,536 statics on 1,024 chunks of
+// 64 each), whatever the change count.
+const dense_change_side: usize = 256;
+// Pitch cells per chunk side, and chunks per world side.
+const dense_change_chunk_cells: usize = default_chunk_size_tiles / 2;
+const dense_change_chunks_side: usize = dense_change_side / dense_change_chunk_cells;
+// Every static of a region chunk changes: the region grows with the change count at this
+// fixed density.
+const dense_change_per_chunk: usize = dense_change_chunk_cells * dense_change_chunk_cells;
+// A move's offset in tiles on each axis, by its chunk's parity there: an even chunk's
+// statics move ahead into the next chunk, an odd chunk's back into the previous one. From
+// any tile of its chunk each lands in its partner chunk, and statics sit on even tiles, so
+// an odd offset lands on a free tile; the two ranges never meet, so no two destinations
+// coincide.
+const dense_change_ahead_tiles: usize = default_chunk_size_tiles + 1;
+const dense_change_back_tiles: usize = default_chunk_size_tiles - 1;
+comptime {
+    std.debug.assert(dense_change_ahead_tiles % 2 == 1 and dense_change_back_tiles % 2 == 1);
+}
+
+const DenseChangeFixture = struct {
+    data: DataSystem,
+    frame: SimulationFrame,
+    colliders: StaticColliderSystem,
+    // The changed statics, each moved between its home tile and its away tile every step.
+    moves: []fixtures.StaticMove,
+    commands: []StructuralCommand,
+    // Chunks a side of the changed region, from the world's first chunk.
+    region_side: usize,
+    // One bit per world chunk, set where a step's changes touch it (fixture check scratch).
+    touched: std.DynamicBitSetUnmanaged,
+    structural_headroom: usize,
+    allocator: std.mem.Allocator,
+
+    // Every static of a square region of `change_count / dense_change_per_chunk` chunks
+    // changes; the region has an even side, so each chunk's pair-swap partner is in it.
+    fn init(allocator: std.mem.Allocator, change_count: usize, case: suite.BenchmarkCase) !DenseChangeFixture {
+        if (change_count % dense_change_per_chunk != 0) return error.DenseChangeNotPerChunk;
+        const region_chunks = change_count / dense_change_per_chunk;
+        const region_side = std.math.sqrt(region_chunks);
+        if (region_side * region_side != region_chunks) return error.DenseChangeRegionNotSquare;
+        if (region_side % 2 != 0 or region_side > dense_change_chunks_side) return error.DenseChangeRegionNotPaired;
+
+        var data = DataSystem.init(allocator);
+        errdefer data.deinit();
+        const moves = try allocator.alloc(fixtures.StaticMove, change_count);
+        errdefer allocator.free(moves);
+        const commands = try allocator.alloc(StructuralCommand, change_count);
+        errdefer allocator.free(commands);
+        var touched = try std.DynamicBitSetUnmanaged.initEmpty(allocator, dense_change_chunks_side * dense_change_chunks_side);
+        errdefer touched.deinit(allocator);
+        var moved: usize = 0;
+        for (0..dense_change_side) |cell_y| for (0..dense_change_side) |cell_x| {
+            const home = pitchCellOrigin(cell_x, cell_y);
+            const entity = try fixtures.addBody(&data, home, .{ .x = static_size, .y = static_size }, .static);
+            if (cell_x / dense_change_chunk_cells >= region_side or cell_y / dense_change_chunk_cells >= region_side) continue;
+            const away = math.Vec2{
+                .x = home.x + awayOffset(cell_x),
+                .y = home.y + awayOffset(cell_y),
+            };
+            moves[moved] = .{ .entity = entity, .positions = .{ home, away } };
+            moved += 1;
+        };
+        std.debug.assert(moved == change_count);
+
+        var frame = SimulationFrame.init(allocator);
+        errdefer frame.deinit();
+        var colliders = StaticColliderSystem.init(allocator);
+        errdefer colliders.deinit();
+        const cells: u32 = @intCast(2 * dense_change_side);
+        try colliders.rebuild(&data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles), null);
+        if (static_colliders_test_support.liveRowCount(colliders) != dense_change_side * dense_change_side) return error.WrongStaticCount;
+        fixtures.setSpliceTuners(&colliders, case);
+        return .{
+            .data = data,
+            .frame = frame,
+            .colliders = colliders,
+            .moves = moves,
+            .commands = commands,
+            .region_side = region_side,
+            .touched = touched,
+            .structural_headroom = structuralEventHeadroom(0, change_count),
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *DenseChangeFixture) void {
+        self.colliders.deinit();
+        self.frame.deinit();
+        self.touched.deinit(self.allocator);
+        self.allocator.free(self.commands);
+        self.allocator.free(self.moves);
+        self.data.deinit();
+        self.* = undefined;
+    }
+
+    // The signed tile offset of a move on an axis whose pitch cell is `cell`: ahead from an
+    // even chunk, back from an odd one.
+    fn awayOffset(cell: usize) f32 {
+        const odd_chunk = (cell / dense_change_chunk_cells) % 2 == 1;
+        const tiles: f32 = @floatFromInt(if (odd_chunk) dense_change_back_tiles else dense_change_ahead_tiles);
+        return if (odd_chunk) -tiles * tile_size else tiles * tile_size;
+    }
+
+    // Every move as one commit through the commit seam; returns the collider sync's time
+    // (capture to synced) and its rewrite batch.
+    fn changeAndSync(self: *DenseChangeFixture, io: std.Io, thread_system: *ThreadSystem) !DenseSync {
+        self.frame.beginStep();
+        for (self.moves, self.commands) |*move, *command| command.* = move.command();
+        var clock = fixtures.CommitSeam.PhaseClock{ .io = io };
+        const seam = fixtures.CommitSeam{ .colliders = &self.colliders, .structural_headroom = self.structural_headroom, .clock = &clock };
+        const commit = try seam.commit(&self.frame, &self.data, self.commands, thread_system);
+        if (commit.structural.components_set != self.moves.len) return error.DenseChangeNotApplied;
+        try self.checkChanges();
+        for (self.moves) |*move| move.advance();
+        return .{ .ns = suite.elapsedNs(clock.captured_ns, clock.synced_ns), .batch = self.colliders.last_splice_batch };
+    }
+
+    // One change per moved static, each leaving its chunk for another in the region, and
+    // the changes together touching exactly the region's chunks.
+    fn checkChanges(self: *DenseChangeFixture) !void {
+        const changes = self.colliders.changesThisStep();
+        if (changes.len != self.moves.len) return error.DenseChangeNotSynced;
+        const chunk_tiles = self.colliders.geometry.?.grid.chunk_tiles;
+        self.touched.unsetAll();
+        for (changes) |change| {
+            const old_cells = (change.old orelse return error.DenseChangeUnplaced).cells;
+            const new_cells = (change.new orelse return error.DenseChangeUnplaced).cells;
+            if (old_cells.min_x / chunk_tiles == new_cells.min_x / chunk_tiles or old_cells.min_y / chunk_tiles == new_cells.min_y / chunk_tiles) return error.DenseChangeStayedInChunk;
+            for ([_]@TypeOf(old_cells){ old_cells, new_cells }) |cells| {
+                const chunk_x: usize = @intCast(cells.min_x / chunk_tiles);
+                const chunk_y: usize = @intCast(cells.min_y / chunk_tiles);
+                if (chunk_x >= self.region_side or chunk_y >= self.region_side) return error.DenseChangeLeftRegion;
+                self.touched.set(chunk_y * dense_change_chunks_side + chunk_x);
+            }
+        }
+        if (self.touched.count() != self.region_side * self.region_side) return error.DenseChangeWrongTouchedChunks;
+    }
+
+    // The colliders' row-pool and payload growths so far.
+    fn grows(self: *const DenseChangeFixture) [2]u64 {
+        return .{ self.colliders.perf.row_grows, self.colliders.perf.payload_grows };
+    }
+};
+
+const DenseSync = struct {
+    ns: u64,
+    batch: BatchStats,
+};
+
+fn runStaticDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var fixture = try DenseChangeFixture.init(allocator, change_count, case);
+    defer fixture.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+
+    // Sync's tuner trains in play, so the tuned case settles it first.
+    var warm = suite.Warmup.init(options, case, 1);
+    while (warm.next(fixture.colliders.chunk_rewrite.phase == .settled)) _ = try fixture.changeAndSync(io, &threads);
+    const settled = case.adaptive and fixture.colliders.chunk_rewrite.phase == .settled;
+
+    var accumulator = suite.StatsAccumulator.init(change_count);
+    var main_total: u128 = 0;
+    const stage_range = case.stageItemsPerRange(splice_range_alignment_items);
+    const warm_grows = fixture.grows();
+    for (0..options.iterations) |_| {
+        const sync = try fixture.changeAndSync(io, &threads);
+        try suite.checkStageDispatched(case, &threads, stage_range, sync.batch);
+        accumulator.record(sync.ns, sync.batch);
+        main_total += sync.ns -| offMainNs(sync.batch);
+    }
+    const grows = fixture.grows();
+    var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    stats.sample_count = change_count;
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&fixture.colliders.chunk_rewrite), settled);
+    // The timed syncs' growths: reported, not asserted.
+    stats.details.print("row_grows={} payload_grows={}\n", .{ grows[0] - warm_grows[0], grows[1] - warm_grows[1] });
+    return stats;
+}
+
+fn writeDenseChangeWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    // `sample_count` holds the change count.
+    const changes = @max(stats.sample_count, 1);
+    try writer.print("per_change={f}", .{suite.formatDuration(stats.mean_ns / changes)});
+    if (view == .summary) return;
+    try writeStage(writer, "rewrite", stats.batch, stats.work_tuning);
+    try suite.writeMainShare(writer, stats, changes);
 }
 
 // One static moved through the commit seam each step, alternating between its pitch cell's
