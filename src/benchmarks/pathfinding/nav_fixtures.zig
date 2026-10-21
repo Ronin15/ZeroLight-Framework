@@ -19,11 +19,13 @@ const SimulationEvent = @import("../../game/simulation.zig").SimulationEvent;
 const PathfindingCapacity = @import("../../game/systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("../../game/systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("../../game/systems/pathfinding.zig").PathfindingSystem;
+const PathfindingConfig = @import("../../game/systems/pathfinding.zig").PathfindingConfig;
 const StaticColliderSystem = @import("../../game/systems/static_colliders.zig").StaticColliderSystem;
 const default_max_solves_per_frame = @import("../../game/systems/pathfinding.zig").default_max_solves_per_frame;
 const pathfinding_range_alignment_items = @import("../../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const intake_range_alignment_items = @import("../../game/systems/pathfinding/types.zig").intake_range_alignment_items;
 const NavUpdateStats = @import("../../game/systems/pathfinding/types.zig").NavUpdateStats;
+const default_cache_ttl_steps = @import("../../game/systems/pathfinding/types.zig").default_cache_ttl_steps;
 const goal_scan_range_alignment_items = @import("../../game/systems/pathfinding/goal_table.zig").scan_range_alignment_items;
 const goal_project_range_alignment_items = @import("../../game/systems/pathfinding/goal_table.zig").project_range_alignment_items;
 const WorldSystem = @import("../../game/world/system.zig").WorldSystem;
@@ -49,18 +51,47 @@ pub fn coldSettleLimit(options: suite.Options) usize {
     return @min(suite.adaptiveSettleIterationLimit(options), cold_settle_cap);
 }
 
-/// One pathfinding update under `case`; a fixed threaded case runs every update stage of
-/// more than one range on workers.
-pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
-    const items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items);
-    const stats = try system.update(requests, agent_count, thread_system, .{
-        .items_per_range = items_per_range,
+/// The update config of a cold step under `case` with the given solve and admission budgets.
+pub fn coldStepConfig(case: suite.BenchmarkCase, solve_budget: usize, fallback_budget: usize) PathfindingConfig {
+    return .{
+        .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
         .max_solved_requests_per_step = solve_budget,
         .max_solve_admissions_per_step = fallback_budget,
-    });
-    try suite.checkStagesDispatched(case, thread_system, items_per_range, &updateBatches(stats));
+    };
+}
+
+/// Moves the step clock past the result TTL, as that many idle steps would: each cached
+/// goal's next request finds its result expired, removes it at intake, and solves it cold,
+/// while every chunk that still holds a registration keeps its registry block. This is the
+/// play shape of a cold request; `clearRuntimeState` is a nav rebuild's reset, which releases
+/// every block. Pending work stays, as in play.
+pub fn expireCachedResults(system: *PathfindingSystem) void {
+    system.step_counter +%= default_cache_ttl_steps;
+}
+
+/// Steps `config` over no requests until nothing is pending: play drops pending work only by
+/// solving it or by its second exhausted attempt.
+pub fn drainPending(system: *PathfindingSystem, thread_system: *ThreadSystem, agent_count: usize, config: PathfindingConfig) !void {
+    var empty = RangeOutputStream(PathRequest).init(system.allocator);
+    defer empty.deinit();
+    // Each entry takes at most two attempts, and a step with work pending admits one or more.
+    var steps_left = 2 * system.pending.len + 1;
+    while (system.pending.len != 0) : (steps_left -= 1) {
+        if (steps_left == 0) return error.PendingDrainStalled;
+        _ = try system.update(&empty, agent_count, thread_system, config);
+    }
+}
+
+/// One pathfinding update under `case`; a fixed threaded case runs every update stage of
+/// more than one range on workers.
+pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
+    const config = coldStepConfig(case, solve_budget, fallback_budget);
+    const stats = try system.update(requests, agent_count, thread_system, config);
+    try suite.checkStagesDispatched(case, thread_system, config.items_per_range, &updateBatches(stats));
+    // A shrink's registry rename pass, at its fixed shape.
+    try suite.checkStageDispatched(case, thread_system, config.items_per_range, stats.perf.registry_rename_batch);
     return stats;
 }
 
@@ -106,7 +137,8 @@ pub const StageReport = struct {
     solve_main_ns: u128 = 0,
     publish_ns: u128 = 0,
     // Intake, group-field advance, group-field begin, solve, publish copy, registry flush,
-    // resize copy. The flush count is separate: it is not a perf-log key.
+    // resize copy. The flush count and a shrink's rename pass are separate: neither is a
+    // perf-log key.
     shapes: suite.StageShapes(update_stage_count) = .{},
     count: suite.StageShapes(1) = .{},
     // Route groups that count unsolved routes: the last timed step's outcome.
@@ -122,12 +154,12 @@ pub const StageReport = struct {
     pub fn add(self: *StageReport, elapsed_ns: u64, stats: PathfindingStats) void {
         self.samples += 1;
         self.timed_ns += elapsed_ns;
-        self.main_ns += elapsed_ns -| offMainStageNs(stats) -| offMainNs(stats.registry_flush_count_batch);
+        self.main_ns += elapsed_ns -| offMainStageNs(stats) -| offMainNs(stats.perf.registry_flush_count_batch) -| offMainNs(stats.perf.registry_rename_batch);
         self.accept_main_ns += stats.accept_ns -| offMainNs(stats.intake_batch);
         self.group_main_ns += stats.group_service_ns -| (offMainNs(stats.perf.group_field_batch) + offMainNs(stats.perf.group_field_begin_batch));
         self.solve_main_ns += stats.solve_ns -| offMainNs(stats.solve_batch);
         self.publish_ns += stats.publish_ns -| offMainNs(stats.perf.publish_copy_batch);
-        self.count.add(.{stats.registry_flush_count_batch});
+        self.count.add(.{stats.perf.registry_flush_count_batch});
         self.registrations_added += stats.perf.registrations_added;
         self.registrations_removed += stats.perf.registrations_removed;
         self.unavailable += stats.perf.unavailable_results;

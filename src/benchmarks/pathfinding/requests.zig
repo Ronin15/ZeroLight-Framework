@@ -34,6 +34,7 @@ const coldWarmup = @import("nav_fixtures.zig").coldWarmup;
 const coldIterations = @import("nav_fixtures.zig").coldIterations;
 const coldSettleLimit = @import("nav_fixtures.zig").coldSettleLimit;
 const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
+const expireCachedResults = @import("nav_fixtures.zig").expireCachedResults;
 const setPathStageTuners = @import("nav_fixtures.zig").setPathStageTuners;
 const StageReport = @import("nav_fixtures.zig").StageReport;
 const OpenWorld = @import("nav_fixtures.zig").OpenWorld;
@@ -56,8 +57,9 @@ const PlanarRoute = @import("nav_fixtures.zig").PlanarRoute;
 //   - `-hard-fallback*`: a `hard_fallback_side`² level with one blocking cell on every third
 //     row's center; each request crosses its row past that cell.
 
-// Cold solve curve: one cold step of distinct-goal requests (runtime state cleared before
-// it, untimed), solving min(count, the per-step solve ceiling) and deferring the rest.
+// Cold solve curve: one cold step of distinct-goal requests (every cached result expired
+// before it, untimed; a deferred backlog carries over, as in play), solving min(count, the
+// per-step solve ceiling) and deferring the rest.
 // Items/s is solves serviced. Passes when the time grows linearly to the ceiling and is flat
 // past it.
 pub const group = suite.BenchmarkGroup{
@@ -398,7 +400,7 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     var warm = suite.Warmup.custom(case, 1 + coldWarmup(options), coldSettleLimit(options));
     while (warm.next(system.tuners.solve.phase == .settled)) {
-        system.clearRuntimeState();
+        expireCachedResults(system);
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
     }
     const settled = if (case.adaptive) (system.tuners.solve.phase == .settled) else false;
@@ -406,7 +408,7 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     for (0..coldIterations(options)) |_| {
-        system.clearRuntimeState();
+        expireCachedResults(system);
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
         accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solve_batch);
@@ -461,7 +463,7 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // Only a cold mode settles: the hot cache's steps never train the solve tuner.
     var warm = suite.Warmup.custom(case, warmup_count, if (mode.isCold()) coldSettleLimit(options) else 0);
     while (warm.next(system.tuners.solve.phase == .settled)) {
-        if (mode.isCold()) system.clearRuntimeState();
+        if (mode.isCold()) expireCachedResults(system);
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
     }
     const settled_before_measurement = if (case.adaptive) (system.tuners.solve.phase == .settled) else false;
@@ -470,7 +472,7 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var last_stats = PathfindingStats{};
     var stage_report = StageReport{};
     for (0..measure_count) |_| {
-        if (mode.isCold()) system.clearRuntimeState();
+        if (mode.isCold()) expireCachedResults(system);
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
         const end_ns = suite.nowNs(io);
@@ -565,10 +567,10 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     return stats;
 }
 
-// Clears the runtime state and accepts every distinct goal in one step, which also solves
-// the first ceiling; the queue carries the rest.
+// Expires every cached result (`expireCachedResults`) and accepts every distinct goal in one
+// step, which also solves the first ceiling; the queue carries the rest.
 fn refillDrainQueue(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !void {
-    system.clearRuntimeState();
+    expireCachedResults(system);
     _ = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
 }
 
@@ -755,10 +757,10 @@ fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: sui
     return stats;
 }
 
-// The untimed setup step: submits the request on cleared state and exhausts its first
-// attempt, leaving it pending at tier 1.
+// The untimed setup step: submits the request with its cached result expired
+// (`expireCachedResults`) and exhausts its first attempt, leaving it pending at tier 1.
 fn promoteDetour(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase) !void {
-    system.clearRuntimeState();
+    expireCachedResults(system);
     const stats = try runColdOnce(system, requests, thread_system, case, 1, 1, 1);
     if (stats.perf.budget_exhausted != 1 or system.pending.len != 1 or system.pending.at(0).tier != 1) return error.EscalatedDetourNotPromoted;
 }

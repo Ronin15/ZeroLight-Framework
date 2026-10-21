@@ -89,7 +89,8 @@ pub const elastic_ramp_group = suite.BenchmarkGroup{
 // `evictions` those evicted. Passes when the resize (step minus hold) grows at most linearly
 // in the capacity it shrinks from. `--details` adds the hold step's time and the difference,
 // the resize, split into its worker-side copy and the rest on the main thread, with the cache
-// and agent capacities before and after.
+// and agent capacities before and after and the shapes of the registry flush's count and of
+// its rename pass (which a shrink that moves entries must run).
 pub const elastic_shrink_group = suite.BenchmarkGroup{
     .name = "pathfinding-elastic-shrink",
     .item_label = "agents before the drop",
@@ -441,6 +442,7 @@ const ShrinkReport = struct {
     hold_ns: u128 = 0,
     copy_ns: u128 = 0,
     count: suite.StageShapes(1) = .{},
+    rename: suite.StageShapes(1) = .{},
     last: ElasticShrink = .{},
 
     fn add(self: *ShrinkReport, shrink: ElasticShrink) void {
@@ -448,7 +450,8 @@ const ShrinkReport = struct {
         self.step_ns += shrink.step_ns;
         self.hold_ns += shrink.hold_ns;
         self.copy_ns += shrink.copy_ns;
-        self.count.add(.{shrink.step_stats.registry_flush_count_batch});
+        self.count.add(.{shrink.step_stats.perf.registry_flush_count_batch});
+        self.rename.add(.{shrink.step_stats.perf.registry_rename_batch});
         self.last = shrink;
     }
 
@@ -458,7 +461,8 @@ const ShrinkReport = struct {
         const resize_main_ns = resize_ns -| self.copy_ns;
         const samples: u128 = self.samples * std.time.ns_per_us;
         var count_buffer: [48]u8 = undefined;
-        details.print("agents {}->{} cache {}->{} kept={} evicted={} moved={} step={}us hold={}us resize={}us ({}% of step) copy={}us resize_main={}us registry_flush_count={s}\n", .{
+        var rename_buffer: [48]u8 = undefined;
+        details.print("agents {}->{} cache {}->{} kept={} evicted={} moved={} step={}us hold={}us resize={}us ({}% of step) copy={}us resize_main={}us registry_flush_count={s} registry_rename={s}\n", .{
             self.last.agent_capacity_before,
             self.last.agent_capacity_after,
             self.last.cache_capacity_before,
@@ -473,6 +477,7 @@ const ShrinkReport = struct {
             @as(u64, @intCast(self.copy_ns / samples)),
             @as(u64, @intCast(resize_main_ns / samples)),
             self.count.label(0, &count_buffer),
+            self.rename.label(0, &rename_buffer),
         });
     }
 };
@@ -600,6 +605,8 @@ fn runElasticShrink(
         const owner = pathfinding_test_support.cacheOwnerOf(system.completed.core, entry.key) orelse continue;
         if (owner != entry.owner) shrink.moved += 1;
     }
+    // A shrink that moves entries rewrites their registrations' owners in one rename pass.
+    if (shrink.moved != 0 and shrink.step_stats.perf.registry_rename_batch.item_count == 0) return error.ElasticShrinkRenamePassSkipped;
     return shrink;
 }
 

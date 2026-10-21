@@ -276,6 +276,7 @@ pub fn setNavTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void 
     system.tuners.nav_evict_count = suite.adaptiveTunerForPartition(case, partition_items, evict_range_alignment_items) orelse fresh;
     system.tuners.nav_evict = suite.adaptiveTunerForPartition(case, partition_items, evict_range_alignment_items) orelse fresh;
     system.tuners.evict_flush = suite.adaptiveTunerForPartition(case, partition_items, 1) orelse fresh;
+    system.tuners.evict_flush_count = suite.adaptiveTunerForPartition(case, partition_items, 1) orelse fresh;
     system.nav_controls = .{
         .adaptive = case.adaptive,
         .max_worker_threads = case.maxWorkerThreads(),

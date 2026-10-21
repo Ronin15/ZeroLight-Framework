@@ -140,6 +140,7 @@ fn navStorageParts(config: NavSizeConfig) NavStorageParts {
             .long_results = config.long_results,
             .runs_per_result = config.runs_per_result,
             .chunks = chunks *| levels,
+            .levels = levels,
             // A marks batch holds at most a mark per cell and a key per chunk.
             .marks = @min(config.batch.mark_chunks, chunks *| levels *| default_chunk_size_tiles *| default_chunk_size_tiles),
             .batch_keys = @min(config.batch.keys, chunks *| levels),
@@ -246,6 +247,7 @@ test "nav storage charges the request side's production bound at the config's sh
             .long_results = config.long_results,
             .runs_per_result = config.runs_per_result,
             .chunks = 256,
+            .levels = config.levels,
             .marks = 256 * @as(usize, default_chunk_size_tiles) * default_chunk_size_tiles,
             .batch_keys = 256,
         });

@@ -544,9 +544,9 @@ pub const PathfindingStats = struct {
     // Request classification (`path_intake`); inline stages report `ran_inline`.
     intake_batch: BatchStats = .{},
     // The path registry's owner ops and adds. `registry_flush` is the apply; the count
-    // dispatch is not a perf-log key. A shrink's byte moves are `resize_copy`.
+    // dispatch is `Perf.registry_flush_count_batch` and a shrink's owner rename pass
+    // `Perf.registry_rename_batch`. A shrink's byte moves are `resize_copy`.
     registry_flush_batch: BatchStats = .{},
-    registry_flush_count_batch: BatchStats = .{},
     resize_copy_batch: BatchStats = .{},
     // Per-phase update timings (ns); zero when perf logging is disabled. Recorded
     // as pathfinding_* sub-stage timers that break down pipeline_pathfinding.
@@ -561,6 +561,10 @@ pub const PathfindingStats = struct {
     /// Diagnostic counts, kept only with `runtime_perf_log.enabled` and zero-sized without
     /// it; `SimulationPipelineStats.recordTo` logs the request and result counts.
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        // The registry flush's count dispatch and its rename pass (a shrink's only): bench
+        // output, not perf-log keys.
+        registry_flush_count_batch: BatchStats = .{},
+        registry_rename_batch: BatchStats = .{},
         // Intake: requests accepted into pending (those whose goal cell was blocked, so their
         // live goal is its projection, in `goal_projected`), and the pending queue's length
         // after the step.

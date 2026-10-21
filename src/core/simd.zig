@@ -81,6 +81,22 @@ fn storeFloat4PrefixScalar(values: []f32, lanes: [lane_count]f32, count: usize) 
     for (0..count) |lane| values[lane] = lanes[lane];
 }
 
+/// Writes the first `count` lanes. `count <= lane_count`. Does not write past
+/// `values[0..count]`.
+pub fn storeUint4Prefix(values: []u32, vector: Uint4, count: usize) void {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    const stored = toUintArray(vector);
+    for (0..count) |lane| values[lane] = stored[lane];
+}
+
+/// Scalar form of `storeUint4Prefix`.
+fn storeUint4PrefixScalar(values: []u32, lanes: [lane_count]u32, count: usize) void {
+    std.debug.assert(count <= lane_count);
+    std.debug.assert(values.len >= count);
+    for (0..count) |lane| values[lane] = lanes[lane];
+}
+
 /// Stores the four lanes of `vector` into the first four values of `values`, in lane order;
 /// the rest of `values` is left as it was.
 pub inline fn storeUint4Slice(values: []u32, vector: Uint4) void {
@@ -452,6 +468,44 @@ pub inline fn gatherFloat4(values: []const f32, indices: [lane_count]usize) Floa
         values[indices[2]],
         values[indices[3]],
     };
+}
+
+/// The `table` entries at the four lanes of `indices`: the u32 form of `gatherFloat4`, for
+/// a table remap of a u32 id column (each lane's id is its index). Every index is below
+/// `table.len`.
+pub inline fn gatherUint4(table: []const u32, indices: Uint4) Uint4 {
+    return .{
+        table[indices[0]],
+        table[indices[1]],
+        table[indices[2]],
+        table[indices[3]],
+    };
+}
+
+/// Scalar form of `gatherUint4`.
+fn gatherUint4Scalar(table: []const u32, indices: [lane_count]u32) [lane_count]u32 {
+    var lanes: [lane_count]u32 = undefined;
+    for (&lanes, indices) |*lane, index| lane.* = table[index];
+    return lanes;
+}
+
+/// `gatherUint4` in the lanes set in `lanes`, and zero in the rest: a column's tail. Reads
+/// only the set lanes' entries, so an inactive lane's index may be anything.
+pub inline fn gatherUint4Masked(table: []const u32, indices: Uint4, lanes: MaskBits) Uint4 {
+    var gathered = splatUint4(0);
+    inline for (0..lane_count) |lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) gathered[lane] = table[indices[lane]];
+    }
+    return gathered;
+}
+
+/// Scalar form of `gatherUint4Masked`.
+fn gatherUint4MaskedScalar(table: []const u32, indices: [lane_count]u32, lanes: MaskBits) [lane_count]u32 {
+    var gathered = [_]u32{ 0, 0, 0, 0 };
+    for (&gathered, indices, 0..) |*lane_value, index, lane| {
+        if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) lane_value.* = table[index];
+    }
+    return gathered;
 }
 
 /// Scatters lane values back to `values` at the given indices. Indices must be
@@ -865,6 +919,40 @@ test "gather and scatter move lanes through sparse indices" {
     var dest = [_]f32{ 0, 0, 0, 0, 0, 0 };
     scatterFloat4(&dest, .{ 5, 0, 3, 1 }, float4(15, 10, 13, 11));
     try std.testing.expectEqual([_]f32{ 10, 11, 0, 13, 0, 15 }, dest);
+}
+
+test "u32 gathers, masked gathers, and prefix stores match their scalar forms" {
+    const table = [_]u32{ 10, 0, std.math.maxInt(u32), 0x8000_0000, 7, 7 };
+    const index_sets = [_][lane_count]u32{ .{ 5, 0, 3, 1 }, .{ 2, 2, 2, 2 }, .{ 0, 1, 2, 3 }, .{ 4, 5, 4, 5 } };
+    for (index_sets) |indices| {
+        const gathered = toUintArray(gatherUint4(&table, indices));
+        try std.testing.expectEqual(gatherUint4Scalar(&table, indices), gathered);
+        for (0..1 << lane_count) |bits| {
+            const lanes: MaskBits = @intCast(bits);
+            const masked = toUintArray(gatherUint4Masked(&table, indices, lanes));
+            try std.testing.expectEqual(gatherUint4MaskedScalar(&table, indices, lanes), masked);
+            for (0..lane_count) |lane| {
+                const expected = if (lanes & (@as(MaskBits, 1) << @intCast(lane)) != 0) gathered[lane] else 0;
+                try std.testing.expectEqual(expected, masked[lane]);
+            }
+        }
+    }
+    // An inactive lane's index is never read: it may lie past the table.
+    const past = [_]u32{ 1, std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32) };
+    try std.testing.expectEqual([_]u32{ 0, 0, 0, 0 }, toUintArray(gatherUint4Masked(&table, past, lanesBelow(1))));
+    try std.testing.expectEqual([_]u32{ 0, 0, 0, 0 }, gatherUint4MaskedScalar(&table, past, lanesBelow(1)));
+
+    const prefix_vector: Uint4 = .{ 0, std.math.maxInt(u32), 0x8000_0001, 5 };
+    for (0..lane_count + 1) |count| {
+        var prefix_simd = [_]u32{ 9, 9, 9, 9, 8, 7 };
+        var prefix_scalar = prefix_simd;
+        storeUint4Prefix(prefix_simd[0..], prefix_vector, count);
+        storeUint4PrefixScalar(prefix_scalar[0..], toUintArray(prefix_vector), count);
+        try std.testing.expectEqual(prefix_scalar, prefix_simd);
+        for (prefix_simd[count..lane_count]) |untouched| try std.testing.expectEqual(@as(u32, 9), untouched);
+        try std.testing.expectEqual(@as(u32, 8), prefix_simd[4]);
+        try std.testing.expectEqual(@as(u32, 7), prefix_simd[5]);
+    }
 }
 
 test "loadFloat4Prefix and scatterFloat4Masked match their scalar forms bit for bit" {

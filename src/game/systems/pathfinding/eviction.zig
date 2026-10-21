@@ -78,14 +78,20 @@ pub fn evictLevel(self: *PathfindingSystem, level: u16, stats: *NavUpdateStats) 
     }
 }
 
+/// The nav reaction's registry flush dispatches: its apply under `evict_flush` and its count
+/// under `evict_flush_count`, apart from the update's flush (`publish.FlushDispatch`).
+pub fn evictFlushDispatch(self: *PathfindingSystem, thread_system: ?*ThreadSystem) ?publish.FlushDispatch {
+    const apply = navDispatch(self, thread_system, &self.tuners.evict_flush) orelse return null;
+    return .{ .apply = apply, .count_tuner = &self.tuners.evict_flush_count };
+}
+
 /// The flush of the rebuilt levels' evictions: a level's worth of retires, a one-off the
 /// flush tuner has no profile for, so a tuned dispatch runs at a fixed shape of about one
 /// pair per range, outside the tuner (as a shrink's flush), and the marks batch's flush
 /// stays the stage's one sample of the step.
 pub fn flushRebuildEvictions(self: *PathfindingSystem, thread_system: ?*ThreadSystem) error{OutOfMemory}!BatchStats {
     self.registry_flush_fixed = true;
-    const dispatch = navDispatch(self, thread_system, &self.tuners.evict_flush);
-    return publish.flushRegistry(self, dispatch, null);
+    return publish.flushRegistry(self, evictFlushDispatch(self, thread_system), null);
 }
 
 /// Eviction before the batch commit, one item per changed key (a chunk with a changed
@@ -96,8 +102,9 @@ pub fn flushRebuildEvictions(self: *PathfindingSystem, thread_system: ?*ThreadSy
 /// them, O(1) per key. Reads only the batch's keys and the registry. On error the graph,
 /// cache, and registry are as they were.
 pub fn prepareEviction(self: *PathfindingSystem, thread_system: ?*ThreadSystem, stats: *NavUpdateStats) !void {
-    // Every update and reaction ends flushed, so every registration names a live entry.
-    std.debug.assert(self.completed.core.ownerLog().len == 0 and self.publish_ranges == 0);
+    // The reaction finished a failed flush first, and its level rebuilds end flushed, so
+    // the walk sees every published path's runs and every registration names a live entry.
+    std.debug.assert(!publish.registryBehind(self));
     var section = StageTimer.begin();
     defer stats.addMain(.reserve_ns, section.lap());
     const keys = self.graph.changed_keys.items;
@@ -183,16 +190,15 @@ pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_syste
             }
         }
     }
-    const flush_dispatch = navDispatch(self, thread_system, &self.tuners.evict_flush);
     const flush_timer = StageTimer.begin();
-    const flush_batch = try publish.flushRegistry(self, flush_dispatch, null);
-    // The flush's code outside its dispatch, inline or not.
-    // Both dispatches, inline or not: what remains is the flush's code outside them.
-    stats.addMain(.evict_ns, flush_timer.lap() -| flush_batch.batch_duration_ns -| self.registry_flush_count_batch.batch_duration_ns);
+    const flush_batch = try publish.flushRegistry(self, evictFlushDispatch(self, thread_system), null);
     if (comptime runtime_perf_log.enabled) {
+        const count_batch = self.perf.last_flush_count_batch;
+        // Both dispatches, inline or not: what remains is the flush's code outside them.
+        stats.addMain(.evict_ns, flush_timer.lap() -| flush_batch.batch_duration_ns -| count_batch.batch_duration_ns);
         stats.perf.evict_flush_batch = flush_batch;
-        stats.perf.registry_flush_count_batch = self.registry_flush_count_batch;
-        stats.addStageTime(self.registry_flush_count_batch);
+        stats.perf.registry_flush_count_batch = count_batch;
+        stats.addStageTime(count_batch);
         stats.addStageTime(stats.perf.evict_count_batch);
         stats.addStageTime(stats.evict_batch);
         stats.addStageTime(flush_batch);
@@ -745,6 +751,122 @@ test "eviction allocates nothing after its pre-commit reserve on a multi-worker 
     _ = try reaction;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(system.completed.count() < cached);
+    try expectRegistryMatchesCache(&system);
+}
+
+test "a nav reaction after a registry flush that ran out of memory past its publish finishes that flush first, so a dig on a path claimed in the failed step evicts it (FailingAllocator)" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const requester = try data.createEntity();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    for (0..16) |index| {
+        const route = test_support.registryRoute(index, 24);
+        try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
+    }
+    var behind: usize = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var fixture = try registryWorld(&meta, 24);
+        defer fixture.world.deinit();
+        var system = try registrySystem(&data, &fixture.world, 32);
+        defer system.deinit();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        setSystemAllocators(&system, failing.allocator());
+        const failed = updatePathfindingInline(&system, &stream, 32, .{});
+        setSystemAllocators(&system, std.testing.allocator);
+        if (failed) |_| break else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        // A failure before the claims leaves no publish behind.
+        if (system.publish_ranges == 0) continue;
+        behind += 1;
+        // A claimed path of at least three cells, dug at its middle cell.
+        var owner: u32 = 0;
+        while (!system.completed.core.records.items[owner].live or storedPath(&system, owner).cells.len < 3) owner += 1;
+        const key = system.completed.core.keyOf(owner);
+        const cells = storedPath(&system, owner).cells;
+        const middle = cells[cells.len / 2];
+        try setRegistryCells(&system, &fixture, &.{.{ @intCast(middle % 24), @intCast(middle / 24) }}, fixture.tree);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
+        try std.testing.expect(system.completed.slotIndex(key) == null);
+        try std.testing.expect(!publish.registryBehind(&system));
+        try expectRegistryMatchesCache(&system);
+    }
+    try std.testing.expect(behind != 0);
+}
+
+test "a nav reaction that rebuilds a level after a registry flush that ran out of memory past its publish finishes that flush first: the failed step's paths are evicted and no registration names a retired owner (FailingAllocator)" {
+    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer serial_threads.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const requester = try data.createEntity();
+    // Sixteen routes past the 64 the cache holds: each claim retires a cached victim and
+    // takes its owner id.
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    for (64..80) |index| {
+        const route = test_support.registryRoute(index, 24);
+        try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
+    }
+    var behind: usize = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var fixture = try registryWorld(&meta, 24);
+        defer fixture.world.deinit();
+        var system = try registrySystem(&data, &fixture.world, 16);
+        defer system.deinit();
+        for (0..4) |batch| try solveRegistryRoutes(&system, requester, 24, batch * 16, 16, 16, null, .{});
+        try std.testing.expectEqual(@as(usize, 64), system.completed.count());
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        setSystemAllocators(&system, failing.allocator());
+        const failed = updatePathfindingInline(&system, &stream, 16, .{});
+        setSystemAllocators(&system, std.testing.allocator);
+        if (failed) |_| break else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        // A failure before the claims leaves no publish behind.
+        if (system.publish_ranges == 0) continue;
+        // The claims logged their victims' retires, and reused owner ids wait in the
+        // publish windows.
+        try std.testing.expect(system.completed.core.ownerLog().len != 0);
+        behind += 1;
+        // Level 0 changes without per-cell events: every cached path runs on it.
+        _ = try fixture.world.addDenseLayer(0, 0, .obstacle, fixture.tree);
+        const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
+        try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
+        try std.testing.expectEqual(@as(usize, 0), system.completed.count());
+        try std.testing.expect(!publish.registryBehind(&system));
+        try expectRegistryMatchesCache(&system);
+    }
+    try std.testing.expect(behind != 0);
+}
+
+test "a scoped eviction's registry flush counts under its own tuner and leaves the update flush's count tuner untouched" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    var system = try registrySystemWith(&data, &fixture.world, 64, .{ .participants = threads.participantSlotCount() });
+    defer system.deinit();
+    try solveRegistryRoutes(&system, requester, 24, 0, 60, 64, &threads, .{});
+    try std.testing.expect(system.tuners.registry_flush_count.last_request != null);
+    try std.testing.expect(system.tuners.evict_flush_count.last_request == null);
+    const update_count = system.tuners.registry_flush_count;
+    try setRegistryCells(&system, &fixture, &dense_change_cells, fixture.tree);
+    const cached = system.completed.count();
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expect(system.completed.count() < cached);
+    try std.testing.expect(system.tuners.evict_flush_count.last_request != null);
+    try std.testing.expectEqualDeep(update_count, system.tuners.registry_flush_count);
     try expectRegistryMatchesCache(&system);
 }
 
@@ -1328,8 +1450,9 @@ test "two levels rebuilt in one step evict each result through either once and f
     try std.testing.expectEqual(@as(usize, 2), stats.levels_built);
     // Routes 0 and 4 have runs on both levels: each is evicted once.
     try expectLinkedCached(&system, keys, .{ false, true, false, false, false });
-    // The one-off flush ran at its fixed shape, so the flush tuner selected nothing.
+    // The one-off flush ran at its fixed shape, so neither flush tuner selected anything.
     try std.testing.expect(system.tuners.evict_flush.last_request == null);
+    try std.testing.expect(system.tuners.evict_flush_count.last_request == null);
 }
 
 test "a level build that fails after an earlier level was evicted still flushes its evictions, and the retry finishes the rest" {

@@ -244,6 +244,10 @@ pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const Stati
     // A level build's relocated closure blocks land even when a later build or the marks
     // batch fails, before the step's staging release.
     errdefer self.graph.landClosure(threads, &stats);
+    // A registry flush that failed is finished first: a level rebuild finds the results to
+    // evict through their registered runs, and its retires must not land on a reused owner
+    // id whose new runs still wait in the publish windows.
+    try publish.recoverRegistry(self, eviction.evictFlushDispatch(self, thread_system));
     const view = colliders.view();
     if (self.graph.world_backed) {
         // Every level build of the step shares one level-sized staging, freed once at the

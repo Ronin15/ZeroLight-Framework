@@ -7,11 +7,9 @@
 //! ordered set chunk-key users (nav's plan merge, the world's batch grouping) drain chunk
 //! and level indices through in order. `ChunkDirectory` is a dense per-level slot array into
 //! a block pool: an occupied slot's payload is one byte allocation the owner splits into
-//! columns. `padded` slots are cache-line records of `{ block, pending }` so workers writing
-//! `pending` on adjacent chunks do not share a line.
+//! columns. A directory `with_pending` keeps a `pending` count per slot beside the block ids.
 
 const std = @import("std");
-const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 
 /// End of an inverse chain, and "no entry" from a lookup.
@@ -169,17 +167,18 @@ pub fn bitSetBytesFor(bits: usize) usize {
 /// One level's chunk slots and a free-list pool of payloads. A slot holds a block id, or
 /// `empty_block`. The block's bytes are one allocation; `Payload` is the owner's column
 /// split of those bytes, stored beside them so freeing the block frees the allocation.
-/// Methods take the caller's allocator; the directory does not store one. `padded` stores
-/// each slot as a cache-line `PaddedSlot` of `{ block, pending }` so workers writing
-/// `pending` on adjacent chunks do not share a line. Unpadded slots are plain block ids
-/// and only the main thread writes them.
-pub fn ChunkDirectory(comptime Payload: type, comptime padded: bool) type {
+/// Methods take the caller's allocator; the directory does not store one. `with_pending`
+/// keeps a dense `pending` column beside each level's slots, one u32 per chunk. Workers
+/// writing `pending` on chunks of different shards write disjoint scattered elements: the
+/// sparse index maintenance `threading.md` § Writes exempts, so neither column is padded.
+pub fn ChunkDirectory(comptime Payload: type, comptime with_pending: bool) type {
     return struct {
         const Self = @This();
-        const SlotValue = struct { block: u32 = empty_block, pending: u32 = 0 };
-        const Slot = if (padded) PaddedSlot(SlotValue) else u32;
-        const Level = struct { slots: []Slot = &.{} };
-        const Block = struct {
+        pub const Level = struct {
+            slots: []u32 = &.{},
+            pending: if (with_pending) []u32 else void = if (with_pending) &.{} else {},
+        };
+        pub const Block = struct {
             bytes: []align(4) u8 = &.{},
             payload: Payload = .{},
         };
@@ -198,40 +197,79 @@ pub fn ChunkDirectory(comptime Payload: type, comptime padded: bool) type {
             self.* = .{};
         }
 
-        /// Allocates `level`'s slots once. A level already open at `slot_count` is left
-        /// alone. A different count is only legal once every slot is empty: the old slots
-        /// are freed after the new ones exist.
+        /// Allocates `level`'s slots (and pending column) once. A level already open at
+        /// `slot_count` is left alone. A different count is only legal once every slot is
+        /// empty: the old columns are freed after the new ones exist.
         pub fn openLevel(self: *Self, allocator: std.mem.Allocator, level: u32, slot_count: usize) error{OutOfMemory}!void {
             const index: usize = level;
             if (self.levels.items.len <= index) {
                 try self.levels.ensureTotalCapacity(allocator, index + 1);
                 self.levels.appendNTimesAssumeCapacity(.{}, index + 1 - self.levels.items.len);
             }
-            const slots = &self.levels.items[index].slots;
-            if (slots.len == slot_count) return;
-            if (slots.len != 0) {
-                for (slots.*) |held| std.debug.assert(slotBlock(held) == empty_block);
+            const held = &self.levels.items[index];
+            if (held.slots.len == slot_count) return;
+            if (held.slots.len != 0) {
+                for (held.slots) |block| std.debug.assert(block == empty_block);
             }
-            const fresh = try allocator.alloc(Slot, slot_count);
-            if (comptime padded) {
-                for (fresh) |*held| held.* = .{};
-            } else {
-                @memset(fresh, empty_block);
+            const fresh = try allocator.alloc(u32, slot_count);
+            errdefer allocator.free(fresh);
+            @memset(fresh, empty_block);
+            if (comptime with_pending) {
+                const pending_column = try allocator.alloc(u32, slot_count);
+                @memset(pending_column, 0);
+                if (held.pending.len != 0) allocator.free(held.pending);
+                held.pending = pending_column;
             }
-            if (slots.len != 0) allocator.free(slots.*);
-            slots.* = fresh;
+            if (held.slots.len != 0) allocator.free(held.slots);
+            held.slots = fresh;
         }
 
         /// Frees `level`'s slots and releases every block they hold.
         pub fn closeLevel(self: *Self, allocator: std.mem.Allocator, level: u32) void {
             if (level >= self.levels.items.len) return;
-            const slots = self.levels.items[level].slots;
-            for (slots) |held| {
-                const block = slotBlock(held);
+            self.emptyLevel(allocator, level);
+            const held = &self.levels.items[level];
+            if (held.slots.len != 0) allocator.free(held.slots);
+            if (comptime with_pending) {
+                if (held.pending.len != 0) allocator.free(held.pending);
+            }
+            held.* = .{};
+        }
+
+        /// Releases every block `level`'s slots hold and empties its slots and pending
+        /// counts; the columns stay allocated. One pass over the slot column, then a memset
+        /// per column.
+        // SIMD verdict: scalar filter of the slot column with one release per occupied
+        // slot, allocator-bound; the clears are `@memset`.
+        pub fn emptyLevel(self: *Self, allocator: std.mem.Allocator, level: u32) void {
+            const held = self.levels.items[level];
+            for (held.slots) |block| {
                 if (block != empty_block) self.release(allocator, block);
             }
-            if (slots.len != 0) allocator.free(slots);
-            self.levels.items[level].slots = &.{};
+            @memset(held.slots, empty_block);
+            if (comptime with_pending) @memset(held.pending, 0);
+        }
+
+        /// Empties every level's slots and pending counts and releases every block holding
+        /// bytes; the level columns and the block pool's storage stay. A block holds bytes
+        /// from its `setPayload` until its release, so this runs between those, never with a
+        /// claimed block not yet installed. One memset per column and one pass over the block
+        /// pool.
+        // SIMD verdict: the column clears are `@memset`; the block pass frees one
+        // allocation per occupied block, allocator-bound.
+        pub fn releaseAll(self: *Self, allocator: std.mem.Allocator) void {
+            for (self.levels.items) |held| {
+                @memset(held.slots, empty_block);
+                if (comptime with_pending) @memset(held.pending, 0);
+            }
+            for (self.blocks.items, 0..) |*block, id| {
+                if (block.bytes.len == 0) continue;
+                allocator.free(block.bytes);
+                block.* = .{};
+                std.debug.assert(self.block_free.items.len < self.block_free.capacity);
+                // Block ids stay below `empty_block`.
+                self.block_free.appendAssumeCapacity(@intCast(id));
+            }
         }
 
         pub fn levelCount(self: *const Self) usize {
@@ -248,13 +286,13 @@ pub fn ChunkDirectory(comptime Payload: type, comptime padded: bool) type {
             if (level >= self.levels.items.len) return empty_block;
             const slots = self.levels.items[level].slots;
             if (index >= slots.len) return empty_block;
-            return slotBlock(slots[index]);
+            return slots[index];
         }
 
         pub fn setSlot(self: *Self, level: u32, index: usize, block: u32) void {
             const slots = self.levels.items[level].slots;
             std.debug.assert(index < slots.len);
-            setSlotBlock(&slots[index], block);
+            slots[index] = block;
         }
 
         /// Grows the free block list to at least `needed` ids. A block id would pass
@@ -314,20 +352,11 @@ pub fn ChunkDirectory(comptime Payload: type, comptime padded: bool) type {
             return &self.blocks.items[block].payload;
         }
 
-        /// `pending` on a padded slot. Only the registry's count workers write it, one
-        /// shard per chunk, and the main thread clears it before apply.
+        /// `pending` of `level`'s chunk `index`. Only the registry's count workers write it,
+        /// one shard per chunk, and the main thread clears it before apply.
         pub fn pending(self: *Self, level: u32, index: usize) *u32 {
-            comptime std.debug.assert(padded);
-            return &self.levels.items[level].slots[index].value.pending;
-        }
-
-        fn slotBlock(held: Slot) u32 {
-            if (comptime padded) return held.value.block;
-            return held;
-        }
-
-        fn setSlotBlock(held: *Slot, block: u32) void {
-            if (comptime padded) held.value.block = block else held.* = block;
+            comptime std.debug.assert(with_pending);
+            return &self.levels.items[level].pending[index];
         }
     };
 }
@@ -408,4 +437,43 @@ test "an ordered index set reserve grows geometrically onto valid tiers, and one
     for ([_]usize{ 127, 0, 64, 63 }) |index| set.insert(index);
     for ([_]usize{ 0, 63, 64, 127 }) |expected| try std.testing.expectEqual(@as(?usize, expected), set.popMin());
     try std.testing.expect(set.isEmpty());
+}
+
+test "emptying a level releases only that level's blocks and keeps its columns, and releasing every block empties every level and returns every block to the pool" {
+    const allocator = std.testing.allocator;
+    const Directory = ChunkDirectory(struct { len: u32 = 0 }, true);
+    var directory: Directory = .{};
+    defer directory.deinit(allocator);
+    try directory.openLevel(allocator, 0, 8);
+    try directory.openLevel(allocator, 1, 8);
+    const held = [_]struct { level: u32, slot: usize }{ .{ .level = 0, .slot = 1 }, .{ .level = 0, .slot = 6 }, .{ .level = 1, .slot = 2 } };
+    for (held) |entry| {
+        const block = try directory.claim(allocator);
+        directory.setPayload(block, try allocator.alignedAlloc(u8, .@"4", 16), .{ .len = 1 });
+        directory.setSlot(entry.level, entry.slot, block);
+        directory.pending(entry.level, entry.slot).* = 3;
+    }
+    const blocks = directory.blocks.items.len;
+    try std.testing.expectEqual(blocks - held.len, directory.block_free.items.len);
+
+    directory.emptyLevel(allocator, 0);
+    try std.testing.expectEqual(@as(usize, 8), directory.slotCount(0));
+    for (0..8) |slot| {
+        try std.testing.expectEqual(empty_block, directory.slot(0, slot));
+        try std.testing.expectEqual(@as(u32, 0), directory.pending(0, slot).*);
+    }
+    try std.testing.expect(directory.slot(1, 2) != empty_block);
+    try std.testing.expectEqual(@as(u32, 3), directory.pending(1, 2).*);
+    try std.testing.expectEqual(blocks - 1, directory.block_free.items.len);
+
+    directory.releaseAll(allocator);
+    for (0..2) |level| {
+        try std.testing.expectEqual(@as(usize, 8), directory.slotCount(@intCast(level)));
+        for (0..8) |slot| {
+            try std.testing.expectEqual(empty_block, directory.slot(@intCast(level), slot));
+            try std.testing.expectEqual(@as(u32, 0), directory.pending(@intCast(level), slot).*);
+        }
+    }
+    try std.testing.expectEqual(blocks, directory.block_free.items.len);
+    for (directory.blocks.items) |block| try std.testing.expectEqual(@as(usize, 0), block.bytes.len);
 }

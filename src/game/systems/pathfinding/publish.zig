@@ -5,10 +5,13 @@
 //! The publish and path registry of `PathfindingSystem`: the step's results are reserved for,
 //! claimed in solve-ordinal order on the main thread (O(1) per result), copied into their cache
 //! stripes or long blocks with their registry runs bucketed per flush pair (`publish_copy`,
-//! threaded per result range). `registry_flush_count` lists the chunks to grow or compact
-//! without mutating runs; the main thread reallocates a chunk that is short of slack;
-//! `registry_flush` compacts, renames, and appends. Both thread per shard. Free functions
-//! over `*PathfindingSystem`; the system calls them directly.
+//! threaded per result range). The main thread plans the owner log once and buckets it by
+//! shard; `registry_flush_count` lists the chunks to grow or compact without mutating runs;
+//! the main thread reallocates a chunk that is short of slack; a shrink's `registry_rename`
+//! rewrites every registration's owner in one pass over the block pool; `registry_flush`
+//! retires, moves heads, compacts, and appends. Count and apply thread per shard, the
+//! rename per block range. Free functions over `*PathfindingSystem`; the system calls them
+//! directly.
 
 const std = @import("std");
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
@@ -30,6 +33,7 @@ const no_entry = chunk_list_map.no_entry;
 const empty_block = chunk_list_map.empty_block;
 const ChunkDirectory = chunk_list_map.ChunkDirectory;
 const pdq = @import("../../../core/sort.zig").pdq;
+const simd = @import("../../../core/simd.zig");
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const types = @import("types.zig");
@@ -40,6 +44,7 @@ const no_owner = @import("types.zig").no_owner;
 const registry_shard_count = @import("types.zig").registry_shard_count;
 const registryShard = @import("types.zig").registryShard;
 const reg_window_alignment_items = @import("types.zig").reg_window_alignment_items;
+const ops_per_entry = @import("caches.zig").ops_per_entry;
 
 /// The publish copy's registration windows, shard-ordered within each range.
 pub const RegRecordList = std.array_list.Aligned(RegRecord, .fromByteUnits(thread_shared_record_alignment));
@@ -232,7 +237,74 @@ comptime {
 
 pub const RegistryDirectory = ChunkDirectory(RegChunk, true);
 
-/// The path registry: one padded directory of registration runs, and one inverse pool per shard.
+/// Bytes of one registration in a chunk payload: its owner, order, and inverse columns.
+pub const reg_row_bytes = 3 * @sizeOf(u32);
+
+comptime {
+    std.debug.assert(reg_row_bytes == @sizeOf(@typeInfo(@FieldType(RegChunk, "owner")).pointer.child) +
+        @sizeOf(@typeInfo(@FieldType(RegChunk, "order")).pointer.child) + @sizeOf(@typeInfo(@FieldType(RegChunk, "inverse")).pointer.child));
+}
+
+/// One bit per registry shard.
+pub const ShardMask = @Int(.unsigned, registry_shard_count);
+
+/// A logged op's chain: the owner id whose pre-flush chain the op's `old` holds at that
+/// point of the log (`no_entry`: none), and the shards that chain has nodes in.
+pub const OpPlan = struct {
+    origin: u32 = no_entry,
+    shards: ShardMask = 0,
+};
+
+/// The owner log's plan for one flush, built once on the main thread for every shard, its
+/// id columns sized to the owner ids. `at` maps an owner id to its place in `ids`
+/// (`no_entry` outside a plan). Per listed id, `origin` is the id whose pre-flush chain it
+/// holds after the log's head moves so far, and `shards` the shards its own pre-flush chain
+/// has nodes in. `ops` is one plan per logged op. `rename_to` maps a pre-flush owner id to
+/// the id its chain ends on: the identity outside a flush's rename pass.
+pub const RetirePlan = struct {
+    ids: std.ArrayList(u32) = .empty,
+    at: std.ArrayList(u32) = .empty,
+    origin: std.ArrayList(u32) = .empty,
+    shards: std.ArrayList(ShardMask) = .empty,
+    rename_to: std.ArrayList(u32) = .empty,
+    ops: std.ArrayList(OpPlan) = .empty,
+
+    pub fn deinit(self: *RetirePlan, allocator: std.mem.Allocator) void {
+        self.ops.deinit(allocator);
+        self.rename_to.deinit(allocator);
+        self.shards.deinit(allocator);
+        self.origin.deinit(allocator);
+        self.at.deinit(allocator);
+        self.ids.deinit(allocator);
+        self.* = .{};
+    }
+
+    // Room for `owners` owner ids (`at` and `rename_to` cover them) and `log` logged ops,
+    // geometric unless `exact`. Returns whether a list grew. On error every list keeps its
+    // contents, `at` stays all `no_entry`, and `rename_to` the identity.
+    fn reserve(self: *RetirePlan, allocator: std.mem.Allocator, owners: usize, log: usize, exact: bool) error{OutOfMemory}!bool {
+        var grew = false;
+        inline for (.{ &self.ids, &self.origin, &self.shards }) |list| grew = try reserveList(list, allocator, owners, exact) or grew;
+        grew = try reserveList(&self.ops, allocator, log, exact) or grew;
+        grew = try reserveList(&self.at, allocator, owners, exact) or grew;
+        grew = try reserveList(&self.rename_to, allocator, owners, exact) or grew;
+        if (owners > self.at.items.len) self.at.appendNTimesAssumeCapacity(no_entry, owners - self.at.items.len);
+        while (self.rename_to.items.len < owners) {
+            // Owner ids stay below the heads' count, a u32 width.
+            self.rename_to.appendAssumeCapacity(@intCast(self.rename_to.items.len));
+        }
+        return grew;
+    }
+
+    fn reserveList(list: anytype, allocator: std.mem.Allocator, count: usize, exact: bool) error{OutOfMemory}!bool {
+        if (count <= list.capacity) return false;
+        if (exact) try list.ensureTotalCapacityPrecise(allocator, count) else try list.ensureTotalCapacity(allocator, count);
+        return true;
+    }
+};
+
+/// The path registry: one directory of registration runs (with a pending count per chunk),
+/// and one inverse pool per shard.
 pub const PathIndex = struct {
     directory: RegistryDirectory = .{},
     pools: [registry_shard_count]InversePool = @splat(.{}),
@@ -242,21 +314,31 @@ pub const PathIndex = struct {
     compact_base: [registry_shard_count]usize = @splat(0),
     counts: [registry_shard_count]PaddedSlot(ShardCount) = @splat(.{}),
     fresh: std.ArrayList(FreshPayload) = .empty,
-    // Retire plan for one flush. The ids and slot heads are the owners the log names;
-    // `retire_heads` is each retire's chain start after the log's head moves, per shard.
-    retire_ids: std.ArrayList(u32) = .empty,
-    retire_slot_heads: std.ArrayList(OwnerHead) = .empty,
-    retire_heads: std.ArrayList(u32) = .empty,
-    retire_head_base: [registry_shard_count]usize = @splat(0),
-    retire_head_count: [registry_shard_count]usize = @splat(0),
+    plan: RetirePlan = .{},
+    // A shrink's plan sized to its new owner count, installed by the flush that installs
+    // the owner heads' truncation.
+    plan_replacement: ?RetirePlan = null,
+    // The owner log bucketed by shard, each shard's op indices in log order at its base:
+    // only ops on an id whose chain the shard holds at that point of the log.
+    shard_ops: std.ArrayList(u32) = .empty,
+    shard_op_base: [registry_shard_count]usize = @splat(0),
+    shard_op_count: [registry_shard_count]usize = @splat(0),
+    // Per shard, the nodes of the chains its ops retire.
     retire_node_count: [registry_shard_count]usize = @splat(0),
+    // Chunks a retire emptied at a flush of step `emptied_step`, each once, each holding a
+    // block (room for one per block of the pool). Each keeps its block and payload until a
+    // flush of a later step finds it still empty, so a chunk published again a step after it
+    // emptied reuses them.
+    emptied: std.ArrayList(ChunkRef) = .empty,
+    emptied_step: u32 = 0,
 
     pub fn deinit(self: *PathIndex, allocator: std.mem.Allocator) void {
         self.abortFresh(allocator);
         self.fresh.deinit(allocator);
-        self.retire_heads.deinit(allocator);
-        self.retire_slot_heads.deinit(allocator);
-        self.retire_ids.deinit(allocator);
+        self.emptied.deinit(allocator);
+        self.shard_ops.deinit(allocator);
+        if (self.plan_replacement) |*replacement| replacement.deinit(allocator);
+        self.plan.deinit(allocator);
         self.compact.deinit(allocator);
         self.growth.deinit(allocator);
         for (&self.pools) |*pool| pool.deinit(allocator);
@@ -291,12 +373,7 @@ pub fn reservePublish(self: *PathfindingSystem) error{OutOfMemory}!void {
         registrations += solved.run_count;
         for (&shard_registrations, solved.shard_counts) |*total, shard_count| total.* += shard_count;
     }
-    const capacity_before = registryCapacity(self);
-    for (&self.path_index.pools, shard_registrations) |*pool, count| {
-        try pool.reserveNodes(self.allocator, count);
-        try pool.reserveOwners(self.allocator, self.completed.logicalCapacity());
-    }
-    var grows: u64 = @intFromBool(registryCapacity(self) != capacity_before);
+    var grows: u64 = @intFromBool(try reserveRegistryRuns(self, shard_registrations));
     // Each range window starts on a cache line.
     const padding = (reg_window_alignment_items - 1) * maxRangeCount(self.solve_results.items.len, 1);
     if (registrations + padding > self.reg_buckets.capacity) {
@@ -308,11 +385,26 @@ pub fn reservePublish(self: *PathfindingSystem) error{OutOfMemory}!void {
     if (pages != 0) self.long_block_growth.record(pages, .info, "path cache long-block pool grew to {d} blocks", .{self.completed.long_block_count});
 }
 
+/// Each shard's inverse pool has room for `shard_registrations` more runs and an owner head
+/// per cache owner id, and the bucketed owner log room for any flush's ops on them. Returns
+/// whether any of it grew; the caller counts the growth. On error nothing is claimed.
+pub fn reserveRegistryRuns(self: *PathfindingSystem, shard_registrations: [registry_shard_count]usize) error{OutOfMemory}!bool {
+    const capacity_before = registryCapacity(self);
+    for (&self.path_index.pools, shard_registrations) |*pool, count| {
+        try pool.reserveNodes(self.allocator, count);
+        try pool.reserveOwners(self.allocator, self.completed.logicalCapacity());
+    }
+    try reserveShardOps(self);
+    return registryCapacity(self) != capacity_before;
+}
+
 // Directory block storage, inverse-node pools, owner heads, and the count windows: a reserve
 // that changed any of them grew.
 fn registryCapacity(self: *const PathfindingSystem) usize {
     const index = &self.path_index;
-    var capacity: usize = index.directory.levelCount() + index.growth.capacity + index.compact.capacity + index.fresh.capacity + index.retire_ids.capacity + index.retire_slot_heads.capacity + index.retire_heads.capacity;
+    const plan = &index.plan;
+    var capacity: usize = index.directory.levelCount() + index.directory.blocks.capacity + index.growth.capacity + index.compact.capacity + index.fresh.capacity +
+        plan.ids.capacity + plan.at.capacity + plan.origin.capacity + plan.shards.capacity + plan.rename_to.capacity + plan.ops.capacity + index.shard_ops.capacity;
     for (0..index.directory.levelCount()) |level| capacity += index.directory.slotCount(@intCast(level));
     for (&index.pools) |*pool| {
         capacity += pool.nodes.capacity + pool.node_free.capacity + pool.owner_heads.capacity + pool.retired.capacity;
@@ -325,44 +417,61 @@ fn countRegistryGrowth(self: *PathfindingSystem, grows: u64) void {
     self.registry_growth.record(grows, .info, "path registry storage grew", .{});
 }
 
-/// Every inverse pool holds an owner head per cache owner id below `capacity`.
+/// Every inverse pool holds an owner head per cache owner id below `capacity`, and the
+/// owner log's plan has room for those ids and a log of `ops_per_entry` ops per id.
 pub fn reserveRegistryOwners(self: *PathfindingSystem, capacity: usize) !void {
     const capacity_before = registryCapacity(self);
     for (&self.path_index.pools) |*pool| try pool.reserveOwners(self.allocator, capacity);
-    var owners: usize = 0;
-    for (&self.path_index.pools) |*pool| owners = @max(owners, pool.owner_heads.items.len);
-    try reserveRetireScratch(self, owners);
+    const owners = ownerIds(self);
+    _ = try self.path_index.plan.reserve(self.allocator, owners, ops_per_entry *| owners, false);
+    try reserveShardOps(self);
     if (registryCapacity(self) != capacity_before) countRegistryGrowth(self, 1);
 }
 
-// The retire plan names at most two ids per op, and one chain start per retire on each
-// shard. A flush logs at most two ops per owner. Reserved with the heads so a warmed
-// flush does not allocate it.
-fn reserveRetireScratch(self: *PathfindingSystem, owners: usize) error{OutOfMemory}!void {
-    const index = &self.path_index;
-    const ids = owners *| 4;
-    // One chain start per retire op per shard: a path's runs are spread across shards.
-    const chains = owners *| 2 *| registry_shard_count;
-    if (ids > index.retire_ids.capacity) try index.retire_ids.ensureTotalCapacity(self.allocator, ids);
-    if (owners > index.retire_slot_heads.capacity) try index.retire_slot_heads.ensureTotalCapacity(self.allocator, owners);
-    if (chains > index.retire_heads.capacity) try index.retire_heads.ensureTotalCapacity(self.allocator, chains);
+// Room for any flush's log bucketed by shard, reserved where its bound grows (the node pools
+// and the owner heads), so no flush allocates it. An op's entries are the shards its chain
+// has nodes in, and a chain takes at most `ops_per_entry` ops between flushes (a shrink's
+// rename, then a retire), so the entries stay below `ops_per_entry` per inverse node, and
+// below `ops_per_entry` per owner id in each shard. Geometric. The plan still grows the list,
+// counted, past this bound.
+fn reserveShardOps(self: *PathfindingSystem) error{OutOfMemory}!void {
+    var nodes: usize = 0;
+    for (&self.path_index.pools) |*pool| nodes += pool.nodes.len;
+    const bound = @min(ops_per_entry *| nodes, registry_shard_count *| ops_per_entry *| ownerIds(self));
+    if (bound > self.path_index.shard_ops.capacity) try self.path_index.shard_ops.ensureTotalCapacity(self.allocator, bound);
 }
 
-/// Drops every path registration. Run lengths go to zero and inverse nodes return to their
-/// pools; payload bytes, directories, and owner-head storage stay, so the same publish fits
-/// again. A prepared owner-head truncation is left for the flush that installs it.
+// The plan names only owner ids below the heads' count.
+fn ownerIds(self: *const PathfindingSystem) usize {
+    var owners: usize = 0;
+    for (&self.path_index.pools) |*pool| owners = @max(owners, pool.owner_heads.items.len);
+    return owners;
+}
+
+/// A shrink to `capacity` owner ids: the plan its flush installs with the owner heads'
+/// truncation, sized exactly to those ids, so the plan follows the owners down. On error
+/// nothing changes.
+pub fn prepareRetireTruncate(self: *PathfindingSystem, capacity: usize) error{OutOfMemory}!void {
+    var replacement = RetirePlan{};
+    errdefer replacement.deinit(self.allocator);
+    _ = try replacement.reserve(self.allocator, capacity, ops_per_entry *| capacity, true);
+    abortRetireTruncate(self);
+    self.path_index.plan_replacement = replacement;
+}
+
+pub fn abortRetireTruncate(self: *PathfindingSystem) void {
+    if (self.path_index.plan_replacement) |*replacement| replacement.deinit(self.allocator);
+    self.path_index.plan_replacement = null;
+}
+
+/// Drops every path registration: every chunk's block and payload return to the pool, so
+/// registry storage follows registrations, and inverse nodes return to their pools. The
+/// directory columns and the node and owner-head storage stay. A prepared owner-head
+/// truncation is left for the flush that installs it.
 pub fn clearRegistry(self: *PathfindingSystem) void {
     const index = &self.path_index;
-    var level: u32 = 0;
-    while (level < index.directory.levelCount()) : (level += 1) {
-        const slots = index.directory.slotCount(level);
-        var slot: usize = 0;
-        while (slot < slots) : (slot += 1) {
-            const block = index.directory.slot(level, slot);
-            if (block != empty_block) index.directory.payloadMut(block).len = 0;
-            index.directory.pending(level, slot).* = 0;
-        }
-    }
+    index.directory.releaseAll(self.allocator);
+    index.emptied.clearRetainingCapacity();
     for (&index.pools) |*pool| pool.clearNodes();
     self.publish_ranges = 0;
 }
@@ -375,15 +484,23 @@ pub fn openRegistryLevels(self: *PathfindingSystem, level_count: usize) error{Ou
     const levels: u32 = @intCast(level_count);
     const chunks = self.graph.chunkCount();
     const directory = &self.path_index.directory;
+    // Held emptied chunks of a closed or emptied level leave the list while every reopened
+    // slot is still empty, so the list never names a later chunk at the same place.
+    var released = false;
+    defer if (released) dropUnheldChunks(&self.path_index);
     var extra = directory.levelCount();
     while (extra > levels) {
         extra -= 1;
         directory.closeLevel(self.allocator, @intCast(extra));
+        released = true;
     }
     var level: u32 = 0;
     while (level < levels) : (level += 1) {
         const current = directory.slotCount(level);
-        if (current != chunks and current != 0) releaseLevelBlocks(self, level);
+        if (current != chunks and current != 0) {
+            directory.emptyLevel(self.allocator, level);
+            released = true;
+        }
         try directory.openLevel(self.allocator, level, chunks);
     }
 }
@@ -443,7 +560,9 @@ pub fn claimPublish(self: *PathfindingSystem, stats: *PathfindingStats) void {
 /// selected shape, O(1) per result; inline it is one range. Returns the stage's batch.
 pub fn publishCopy(self: *PathfindingSystem, dispatch: Dispatch) BatchStats {
     const item_count = self.solve_results.items.len;
-    self.publish_ranges = 0;
+    // The last flush added the previous publish's registrations: a flush that failed is
+    // finished at the next update's top (`recoverRegistry`) before any publish.
+    std.debug.assert(self.publish_ranges == 0);
     if (item_count == 0) return .{};
     const shape = stageShape(dispatch, item_count, 1);
     std.debug.assert(self.publish_range_bases.capacity >= shape.range_count);
@@ -530,40 +649,81 @@ fn publishCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     job.bands[range.index] = .{ .counts = counts };
 }
 
-/// `registry_flush`: shard by shard, compacts the chunks a retire touched (survivors keep
-/// their order), renames along each inverse chain, then appends the last publish copy's
+/// A threaded flush's dispatches: the apply stage under its caller's tuner, and the count
+/// dispatch's own tuner. The update's flush and the eviction's flush each own both: the
+/// eviction's count items are all retired inverse nodes (a chain walk and a sort of the
+/// listed chunks), the update's mostly publish adds (a bucket read and a pending increment).
+pub const FlushDispatch = struct {
+    apply: Dispatch,
+    count_tuner: *AdaptiveWorkTuner,
+};
+
+/// True when a flush that ran out of memory left work for the next one: the last publish's
+/// registrations, logged owner ops, or a shrink's prepared owner heads. Every update and
+/// nav reaction otherwise ends flushed.
+pub fn registryBehind(self: *const PathfindingSystem) bool {
+    return self.publish_ranges != 0 or self.completed.core.ownerLog().len != 0 or self.registry_truncate_pending;
+}
+
+/// Finishes the work a failed flush left (`registryBehind`) before anything publishes, logs
+/// more owner ops, resizes, or reads the registry: a later publish copy would overwrite the
+/// pending registrations, and a retire logged after them would leave them naming a dead
+/// owner. A one-off, so it runs at the fixed shape outside the tuners, as a shrink's flush.
+/// Does nothing when the registry is current. On `OutOfMemory` it is still behind, for retry.
+pub fn recoverRegistry(self: *PathfindingSystem, dispatch: ?FlushDispatch) error{OutOfMemory}!void {
+    if (!registryBehind(self)) return;
+    self.registry_flush_fixed = true;
+    _ = try flushRegistry(self, dispatch, null);
+}
+
+/// `registry_flush`: shard by shard, applies the owner ops on the shard's chains in log
+/// order (a retire marks its chain, a rename moves its head), compacts the chunks a retire
+/// touched (survivors keep their order), then appends the last publish copy's
 /// registrations of the shard in range order, and installs a shrink's prepared owner heads.
-/// Count runs first and does not mutate runs. The main thread then reallocates a chunk
-/// whose cap cannot hold its adds. On `OutOfMemory` the runs are unchanged and `pending`
-/// is cleared. Each pair (shard) writes only its shard and its tally. Then the log is
-/// emptied and the replaced owner heads are freed. `stats` (when given) takes the apply
-/// batch; the count batch is `registry_flush_count_batch` and is not a perf-log key.
-/// Count items: pair p weighs its adds + the inverse nodes its retires mark after the
-/// log's head moves + 1. Apply items: the live lengths of the chunks it compacts + its
-/// adds + 1. A range runs the pairs whose first unit lies in it. A shrink or a rebuild
-/// flush runs both dispatches at a fixed shape of about one pair per range, outside the
-/// tuners. A dispatch wakes at most one worker fewer than the pair count. Returns the
-/// apply batch.
-pub fn flushRegistry(self: *PathfindingSystem, dispatch: ?Dispatch, stats: ?*PathfindingStats) error{OutOfMemory}!BatchStats {
+/// The plan buckets the log by shard once on the main thread. Count runs first and does not
+/// mutate runs. The main thread then reallocates a chunk whose cap cannot hold its adds
+/// (`reserveRegistryPayloads`, the flush's growth seam). A flush that renames rewrites every
+/// registration's owner in one pass over the block pool (`registry_rename`) before the
+/// apply. On `OutOfMemory` the runs are unchanged, `pending` is cleared, and the publish's
+/// registrations, the log, and a prepared truncation stay for the retry
+/// (`recoverRegistry`). Each pair (shard) writes only its shard and its tally. After the
+/// apply join the main thread holds every compacted chunk left without registrations, and a
+/// flush of a later step, with work or not, releases the block of each held chunk still
+/// empty. Then the log is emptied and the replaced owner heads and plan are freed.
+/// `stats` (when given) takes the apply batch; the count and rename batches are
+/// perf-log-gated bench output (`PathfindingStats.Perf`).
+/// Count items: pair p weighs its adds + its ops + the inverse nodes its retires mark + 1.
+/// Apply items: the live lengths of the chunks it compacts + its adds + its ops + the
+/// nodes its retires mark + 1. A range runs the pairs whose first unit lies in it. A
+/// shrink, a rebuild, or a recovery flush runs both dispatches at a fixed shape of about
+/// one pair per range, outside the tuners; the rename pass always does. A dispatch wakes at
+/// most one worker fewer than the pair count. Returns the apply batch.
+pub fn flushRegistry(self: *PathfindingSystem, dispatch: ?FlushDispatch, stats: ?*PathfindingStats) error{OutOfMemory}!BatchStats {
+    // A failed flush leaves the fixed shape to the flush that finishes it, never a later one.
+    defer self.registry_flush_fixed = false;
     var batch = BatchStats{};
     const truncate = self.registry_truncate_pending;
     const ops = self.completed.core.ownerLog();
+    var count_batch = BatchStats{};
+    var rename_batch = BatchStats{};
     if (ops.len != 0 or self.publish_ranges != 0 or truncate) {
         var pair_adds: [flush_pair_count]usize = @splat(0);
+        // SIMD verdict: scalar. A 16-wide sum per publish range, a tiny fixed batch.
         for (self.publish_bands.items[0..self.publish_ranges]) |band| {
             for (&pair_adds, band.counts) |*adds, count| adds.* += count;
         }
-        const retire_nodes = try planRetireChains(self, ops);
+        const planned = try planOwnerLog(self, ops);
         const fix = truncate or self.registry_flush_fixed;
-        const count_batch = try runRegistryCount(self, dispatch, pair_adds, retire_nodes, fix);
-        self.registry_flush_count_batch = count_batch;
-        if (stats) |step| step.registry_flush_count_batch = count_batch;
+        count_batch = try runRegistryCount(self, dispatch, ops, pair_adds, fix);
         try reserveRegistryPayloads(self);
+        if (planned.renamed_nodes != 0) rename_batch = runRegistryRename(self, if (dispatch) |stage| stage.apply else null);
         var apply_units: [flush_pair_count]usize = undefined;
-        for (&apply_units, &self.path_index.counts, pair_adds) |*units, *counted, adds| {
-            units.* = counted.value.compact_len + adds + 1;
+        for (&apply_units, &self.path_index.counts, pair_adds, self.path_index.shard_op_count, self.path_index.retire_node_count) |*units, *counted, adds, shard_ops, retired| {
+            units.* = counted.value.compact_len + adds + shard_ops + retired + 1;
         }
-        batch = runRegistryApply(self, dispatch, ops, apply_units, fix);
+        batch = runRegistryApply(self, if (dispatch) |stage| stage.apply else null, ops, apply_units, fix);
+        releaseEmptiedChunks(self);
+        holdEmptiedChunks(self);
         if (comptime runtime_perf_log.enabled) {
             if (stats) |step| {
                 for (self.flush_tallies) |tally| {
@@ -572,100 +732,128 @@ pub fn flushRegistry(self: *PathfindingSystem, dispatch: ?Dispatch, stats: ?*Pat
                 }
             }
         }
-    } else {
-        self.registry_flush_count_batch = .{};
-        if (stats) |step| step.registry_flush_count_batch = .{};
+    } else if (self.path_index.emptied_step != self.step_counter) releaseEmptiedChunks(self);
+    if (comptime runtime_perf_log.enabled) {
+        self.perf.last_flush_count_batch = count_batch;
+        self.perf.last_flush_rename_batch = rename_batch;
+        if (stats) |step| {
+            step.perf.registry_flush_count_batch = count_batch;
+            step.perf.registry_rename_batch = rename_batch;
+        }
     }
     self.publish_ranges = 0;
     self.completed.core.finishOwnerLog(self.allocator);
     if (truncate) {
-        for (&self.path_index.pools) |*pool| pool.releaseTruncated(self.allocator);
+        const index = &self.path_index;
+        for (&index.pools) |*pool| pool.releaseTruncated(self.allocator);
+        if (index.plan_replacement) |replacement| {
+            index.plan.deinit(self.allocator);
+            index.plan = replacement;
+            index.plan_replacement = null;
+        }
         self.registry_truncate_pending = false;
     }
-    self.registry_flush_fixed = false;
     return batch;
 }
 
-fn lessU32(_: void, a: u32, b: u32) bool {
-    return a < b;
-}
+/// What the plan found: the inverse nodes of the chains the log renames, over every shard.
+const PlanTotals = struct {
+    renamed_nodes: usize = 0,
+};
 
-fn orderU32(item: u32, key: u32) std.math.Order {
-    return std.math.order(item, key);
-}
-
-fn retireHead(ids: []const u32, heads: []OwnerHead, owner: u32) ?*OwnerHead {
-    const at = std.sort.lowerBound(u32, ids, owner, orderU32);
-    if (at >= ids.len or ids[at] != owner) return null;
-    return &heads[at];
-}
-
-// Head moves in log order, on the owners the log names. A retire records the chain it
-// will mark and clears that head; a rename moves the head. Does not touch runs or the
-// live heads. The count job walks the recorded chains, and that walk's node count is the
-// compact window. O(logged ops) here.
-fn planRetireChains(self: *PathfindingSystem, ops: []const OwnerOp) error{OutOfMemory}![flush_pair_count]usize {
-    const index = &self.path_index;
-    var owners: usize = 0;
-    for (&index.pools) |*pool| owners = @max(owners, pool.owner_heads.items.len);
-    try reserveRetireScratch(self, owners);
-    const id_need = ops.len *| 2;
-    const chain_need = ops.len *| registry_shard_count;
-    if (id_need > index.retire_ids.capacity) try index.retire_ids.ensureTotalCapacity(self.allocator, id_need);
-    if (chain_need > index.retire_heads.capacity) try index.retire_heads.ensureTotalCapacity(self.allocator, chain_need);
-    index.retire_heads.clearRetainingCapacity();
-    var nodes: [flush_pair_count]usize = @splat(0);
-    for (&index.pools, 0..) |*pool, shard| {
-        const base = index.retire_heads.items.len;
-        const planned = planShardRetires(index, pool, ops);
-        index.retire_head_base[shard] = base;
-        index.retire_head_count[shard] = planned.chains;
-        nodes[shard] = planned.nodes;
-    }
-    index.retire_node_count = nodes;
-    return nodes;
-}
-
-fn planShardRetires(index: *PathIndex, pool: *const InversePool, ops: []const OwnerOp) struct { chains: usize, nodes: usize } {
-    std.debug.assert(pool.owner_heads.items.len <= std.math.maxInt(u32));
-    const limit: u32 = @intCast(pool.owner_heads.items.len);
-    index.retire_ids.clearRetainingCapacity();
-    for (ops) |op| {
-        if (op.old < limit) index.retire_ids.appendAssumeCapacity(op.old);
-        if (op.new != no_owner and op.new < limit) index.retire_ids.appendAssumeCapacity(op.new);
-    }
-    const gathered = index.retire_ids.items;
-    pdq(u32, gathered, {}, lessU32);
-    var unique: usize = 0;
-    for (gathered) |owner| {
-        if (unique != 0 and gathered[unique - 1] == owner) continue;
-        gathered[unique] = owner;
-        unique += 1;
-    }
-    index.retire_ids.items.len = unique;
-    index.retire_slot_heads.clearRetainingCapacity();
-    for (index.retire_ids.items) |owner| index.retire_slot_heads.appendAssumeCapacity(pool.owner_heads.items[owner]);
-    const heads = index.retire_slot_heads.items;
-    var chains: usize = 0;
-    var node_count: usize = 0;
-    for (ops) |op| {
-        const old = retireHead(index.retire_ids.items, heads, op.old) orelse continue;
-        if (old.node == no_entry) continue;
-        if (op.new == no_owner) {
-            index.retire_heads.appendAssumeCapacity(old.node);
-            node_count += old.len;
-            chains += 1;
-            old.* = .{};
-            continue;
+// The id's place in the plan, listing it on first sight with the shards its pre-flush
+// chain has nodes in: one head read per shard.
+// SIMD verdict: scalar. Sixteen head reads from sixteen pools, a tiny fixed batch.
+fn planSlot(index: *PathIndex, owner: u32) u32 {
+    const plan = &index.plan;
+    const at = &plan.at.items[owner];
+    if (at.* == no_entry) {
+        at.* = @intCast(plan.ids.items.len);
+        var shards: ShardMask = 0;
+        for (&index.pools, 0..) |*pool, shard| {
+            const heads = pool.owner_heads.items;
+            if (owner < heads.len and heads[owner].node != no_entry) shards |= @as(ShardMask, 1) << @intCast(shard);
         }
-        // The renamed-to id is in this pool's heads: the log only renames onto one.
-        std.debug.assert(op.new < limit);
-        const dest = retireHead(index.retire_ids.items, heads, op.new).?;
-        std.debug.assert(dest.node == no_entry);
-        dest.* = old.*;
-        old.* = .{};
+        plan.ids.appendAssumeCapacity(owner);
+        plan.origin.appendAssumeCapacity(owner);
+        plan.shards.appendAssumeCapacity(shards);
     }
-    return .{ .chains = chains, .nodes = node_count };
+    return at.*;
+}
+
+// The owner log's plan, once for every shard, on the main thread. Head moves in log order
+// on the owner ids the log names (below the heads' count; ids past it hold no chain and
+// receive none): each listed id tracks which id's pre-flush chain it holds, a rename moves
+// that origin to the new id and a retire ends it. Every chain moves whole, so an op touches
+// exactly the shards its origin's pre-flush chain has nodes in. Then the log is bucketed by
+// shard (`shard_ops`, log order within a shard), each shard's retired nodes are summed for
+// the count windows and both dispatches' weights, and the renamed nodes for the rename
+// pass. Does not touch runs or the live heads. O(logged ops + 16 per listed id + the ops'
+// shard entries): O(1) per item, no sort or search. On error `at` stays all `no_entry`.
+// SIMD verdict: scalar. Sequential head moves, each depending on the ops before it, and a
+// counting-sort scatter by shard bit.
+fn planOwnerLog(self: *PathfindingSystem, ops: []const OwnerOp) error{OutOfMemory}!PlanTotals {
+    const index = &self.path_index;
+    const plan = &index.plan;
+    const owners = ownerIds(self);
+    if (try plan.reserve(self.allocator, owners, ops.len, false)) countRegistryGrowth(self, 1);
+    std.debug.assert(owners <= std.math.maxInt(u32) and ops.len <= std.math.maxInt(u32));
+    std.debug.assert(plan.at.items.len >= owners and plan.rename_to.items.len >= owners);
+    const limit: u32 = @intCast(owners);
+    plan.ids.clearRetainingCapacity();
+    plan.origin.clearRetainingCapacity();
+    plan.shards.clearRetainingCapacity();
+    plan.ops.items.len = ops.len;
+    var shard_ops: [flush_pair_count]usize = @splat(0);
+    for (ops, plan.ops.items) |op, *planned| {
+        planned.* = .{};
+        if (op.old >= limit) continue;
+        const old = planSlot(index, op.old);
+        const origin = plan.origin.items[old];
+        plan.origin.items[old] = no_entry;
+        if (origin != no_entry) {
+            planned.* = .{ .origin = origin, .shards = plan.shards.items[plan.at.items[origin]] };
+            var bits = planned.shards;
+            while (bits != 0) : (bits &= bits - 1) shard_ops[@ctz(bits)] += 1;
+        }
+        if (op.new == no_owner) continue;
+        // The log only renames onto an id below the heads' count that holds no chain.
+        std.debug.assert(op.new < limit);
+        const dest = planSlot(index, op.new);
+        if (std.debug.runtime_safety) {
+            const held = plan.origin.items[dest];
+            if (held == op.new) std.debug.assert(plan.shards.items[dest] == 0) else std.debug.assert(held == no_entry);
+        }
+        plan.origin.items[dest] = origin;
+    }
+    for (plan.ids.items) |owner| plan.at.items[owner] = no_entry;
+    var total: usize = 0;
+    var cursors: [flush_pair_count]usize = undefined;
+    for (&cursors, shard_ops) |*cursor, count| {
+        cursor.* = total;
+        total += count;
+    }
+    if (total > index.shard_ops.capacity) {
+        try index.shard_ops.ensureTotalCapacity(self.allocator, total);
+        countRegistryGrowth(self, 1);
+    }
+    index.shard_ops.items.len = total;
+    index.shard_op_base = cursors;
+    index.shard_op_count = shard_ops;
+    var retired: [flush_pair_count]usize = @splat(0);
+    var totals = PlanTotals{};
+    for (ops, plan.ops.items, 0..) |op, planned, op_index| {
+        var bits = planned.shards;
+        while (bits != 0) : (bits &= bits - 1) {
+            const shard = @ctz(bits);
+            index.shard_ops.items[cursors[shard]] = @intCast(op_index);
+            cursors[shard] += 1;
+            const nodes = index.pools[shard].owner_heads.items[planned.origin].len;
+            if (op.new == no_owner) retired[shard] += nodes else totals.renamed_nodes += nodes;
+        }
+    }
+    index.retire_node_count = retired;
+    return totals;
 }
 
 fn shapedDispatch(stage: Dispatch, units: usize, fix: bool, tuner: *AdaptiveWorkTuner) Dispatch {
@@ -678,6 +866,7 @@ fn shapedDispatch(stage: Dispatch, units: usize, fix: bool, tuner: *AdaptiveWork
     return shaped;
 }
 
+// SIMD verdict: scalar. A 16-entry prefix sum, a tiny fixed batch.
 fn unitStarts(weights: [flush_pair_count]usize) struct { starts: [flush_pair_count + 1]usize, total: usize } {
     var starts: [flush_pair_count + 1]usize = undefined;
     var total: usize = 0;
@@ -691,19 +880,21 @@ fn unitStarts(weights: [flush_pair_count]usize) struct { starts: [flush_pair_cou
 
 fn runRegistryCount(
     self: *PathfindingSystem,
-    dispatch: ?Dispatch,
+    dispatch: ?FlushDispatch,
+    ops: []const OwnerOp,
     pair_adds: [flush_pair_count]usize,
-    retire_nodes: [flush_pair_count]usize,
     fix: bool,
 ) error{OutOfMemory}!BatchStats {
+    const index = &self.path_index;
     var weights: [flush_pair_count]usize = undefined;
-    for (&weights, pair_adds, retire_nodes) |*weight, adds, nodes| weight.* = adds + nodes + 1;
+    for (&weights, pair_adds, index.shard_op_count, index.retire_node_count) |*weight, adds, shard_ops, nodes| weight.* = adds + shard_ops + nodes + 1;
     const counted = unitStarts(weights);
-    try reserveCountWindows(self, pair_adds, retire_nodes);
-    const count_dispatch: ?Dispatch = if (dispatch) |stage| shapedDispatch(stage, counted.total, fix, &self.tuners.registry_flush_count) else null;
+    try reserveCountWindows(self, pair_adds, index.retire_node_count);
+    const count_dispatch: ?Dispatch = if (dispatch) |stage| shapedDispatch(stage.apply, counted.total, fix, stage.count_tuner) else null;
     const shape = stageShape(count_dispatch, counted.total, 1);
     var job = RegistryCountJob{
         .system = self,
+        .ops = ops,
         .publish_ranges = self.publish_ranges,
         .range_count = shape.range_count,
         .unit_starts = counted.starts,
@@ -711,6 +902,7 @@ fn runRegistryCount(
     return runShaped(count_dispatch, shape, counted.total, 1, &job, registryCountJob);
 }
 
+// SIMD verdict: scalar. A 16-entry aligned prefix, a tiny fixed batch.
 fn reserveCountWindows(self: *PathfindingSystem, pair_adds: [flush_pair_count]usize, retire_nodes: [flush_pair_count]usize) error{OutOfMemory}!void {
     var cursor: usize = 0;
     var bases: [flush_pair_count]usize = undefined;
@@ -720,12 +912,79 @@ fn reserveCountWindows(self: *PathfindingSystem, pair_adds: [flush_pair_count]us
         cursor += adds + nodes;
     }
     const index = &self.path_index;
-    if (cursor > index.growth.capacity) try index.growth.ensureTotalCapacity(self.allocator, cursor);
-    if (cursor > index.compact.capacity) try index.compact.ensureTotalCapacity(self.allocator, cursor);
+    var grows: u64 = 0;
+    if (cursor > index.growth.capacity) {
+        try index.growth.ensureTotalCapacity(self.allocator, cursor);
+        grows += 1;
+    }
+    if (cursor > index.compact.capacity) {
+        try index.compact.ensureTotalCapacity(self.allocator, cursor);
+        grows += 1;
+    }
+    if (grows != 0) countRegistryGrowth(self, grows);
     index.growth.items.len = cursor;
     index.compact.items.len = cursor;
     index.growth_base = bases;
     index.compact_base = bases;
+}
+
+// `registry_rename`, after the payload growth and before the apply: the plan's renames
+// rewrite the owner of every registration in one pass over the block pool, one item per
+// block (a chunk's run), instead of walking each renamed chain. `rename_to` maps each
+// renamed chain's pre-flush owner to the id its chain ends on, set here on the main thread
+// (O(listed ids)) and reset to the identity after the join. A one-off of a cache shrink, so
+// it runs at a fixed shape of about a sixteenth of the pool per range, outside the tuners.
+// Returns the stage's batch.
+// SIMD verdict: scalar. The `rename_to` set and reset are sparse scatters over the listed
+// ids.
+fn runRegistryRename(self: *PathfindingSystem, dispatch: ?Dispatch) BatchStats {
+    const index = &self.path_index;
+    const plan = &index.plan;
+    for (plan.ids.items, plan.origin.items) |id, origin| {
+        if (origin != no_entry and origin != id) plan.rename_to.items[origin] = id;
+    }
+    const blocks = index.directory.blocks.items;
+    const rename_dispatch: ?Dispatch = if (dispatch) |stage| shapedDispatch(stage, blocks.len, true, stage.tuner) else null;
+    const shape = stageShape(rename_dispatch, blocks.len, 1);
+    var job = RegistryRenameJob{
+        .blocks = blocks,
+        .rename_to = plan.rename_to.items,
+        .range_count = shape.range_count,
+    };
+    const batch = runShaped(rename_dispatch, shape, blocks.len, 1, &job, registryRenameJob);
+    for (plan.ids.items, plan.origin.items) |id, origin| {
+        if (origin != no_entry and origin != id) plan.rename_to.items[origin] = origin;
+    }
+    return batch;
+}
+
+const RegistryRenameJob = struct {
+    blocks: []const RegistryDirectory.Block,
+    rename_to: []const u32,
+    range_count: usize,
+};
+
+// SIMD verdict: SIMD. Each run's owner column streams through `rename_to` in u32 lane gathers,
+// its tail the same gather on one masked lane batch. Ranges write only their own blocks'
+// payloads, separate allocations.
+fn registryRenameJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *RegistryRenameJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end and range.end <= job.blocks.len);
+    const rename_to = job.rename_to;
+    for (job.blocks[range.start..range.end]) |block| {
+        const owners = block.payload.owner[0..block.payload.len];
+        var row: usize = 0;
+        while (row + simd.lane_count <= owners.len) : (row += simd.lane_count) {
+            const renamed = simd.gatherUint4(rename_to, simd.loadUint4(owners[row..]));
+            simd.storeUint4Slice(owners[row..], renamed);
+        }
+        const tail = owners.len - row;
+        if (tail != 0) {
+            const renamed = simd.gatherUint4Masked(rename_to, simd.loadUint4Prefix(owners[row..], tail), simd.lanesBelow(tail));
+            simd.storeUint4Prefix(owners[row..], renamed, tail);
+        }
+    }
 }
 
 fn runRegistryApply(
@@ -749,11 +1008,19 @@ fn runRegistryApply(
     return runShaped(apply_dispatch, shape, counted.total, 1, &job, registryApplyJob);
 }
 
+// The flush's growth seam, on the main thread between the count join and the apply
+// dispatch: every chunk the count listed whose cap cannot hold its adds gets a geometric
+// payload (and, when it held none, a block), all or nothing. Each payload allocation, block
+// claim, and growth of the block pool or the fresh list is counted in `registry_growth`.
+// SIMD verdict: scalar. One allocation and copy per grown chunk, allocator-bound.
 fn reserveRegistryPayloads(self: *PathfindingSystem) error{OutOfMemory}!void {
     const index = &self.path_index;
     var listed: usize = 0;
     for (&index.counts) |counted| listed += counted.value.growth;
     index.fresh.clearRetainingCapacity();
+    const fresh_capacity = index.fresh.capacity;
+    const block_capacity = index.directory.blocks.capacity;
+    const emptied_capacity = index.emptied.capacity;
     index.fresh.ensureTotalCapacity(self.allocator, listed) catch {
         clearCountedPending(self);
         return error.OutOfMemory;
@@ -770,14 +1037,80 @@ fn reserveRegistryPayloads(self: *PathfindingSystem) error{OutOfMemory}!void {
             };
         }
     }
+    // The held emptied chunks are distinct chunks holding blocks, so the list grows with the
+    // block pool, here.
+    index.emptied.ensureTotalCapacity(self.allocator, index.directory.blocks.items.len) catch {
+        index.abortFresh(self.allocator);
+        clearCountedPending(self);
+        return error.OutOfMemory;
+    };
+    var grows: u64 = @as(u64, @intFromBool(index.fresh.capacity != fresh_capacity)) + @intFromBool(index.directory.blocks.capacity != block_capacity) +
+        @intFromBool(index.emptied.capacity != emptied_capacity);
     for (index.fresh.items) |item| {
         if (item.old_bytes.len != 0) freePayload(self.allocator, item.old_bytes);
         index.directory.setPayload(item.block, item.bytes, item.columns);
         if (item.is_new) index.directory.setSlot(item.level, item.chunk, item.block);
         std.debug.assert(item.columns.cap >= item.columns.len);
+        grows += 1 + @as(u64, @intFromBool(item.is_new));
     }
+    if (grows != 0) countRegistryGrowth(self, grows);
     index.fresh.clearRetainingCapacity();
     clearCountedPending(self);
+}
+
+// After a flush's apply join, or in a flush with no work: at a flush of a later step than
+// the one that held them, every held chunk still without registrations returns its block and
+// payload, so registry storage follows the chunks holding registrations with one step's lag,
+// and the list empties. At a flush of the same step, a held chunk published again leaves the
+// list, so every listed chunk holds a block and no registration after each flush, and the
+// list never names a chunk twice. A held chunk whose level closed or emptied reads
+// `empty_block`. O(held chunks) on the main thread, in list order, so block ids never depend
+// on workers.
+// SIMD verdict: scalar. A sparse walk of the held chunks with one free each,
+// allocator-bound.
+fn releaseEmptiedChunks(self: *PathfindingSystem) void {
+    const index = &self.path_index;
+    const directory = &index.directory;
+    if (index.emptied_step == self.step_counter) return dropUnheldChunks(index);
+    for (index.emptied.items) |ref| {
+        const block = directory.slot(ref.level, ref.chunk);
+        if (block == empty_block or directory.payload(block).len != 0) continue;
+        directory.release(self.allocator, block);
+        directory.setSlot(ref.level, ref.chunk, empty_block);
+    }
+    index.emptied.clearRetainingCapacity();
+    index.emptied_step = self.step_counter;
+}
+
+// Drops every listed chunk that holds registrations again or no longer holds a block.
+// SIMD verdict: scalar. An in-place filter of the sparse held list.
+fn dropUnheldChunks(index: *PathIndex) void {
+    var kept: usize = 0;
+    for (index.emptied.items) |ref| {
+        const block = index.directory.slot(ref.level, ref.chunk);
+        if (block == empty_block or index.directory.payload(block).len != 0) continue;
+        index.emptied.items[kept] = ref;
+        kept += 1;
+    }
+    index.emptied.items.len = kept;
+}
+
+// After the apply join and `releaseEmptiedChunks`: every chunk a retire compacted that holds
+// no registration now is held (`PathIndex.emptied`). A compacted chunk held registrations
+// after the last flush, so it is not listed yet; room for one ref per block is reserved at
+// the growth seam. O(compacted chunks) on the main thread, in shard order.
+// SIMD verdict: scalar. A sparse walk of the compacted chunks.
+fn holdEmptiedChunks(self: *PathfindingSystem) void {
+    const index = &self.path_index;
+    std.debug.assert(index.emptied_step == self.step_counter);
+    for (&index.counts, index.compact_base) |counted, base| {
+        for (index.compact.items[base..][0..counted.value.compact]) |ref| {
+            const block = index.directory.slot(ref.level, ref.chunk);
+            if (block == empty_block or index.directory.payload(block).len != 0) continue;
+            std.debug.assert(index.emptied.items.len < index.emptied.capacity);
+            index.emptied.appendAssumeCapacity(ref);
+        }
+    }
 }
 
 fn growChunk(self: *PathfindingSystem, ref: ChunkRef) error{OutOfMemory}!void {
@@ -812,25 +1145,13 @@ fn growChunk(self: *PathfindingSystem, ref: ChunkRef) error{OutOfMemory}!void {
     committed = true;
 }
 
+// SIMD verdict: scalar. A sparse scatter over the grown chunks.
 fn clearCountedPending(self: *PathfindingSystem) void {
     const index = &self.path_index;
     for (&index.counts, index.growth_base) |counted, base| {
         for (index.growth.items[base..][0..counted.value.growth]) |ref| {
             index.directory.pending(ref.level, ref.chunk).* = 0;
         }
-    }
-}
-
-fn releaseLevelBlocks(self: *PathfindingSystem, level: u32) void {
-    const directory = &self.path_index.directory;
-    const slots = directory.slotCount(level);
-    var slot: usize = 0;
-    while (slot < slots) : (slot += 1) {
-        const block = directory.slot(level, slot);
-        if (block == empty_block) continue;
-        directory.release(self.allocator, block);
-        directory.setSlot(level, slot, empty_block);
-        directory.pending(level, slot).* = 0;
     }
 }
 
@@ -848,7 +1169,7 @@ fn geometricCap(cap: u32, len: u32, pending: u32) error{OutOfMemory}!u32 {
 }
 
 fn regBytes(cap: u32) usize {
-    return @as(usize, cap) * 3 * @sizeOf(u32);
+    return @as(usize, cap) * reg_row_bytes;
 }
 
 fn allocPayload(allocator: std.mem.Allocator, size: usize) error{OutOfMemory}![]align(4) u8 {
@@ -901,6 +1222,7 @@ pub fn registrationRun(directory: *const RegistryDirectory, key: u64) RegChunk {
 
 const RegistryCountJob = struct {
     system: *PathfindingSystem,
+    ops: []const OwnerOp,
     publish_ranges: usize,
     range_count: usize,
     unit_starts: [flush_pair_count + 1]usize,
@@ -920,11 +1242,11 @@ fn registryCountJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
     std.debug.assert(range.start <= range.end and range.end <= job.unit_starts[flush_pair_count]);
     var pair = std.sort.lowerBound(usize, starts, range.start, orderUnit);
     while (pair < flush_pair_count and starts[pair] < range.end) : (pair += 1) {
-        countShard(system, pair, job.publish_ranges);
+        countShard(system, pair, job.ops, job.publish_ranges);
     }
 }
 
-fn countShard(system: *PathfindingSystem, pair: usize, publish_ranges: usize) void {
+fn countShard(system: *PathfindingSystem, pair: usize, ops: []const OwnerOp, publish_ranges: usize) void {
     const index = &system.path_index;
     const pool = &index.pools[pair];
     const directory = &index.directory;
@@ -945,14 +1267,14 @@ fn countShard(system: *PathfindingSystem, pair: usize, publish_ranges: usize) vo
             pending.* += 1;
         }
     }
-    // The chains `planRetireChains` recorded: a rename onto an id, then a retire of that
-    // id, lists the moved chain, which is what `markRetired` marks.
+    // The pre-flush chains the shard's retires mark, from the live heads of their origins:
+    // a rename onto an id, then a retire of that id, marks the moved chain.
     var listed: u32 = 0;
-    const head_base = index.retire_head_base[pair];
-    const head_count = index.retire_head_count[pair];
-    std.debug.assert(head_base + head_count <= index.retire_heads.items.len);
-    for (index.retire_heads.items[head_base..][0..head_count]) |start| {
-        var node = start;
+    const heads = pool.owner_heads.items;
+    const plans = index.plan.ops.items;
+    for (index.shard_ops.items[index.shard_op_base[pair]..][0..index.shard_op_count[pair]]) |op_index| {
+        if (ops[op_index].new != no_owner) continue;
+        var node = heads[plans[op_index].origin].node;
         while (node != no_entry) : (node = pool.node_next[node]) {
             std.debug.assert(@as(usize, listed) < index.retire_node_count[pair]);
             const key = pool.node_chunk[node];
@@ -1001,15 +1323,18 @@ fn applyShard(system: *PathfindingSystem, pair: usize, ops: []const OwnerOp, pub
     const index = &system.path_index;
     const pool = &index.pools[pair];
     const directory = &index.directory;
-    // Log order: a retire after a rename must see the chain on its new owner. Compact
-    // follows, so every mark is in place and survivor indices are rewritten once.
+    // The shard's ops in log order: a retire after a rename must see the chain on its new
+    // owner. The rename pass already rewrote the registrations' owners, so a rename moves
+    // the head alone. Compact follows, so every mark is in place and survivor indices are
+    // rewritten once.
     var removed: usize = 0;
-    for (ops) |op| {
-        if (!pool.holdsOwner(op.old)) continue;
+    for (index.shard_ops.items[index.shard_op_base[pair]..][0..index.shard_op_count[pair]]) |op_index| {
+        const op = ops[op_index];
+        std.debug.assert(pool.holdsOwner(op.old));
         if (op.new == no_owner) {
             removed += pool.owner_heads.items[op.old].len;
             markRetired(pool, op.old);
-        } else renameOwner(directory, pool, op.old, op.new);
+        } else moveChain(pool, op.old, op.new);
     }
     const compact_base = index.compact_base[pair];
     const compact_count = index.counts[pair].value.compact;
@@ -1059,17 +1384,10 @@ fn compactChunk(directory: *RegistryDirectory, pool: *InversePool, ref: ChunkRef
     std.debug.assert(run.cap >= run.len);
 }
 
-fn renameOwner(directory: *RegistryDirectory, pool: *InversePool, old: u32, new: u32) void {
+// A rename's head move; its registrations' owners were rewritten by the rename pass.
+fn moveChain(pool: *InversePool, old: u32, new: u32) void {
     std.debug.assert(new < pool.owner_heads.items.len);
     std.debug.assert(pool.owner_heads.items[new].node == no_entry);
-    var node = pool.owner_heads.items[old].node;
-    while (node != no_entry) {
-        const key = pool.node_chunk[node];
-        const at = pool.node_index[node];
-        const block = directory.slot(keyLevel(key), keyChunk(key));
-        directory.payloadMut(block).owner[at] = new;
-        node = pool.node_next[node];
-    }
     pool.owner_heads.items[new] = pool.owner_heads.items[old];
     pool.owner_heads.items[old] = .{};
 }
@@ -1123,7 +1441,6 @@ const expectRegistryMatchesCache = test_support.expectRegistryMatchesCache;
 const expectSameCache = test_support.expectSameCache;
 const expectSameRegistry = test_support.expectSameRegistry;
 const fixed_threads_config = test_support.fixed_threads_config;
-const flushUnits = test_support.flushUnits;
 const loadTestWorldMeta = test_support.loadTestWorldMeta;
 const publishTestPath = test_support.publishTestPath;
 const registryRoute = test_support.registryRoute;
@@ -1137,6 +1454,12 @@ const shrinkFixture = test_support.shrinkFixture;
 const solveIndividualGoals = test_support.solveIndividualGoals;
 const solveRegistryRoutes = test_support.solveRegistryRoutes;
 const cachedStep = test_support.cachedStep;
+
+// Work units of a registry flush that adds `adds` registrations and applies no op: one per
+// pair and one per add.
+fn flushUnits(adds: usize) usize {
+    return flush_pair_count + adds;
+}
 
 // The last update published routes `[first, first + count)` of a registry world `side` tiles
 // a side.
@@ -1210,8 +1533,12 @@ test "pathfinding result publish after its reserve allocates nothing (FailingAll
     try std.testing.expect(system.long_block_growth.logged);
     const long_blocks = system.completed.long_block_count;
 
-    // Cleared (every block free again), the same results publish on a failing allocator.
-    clearCompleted(&system);
+    // Expired and solved again, the same results publish in place; expired once more, they
+    // publish on a failing allocator.
+    test_support.expireCachedResults(&system);
+    _ = try solveIndividualGoals(&system, requester, &goals, 8);
+    try expectGoalsSolved(&system, &goals);
+    test_support.expireCachedResults(&system);
     const original = system.allocator;
     system.allocator = std.testing.failing_allocator;
     system.graph.allocator = std.testing.failing_allocator;
@@ -1366,6 +1693,231 @@ test "re-putting a key replaces its registrations" {
     try std.testing.expectEqual(@as(usize, 2), registrations);
 }
 
+// `cells` of a 24-tile registry world's row `y`, from column `first` on.
+fn rowCells(cells: []u32, y: u32, first: u32) []const u32 {
+    for (cells, 0..) |*cell, x| cell.* = y * 24 + first + @as(u32, @intCast(x));
+    return cells;
+}
+
+test "a registry flush out of memory partway through its payload growth releases every claimed block and payload and clears pending, and the retry matches the cache (FailingAllocator)" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    // Row 1 from column 1 to 22: one run on each of six unregistered 4-tile chunks.
+    var cells: [22]u32 = undefined;
+    const path = rowCells(&cells, 1, 1);
+    var failures: usize = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var system = try registrySystem(&data, &fixture.world, 8);
+        defer system.deinit();
+        var key = emptyKey(system.graph.version);
+        key.goal = .{ .x = 22, .y = 1 };
+        var stats = PathfindingStats{};
+        try test_support.stageTestPath(&system, key, path, 1, &stats);
+        const directory = &system.path_index.directory;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        test_support.setSystemAllocators(&system, failing.allocator());
+        const flushed = flushRegistry(&system, null, null);
+        test_support.setSystemAllocators(&system, std.testing.allocator);
+        if (flushed) |_| {
+            try expectRegistryMatchesCache(&system);
+            break;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        failures += 1;
+        // Rolled back: no chunk holds a block or a pending count, every block is free and
+        // holds no bytes, and the publish's registrations wait for the retry.
+        try std.testing.expect(registryBehind(&system));
+        var level: u32 = 0;
+        while (level < directory.levelCount()) : (level += 1) {
+            for (0..directory.slotCount(level)) |slot| {
+                try std.testing.expectEqual(empty_block, directory.slot(level, slot));
+                try std.testing.expectEqual(@as(u32, 0), directory.pending(level, slot).*);
+            }
+        }
+        try std.testing.expectEqual(directory.blocks.items.len, directory.block_free.items.len);
+        for (directory.blocks.items) |block| try std.testing.expectEqual(@as(usize, 0), block.bytes.len);
+        _ = try flushRegistry(&system, null, null);
+        try expectRegistryMatchesCache(&system);
+    }
+    // Every allocation of the flush failed in turn, the six payloads' included: the last
+    // ones fail with earlier chunks' payloads and blocks already claimed.
+    try std.testing.expect(failures >= 6);
+}
+
+test "a chunk whose registrations all retire keeps its block through its step's flushes and returns it at a later step's flush that finds it still empty, and a chunk still holding registrations keeps its payload" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    var system = try registrySystem(&data, &fixture.world, 8);
+    defer system.deinit();
+    const geometry = system.graph.chunkGeometry();
+    const directory = &system.path_index.directory;
+    var stats = PathfindingStats{};
+    // Row 1 across three chunks, and row 2 inside the third only.
+    var long_cells: [10]u32 = undefined;
+    var short_cells: [3]u32 = undefined;
+    var long_key = emptyKey(system.graph.version);
+    long_key.goal = .{ .x = 10, .y = 1 };
+    var short_key = emptyKey(system.graph.version);
+    short_key.goal = .{ .x = 10, .y = 2 };
+    const long_path = rowCells(&long_cells, 1, 1);
+    try publishTestPath(&system, long_key, long_path, 1, &stats);
+    try publishTestPath(&system, short_key, rowCells(&short_cells, 2, 8), 1, &stats);
+    const left = geometry.chunkOfCell(long_path[0]);
+    const middle = geometry.chunkOfCell(long_path[4]);
+    const shared = geometry.chunkOfCell(long_path[9]);
+    try std.testing.expect(left != middle and middle != shared and shared == geometry.chunkOfCell(short_cells[0]));
+    for ([_]u32{ left, middle, shared }) |chunk| try std.testing.expect(directory.slot(0, chunk) != empty_block);
+    const free_before = directory.block_free.items.len;
+    const shared_cap = registrationRun(directory, chunkKey(0, shared)).cap;
+
+    system.completed.removeAt(system.completed.slotIndex(long_key).?);
+    // Emptied, the two chunks hold their blocks and payloads through every flush of the step.
+    for (0..2) |_| {
+        _ = try flushRegistry(&system, null, null);
+        for ([_]u32{ left, middle }) |chunk| {
+            const block = directory.slot(0, chunk);
+            try std.testing.expect(block != empty_block and directory.blockBytes(block).len != 0);
+            try std.testing.expectEqual(@as(u32, 0), directory.payload(block).len);
+        }
+        try std.testing.expectEqual(free_before, directory.block_free.items.len);
+        try expectRegistryMatchesCache(&system);
+    }
+    // The next step's flush, with no work, finds them still empty and releases them.
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    _ = try updatePathfindingInline(&system, &empty, 8, .{});
+    try std.testing.expectEqual(empty_block, directory.slot(0, left));
+    try std.testing.expectEqual(empty_block, directory.slot(0, middle));
+    try std.testing.expectEqual(free_before + 2, directory.block_free.items.len);
+    const kept = registrationRun(directory, chunkKey(0, shared));
+    try std.testing.expectEqual(@as(u32, 1), kept.len);
+    try std.testing.expectEqual(shared_cap, kept.cap);
+    try expectRegistryMatchesCache(&system);
+
+    // Published again, the released chunks claim blocks again.
+    try publishTestPath(&system, long_key, long_path, 2, &stats);
+    for ([_]u32{ left, middle }) |chunk| try std.testing.expect(directory.slot(0, chunk) != empty_block);
+    try expectRegistryMatchesCache(&system);
+}
+
+test "chunks emptied at one step's flush and published again at the next step's keep their blocks and payloads, so that publish allocates nothing (FailingAllocator)" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try data.createEntity();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGrid(&data, 512, 512, 32);
+    const goals = [_]math.Vec2{ cellWorld(6, 1), cellWorld(6, 9), cellWorld(12, 4), cellWorld(3, 13) };
+    _ = try solveIndividualGoals(&system, requester, &goals, 8);
+    try expectGoalsSolved(&system, &goals);
+
+    // Dropped from the cache, every result retires at a flush of the step, as an eviction's
+    // does, which empties every chunk they ran through.
+    for (goals) |goal| system.completed.removeAt(system.completed.slotIndex(system.graph.keyForWorld(0, goal, .default).?).?);
+    _ = try flushRegistry(&system, null, null);
+    const directory = &system.path_index.directory;
+    var held: usize = 0;
+    for (directory.blocks.items) |block| {
+        if (block.bytes.len == 0) continue;
+        try std.testing.expectEqual(@as(u32, 0), block.payload.len);
+        held += 1;
+    }
+    try std.testing.expect(held != 0);
+
+    // Requested again the step after, they publish into the held blocks on a failing allocator.
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+    defer {
+        system.allocator = original;
+        system.graph.allocator = original;
+    }
+    _ = try solveIndividualGoals(&system, requester, &goals, 8);
+    try expectGoalsSolved(&system, &goals);
+    system.allocator = original;
+    system.graph.allocator = original;
+    try expectRegistryMatchesCache(&system);
+}
+
+test "a registry clear returns every chunk's block and payload to the pool, and the next publish claims them again" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var system = try registrySystem(&data, &fixture.world, 16);
+    defer system.deinit();
+    try solveRegistryRoutes(&system, requester, 24, 0, 16, 16, null, .{});
+    const directory = &system.path_index.directory;
+    try std.testing.expect(directory.block_free.items.len < directory.blocks.items.len);
+
+    clearCompleted(&system);
+    var level: u32 = 0;
+    while (level < directory.levelCount()) : (level += 1) {
+        for (0..directory.slotCount(level)) |slot| {
+            try std.testing.expectEqual(empty_block, directory.slot(level, slot));
+            try std.testing.expectEqual(@as(u32, 0), directory.pending(level, slot).*);
+        }
+    }
+    try std.testing.expectEqual(directory.blocks.items.len, directory.block_free.items.len);
+    for (directory.blocks.items) |block| try std.testing.expectEqual(@as(usize, 0), block.bytes.len);
+    try expectRegistryMatchesCache(&system);
+
+    try solveRegistryRoutes(&system, requester, 24, 0, 16, 16, null, .{});
+    try std.testing.expect(directory.block_free.items.len < directory.blocks.items.len);
+    try expectRegistryMatchesCache(&system);
+}
+
+test "an update after a registry flush that ran out of memory past its publish finishes that flush first, so every claimed path keeps its registrations (FailingAllocator)" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var first = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer first.deinit();
+    var later = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer later.deinit();
+    for (0..24) |index| {
+        const route = registryRoute(index, 24);
+        try appendPathRequest(if (index < 16) &first else &later, .{ .entity = requester, .start = route[0], .goal = route[1] });
+    }
+    var behind: usize = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var system = try registrySystem(&data, &fixture.world, 32);
+        defer system.deinit();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        test_support.setSystemAllocators(&system, failing.allocator());
+        const failed = updatePathfindingInline(&system, &first, 32, .{});
+        test_support.setSystemAllocators(&system, std.testing.allocator);
+        if (failed) |_| break else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        // A failure before the claims leaves no publish behind.
+        if (system.publish_ranges == 0) continue;
+        behind += 1;
+        // The next update publishes other routes, whose publish copy reuses the windows the
+        // pending registrations sit in.
+        _ = try updatePathfindingInline(&system, &later, 32, .{});
+        try expectRoutesSolved(&system, 24, 16, 8);
+        try std.testing.expect(!registryBehind(&system));
+        try expectRegistryMatchesCache(&system);
+    }
+    try std.testing.expect(behind != 0);
+}
+
 test "threaded publish equals serial across range sizes and worker counts (cache bytes and per-shard lists), and publish_copy and registry_flush run on workers" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1415,16 +1967,20 @@ test "publish after its reserve allocates nothing on a multi-worker ThreadSystem
     defer threads.deinit();
     var system = try registrySystemWith(&data, &fixture.world, 64, .{ .stored_path_cells = 8, .participants = threads.participantSlotCount() });
     defer system.deinit();
-    // One publish of the routes reserves the registry, its windows, and long pages; cleared,
-    // the same publish fits them.
+    // One publish of the routes reserves the registry, its windows, and long pages, and one
+    // re-solve of the expired routes grows the payloads for a re-solve in place; expired
+    // again, the same publish fits them.
     try solveRegistryRoutes(&system, requester, 24, 0, 48, 64, &threads, fixed_threads_config);
-    system.clearRuntimeState();
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     for (0..48) |index| {
         const route = registryRoute(index, 24);
         try appendPathRequest(&stream, .{ .entity = requester, .start = route[0], .goal = route[1] });
     }
+    test_support.expireCachedResults(&system);
+    _ = try system.update(&stream, 64, &threads, fixed_threads_config);
+    try expectRoutesSolved(&system, 24, 0, 48);
+    test_support.expireCachedResults(&system);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     setSystemAllocators(&system, failing.allocator());
     const stats = system.update(&stream, 64, &threads, fixed_threads_config);
@@ -1432,9 +1988,10 @@ test "publish after its reserve allocates nothing on a multi-worker ThreadSystem
     const published = try stats;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try expectRoutesSolved(&system, 24, 0, 48);
-    // One unit per shard and per registration added: each published path adds at least one.
+    // At least one unit per shard and per registration added: each published path adds at
+    // least one, and its expired result's retire adds its own.
     const units = published.registry_flush_batch.item_count;
-    try std.testing.expect(units >= flushUnits(0, 48));
+    try std.testing.expect(units >= flushUnits(48));
     try std.testing.expectEqual(units, published.registry_flush_batch.range_count);
     try expectRegistryMatchesCache(&system);
 }
@@ -1495,6 +2052,45 @@ test "a shrink's registry flush runs on workers at about one pair per range unde
     try expectSameRegistry(&serial, &threaded);
     try expectRegistryMatchesCache(&threaded);
     for (&threaded.path_index.pools) |*pool| try std.testing.expectEqual(@as(usize, 32), pool.owner_heads.items.len);
+}
+
+test "a shrink step whose claims retire victims among the renamed results flushes the renames and then the retires in log order, threaded as serially, and matches the cache" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    var serial = try shrinkFixture(&data, &fixture, requester, 1);
+    defer serial.deinit();
+    var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
+    defer threaded.deinit();
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    // New routes in the step that shrinks: its claims follow the shrink's renames into a
+    // full cache, so each retires a victim, some of them renamed in the same log.
+    var fresh = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer fresh.deinit();
+    for (64..72) |index| {
+        const route = registryRoute(index, 24);
+        try appendPathRequest(&fresh, .{ .entity = requester, .start = route[0], .goal = route[1] });
+    }
+    const window = serial.capacity.capacity_shrink_window;
+    for (0..window) |step| {
+        const requests = if (step + 1 == window) &fresh else &empty;
+        _ = try updatePathfindingInline(&serial, requests, 1, .{});
+        _ = try threaded.update(requests, 1, &threads, .{});
+    }
+    try std.testing.expectEqual(@as(usize, 32), threaded.completed.logicalCapacity());
+    try std.testing.expectEqual(@as(usize, 32), threaded.completed.count());
+    try expectRoutesSolved(&threaded, 24, 64, 8);
+    try expectSameCache(&serial, &threaded);
+    try expectSameRegistry(&serial, &threaded);
+    try expectRegistryMatchesCache(&serial);
+    try expectRegistryMatchesCache(&threaded);
 }
 
 test "a shrink's registry flush keeps a configured range size and equals the serial flush" {

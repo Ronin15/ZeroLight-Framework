@@ -79,10 +79,9 @@ const default_flood_budget_cap = @import("connectivity.zig").default_flood_budge
 const span_words = @import("connectivity_closure.zig").span_words;
 const bitSetBytesFor = @import("../chunk_list_map.zig").bitSetBytesFor;
 const OrderedIndexSet = @import("../chunk_list_map.zig").OrderedIndexSet;
-const FieldElem = @import("../chunk_list_map_test_support.zig").FieldElem;
-const directoryResidentBytes = @import("../chunk_list_map_test_support.zig").directoryResidentBytes;
-const inversePoolResidentBytes = @import("../chunk_list_map_test_support.zig").inversePoolResidentBytes;
+const assertFieldsClassified = @import("../chunk_list_map.zig").assertFieldsClassified;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
+const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const RegRecord = types.RegRecord;
 const PathSolveResult = types.PathSolveResult;
 const GroupRequestTally = types.GroupRequestTally;
@@ -96,7 +95,6 @@ const registry_shard_count = types.registry_shard_count;
 const reg_window_alignment_items = types.reg_window_alignment_items;
 const hit_window_alignment_items = types.hit_window_alignment_items;
 const intake_range_alignment_items = types.intake_range_alignment_items;
-const pooledStorageBytesBound = @import("../chunk_list_map_test_support.zig").pooledStorageBytesBound;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const ChunkPortals = @import("nav_graph.zig").ChunkPortals;
 const LabelSet = @import("nav_graph.zig").LabelSet;
@@ -126,6 +124,7 @@ const PathfindingConfig = @import("types.zig").PathfindingConfig;
 const registryShard = @import("types.zig").registryShard;
 const chunkKey = @import("../chunk_list_map.zig").chunkKey;
 const no_entry = @import("../chunk_list_map.zig").no_entry;
+const empty_block = @import("../chunk_list_map.zig").empty_block;
 
 /// `OrderedIndexSet.residentBytes` of a set reserved for indices below `bits`: its tiers as
 /// `reserve` builds them.
@@ -1115,6 +1114,13 @@ pub fn appendIndividual(stream: *RangeOutputStream(PathRequest), entity: EntityI
 /// Stores the level-0 plain `path` for `key` at `step` as one publish would, its registry
 /// runs included, and flushes the registry.
 pub fn publishTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []const u32, step: u32, stats: *PathfindingStats) !void {
+    try stageTestPath(system, key, path, step, stats);
+    _ = try publish.flushRegistry(system, null, null);
+}
+
+/// `publishTestPath` without its flush: the path is claimed and stored, and its runs wait
+/// in one publish range for the caller's flush.
+pub fn stageTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []const u32, step: u32, stats: *PathfindingStats) !void {
     system.completed.core.beginPublish();
     const claimed = system.completed.claim(key, path.len, 0, 0, .{ .level = 0, .cell = path[path.len - 1] }, path[path.len - 1], step, stats);
     @memcpy(system.completed.destination(claimed)[0..path.len], path);
@@ -1133,7 +1139,6 @@ pub fn publishTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []co
         });
     }
     try stageRegistryRuns(system, records.items);
-    _ = try publish.flushRegistry(system, null, null);
 }
 
 /// One publish range of `records`, shard-ordered the way `publish_copy` writes them, with
@@ -1161,10 +1166,9 @@ pub fn stageRegistryRuns(system: *PathfindingSystem, records: []const RegRecord)
     }
     system.publish_bands.items[0] = .{ .counts = counts };
     system.publish_ranges = 1;
-    for (&system.path_index.pools, counts) |*pool, count| {
-        try pool.reserveNodes(system.allocator, count);
-        try pool.reserveOwners(system.allocator, system.completed.logicalCapacity());
-    }
+    var shard_registrations: [registry_shard_count]usize = undefined;
+    for (&shard_registrations, counts) |*total, count| total.* = count;
+    _ = try publish.reserveRegistryRuns(system, shard_registrations);
 }
 
 /// Solves `goals` from cellWorld(1, 2) in one serial step with the default budgets.
@@ -1173,6 +1177,22 @@ pub fn solveIndividualGoals(system: *PathfindingSystem, requester: EntityId, goa
     defer stream.deinit();
     for (goals) |goal| try appendIndividual(&stream, requester, goal);
     return updatePathfindingInline(system, &stream, agent_count, .{});
+}
+
+/// Ages every cached result past the cache TTL: the next request of its goal removes it at
+/// intake and solves it again in the same step, so that step's flush retires and re-adds
+/// its registrations together and a chunk holding them keeps its block. The second such
+/// step of the same requests finds every payload grown for both.
+pub fn expireCachedResults(system: *PathfindingSystem) void {
+    for (system.completed.core.records.items) |*record| {
+        if (record.live) record.stamp -%= types.default_cache_ttl_steps + 1;
+    }
+}
+
+/// Ages `key`'s cached result past the cache TTL (`expireCachedResults`).
+pub fn expireCachedResult(system: *PathfindingSystem, key: PathQueryKey) void {
+    const owner = cacheOwnerOf(system.completed.core, key).?;
+    system.completed.core.records.items[owner].stamp -%= types.default_cache_ttl_steps + 1;
 }
 
 /// The last update published every goal's level-0 result, and each reads available from
@@ -1399,6 +1419,7 @@ pub fn expectSameRegistry(a: *const PathfindingSystem, b: *const PathfindingSyst
         var slot: usize = 0;
         while (slot < directory_a.slotCount(level)) : (slot += 1) {
             const key = chunkKey(@intCast(level), @intCast(slot));
+            try std.testing.expectEqual(directory_a.slot(level, slot) == empty_block, directory_b.slot(level, slot) == empty_block);
             const run_a = publish.registrationRun(directory_a, key);
             const run_b = publish.registrationRun(directory_b, key);
             try std.testing.expectEqualSlices(u32, run_a.owner[0..run_a.len], run_b.owner[0..run_b.len]);
@@ -1445,12 +1466,6 @@ pub fn setSystemAllocators(system: *PathfindingSystem, allocator: std.mem.Alloca
 /// A fixed-range threaded control: one item per range, so every stage with two or more items
 /// runs on workers.
 pub const fixed_threads_config = PathfindingConfig{ .adaptive = false, .items_per_range = 1 };
-
-/// Work units of a registry flush over `ops` logged ops and `adds` pending registrations:
-/// every pair weighs the whole log, its adds, and one.
-pub fn flushUnits(ops: usize, adds: usize) usize {
-    return registry_shard_count * (ops + 1) + adds;
-}
 
 /// Two registry systems filled alike with long and inline results, for a shrink to the
 /// floor's 32 entries.
@@ -1646,6 +1661,8 @@ pub const RequestShape = struct {
     /// Chunks over every level. The registry directory opens one slot per chunk when
     /// the nav levels open, and a registry key is a chunk, so keys never pass it.
     chunks: usize = std.math.maxInt(usize),
+    /// Open nav levels.
+    levels: usize,
     /// The most nav marks recorded between two nav batches (a terrain record's events or
     /// two per static change), and the most chunk keys one batch changes.
     marks: usize = 0,
@@ -1682,32 +1699,119 @@ pub fn requestResidentBytes(system: *const PathfindingSystem) RequestStorage {
     return storage;
 }
 
-fn registryResidentBytes(index: anytype) usize {
+fn registryResidentBytes(index: *const publish.PathIndex) usize {
+    comptime assertFieldsClassified(publish.PathIndex, &.{
+        "directory", "pools", "growth", "compact", "fresh", "plan", "plan_replacement", "shard_ops", "emptied",
+    }, &.{ "growth_base", "compact_base", "counts", "shard_op_base", "shard_op_count", "retire_node_count", "emptied_step" });
     var bytes = directoryResidentBytes(&index.directory);
-    bytes += index.growth.capacity * @sizeOf(publish.ChunkRef) + index.compact.capacity * @sizeOf(publish.ChunkRef);
-    const Fresh = @typeInfo(@TypeOf(index.fresh.items)).pointer.child;
-    const SlotHead = @typeInfo(@TypeOf(index.retire_slot_heads.items)).pointer.child;
-    bytes += index.fresh.capacity * @sizeOf(Fresh);
-    bytes += index.retire_ids.capacity * @sizeOf(u32) + index.retire_heads.capacity * @sizeOf(u32) + index.retire_slot_heads.capacity * @sizeOf(SlotHead);
+    bytes += index.growth.capacity * @sizeOf(FieldElem(publish.PathIndex, "growth")) + index.compact.capacity * @sizeOf(FieldElem(publish.PathIndex, "compact"));
+    bytes += index.fresh.capacity * @sizeOf(FieldElem(publish.PathIndex, "fresh")) + index.emptied.capacity * @sizeOf(FieldElem(publish.PathIndex, "emptied"));
+    bytes += retirePlanResidentBytes(&index.plan) + index.shard_ops.capacity * @sizeOf(FieldElem(publish.PathIndex, "shard_ops"));
+    if (index.plan_replacement) |*replacement| bytes += retirePlanResidentBytes(replacement);
     for (&index.pools) |*pool| bytes += inversePoolResidentBytes(pool);
     return bytes;
 }
 
+// Bytes of the owner log's plan: its owner-id columns and its per-op plans.
+fn retirePlanResidentBytes(plan: *const publish.RetirePlan) usize {
+    const Plan = publish.RetirePlan;
+    comptime assertFieldsClassified(Plan, &.{ "ids", "at", "origin", "shards", "rename_to", "ops" }, &.{});
+    return plan.ids.capacity * @sizeOf(FieldElem(Plan, "ids")) + plan.at.capacity * @sizeOf(FieldElem(Plan, "at")) +
+        plan.origin.capacity * @sizeOf(FieldElem(Plan, "origin")) + plan.shards.capacity * @sizeOf(FieldElem(Plan, "shards")) +
+        plan.rename_to.capacity * @sizeOf(FieldElem(Plan, "rename_to")) + plan.ops.capacity * @sizeOf(FieldElem(Plan, "ops"));
+}
+
 /// Payload bytes plus inverse-pool bytes. Directory slots opened with the nav level are
 /// not included: a publish grows the payloads and the node pools.
-pub fn registryContentBytes(index: anytype) usize {
+pub fn registryContentBytes(index: *const publish.PathIndex) usize {
     var bytes: usize = 0;
-    var level: u32 = 0;
-    while (level < index.directory.levelCount()) : (level += 1) {
-        var slot: usize = 0;
-        while (slot < index.directory.slotCount(level)) : (slot += 1) {
-            const block = index.directory.slot(level, slot);
-            if (block == std.math.maxInt(u32)) continue;
-            bytes += index.directory.blockBytes(block).len;
-        }
-    }
+    for (index.directory.blocks.items) |block| bytes += block.bytes.len;
     for (&index.pools) |*pool| bytes += inversePoolResidentBytes(pool);
     return bytes;
+}
+
+// ---- Path registry byte counts ------------------------------------------------------------
+// Built from the registry's own types: the directory's `Level` and `Block` records and
+// slot columns, the inverse pools' node and head rows, and a payload's row bytes.
+
+const RegistryDirectory = publish.RegistryDirectory;
+const InversePool = publish.InversePool;
+const DirectoryLevel = RegistryDirectory.Level;
+const DirectoryBlock = RegistryDirectory.Block;
+const InverseNodes = @FieldType(InversePool, "nodes");
+const OwnerHead = FieldElem(InversePool, "owner_heads");
+// Bytes of one chunk's directory columns: its block id and its pending count.
+const directory_chunk_bytes = @sizeOf(@typeInfo(@FieldType(DirectoryLevel, "slots")).pointer.child) +
+    @sizeOf(@typeInfo(@FieldType(DirectoryLevel, "pending")).pointer.child);
+
+/// The element type of `T.field`: a std list's, a `MultiArrayList`'s row, or a slice's.
+fn FieldElem(comptime T: type, comptime field: []const u8) type {
+    const List = @FieldType(T, field);
+    if (@typeInfo(List) == .pointer) return @typeInfo(List).pointer.child;
+    if (@hasField(List, "items")) return @typeInfo(@FieldType(List, "items")).pointer.child;
+    return @typeInfo(@TypeOf(List.get)).@"fn".return_type.?;
+}
+
+/// Bytes of a registry directory: its level list, each open level's slot and pending
+/// columns, the block pool and its free ids, and every block's payload.
+fn directoryResidentBytes(directory: *const RegistryDirectory) usize {
+    comptime assertFieldsClassified(RegistryDirectory, &.{ "levels", "blocks", "block_free" }, &.{});
+    var bytes = directory.levels.capacity * @sizeOf(DirectoryLevel) +
+        directory.blocks.capacity * @sizeOf(DirectoryBlock) +
+        directory.block_free.capacity * @sizeOf(FieldElem(RegistryDirectory, "block_free"));
+    var level: u32 = 0;
+    while (level < directory.levelCount()) : (level += 1) bytes += directory.slotCount(level) * directory_chunk_bytes;
+    for (directory.blocks.items) |block| bytes += block.bytes.len;
+    return bytes;
+}
+
+/// Bytes of one inverse pool: its node columns, free ids, and owner heads, including a
+/// prepared or retired truncation.
+fn inversePoolResidentBytes(pool: *const InversePool) usize {
+    comptime assertFieldsClassified(InversePool, &.{ "nodes", "node_free", "owner_heads", "replacement", "retired" }, &.{ "node_next", "node_chunk", "node_index" });
+    var bytes = InverseNodes.capacityInBytes(pool.nodes.capacity) +
+        pool.node_free.capacity * @sizeOf(FieldElem(InversePool, "node_free")) +
+        pool.owner_heads.capacity * @sizeOf(OwnerHead) +
+        pool.retired.capacity * @sizeOf(OwnerHead);
+    if (pool.replacement) |replacement| bytes += replacement.capacity * @sizeOf(OwnerHead);
+    return bytes;
+}
+
+/// An over-estimate of one registry: `levels` level records and `chunks` chunks of
+/// directory columns, a block per chunk holding registrations or held a step after they
+/// retired (at most min(chunks, entries)) in a pool doubled ahead of need, a geometric payload for `entries`
+/// registrations, and `shards` inverse pools whose nodes sum to `entries` and whose owner
+/// heads hold `owners` ids. Saturates.
+fn pooledStorageBytesBound(shards: usize, levels: usize, chunks: usize, entries: usize, owners: usize) usize {
+    const blocks = @min(chunks, entries);
+    // A payload's cap is a power of two at most twice the most registrations it held.
+    const payload = (entries *| 2) *| publish.reg_row_bytes;
+    const directory = listBytesBound(DirectoryLevel, levels) +| chunks *| directory_chunk_bytes +|
+        listBytesBound(DirectoryBlock, blocks *| 2) +| listBytesBound(FieldElem(RegistryDirectory, "block_free"), blocks *| 2);
+    const node_pool = InverseNodes.capacityInBytes(InverseNodes.growCapacity(entries *| 2)) +| shards *| InverseNodes.capacityInBytes(InverseNodes.growCapacity(0));
+    const free_ids = pooledFreeIds(shards, entries);
+    const heads = shards *| listBytesBound(OwnerHead, owners);
+    // Count windows, growth and compact: one record per registration a flush adds or
+    // retires, each shard's window starting on a cache line.
+    const ChunkRef = FieldElem(publish.PathIndex, "compact");
+    const windows = 2 *| listBytesBound(ChunkRef, entries *| 2 +| shards *| @divExact(thread_shared_record_alignment, @sizeOf(ChunkRef)));
+    // Held emptied chunks: room for one per block of the pool.
+    const emptied = listBytesBound(FieldElem(publish.PathIndex, "emptied"), blocks *| 2);
+    // The owner log's plan: its owner-id columns, a plan per op of a log of
+    // `ops_per_entry` ops per owner id, and the log bucketed by shard: an op's entries are
+    // the shards its chain has nodes in, and each chain takes at most `ops_per_entry` ops,
+    // so at most that many entries per inverse node and per owner id in each shard.
+    const Plan = publish.RetirePlan;
+    const plan = listBytesBound(FieldElem(Plan, "ids"), owners) +| listBytesBound(FieldElem(Plan, "at"), owners) +|
+        listBytesBound(FieldElem(Plan, "origin"), owners) +| listBytesBound(FieldElem(Plan, "shards"), owners) +|
+        listBytesBound(FieldElem(Plan, "rename_to"), owners) +| listBytesBound(FieldElem(Plan, "ops"), caches.ops_per_entry *| owners) +|
+        listBytesBound(FieldElem(publish.PathIndex, "shard_ops"), @min(caches.ops_per_entry *| entries *| 2, shards *| caches.ops_per_entry *| owners));
+    return directory +| payload +| node_pool +| free_ids +| heads +| windows +| emptied +| plan;
+}
+
+fn pooledFreeIds(shards: usize, entries: usize) usize {
+    const Ids = std.ArrayList(u32);
+    return Ids.growCapacity(entries *| 2) *| @sizeOf(u32) +| shards *| Ids.growCapacity(0) *| @sizeOf(u32);
 }
 
 /// An over-estimate of `requestResidentBytes` for a system never reserved past
@@ -1746,7 +1850,7 @@ pub fn requestStorageBytesBound(capacity: PathfindingCapacity, shape: RequestSha
             listBytesBound(?ResultCache.Claimed, solves),
         // One directory slot per chunk of the open levels (`openRegistryLevels`), whether
         // or not a run is stored there. The run charge stays the stored paths' runs.
-        .registry = pooledStorageBytesBound(registry_shard_count, shape.chunks, live_runs, limits.cached_results) +|
+        .registry = pooledStorageBytesBound(registry_shard_count, @min(shape.levels, shape.chunks), shape.chunks, live_runs, limits.cached_results) +|
             RegRecordList.growCapacity(windows) *| @sizeOf(RegRecord),
         // A resolve past the limit doubles it, so one intent per agent reserves at most twice that.
         .goals = goalTableStorageBytesBound(2 *| limits.pending_requests),

@@ -14,6 +14,7 @@ const PathRequest = @import("../../game/simulation.zig").PathRequest;
 const RangeOutputStream = @import("../../game/simulation.zig").RangeOutputStream;
 const PathfindingCapacity = @import("../../game/systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("../../game/systems/pathfinding.zig").PathfindingStats;
+const PathfindingConfig = @import("../../game/systems/pathfinding.zig").PathfindingConfig;
 const PathfindingSystem = @import("../../game/systems/pathfinding.zig").PathfindingSystem;
 const pathfinding_test_support = @import("../../game/systems/pathfinding/test_support.zig");
 const pathfinding_range_alignment_items = @import("../../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
@@ -31,6 +32,9 @@ const coldWarmup = @import("nav_fixtures.zig").coldWarmup;
 const coldIterations = @import("nav_fixtures.zig").coldIterations;
 const coldSettleLimit = @import("nav_fixtures.zig").coldSettleLimit;
 const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
+const coldStepConfig = @import("nav_fixtures.zig").coldStepConfig;
+const expireCachedResults = @import("nav_fixtures.zig").expireCachedResults;
+const drainPending = @import("nav_fixtures.zig").drainPending;
 const setPathStageTuners = @import("nav_fixtures.zig").setPathStageTuners;
 const StageReport = @import("nav_fixtures.zig").StageReport;
 const OpenWorld = @import("nav_fixtures.zig").OpenWorld;
@@ -141,7 +145,8 @@ pub const cross_level_shaft_group = suite.BenchmarkGroup{
 // promoted, restarts at a partial's end on its level, and repeats until a hop arrives; the
 // sample's time is the steps' total, and a hop that drops or a chain past the route's cells +
 // 64 hops fails the case.
-// A caps, probe, or crowd sample is one request cycle from empty runtime state: the first
+// A caps, probe, or crowd sample is one request cycle with nothing pending and every cached
+// result expired (untimed, through the production steps and the result TTL): the first
 // attempt's step, the escalated attempt's step when the first exhausted, then every agent's
 // status. Claims must repeat exactly across samples. Serial only: each step solves one
 // request. Each variant runs 3 route lengths per layout.
@@ -1015,10 +1020,7 @@ const LongPathCycle = struct {
 // entry (the step's only escalated admission) for an escalated one.
 fn runLongPathAttempt(io: std.Io, threads: *ThreadSystem, system: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), request: PathRequest, agent_count: usize, tier: u8) !LongPathAttempt {
     const start_ns = suite.nowNs(io);
-    const stats = try system.update(requests, agent_count, threads, .{
-        .max_solved_requests_per_step = agent_count,
-        .max_solve_admissions_per_step = agent_count,
-    });
+    const stats = try system.update(requests, agent_count, threads, longPathAttemptConfig(agent_count));
     const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
     if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
     if (stats.perf.start_invalid_dropped != 0) return error.RouteStartInvalid;
@@ -1059,6 +1061,14 @@ fn runLongPathAttempt(io: std.Io, threads: *ThreadSystem, system: *PathfindingSy
     };
 }
 
+// A long-path attempt's inline step: every agent's request may solve.
+fn longPathAttemptConfig(agent_count: usize) PathfindingConfig {
+    return .{ .max_solved_requests_per_step = agent_count, .max_solve_admissions_per_step = agent_count };
+}
+
+// A walk's or hop chain's inline step: one solve.
+const one_solve_config = PathfindingConfig{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 };
+
 // Whether a corridor ends on a goal portal of `request` (`isGoalPortal` at its live goal); a
 // least-estimate corridor ends short of one.
 fn corridorEndsAtGoal(system: *const PathfindingSystem, corridor: []const usize, request: PathRequest) bool {
@@ -1073,12 +1083,14 @@ fn corridorEndsAtGoal(system: *const PathfindingSystem, corridor: []const usize,
     return isGoalPortal(level, geometry.chunkOfCell(cell), grid.labelAt(cell), request.goal_level, geometry.chunkOfCell(goal_index), goal_grid.labelAt(goal_index));
 }
 
-// One request cycle from empty runtime state: the first attempt, the escalated attempt when
-// the first exhausted, then every agent's status. No request stays pending after the second
-// attempt: it solves or drops.
+// One request cycle with nothing pending and every cached result expired (`drainPending`,
+// `expireCachedResults`): the first attempt, the escalated attempt when the first exhausted,
+// then every agent's status. No request stays pending after the second attempt: it solves or
+// drops.
 fn runLongPathCycle(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, empty: *const RangeOutputStream(PathRequest), requests: []const PathRequest) !LongPathCycle {
     const system = &fixture.system;
-    system.clearRuntimeState();
+    try drainPending(system, threads, requests.len, longPathAttemptConfig(requests.len));
+    expireCachedResults(system);
     const first = try runLongPathAttempt(io, threads, system, &fixture.requests, requests[0], requests.len, 0);
     var escalated: ?LongPathAttempt = null;
     if (first.outcome != .available) {
@@ -1124,10 +1136,12 @@ const LongPathWalk = struct {
     }
 };
 
-// Walks `request`'s agent from empty runtime state to its goal (see the group comment).
+// Walks `request`'s agent to its goal with nothing pending and every cached result expired
+// (`drainPending`, `expireCachedResults`; see the group comment).
 fn runLongPathWalk(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, step_limit: usize) !LongPathWalk {
     const system = &fixture.system;
-    system.clearRuntimeState();
+    try drainPending(system, threads, 1, one_solve_config);
+    expireCachedResults(system);
     const grid = system.graph.grid(request.start_level) orelse return error.RouteUnavailable;
     const goal_cell = grid.worldToCellClamped(request.goal);
     var position = request.start;
@@ -1159,7 +1173,7 @@ fn runLongPathWalk(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, s
         tier0_abstract.reset();
         tier1_abstract.reset();
         const start_ns = suite.nowNs(io);
-        const stats = try system.update(stream, 1, threads, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
+        const stats = try system.update(stream, 1, threads, one_solve_config);
         walk.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
         walk.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
         if (stats.perf.unavailable_results != 0) return error.RouteUnavailable;
@@ -1233,12 +1247,14 @@ const LongPathHops = struct {
     }
 };
 
-// Chains `request`'s hops from empty runtime state: each hop's request runs its first attempt
+// Chains `request`'s hops with nothing pending and every cached result expired
+// (`drainPending`, `expireCachedResults`): each hop's request runs its first attempt
 // and, when that promoted, its escalated attempt; a partial restarts the chain at its end, on
 // its level, until a hop arrives (`.available`) or drops (`.missing`).
 fn runLongPathHops(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, stream: *RangeOutputStream(PathRequest), request: PathRequest, hop_limit: usize) !LongPathHops {
     const system = &fixture.system;
-    system.clearRuntimeState();
+    try drainPending(system, threads, 1, one_solve_config);
+    expireCachedResults(system);
     const tier0_abstract = &system.scratch_slots.items[0].corridor.abstract;
     const tier1_abstract = &system.tier1_scratch.items[0].corridor.abstract;
     var chain = LongPathHops{};
@@ -1256,7 +1272,7 @@ fn runLongPathHops(io: std.Io, threads: *ThreadSystem, fixture: *RouteFixture, s
             tier0_abstract.reset();
             tier1_abstract.reset();
             const start_ns = suite.nowNs(io);
-            const stats = try system.update(stream, 1, threads, .{ .max_solved_requests_per_step = 1, .max_solve_admissions_per_step = 1 });
+            const stats = try system.update(stream, 1, threads, one_solve_config);
             chain.solve_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
             try fixtures.writeRequests(stream, &.{});
             chain.claims += tier0_abstract.nodes_used + tier1_abstract.nodes_used;
@@ -1573,14 +1589,16 @@ fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_syste
     return stats;
 }
 
-// Times one cold pathfinding step of the fixture's requests per iteration (runtime
-// state cleared, untimed, before each).
+// Times one cold pathfinding step of the fixture's requests per iteration, each with nothing
+// pending and every cached result expired, untimed (`drainPending`, `expireCachedResults`).
 fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *RouteFixture, thread_system: *ThreadSystem, unsolved_routes: UnsolvedRoutes) !suite.RunStats {
     const system = &fixture.system;
     setPathStageTuners(system, case);
+    const cold_config = coldStepConfig(case, route_request_count, route_request_count);
     var warm = suite.Warmup.custom(case, options.warmup_iterations, coldSettleLimit(options));
     while (warm.next(system.tuners.solve.phase == .settled)) {
-        system.clearRuntimeState();
+        try drainPending(system, thread_system, route_request_count, cold_config);
+        expireCachedResults(system);
         _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
     }
     const settled = if (case.adaptive) (system.tuners.solve.phase == .settled) else false;
@@ -1590,7 +1608,8 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     var abstract_nodes: usize = 0;
     var stage_report = StageReport{};
     for (0..options.iterations) |_| {
-        system.clearRuntimeState();
+        try drainPending(system, thread_system, route_request_count, cold_config);
+        expireCachedResults(system);
         const start_ns = suite.nowNs(io);
         last_stats = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
