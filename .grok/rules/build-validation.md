@@ -26,16 +26,17 @@ Commands and options: `docs/development-workflow.md`.
 - Default mode is `Debug`: every test and bench while working, before/after
   comparisons included, runs in Debug. ReleaseFast is for the branch commit,
   release candidates, and shipping builds; packaged builds ship `ReleaseFast`.
-- Exception: a question Debug cannot answer by construction (false sharing
-  between worker ranges, a SIMD or inlining gain) gets one targeted
-  ReleaseFast run of the group that asks it
+- Exception: a question Debug cannot answer by construction gets one
+  targeted ReleaseFast run of the group that asks it
   (`tools/bench_ab.py --optimize ReleaseFast`), ReleaseFast base against
-  ReleaseFast tree. It answers only that question and is never a baseline or
-  a gate. Modes compare only with themselves (Debug against Debug,
-  ReleaseFast against ReleaseFast). It never excuses a Debug finding: a
-  slower Debug case gets its verdict per `tests-benchmarks.md`, and its fix
-  never reverts a SIMD-shaped loop (`memory-performance.md` § SIMD and core
-  math); Debug at a size stands in for release at larger sizes.
+  ReleaseFast tree: false sharing between worker ranges, an inlining gain, a
+  SIMD-vs-scalar tie, or a SIMD-shaped loop slower in Debug than the code it
+  replaces. That run shows the SIMD gain Debug hides; the SIMD shape stays
+  (`memory-performance.md` § SIMD and core math). It answers only that
+  question and is never a baseline or a gate. Modes compare only with
+  themselves (Debug against Debug, ReleaseFast against ReleaseFast). Any
+  other slower Debug case gets its verdict per `tests-benchmarks.md`; Debug
+  at a size stands in for release at larger sizes.
 - ReleaseSafe is for soaks, which are diagnostics, not an every-edit step.
   Before a ReleaseFast release candidate, a multi-hour ReleaseSafe soak across
   realistic to extreme entity counts and spawn/despawn churn must pass;
