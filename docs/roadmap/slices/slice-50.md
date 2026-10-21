@@ -4,7 +4,8 @@
 
 **Status: landed on `core_systems` (`e56e37b`..`987b342`); TSan and `verify` pass.**
 Open before the archive move: the ReleaseFast `zig build test` (once, at the
-branch commit) and the owner's Windows and Mac runs (Acceptance). Opened the
+branch commit) and the owner's Windows run (Acceptance). Mac runs and
+compiles (owner). Opened the
 core-systems branch (owner 2026-10-12). Prerequisite for 51 (the lane thread
 relies on the foreign-thread rule, naming, and TSan workflow). 52C adds a TSan
 job.
@@ -134,8 +135,8 @@ instances, dispatches through this pool, so its safety is engine-wide.
       --case thread-small-range` ReleaseFast, 3 reps, `5673672` vs the slice
       tip: 1,024 −3.5%, 4,096 −25.0%, 10,000 −17.3%, all within spread.
 - [x] `zig build verify` passes at the slice tip (27/27 steps, 1,769/1,769 tests).
-- [ ] Owner runs on Windows and Mac: `zig build test` plus the
-      `thread-dispatch` bench on each.
+- [x] Owner run on Mac: the code runs and compiles (owner).
+- [ ] Owner run on Windows: `zig build test` plus the `thread-dispatch` bench.
 
 ### Measured and not pursued
 

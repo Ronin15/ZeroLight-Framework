@@ -270,8 +270,8 @@ roadmap flow (Suggested Order) resumes after the AI branch.
 2. **Core systems:** opens with [50](roadmap/slices/slice-50.md) (owner
    2026-10-12), so the branch's threaded rework runs under the race
    detector. Slice 50 landed on `core_systems` (`e56e37b`..`987b342`); TSan
-   and `verify` pass, and its ReleaseFast and owner Windows/Mac runs are open
-   in the slice. The measuring landing (`5d5a089`) benched today's code; each
+   and `verify` pass. Its ReleaseFast test and the owner's Windows run are
+   still open. Mac runs and compiles. The measuring landing (`5d5a089`) benched today's code; each
    finding, with its `file:line` re-checked there, its measured number, and
    its pass shape, lives in its slice. 83 landed (`3c42b4f`, `176ed03`,
    `13e88ad`; `verify` passes); 84's programming landed (`c52a5ff`,
