@@ -31,8 +31,21 @@
 //! bodies (one strip each on this fixture), not the statics; in `collision-static-index-change`
 //! also the collider row count, and that each move commits, syncs, and changes chunks.
 //!
+//! `collision-static-triggers` holds the item count of stored trigger pairs: two overlapping
+//! one-tile triggers per pitch cell, 512 dynamics on the first cells (half on a trigger), and
+//! one dynamic over a 10 x 10-cell square of them. One trigger is kinematic, so exclusion
+//! stays on, and another crosses the allow bit before every step, so every step moves the
+//! allow epoch and repacks the stored pairs' allow column. The system is reserved to the
+//! movement bodies first, as the population seam reserves it. Pass shape: time per stored
+//! pair flat in pairs (the pack and the stored trigger contacts are linear in them). Asserts:
+//! the analytic contact count; every measured step packs every stored pair, on workers in a
+//! fixed threaded case; one step with no allow crossing packs nothing; and the cold step,
+//! whose wide dynamic outgrows its static query slot's reserved hit rows while the broadphase
+//! stays inside the pair bound, is flagged and counted once.
+//!
 //! Every group prints `candidate_pairs=` and `contacts=`, the shape groups `per_body=`
-//! (mean time per body), the static groups `per_dynamic=`; `--details` adds each stage's
+//! (mean time per body), the static groups `per_dynamic=` (`collision-static-triggers`
+//! `per_pair=`, per stored pair); `--details` adds each stage's
 //! shape and batch time, `fill=`, `sort=`, `broad=` (the row's batch, its mean time; the
 //! others the last step's), and `narrow=`, with the fill, sort, and narrowphase tuners'
 //! state in brackets (each stage tunes on its own; the broadphase's is the row's tuning
@@ -125,6 +138,14 @@ pub const static_index_change_group = suite.BenchmarkGroup{
     .item_counts = &static_item_counts,
     .runCase = runStaticIndexChangeCase,
     .write_workload = writeStaticWorkload,
+};
+
+pub const static_triggers_group = suite.BenchmarkGroup{
+    .name = "collision-static-triggers",
+    .item_label = "stored trigger pairs",
+    .item_counts = &trigger_pair_counts,
+    .runCase = runStaticTriggersCase,
+    .write_workload = writeTriggerWorkload,
 };
 
 const FixtureMode = enum {
@@ -269,7 +290,7 @@ fn runShapeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const shape = try gridShapeFor(item_count);
     var data = try createGridFixture(allocator, shape);
     defer data.deinit();
-    var stats = try measureCase(allocator, io, options, case, shape.bodies(), &data, null, null);
+    var stats = try measureCase(allocator, io, options, case, shape.bodies(), &data, .{});
     std.debug.assert(stats.output_count == shape.contacts());
     const stages = stats.collision_stages.?;
     if (stages.entries > shape.bodies() * denseStripsPerBodyBound()) return error.CollisionEntriesPastStripBound;
@@ -284,7 +305,7 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     var data = try createFixtureWithMode(allocator, item_count, mode);
     defer data.deinit();
-    const stats = try measureCase(allocator, io, options, case, item_count, &data, null, null);
+    const stats = try measureCase(allocator, io, options, case, item_count, &data, .{});
     if (stats.iterations > 0 and stats.output_count != fixtureContacts(item_count, mode)) return error.CollisionContactCountMismatch;
     // A dense strip's rows overlap in x past one lane group, so the sweep runs its lanes.
     if (mode == .dense and stats.iterations > 0 and stats.collision_stages.?.simd_groups == 0) return error.CollisionSweepRanNoLanes;
@@ -403,10 +424,115 @@ fn runStaticCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Option
         try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles));
     }
 
-    var stats = try measureCase(allocator, io, options, case, static_dynamic_count, &fixture.data, if (mover) |*static_mover| static_mover else null, if (move_static) null else &colliders);
+    var stats = try measureCase(allocator, io, options, case, static_dynamic_count, &fixture.data, .{
+        .mover = if (mover) |*static_mover| static_mover else null,
+        .colliders = if (move_static) null else &colliders,
+        .swept_bodies = static_dynamic_count,
+        .one_strip_per_body = true,
+    });
     std.debug.assert(stats.output_count == static_fixture_contacts);
     // The header names the static count; throughput and `per_dynamic=` stay per dynamic.
     stats.item_count = static_count;
+    return stats;
+}
+
+// ----------------------------------------------------------------------------
+// Static triggers: stored trigger pairs whose allow column repacks every step.
+// ----------------------------------------------------------------------------
+
+const trigger_pair_counts = [_]usize{ 1_024, 4_096, 16_384 };
+const trigger_dynamic_count: usize = 512;
+// Trigger B sits half a tile down and right of trigger A in its pitch cell: one stored pair
+// per cell, clear of the next cell (B ends at 48 of the 64-unit pitch).
+const trigger_pair_offset: f32 = tile_size / 2;
+// Dynamic slot 1 sits past trigger B in its cell and overlaps nothing.
+const trigger_free_slot_offset: f32 = tile_size + trigger_pair_offset + 2;
+// The wide dynamic covers a square of this many pitch cells a side, both triggers of each.
+const trigger_wide_cells: usize = 10;
+
+// One trigger whose tier crosses the allow bit each step, so every step moves the collision
+// allow epoch and repacks the stored pairs' allow column.
+const AllowToggle = struct {
+    entity: EntityId,
+    // The fixture's stored pairs, which every repack covers.
+    stored_pairs: usize,
+    excluded: bool = false,
+
+    fn flip(self: *AllowToggle, data: *DataSystem) !void {
+        self.excluded = !self.excluded;
+        try data.setSimulationTier(self.entity, if (self.excluded) .kinematic else .cognition);
+    }
+};
+
+const TriggerFixture = struct {
+    data: DataSystem,
+    side: usize,
+    toggle: AllowToggle,
+
+    // The kinematic trigger's pair, the toggled trigger's pair while it is excluded, every
+    // slot-0 dynamic on its cell's trigger A, and the wide dynamic on both triggers of its
+    // cells.
+    fn contacts(self: *const TriggerFixture) usize {
+        const pairs = self.toggle.stored_pairs - 1 - @intFromBool(self.toggle.excluded);
+        return pairs + trigger_dynamic_count / 2 + 2 * trigger_wide_cells * trigger_wide_cells;
+    }
+};
+
+fn addTrigger(data: *DataSystem, position: math.Vec2) !EntityId {
+    const entity = try fixtures.addBody(data, position, .{ .x = static_size, .y = static_size }, .static);
+    try data.setCollisionResponse(entity, .{ .mobility = .static, .mode = .trigger });
+    return entity;
+}
+
+// `pair_count` cells row-major on the pitch grid, two overlapping triggers each. Cell 0's
+// trigger B is kinematic, so exclusion stays on; cell 1's is the toggle. The dynamics fill
+// the first cells, dynamic k in slot k % 2 of cell k / 2, and one wide dynamic covers the
+// grid's last `trigger_wide_cells` square.
+fn createTriggerFixture(allocator: std.mem.Allocator, pair_count: usize) !TriggerFixture {
+    const side = std.math.sqrt(pair_count);
+    if (side * side != pair_count) return error.TriggerPairCountNotSquare;
+    if (trigger_dynamic_count / 2 + trigger_wide_cells * side > pair_count) return error.TriggerGridTooSmall;
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+
+    var toggled = EntityId.invalid;
+    for (0..side) |cell_y| for (0..side) |cell_x| {
+        const origin = pitchCellOrigin(cell_x, cell_y);
+        _ = try addTrigger(&data, origin);
+        const b = try addTrigger(&data, .{ .x = origin.x + trigger_pair_offset, .y = origin.y + trigger_pair_offset });
+        const cell = cell_y * side + cell_x;
+        if (cell == 0) try data.setSimulationTier(b, .kinematic);
+        if (cell == 1) toggled = b;
+    };
+    for (0..trigger_dynamic_count) |index| {
+        const cell = index / 2;
+        const origin = pitchCellOrigin(cell % side, cell / side);
+        const offset: f32 = if (index % 2 == 0) 2 else trigger_free_slot_offset;
+        _ = try fixtures.addBody(&data, .{ .x = origin.x + offset, .y = origin.y + offset }, .{ .x = dense_body_size, .y = dense_body_size }, .dynamic);
+    }
+    const corner = pitchCellOrigin(side - trigger_wide_cells, side - trigger_wide_cells);
+    const wide = @as(f32, @floatFromInt(trigger_wide_cells)) * static_pitch - 2;
+    _ = try fixtures.addBody(&data, .{ .x = corner.x + 1, .y = corner.y + 1 }, .{ .x = wide, .y = wide }, .dynamic);
+    return .{ .data = data, .side = side, .toggle = .{ .entity = toggled, .stored_pairs = pair_count } };
+}
+
+fn runStaticTriggersCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, pair_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var fixture = try createTriggerFixture(allocator, pair_count);
+    defer fixture.data.deinit();
+    var colliders = StaticColliderSystem.init(allocator);
+    defer colliders.deinit();
+    const cells: u32 = @intCast(2 * fixture.side);
+    try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles));
+    if (static_colliders_test_support.liveRowCount(colliders) != 2 * pair_count) return error.WrongStaticCount;
+
+    const stats = try measureCase(allocator, io, options, case, pair_count, &fixture.data, .{
+        .colliders = &colliders,
+        .toggle = &fixture.toggle,
+        .reserved_cold_growth = true,
+        .swept_bodies = trigger_dynamic_count + 1,
+    });
+    if (stats.iterations > 0 and stats.output_count != fixture.contacts()) return error.CollisionContactCountMismatch;
     return stats;
 }
 
@@ -469,9 +595,27 @@ const StaticMover = struct {
     }
 };
 
-// Warms up, settles the stage tuners, and times one step per iteration: `mover`'s static
-// move through the commit seam when set, then the collision update over `data`.
-fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, data: *DataSystem, mover: ?*StaticMover, colliders: ?*StaticColliderSystem) !suite.RunStats {
+// What a measured step runs besides the collision update, and the fixture invariants the
+// measurement checks.
+const StepInputs = struct {
+    // A static moved through the commit seam before each update.
+    mover: ?*StaticMover = null,
+    // A collider structure built once; its view feeds every update.
+    colliders: ?*StaticColliderSystem = null,
+    // A trigger whose tier crosses the allow bit before each update.
+    toggle: ?*AllowToggle = null,
+    // `reserve`s the system to the fixture's movement bodies first, as the population seam
+    // does, and checks the cold step: one static query slot outgrows its reserved hit rows,
+    // flagged once while the broadphase stays inside the pair bound.
+    reserved_cold_growth: bool = false,
+    // Every step sweeps this many bodies, one strip each when `one_strip_per_body`.
+    swept_bodies: ?usize = null,
+    one_strip_per_body: bool = false,
+};
+
+// Warms up, settles the stage tuners, and times one step per iteration: the inputs' static
+// move or tier flip, then the collision update over `data`.
+fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, data: *DataSystem, inputs: StepInputs) !suite.RunStats {
     var system = CollisionSystem.init(allocator);
     defer system.deinit();
     useCaseTuners(&system, case);
@@ -482,9 +626,17 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer threads.deinit();
     const thread_ptr = &threads;
 
+    if (inputs.reserved_cold_growth) {
+        try system.reserve(data.movementBodySliceConst().entities.len);
+        const cold = try runOnce(&system, data, inputs, &contacts, thread_ptr, case);
+        // A broadphase inside its bound cannot flag the step, so the flag is the static
+        // slot's growth, kept through the later broadphase.
+        if (cold.candidate_pair_count > system.reserved_pair_bound) return error.CollisionColdBroadphaseOutgrewBound;
+        if (!cold.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 1) return error.CollisionColdSlotGrowthNotFlagged;
+    }
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(stageTunersSettled(&system))) {
-        _ = try runOnce(&system, data, mover, colliders, &contacts, thread_ptr, case);
+        _ = try runOnce(&system, data, inputs, &contacts, thread_ptr, case);
     }
     const fill_settled_before_measurement = case.adaptive and (system.fill_tuner.phase == .settled);
     const sort_settled_before_measurement = case.adaptive and (system.sort_tuner.phase == .settled);
@@ -499,20 +651,21 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     const stage_range = case.stageItemsPerRange(collision_range_alignment_items);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        last_collision_stats = try runOnce(&system, data, mover, colliders, &contacts, thread_ptr, case);
+        last_collision_stats = try runOnce(&system, data, inputs, &contacts, thread_ptr, case);
         const end_ns = suite.nowNs(io);
-        if (mover != null or colliders != null) {
-            std.debug.assert(last_collision_stats.body_count == item_count);
-            std.debug.assert(last_collision_stats.entry_count == last_collision_stats.body_count);
-        }
-        try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ last_collision_stats.perf.fill_batch, last_collision_stats.perf.sort_batch, last_collision_stats.broadphase_batch, last_collision_stats.narrowphase_batch, last_collision_stats.perf.static_pairs_batch, last_collision_stats.perf.static_rect_batch, last_collision_stats.perf.static_sort_batch });
+        if (inputs.swept_bodies) |bodies| std.debug.assert(last_collision_stats.body_count == bodies);
+        if (inputs.one_strip_per_body) std.debug.assert(last_collision_stats.entry_count == last_collision_stats.body_count);
+        const perf = last_collision_stats.perf;
+        // Every flip moves the allow epoch, so every measured step repacks the stored pairs.
+        if (inputs.toggle) |toggle| if (perf.trigger_allow_batch.item_count != toggle.stored_pairs) return error.CollisionTriggerAllowNotPacked;
+        try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ perf.fill_batch, perf.sort_batch, last_collision_stats.broadphase_batch, last_collision_stats.narrowphase_batch, perf.static_pairs_batch, perf.static_rect_batch, perf.static_sort_batch, perf.trigger_allow_batch });
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_collision_stats.broadphase_batch);
-        const mover_off_main_ns = if (mover) |static_mover| static_mover.spliceOffMainNs() else 0;
-        const off_main_ns = offMainNs(last_collision_stats.perf.fill_batch) + offMainNs(last_collision_stats.perf.sort_batch) +
+        const mover_off_main_ns = if (inputs.mover) |static_mover| static_mover.spliceOffMainNs() else 0;
+        const off_main_ns = offMainNs(perf.fill_batch) + offMainNs(perf.sort_batch) +
             offMainNs(last_collision_stats.broadphase_batch) + offMainNs(last_collision_stats.narrowphase_batch) +
-            offMainNs(last_collision_stats.perf.static_pairs_batch) + offMainNs(last_collision_stats.perf.static_rect_batch) +
-            offMainNs(last_collision_stats.perf.static_sort_batch);
+            offMainNs(perf.static_pairs_batch) + offMainNs(perf.static_rect_batch) +
+            offMainNs(perf.static_sort_batch) + offMainNs(perf.trigger_allow_batch);
         main_total += elapsed_ns -| off_main_ns -| mover_off_main_ns;
     }
 
@@ -536,12 +689,21 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.broadphase_tuner), broadphase_settled_before_measurement);
         stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.narrowphase_tuner), narrowphase_settled_before_measurement);
     }
+
+    if (inputs.toggle != null) {
+        // A step with no allow crossing keeps the packed column: no pack runs.
+        var quiet_inputs = inputs;
+        quiet_inputs.toggle = null;
+        const quiet = try runOnce(&system, data, quiet_inputs, &contacts, thread_ptr, case);
+        if (quiet.perf.trigger_allow_batch.item_count != 0) return error.CollisionTriggerAllowRepackedFreshColumn;
+        if (quiet.contact_count != last_collision_stats.contact_count) return error.CollisionQuietStepChangedContacts;
+    }
     return stats;
 }
 
 /// Gives each of `system`'s stage tuners the case's own tuner (an adaptive case only).
 pub fn useCaseTuners(system: *CollisionSystem, case: suite.BenchmarkCase) void {
-    for ([_]*AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner, &system.static_pair_tuner, &system.static_rect_tuner, &system.static_sort_tuner }) |tuner| {
+    for ([_]*AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner, &system.static_pair_tuner, &system.static_rect_tuner, &system.static_sort_tuner, &system.trigger_allow_tuner }) |tuner| {
         tuner.* = suite.adaptiveTunerForCase(case, collision_range_alignment_items) orelse return;
     }
 }
@@ -552,22 +714,23 @@ pub fn stageTunersSettled(system: *const CollisionSystem) bool {
         (system.broadphase_tuner.phase == .settled) and (system.narrowphase_tuner.phase == .settled) and
         (system.static_pair_tuner.sample_count == 0 or system.static_pair_tuner.phase == .settled) and
         (system.static_rect_tuner.sample_count == 0 or system.static_rect_tuner.phase == .settled) and
-        (system.static_sort_tuner.sample_count == 0 or system.static_sort_tuner.phase == .settled);
+        (system.static_sort_tuner.sample_count == 0 or system.static_sort_tuner.phase == .settled) and
+        (system.trigger_allow_tuner.sample_count == 0 or system.trigger_allow_tuner.phase == .settled);
 }
 
 fn runOnce(
     system: *CollisionSystem,
     data: *DataSystem,
-    mover: ?*StaticMover,
-    colliders: ?*StaticColliderSystem,
+    inputs: StepInputs,
     contacts: *RangeOutputStream(CollisionContact),
     thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) !CollisionStats {
-    if (mover) |static_mover| try static_mover.moveAndSync(data, thread_system);
-    const view: ColliderView = if (mover) |static_mover|
+    if (inputs.mover) |static_mover| try static_mover.moveAndSync(data, thread_system);
+    if (inputs.toggle) |toggle| try toggle.flip(data);
+    const view: ColliderView = if (inputs.mover) |static_mover|
         static_mover.colliders.view()
-    else if (colliders) |static_colliders|
+    else if (inputs.colliders) |static_colliders|
         static_colliders.view()
     else
         .{};
@@ -605,6 +768,14 @@ fn writeCollisionWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: s
     try writer.print("candidate_pairs={} contacts={}", .{ stats.candidate_pairs, stats.output_count });
     // `sample_count` holds the body count.
     if (stats.sample_count != 0) try writer.print(" per_body={f}", .{suite.formatDuration(stats.mean_ns / stats.sample_count)});
+    if (view == .summary) return;
+    try writeCollisionDetails(writer, stats);
+}
+
+fn writeTriggerWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("candidate_pairs={} contacts={}", .{ stats.candidate_pairs, stats.output_count });
+    // `sample_count` holds the stored pair count.
+    if (stats.sample_count != 0) try writer.print(" per_pair={f}", .{suite.formatDuration(stats.mean_ns / stats.sample_count)});
     if (view == .summary) return;
     try writeCollisionDetails(writer, stats);
 }

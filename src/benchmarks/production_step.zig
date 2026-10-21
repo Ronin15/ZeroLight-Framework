@@ -19,9 +19,9 @@
 //! levels 1 and 32, side 512 and 2048, 1 or 4 inert rows per agent, and `stacked` at 256
 //! agents per level on 1, 4, and 8 levels.
 //!
-//! Each sample binds a fresh runtime perf log: `main` is the step's wall time minus the
-//! off-main time of the logged batches that ran on workers (an upper bound: unlogged batches
-//! count as main), and `untimed` is the wall time no top-level stage timer holds. `tiers=`
+//! Each sample binds a fresh runtime perf log and bench-only batch sink: `main` is the step's
+//! wall time minus the off-main time of the logged and bench-only batches that ran on
+//! workers (an upper bound: batches neither carries count as main), and `untimed` is the wall time no top-level stage timer holds. `tiers=`
 //! splits the rows by scope tier (cognition/locomotion/kinematic/dormant), `thinking=` counts
 //! the rows the AI stage ran, `separation_per_thinking=` the AI separation candidate checks
 //! and neighbor samples per thinking row, and `top_main=` names the three top-level stages
@@ -71,6 +71,7 @@ const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
 const BatchStage = runtime_perf_log.BatchStage;
+const BenchBatchStage = runtime_perf_log.BenchBatchStage;
 const Metric = runtime_perf_log.Metric;
 const Timing = runtime_perf_log.Timing;
 
@@ -131,37 +132,50 @@ fn isTopLevelStage(stage: Timing) bool {
     return std.mem.startsWith(u8, name, "pipeline_") or std.mem.startsWith(u8, name, "gameplay_");
 }
 
-// The logged batch stages that run inside each top-level stage timer, for the per-stage
-// main-thread split.
-fn stageBatches(stage: Timing) []const BatchStage {
+// The batches that run inside one top-level stage timer: the perf log's cost-driver stages
+// and the bench-only stages the step hands the census's sink.
+const StageBatches = struct {
+    logged: []const BatchStage = &.{},
+    bench: []const BenchBatchStage = &.{},
+};
+
+// Each top-level stage timer's batches, for the per-stage main-thread split.
+fn stageBatches(stage: Timing) StageBatches {
     return switch (stage) {
-        .pipeline_spatial_index => &.{.spatial_index_build},
-        .pipeline_perception => &.{.perception},
-        .pipeline_ai => &.{ .ai_separation, .ai_intent },
-        .pipeline_steering => &.{.steering},
-        .pipeline_pathfinding => &.{ .path_solve, .path_intake, .path_registry_flush, .path_resize_copy },
-        .pipeline_movement => &.{.movement},
-        .pipeline_collision => &.{ .collision_fill, .collision_sort, .collision_broadphase, .collision_narrowphase, .collision_static_pairs, .collision_static_rect, .collision_trigger_allow },
-        .pipeline_chunk_derive => &.{.chunk_derive},
-        .gameplay_particles => &.{.particles},
-        .gameplay_structural => &.{ .static_collider_splice, .nav_remask, .nav_connect, .nav_closure, .nav_evict },
-        else => &.{},
+        .pipeline_spatial_index => .{ .logged = &.{.spatial_index_build} },
+        .pipeline_perception => .{ .bench = &.{.perception} },
+        .pipeline_ai => .{ .bench = &.{ .ai_separation, .ai_intent } },
+        .pipeline_steering => .{ .bench = &.{.steering} },
+        .pipeline_pathfinding => .{ .logged = &.{ .path_intake, .path_registry_flush, .path_resize_copy }, .bench = &.{.path_solve} },
+        .pipeline_movement => .{ .bench = &.{.movement} },
+        .pipeline_collision => .{ .bench = &.{ .collision_fill, .collision_sort, .collision_broadphase, .collision_narrowphase, .collision_static_pairs, .collision_static_rect, .collision_trigger_allow } },
+        .pipeline_chunk_derive => .{ .bench = &.{.chunk_derive} },
+        .gameplay_particles => .{ .bench = &.{.particles} },
+        .gameplay_structural => .{ .logged = &.{ .static_collider_splice, .nav_remask, .nav_connect, .nav_closure, .nav_evict } },
+        else => .{},
     };
 }
 
 comptime {
-    // Every batch stage the step logs sits in exactly one stage timer; sprite prep runs in
-    // render, outside the step.
+    // Every batch stage the step records sits in exactly one stage timer.
     @setEvalBranchQuota(20_000);
     for (std.meta.tags(BatchStage)) |batch| {
         var owners: usize = 0;
         for (std.meta.tags(Timing)) |stage| {
-            for (stageBatches(stage)) |owned| {
+            for (stageBatches(stage).logged) |owned| {
                 if (owned == batch) owners += 1;
             }
         }
-        const expected: usize = if (batch == .sprite_prep) 0 else 1;
-        if (owners != expected) @compileError("batch stage " ++ @tagName(batch) ++ " needs exactly one stage timer");
+        if (owners != 1) @compileError("batch stage " ++ @tagName(batch) ++ " needs exactly one stage timer");
+    }
+    for (std.meta.tags(BenchBatchStage)) |batch| {
+        var owners: usize = 0;
+        for (std.meta.tags(Timing)) |stage| {
+            for (stageBatches(stage).bench) |owned| {
+                if (owned == batch) owners += 1;
+            }
+        }
+        if (owners != 1) @compileError("bench batch stage " ++ @tagName(batch) ++ " needs exactly one stage timer");
     }
 }
 
@@ -507,10 +521,12 @@ const StepRunner = struct {
     transitions: *StateTransitions,
     threads: *ThreadSystem,
     perf_log: runtime_perf_log.RuntimePerfLog = runtime_perf_log.RuntimePerfLog.init(0),
+    step_batches: runtime_perf_log.StepBatches = .{},
 
     // The step's wall time.
     fn run(self: *StepRunner) !u64 {
         self.perf_log = runtime_perf_log.RuntimePerfLog.init(0);
+        self.step_batches = .{};
         self.audio.beginStep();
         const start_ns = suite.nowNs(self.io);
         try self.state.update(.{
@@ -521,7 +537,7 @@ const StepRunner = struct {
             .delta_seconds = TimeLoop.fixed_delta_seconds,
             .transitions = self.transitions,
             .thread_system = self.threads,
-            .perf = runtime_perf_log.Context.bind(&self.perf_log),
+            .perf = .{ .logger = &self.perf_log, .step_batches = &self.step_batches },
         });
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(self.io));
         std.debug.assert(self.state.simulation_frame.phase == .finished);
@@ -538,9 +554,22 @@ const Census = struct {
     batch_off_main_ns: std.enums.EnumArray(BatchStage, u128) = .initFill(0),
     batch_threaded_steps: std.enums.EnumArray(BatchStage, usize) = .initFill(0),
     batch_recorded_steps: std.enums.EnumArray(BatchStage, usize) = .initFill(0),
+    bench_batch_off_main_ns: std.enums.EnumArray(BenchBatchStage, u128) = .initFill(0),
+    bench_batch_threaded_steps: std.enums.EnumArray(BenchBatchStage, usize) = .initFill(0),
+    bench_batch_recorded_steps: std.enums.EnumArray(BenchBatchStage, usize) = .initFill(0),
     metrics: std.enums.EnumArray(Metric, u128) = .initFill(0),
 
-    fn add(self: *Census, log: *const runtime_perf_log.RuntimePerfLog, step_ns: u64) void {
+    // One stage's step: whether it ran, and its off-main time when every call ran on workers.
+    fn addBatch(calls: u64, threaded_calls: u64, total_duration_ns: u64, recorded: *usize, threaded: *usize, off_main: *u128) u64 {
+        if (calls == 0) return 0;
+        recorded.* += 1;
+        if (threaded_calls != calls) return 0;
+        threaded.* += 1;
+        off_main.* += total_duration_ns;
+        return total_duration_ns;
+    }
+
+    fn add(self: *Census, log: *const runtime_perf_log.RuntimePerfLog, step_batches: *const runtime_perf_log.StepBatches, step_ns: u64) void {
         self.steps += 1;
         var timed_ns: u64 = 0;
         for (std.meta.tags(Timing)) |stage| {
@@ -549,15 +578,14 @@ const Census = struct {
             if (isTopLevelStage(stage)) timed_ns += wall_ns;
         }
         var off_main_ns: u64 = 0;
+        // A step counts off main only when every call of the stage ran on workers.
         for (std.meta.tags(BatchStage)) |stage| {
             const batch = log.batches[@backingInt(stage)];
-            if (batch.calls == 0) continue;
-            self.batch_recorded_steps.getPtr(stage).* += 1;
-            // A step counts off main only when every call of the stage ran on workers.
-            if (batch.threaded_calls != batch.calls) continue;
-            self.batch_threaded_steps.getPtr(stage).* += 1;
-            self.batch_off_main_ns.getPtr(stage).* += batch.total_duration_ns;
-            off_main_ns += batch.total_duration_ns;
+            off_main_ns += addBatch(batch.calls, batch.threaded_calls, batch.total_duration_ns, self.batch_recorded_steps.getPtr(stage), self.batch_threaded_steps.getPtr(stage), self.batch_off_main_ns.getPtr(stage));
+        }
+        for (std.meta.tags(BenchBatchStage)) |stage| {
+            const batch = step_batches.batches[@backingInt(stage)];
+            off_main_ns += addBatch(batch.calls, batch.threaded_calls, batch.total_duration_ns, self.bench_batch_recorded_steps.getPtr(stage), self.bench_batch_threaded_steps.getPtr(stage), self.bench_batch_off_main_ns.getPtr(stage));
         }
         for (std.meta.tags(Metric)) |metric| self.metrics.getPtr(metric).* += log.metrics[@backingInt(metric)];
         self.main_ns += step_ns -| off_main_ns;
@@ -575,6 +603,11 @@ const Census = struct {
             summary.batch_off_main_ns.set(stage, @intCast(self.batch_off_main_ns.get(stage) / steps));
             summary.batch_threaded_steps.set(stage, self.batch_threaded_steps.get(stage));
             summary.batch_recorded_steps.set(stage, self.batch_recorded_steps.get(stage));
+        }
+        for (std.meta.tags(BenchBatchStage)) |stage| {
+            summary.bench_batch_off_main_ns.set(stage, @intCast(self.bench_batch_off_main_ns.get(stage) / steps));
+            summary.bench_batch_threaded_steps.set(stage, self.bench_batch_threaded_steps.get(stage));
+            summary.bench_batch_recorded_steps.set(stage, self.bench_batch_recorded_steps.get(stage));
         }
         for (std.meta.tags(Metric)) |metric| summary.metrics.set(metric, @intCast(self.metrics.get(metric) / steps));
         return summary;
@@ -651,7 +684,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     for (0..options.iterations) |iteration| {
         const step_ns = try step.run();
         accumulator.record(step_ns, .{});
-        census.add(&step.perf_log, step_ns);
+        census.add(&step.perf_log, &step.step_batches, step_ns);
         if (span_record) |*record| if (iteration + 1 < options.iterations) record.widen(&state.data);
     }
     var stats = accumulator.finish();
@@ -685,8 +718,10 @@ fn moreMainFirst(summary: *const suite.ProductionStepSummary, lhs: Timing, rhs: 
 }
 
 fn stageOffMainNs(summary: *const suite.ProductionStepSummary, stage: Timing) u64 {
+    const batches = stageBatches(stage);
     var off_main_ns: u64 = 0;
-    for (stageBatches(stage)) |batch| off_main_ns += summary.batch_off_main_ns.get(batch);
+    for (batches.logged) |batch| off_main_ns += summary.batch_off_main_ns.get(batch);
+    for (batches.bench) |batch| off_main_ns += summary.bench_batch_off_main_ns.get(batch);
     return off_main_ns;
 }
 
@@ -731,9 +766,14 @@ fn writeStepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.
             suite.formatDuration(stageOffMainNs(summary, stage)),
             suite.formatDuration(stageMainNs(summary, stage)),
         });
-        for (stageBatches(stage)) |batch| {
+        const batches = stageBatches(stage);
+        for (batches.logged) |batch| {
             if (summary.batch_recorded_steps.get(batch) == 0) continue;
             try writer.print(" {s}:threaded={}/{}", .{ @tagName(batch), summary.batch_threaded_steps.get(batch), summary.measured_steps });
+        }
+        for (batches.bench) |batch| {
+            if (summary.bench_batch_recorded_steps.get(batch) == 0) continue;
+            try writer.print(" {s}:threaded={}/{}", .{ @tagName(batch), summary.bench_batch_threaded_steps.get(batch), summary.measured_steps });
         }
     }
     try writer.writeAll("\n    nested");

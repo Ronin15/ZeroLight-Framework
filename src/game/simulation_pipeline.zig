@@ -595,7 +595,7 @@ pub const SimulationPipelineStats = struct {
             perf.recordMetric(.perception_nearest_threat_found, metric(perception_stats.perf.nearest_threat_found_count));
             perf.recordMetric(.perception_candidate_checks, metric(perception_stats.perf.candidate_checks));
         }
-        perf.recordBatch(.perception, perception_stats.batch);
+        perf.recordBenchBatch(.perception, perception_stats.batch);
 
         perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
         perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));
@@ -604,8 +604,8 @@ pub const SimulationPipelineStats = struct {
             perf.recordMetric(.ai_separation_candidate_checks, metric(ai_stats.perf.separation_candidate_checks));
             perf.recordMetric(.ai_separation_neighbor_samples, metric(ai_stats.perf.separation_neighbor_samples));
         }
-        perf.recordBatch(.ai_separation, ai_stats.separation_batch);
-        perf.recordBatch(.ai_intent, ai_stats.intent_batch);
+        perf.recordBenchBatch(.ai_separation, ai_stats.separation_batch);
+        perf.recordBenchBatch(.ai_intent, ai_stats.intent_batch);
 
         perf.recordMetric(.steering_navigation_intents, metric(steering_stats.navigation_intent_count));
         perf.recordMetric(.steering_selected_intents, metric(steering_stats.selected_intent_count));
@@ -623,7 +623,7 @@ pub const SimulationPipelineStats = struct {
             perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.perf.agent_candidate_checks));
             perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.perf.obstacle_candidate_checks));
         }
-        perf.recordBatch(.steering, steering_stats.batch);
+        perf.recordBenchBatch(.steering, steering_stats.batch);
         perf.recordTiming(.steering_select, steering_stats.select_ns);
         perf.recordTiming(.steering_snapshot, steering_stats.snapshot_ns);
         perf.recordTiming(.steering_directions, steering_stats.directions_ns);
@@ -654,7 +654,7 @@ pub const SimulationPipelineStats = struct {
             perf.recordMetricMax(.path_max_distinct_group_keys, metric(pathfinding_stats.perf.distinct_group_keys));
             perf.recordMetric(.path_group_field_evictions, metric(pathfinding_stats.perf.group_field_evictions));
         }
-        perf.recordBatch(.path_solve, pathfinding_stats.solve_batch);
+        perf.recordBenchBatch(.path_solve, pathfinding_stats.solve_batch);
         perf.recordBatch(.path_intake, pathfinding_stats.intake_batch);
         perf.recordBatch(.path_registry_flush, pathfinding_stats.registry_flush_batch);
         perf.recordTiming(.pathfinding_accept, pathfinding_stats.accept_ns);
@@ -668,40 +668,40 @@ pub const SimulationPipelineStats = struct {
         }
 
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
-        perf.recordBatch(.movement, movement_stats.batch);
-        perf.recordBatch(.chunk_derive, self.chunk_derive);
+        perf.recordBenchBatch(.movement, movement_stats.batch);
+        perf.recordBenchBatch(.chunk_derive, self.chunk_derive);
 
         perf.recordMetric(.collision_bodies, metric(collision_stats.body_count));
         perf.recordMetric(.collision_candidate_pairs, metric(collision_stats.candidate_pair_count));
         perf.recordMetric(.collision_contacts, metric(collision_stats.contact_count));
         perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
-        if (collision_stats.pair_bound_exceeded) perf.recordMetric(.collision_pair_bound_exceeded, 1);
         if (comptime runtime_perf_log.enabled) {
+            if (collision_stats.perf.pair_bound_exceeded) perf.recordMetric(.collision_pair_bound_exceeded, 1);
             const fill_batch = collision_stats.perf.fill_batch;
             // An untimed batch with no workers is not a sample. The inline banded fill is timed.
             if (fill_batch.available_worker_threads != 0 or fill_batch.batch_duration_ns != 0) {
-                perf.recordBatch(.collision_fill, fill_batch);
+                perf.recordBenchBatch(.collision_fill, fill_batch);
             }
             const sort_batch = collision_stats.perf.sort_batch;
             // An untimed batch with no workers is not a sample. The inline banded sort is timed.
             if (sort_batch.available_worker_threads != 0 or sort_batch.batch_duration_ns != 0) {
-                perf.recordBatch(.collision_sort, sort_batch);
+                perf.recordBenchBatch(.collision_sort, sort_batch);
             }
-            const static_pairs = collision_stats.static_pairs_batch;
+            const static_pairs = collision_stats.perf.static_pairs_batch;
             if (static_pairs.available_worker_threads != 0 or static_pairs.batch_duration_ns != 0) {
-                perf.recordBatch(.collision_static_pairs, static_pairs);
+                perf.recordBenchBatch(.collision_static_pairs, static_pairs);
             }
-            const static_rect = collision_stats.static_rect_batch;
+            const static_rect = collision_stats.perf.static_rect_batch;
             if (static_rect.available_worker_threads != 0 or static_rect.batch_duration_ns != 0) {
-                perf.recordBatch(.collision_static_rect, static_rect);
+                perf.recordBenchBatch(.collision_static_rect, static_rect);
             }
-            const trigger_allow = collision_stats.trigger_allow_batch;
+            const trigger_allow = collision_stats.perf.trigger_allow_batch;
             if (trigger_allow.available_worker_threads != 0 or trigger_allow.batch_duration_ns != 0) {
-                perf.recordBatch(.collision_trigger_allow, trigger_allow);
+                perf.recordBenchBatch(.collision_trigger_allow, trigger_allow);
             }
         }
-        perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
-        perf.recordBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
+        perf.recordBenchBatch(.collision_broadphase, collision_stats.broadphase_batch);
+        perf.recordBenchBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
 
         perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
         perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
@@ -3621,7 +3621,6 @@ fn runContactBoundScenario(mode: CollisionResponseMode) !void {
             try std.testing.expectEqual(stats.collision.contact_count, frame.collision_triggers.mergedItems().len);
         },
     }
-    try std.testing.expect(!stats.collision.pair_bound_exceeded);
 }
 
 const respond_scenario_bodies: usize = 63;

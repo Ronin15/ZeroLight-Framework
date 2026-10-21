@@ -51,7 +51,7 @@ pub const ParticleUpdateStats = struct {
         perf.recordMetric(.particle_active_before, metric(self.active_before));
         perf.recordMetric(.particle_active_after, metric(self.active_after));
         perf.recordMetric(.particle_removed, metric(self.removed_count));
-        perf.recordBatch(.particles, self.batch);
+        perf.recordBenchBatch(.particles, self.batch);
     }
 };
 

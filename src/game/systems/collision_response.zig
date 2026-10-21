@@ -755,10 +755,7 @@ fn writeIntent(
 // The entity's movement row: the contact's hint when it still names the entity, else a
 // slot resolve; `no_row` when the entity has no movement body.
 fn movementRowFor(data: *const DataSystem, movement_entities: []const EntityId, entity: EntityId, hint: usize) u32 {
-    const row = if (hint < movement_entities.len and movement_entities[hint].eql(entity))
-        hint
-    else
-        data.movementBodyDenseIndex(entity) orelse return no_row;
+    const row = data.movementBodyDenseIndexHinted(movement_entities, entity, hint) orelse return no_row;
     // Movement rows are u32 slot indices, below `no_row`.
     std.debug.assert(row < no_row);
     return @intCast(row);

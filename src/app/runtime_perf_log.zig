@@ -214,45 +214,52 @@ pub const Timing = enum {
     render_end_frame,
 };
 
+/// The batch stages the log records: each change path's cost-driver stage only
+/// (`threading.md` § Verification). Every other stage's batch is bench output
+/// (`BenchBatchStage`).
 pub const BatchStage = enum {
+    // The per-step spatial index build's sort, the build's cost driver.
     spatial_index_build,
+    // Path requests: the request intake, and the pathfinding update's registry flush, shrinks
+    // included (not the eviction flush).
+    path_intake,
+    path_registry_flush,
+    // Capacity resize: the pathfinding update's shrink copy, its byte moves.
+    path_resize_copy,
+    // A static add, move, or destroy: the commit seam's collider chunk-list splice.
+    static_collider_splice,
+    // Dig, build, and dense terrain change: the nav reaction's chunk remask, its
+    // connectivity flood (rounds summed, the removal-shaped share), its one-way closure rows
+    // (round 0 and its rounds summed), and the path-cache eviction halo walk.
+    nav_remask,
+    nav_connect,
+    nav_closure,
+    nav_evict,
+};
+
+/// Stages whose batch timing is bench output only. A bench that sets a `StepBatches` sink on
+/// its `Context` (`step_batches`) receives them; the log never records them.
+pub const BenchBatchStage = enum {
     perception,
     ai_separation,
     ai_intent,
     steering,
     path_solve,
-    path_intake,
-    // The pathfinding update's registry flush, shrinks included; not the eviction flush.
-    path_registry_flush,
-    // The pathfinding update's resize copy: a capacity shrink's byte moves, its cost driver.
-    path_resize_copy,
     movement,
     chunk_derive,
-    // The collision detect fill, inline or on workers. An untimed batch with no workers
-    // is not recorded.
+    // The collision detect fill and sort, inline or on workers. An untimed batch with no
+    // workers is not a sample.
     collision_fill,
-    // The collision detect sort, inline or on workers. An untimed batch with no workers
-    // is not recorded.
     collision_sort,
     collision_broadphase,
     collision_narrowphase,
-    // Dynamic×static overlap query. The cost driver of a step with statics at rest.
+    // Dynamic x static overlap query.
     collision_static_pairs,
-    // Debug stored-rect compare. Recorded only when that batch ran.
+    // Debug stored-rect compare, when that batch ran.
     collision_static_rect,
-    // Stored-trigger allow pack. Recorded only on the step that packs a stale column.
+    // Stored-trigger allow pack, on a step that packs a stale column.
     collision_trigger_allow,
-    static_collider_splice,
-    nav_remask,
-    // The nav reaction's connectivity flood, its rounds summed: the removal-shaped share of a
-    // dig, fill, or dense terrain change.
-    nav_connect,
-    // The nav reaction's one-way closure rows, round 0 and its rounds summed: the cost of a
-    // change to a one-way system.
-    nav_closure,
-    nav_evict,
     particles,
-    sprite_prep,
 };
 
 pub const FrameSample = struct {
@@ -266,11 +273,25 @@ pub const FrameSample = struct {
 const metric_count = @typeInfo(Metric).@"enum".field_names.len;
 const timing_count = @typeInfo(Timing).@"enum".field_names.len;
 const batch_stage_count = @typeInfo(BatchStage).@"enum".field_names.len;
+const bench_batch_stage_count = @typeInfo(BenchBatchStage).@"enum".field_names.len;
 
 pub const RuntimePerfLog = if (enabled) EnabledRuntimePerfLog else DisabledRuntimePerfLog;
 
+/// A bench's sink for the step's bench-only batches, aggregated like the log's and indexed
+/// by `BenchBatchStage`.
+pub const StepBatches = if (enabled) struct {
+    batches: [bench_batch_stage_count]BatchAggregate = @splat(.{}),
+
+    fn record(self: *StepBatches, stage: BenchBatchStage, stats: BatchStats) void {
+        if (isEmptyBatch(stats)) return;
+        self.batches[@backingInt(stage)].record(stats);
+    }
+} else struct {};
+
 pub const Context = if (enabled) struct {
     logger: ?*RuntimePerfLog = null,
+    // Set only by a bench census; the game binds the log alone.
+    step_batches: ?*StepBatches = null,
 
     pub fn bind(logger: *RuntimePerfLog) Context {
         return .{ .logger = logger };
@@ -295,6 +316,11 @@ pub const Context = if (enabled) struct {
     pub fn recordBatch(self: Context, stage: BatchStage, stats: BatchStats) void {
         if (self.logger) |logger| logger.recordBatch(stage, stats);
     }
+
+    /// Reaches only a bound `StepBatches` sink; the log never records it.
+    pub fn recordBenchBatch(self: Context, stage: BenchBatchStage, stats: BatchStats) void {
+        if (self.step_batches) |sink| sink.record(stage, stats);
+    }
 } else struct {
     pub fn bind(_: *RuntimePerfLog) Context {
         return .{};
@@ -304,12 +330,14 @@ pub const Context = if (enabled) struct {
     pub fn recordMetricMax(_: Context, _: Metric, _: u64) void {}
     pub fn recordTiming(_: Context, _: Timing, _: u64) void {}
     pub fn recordBatch(_: Context, _: BatchStage, _: BatchStats) void {}
+    pub fn recordBenchBatch(_: Context, _: BenchBatchStage, _: BatchStats) void {}
 };
 
 comptime {
     if (!enabled) {
         std.debug.assert(@sizeOf(RuntimePerfLog) == 0);
         std.debug.assert(@sizeOf(Context) == 0);
+        std.debug.assert(@sizeOf(StepBatches) == 0);
     }
 }
 
@@ -384,7 +412,7 @@ const EnabledRuntimePerfLog = struct {
     }
 
     pub fn recordBatch(self: *EnabledRuntimePerfLog, stage: BatchStage, stats: BatchStats) void {
-        if (stats.item_count == 0 and stats.range_count == 0 and stats.batch_duration_ns == 0) return;
+        if (isEmptyBatch(stats)) return;
         self.batches[@backingInt(stage)].record(stats);
     }
 
@@ -413,7 +441,6 @@ const EnabledRuntimePerfLog = struct {
         self.recordMetric(.sprite_vertices, stats.vertex_count);
         self.recordMetric(.sprite_draw_groups, stats.draw_group_count);
         self.recordMetric(.sprite_command_overflow_grows, stats.command_overflow_grows);
-        self.recordBatch(.sprite_prep, stats.batch);
     }
 
     fn reset(self: *EnabledRuntimePerfLog, now_ns: u64) void {
@@ -883,6 +910,11 @@ const BatchAggregate = struct {
     }
 };
 
+// A stage that did not run this step.
+fn isEmptyBatch(stats: BatchStats) bool {
+    return stats.item_count == 0 and stats.range_count == 0 and stats.batch_duration_ns == 0;
+}
+
 fn millis(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_ms));
 }
@@ -916,7 +948,7 @@ test "runtime performance log reset clears accumulators" {
     log_under_test.recordMetric(.sdl_events, 3);
     log_under_test.recordTiming(.app_tick, 12);
     log_under_test.recordTiming(.gameplay_update, 8);
-    log_under_test.recordBatch(.movement, .{
+    log_under_test.recordBatch(.nav_remask, .{
         .item_count = 16,
         .range_count = 1,
         .batch_duration_ns = 100,
@@ -935,5 +967,27 @@ test "runtime performance log reset clears accumulators" {
     try std.testing.expectEqual(@as(u64, 0), log_under_test.metricValue(.sdl_events));
     try std.testing.expectEqual(@as(u64, 0), log_under_test.timingValue(.app_tick).count);
     try std.testing.expectEqual(@as(u64, 0), log_under_test.timingValue(.gameplay_update).count);
-    try std.testing.expectEqual(@as(u64, 0), log_under_test.batchValue(.movement).calls);
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.batchValue(.nav_remask).calls);
+}
+
+test "a bench-only batch reaches a bound step sink and never the log" {
+    // With the log compiled out, the sink and the context hold nothing.
+    if (comptime !enabled) {
+        try std.testing.expectEqual(@as(usize, 0), @sizeOf(StepBatches));
+        try std.testing.expectEqual(@as(usize, 0), @sizeOf(Context));
+        return;
+    }
+    var log_under_test = EnabledRuntimePerfLog.init(0);
+    var sink = StepBatches{};
+    const stats = BatchStats{ .item_count = 16, .range_count = 2, .batch_duration_ns = 100, .ran_inline = false, .active_worker_threads = 1 };
+    const unbound = Context.bind(&log_under_test);
+    try std.testing.expect(unbound.step_batches == null);
+    unbound.recordBenchBatch(.movement, stats);
+    const bound = Context{ .logger = &log_under_test, .step_batches = &sink };
+    bound.recordBenchBatch(.movement, stats);
+    bound.recordBenchBatch(.steering, .{});
+    try std.testing.expectEqual(@as(u64, 1), sink.batches[@backingInt(BenchBatchStage.movement)].calls);
+    try std.testing.expectEqual(@as(u64, 1), sink.batches[@backingInt(BenchBatchStage.movement)].threaded_calls);
+    try std.testing.expectEqual(@as(u64, 0), sink.batches[@backingInt(BenchBatchStage.steering)].calls);
+    for (log_under_test.batches) |batch| try std.testing.expectEqual(@as(u64, 0), batch.calls);
 }

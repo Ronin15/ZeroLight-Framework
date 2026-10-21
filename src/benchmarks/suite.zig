@@ -18,6 +18,7 @@ const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfi
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const PerfBatchStage = @import("../app/runtime_perf_log.zig").BatchStage;
+const PerfBenchBatchStage = @import("../app/runtime_perf_log.zig").BenchBatchStage;
 const PerfMetric = @import("../app/runtime_perf_log.zig").Metric;
 const PerfTiming = @import("../app/runtime_perf_log.zig").Timing;
 const NavMainPhases = @import("../game/systems/pathfinding/types.zig").NavMainPhases;
@@ -531,8 +532,8 @@ pub const RenderCapacitySummary = struct {
 };
 
 /// One production fixed step's census, means per measured step. `main_ns` is the step's
-/// wall time minus the off-main time of every perf-log batch stage that ran on workers: an
-/// upper bound, since batches the log does not carry count as main. `untimed_ns` is the
+/// wall time minus the off-main time of every perf-log and bench-only batch stage that ran
+/// on workers: an upper bound, since batches neither carries count as main. `untimed_ns` is the
 /// wall time no top-level stage timer holds. Stage wall times are every perf-log timer the
 /// step records, nested ones included; batch off-main time counts a step only when every
 /// call of the stage that step ran on workers. `shared_tuner` is the thread system's
@@ -546,6 +547,10 @@ pub const ProductionStepSummary = struct {
     batch_off_main_ns: std.enums.EnumArray(PerfBatchStage, u64) = .initFill(0),
     batch_threaded_steps: std.enums.EnumArray(PerfBatchStage, usize) = .initFill(0),
     batch_recorded_steps: std.enums.EnumArray(PerfBatchStage, usize) = .initFill(0),
+    // The same for the bench-only stages the step hands the census's sink.
+    bench_batch_off_main_ns: std.enums.EnumArray(PerfBenchBatchStage, u64) = .initFill(0),
+    bench_batch_threaded_steps: std.enums.EnumArray(PerfBenchBatchStage, usize) = .initFill(0),
+    bench_batch_recorded_steps: std.enums.EnumArray(PerfBenchBatchStage, usize) = .initFill(0),
     metrics: std.enums.EnumArray(PerfMetric, u64) = .initFill(0),
     shared_tuner: AdaptiveWorkReport = .{},
     // A per-level shape's separation check bound per query and the most cells any row

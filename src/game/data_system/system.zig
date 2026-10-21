@@ -468,6 +468,14 @@ pub const DataSystem = struct {
         return @intCast(dense_index);
     }
 
+    /// `id`'s movement row from a stored `hint`: the hint while `entities[hint]` still names
+    /// `id` (index and generation), else one slot resolve; null with no movement body.
+    /// `entities` is the movement store's entity column the caller sliced once.
+    pub fn movementBodyDenseIndexHinted(self: *const DataSystem, entities: []const EntityId, id: EntityId, hint: usize) ?usize {
+        if (hint < entities.len and entities[hint].eql(id)) return hint;
+        return self.movementBodyDenseIndex(id);
+    }
+
     pub fn bodyLevelFaction(self: *const DataSystem, id: EntityId) ?BodyLevelFaction {
         const slot = self.resolveSlotConst(id) orelse return null;
         const movement_body = slot.movement_body_index orelse return null;
@@ -1283,6 +1291,28 @@ test "setMovementBody syncs scope metadata level when world level already exists
 
     try std.testing.expectEqual(@as(u16, 7), data.worldLevelConst(entity).?);
     try std.testing.expectEqual(@as(u16, 7), data.scopeColumnsSliceConst().level[0]);
+}
+
+test "a hinted movement row is kept only while its row still names the entity" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const first = try data.createEntity();
+    try data.setMovementBody(first, .{});
+    const second = try data.createEntity();
+    try data.setMovementBody(second, .{});
+    const bodiless = try data.createEntity();
+    try std.testing.expectEqual(@as(?usize, 1), data.movementBodyDenseIndexHinted(data.movementBodySliceConst().entities, second, 1));
+    // A stale hint: the destroy swaps `second` onto row 0, and row 1 is past the column end.
+    try std.testing.expect(data.destroyEntity(first));
+    const entities = data.movementBodySliceConst().entities;
+    try std.testing.expectEqual(@as(?usize, 0), data.movementBodyDenseIndexHinted(entities, second, 1));
+    // A hint naming another entity's row, and a destroyed id on its old row, resolve.
+    const third = try data.createEntity();
+    try data.setMovementBody(third, .{});
+    const grown = data.movementBodySliceConst().entities;
+    try std.testing.expectEqual(@as(?usize, 1), data.movementBodyDenseIndexHinted(grown, third, 0));
+    try std.testing.expectEqual(@as(?usize, null), data.movementBodyDenseIndexHinted(grown, first, 0));
+    try std.testing.expectEqual(@as(?usize, null), data.movementBodyDenseIndexHinted(grown, bodiless, 0));
 }
 
 test "entity generations reject stale ids after removal and reuse" {
