@@ -60,12 +60,13 @@ How the thread system works: `docs/architecture.md` § Thread System.
   before the cap, with parity tests that cross ranges and hit the cap.
 - Hot loops iterate dense columns; membership masks never become dynamic
   joins.
-- Worker ranges never share a writable cache line, and the range shape
-  guarantees it, not padding. A stage's `range_alignment_items` is at least
-  one lane batch and puts every range boundary on a cache line in each column
-  the stage writes (64 B / the narrowest written element). Rows stay dense,
-  each range streams whole lane batches, and only the stage's last range ends
-  in the masked tail.
+- The range shape, not padding, keeps worker ranges off each other's cache
+  lines. A stage's `range_alignment_items` is at least one lane batch and
+  makes each range span at least one full cache line in every column the
+  stage writes (64 B / the narrowest written element), so neighbouring ranges
+  share at most the line at their boundary. Rows stay dense, each range
+  streams whole lane batches, and only the stage's last range ends in the
+  masked tail.
 - Pad only per-range and per-worker records (slots, cursors, counters) to the
   cache-line quantum, and a contended shared record to the platform cache
   line. Never pad rows or column elements.

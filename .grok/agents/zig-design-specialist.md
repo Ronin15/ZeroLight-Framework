@@ -109,11 +109,9 @@ section with nothing new is omitted.
   order is read where it sits. Do not copy it into a side group to fill
   lanes. Name the common call's length. A short slice is that same kernel
   with a mask, not a second scalar loop of the compare. A design that replaces a hot loop keeps a pattern that is already
-  the right shape and replaces one that is not. It lands only when
-  ReleaseFast on that path is faster than the code it replaces. Within
-  spread is not a win. Do not revert that shape to get there. If it
-  cannot be made faster, the proof is the ReleaseFast pair and what was
-  tried. The owner accepts a revert before the code goes back. Inherited code the change
+  the right shape and replaces one that is not. The SIMD shape always
+  stays; ReleaseFast only breaks a SIMD-vs-scalar tie (`build-validation.md`),
+  and a Debug gap gets its verdict per `tests-benchmarks.md`. Inherited code the change
   keeps on the hot path is in the table. "Same as the old loop" is not
   a pass. The only exemptions are the ones that section names, and the
   row names the exemption. A movement-column gather is not exempt: those columns are

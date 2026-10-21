@@ -15,7 +15,8 @@
   another store's columns gathers them once into packed scratch. Inherently
   indirect access is exempt: search frontiers, pair streams, hash point
   lookups, and sparse index maintenance that visits only changed items (owner
-  or inverse indexes such as the path registry).
+  or inverse indexes such as the path registry) while the changed set stays
+  sparse; a pass that rewrites most of an index streams it.
 - A layout that fails either bullet fails the design and is fixed in the
   layout.
 

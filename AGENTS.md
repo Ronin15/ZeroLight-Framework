@@ -113,9 +113,9 @@ Validation cadence and modes: `build-validation.md`.
   unless the brief names another path. A spawn prompt cites the file.
 - `tools/bench_ab.py` is the before/after bench; `zig-specialist` runs it
   when the change can move a hot path (DW § Benchmarks). A hot-path
-  replacement stays until ReleaseFast on that path is faster than the
-  code it replaces. If it cannot be made faster, show that proof and
-  wait for the owner before reverting. Do not revert first.
+  replacement keeps its SIMD shape; slower cases get their verdict per
+  `tests-benchmarks.md`, and ReleaseFast only breaks a SIMD-vs-scalar tie
+  (`build-validation.md`). Never revert implemented work without the owner.
 - `hooks/zig-fmt.sh` runs `zig fmt` on each `.zig`/`.zon` file a
   `search_replace` or `write` just edited (needs `jq`); it does not replace
   validation.
