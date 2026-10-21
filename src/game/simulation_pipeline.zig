@@ -691,6 +691,10 @@ pub const SimulationPipelineStats = struct {
             if (static_pairs.available_worker_threads != 0 or static_pairs.batch_duration_ns != 0) {
                 perf.recordBatch(.collision_static_pairs, static_pairs);
             }
+            const trigger_allow = collision_stats.trigger_allow_batch;
+            if (trigger_allow.available_worker_threads != 0 or trigger_allow.batch_duration_ns != 0) {
+                perf.recordBatch(.collision_trigger_allow, trigger_allow);
+            }
         }
         perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
         perf.recordBatch(.collision_narrowphase, collision_stats.narrowphase_batch);

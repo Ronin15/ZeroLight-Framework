@@ -141,7 +141,7 @@ fn stageBatches(stage: Timing) []const BatchStage {
         .pipeline_steering => &.{.steering},
         .pipeline_pathfinding => &.{ .path_solve, .path_intake, .path_registry_flush, .path_resize_copy },
         .pipeline_movement => &.{.movement},
-        .pipeline_collision => &.{ .collision_fill, .collision_sort, .collision_broadphase, .collision_narrowphase, .collision_static_pairs },
+        .pipeline_collision => &.{ .collision_fill, .collision_sort, .collision_broadphase, .collision_narrowphase, .collision_static_pairs, .collision_trigger_allow },
         .pipeline_chunk_derive => &.{.chunk_derive},
         .gameplay_particles => &.{.particles},
         .gameplay_structural => &.{ .static_collider_splice, .nav_remask, .nav_connect, .nav_closure, .nav_evict },

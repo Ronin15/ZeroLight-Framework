@@ -361,6 +361,8 @@ pub const CollisionStats = struct {
     narrowphase_batch: BatchStats = .{},
     /// Dynamic×static query. Present in every build; the perf log copies it when enabled.
     static_pairs_batch: BatchStats = .{},
+    /// Stored-trigger allow pack. Zero when that pack did not run.
+    trigger_allow_batch: BatchStats = .{},
     /// This step outgrew the reserved pair bound, so a main-thread grow path ran: the
     /// candidate pairs exceeded `CollisionSystem.reserved_pair_bound`, or a broadphase
     /// range held more than `broadphase_pairs_per_item` pairs per entry its slot was
@@ -435,6 +437,9 @@ const KeyedContact = struct {
 /// in range order.
 const ContactStagingList = std.array_list.Aligned(CollisionContact, .fromByteUnits(thread_shared_record_alignment));
 const NarrowphaseKeyList = std.array_list.Aligned(u256, .fromByteUnits(thread_shared_record_alignment));
+// One word per stored trigger pair. u32 so a range of `collision_range_alignment_items`
+// is one cache line and two ranges never share one.
+const TriggerAllowList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
 
 /// One narrowphase range's contact count, written once by the range's job.
 const ContactCountTally = struct {
@@ -449,6 +454,7 @@ comptime {
     // One narrowphase range starts on a cache line when the previous one does.
     std.debug.assert(collision_range_alignment_items * @sizeOf(CollisionContact) % thread_shared_record_alignment == 0);
     std.debug.assert(collision_range_alignment_items * @sizeOf(u256) % thread_shared_record_alignment == 0);
+    std.debug.assert(collision_range_alignment_items * @sizeOf(u32) % thread_shared_record_alignment == 0);
 }
 
 const ContactCountTallyList = std.array_list.Aligned(ContactCountTally, .fromByteUnits(thread_shared_record_alignment));
@@ -576,6 +582,7 @@ pub const CollisionSystem = struct {
     broadphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     narrowphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     static_pair_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    trigger_allow_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     static_sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     strips: CollisionStrips = .default,
     static_pair_slots: SlotList(StaticPairBuffer) = .empty,
@@ -585,6 +592,10 @@ pub const CollisionSystem = struct {
     sort_offsets: SlotList(BandOffsets) = .empty,
     triggers: std.ArrayList(TriggerHead) = .empty,
     trigger_pairs: std.ArrayList(KeyedContact) = .empty,
+    // Parallel to `trigger_pairs`: 1 when both stored movement indices allow collision, else 0.
+    // `len == trigger_pairs.len` only after the pack that stored `trigger_allow_epoch`.
+    trigger_allow: TriggerAllowList = .empty,
+    trigger_allow_epoch: u64 = 0,
     trigger_rows: std.ArrayList(u32) = .empty,
     change_mark: std.ArrayList(u32) = .empty,
     change_generation: u32 = 1,
@@ -625,6 +636,7 @@ pub const CollisionSystem = struct {
     pub fn deinit(self: *CollisionSystem) void {
         self.change_mark.deinit(self.allocator);
         self.trigger_rows.deinit(self.allocator);
+        self.trigger_allow.deinit(self.allocator);
         self.trigger_pairs.deinit(self.allocator);
         self.triggers.deinit(self.allocator);
         self.sort_offsets.deinit(self.allocator);
@@ -1234,6 +1246,7 @@ pub const CollisionSystem = struct {
         self.static_pairs.clearRetainingCapacity();
         if (view.geometry == null) return false;
         try self.refreshTriggers(data, view, threads);
+        const exclude_tiers = data.tierCount(.dormant) + data.tierCount(.kinematic) != 0;
         const input_count = self.proxies.len;
         if (input_count != 0) {
             const stage = threads.stage(&self.static_pair_tuner);
@@ -1246,7 +1259,7 @@ pub const CollisionSystem = struct {
                 .proxies = ConstProxyColumns.of(self.proxies.slice()),
                 .strips = self.strips,
                 .slots = slots,
-                .exclude_tiers = data.tierCount(.dormant) + data.tierCount(.kinematic) != 0,
+                .exclude_tiers = exclude_tiers,
                 .items_per_range = selection.items_per_range,
                 .range_count = selection.range_count,
                 .input_count = input_count,
@@ -1284,7 +1297,8 @@ pub const CollisionSystem = struct {
                 for (slots) |slot| if (slot.value.moved) return true;
             }
         }
-        try self.appendTriggerContacts(data);
+        try self.packTriggerAllow(data, threads, exclude_tiers, stats);
+        try self.appendTriggerContacts(exclude_tiers);
         return false;
     }
 
@@ -1297,6 +1311,7 @@ pub const CollisionSystem = struct {
     }
 
     fn rebuildTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
+        self.trigger_allow.items.len = 0;
         self.trigger_pairs.clearRetainingCapacity();
         self.triggers.clearRetainingCapacity();
         self.trigger_rows.clearRetainingCapacity();
@@ -1310,6 +1325,7 @@ pub const CollisionSystem = struct {
     }
 
     fn patchTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
+        self.trigger_allow.items.len = 0;
         try self.markChanges(view.changes);
         self.dropChangedPairs();
         const kept = self.trigger_pairs.items.len;
@@ -1529,12 +1545,46 @@ pub const CollisionSystem = struct {
         }
     }
 
-    fn appendTriggerContacts(self: *CollisionSystem, data: *const DataSystem) !void {
-        const exclude = data.tierCount(.dormant) + data.tierCount(.kinematic) != 0;
-        for (self.trigger_pairs.items) |pair| {
-            if (exclude and !pairTiersAllow(data, pair.contact)) continue;
-            try self.static_pairs.append(self.allocator, pair);
+    // One reserve, then every stored pair, or only the pairs whose allow word is 1.
+    // The pack wrote that column; this does not read tiers.
+    fn appendTriggerContacts(self: *CollisionSystem, exclude: bool) !void {
+        const pairs = self.trigger_pairs.items;
+        if (pairs.len == 0) return;
+        try self.static_pairs.ensureTotalCapacity(self.allocator, self.static_pairs.items.len + pairs.len);
+        if (!exclude) {
+            self.static_pairs.appendSliceAssumeCapacity(pairs);
+            return;
         }
+        const allow = self.trigger_allow.items;
+        std.debug.assert(allow.len == pairs.len);
+        for (pairs, allow) |pair, word| {
+            std.debug.assert(word == 0 or word == 1);
+            if (word == 1) self.static_pairs.appendAssumeCapacity(pair);
+        }
+    }
+
+    // Packs one u32 per stored pair when exclusion is on and the column is stale.
+    // Below the tuner gate the same job runs inline. A fresh column, exclusion off,
+    // or an empty list does not dispatch.
+    fn packTriggerAllow(self: *CollisionSystem, data: *const DataSystem, threads: Threads, exclude: bool, stats: *CollisionStats) !void {
+        const pair_count = self.trigger_pairs.items.len;
+        if (!exclude or pair_count == 0 or (self.trigger_allow.items.len == pair_count and self.trigger_allow_epoch == data.collision_allow_epoch)) {
+            stats.trigger_allow_batch = .{};
+            return;
+        }
+        try self.trigger_allow.ensureTotalCapacity(self.allocator, pair_count);
+        self.trigger_allow.items.len = pair_count;
+        const stage = threads.stage(&self.trigger_allow_tuner);
+        const selection = stage.select(pair_count, collision_range_alignment_items);
+        var job = PackTriggerAllowJob{
+            .data = data,
+            .pairs = self.trigger_pairs.items,
+            .allow = self.trigger_allow.items,
+            .items_per_range = selection.items_per_range,
+            .range_count = selection.range_count,
+        };
+        stats.trigger_allow_batch = stage.run(selection, pair_count, collision_range_alignment_items, &job, packTriggerAllowJob);
+        self.trigger_allow_epoch = data.collision_allow_epoch;
     }
 
     fn sortStaticPairs(self: *CollisionSystem, threads: Threads, stats: *CollisionStats) !void {
@@ -1998,10 +2048,28 @@ fn pairBandStarts(offsets: []const PaddedSlot(BandOffsets)) [band_count + 1]u32 
     return starts;
 }
 
-fn pairTiersAllow(data: *const DataSystem, contact: CollisionContact) bool {
-    const tier_a = data.movement_bodies.tierAt(contact.a_movement_index);
-    const tier_b = data.movement_bodies.tierAt(contact.b_movement_index);
-    return tier_a.allowsCollision() and tier_b.allowsCollision();
+const PackTriggerAllowJob = struct {
+    data: *const DataSystem,
+    pairs: []const KeyedContact,
+    allow: []u32,
+    items_per_range: usize,
+    range_count: usize,
+};
+
+// Scalar: each pair is two indexed tier loads and one store. The tier column is not in pair order.
+fn packTriggerAllowJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *PackTriggerAllowJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.end <= job.pairs.len and range.end <= job.allow.len);
+    const tier = job.data.scopeColumnsSliceConst().tier;
+    for (job.pairs[range.start..range.end], job.allow[range.start..range.end]) |pair, *word| {
+        const a_index = pair.contact.a_movement_index;
+        const b_index = pair.contact.b_movement_index;
+        std.debug.assert(a_index < tier.len and b_index < tier.len);
+        const allow = tier[a_index].allowsCollision() and tier[b_index].allowsCollision();
+        word.* = @intFromBool(allow);
+    }
 }
 
 // The reference run key: ordered min_x, ordered min_y, entity. Level and the contact
@@ -4678,6 +4746,160 @@ test "a kinematic static drops its contact only when scope excludes" {
     try data.setSimulationTier(wall, .kinematic);
     const closed = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
     try std.testing.expectEqual(@as(usize, 0), closed.contact_count);
+}
+
+fn contactsNotNaming(contacts: []const CollisionContact, id: EntityId) ![]CollisionContact {
+    var kept: std.ArrayList(CollisionContact) = .empty;
+    errdefer kept.deinit(std.testing.allocator);
+    for (contacts) |contact| {
+        if (contact.a.eql(id) or contact.b.eql(id)) continue;
+        try kept.append(std.testing.allocator, contact);
+    }
+    return try kept.toOwnedSlice(std.testing.allocator);
+}
+
+fn expectStoredTriggerAllowFollowsTier(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const left = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 40, .h = 40 }, .static, .trigger);
+    const right = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
+    // Default rows are cognition. Locomotion crosses no allow bit, so setup leaves epoch 0.
+    try data.setSimulationTier(left, .locomotion);
+    try data.setSimulationTier(right, .locomotion);
+
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry());
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    const view = colliders.view();
+
+    const open = try updateView(&system, &data, &contacts, view, workers, null);
+    try std.testing.expect(open.contact_count > 0);
+    try std.testing.expectEqual(@as(u64, 0), data.collision_allow_epoch);
+    try std.testing.expectEqual(@as(usize, 0), system.trigger_allow.items.len);
+    var first: std.ArrayList(CollisionContact) = .empty;
+    defer first.deinit(std.testing.allocator);
+    try first.appendSlice(std.testing.allocator, contacts.mergedItems());
+
+    try data.setSimulationTier(right, .kinematic);
+    _ = try updateView(&system, &data, &contacts, view, workers, null);
+    try std.testing.expectEqual(@as(u64, 1), data.collision_allow_epoch);
+    const dropped = try contactsNotNaming(first.items, right);
+    defer std.testing.allocator.free(dropped);
+    try expectSameContacts(dropped, contacts.mergedItems());
+
+    try data.setSimulationTier(right, .dormant);
+    // Exclusion stays on and the epoch did not move, so this step must not pack.
+    const steady = try updateView(&system, &data, &contacts, view, workers, null);
+    try std.testing.expectEqual(@as(u64, 1), data.collision_allow_epoch);
+    try std.testing.expectEqual(BatchStats{}, steady.trigger_allow_batch);
+    try expectSameContacts(dropped, contacts.mergedItems());
+
+    try data.setSimulationTier(right, .locomotion);
+    _ = try updateView(&system, &data, &contacts, view, workers, null);
+    try std.testing.expectEqual(@as(u64, 2), data.collision_allow_epoch);
+    try expectSameContacts(first.items, contacts.mergedItems());
+
+    try data.setSimulationMetadata(right, .{ .tier = .kinematic });
+    _ = try updateView(&system, &data, &contacts, view, workers, null);
+    try std.testing.expectEqual(@as(u64, 3), data.collision_allow_epoch);
+    try expectSameContacts(dropped, contacts.mergedItems());
+}
+
+test "collision stored trigger allow follows allowsCollision without a collider sync" {
+    try expectStoredTriggerAllowFollowsTier(0);
+    try expectStoredTriggerAllowFollowsTier(2);
+}
+
+test "collision stored trigger allow follows a swapRemove onto a stored index" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const left = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 40, .h = 40 }, .static, .trigger);
+    const right = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
+    const mover = try addObstacle(&data, .{ .x = 1000, .y = 1000, .w = 8, .h = 8 }, .dynamic, .solid);
+    try data.setSimulationTier(left, .locomotion);
+    try data.setSimulationTier(right, .locomotion);
+    try data.setSimulationTier(mover, .kinematic);
+
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry());
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    const view = colliders.view();
+
+    const open = try updateView(&system, &data, &contacts, view, 0, null);
+    try std.testing.expect(open.contact_count > 0);
+    const epoch = data.collision_allow_epoch;
+    try std.testing.expect(data.destroyEntity(left));
+    try std.testing.expectEqual(epoch + 1, data.collision_allow_epoch);
+    // The mover lands on left's stored movement index and does not allow collision.
+    const closed = try updateView(&system, &data, &contacts, view, 0, null);
+    try std.testing.expectEqual(@as(usize, 0), closed.contact_count);
+}
+
+test "collision stored trigger allow packs on workers" {
+    const span = 2 * collision_range_alignment_items;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const pitch: f32 = 48;
+    const wide: f32 = @as(f32, @floatFromInt(span)) * pitch;
+    _ = try addObstacle(&data, .{ .x = 0, .y = 0, .w = wide, .h = 40 }, .static, .trigger);
+    var smalls: [span]EntityId = undefined;
+    for (0..span) |index| {
+        smalls[index] = try addObstacle(&data, .{
+            .x = @as(f32, @floatFromInt(index)) * pitch + 8,
+            .y = 8,
+            .w = 16,
+            .h = 16,
+        }, .static, .trigger);
+    }
+    try data.setSimulationTier(smalls[0], .kinematic);
+
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry());
+    const view = colliders.view();
+
+    var serial = CollisionSystem.init(std.testing.allocator);
+    defer serial.deinit();
+    var serial_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer serial_contacts.deinit();
+    _ = try updateView(&serial, &data, &serial_contacts, view, 0, collision_range_alignment_items);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    const warm = try updateView(&system, &data, &contacts, view, 2, collision_range_alignment_items);
+    try expectSameContacts(serial_contacts.mergedItems(), contacts.mergedItems());
+    try std.testing.expect(warm.trigger_allow_batch.range_count > 1);
+    try std.testing.expectEqual(system.trigger_pairs.items.len, system.trigger_allow.items.len);
+    var saw_zero = false;
+    var saw_one = false;
+    for (system.trigger_pairs.items, system.trigger_allow.items) |pair, word| {
+        const names_kinematic = pair.contact.a.eql(smalls[0]) or pair.contact.b.eql(smalls[0]);
+        try std.testing.expectEqual(names_kinematic, word == 0);
+        if (word == 0) saw_zero = true else saw_one = true;
+    }
+    try std.testing.expect(saw_zero);
+    try std.testing.expect(saw_one);
+
+    const allocator = system.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = failing.allocator();
+    defer system.allocator = allocator;
+    // Another allow cross keeps exclusion on, so this step packs the same pair count.
+    try data.setSimulationTier(smalls[1], .kinematic);
+    const repacked = try updateView(&system, &data, &contacts, view, 2, collision_range_alignment_items);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(repacked.trigger_allow_batch.range_count > 1);
+    try std.testing.expect(repacked.trigger_allow_batch.active_worker_threads > 0);
 }
 
 test "an unsynced static move is out of band" {

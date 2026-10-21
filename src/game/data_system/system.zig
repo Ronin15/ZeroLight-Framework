@@ -122,6 +122,10 @@ pub const DataSystem = struct {
     // create/destroy/metadata-change so the per-fixed-step scope stats are O(1)
     // instead of scanning every slot. Indexed by @backingInt(SimulationTier).
     tier_counts: [4]usize = .{ 0, 0, 0, 0 },
+    /// Stamp of movement-row collision allowance. Zero is a packed epoch, not an
+    /// unpacked marker. It moves when a tier crosses `allowsCollision`, and when a
+    /// movement row is removed, because `swapRemove` can retarget that index.
+    collision_allow_epoch: u64 = 0,
     movement_bodies: MovementBodyStore = .{},
     facings: FacingStore = .{},
     primitive_visuals: PrimitiveVisualStore = .{},
@@ -277,6 +281,7 @@ pub const DataSystem = struct {
         self.tier_counts[@backingInt(stored.tier)] -= 1;
         self.tier_counts[@backingInt(metadata.tier)] += 1;
         self.movement_bodies.setScopeMetadata(di, resolved);
+        self.noteCollisionAllow(stored.tier, metadata.tier);
         self.snapInterpolationIfStill(di, metadata.tier);
     }
 
@@ -286,11 +291,19 @@ pub const DataSystem = struct {
     pub fn setSimulationTier(self: *DataSystem, id: EntityId, tier: SimulationTier) !void {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         const di: usize = slot.movement_body_index orelse return error.InvalidEntity;
-        self.tier_counts[@backingInt(self.movement_bodies.tierAt(di))] -= 1;
+        const old_tier = self.movement_bodies.tierAt(di);
+        self.tier_counts[@backingInt(old_tier)] -= 1;
         self.tier_counts[@backingInt(tier)] += 1;
         self.movement_bodies.setTier(di, tier);
+        self.noteCollisionAllow(old_tier, tier);
         // chunk, stagger_phase, and always_active are intentionally preserved.
         self.snapInterpolationIfStill(di, tier);
+    }
+
+    // Dormant and kinematic are the tiers that do not allow collision. Locomotion
+    // and cognition cross neither each other nor this stamp.
+    fn noteCollisionAllow(self: *DataSystem, old_tier: SimulationTier, new_tier: SimulationTier) void {
+        if (old_tier.allowsCollision() != new_tier.allowsCollision()) self.collision_allow_epoch +%= 1;
     }
 
     /// When an entity enters a non-moving tier, snap previous=position so render
@@ -920,6 +933,8 @@ pub const DataSystem = struct {
     fn removeMovementBodyAt(self: *DataSystem, index: usize) void {
         // The scope tier row leaves with the movement body, so drop its tier count
         // before the swap overwrites it. The moved tail row keeps its own tier.
+        // A later row may land on this index; stored trigger pairs re-read it.
+        self.collision_allow_epoch +%= 1;
         self.tier_counts[@backingInt(self.movement_bodies.tierAt(index))] -= 1;
         const removed = self.movement_bodies.sliceConst().entities[index];
         const bounds_index = self.slots.items[@intCast(removed.index)].collision_bounds_index;
