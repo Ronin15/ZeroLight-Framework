@@ -246,7 +246,8 @@ const ToggleChecks = struct {
 
 // Fails when a reaction's closure passed what its prepare bounded: tail words past its
 // reserve or its bound, new terminals past its gross pops, or, for a block kept in place, row
-// words written past its affected rows (recomputed, left, and new) at the widest row.
+// words written past its affected rows (recomputed, left, and new) at the widest row. Reads
+// the live closure limits, so it runs before the next reaction replaces them.
 fn checkOnewayWithinBounds(fixture: *const ReactFixture, stats: NavUpdateStats, fixed_blocks: bool) !void {
     const perf = stats.perf;
     if (perf.closure_tail_used > perf.closure_tail_bound) return error.ConnectivityOnewayTailPastReserve;
@@ -294,6 +295,8 @@ fn checkOnewayIsolated(fixture: *const ReactFixture, stats: NavUpdateStats, tail
 fn runToggle(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, cells: []const CellCoord, thread_system: *ThreadSystem, checks: ToggleChecks, revert_tuners: *fixtures.NavTuners) !ToggleSample {
     const tail_capacity = fixture.system.graph.connectivity.closure.tail.capacity;
     const change = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
+    try checkOnewayWithinBounds(fixture, change.stats, checks.fixed_blocks);
+    if (checks.untouched) try checkOnewayUntouched(change.stats);
     if (checks.isolated) try checkOnewayIsolated(fixture, change.stats, tail_capacity);
     const stats = change.stats;
     const perf = stats.perf;
@@ -321,15 +324,14 @@ fn runToggle(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, cell
     const revert = revert: {
         fixtures.swapNavTuners(&fixture.system, revert_tuners);
         defer fixtures.swapNavTuners(&fixture.system, revert_tuners);
-        break :revert try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
+        const reaction = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
+        try checkOnewayWithinBounds(fixture, reaction.stats, checks.fixed_blocks);
+        if (checks.untouched) try checkOnewayUntouched(reaction.stats);
+        break :revert reaction;
     };
     if (checks.isolated) try checkOnewayIsolated(fixture, revert.stats, tail_capacity);
     // An opening floods nothing.
     if (revert.stats.perf.conn_flood_nodes != 0) return error.ConnectivityOpeningFlooded;
-    for ([_]NavUpdateStats{ change.stats, revert.stats }) |reaction| {
-        try checkOnewayWithinBounds(fixture, reaction, checks.fixed_blocks);
-        if (checks.untouched) try checkOnewayUntouched(reaction);
-    }
     // A toggle and its revert never resize a one-way block.
     if (checks.fixed_blocks and (change.stats.perf.closure_shrinks != 0 or revert.stats.perf.closure_shrinks != 0)) return error.ConnectivityOnewayShrinkFlip;
     if (checks.reserve_ratio) {

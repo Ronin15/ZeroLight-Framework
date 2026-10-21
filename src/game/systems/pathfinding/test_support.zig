@@ -1643,7 +1643,8 @@ pub const RequestShape = struct {
     /// The most registry runs (chunk-local stretches of a stored path) one result holds;
     /// null is one per stored cell, the most a plain or stitched path holds.
     runs_per_result: ?usize = null,
-    /// Chunks over every level: a registry key is a chunk, so keys never pass it.
+    /// Chunks over every level. The registry directory opens one slot per chunk when
+    /// the nav levels open, and a registry key is a chunk, so keys never pass it.
     chunks: usize = std.math.maxInt(usize),
     /// The most nav marks recorded between two nav batches (a terrain record's events or
     /// two per static change), and the most chunk keys one batch changes.
@@ -1743,7 +1744,9 @@ pub fn requestStorageBytesBound(capacity: PathfindingCapacity, shape: RequestSha
         .results = resultCacheStorageBytesBound(limits.cached_results, capacity.max_stored_path_cells, stripe_words, shape.long_results) +|
             listBytesBound(u32, pool_words) +| listBytesBound(u16, pool_words) +| listBytesBound(PathfindingSystem.SolvedPath, solves) +|
             listBytesBound(?ResultCache.Claimed, solves),
-        .registry = pooledStorageBytesBound(registry_shard_count, @min(shape.chunks, live_runs), live_runs, limits.cached_results) +|
+        // One directory slot per chunk of the open levels (`openRegistryLevels`), whether
+        // or not a run is stored there. The run charge stays the stored paths' runs.
+        .registry = pooledStorageBytesBound(registry_shard_count, shape.chunks, live_runs, limits.cached_results) +|
             RegRecordList.growCapacity(windows) *| @sizeOf(RegRecord),
         // A resolve past the limit doubles it, so one intent per agent reserves at most twice that.
         .goals = goalTableStorageBytesBound(2 *| limits.pending_requests),

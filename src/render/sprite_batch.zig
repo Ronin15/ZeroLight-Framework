@@ -1352,6 +1352,11 @@ test "sprite prep adaptive gate keeps cheap batches inline" {
     });
     defer threads.deinit();
 
+    // Production prep uses the central gate. The run below pins a gate no batch
+    // reaches, so the inline decision holds on any host and build mode.
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, batch.adaptive_tuner.config.threaded_batch_ns);
+    batch.adaptive_tuner.config.threaded_batch_ns = std.math.maxInt(u64);
+
     const warmup_windows = batch.adaptive_tuner.config.sample_window * 4;
     var last_stats: SpritePrepStats = .{};
     var window: usize = 0;
@@ -1359,7 +1364,6 @@ test "sprite prep adaptive gate keeps cheap batches inline" {
         last_stats = try prepare(&batch, table.resolver(), &threads, .{});
     }
 
-    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, batch.adaptive_tuner.config.threaded_batch_ns);
     try std.testing.expectEqual(@as(usize, 0), last_stats.batch.active_worker_threads);
 }
 

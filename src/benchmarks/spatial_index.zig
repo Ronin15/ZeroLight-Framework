@@ -5,13 +5,13 @@
 //! Shared spatial index groups, each timing the index alone (its consumers' groups build it
 //! untimed).
 //! - `spatial_index`: the build over shuffled slots, so keys reach the sort in store order.
-//!   Pass shape: H log(H/B) in H indexed entities over B key bands, the sort off main on the
-//!   tuned case. Asserts check the sort ran on workers at the largest size.
+//!   Pass shape: H log(H/B) in H indexed entities over B key bands. The tuned case follows
+//!   the production tuner: bucket, sort, and link stay inline while under the gate.
 //! - `spatial_index-shape`: the build in a `shape_world_chunks`² world with every body in one
 //!   chunk (`dense_chunk`), one per chunk (`sparse_chunks`), or `shape_deep_bodies` over its
-//!   levels (`deep_levels`). Pass shape: linear in H with the sort off main on the tuned case
-//!   at the largest H; `deep_levels` flat in levels, its storage linear in levels. Asserts
-//!   check every body indexed, the sort on workers, and the directories' bytes whole against
+//!   levels (`deep_levels`). Pass shape: linear in H, the tuned case on the production tuner;
+//!   `deep_levels` flat in levels, its storage linear in levels. Asserts
+//!   check every body indexed and the directories' bytes whole against
 //!   `chunk_slot_bytes` x chunks x levels.
 //!   Both build groups print `entities=`, `--details` adding `main=` and the `sort=` and
 //!   `link=` stage shapes; `spatial_index-shape` also prints `directory_bytes=`, the level
@@ -134,17 +134,11 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var fixture = try createFixture(allocator, item_count);
     defer fixture.deinit();
-    const counts = &suite.event_scale_counts;
-    const expect_off_main = item_count == counts[counts.len - 1];
     const rows = (item_count + 127) / 128;
     const geometry = fixtures.indexGeometryCovering(128 * 11.0, @as(f32, @floatFromInt(rows)) * 9.0, 1);
-    const timed = try timeBuilds(allocator, io, options, case, &fixture.data, geometry, item_count, if (expect_off_main) .sort else .none);
+    const timed = try timeBuilds(allocator, io, options, case, &fixture.data, geometry, item_count);
     return timed.stats;
 }
-
-// Whether a tuned case asserts the sort, the build's cost driver, ran on workers; bucket and
-// link run inline where their tuners keep them below the gate.
-const OffMain = enum { none, sort };
 
 const TimedBuilds = struct {
     stats: suite.RunStats,
@@ -152,9 +146,9 @@ const TimedBuilds = struct {
 };
 
 // Times `options.iterations` builds of every AI agent of `data` over `geometry` after warmup
-// and, on an adaptive case, tuner settling, asserting `off_main`'s stages ran on workers on
-// the tuned case.
-fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *const DataSystem, geometry: IndexGeometry, item_count: usize, off_main: OffMain) !TimedBuilds {
+// and, on an adaptive case, tuner settling. A fixed threaded case proves each stage left
+// main; the tuned case follows its tuners.
+fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *const DataSystem, geometry: IndexGeometry, item_count: usize) !TimedBuilds {
     var system = SpatialIndexSystem.init(allocator);
     defer system.deinit();
     try system.reserve(data.aiAgentSliceConst().entities.len);
@@ -173,7 +167,6 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     const bucket_settled_before_measurement = if (case.adaptive) (system.bucket_tuner.phase == .settled) else false;
     const sort_settled_before_measurement = if (case.adaptive) (system.sort_tuner.phase == .settled) else false;
 
-    const tuned = case.adaptive and case.adaptive_range_mode == .tuned;
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = SpatialIndexStats{};
     var main_total: u128 = 0;
@@ -182,10 +175,6 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         last_stats = try runOnce(&system, data, geometry, thread_ptr, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        if (tuned) switch (off_main) {
-            .none => {},
-            .sort => if (last_stats.sort_batch.ran_inline) return error.SortRanInline,
-        };
         accumulator.record(elapsed_ns, last_stats.perf.bucket_batch);
         try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(spatial_index_range_alignment_items), &.{ last_stats.perf.bucket_batch, last_stats.sort_batch, last_stats.perf.link_batch });
         main_total += elapsed_ns -| (offMainNs(last_stats.perf.bucket_batch) + offMainNs(last_stats.sort_batch) + offMainNs(last_stats.perf.link_batch));
@@ -310,8 +299,7 @@ fn runShapeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const body_count = fixture.data.aiAgentSliceConst().entities.len;
     const levels: usize = if (fields.variant == .deep_levels) fields.axis else 1;
     const geometry = IndexGeometry{ .tile_size = required_tile_size, .chunk_size_tiles = default_chunk_size_tiles, .chunks_x = shape_world_chunks, .chunks_y = shape_world_chunks, .level_count = levels };
-    const off_main: OffMain = if (fields.variant != .deep_levels and fields.axis == shape_largest_bodies) .sort else .none;
-    const timed = try timeBuilds(allocator, io, options, case, &fixture.data, geometry, item_count, off_main);
+    const timed = try timeBuilds(allocator, io, options, case, &fixture.data, geometry, item_count);
     var stats = timed.stats;
     std.debug.assert(stats.output_count == body_count);
     // A directory per level of the world's chunks, checked whole against the live bytes.

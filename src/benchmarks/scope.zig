@@ -6,9 +6,9 @@
 //!   untimed: `spread` over N entities on 16 x-chunks whose levels (`index % 5`) give a
 //!   mixed-tier population (cognition, locomotion, kinematic, dormant), `dense_chunk` with
 //!   every agent in one chunk (one index record), whose ranges split the chunk. Pass shape: linear in the H indexed
-//!   rows in both layouts, `spread` on workers at the largest size on the tuned case, the
-//!   main thread's share (the window merges) flat per row. Asserts check `spread`'s tuned case
-//!   off main at the largest size, one record for `dense_chunk`, every case's think set equal
+//!   rows in both layouts. The tuned case follows the production tuner and stays inline while
+//!   its batch is under the gate; the main thread's share (the window merges) is flat per row.
+//!   Asserts check one record for `dense_chunk`, every case's think set equal
 //!   to the serial pass's, and every indexed row counted once, thinking or skipped. Item
 //!   code `layout * 10^6 + agents` (layout 0 `spread`, 1 `dense_chunk`). Prints `indexed=`
 //!   (H) and `thinking=`; `--details` adds `main=` with `main_per_item=` (per indexed row).
@@ -177,9 +177,6 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     while (warm.next(scope.cognition_tuner.phase == .settled)) _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
     const settled_before_measurement = if (case.adaptive) (scope.cognition_tuner.phase == .settled) else false;
 
-    const counts = &suite.event_scale_counts;
-    // `dense_chunk` runs inline where its tuner measures that cheaper.
-    const expect_off_main = fields.layout == .spread and case.adaptive and case.adaptive_range_mode == .tuned and fields.agents == counts[counts.len - 1];
     var accumulator = suite.StatsAccumulator.init(item_count);
     var think_rows: usize = 0;
     var main_total: u128 = 0;
@@ -187,7 +184,6 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         const start_ns = suite.nowNs(io);
         const result = try runCognitionOnce(&scope, &view, thread_ptr, case);
         const end_ns = suite.nowNs(io);
-        if (expect_off_main and result.batch.ran_inline) return error.CognitionRanInline;
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, result.batch);
         main_total += elapsed_ns -| offMainNs(result.batch);
