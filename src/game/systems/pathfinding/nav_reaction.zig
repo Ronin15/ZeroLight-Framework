@@ -100,7 +100,7 @@ pub fn rebuildStaticNavGridWithWorld(self: *PathfindingSystem, data: *const Data
 fn rebuildNavFromData(self: *PathfindingSystem, data: *const DataSystem, extent: NavExtent, thread_system: ?*ThreadSystem) NavBuildError!void {
     var colliders = StaticColliderSystem.init(self.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(data, try extent.colliderGeometry());
+    try colliders.rebuild(data, try extent.colliderGeometry(), thread_system);
     try rebuildNavFromColliders(self, &colliders, extent, thread_system);
 }
 

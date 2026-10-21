@@ -775,7 +775,7 @@ test "a cell-aligned static past 32768 world units blocks only its own nav cell"
     _ = try addNavBody(&data, .{ .x = 35_296, .y = 35_296 }, .{ .x = 32, .y = 32 }, true);
     var colliders = static_colliders.StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, .init(32, 2048, 2048, 16));
+    try colliders.rebuild(&data, .init(32, 2048, 2048, 16), null);
     var grid = NavGrid{};
     defer grid.deinit(std.testing.allocator);
     try grid.prepare(std.testing.allocator, 0, 2048, 2048, 32, 16);

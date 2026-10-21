@@ -329,7 +329,9 @@ pub const CollisionResponseSystem = struct {
     // direct block table; `table_blocks` is how many leading slots are real blocks.
     block_slots: BlockSlotList = .empty,
     worker_generation: SlotList(WorkerGeneration) = .empty,
-    // Cached by the first reserve. Later steps do not call getCpuCount.
+    // The most participants the direct tables are reserved for: the machine's count,
+    // read once by the first reserve, raised by a reserve for a larger thread system.
+    // Later steps do not call getCpuCount.
     participant_ceiling: usize = 0,
     table_participants: usize = 0,
     table_blocks: usize = 0,
@@ -393,8 +395,14 @@ pub const CollisionResponseSystem = struct {
         return self.observer_staging.items;
     }
 
-    pub fn reserveForContacts(self: *CollisionResponseSystem, max_contacts: usize) !void {
-        try self.ensureContactCapacity(max_contacts);
+    /// Reserves every response store for `max_contacts` contacts, and the direct block
+    /// tables for `participants` (the dispatching thread system's
+    /// `participantSlotCount()`) or the machine's participant count, whichever is larger.
+    /// Grow-only: a later call with fewer participants keeps the larger reserve.
+    pub fn reserveForContacts(self: *CollisionResponseSystem, max_contacts: usize, participants: usize) !void {
+        const reserved = @max(self.participantCeilingCached(), participants);
+        try self.ensureContactCapacity(max_contacts, reserved);
+        self.participant_ceiling = reserved;
     }
 
     fn run(self: *CollisionResponseSystem, data: *DataSystem, frame: *SimulationFrame, observer: EntityId, threads: ResponseThreads) !CollisionResponseStats {
@@ -502,7 +510,7 @@ pub const CollisionResponseSystem = struct {
         if (contact_count == 0) return null;
 
         // Every reserve, sized from this step's contacts, lands before any dispatch.
-        try self.ensureContactCapacity(contact_count);
+        try self.ensureContactCapacity(contact_count, self.participantCeilingCached());
         try frame.collision_triggers.reserve(1, contact_count);
         const intent_capacity = 2 * contact_count;
         setRowCount(IntentRow, &self.intent_rows, intent_capacity);
@@ -564,7 +572,7 @@ pub const CollisionResponseSystem = struct {
         self.observer_staging.items.len = dst;
     }
 
-    fn ensureContactCapacity(self: *CollisionResponseSystem, contact_capacity: usize) !void {
+    fn ensureContactCapacity(self: *CollisionResponseSystem, contact_capacity: usize, participants: usize) !void {
         const intent_capacity = 2 * contact_capacity;
         try self.intent_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(intent_capacity));
         try self.packed_intents.ensureTotalCapacity(self.allocator, hotStoreCapacity(intent_capacity));
@@ -572,20 +580,19 @@ pub const CollisionResponseSystem = struct {
         try self.range_runs.ensureTotalCapacity(self.allocator, intent_capacity);
         try self.grouped_runs.ensureTotalCapacity(self.allocator, intent_capacity);
         try self.block_items.ensureTotalCapacity(self.allocator, intent_capacity);
-        try self.ensureDirectTableReserve(contact_capacity);
+        try self.ensureDirectTableReserve(contact_capacity, participants);
         try self.trigger_staging.ensureTotalCapacity(self.allocator, contact_capacity);
         try self.observer_staging.ensureTotalCapacity(self.allocator, contact_capacity);
         try self.gather_rows.ensureTotalCapacity(self.allocator, @max(maxRangeCount(contact_capacity, collision_response_range_alignment_items), 1));
     }
 
-    // Capacity for one direct table per machine participant, long enough for a block
+    // Capacity for one direct table per reserved participant, long enough for a block
     // per `block_rows` contacts. The step commits the live length from its movement
     // rows and its thread system's participants; this keeps that commit from allocating
-    // when the contact bound covers the bodies.
-    fn ensureDirectTableReserve(self: *CollisionResponseSystem, contact_capacity: usize) !void {
+    // when the contact bound covers the bodies and the reserve covers that thread system.
+    fn ensureDirectTableReserve(self: *CollisionResponseSystem, contact_capacity: usize, participants: usize) !void {
         if (contact_capacity == 0) return;
         const blocks = blockCount(contact_capacity);
-        const participants = self.participantCeilingCached();
         const slots = std.math.mul(usize, participants, tableStride(blocks)) catch return error.OutOfMemory;
         try self.ensureBlockSlotCapacity(slots);
         try self.worker_generation.ensureTotalCapacity(self.allocator, participants);
@@ -1416,7 +1423,7 @@ test "warmed response update does not allocate" {
 
     var system = CollisionResponseSystem.init(std.testing.allocator);
     defer system.deinit();
-    try system.reserveForContacts(1);
+    try system.reserveForContacts(1, 1);
 
     const original_system_allocator = system.allocator;
     const original_trigger_allocator = frame.collision_triggers.allocator;
@@ -1459,7 +1466,7 @@ test "warmed solid response update does not allocate" {
 
     var system = CollisionResponseSystem.init(std.testing.allocator);
     defer system.deinit();
-    try system.reserveForContacts(1);
+    try system.reserveForContacts(1, 1);
 
     const original_system_allocator = system.allocator;
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
@@ -2104,27 +2111,51 @@ test "apply lanes match the scalar apply bit for bit" {
 }
 
 test "threaded multi-worker response allocates nothing after reserveForContacts" {
+    // Two pinned workers, so the gather dispatches and the apply takes the direct tables
+    // on any machine.
+    try expectThreadedResponseAllocatesNothing(2, null);
+}
+
+test "a thread system with more participants than the machine has cpus reserves its direct tables up front" {
+    // A one-cpu machine's ceiling under eight participants: the reserve must follow the
+    // dispatching thread system, not the cpu count, or the first threaded step grows the
+    // direct tables under the FailingAllocator. Seeding the cached ceiling makes the
+    // proof hold on any machine.
+    try expectThreadedResponseAllocatesNothing(7, 1);
+}
+
+// Reserves for the ring's contacts on `worker_count` pinned workers, then runs one
+// threaded response step under a FailingAllocator: nothing allocates, and the apply
+// took the direct tables sized to every participant. `machine_participants` seeds the
+// cached machine ceiling; null reads the machine's.
+fn expectThreadedResponseAllocatesNothing(worker_count: usize, machine_participants: ?usize) !void {
     const allocator = std.testing.allocator;
     var fixture = try buildRingFixture(allocator, 40);
     defer fixture.deinit(allocator);
-    var threads = try ThreadSystem.init(allocator, std.testing.io, .{});
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = worker_count });
     defer threads.deinit();
     const contact_count = fixture.frame.contacts.mergedItems().len;
 
     var system = CollisionResponseSystem.init(allocator);
     defer system.deinit();
-    try system.reserveForContacts(contact_count);
+    if (machine_participants) |count| system.participant_ceiling = count;
+    try system.reserveForContacts(contact_count, threads.participantSlotCount());
+    // The reserve itself covers every participant's table at the contact bound.
+    try std.testing.expect(system.block_slots.capacity >= threads.participantSlotCount() * tableStride(blockCount(contact_count)));
+    try std.testing.expect(system.worker_generation.capacity >= threads.participantSlotCount());
     try fixture.frame.collision_triggers.reserve(1, estimateTriggerCapacity(contact_count));
 
     var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     system.allocator = failing_allocator.allocator();
     fixture.frame.collision_triggers.allocator = failing_allocator.allocator();
-    const result = system.update(&fixture.data, &fixture.frame, fixture.observer, &threads, .{ .items_per_range = 16, .adaptive = false });
+    const result = system.update(&fixture.data, &fixture.frame, fixture.observer, &threads, .{ .items_per_range = 16, .max_worker_threads = worker_count, .adaptive = false });
     system.allocator = allocator;
     fixture.frame.collision_triggers.allocator = allocator;
     const stats = try result;
 
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
+    try std.testing.expect(system.table_blocks != 0);
+    try std.testing.expectEqual(threads.participantSlotCount(), system.table_participants);
     try std.testing.expect(stats.intent_count > 0);
     try std.testing.expect(stats.trigger_count > 0);
     try std.testing.expectEqual(stats.trigger_count, fixture.frame.collision_triggers.mergedItems().len);
@@ -2234,7 +2265,7 @@ test "contacts past the reserve grow on main before dispatch and match serial" {
 
     var system = CollisionResponseSystem.init(allocator);
     defer system.deinit();
-    try system.reserveForContacts(4);
+    try system.reserveForContacts(4, threads.participantSlotCount());
     var threaded = try runRing(allocator, &system, &fixture, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
     defer threaded.deinit(allocator);
     try expectRingResultsEqual(serial, threaded);

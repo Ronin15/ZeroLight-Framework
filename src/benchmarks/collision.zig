@@ -14,7 +14,12 @@
 //! against the grid's bound: the entries of one strip in the columns a body's width reaches,
 //! flat in column height, row width, and level count. `collision` and `collision-sparse`:
 //! time linear in bodies; asserts check the analytic contact count (the 512-wide grid's
-//! neighbour pairs; one pair per group of 20 sparse bodies).
+//! neighbour pairs; one pair per group of 20 sparse bodies). `collision` also checks the
+//! pair-bound flag counts, untimed, on systems apart from the measured one: reserved to a
+//! quarter of the grid's bodies, every step on the case's dispatch path is flagged and
+//! counted once; and a broadphase slot that outgrows its reserve inside the total bound
+//! (a fixed four-range cluster on two workers) flags and counts its replayed step once and
+//! the next step not at all.
 //!
 //! The static groups hold the item count of one-tile statics on a two-tile pitch, so the
 //! world grows with the static count, plus a fixed 2,048 dynamic bodies, half of them
@@ -29,7 +34,14 @@
 //! Asserts check fixture invariants only: the analytic contact count (one per overlapping
 //! dynamic) in every static group; sweep `body_count` and `entry_count` follow the dynamic
 //! bodies (one strip each on this fixture), not the statics; in `collision-static-index-change`
-//! also the collider row count, and that each move commits, syncs, and changes chunks.
+//! also the collider row count, that each move commits, syncs, and changes chunks, and that
+//! the warm syncs grow no collider rows or payloads (each rewrites its two chunks in place).
+//! - `collision-static-rebuild`: the clustered fixture's statics rebuilt whole each step
+//!   (`StaticColliderSystem.rebuild`, its chunk fill on the case's thread system, as world
+//!   creation runs it). Pass shape: time and main per static flat in statics. Asserts: the
+//!   row count, a fill of at least two units per static, and the fill on workers in every
+//!   threaded case, the tuned case's fresh system included (a rebuild fills at a fixed
+//!   shape, outside the `chunk_rewrite` tuner, so it reports no tuner).
 //!
 //! `collision-static-triggers` holds the item count of stored trigger pairs: two overlapping
 //! one-tile triggers per pitch cell, 512 dynamics on the first cells (half on a trigger), and
@@ -51,10 +63,15 @@
 //! state in brackets (each stage tunes on its own; the broadphase's is the row's tuning
 //! cell), then `entries=` (sweep entries), `visits_per_body=` (candidates the sweep tested,
 //! counted with the perf log only), and `main=` with `main_per_item=` per body: the time
-//! outside the four stages' worker dispatches.
+//! outside the stages' worker dispatches. The `--details` line under each row gives the
+//! measured steps' static query, Debug rect compare, static sort, and trigger allow pack
+//! shapes, and in `collision-static-index-change` the collider sync's splice shape and its
+//! `row_grows=` and `payload_grows=` counts. `collision-static-rebuild` prints `per_static=`,
+//! and with `--details` the fill stage and the main share per static.
 
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
@@ -62,6 +79,7 @@ const DataSystem = @import("../game/data_system.zig").DataSystem;
 const CollisionStats = @import("../game/systems/collision.zig").CollisionStats;
 const CollisionStrips = @import("../game/systems/collision.zig").CollisionStrips;
 const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
+const CollisionConfig = @import("../game/systems/collision.zig").CollisionConfig;
 const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const CollisionContact = @import("../game/simulation.zig").CollisionContact;
@@ -70,6 +88,7 @@ const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const ColliderGeometry = @import("../game/systems/static_colliders.zig").ColliderGeometry;
 const ColliderView = @import("../game/systems/static_colliders.zig").ColliderView;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
+const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const tile_size = @import("../assets/world_tileset_meta.zig").required_tile_size;
 const fixtures = @import("fixtures.zig");
@@ -138,6 +157,14 @@ pub const static_index_change_group = suite.BenchmarkGroup{
     .item_counts = &static_item_counts,
     .runCase = runStaticIndexChangeCase,
     .write_workload = writeStaticWorkload,
+};
+
+pub const static_rebuild_group = suite.BenchmarkGroup{
+    .name = "collision-static-rebuild",
+    .item_label = "static bodies",
+    .item_counts = &static_item_counts,
+    .runCase = runStaticRebuildCase,
+    .write_workload = writeRebuildWorkload,
 };
 
 pub const static_triggers_group = suite.BenchmarkGroup{
@@ -305,11 +332,77 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     var data = try createFixtureWithMode(allocator, item_count, mode);
     defer data.deinit();
+    if (mode == .dense) try checkPairBoundFlags(allocator, io, case, &data);
     const stats = try measureCase(allocator, io, options, case, item_count, &data, .{});
     if (stats.iterations > 0 and stats.output_count != fixtureContacts(item_count, mode)) return error.CollisionContactCountMismatch;
     // A dense strip's rows overlap in x past one lane group, so the sweep runs its lanes.
     if (mode == .dense and stats.iterations > 0 and stats.collision_stages.?.simd_groups == 0) return error.CollisionSweepRanNoLanes;
     return stats;
+}
+
+// The pair-bound flag counts, untimed, on systems apart from the measured one. Through the
+// case's thread system and controls, a reserve to a quarter of the dense grid's bodies sits
+// below its candidates: every step is flagged and counted once. Then a broadphase slot that
+// outgrows its reserve inside the total bound flags its step (`checkSlotReplayFlag`).
+fn checkPairBoundFlags(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase, data: *DataSystem) !void {
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    var system = CollisionSystem.init(allocator);
+    defer system.deinit();
+    useCaseTuners(&system, case);
+    const bodies = data.movementBodySliceConst().entities.len;
+    try system.reserve(@max(bodies / 4, 1));
+    var contacts = RangeOutputStream(CollisionContact).init(allocator);
+    defer contacts.deinit();
+    const config: CollisionConfig = .{
+        .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
+        .max_worker_threads = case.maxWorkerThreads(),
+        .adaptive = case.adaptive,
+    };
+    for (0..3) |step| {
+        const stats = try system.update(data, &contacts, &threads, config);
+        if (stats.candidate_pair_count <= system.reserved_pair_bound) return error.CollisionBoundFixtureInsideBound;
+        if (!stats.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != step + 1) return error.CollisionPastBoundStepNotFlagged;
+    }
+    try checkSlotReplayFlag(allocator, io);
+}
+
+// A body with `box`'s bounds and no collision response.
+fn addBoxBody(data: *DataSystem, x: f32, y: f32, w: f32, h: f32) !void {
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = x, .y = y }, .previous_position = .{ .x = x, .y = y } });
+    try data.setCollisionBounds(entity, .{ .size = .{ .x = w, .y = h } });
+}
+
+// 64 bodies at a 64-body reserve (256-pair bound, 128-entry bound), four broadphase ranges
+// of 16 entries: slot 2 holds 4 * ceil(128 / 3) = 172 pairs. Ranges 0 and 1 are 32
+// isolated bodies; range 2 is 16 wide bodies that all overlap (120 pairs) and the four
+// narrow bodies of range 3 they cover in y (64 pairs): 184, past slot 2 but inside the
+// total bound. The slot grows and the broadphase replays: one flagged, counted step. The
+// grown slot then holds the cluster, so the next step is not flagged. The four ranges run on
+// two workers of its own thread system, whatever the case's.
+fn checkSlotReplayFlag(allocator: std.mem.Allocator, io: std.Io) !void {
+    var threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    const body_count: usize = 64;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    for (0..32) |index| try addBoxBody(&data, @floatFromInt(index * 100), 0, 22, 8);
+    for (0..16) |index| try addBoxBody(&data, 10_000 + @as(f32, @floatFromInt(index)), 0, 1000, 8);
+    for (0..16) |index| try addBoxBody(&data, 10_100 + @as(f32, @floatFromInt(index * 50)), if (index < 4) 4 else 10, 8, 8);
+    var system = CollisionSystem.init(allocator);
+    defer system.deinit();
+    try system.reserve(body_count);
+    var contacts = RangeOutputStream(CollisionContact).init(allocator);
+    defer contacts.deinit();
+    try CollisionSystem.reserveContactStream(&contacts, body_count);
+    const config: CollisionConfig = .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false };
+    const replayed = try system.update(&data, &contacts, &threads, config);
+    if (replayed.candidate_pair_count != 120 + 64 or replayed.candidate_pair_count > system.reserved_pair_bound) return error.CollisionReplayFixtureMismatch;
+    if (replayed.broadphase_batch.range_count != 4 or replayed.broadphase_batch.ran_inline) return error.CollisionReplayFixtureMismatch;
+    if (!replayed.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 1) return error.CollisionSlotReplayNotFlagged;
+    const settled = try system.update(&data, &contacts, &threads, config);
+    if (settled.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 1) return error.CollisionGrownSlotFlagged;
 }
 
 // Contacts of `count` bodies in `mode`: a dense body overlaps its row, column, and diagonal
@@ -421,7 +514,7 @@ fn runStaticCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Option
     defer colliders.deinit();
     if (!move_static) {
         const cells: u32 = @intCast(2 * fixture.side);
-        try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles));
+        try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles), null);
     }
 
     var stats = try measureCase(allocator, io, options, case, static_dynamic_count, &fixture.data, .{
@@ -523,7 +616,7 @@ fn runStaticTriggersCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     var colliders = StaticColliderSystem.init(allocator);
     defer colliders.deinit();
     const cells: u32 = @intCast(2 * fixture.side);
-    try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles));
+    try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles), null);
     if (static_colliders_test_support.liveRowCount(colliders) != 2 * pair_count) return error.WrongStaticCount;
 
     const stats = try measureCase(allocator, io, options, case, pair_count, &fixture.data, .{
@@ -534,6 +627,82 @@ fn runStaticTriggersCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     });
     if (stats.iterations > 0 and stats.output_count != fixture.contacts()) return error.CollisionContactCountMismatch;
     return stats;
+}
+
+// ----------------------------------------------------------------------------
+// Static rebuild: the whole collider structure built from the static-heavy fixture, the
+// shape world create runs: each timed rebuild fills a fresh system with an untrained tuner
+// (`SimulationPipeline.init`, `NavReaction`), which the rebuild's fixed-shape fill never
+// samples, and its teardown runs outside the window.
+// ----------------------------------------------------------------------------
+
+fn runStaticRebuildCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, static_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var fixture = try createStaticHeavyFixture(allocator, static_count, .clustered);
+    defer fixture.data.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const cells: u32 = @intCast(2 * fixture.side);
+    const geometry = ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles);
+
+    // Warmup rebuilds warm the caches and the allocator, never a tuner: each is a fresh
+    // system too, as world create builds it.
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(true)) {
+        var colliders = freshRebuildSystem(allocator, case);
+        defer colliders.deinit();
+        try colliders.rebuild(&fixture.data, geometry, &threads);
+    }
+
+    var accumulator = suite.StatsAccumulator.init(static_count);
+    var main_total: u128 = 0;
+    const stage_range = case.stageItemsPerRange(splice_range_alignment_items);
+    for (0..options.iterations) |_| {
+        var colliders = freshRebuildSystem(allocator, case);
+        defer colliders.deinit();
+        const start_ns = suite.nowNs(io);
+        try colliders.rebuild(&fixture.data, geometry, &threads);
+        const end_ns = suite.nowNs(io);
+        if (static_colliders_test_support.liveRowCount(colliders) != static_count) return error.WrongStaticCount;
+        const batch = colliders.last_splice_batch;
+        // One fill unit per span, query record, and item: at least two per static.
+        if (batch.item_count < 2 * static_count) return error.RebuildFillMissedStatics;
+        try suite.checkStageDispatched(case, &threads, stage_range, batch);
+        try checkFixedFillDispatched(case, &threads, batch);
+        const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
+        accumulator.record(elapsed_ns, batch);
+        main_total += elapsed_ns -| offMainNs(batch);
+    }
+    var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    stats.sample_count = static_count;
+    return stats;
+}
+
+// A tuned case's rebuild fill, at its fixed shape from a fresh system, runs on workers
+// whenever the case allows one and the fill spans more than the thread system's untuned
+// range size (the fixed shape's floor).
+fn checkFixedFillDispatched(case: suite.BenchmarkCase, threads: *const ThreadSystem, batch: BatchStats) error{RebuildFillRanInline}!void {
+    if (!case.adaptive or threads.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
+    const floor = std.mem.alignForward(usize, threads.config.items_per_range, splice_range_alignment_items);
+    if (batch.item_count > floor and batch.ran_inline) return error.RebuildFillRanInline;
+}
+
+// An empty collider system with the case's stage controls; the tuned case keeps the
+// default untrained tuner, as production's fresh systems do.
+fn freshRebuildSystem(allocator: std.mem.Allocator, case: suite.BenchmarkCase) StaticColliderSystem {
+    var colliders = StaticColliderSystem.init(allocator);
+    fixtures.setSpliceTuners(&colliders, case);
+    return colliders;
+}
+
+fn writeRebuildWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    // `sample_count` holds the static count.
+    const statics = @max(stats.sample_count, 1);
+    try writer.print("per_static={f}", .{suite.formatDuration(stats.mean_ns / statics)});
+    if (view == .summary) return;
+    try writeStage(writer, "fill", stats.batch, stats.work_tuning);
+    try suite.writeMainShare(writer, stats, statics);
 }
 
 // One static moved through the commit seam each step, alternating between its pitch cell's
@@ -553,7 +722,7 @@ const StaticMover = struct {
         errdefer colliders.deinit();
         // The statics' tiles: two tiles per pitch cell a side.
         const cells: u32 = @intCast(2 * fixture.side);
-        try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles));
+        try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles), null);
         if (static_colliders_test_support.liveRowCount(colliders) != fixture.side * fixture.side) return error.WrongStaticCount;
         fixtures.setSpliceTuners(&colliders, case);
         const home = pitchCellOrigin(fixture.side - 1, fixture.side - 1);
@@ -592,6 +761,11 @@ const StaticMover = struct {
 
     fn spliceOffMainNs(self: *const StaticMover) u64 {
         return offMainNs(self.colliders.last_splice_batch);
+    }
+
+    // The colliders' row-pool and payload growths so far.
+    fn grows(self: *const StaticMover) [2]u64 {
+        return .{ self.colliders.perf.row_grows, self.colliders.perf.payload_grows };
     }
 };
 
@@ -648,6 +822,11 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var main_total: u128 = 0;
     // A warm system grows no slot or bound past its reserve again.
     const warm_overflows = .{ system.perf.entry_bound_overflows, system.perf.pair_bound_overflows };
+    // A warm mover's sync rewrites its two chunks in place: no row or payload growth.
+    const warm_collider_grows = if (inputs.mover) |static_mover| static_mover.grows() else .{ 0, 0 };
+    // Static query, Debug rect compare, static sort, and trigger allow pack; the mover's splice.
+    var static_stages = suite.StageShapes(4){};
+    var splice_stages = suite.StageShapes(1){};
     const stage_range = case.stageItemsPerRange(collision_range_alignment_items);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
@@ -667,9 +846,15 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
             offMainNs(perf.static_pairs_batch) + offMainNs(perf.static_rect_batch) +
             offMainNs(perf.static_sort_batch) + offMainNs(perf.trigger_allow_batch);
         main_total += elapsed_ns -| off_main_ns -| mover_off_main_ns;
+        static_stages.add(.{ perf.static_pairs_batch, perf.static_rect_batch, perf.static_sort_batch, perf.trigger_allow_batch });
+        if (inputs.mover) |static_mover| splice_stages.add(.{static_mover.colliders.last_splice_batch});
     }
 
     if (system.perf.entry_bound_overflows != warm_overflows[0] or system.perf.pair_bound_overflows != warm_overflows[1]) return error.CollisionWarmStepOverflowed;
+    if (inputs.mover) |static_mover| {
+        const grows = static_mover.grows();
+        if (grows[0] != warm_collider_grows[0] or grows[1] != warm_collider_grows[1]) return error.CollisionWarmSyncGrewColliders;
+    }
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.collision_stages = .{
@@ -681,6 +866,12 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         .visits = last_collision_stats.perf.broadphase_visits,
         .simd_groups = last_collision_stats.broadphase_simd_groups,
     };
+    writeStaticStageDetails(&stats.details, &static_stages);
+    if (inputs.mover) |static_mover| {
+        var splice_buffer: [48]u8 = undefined;
+        const grows = static_mover.grows();
+        stats.details.print("splice={s} row_grows={} payload_grows={}\n", .{ splice_stages.label(0, &splice_buffer), grows[0], grows[1] });
+    }
     stats.sample_count = item_count;
     stats.candidate_pairs = last_collision_stats.candidate_pair_count;
     stats.output_count = last_collision_stats.contact_count;
@@ -699,6 +890,18 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         if (quiet.contact_count != last_collision_stats.contact_count) return error.CollisionQuietStepChangedContacts;
     }
     return stats;
+}
+
+// The measured steps' static query, Debug rect compare, static sort, and trigger allow pack
+// shapes (`StageShapes.label`).
+fn writeStaticStageDetails(details: *suite.DetailLines, stages: *const suite.StageShapes(4)) void {
+    var buffers: [4][48]u8 = undefined;
+    details.print("static_pairs={s} static_rect={s} static_sort={s} trigger_allow={s}\n", .{
+        stages.label(0, &buffers[0]),
+        stages.label(1, &buffers[1]),
+        stages.label(2, &buffers[2]),
+        stages.label(3, &buffers[3]),
+    });
 }
 
 /// Gives each of `system`'s stage tuners the case's own tuner (an adaptive case only).

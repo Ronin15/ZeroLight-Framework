@@ -204,7 +204,7 @@ fn createFixture(allocator: std.mem.Allocator, count: usize, layout: Layout) !Fi
 fn buildColliders(allocator: std.mem.Allocator, data: *const DataSystem, pathfinding: *const PathfindingSystem, width: f32, height: f32) !StaticColliderSystem {
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
-    try colliders.rebuild(data, try pathfinding.boundsNavExtent(width, height, nav_cell_size).colliderGeometry());
+    try colliders.rebuild(data, try pathfinding.boundsNavExtent(width, height, nav_cell_size).colliderGeometry(), null);
     return colliders;
 }
 

@@ -93,7 +93,7 @@ pub fn appendNavigationIntents(frame: *SimulationFrame, intents: []const Navigat
 pub fn testColliders(pathfinding: *const PathfindingSystem, data: *const DataSystem, width: f32, height: f32, cell_size: f32) !StaticColliderSystem {
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     errdefer colliders.deinit();
-    try colliders.rebuild(data, try pathfinding.boundsNavExtent(width, height, cell_size).colliderGeometry());
+    try colliders.rebuild(data, try pathfinding.boundsNavExtent(width, height, cell_size).colliderGeometry(), null);
     return colliders;
 }
 

@@ -1916,11 +1916,11 @@ fn staticQueryJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             .max_x = proxies.max_x[slot_index],
             .max_y = proxies.max_y[slot_index],
         };
+        // Debug: a range whose walks outgrow its id list keeps recording its need to the
+        // end, so the replay after one grow holds it.
         const full = if (comptime builtin.mode == .debug) blk: {
             var span_ids = SpanIds{ .ids = &slot.ids, .required = &slot.ids_required };
-            const found = job.view.collectOverlaps(proxies.level[slot_index], box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, &span_ids);
-            if (span_ids.overflowed) return;
-            break :blk found;
+            break :blk job.view.collectOverlaps(proxies.level[slot_index], box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, &span_ids);
         } else job.view.collectOverlaps(proxies.level[slot_index], box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, {});
         if (!slot.admit(full)) continue;
         packStaticHits(job.view, job.data, hits, full, entity, bodies, scope, job.exclude_tiers);
@@ -5080,7 +5080,7 @@ test "static split contacts match the filtered reference" {
 
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
     const expected = try filteredReference(&data, .default);
     defer std.testing.allocator.free(expected);
     try std.testing.expect(expected.len > 0);
@@ -5148,7 +5148,7 @@ test "a kinematic static drops its contact only when scope excludes" {
     _ = try addObstacle(&data, .{ .x = 8, .y = 8, .w = 16, .h = 16 }, .dynamic, .solid);
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
 
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
@@ -5170,7 +5170,7 @@ fn expectKinematicDynamicDropsStaticContacts(workers: usize) !void {
     const parked = try addObstacle(&data, .{ .x = 44, .y = 8, .w = 8, .h = 8 }, .dynamic, .solid);
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
@@ -5222,7 +5222,7 @@ fn expectStoredTriggerAllowFollowsTier(workers: usize) !void {
 
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
@@ -5279,7 +5279,7 @@ fn expectStoredTriggerAllowFollowsMovedRow(workers: usize) !void {
 
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
@@ -5330,7 +5330,7 @@ fn expectStoredTriggerAllowPastColumnEnd(workers: usize) !void {
 
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
@@ -5378,7 +5378,7 @@ test "collision stored trigger allow packed over several ranges matches serial a
 
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
     const view = colliders.view();
 
     var serial = CollisionSystem.init(std.testing.allocator);
@@ -5429,7 +5429,7 @@ test "an unsynced static move is out of band" {
     _ = try addObstacle(&data, .{ .x = 8, .y = 8, .w = 16, .h = 16 }, .dynamic, .solid);
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
 
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
@@ -5507,7 +5507,7 @@ test "collision debug seam check flags a walked non-hit and ignores a static out
     _ = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 16, .h = 16 }, .dynamic, .solid);
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
@@ -5535,7 +5535,7 @@ test "collision debug seam check matches across workers" {
     _ = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 16, .h = 16 }, .dynamic, .solid);
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
 
     var serial = CollisionSystem.init(std.testing.allocator);
     defer serial.deinit();
@@ -5644,7 +5644,7 @@ test "collision debug rect compare flags a static moved in its second range on a
     _ = try addObstacle(&data, .{ .x = 0, .y = 0, .w = @as(f32, @floatFromInt(static_count)) * 32, .h = 16 }, .dynamic, .solid);
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
@@ -5751,7 +5751,7 @@ fn expectStaticHitLanes(dynamic_box: TestBox, statics: []const LaneStatic) !void
 
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
     var out_entity: [8]u32 = undefined;
     var out_min_x: [8]f32 = undefined;
     var out_min_y: [8]f32 = undefined;
@@ -5850,7 +5850,7 @@ test "a reserved warm static step allocates nothing" {
     _ = try addObstacle(&data, .{ .x = 4, .y = 4, .w = 16, .h = 16 }, .dynamic, .solid);
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
 
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
@@ -5885,7 +5885,7 @@ test "a reserved warm static step allocates nothing" {
     }
     var worker_colliders = StaticColliderSystem.init(std.testing.allocator);
     defer worker_colliders.deinit();
-    try worker_colliders.rebuild(&worker_data, testGeometry());
+    try worker_colliders.rebuild(&worker_data, testGeometry(), null);
     var worker_system = CollisionSystem.init(std.testing.allocator);
     defer worker_system.deinit();
     try worker_system.reserve(worker_bodies);
@@ -6014,7 +6014,7 @@ fn expectTriggerPatchesMatchRebuild(workers: usize) !void {
 
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers });
     defer threads.deinit();
     var patched = CollisionSystem.init(std.testing.allocator);
@@ -6115,7 +6115,7 @@ fn expectWideQueryReplays(workers: usize) !void {
     _ = try addObstacle(&data, .{ .x = 1500, .y = 1500, .w = 8, .h = 8 }, .dynamic, .solid);
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&data, testGeometry());
+    try colliders.rebuild(&data, testGeometry(), null);
     const expected = try filteredReference(&data, .default);
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqual(columns * (rows - 1), expected.len);

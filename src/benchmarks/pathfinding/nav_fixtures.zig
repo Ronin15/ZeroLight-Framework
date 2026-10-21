@@ -468,7 +468,7 @@ pub fn assembleReactFixture(allocator: std.mem.Allocator, open: *OpenWorld, data
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
     const extent = PathfindingSystem.worldNavExtent(&open.world);
-    try colliders.rebuild(data, try extent.colliderGeometry());
+    try colliders.rebuild(data, try extent.colliderGeometry(), null);
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(capacity);

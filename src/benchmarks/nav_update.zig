@@ -132,7 +132,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, participant_count: usi
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
     const extent = PathfindingSystem.worldNavExtent(&world);
-    try colliders.rebuild(&data, try extent.colliderGeometry());
+    try colliders.rebuild(&data, try extent.colliderGeometry(), null);
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(.{ .worker_participant_count = participant_count });
@@ -409,7 +409,7 @@ fn initStaticMoveFixture(allocator: std.mem.Allocator, io: std.Io, other_statics
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
     const extent = PathfindingSystem.worldNavExtent(&world);
-    try colliders.rebuild(&data, try extent.colliderGeometry());
+    try colliders.rebuild(&data, try extent.colliderGeometry(), null);
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(.{ .worker_participant_count = participant_count });
@@ -701,7 +701,7 @@ fn initStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, change_count
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
     const extent = PathfindingSystem.worldNavExtent(&world);
-    try colliders.rebuild(&data, try extent.colliderGeometry());
+    try colliders.rebuild(&data, try extent.colliderGeometry(), null);
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(.{ .worker_participant_count = participant_count });

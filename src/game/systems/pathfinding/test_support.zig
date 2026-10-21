@@ -262,7 +262,7 @@ pub const no_colliders = StaticColliderSystem.init(std.testing.failing_allocator
 pub fn worldColliders(data: *const DataSystem, world: *const WorldSystem) !StaticColliderSystem {
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     errdefer colliders.deinit();
-    try colliders.rebuild(data, try (NavExtent{ .world = world }).colliderGeometry());
+    try colliders.rebuild(data, try (NavExtent{ .world = world }).colliderGeometry(), null);
     return colliders;
 }
 

@@ -267,7 +267,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, agent_count: usize, wo
     var colliders = StaticColliderSystem.init(allocator);
     errdefer colliders.deinit();
     const extent = PathfindingSystem.worldNavExtent(&world);
-    try colliders.rebuild(&data, try extent.colliderGeometry());
+    try colliders.rebuild(&data, try extent.colliderGeometry(), null);
     var nav = PathfindingSystem.init(allocator);
     errdefer nav.deinit();
     try nav.reserve(.{ .worker_participant_count = participant_count });

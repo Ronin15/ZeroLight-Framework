@@ -54,6 +54,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     collision.static_heavy_sap_group,
     collision.static_heavy_group,
     collision.static_index_change_group,
+    collision.static_rebuild_group,
     collision.static_triggers_group,
     collision_response.stage_group,
     pathfinding_requests.group,

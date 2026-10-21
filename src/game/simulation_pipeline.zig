@@ -426,7 +426,8 @@ pub const SimulationPipelineConfig = struct {
     /// its tiles and nav chunks its chunks.
     nav_cell_size: f32 = 32.0,
     navigation_world: ?*const WorldSystem = null,
-    /// When set, the one-time static nav build fans mask/abstract work across levels.
+    /// When set, the static-collider rebuild fills its chunks on its workers and, with
+    /// `navigation_world`, the static nav build fans mask/abstract work across levels.
     nav_build_thread_system: ?*ThreadSystem = null,
     dig: DigConfig = .{},
     /// The caller's part of the per-step `.structural_commit` event share, in events, sized
@@ -842,15 +843,20 @@ pub const SimulationPipeline = struct {
             pathfinding.boundsNavExtent(bounds_width, bounds_height, config.nav_cell_size);
         var static_colliders = StaticColliderSystem.init(allocator);
         errdefer static_colliders.deinit();
-        try static_colliders.rebuild(data, try nav_extent.colliderGeometry());
+        try static_colliders.rebuild(data, try nav_extent.colliderGeometry(), config.nav_build_thread_system);
         try pathfinding.rebuildNavFromColliders(&static_colliders, nav_extent, if (config.navigation_world != null) config.nav_build_thread_system else null);
         var collision = CollisionSystem.init(allocator);
         errdefer collision.deinit();
+        // The Debug rect compare covers the built colliders' index space, as each sync
+        // reserves it, so the first detect does not allocate.
+        try collision.reserveDebugRects(static_colliders.view().row_of_index.len);
         var collision_response = CollisionResponseSystem.init(allocator);
         errdefer collision_response.deinit();
         // The response reserves follow the collision pair bound over the population, like
         // `collision.reserve`; `reserve` sizes the frame's contact streams to the same bound.
-        try collision_response.reserveForContacts(@max(config.contact_capacity, CollisionSystem.estimateContactCapacity(population)));
+        // Its direct tables cover the configured threaded participant count (the stepping
+        // thread system's `participantSlotCount()`, as pathfinding's scratch does).
+        try collision_response.reserveForContacts(@max(config.contact_capacity, CollisionSystem.estimateContactCapacity(population)), config.pathfinding.worker_participant_count);
         try collision.reserve(population);
         var scope = SimulationScopeSystem.init(allocator);
         errdefer scope.deinit();
@@ -938,7 +944,7 @@ pub const SimulationPipeline = struct {
         try CollisionSystem.reserveContactStream(&frame.contacts, self.movement_body_capacity);
         // Response writes the trigger stream as one range.
         try frame.collision_triggers.reserve(1, estimateTriggerCapacity(contact_capacity));
-        try self.collision_response.reserveForContacts(contact_capacity);
+        try self.collision_response.reserveForContacts(contact_capacity, self.pathfinding.capacity.worker_participant_count);
     }
 
     /// The most ranges steering's avoidance pass appends to `frame.intents` and to

@@ -228,7 +228,7 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     defer fixture.deinit(allocator);
     var system = CollisionResponseSystem.init(allocator);
     defer system.deinit();
-    try system.reserveForContacts(item_count);
+    try system.reserveForContacts(item_count, thread_ptr.participantSlotCount());
     if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
         system.gather_tuner = tuner;
         // Fixed-adaptive apply: one block per range. The tuned case keeps the system's tuner.
