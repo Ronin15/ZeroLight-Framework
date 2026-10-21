@@ -34,6 +34,7 @@ const thread_shared_record_alignment = @import("../../app/thread_system.zig").th
 const required_tile_size = @import("../../assets/world_tileset_meta.zig").required_tile_size;
 const ConstCollisionBoundsSlice = @import("../data_system.zig").ConstCollisionBoundsSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
+const ConstScopeColumnsSlice = @import("../data_system.zig").ConstScopeColumnsSlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const hot_soa_column_alignment = @import("../data_system.zig").hot_soa_column_alignment;
@@ -452,38 +453,57 @@ comptime {
 
 const ContactCountTallyList = std.array_list.Aligned(ContactCountTally, .fromByteUnits(thread_shared_record_alignment));
 
-const HitScratch = struct {
-    entity: std.ArrayList(u32) = .empty,
-    min_x: std.ArrayList(f32) = .empty,
-    min_y: std.ArrayList(f32) = .empty,
-    max_x: std.ArrayList(f32) = .empty,
-    max_y: std.ArrayList(f32) = .empty,
+const HitRow = struct {
+    entity: u32,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    movement_index: u32,
+    generation: u32,
+    allow: u32,
+    velocity_x: f32,
+    velocity_y: f32,
+};
 
-    fn deinit(self: *HitScratch, allocator: std.mem.Allocator) void {
-        self.entity.deinit(allocator);
-        self.min_x.deinit(allocator);
-        self.min_y.deinit(allocator);
-        self.max_x.deinit(allocator);
-        self.max_y.deinit(allocator);
-    }
+const HitColumns = struct {
+    entity: []u32,
+    min_x: []f32,
+    min_y: []f32,
+    max_x: []f32,
+    max_y: []f32,
+    movement_index: []u32,
+    generation: []u32,
+    allow: []u32,
+    velocity_x: []f32,
+    velocity_y: []f32,
 
-    fn ensure(self: *HitScratch, allocator: std.mem.Allocator, n: usize) !void {
-        try self.entity.ensureTotalCapacityPrecise(allocator, n);
-        try self.min_x.ensureTotalCapacityPrecise(allocator, n);
-        try self.min_y.ensureTotalCapacityPrecise(allocator, n);
-        try self.max_x.ensureTotalCapacityPrecise(allocator, n);
-        try self.max_y.ensureTotalCapacityPrecise(allocator, n);
-        self.entity.items.len = n;
-        self.min_x.items.len = n;
-        self.min_y.items.len = n;
-        self.max_x.items.len = n;
-        self.max_y.items.len = n;
+    fn of(rows: std.MultiArrayList(HitRow).Slice) HitColumns {
+        return .{
+            .entity = rows.items(.entity),
+            .min_x = rows.items(.min_x),
+            .min_y = rows.items(.min_y),
+            .max_x = rows.items(.max_x),
+            .max_y = rows.items(.max_y),
+            .movement_index = rows.items(.movement_index),
+            .generation = rows.items(.generation),
+            .allow = rows.items(.allow),
+            .velocity_x = rows.items(.velocity_x),
+            .velocity_y = rows.items(.velocity_y),
+        };
     }
 };
 
+// Exact high water. `setCapacity` allocates even when the capacity already matches,
+// so a warm slot only sets the row count.
+fn ensureHitRows(hits: *std.MultiArrayList(HitRow), allocator: std.mem.Allocator, n: usize) !void {
+    if (hits.capacity < n) try hits.setCapacity(allocator, n);
+    setRowCount(HitRow, hits, n);
+}
+
 const StaticPairBuffer = struct {
     pairs: std.ArrayList(KeyedContact) = .empty,
-    hits: HitScratch = .{},
+    hits: std.MultiArrayList(HitRow) = .{},
     required: usize = 0,
     moved: bool = false,
 
@@ -685,7 +705,7 @@ pub const CollisionSystem = struct {
         for (self.static_pair_slots.items[0..static_ranges], 0..) |*slot, range_index| {
             const bound = broadphasePairBound(@divCeil(body_capacity, range_index + 1));
             try slot.value.pairs.ensureTotalCapacityPrecise(self.allocator, bound);
-            try slot.value.hits.ensure(self.allocator, bound);
+            try ensureHitRows(&slot.value.hits, self.allocator, bound);
         }
         try self.static_pairs.ensureTotalCapacity(self.allocator, pair_capacity);
         try self.ordered.ensureTotalCapacity(self.allocator, pair_capacity);
@@ -1199,9 +1219,9 @@ pub const CollisionSystem = struct {
     fn growStaticPairSlots(self: *CollisionSystem, range_count: usize) !bool {
         var grew = false;
         for (self.static_pair_slots.items[0..range_count]) |*slot| {
-            if (slot.value.required <= slot.value.hits.entity.items.len) continue;
+            if (slot.value.required <= slot.value.hits.len) continue;
             const n = slot.value.required;
-            try slot.value.hits.ensure(self.allocator, n);
+            try ensureHitRows(&slot.value.hits, self.allocator, n);
             try slot.value.pairs.ensureTotalCapacity(self.allocator, n);
             grew = true;
         }
@@ -1633,67 +1653,195 @@ fn staticQueryJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start == range.index * job.items_per_range);
     std.debug.assert(range.start <= range.end and range.end <= job.input_count);
     const slot = &job.slots[range.index].value;
+    const hits = HitColumns.of(slot.hits.slice());
+    const bodies = job.data.movement_bodies.sliceConst();
+    const scope = job.data.movement_bodies.scopeSliceConst();
     const proxies = job.proxies;
     var slot_index = range.start;
     while (slot_index < range.end) : (slot_index += 1) {
         const entity = proxies.entity[slot_index];
         if (!entity.isValid()) continue;
         const movement: usize = proxies.movement_index[slot_index];
-        if (job.exclude_tiers and !job.data.movement_bodies.tierAt(movement).allowsCollision()) continue;
+        if (job.exclude_tiers and !scope.tier[movement].allowsCollision()) continue;
         const box = math.Aabb{
             .min_x = proxies.min_x[slot_index],
             .min_y = proxies.min_y[slot_index],
             .max_x = proxies.max_x[slot_index],
             .max_y = proxies.max_y[slot_index],
         };
-        const cap = slot.hits.entity.items.len;
+        const cap = hits.entity.len;
         const full = if (comptime builtin.mode == .debug)
-            job.view.collectOverlapsChecked(proxies.level[slot_index], box, slot.hits.entity.items, slot.hits.min_x.items, slot.hits.min_y.items, slot.hits.max_x.items, slot.hits.max_y.items, job.data, &slot.moved)
+            job.view.collectOverlapsChecked(proxies.level[slot_index], box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, job.data, &slot.moved)
         else
-            job.view.collectOverlaps(proxies.level[slot_index], box, slot.hits.entity.items, slot.hits.min_x.items, slot.hits.min_y.items, slot.hits.max_x.items, slot.hits.max_y.items);
+            job.view.collectOverlaps(proxies.level[slot_index], box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y);
         if (full > cap or slot.pairs.items.len + full > slot.pairs.capacity) {
             slot.required = @max(slot.required, @max(full, slot.pairs.items.len + full));
             return;
         }
-        const level = proxies.level[slot_index];
-        for (0..full) |hit| writeDynamicStaticPair(job, slot, slot_index, box, level, hit);
+        packStaticHits(job.view, job.data, hits, full, entity, bodies, scope, job.exclude_tiers);
+        writeStaticHitContacts(&slot.pairs, hits, full, entity, proxies.movement_index[slot_index], box, proxies.velocity_x[slot_index], proxies.velocity_y[slot_index], proxies.level[slot_index], job.strips);
     }
 }
 
-fn writeDynamicStaticPair(job: *const StaticQueryJob, slot: *StaticPairBuffer, slot_index: usize, box: math.Aabb, level: u16, hit: usize) void {
-    const entity_index = slot.hits.entity.items[hit];
-    const view = job.view;
-    if (entity_index >= view.row_of_index.len) return;
-    const row = view.row_of_index[entity_index];
-    if (row == no_static_row or row >= view.row_entity.len) return;
-    const other = view.row_entity[row];
-    const dynamic = job.proxies.entity[slot_index];
-    if (other.eql(dynamic)) return;
-    const other_move = job.data.movementBodyDenseIndex(other) orelse return;
-    if (job.exclude_tiers and !job.data.movement_bodies.tierAt(other_move).allowsCollision()) return;
-    const other_body = job.data.movementBodyConst(other) orelse return;
-    const other_box = math.Aabb{
-        .min_x = slot.hits.min_x.items[hit],
-        .min_y = slot.hits.min_y.items[hit],
-        .max_x = slot.hits.max_x.items[hit],
-        .max_y = slot.hits.max_y.items[hit],
-    };
-    if (!positiveOverlap(box, other_box)) return;
-    const proxies = job.proxies;
+// Movement index, generation, allow, and velocity onto the hits just scanned.
+// `allow` is 0 or 1. A rejected hit stores zeros; the kernel does not read it.
+fn packStaticHits(
+    view: ColliderView,
+    data: *const DataSystem,
+    hits: HitColumns,
+    full: usize,
+    dynamic: EntityId,
+    bodies: ConstMovementBodySlice,
+    scope: ConstScopeColumnsSlice,
+    exclude_tiers: bool,
+) void {
+    for (0..full) |hit| {
+        const entity_index = hits.entity[hit];
+        const admitted = admit: {
+            if (entity_index >= view.row_of_index.len) break :admit null;
+            const row = view.row_of_index[entity_index];
+            if (row == no_static_row or row >= view.row_entity.len) break :admit null;
+            const other = view.row_entity[row];
+            if (other.eql(dynamic)) break :admit null;
+            const move = data.movementBodyDenseIndex(other) orelse break :admit null;
+            if (exclude_tiers and !scope.tier[move].allowsCollision()) break :admit null;
+            break :admit .{
+                .movement_index = @as(u32, @intCast(move)),
+                .generation = other.generation,
+                .velocity_x = bodies.velocity_x[move],
+                .velocity_y = bodies.velocity_y[move],
+            };
+        };
+        if (admitted) |hit_pack| {
+            hits.movement_index[hit] = hit_pack.movement_index;
+            hits.generation[hit] = hit_pack.generation;
+            hits.allow[hit] = 1;
+            hits.velocity_x[hit] = hit_pack.velocity_x;
+            hits.velocity_y[hit] = hit_pack.velocity_y;
+        } else {
+            hits.movement_index[hit] = 0;
+            hits.generation[hit] = 0;
+            hits.allow[hit] = 0;
+            hits.velocity_x[hit] = 0;
+            hits.velocity_y[hit] = 0;
+        }
+    }
+}
+
+// One group, including a 1–3 hit tail: prefix loads, then the same overlap lanes.
+// A shared edge stays in the hit row and fails the positive-overlap mask.
+fn writeStaticHitContacts(
+    pairs: *std.ArrayList(KeyedContact),
+    hits: HitColumns,
+    full: usize,
+    dynamic: EntityId,
+    dynamic_move: u32,
+    box: math.Aabb,
+    dynamic_velocity_x: f32,
+    dynamic_velocity_y: f32,
+    level: u16,
+    strips: CollisionStrips,
+) void {
     const key_dynamic = bodyRunKey(box.min_x, box.min_y, dynamic.index);
-    const key_static = bodyRunKey(other_box.min_x, other_box.min_y, other.index);
-    const strip = math.worldPosToCell(@max(box.min_y, other_box.min_y), job.strips.height, strip_count);
-    const dynamic_move: u32 = proxies.movement_index[slot_index];
-    const static_move: u32 = @intCast(other_move);
-    const contact = if (key_dynamic <= key_static)
-        contactForAabbs(dynamic, other, dynamic_move, static_move, box, other_box, proxies.velocity_x[slot_index], proxies.velocity_y[slot_index], other_body.velocity.x, other_body.velocity.y)
-    else
-        contactForAabbs(other, dynamic, static_move, dynamic_move, other_box, box, other_body.velocity.x, other_body.velocity.y, proxies.velocity_x[slot_index], proxies.velocity_y[slot_index]);
-    const key = if (key_dynamic <= key_static)
-        contactOrderKey(level, strip, key_dynamic, key_static)
-    else
-        contactOrderKey(level, strip, key_static, key_dynamic);
-    slot.pairs.appendAssumeCapacity(.{ .key = key, .contact = contact });
+    const dyn_min_x = simd.splatFloat4(box.min_x);
+    const dyn_min_y = simd.splatFloat4(box.min_y);
+    const dyn_max_x = simd.splatFloat4(box.max_x);
+    const dyn_max_y = simd.splatFloat4(box.max_y);
+    const dyn_vx = simd.splatFloat4(dynamic_velocity_x);
+    const dyn_vy = simd.splatFloat4(dynamic_velocity_y);
+    const zero = simd.splatFloat4(0);
+    const one = simd.splatFloat4(1);
+    const negative_one = simd.splatFloat4(-1);
+    const half = simd.splatFloat4(0.5);
+    const allow_one = simd.splatUint4(1);
+    var index: usize = 0;
+    while (index < full) {
+        const group = @min(simd.lane_count, full - index);
+        const hit_min_x = loadFillFloat4(hits.min_x, index, group);
+        const hit_min_y = loadFillFloat4(hits.min_y, index, group);
+        const hit_max_x = loadFillFloat4(hits.max_x, index, group);
+        const hit_max_y = loadFillFloat4(hits.max_y, index, group);
+        const hit_vx = loadFillFloat4(hits.velocity_x, index, group);
+        const hit_vy = loadFillFloat4(hits.velocity_y, index, group);
+        const entity = loadFillUint4(hits.entity, index, group);
+        const movement = loadFillUint4(hits.movement_index, index, group);
+        const generation = loadFillUint4(hits.generation, index, group);
+        const allow = loadFillUint4(hits.allow, index, group);
+
+        var key_static = [_]u128{ 0, 0, 0, 0 };
+        var dynamic_is_a_lanes = [_]bool{ false, false, false, false };
+        inline for (0..simd.lane_count) |lane| {
+            if (lane < group and allow[lane] == 1) {
+                key_static[lane] = bodyRunKey(hit_min_x[lane], hit_min_y[lane], entity[lane]);
+                dynamic_is_a_lanes[lane] = key_dynamic <= key_static[lane];
+            }
+        }
+        const dynamic_is_a = simd.Mask4{
+            dynamic_is_a_lanes[0],
+            dynamic_is_a_lanes[1],
+            dynamic_is_a_lanes[2],
+            dynamic_is_a_lanes[3],
+        };
+        const a_min_x = simd.selectFloat4(dynamic_is_a, dyn_min_x, hit_min_x);
+        const b_min_x = simd.selectFloat4(dynamic_is_a, hit_min_x, dyn_min_x);
+        const a_min_y = simd.selectFloat4(dynamic_is_a, dyn_min_y, hit_min_y);
+        const b_min_y = simd.selectFloat4(dynamic_is_a, hit_min_y, dyn_min_y);
+        const a_max_x = simd.selectFloat4(dynamic_is_a, dyn_max_x, hit_max_x);
+        const b_max_x = simd.selectFloat4(dynamic_is_a, hit_max_x, dyn_max_x);
+        const a_max_y = simd.selectFloat4(dynamic_is_a, dyn_max_y, hit_max_y);
+        const b_max_y = simd.selectFloat4(dynamic_is_a, hit_max_y, dyn_max_y);
+        const a_vx = simd.selectFloat4(dynamic_is_a, dyn_vx, hit_vx);
+        const b_vx = simd.selectFloat4(dynamic_is_a, hit_vx, dyn_vx);
+        const a_vy = simd.selectFloat4(dynamic_is_a, dyn_vy, hit_vy);
+        const b_vy = simd.selectFloat4(dynamic_is_a, hit_vy, dyn_vy);
+
+        const overlap_x = simd.minFloat4(simd.subFloat4(a_max_x, b_min_x), simd.subFloat4(b_max_x, a_min_x));
+        const overlap_y = simd.minFloat4(simd.subFloat4(a_max_y, b_min_y), simd.subFloat4(b_max_y, a_min_y));
+        const use_x_axis = simd.lessEqualFloat4(overlap_x, overlap_y);
+        const a_center_x = simd.mulFloat4(simd.addFloat4(a_min_x, a_max_x), half);
+        const b_center_x = simd.mulFloat4(simd.addFloat4(b_min_x, b_max_x), half);
+        const a_center_y = simd.mulFloat4(simd.addFloat4(a_min_y, a_max_y), half);
+        const b_center_y = simd.mulFloat4(simd.addFloat4(b_min_y, b_max_y), half);
+        const normal_x = simd.selectFloat4(use_x_axis, simd.selectFloat4(simd.lessEqualFloat4(a_center_x, b_center_x), negative_one, one), zero);
+        const normal_y = simd.selectFloat4(use_x_axis, zero, simd.selectFloat4(simd.lessEqualFloat4(a_center_y, b_center_y), negative_one, one));
+        const penetration = simd.selectFloat4(use_x_axis, overlap_x, overlap_y);
+        const speed_a_sq = simd.addFloat4(simd.mulFloat4(a_vx, a_vx), simd.mulFloat4(a_vy, a_vy));
+        const speed_b_sq = simd.addFloat4(simd.mulFloat4(b_vx, b_vx), simd.mulFloat4(b_vy, b_vy));
+        const rel_x = simd.subFloat4(a_vx, b_vx);
+        const rel_y = simd.subFloat4(a_vy, b_vy);
+        const max_speed_sq = simd.maxFloat4(speed_a_sq, speed_b_sq);
+        const rel_speed_sq = simd.addFloat4(simd.mulFloat4(rel_x, rel_x), simd.mulFloat4(rel_y, rel_y));
+        const emit = simd.maskBits(simd.greaterThanFloat4(overlap_x, zero) & simd.greaterThanFloat4(overlap_y, zero) & simd.equalUint4(allow, allow_one)) & simd.lanesBelow(group);
+
+        inline for (0..simd.lane_count) |lane| {
+            if (emit & (1 << lane) != 0) {
+                const static_entity = EntityId{ .index = entity[lane], .generation = generation[lane] };
+                const dynamic_first = dynamic_is_a_lanes[lane];
+                const a_entity = if (dynamic_first) dynamic else static_entity;
+                const b_entity = if (dynamic_first) static_entity else dynamic;
+                const a_move = if (dynamic_first) dynamic_move else movement[lane];
+                const b_move = if (dynamic_first) movement[lane] else dynamic_move;
+                const strip = math.worldPosToCell(@max(a_min_y[lane], b_min_y[lane]), strips.height, strip_count);
+                const key_a = if (dynamic_first) key_dynamic else key_static[lane];
+                const key_b = if (dynamic_first) key_static[lane] else key_dynamic;
+                pairs.appendAssumeCapacity(.{
+                    .key = contactOrderKey(level, strip, key_a, key_b),
+                    .contact = .{
+                        .a = a_entity,
+                        .b = b_entity,
+                        .a_movement_index = a_move,
+                        .b_movement_index = b_move,
+                        .normal_x = normal_x[lane],
+                        .normal_y = normal_y[lane],
+                        .penetration = penetration[lane],
+                        .pre_response_max_speed_sq = max_speed_sq[lane],
+                        .pre_response_relative_speed_sq = rel_speed_sq[lane],
+                    },
+                });
+            }
+        }
+        index += group;
+    }
 }
 
 const TriggerJob = struct {
@@ -1725,15 +1873,16 @@ fn writeTriggerRow(job: *const TriggerJob, slot: *StaticPairBuffer, row: u32) vo
     const level = job.data.worldLevelConst(entity) orelse 0;
     const self_body = job.data.movementBodyConst(entity) orelse return;
     const self_move = job.data.movementBodyDenseIndex(entity) orelse return;
-    const cap = slot.hits.entity.items.len;
-    const full = job.view.collectOverlaps(level, rect, slot.hits.entity.items, slot.hits.min_x.items, slot.hits.min_y.items, slot.hits.max_x.items, slot.hits.max_y.items);
+    const hits = HitColumns.of(slot.hits.slice());
+    const cap = hits.entity.len;
+    const full = job.view.collectOverlaps(level, rect, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y);
     if (full > cap or slot.pairs.items.len + full > slot.pairs.capacity) {
         slot.required = @max(slot.required, @max(full, slot.pairs.items.len + full));
         return;
     }
     const self_box = rect;
     for (0..full) |hit| {
-        const entity_index = slot.hits.entity.items[hit];
+        const entity_index = hits.entity[hit];
         if (entity_index >= view.row_of_index.len) continue;
         const other_row = view.row_of_index[entity_index];
         if (other_row == no_static_row or other_row >= view.row_entity.len) continue;
@@ -1741,10 +1890,10 @@ fn writeTriggerRow(job: *const TriggerJob, slot: *StaticPairBuffer, row: u32) vo
         if (other.eql(entity)) continue;
         const other_response = job.data.collisionResponseConst(other) orelse continue;
         const other_box = math.Aabb{
-            .min_x = slot.hits.min_x.items[hit],
-            .min_y = slot.hits.min_y.items[hit],
-            .max_x = slot.hits.max_x.items[hit],
-            .max_y = slot.hits.max_y.items[hit],
+            .min_x = hits.min_x[hit],
+            .min_y = hits.min_y[hit],
+            .max_x = hits.max_x[hit],
+            .max_y = hits.max_y[hit],
         };
         if (!positiveOverlap(self_box, other_box)) continue;
         const key_self = bodyRunKey(self_box.min_x, self_box.min_y, entity.index);
@@ -4596,6 +4745,144 @@ test "dynamic bounds index tracks static membership through removal" {
     try expectDynamicIndex(&data, &.{other_now});
 }
 
+const LaneStatic = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    velocity_x: f32,
+    velocity_y: f32,
+    kinematic: bool = false,
+    shared_edge: bool = false,
+    equal_center: bool = false,
+};
+
+fn expectStaticHitLanes(dynamic_box: TestBox, statics: []const LaneStatic) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const dynamic = try addObstacle(&data, dynamic_box, .dynamic, .solid);
+    var kinematic_id: ?EntityId = null;
+    var equal_center: ?EntityId = null;
+    var shared_edge: ?EntityId = null;
+    var expect_static_first = false;
+    var expect_dynamic_first = false;
+    var static_index: [8]u32 = undefined;
+    const dynamic_key = bodyRunKey(dynamic_box.x, dynamic_box.y, dynamic.index);
+    for (statics, 0..) |spec, index| {
+        const entity = try addObstacle(&data, .{
+            .x = spec.x,
+            .y = spec.y,
+            .w = spec.w,
+            .h = spec.h,
+            .velocity_x = spec.velocity_x,
+            .velocity_y = spec.velocity_y,
+        }, .static, .solid);
+        static_index[index] = entity.index;
+        if (spec.kinematic) {
+            try data.setSimulationTier(entity, .kinematic);
+            kinematic_id = entity;
+        }
+        if (spec.equal_center) equal_center = entity;
+        if (spec.shared_edge) shared_edge = entity;
+        if (!spec.shared_edge and !spec.kinematic) {
+            const static_key = bodyRunKey(spec.x, spec.y, entity.index);
+            if (static_key < dynamic_key) expect_static_first = true else expect_dynamic_first = true;
+        }
+    }
+
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry());
+    var out_entity: [8]u32 = undefined;
+    var out_min_x: [8]f32 = undefined;
+    var out_min_y: [8]f32 = undefined;
+    var out_max_x: [8]f32 = undefined;
+    var out_max_y: [8]f32 = undefined;
+    const queried = colliders.view().collectOverlaps(0, .{
+        .min_x = dynamic_box.x,
+        .min_y = dynamic_box.y,
+        .max_x = dynamic_box.x + dynamic_box.w,
+        .max_y = dynamic_box.y + dynamic_box.h,
+    }, &out_entity, &out_min_x, &out_min_y, &out_max_x, &out_max_y);
+    // One cell, so query order is creation order. A later case relies on that.
+    try std.testing.expectEqual(statics.len, queried);
+    try std.testing.expectEqualSlices(u32, static_index[0..statics.len], out_entity[0..queried]);
+
+    const all = try filteredReference(&data, .default);
+    defer std.testing.allocator.free(all);
+    var expected_list: std.ArrayList(CollisionContact) = .empty;
+    defer expected_list.deinit(std.testing.allocator);
+    var kinematic_named = false;
+    for (all) |contact| {
+        if (kinematic_id) |id| {
+            if (contact.a.eql(id) or contact.b.eql(id)) {
+                kinematic_named = true;
+                continue;
+            }
+        }
+        try expected_list.append(std.testing.allocator, contact);
+    }
+    const expected = expected_list.items;
+    try std.testing.expect(expected.len > 0);
+    try std.testing.expect(expected[0].pre_response_max_speed_sq != 0);
+    if (kinematic_id != null) try std.testing.expect(kinematic_named);
+    if (expect_static_first) {
+        var found = false;
+        for (expected) |contact| found = found or contact.b.eql(dynamic);
+        try std.testing.expect(found);
+    }
+    if (expect_dynamic_first) {
+        var found = false;
+        for (expected) |contact| found = found or contact.a.eql(dynamic);
+        try std.testing.expect(found);
+    }
+    if (equal_center) |id| {
+        var found = false;
+        for (expected) |contact| {
+            if (!contact.a.eql(id) and !contact.b.eql(id)) continue;
+            try std.testing.expectEqual(@as(f32, -1), contact.normal_x);
+            try std.testing.expectEqual(@as(f32, 0), contact.normal_y);
+            found = true;
+        }
+        try std.testing.expect(found);
+    }
+    if (shared_edge) |id| {
+        for (expected) |contact| try std.testing.expect(!contact.a.eql(id) and !contact.b.eql(id));
+    }
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
+    try expectSameContacts(expected, contacts.mergedItems());
+}
+
+test "collision static hit lanes match contactForAabbs" {
+    const dynamic = TestBox{ .x = 0, .y = 0, .w = 16, .h = 16, .velocity_x = 2, .velocity_y = -3 };
+    try expectStaticHitLanes(dynamic, &.{
+        .{ .x = 8, .y = 2, .w = 16, .h = 16, .velocity_x = 1, .velocity_y = 4 },
+    });
+    try expectStaticHitLanes(.{ .x = 0, .y = 0, .w = 16, .h = 16, .velocity_x = 3, .velocity_y = 1 }, &.{
+        .{ .x = -8, .y = 2, .w = 16, .h = 16, .velocity_x = -2, .velocity_y = 2 },
+        .{ .x = 8, .y = 2, .w = 16, .h = 16, .velocity_x = 4, .velocity_y = -2 },
+    });
+    try expectStaticHitLanes(.{ .x = 0, .y = 0, .w = 16, .h = 16, .velocity_x = 2, .velocity_y = 3 }, &.{
+        .{ .x = -6, .y = 4, .w = 12, .h = 12, .velocity_x = -1, .velocity_y = 2 },
+        .{ .x = 10, .y = 6, .w = 12, .h = 12, .velocity_x = 5, .velocity_y = 1 },
+        .{ .x = 0, .y = 0, .w = 16, .h = 16, .velocity_x = 1, .velocity_y = -1, .equal_center = true },
+    });
+    // Shared edge and kinematic are query rows 0 and 1 and emit nothing. Rows 3 and 4
+    // overlap, so lane 3 of the full group and the one-row tail both have to emit.
+    try expectStaticHitLanes(.{ .x = 0, .y = 0, .w = 16, .h = 16, .velocity_x = 4, .velocity_y = -2 }, &.{
+        .{ .x = 16, .y = 0, .w = 16, .h = 16, .velocity_x = 6, .velocity_y = 1, .shared_edge = true },
+        .{ .x = 4, .y = 4, .w = 8, .h = 8, .velocity_x = 3, .velocity_y = 3, .kinematic = true },
+        .{ .x = -6, .y = 4, .w = 12, .h = 12, .velocity_x = -1, .velocity_y = 2 },
+        .{ .x = 10, .y = 6, .w = 12, .h = 12, .velocity_x = 5, .velocity_y = 1 },
+        .{ .x = 0, .y = 0, .w = 16, .h = 16, .velocity_x = 1, .velocity_y = -1, .equal_center = true },
+    });
+}
+
 test "a reserved warm static step allocates nothing" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4617,9 +4904,43 @@ test "a reserved warm static step allocates nothing" {
     try std.testing.expect(contacts.mergedItems().len > 0);
 
     const allocator = system.allocator;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     system.allocator = failing.allocator();
     defer system.allocator = allocator;
     _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    const worker_bodies = 2 * collision_range_alignment_items;
+    var worker_data = DataSystem.init(std.testing.allocator);
+    defer worker_data.deinit();
+    _ = try addObstacle(&worker_data, .{ .x = 0, .y = 0, .w = 4000, .h = 40, .velocity_x = 1, .velocity_y = 1 }, .static, .solid);
+    for (0..worker_bodies) |index| {
+        _ = try addObstacle(&worker_data, .{
+            .x = @as(f32, @floatFromInt(index)) * 8,
+            .y = 4,
+            .w = 8,
+            .h = 8,
+            .velocity_x = 2,
+            .velocity_y = -1,
+        }, .dynamic, .solid);
+    }
+    var worker_colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer worker_colliders.deinit();
+    try worker_colliders.rebuild(&worker_data, testGeometry());
+    var worker_system = CollisionSystem.init(std.testing.allocator);
+    defer worker_system.deinit();
+    try worker_system.reserve(worker_bodies);
+    var worker_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer worker_contacts.deinit();
+    try CollisionSystem.reserveContactStream(&worker_contacts, worker_bodies);
+    _ = try updateView(&worker_system, &worker_data, &worker_contacts, worker_colliders.view(), 2, collision_range_alignment_items);
+
+    const worker_allocator = worker_system.allocator;
+    var worker_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    worker_system.allocator = worker_failing.allocator();
+    defer worker_system.allocator = worker_allocator;
+    const worker_stats = try updateView(&worker_system, &worker_data, &worker_contacts, worker_colliders.view(), 2, collision_range_alignment_items);
+    try std.testing.expectEqual(@as(usize, 0), worker_failing.allocations);
+    try std.testing.expect(worker_stats.static_pairs_batch.range_count > 1);
+    try std.testing.expect(worker_stats.static_pairs_batch.active_worker_threads > 0);
 }
