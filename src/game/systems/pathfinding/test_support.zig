@@ -1788,6 +1788,7 @@ fn pooledStorageBytesBound(shards: usize, levels: usize, chunks: usize, entries:
     const payload = (entries *| 2) *| publish.reg_row_bytes;
     const directory = listBytesBound(DirectoryLevel, levels) +| chunks *| directory_chunk_bytes +|
         listBytesBound(DirectoryBlock, blocks *| 2) +| listBytesBound(FieldElem(RegistryDirectory, "block_free"), blocks *| 2);
+    const node_capacity = InverseNodes.growCapacity(entries *| 2) +| shards *| InverseNodes.growCapacity(0);
     const node_pool = InverseNodes.capacityInBytes(InverseNodes.growCapacity(entries *| 2)) +| shards *| InverseNodes.capacityInBytes(InverseNodes.growCapacity(0));
     const free_ids = pooledFreeIds(shards, entries);
     const heads = shards *| listBytesBound(OwnerHead, owners);
@@ -1800,12 +1801,13 @@ fn pooledStorageBytesBound(shards: usize, levels: usize, chunks: usize, entries:
     // The owner log's plan: its owner-id columns, a plan per op of a log of
     // `ops_per_entry` ops per owner id, and the log bucketed by shard: an op's entries are
     // the shards its chain has nodes in, and each chain takes at most `ops_per_entry` ops,
-    // so at most that many entries per inverse node and per owner id in each shard.
+    // so at most that many entries per inverse node slot the pools hold and per owner id in
+    // each shard.
     const Plan = publish.RetirePlan;
     const plan = listBytesBound(FieldElem(Plan, "ids"), owners) +| listBytesBound(FieldElem(Plan, "at"), owners) +|
         listBytesBound(FieldElem(Plan, "origin"), owners) +| listBytesBound(FieldElem(Plan, "shards"), owners) +|
         listBytesBound(FieldElem(Plan, "rename_to"), owners) +| listBytesBound(FieldElem(Plan, "ops"), caches.ops_per_entry *| owners) +|
-        listBytesBound(FieldElem(publish.PathIndex, "shard_ops"), @min(caches.ops_per_entry *| entries *| 2, shards *| caches.ops_per_entry *| owners));
+        listBytesBound(FieldElem(publish.PathIndex, "shard_ops"), @min(caches.ops_per_entry *| node_capacity, shards *| caches.ops_per_entry *| owners));
     return directory +| payload +| node_pool +| free_ids +| heads +| windows +| emptied +| plan;
 }
 

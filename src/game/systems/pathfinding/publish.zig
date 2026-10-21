@@ -432,11 +432,12 @@ pub fn reserveRegistryOwners(self: *PathfindingSystem, capacity: usize) !void {
 // and the owner heads), so no flush allocates it. An op's entries are the shards its chain
 // has nodes in, and a chain takes at most `ops_per_entry` ops between flushes (a shrink's
 // rename, then a retire), so the entries stay below `ops_per_entry` per inverse node, and
-// below `ops_per_entry` per owner id in each shard. Geometric. The plan still grows the list,
-// counted, past this bound.
+// below `ops_per_entry` per owner id in each shard. Keyed on node capacity, not length, so a
+// step that takes nodes from a pool's slack allocates nothing here either. Geometric. The
+// plan still grows the list, counted, past this bound.
 fn reserveShardOps(self: *PathfindingSystem) error{OutOfMemory}!void {
     var nodes: usize = 0;
-    for (&self.path_index.pools) |*pool| nodes += pool.nodes.len;
+    for (&self.path_index.pools) |*pool| nodes += pool.nodes.capacity;
     const bound = @min(ops_per_entry *| nodes, registry_shard_count *| ops_per_entry *| ownerIds(self));
     if (bound > self.path_index.shard_ops.capacity) try self.path_index.shard_ops.ensureTotalCapacity(self.allocator, bound);
 }
@@ -1038,8 +1039,9 @@ fn reserveRegistryPayloads(self: *PathfindingSystem) error{OutOfMemory}!void {
         }
     }
     // The held emptied chunks are distinct chunks holding blocks, so the list grows with the
-    // block pool, here.
-    index.emptied.ensureTotalCapacity(self.allocator, index.directory.blocks.items.len) catch {
+    // block pool's storage, here: keyed on capacity, so blocks claimed from the pool's slack
+    // allocate nothing.
+    index.emptied.ensureTotalCapacity(self.allocator, index.directory.blocks.capacity) catch {
         index.abortFresh(self.allocator);
         clearCountedPending(self);
         return error.OutOfMemory;
