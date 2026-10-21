@@ -615,9 +615,10 @@ windowed gather's MAL rows or slice items).
 do not fit (collision broadphase's replay). A pass with at most one output per
 item tallies into a range tally sized by `maxRangeCount(item_count,
 range_alignment_items)`, the bound on ranges any partition can produce, so a
-retune never allocates in-stage. Rows stay dense: each stage's
-`range_alignment_items` keeps range boundaries on cache lines in the columns it
-writes (`threading.md` § Writes, capacity, and determinism). Per-range and
+retune never allocates in-stage; data-dependent per-range output slots are
+sized from the selection the dispatch uses (`threading.md` § Writes, capacity,
+and determinism). Rows stay dense: each stage's `range_alignment_items` makes
+every range span at least one full cache line in the columns it writes. Per-range and
 per-worker records pad to the 64-byte `thread_shared_record_alignment` (slot
 arrays multiply); a contended singleton
 shared record aligns to `std.atomic.cache_line` (`shared_line`). A batched

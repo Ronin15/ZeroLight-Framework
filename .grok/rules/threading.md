@@ -49,10 +49,12 @@ How the thread system works: `docs/architecture.md` § Thread System.
 - Output capacity is reserved on the main thread before dispatch, sized from
   the value the dispatch uses; an undersized reserve is a data race, not an
   out-of-memory error.
-- Output with at most one record per item writes the item's own window; output
-  whose size depends on the data keeps per-range slots bounded at the seam by
-  the per-item bound times the most items a range can cover (never clamped to
-  the total), with counted grow-and-replay on overflow.
+- Output with at most one record per item writes the item's own window. Output
+  whose size depends on the data keeps per-range slots sized at the
+  pre-dispatch reserve from the selection the dispatch uses: the per-item
+  bound times the items that range covers, so the slots total O(items x
+  bound). A retune that needs more grows there, geometrically and counted,
+  with counted grow-and-replay on overflow.
 - Results merge in range order and never depend on worker count, timing, IDs,
   or global atomics. A batched stream commits once per batch, never per record.
 - Events derived from worker-written state are emitted by the main thread
