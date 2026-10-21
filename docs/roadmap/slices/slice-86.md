@@ -6,10 +6,15 @@
 subsystem against the current cost model and rules. 71B.1's collision queries
 and 71B.2's static split moved here (owner 2026-10-16). Its inert-row item
 lands after 88 (index, merged order 9b). Landed on `core_systems` through
-`65aa77d`: banded sweep merge, one collision path, contiguous static and
-path-registry runs, statics out of the per-step sweep, and response apply
-items as occupied 16-row blocks. The response consumer still reads through
-`order[]`. That layout item is next. Rows at rest stay after slice 88.
+`28f6b61`: banded sweep merge, one collision path, contiguous static and
+path-registry runs, statics out of the per-step sweep, response apply as
+occupied 16-row blocks streaming packed columns (`intent_order` is gone),
+and the hot-loop packs checked below. The static-query masked compare
+landed in `483d88e`. The owner closed it: the ReleaseFast gaps were inside
+the spread. Still open: gather and
+sort off main (the `production-step` figures are not a `collision` group
+proof), the worst-case benches, the tests, and `zig build verify`. Rows at
+rest stay after slice 88.
 
 Goal: each body's broadphase work follows its local same-level density,
 never column height or level count. Gather and sort leave the main thread.
@@ -30,10 +35,18 @@ the current bench.
   dropped. A static trigger over a static is stored until the collider
   revision changes, and that refresh runs at the collider sync.
 - `CollisionResponseSystem.gatherRange` stays scalar. `computeIntentMath`
-  streams the intent columns in lanes. With workers, each range groups
-  placed intents on a direct table keyed by `movement_row >> 4`. Apply
-  items are the occupied 16-row blocks. The consumer still loads intent
-  columns through `order[]` and gathers movement columns in the flush.
+  streams the intent columns in lanes, and the remainder is that multiply
+  on a prefix. With workers, each range groups placed intents on a direct
+  table keyed by `movement_row >> 4` and scatters the apply columns in
+  that order. Apply items are the occupied 16-row blocks. Each run is a
+  unit-stride prefix; movement position and velocity are gathered at the
+  flush. `intent_order` is gone.
+- The fill packs each slot's lane inputs before `fillSlots`. `writeSorted`
+  copies proxy bounds into the entry columns; the sweep loads those columns
+  unit-stride. Narrowphase and static-hit overlap keep the speed squares in
+  lanes. A stored trigger pair carries an allow word. The Debug rect
+  compare runs after the query joins. The static query's overlap test is
+  one masked compare over the column span the box covers (`483d88e`).
 - Collision runs on `locomotion` and `cognition` tier rows.
 - `StaticColliderSystem` stores statics as contiguous per-chunk runs.
   Steering still queries through `ColliderView.queryBox`. Path
@@ -64,18 +77,16 @@ the current bench.
 - Contact streams are deterministic from range order and sized to the pair
   bound at the seam (`.grok/rules/threading.md`,
   `.grok/rules/budgets-capacities.md`).
-- The static split is gated: a control bench must show static-heavy SAP cost
-  growing with static count before it lands; otherwise it closes as measured
-  not needed. Split contacts equal today's contacts minus static × static
-  pairs that produce no response outcome, identical in every field and
-  order; a static trigger over a static keeps its trigger event
-  (`collision_response.zig:449-450`); dynamic × static capacity terms from 61
+- The static split landed in `b126599`. Solid static×static pairs are not
+  contacts. A static trigger over a static keeps its trigger event
+  (`collision_response.zig:684`). Dynamic × static capacity terms from 61
   and 62 stay.
 - A static body moves only through structural commands
   (`.grok/rules/simulation.md` § Controllers and processors); a Debug
   verification catches an out-of-band move.
-- Main holds only the ordered merge of the split's output
-  (`.grok/rules/threading.md`); the design decides where resolve runs.
+- Static-hit overlap runs in the query's worker ranges
+  (`writeStaticHitContacts`). Main merges those range windows
+  (`.grok/rules/threading.md`).
 - From [72](slice-72.md) D1: the destructible resolve answered by the
   shared static-collider query. From 75: collision fidelity per band.
 
@@ -105,11 +116,13 @@ the current bench.
       fill batch recorded: fill and sort are on workers for all 30 steps.
       Collision main is 92 µs at 1,537 bodies and 104 µs at 6,145 bodies,
       both with no contacts, and 127 µs / 417 µs at 1,272 / 5,424 contacts.
+      Those `production-step` figures are not a `collision` group proof.
       Pass: in `collision` and `production-step
       --details` the main share is the ordered merge only; serial == threaded
       across range sizes and worker counts; `FailingAllocator` proof on a
       multi-worker step; a pipeline test proves the stages ran on workers.
-- [ ] Rows at rest cost no per-step collision work. Failure scenario: an
+- [ ] Rows at rest cost no per-step collision work. Owner: after slice 88.
+      Failure scenario: an
       inert row is gathered, sorted, and swept every step it sits in a
       collision tier. Measured: the inert axis above. Pass: `production-step`
       collision cost flat in inert rows; static colliders through the two
@@ -146,7 +159,7 @@ the current bench.
       consumers; the path registry item and the two items below build on this
       structure.
 - [x] Collision's static queries read `StaticColliderSystem`
-      (`static_colliders.zig:478`, `:580`) instead of gathering statics every
+      (`queryBox` `static_colliders.zig:372`, `collectOverlaps` `:392`) instead of gathering statics every
       step (moved from 71B.1). Failure scenario: every static row is
       gathered and sorted each step (`collision.zig:473`, `:684`). Pass:
       `collision-static-index-change` flat in static count.
@@ -177,62 +190,98 @@ the current bench.
       `src/game/`, not `systems/`. Response apply had no new hit. The
       destructible cell scan is 72 D1, which replaces that scan. The other
       hits are the items below.
-- [ ] Warm fill resolves each input through other stores inside the lane
-      group (`collision.zig:1984`, `FillContext.resolve` at `:1918`).
-      Failure: a warm step reads `warm_sources`, bounds, and movement
+- [x] Warm fill packs each slot before the lane kernel. Landed in
+      `6670f2e`. `packFillRange` (`collision.zig:2547`) writes position,
+      offset, size, level, entity index, and `filled` (`u32`, 0 or 1).
+      `fillSlots` (`:2593`) loads those columns: a full group with
+      `loadFloat4`, a short tail with `loadFloat4Prefix`.
+      `chooseSplitters` (`:2655`) still resolves its fixed sample on main.
+      Failure: a warm step read `warm_sources`, bounds, and movement
       position and velocity per lane (`memory-performance.md` § Data-oriented
       design, § SIMD and core math). Pass: the fill job packs those columns
       once in slot order, and `fillSlots` loads that scratch with the lane
       kernel and a masked tail.
-- [ ] `writeSorted` gathers proxy columns through `entry.slot`
-      (`collision.zig:2203`). Failure: after the band is in key order, each
-      lane group gathers `min_x/min_y/max_x/max_y` and the warm source by
-      slot (`memory-performance.md` § Data-oriented design). Pass: those
-      values are stored in entry order and `writeSorted` loads them
-      unit-stride. Where the values ride (the sort record, or one pack) is
-      open.
-- [ ] Intent math keeps a scalar tail (`collision_response.zig:781`).
-      Failure: `computeIntentMath` runs the correction and velocity scale
-      in lanes, then repeats that math one intent at a time
-      (`memory-performance.md` § SIMD and core math). Pass: the remainder
-      is that kernel with a mask. Inactive lanes do not write past the
-      window.
-- [ ] Narrowphase drains lane contacts into scalar calls
-      (`collision.zig:2379`). Failure: overlap, normal, and penetration are
-      lanes, then each valid lane calls `contactForResolved`
+- [x] `writeSorted` stores proxy bounds in entry order. Landed in
+      `9f15071`. After the band merge, `writeSorted` (`collision.zig:2792`)
+      copies `min_x/min_y/max_x/max_y` from the proxy at `entry.slot` into
+      the entry columns. `SortEntry` stays 32 bytes (`:178`). The sweep
+      (`sweepEntries`, `:2867`) loads those columns unit-stride.
+      Failure: after the band is in key order, each lane group gathered
+      those columns and the warm source by slot
+      (`memory-performance.md` § Data-oriented design). Pass: the values
+      ride in the entry columns, and the sweep loads them unit-stride.
+- [x] Intent math's remainder is the lane multiply. Landed in `d9e5f13`.
+      `computeIntentMath` (`collision_response.zig:770`) stores a full group
+      with `storeFloat4Slice`. The leftover intents use `loadFloat4Prefix`
+      and `storeFloat4Prefix`, so the store does not run past the window.
+      Failure: the correction and velocity scale ran in lanes, then repeated
+      one intent at a time (`memory-performance.md` § SIMD and core math).
+      Pass: the remainder is that kernel with a mask. Inactive lanes do not
+      write past the window.
+- [x] Narrowphase keeps speed squares in the lane kernel. Landed in
+      `bc5c518`. `writeNarrowphaseContactsSimd` (`collision.zig:2928`)
+      gathers velocity with the AABBs and stores the squares from the lanes.
+      A short group repeats the last in-range pair and the store mask drops
+      it. Compaction walks the emit mask. `contactForResolved` is gone.
+      `contactForCandidate` (`:3014`) is the test oracle.
+      Failure: overlap, normal, and penetration were lanes, then each valid
+      lane called `contactForResolved`
       (`memory-performance.md` § SIMD and core math). Pass: velocity and the
       speed squares stay in that lane loop. Compaction into the window may
       stay scalar.
-- [ ] Static-pair materialization looks up entity slots per hit
-      (`collision.zig:1654`, `tierAt` at `:1633`). Failure: after the search,
-      every hit indexes `row_of_index`, tier, and the movement row
-      (`memory-performance.md` § Data-oriented design). Pass: the contact
-      loop streams hit columns that already hold entity, movement index,
-      allow bit, and velocity. Where those columns are packed is open.
-- [ ] Stored trigger pairs re-check tiers on the caller of `update`
-      (`collision.zig:1503`). Failure: every step walks every stored pair
-      and slices the movement store per pair (`memory-performance.md`
-      § Data-oriented design; `threading.md` § What runs where). Pass: main
-      does not call `tierAt`. The allow bit is packed before that pass, and
-      main reserves once. Where the bit is stored is open.
-- [ ] Static hit contacts stay scalar over packed float columns
-      (`collision.zig:1650`). Failure: each hit runs `contactForAabbs` on a
-      dense hit buffer that the next body reuses
-      (`memory-performance.md` § SIMD and core math). Pass: the overlap math
-      on that buffer is one masked lane loop. The search stays scalar.
-- [ ] Static query overlap. The collision query is uncapped and a cell
-      holds one static, so that compare stays the tight scalar loop
-      (`scanUncapped`). A lane kernel replaces it only when ReleaseFast
-      `collision-static-heavy` is faster than that loop. A copy of short
-      runs into a side group is not that kernel. Measured against
-      `d9e5f13`: the copy and the in-place prefix were slower or inside a
-      wide spread, and the change did not land.
-- [ ] Debug static scan chases `DataSystem` per row
-      (`static_colliders.zig:629`). Failure: in Debug every tested row
-      resolves `row_of_index`, the slot, the body, and the bounds.
-      ReleaseFast compiles the call out (`memory-performance.md`
-      § Data-oriented design). Pass: the scan does not read `DataSystem`.
-      Where a rect compare moves is open.
+- [x] Static-pair hits are packed before the contact loop. Landed in
+      `ee92e92`. `packStaticHits` (`collision.zig:1844`) writes movement
+      index, generation, allow (0 or 1), and velocity onto the hit row.
+      `writeStaticHitContacts` (`:1889`) streams those columns.
+      Failure: after the search, every hit indexed `row_of_index`, tier, and
+      the movement row (`memory-performance.md` § Data-oriented design).
+      Pass: the contact loop streams hit columns that already hold entity,
+      movement index, allow bit, and velocity.
+- [x] Stored trigger pairs read a packed allow word. Landed in `af44a86`.
+      `trigger_allow` is one `u32` per stored pair, 0 or 1, in pair order.
+      `packTriggerAllow` (`collision.zig:1673`) reserves once and packs the
+      column when exclusion is on and the column is stale, on the
+      trigger-allow stage or inline below its gate. `appendTriggerContacts`
+      (`:1654`) does not call `tierAt`. `collision_allow_epoch` moves when a
+      tier crosses `allowsCollision` (`data_system/system.zig:305`) and when
+      a movement row is removed (`:937`). A new body does not move it.
+      Failure: every step walked every stored pair and sliced the movement
+      store per pair (`memory-performance.md` § Data-oriented design;
+      `threading.md` § What runs where). Pass: main does not call `tierAt`.
+      The allow bit is packed before that pass, and main reserves once.
+- [x] Static hit contacts use the narrowphase overlap lanes. Landed in
+      `ee92e92`. `writeStaticHitContacts` (`collision.zig:1889`) is that
+      kernel, including a 1–3 hit tail via prefix loads. A shared edge stays
+      a query hit and is not a contact. The search stays scalar.
+      `writeTriggerRow` (`:2214`) still builds stored-trigger contacts one
+      at a time.
+      Failure: each hit ran `contactForAabbs` on a dense hit buffer that the
+      next body reuses (`memory-performance.md` § SIMD and core math). Pass:
+      the overlap math on that buffer is one masked lane loop. The search
+      stays scalar.
+- [x] Static query overlap. The masked compare landed in `483d88e`.
+      `scanUncapped` (`static_colliders.zig:601`) and `queryBox`'s
+      capped walk (`scanCapped`, `:626`) share `overlapMaskLanes` (`:742`).
+      A full group loads with `loadFloat4`; a short slice uses
+      `loadFloat4Prefix`. The anchor walk and the chunk search stay scalar.
+      The scan reads the column span the box covers. `queryBox` (`:372`)
+      uses that compare and still stops on the work budget and the hit cap.
+      A copy of short runs into a side group is not this kernel. ReleaseFast
+      `collision-static-heavy`, one static per cell, 30 iterations, 3 reps,
+      both sides inline: 4,096 110.2 → 127.4 µs (+17 µs), 16,384 123.6 →
+      110.9 µs (−13 µs), 65,536 151.4 → 104.7 µs (−47 µs), all inside wide
+      spreads. The owner closed it on that pair.
+- [x] Debug static scan does not read `DataSystem`. Landed in `28f6b61`.
+      The overlap scan records the entity ids it walked (`recordSpan`,
+      `static_colliders.zig:608`). After the query joins,
+      `compareStoredRects` (`collision.zig:2059`) checks each distinct
+      static's stored bounds against the live rect. A mismatch is
+      `StaticMovedOutsideCommit`. ReleaseFast calls `collectOverlaps` and
+      does not record, stamp, or compare.
+      Failure: in Debug every tested row resolved `row_of_index`, the slot,
+      the body, and the bounds inside the scan. ReleaseFast compiled the
+      call out (`memory-performance.md` § Data-oriented design). Pass: the
+      scan does not read `DataSystem`.
 - [x] Path registry lists read as contiguous runs per key (contiguity audit
       L1). Failure: the `path_index` shards are `ChunkListMap`s keyed by
       (level, chunk) (`pathfinding/system.zig:150`), and the threaded
@@ -242,13 +291,13 @@ the current bench.
       (`.grok/rules/memory-performance.md` § Data-oriented design, § Hot
       paths). Failure scenario: after publish churn, an explosion's
       multi-chunk change evicts through scattered entries. Pass: eviction
-      reads each key's registrations as one contiguous run; it lands with the
-      static-collider item, whose lists use the same `ChunkListMap`
-      (`src/game/systems/chunk_list_map.zig`).
+      reads each key's registrations as one contiguous run. Landed with the
+      static-collider runs; both are `ChunkDirectory` payloads
+      (`src/game/systems/chunk_list_map.zig`). `ChunkListMap` is gone.
 - [x] Collision response's `apply` stage dispatches items that track its work.
       Landed in `65aa77d`. Occupied 16-row blocks: 33 / 129 / 513 at
       1,024 / 4,096 / 16,384 contacts. The separate no-worker path is gone.
-      The consumer layout is the next item, not this one.
+      The consumer streams packed columns; that item is below.
       Failure: it dispatches one item per fixed band (`collision_response.zig:296`,
       `:307`; at most `max_bands` 64, `:56`), a fixed partition count whose work
       varies behind it (`.grok/rules/threading.md`: "A stage's items are units
@@ -266,16 +315,22 @@ the current bench.
       was measured and rejected. The landing groups on a direct block-id
       table. Tuned Debug at 16,384 contacts was 699 µs to 980 µs, inside the
       base spread, and stands as noise.
-- [ ] Response apply reads intent columns through `order[]`
-      (`src/game/systems/collision_response.zig` `ApplyLanes.push`) and
-      gathers movement columns inside the flush. A partial lane group then
-      calls `applyIntentScalar` per row. Failure: the hot read is an index
-      permutation, and a short group leaves the lane path
+- [x] Response apply streams packed columns. Landed in `24970f0`.
+      Gather scatters correction, normal, velocity scale, kind, and movement
+      row into `packed_intents` in apply order (`collision_response.zig:952`).
+      `intent_order` is gone. `applyBlockJob` (`:1104`) walks each run as a
+      unit-stride prefix. `applyGroup` (`:1066`) prefix-loads it. A repeated
+      row flushes first. A short group is that kernel with a mask. The open
+      group ends at the run. Movement position and velocity are gathered at
+      the flush. Inline apply copies the same intent fields into `ApplyLanes`
+      (`:1168`) and calls `applyGroup`. Contact order stays. The 16-row block
+      stays.
+      Failure: the hot read was an index permutation through `order[]`, and
+      a short group called `applyIntentScalar` per row
       (`memory-performance.md` § Data-oriented design, § SIMD and core math).
-      The movement gather is not exempt. Pass: the intent fields and the
-      movement columns the consumer uses are packed once in its read order,
-      and the tail is a masked lane batch. Contact order stays. The 16-row
-      block ownership stays.
+      Pass: the intent fields are packed once in apply order, the tail is a
+      masked lane batch, and movement position and velocity are gathered at
+      the flush. Contact order stays. The 16-row block ownership stays.
 - [x] Collision's banded fill and sort fails the cost model when it runs
       inline (lands before the response and contiguity landings, with the
       item after it: every later collision A/B and the static gate measure
@@ -312,8 +367,10 @@ the current bench.
       shape asserts landing with each fix (`.grok/rules/tests-benchmarks.md`).
 - [ ] Tests: identical contacts and order across worker counts; cross-level,
       tall, and inert fixtures; allocation-free warmed step.
-- [ ] Docs: `docs/architecture.md` collision;
-      `docs/simulation-tiers-and-pipeline.md` stage list.
+- [x] Docs: `docs/architecture.md` collision and response. The pipeline
+      stage list matches `stage_order` (`collision_scope_gather` →
+      `collision_detect` → `collision_respond`), so
+      `docs/simulation-tiers-and-pipeline.md` is unchanged.
 
 ### Acceptance checks
 

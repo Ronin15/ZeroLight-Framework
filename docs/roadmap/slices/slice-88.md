@@ -95,7 +95,7 @@ in its owning slice.
       `gatherPerceptionData` (`perception.zig:373`), the think-set compaction
       `compactCognition` (`simulation_scope.zig:396`, which reads only index
       columns), `collisionGatherJob` and `aiGatherJob`
-      (`:787`, `:816`), collision `gatherBodies` (`collision.zig:455`), the
+      (`:787`, `:816`), collision `packFillRange` (`collision.zig:2547`), the
       `world_gate` walks (`world_gate.zig:41`, `:119`), and render collect
       (87). Failure scenario (derived): with phases striped by row, each
       step's P/4 think set touches every cache line of each AI and movement
@@ -214,7 +214,7 @@ in its owning slice.
 - [ ] One `hotStoreCapacity` (code audit L8). Failure: eight private copies
       wrap `std.mem.alignForwardAnyAlign` (`systems/ai.zig:81`,
       `perception.zig:106`, `affect.zig:92`, `ai_memory.zig:71`,
-      `particle.zig:31`, `collision.zig:45`, `collision_response.zig:60`,
+      `particle.zig:31`, `collision.zig:76`, `collision_response.zig:59`,
       `steering/system.zig:67`) beside the shared
       `data_system/types.zig:28` (`.grok/rules/memory-performance.md`,
       `.grok/rules/engine-design.md` § Changes and docs). Failure scenario:

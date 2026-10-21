@@ -148,11 +148,10 @@ Designs start here, then read the live structure below (rules:
 - `src/game/systems/plane_entry.zig` owns `PlaneEntrySystem`, plane traversal's
   threaded per-agent cell-entry gather and classification.
 - `src/game/systems/static_colliders.zig` owns `StaticColliderSystem`, the shared
-  static-collider rows nav and steering read through `ColliderView`.
-- `src/game/systems/chunk_list_map.zig` holds `ChunkListMap` (per-key owner lists
-  backing the static-collider chunk lists and the path registry) and
-  `OrderedIndexSet` (the ordered chunk/level set nav's plan merge and the world's
-  write grouping drain).
+  static-collider rows nav, steering, and collision read through `ColliderView`.
+- `src/game/systems/chunk_list_map.zig` holds `ChunkDirectory` (per-level chunk
+  slots and a payload pool), chunk-key helpers, and `OrderedIndexSet` (nav's
+  plan sets and the world's edit-level set).
 - `src/game/systems/spatial_index.zig` owns `SpatialIndexSystem`, the
   pipeline-shared neighbor index, built each step on workers from a handed
   population into per-chunk records keyed by level and faction, and read by
@@ -913,35 +912,67 @@ stage; main keeps O(ranges) dispatch. The rows are scattered across the velocity
 columns, which `threading.md` allows: `movement-apply-intents-sorted` is its
 row-order control.
 
-`CollisionSystem` is a high-throughput contact generator over entities that have
-both movement bodies and collision bounds. It owns warmed AABB
-proxy scratch, preserves a sorted sweep-and-prune order across fixed steps, and
-threads broadphase anchor ranges through `ThreadSystem` to emit candidate pairs
-once with SIMD Y-overlap filtering. Narrowphase then uses its own threaded batch
-over candidate pairs, computes AABB contact math with SIMD lanes inside each
-worker range, and merges range-owned contact buffers deterministically for
-same-step response. Thread-written range scratch is cache-line padded;
-persistent collision component data is not padded by default. Broadphase and
-narrowphase keep separate adaptive tuners and batch stats so each stage is
-measured against its own workload; benchmark detail rows report narrowphase
-separately so an inline narrowphase cannot be mistaken for a broadphase tuning
-result.
-Contacts are transient `SimulationFrame` data; `CollisionResponseSystem`
-consumes the completed same-step contact stream through explicit response-policy
-components in two threaded stages, each with its own tuner and an inline path.
-`gather` (over contacts) classifies each contact, resolves each response intent's
-movement row, writes its range's windows of intents, triggers, and observer
-contacts, and runs the intent math with `src/core/simd.zig`; with workers it also
-places its intents by 16-row movement band, and `apply` (over bands) applies, for
-the rows each band owns, every gather range's segment in range order (a 4-lane
-SIMD block, flushed when a row repeats). An inline gather applies its own window
-inside its timed range, so its tuner measures everything the inline choice keeps
-on main. Either way each movement row takes its intents in contact order, so the
-result is bit-identical for any worker count, range size, or tuner decision. Main
-does O(ranges) tallies, merges the trigger stream and observer contacts in range
-order (O(1) per record), and reserves everything before dispatch.
-`observerContacts` (the contacts naming the observer) serves player impacts and
-collision audio, replacing two scans of every contact.
+`CollisionSystem` generates contacts for entities that have both a movement
+body and collision bounds. `update` runs the banded fill, sort, sweep, and
+narrowphase, each under its own tuner, and the same functions inline when the
+tuner or a zero-worker pool stays on the caller. The sweep key is level, strip,
+ordered min, and entity. Statics are not sweep entries. Dynamic×static pairs
+come from `ColliderView`. Solid static×static pairs are dropped. A static
+trigger over a static is stored until the collider revision changes; that
+refresh runs at the collider sync (`syncStaticColliders`).
+
+`packFillRange` writes each slot's position, offset, size, level, and entity
+index once. `fillSlots` loads those columns in lanes; a short tail is that
+kernel with a prefix load. `chooseSplitters` still resolves its fixed sample
+on the main thread. Each band sorts its first, second, and spill runs and
+merges them. `writeSorted` then copies bounds from the proxy at `entry.slot`
+into the entry columns. `SortEntry` stays the 32-byte key, slot, and
+first-copy flag. The sweep reads those columns unit-stride and emits candidate
+pairs. Narrowphase gathers each pair's bounds and velocity and keeps overlap,
+normal, penetration, and the speed squares in lanes until the compact stores
+them. A group shorter than a lane repeats the last in-range pair and the store
+mask drops it. Compaction walks the emit mask. Range scratch is cache-line
+padded; persistent collision component data is not. With no static pairs,
+narrowphase windows merge in range order. With static pairs, dynamic and
+static contacts merge in key order. Broadphase and narrowphase keep separate
+tuners and batch stats.
+
+After the static query, one pass writes movement index, generation, an allow
+word (0 or 1), and velocity onto the hit row. The contact loop streams those
+columns with the same overlap lanes. A shared edge stays a query hit and is
+not a contact. Stored static-trigger pairs keep that allow word in pair order.
+It is packed when a dormant or kinematic body exists and the column is stale
+(`collision_allow_epoch` moves when a tier crosses `allowsCollision` and when
+a movement row is removed), on the trigger-allow stage or inline below its
+gate. The append reserves once and does not re-read tiers. In Debug the query
+records the static ids it walked; after the ranges join, one compare checks
+each distinct static's stored bounds against the live rect and returns
+`StaticMovedOutsideCommit` on a mismatch. ReleaseFast does not record, stamp,
+or compare.
+
+Contacts are transient `SimulationFrame` data. `CollisionResponseSystem`
+consumes that stream through explicit response-policy components. `gather`
+(over contacts) classifies each contact, resolves each intent's movement row,
+and writes its range's windows of intents, triggers, and observer contacts.
+`computeIntentMath` streams correction and velocity scale: a full group is a
+vector load and store, and the remainder is that multiply on a prefix
+(`loadFloat4Prefix` / `storeFloat4Prefix`) so it does not read or write past
+the window. With workers, each range groups intents on a direct table keyed
+by `movement_row >> 4` and scatters correction, normal, velocity scale, kind,
+and movement row into `packed_intents` in apply order. `place` is one item on
+the caller and merges those runs so earlier ranges stay first. `apply` (over
+occupied 16-row blocks, its own tuner) streams each run as a unit-stride
+prefix. A repeated row flushes before the next intent joins it, a short group
+is the same kernel with a mask, and the open group ends at the run. Movement
+position and velocity are gathered at that flush, not packed with the intents.
+Zero workers, and a tuner that stays inline, apply inside the gather: the same
+kernel over a four-lane copy of the window, so there is no second walk of the
+contacts. Either way each movement row takes its intents in contact order, so
+the result is bit-identical for any worker count, range size, or tuner
+decision. Main does O(ranges) tallies, merges the trigger stream and observer
+contacts in range order (O(1) per record), and reserves everything before
+dispatch. `observerContacts` (the contacts naming the observer) serves player
+impacts and collision audio, replacing two scans of every contact.
 
 `SpatialIndexSystem` (`src/game/systems/spatial_index.zig`) is the pipeline's one
 neighbor index. `spatial_index_build` builds it each step from the unstaggered
@@ -1144,11 +1175,13 @@ cache still does; Slice 64G checklist). The fixed-step work:
 - Publish: the main thread claims slots, payloads, and long blocks in order, O(1)
   per result (a claim is never another claim's victim in the same publish);
   `publish_copy` copies path bytes and buckets each path's registry runs per shard
-  on workers. `registry_flush` then applies the owner log (retire, rename) and adds
-  per shard, appending each shard's sorted segment with one probe per run of
-  same-key records (`ChunkListMap.addAll`); its items are work units over the 16 shard pairs (a pair weighs its
-  ops plus its adds plus one), a range runs the pairs whose first unit lies in it,
-  and at most 15 workers dispatch. Pending compaction costs the solve window, not the queue.
+  on workers. `registry_flush` (`flushRegistry`) compacts the chunks a retire
+  touched, renames along each inverse chain, and appends that shard's
+  registrations onto the chunk's owner/order run. Its items are work units over
+  the 16 shard pairs (count weighs a pair's adds plus the inverse nodes its
+  retires mark plus one; apply weighs the compacted chunk lengths plus its adds
+  plus one), a range runs the pairs whose first unit lies in it, and at most 15
+  workers dispatch. Pending compaction costs the solve window, not the queue.
 
 Reachability answers before any search (`pathfinding.md`). Status, intake, and solve
 read, in order, the live goal (the key's cell when open, else its projection from
@@ -1228,10 +1261,11 @@ one per entry, plus its end and goal cell. A grow appends pages and copies nothi
 shrink selects survivors by an O(n) radix pass (oldest first, equal to the age
 order), `resize_copy` moves path bytes on workers, tail pages free, and the owner log
 renames registry owners. A shrink's registry flush runs at a fixed one-range-per-pair
-shape outside the flush tuner. The path registry is 16 `ChunkListMap` shards keyed
-by (level, chunk) (shard = top bits of `std.hash.int` of the key): every published
-path registers each run of consecutive cells on one level in one chunk, so eviction
-reaches exactly the results whose cells a change touches.
+shape outside the flush tuner. The path registry is one padded `ChunkDirectory`
+of per-chunk runs (`owner`, `order`, `inverse`) plus 16 inverse pools. A chunk
+key's shard is the top bits of `std.hash.int` of the key. Every published path
+registers each run of consecutive cells on one level in one chunk, so eviction
+reads that chunk's run.
 
 Group fields (`group_field.zig`) build only for declared group requests whose
 decaying per-step tally reaches `min_group_field_agents` (1024 sharers, a fixed
@@ -1344,13 +1378,20 @@ bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
   it. Memory follows nodes and terminals; a one-way system of k terminals holds
   about k²/32 words, inherent to an exact table.
 - **Statics.** `StaticColliderSystem` rows (one per static navigation obstacle:
-  committed AABB, level, cell span) are listed per (level, chunk) in a
-  `ChunkListMap` in entity-index order, plus a query tier (a size-class map with
-  per-chunk anchor bitmaps) for `ColliderView.queryBox`. The commit seam captures
-  the step's entity changes into a persistent dirty list; `sync` applies them with
-  O(1) main work per change and a threaded `static_collider_splice` stage that
-  places list entries in entity order, so a static add, move, or destroy costs its
-  own footprint chunks, never the static count.
+  committed AABB, level, cell span) sit in a `ChunkDirectory` of per-chunk
+  column runs: nav spans, and query columns in cell then entity order, with
+  per-chunk anchor bitmaps and a size-class tier. `ColliderView.queryBox` and
+  `collectOverlaps` read the column span the box covers. The overlap test is
+  one masked compare: a full group loads four lanes, and a short slice is that
+  compare with a prefix load. The anchor walk and the chunk search stay
+  scalar. `queryBox` uses that compare and stops on its work budget and hit
+  cap; a group stops at the remaining budget, and a hit that fills the cap
+  drops later lanes. The commit seam captures the step's entity changes into a
+  persistent dirty list. `sync` plans with O(1) main work per dirty static and
+  per footprint chunk, then one `chunk_rewrite` dispatch fills fresh payloads
+  (recorded as `static_collider_splice`). A row whose chunks, AABB, and query
+  key are unchanged is not rewritten, so a static add, move, or destroy costs
+  its own footprint chunks, never the static count.
 
 `PathfindingSystem` owns the post-commit nav reaction end to end
 (`.grok/rules/pathfinding.md`; `nav_reaction.zig`, eviction in `eviction.zig`).

@@ -25,10 +25,11 @@ Goal:
   row per static navigation obstacle (AABB, level, cell span) listed per
   (level, chunk) in entity order, synced at the commit seam with O(1) main work
   per change, plus a size-class query tier with per-chunk anchor bitmaps.
-  Nav and steering read it through `ColliderView`; steering's box query
-  (`queryBox`) visits at most 64 hits and 512 probes per agent, so a static
-  change costs steering nothing (`steering-static-change` flat in static count,
-  `173cc17`). Collision still gathers its statics every step (Slice 86).
+  Nav, steering, and collision read it through `ColliderView`; steering's box
+  query (`queryBox`) visits at most 64 hits and 512 probes per agent, so a
+  static change costs steering nothing (`steering-static-change` flat in
+  static count, `173cc17`). Collision's static pairs come from those columns
+  (Slice 86, `b126599`); statics are not sweep entries.
 - Statics move only through structural commands; a created static emits
   `component_changed` with `is_static`.
 - Group fields (`src/game/systems/pathfinding/`): `max_group_fields` slots
