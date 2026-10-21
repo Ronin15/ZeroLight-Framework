@@ -290,20 +290,27 @@ pub const ReactFixture = struct {
     }
 
     // Requests every result in batches the intake admits and drains each batch, until
-    // every result is cached. Untimed.
+    // every result reads available. A cache hit keeps its solve step, so a pass's own
+    // steps can age a result past the TTL after that pass already served it; the next
+    // pass re-solves those. Passes stop at one per solve step of a full generation,
+    // plus one wave. Untimed.
     pub fn fillCache(self: *ReactFixture, case: suite.BenchmarkCase, thread_system: *ThreadSystem) !void {
-        var start: usize = 0;
-        while (start < self.requests.len) : (start += self.agent_count) {
-            const end = @min(start + self.agent_count, self.requests.len);
-            try fixtures.writeRequests(&self.stream, self.requests[start..end]);
-            var step_stats = try runColdOnce(&self.system, &self.stream, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
-            var guard = @divCeil(self.agent_count, default_max_solves_per_frame) + 2;
-            while (step_stats.perf.pending_requests != 0) : (guard -= 1) {
-                if (guard == 0) return error.EvictFillStalled;
-                step_stats = try runColdOnce(&self.system, &self.empty, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
+        const pass_limit = @divCeil(self.requests.len, default_max_solves_per_frame) + 2;
+        for (0..pass_limit) |_| {
+            var start: usize = 0;
+            while (start < self.requests.len) : (start += self.agent_count) {
+                const end = @min(start + self.agent_count, self.requests.len);
+                try fixtures.writeRequests(&self.stream, self.requests[start..end]);
+                var step_stats = try runColdOnce(&self.system, &self.stream, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
+                var guard = @divCeil(self.agent_count, default_max_solves_per_frame) + 2;
+                while (step_stats.perf.pending_requests != 0) : (guard -= 1) {
+                    if (guard == 0) return error.EvictFillStalled;
+                    step_stats = try runColdOnce(&self.system, &self.empty, thread_system, case, self.agent_count, self.agent_count, self.agent_count);
+                }
             }
+            if (self.cachedCount() == self.requests.len) return;
         }
-        if (self.cachedCount() != self.requests.len) return error.EvictFillIncomplete;
+        return error.EvictFillIncomplete;
     }
 
     // Requests whose path the cache serves. Untimed: one status query per request.
