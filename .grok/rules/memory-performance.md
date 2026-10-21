@@ -9,11 +9,13 @@
   spatial data); within it, keys a loop filters on (level, faction, kind)
   order the data ahead of position, so a filtered loop streams contiguous runs
   whole in SIMD lanes.
-- A hot loop pays no per-item indirection: no pointer or linked-list walk, no
-  read through an index permutation, no per-row lookup into another store; a
-  stage needing another store's columns gathers them once into packed scratch.
-  Inherently indirect access is exempt: search frontiers, pair streams, hash
-  point lookups.
+- A loop over a population or dense columns (per entity, row, or cell) pays
+  no per-item indirection: no pointer or linked-list walk, no read through an
+  index permutation, no per-row lookup into another store; a stage needing
+  another store's columns gathers them once into packed scratch. Inherently
+  indirect access is exempt: search frontiers, pair streams, hash point
+  lookups, and sparse index maintenance that visits only changed items (owner
+  or inverse indexes such as the path registry).
 - A layout that fails either bullet fails the design and is fixed in the
   layout.
 

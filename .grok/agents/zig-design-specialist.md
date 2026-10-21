@@ -115,9 +115,8 @@ section with nothing new is omitted.
   cannot be made faster, the proof is the ReleaseFast pair and what was
   tried. The owner accepts a revert before the code goes back. Inherited code the change
   keeps on the hot path is in the table. "Same as the old loop" is not
-  a pass. The only exemptions are the ones that section names (search
-  frontiers, pair streams, hash point lookups), and the row names the
-  exemption. A movement-column gather is not exempt: those columns are
+  a pass. The only exemptions are the ones that section names, and the
+  row names the exemption. A movement-column gather is not exempt: those columns are
   packed once into the consumer's scratch before the lane path.
 - **Stage shape on today's `ThreadSystem`**: each threaded stage fits the
   thread system and tuner as they are, never a change to them (owner). State

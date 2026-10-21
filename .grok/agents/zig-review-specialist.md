@@ -90,8 +90,8 @@ scope only where the diff relies on it.
    mask. A remainder that is not the same math stays scalar and says why.
    An irreducible loop stays scalar.
    A SIMD-shaped loop that is only a little slower in Debug is not a finding.
-   "Same as the old loop" is not a pass. The only exemptions are search
-   frontiers, pair streams, and hash point lookups, named in the plan.
+   "Same as the old loop" is not a pass. The only exemptions are the ones
+   that section names, named in the plan.
    Another store's columns are packed once before the lane path. Also
    check whether requesters repeat identical intermediate work
    (`engine-design.md` § Cost model, shared results). A failure is a High
