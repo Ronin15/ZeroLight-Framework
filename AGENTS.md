@@ -67,7 +67,9 @@ orchestrates, verifies every agent claim against live code, and reports.
   session commits.
 - Never use generic skills or agents (`/code-review`, `/simplify`, generic
   Explore/Plan) for Zig work in this repo.
-- Terse reports and docs, never by dropping findings. Make engineering calls
+- Terse reports and docs, never by dropping findings. A perf report gives
+  both sides' times for each case, each with its entity count, both sides
+  built at the same CPU. Make engineering calls
   without asking, on best practice, scale, performance, and efficiency, never
   on what today's code happens to produce or by doing less work, and report
   them. A call may depart from a rule only where the rule's letter would cost
@@ -79,7 +81,9 @@ orchestrates, verifies every agent claim against live code, and reports.
   unless the owner asks.
 - When work splits into independent read-only pieces, spawn those agents
   together in the same turn and wait for all of them. Implementation agents
-  stay sequential in the main tree. Let every read-only agent finish before
+  stay sequential in the main tree, each with one commit-sized unit; more
+  work goes to a fresh agent after that commit, never queued onto a running
+  one. Let every read-only agent finish before
   using its result. One commit per logical
   change with review fixes folded in; no per-finding commits, worktrees, or
   merge commits. Never commit known-broken or unfinished code; the owner

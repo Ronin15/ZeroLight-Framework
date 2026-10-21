@@ -31,6 +31,13 @@ Designs start here, then read the live structure below (rules:
 - **Populations, items, links:** grow in play at the structural-commit seam.
 - **Scale:** 2048² levels, deep stacks, and several worlds are a floor; work
   and memory follow what changed and what exists, never extent × world count.
+- **Content shape (owner design calls):** long links (teleports) are one-off
+  world gates and dungeon entrances, a handful per world. A very long path
+  completes by moving toward the goal and retrying later. An agent knows a
+  location only if it has been there or heard of it from one that has, so far
+  goals come from what agents know. Large full-fidelity bench crowds are
+  signal; in play, far agents run at lower fidelity, so they overstate the
+  per-step load.
 
 ## Source Layout
 

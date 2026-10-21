@@ -33,6 +33,8 @@ rule file in the same change. Never loosen a rule to ease work. Owner decisions 
 - Target scale is a floor: 2048² levels, deep stacks that grow in play, several
   worlds, large populations. Dense multi-chunk terrain change in one step
   (cave-ins, explosions) is normal gameplay.
+- The bar is the target scale itself: what shipped games do is never a
+  standard, a justification, or a reason to accept less.
 
 ## Cost model (before code)
 
@@ -115,6 +117,13 @@ Every design, and every fix touching storage or per-change work, states:
 
 - Search the owning module for an existing utility before adding one; keep
   changes scoped; never reformat or refactor unrelated code.
+- A change lands complete: every piece it needs to be correct (fallbacks,
+  keeping its inputs current, tests) is in the same landing, never half a
+  mechanism with the rest offered later.
+- A small local defect found in passing (a stale comment, a noisy test, dead
+  code, a callerless `pub`) is fixed on the branch, in the landing that
+  touches its file or its own commit, never only mentioned. This covers
+  defects, not refactors.
 - `README.md` is an overview (what it is, one-line feature bullets,
   requirements, quick start, commands, layout, doc links); how things work
   belongs in `docs/`.
