@@ -25,8 +25,7 @@
 //! splits the rows by scope tier (cognition/locomotion/kinematic/dormant), `thinking=` counts
 //! the rows the AI stage ran, `separation_per_thinking=` the AI separation candidate checks
 //! and neighbor samples per thinking row, and `top_main=` names the three top-level stages
-//! with the most main time. `--details` adds `shared_tuner=` (the thread system's shared
-//! tuner after the run: phase, samples, settled windows), each top-level stage's `wall=`,
+//! with the most main time. `--details` adds each top-level stage's `wall=`,
 //! `off_main=`, and `main=` with its batches' `threaded=` steps over the measured steps, the
 //! nested stage timers, and the census counters as means per step. ReleaseFast compiles the
 //! log out, so only the step total prints there.
@@ -46,7 +45,6 @@ const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const StateTransitions = @import("../app/state.zig").StateTransitions;
-const AdaptiveWorkReport = suite.AdaptiveWorkReport;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const TimeLoop = @import("../app/time_loop.zig").TimeLoop;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -62,6 +60,8 @@ const GameDemoState = @import("../game/game_demo_state.zig").GameDemoState;
 const placeSpawnedMover = @import("../game/game_demo_state.zig").placeSpawnedMover;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
+const data_test_support = @import("../game/data_system/test_support.zig");
+const keep_stagger_phase = @import("../game/simulation_scope.zig").keep_stagger_phase;
 const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
 const separation_radius = @import("../game/systems/ai.zig").separation_radius;
 const boxAxisCells = @import("../game/systems/spatial_index.zig").boxAxisCells;
@@ -318,9 +318,16 @@ fn spawnPopulation(allocator: std.mem.Allocator, state: *GameDemoState, fields: 
     _ = try state.data.applyStructuralCommands(commands.items);
     const movement = state.data.movementBodySliceConst();
     std.debug.assert(movement.entities.len == rows_before + row_count);
-    // `stacked` rows are `always_active`, so every level's crowd is indexed and its AI rows
-    // think.
-    for (movement.entities[rows_before..]) |entity| try placeSpawnedMover(&state.data, &state.world, entity, fields.shape == .stacked);
+    // `stacked` rows are then marked `always_active` (each row's placement and stagger phase
+    // kept), so every level's crowd is indexed and its AI rows think.
+    for (movement.entities[rows_before..]) |entity| {
+        try placeSpawnedMover(&state.data, &state.world, entity);
+        if (fields.shape != .stacked) continue;
+        var metadata = data_test_support.simulationMetadata(&state.data, entity).?;
+        metadata.always_active = true;
+        metadata.stagger_phase = keep_stagger_phase;
+        try state.data.setSimulationMetadata(entity, metadata);
+    }
 
     // The observer stands at the footprint's centre.
     const player = state.data.movementBodyPtr(state.player.entity).?;
@@ -592,8 +599,8 @@ const Census = struct {
         self.untimed_ns += step_ns -| timed_ns;
     }
 
-    fn finish(self: *const Census, population: usize, shared_tuner: AdaptiveWorkReport) suite.ProductionStepSummary {
-        var summary = suite.ProductionStepSummary{ .population = population, .measured_steps = self.steps, .shared_tuner = shared_tuner };
+    fn finish(self: *const Census, population: usize) suite.ProductionStepSummary {
+        var summary = suite.ProductionStepSummary{ .population = population, .measured_steps = self.steps };
         if (self.steps == 0) return summary;
         const steps: u128 = self.steps;
         summary.main_ns = @intCast(self.main_ns / steps);
@@ -691,7 +698,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     stats.items_per_second = suite.itemsPerSecond(population, stats.mean_ns);
     stats.batch_carried = false;
     stats.output_count = population;
-    stats.production_step = census.finish(population, suite.tunerReport(&threads.adaptive_tuner));
+    stats.production_step = census.finish(population);
     if (span_record) |*record| {
         try record.expectRowsUnchanged(&state.data);
         try checkStackedSeparation(allocator, &stats.production_step.?, fields, record);
@@ -757,8 +764,6 @@ fn writeStepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.
     }
     if (view == .summary) return;
 
-    const tuner = summary.shared_tuner;
-    try writer.print(" shared_tuner={s}/samples:{}/windows:{}", .{ @tagName(tuner.phase), tuner.sample_count, tuner.settled_window_count });
     for (stages) |stage| {
         try writer.print("\n    stage {s} wall={f} off_main={f} main={f}", .{
             @tagName(stage),

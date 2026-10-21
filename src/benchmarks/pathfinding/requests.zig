@@ -10,6 +10,7 @@ const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const math = @import("../../core/math.zig");
 const DataSystem = @import("../../game/data_system.zig").DataSystem;
 const EntityId = @import("../../game/data_system.zig").EntityId;
@@ -611,12 +612,13 @@ fn queryJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void
     }
 }
 
-fn runQueries(ctx: *QueryContext, thread_system: *ThreadSystem, case: suite.BenchmarkCase, item_count: usize) BatchStats {
+fn runQueries(ctx: *QueryContext, thread_system: *ThreadSystem, tuner: *AdaptiveWorkTuner, case: suite.BenchmarkCase, item_count: usize) BatchStats {
     return thread_system.parallelForWithOptions(item_count, ctx, queryJob, .{
         .items_per_range = case.stageItemsPerRange(pathfinding_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .range_alignment_items = pathfinding_range_alignment_items,
         .adaptive = case.adaptive,
+        .adaptive_tuner = tuner,
     });
 }
 
@@ -671,13 +673,15 @@ fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     if (warm_paths != item_count) return error.QueryCacheNotWarm;
 
     var context = QueryContext{ .system = system, .starts = starts, .goals = goals, .hints = hints, .sink = sink };
+    // The query batch's own tuner: the suite's fixed-range one, else a default stage tuner.
+    var tuner = suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
     // Warmup also settles each agent's hint to its midpoint index.
-    for (0..options.warmup_iterations) |_| _ = runQueries(&context, thread_ptr, case, item_count);
+    for (0..options.warmup_iterations) |_| _ = runQueries(&context, thread_ptr, &tuner, case, item_count);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = runQueries(&context, thread_ptr, case, item_count);
+        const batch = runQueries(&context, thread_ptr, &tuner, case, item_count);
         accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), batch);
     }
     var stats = accumulator.finish();

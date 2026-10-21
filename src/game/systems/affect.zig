@@ -47,9 +47,7 @@ const affect_events_per_row_max = @import("../simulation.zig").affect_events_per
 
 pub const affect_range_alignment_items: usize = movement_range_alignment_items;
 
-fn hotStoreCapacity(min_len: usize) usize {
-    return std.mem.alignForwardAnyAlign(usize, min_len, affect_range_alignment_items);
-}
+const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;
 
 const default_max_events_per_step: usize = 512;
 
@@ -1221,7 +1219,7 @@ test "after reserve alone, threaded updates at 64- then 16-item ranges allocate 
     try testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
-test "threaded update records one sample into the compute tuner and none into the shared tuner" {
+test "threaded update records one sample into the compute tuner" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     for (0..64) |_| {
@@ -1246,8 +1244,6 @@ test "threaded update records one sample into the compute tuner and none into th
     try testing.expectEqual(@as(usize, 64), sys.rows.len);
     try testing.expectEqual(@as(usize, 1), sys.compute_tuner.sample_count);
     try testing.expect(sys.compute_tuner.last_request != null);
-    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "crossings are emitted in (gather row, drive declaration) order, not entity-index order" {

@@ -98,7 +98,6 @@ pub const PlaneStageError = WorldEditError || error{
     UnorderedDenseChunkWrites,
     EventCapacityExceeded,
     InvalidEntity,
-    TooManyWorldLevelRows,
 };
 
 pub const DigController = struct {

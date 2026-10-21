@@ -69,9 +69,7 @@ const perception_adaptive_tuner_config = AdaptiveWorkTunerConfig{
     .smallest_range_items = perception_range_alignment_items,
 };
 
-fn hotStoreCapacity(min_len: usize) usize {
-    return std.mem.alignForwardAnyAlign(usize, min_len, perception_range_alignment_items);
-}
+const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;
 
 // Mirrors ai.zig's max_separation_neighbors/max_separation_candidate_checks
 // shape: a small fixed candidate buffer bounded by a scan-cost ceiling.
@@ -2645,7 +2643,7 @@ test "serial and threaded PerceptionSystem updates route through identical math"
     try testing.expectEqualSlices(SimulationEvent, serial_merged, threaded_merged);
 }
 
-test "threaded PerceptionSystem update records one sample into the compute tuner and none into the shared tuner" {
+test "threaded PerceptionSystem update records one sample into the compute tuner" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     for (0..8) |h| {
@@ -2675,8 +2673,6 @@ test "threaded PerceptionSystem update records one sample into the compute tuner
     try testing.expectEqual(observer_total, stats.observer_count);
     try testing.expectEqual(@as(usize, 1), sys.compute_tuner.sample_count);
     try testing.expect(sys.compute_tuner.last_request != null);
-    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "PerceptionSystem has no steady-state allocation after warmup (FailingAllocator)" {

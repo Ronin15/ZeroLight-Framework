@@ -56,8 +56,12 @@ const block_row_shift: u6 = 4;
 // `BlockSlot` is 16 bytes so a worker region can start on a cache line.
 const block_slots_per_line: usize = thread_shared_record_alignment / 16;
 
-fn hotStoreCapacity(min_len: usize) usize {
-    return std.mem.alignForwardAnyAlign(usize, min_len, collision_response_range_alignment_items);
+const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;
+
+comptime {
+    // Store capacities round to the shared hot-store quantum; each range's whole lane
+    // batches must still fit one.
+    std.debug.assert(@import("../data_system.zig").movement_range_alignment_items % collision_response_range_alignment_items == 0);
 }
 
 fn blockId(movement_row: u32) u32 {
@@ -2189,7 +2193,6 @@ test "response stages record into their own tuners" {
     }
 
     try std.testing.expect(system.apply_tuner.baseline_mean_batch_duration_ns > 0);
-    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.baseline_mean_batch_duration_ns);
 }
 
 test "an empty contact stream records no batch and leaves no triggers or observer contacts" {

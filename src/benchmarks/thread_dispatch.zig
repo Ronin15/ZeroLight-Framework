@@ -22,8 +22,8 @@ const suite = @import("suite.zig");
 // ranges align to whole cache lines, so no two ranges share a writable line.
 // `serial-direct` runs the same dispatch on a thread system with no workers, the inline
 // path production takes on a machine with no spare core (one range over every item); fixed cases pin range size and worker cap; `thread-adaptive-fixed-range` runs the
-// suite's fixed-range tuner and `thread-adaptive-tuned-range` the thread system's shared
-// tuner. Ladder: 1, 16, 256, and 4,096 ranges at the default range size. Cost model: a
+// suite's fixed-range tuner and `thread-adaptive-tuned-range` a stage tuner of its own
+// (`AdaptiveWorkTuner.init(.{})`, what a production stage owns). Ladder: 1, 16, 256, and 4,096 ranges at the default range size. Cost model: a
 // threaded batch costs O(ranges) claims plus O(workers) wakes plus the job, independent of
 // world size and population. At the top rung the column (1 MiB) spreads across cores'
 // caches, so its per-range time includes moving job data between cores; a before/after
@@ -65,13 +65,10 @@ fn incrementJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 fn dispatchOnce(
     context: *DispatchContext,
     threads: *ThreadSystem,
-    fixed_tuner: *?AdaptiveWorkTuner,
+    tuner: *AdaptiveWorkTuner,
     case: suite.BenchmarkCase,
 ) BatchStats {
     const item_count = context.items.len;
-    // A fixed case never consults its tuner; adaptive cases without a fixed-range tuner
-    // run the thread system's shared one.
-    const tuner: *AdaptiveWorkTuner = if (fixed_tuner.*) |*owned| owned else &threads.adaptive_tuner;
     const controls: StageControls = if (case.adaptive) .{} else .{
         .items_per_range = case.fixedItemsPerRange(range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
@@ -81,11 +78,6 @@ fn dispatchOnce(
     const selection = dispatch.select(item_count, range_alignment_items);
     context.range_count = selection.range_count;
     return dispatch.run(selection, item_count, range_alignment_items, context, incrementJob);
-}
-
-fn tunerSettled(thread_system: *const ThreadSystem, fixed_tuner: *const ?AdaptiveWorkTuner) bool {
-    if (fixed_tuner.*) |*tuner| return (tuner.phase == .settled);
-    return (thread_system.adaptive_tuner.phase == .settled);
 }
 
 // The shape every threaded batch must have, whoever chose it.
@@ -121,21 +113,23 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     defer allocator.free(items);
     @memset(items, 0);
     var context = DispatchContext{ .items = items, .range_count = 0 };
-    var fixed_tuner = suite.adaptiveTunerForCase(case, range_alignment_items);
+    // A fixed case never consults its tuner; an adaptive case without the suite's
+    // fixed-range tuner runs a stage tuner of its own.
+    var tuner = suite.adaptiveTunerForCase(case, range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
 
     var dispatches: usize = 0;
     var warm = suite.Warmup.custom(case, options.warmup_iterations, suite.adaptiveSettleIterationLimit(options));
-    while (warm.next(case.adaptive and tunerSettled(&threads, &fixed_tuner))) {
+    while (warm.next(case.adaptive and tuner.phase == .settled)) {
         // No dispatch here is ever forced inline (a nested or foreign-thread call).
-        std.debug.assert(!dispatchOnce(&context, &threads, &fixed_tuner, case).forced_inline);
+        std.debug.assert(!dispatchOnce(&context, &threads, &tuner, case).forced_inline);
         dispatches += 1;
     }
-    const settled_before_measurement = case.adaptive and tunerSettled(&threads, &fixed_tuner);
+    const settled_before_measurement = case.adaptive and tuner.phase == .settled;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = dispatchOnce(&context, &threads, &fixed_tuner, case);
+        const batch = dispatchOnce(&context, &threads, &tuner, case);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         dispatches += 1;
         std.debug.assert(batch.item_count == item_count);
@@ -153,8 +147,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var stats = accumulator.finish();
     stats.output_count = item_count;
     if (case.adaptive) {
-        const report = if (fixed_tuner) |*tuner| suite.tunerReport(tuner) else suite.tunerReport(&threads.adaptive_tuner);
-        stats.work_tuning = suite.workTuningSummary(report, settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&tuner), settled_before_measurement);
     }
     return stats;
 }

@@ -59,7 +59,8 @@ pub const CollisionBoundsStore = struct {
     }
 
     pub fn append(self: *CollisionBoundsStore, allocator: std.mem.Allocator, entity: EntityId, bounds: CollisionBounds) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyCollisionBoundsRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -188,7 +189,8 @@ pub const CollisionResponseStore = struct {
     }
 
     pub fn append(self: *CollisionResponseStore, allocator: std.mem.Allocator, entity: EntityId, response: CollisionResponse) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyCollisionResponseRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -305,4 +307,14 @@ test "CollisionResponseStore append is allocation-free after ensureCapacity rese
     }
     try std.testing.expectEqual(@as(usize, reserved), store.len());
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+const data_test_support = @import("test_support.zig");
+
+test "CollisionBoundsStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(CollisionBoundsStore, CollisionBounds{ .size = .{ .x = 1, .y = 1 } });
+}
+
+test "CollisionResponseStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(CollisionResponseStore, CollisionResponse{});
 }

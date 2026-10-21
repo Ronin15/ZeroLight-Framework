@@ -31,7 +31,8 @@ pub const FactionStore = struct {
     }
 
     pub fn append(self: *FactionStore, allocator: std.mem.Allocator, entity: EntityId, entity_faction: Faction) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyFactionRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -83,7 +84,8 @@ pub const WorldLevelStore = struct {
     }
 
     pub fn append(self: *WorldLevelStore, allocator: std.mem.Allocator, entity: EntityId, level: u16) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyWorldLevelRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -171,4 +173,14 @@ test "WorldLevelStore append is allocation-free after ensureCapacity reserves" {
     }
     try std.testing.expectEqual(@as(usize, reserved), store.len());
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+const data_test_support = @import("test_support.zig");
+
+test "FactionStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(FactionStore, Faction.neutral);
+}
+
+test "WorldLevelStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(WorldLevelStore, @as(u16, 0));
 }

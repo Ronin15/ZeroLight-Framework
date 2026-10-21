@@ -1004,15 +1004,15 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, i
         break :blk e;
     };
 
-    try placeSpawnedMover(data, world, entity, false);
+    try placeSpawnedMover(data, world, entity);
     return entity;
 }
 
 /// Places a just-created movement row on its `world_level` (the surface without one): its
 /// render z at that level's base and its scope metadata (cognition tier, the chunk under its
-/// position, that level, `always_active` as given). Returns `error.InvalidEntity` for a row
-/// with no movement body.
-pub fn placeSpawnedMover(data: *DataSystem, world: *const WorldSystem, entity: EntityId, always_active: bool) !void {
+/// position, that level, not `always_active`). Returns `error.InvalidEntity` for a row with
+/// no movement body.
+pub fn placeSpawnedMover(data: *DataSystem, world: *const WorldSystem, entity: EntityId) !void {
     const body = data.movementBodyPtr(entity) orelse return error.InvalidEntity;
     const level = data.worldLevelConst(entity) orelse 0;
     body.snapZ(world.levelBaseZ(level));
@@ -1020,7 +1020,6 @@ pub fn placeSpawnedMover(data: *DataSystem, world: *const WorldSystem, entity: E
         .tier = .cognition,
         .chunk = world.chunkCoordForWorldPos(body.position_x.*, body.position_y.*),
         .level = level,
-        .always_active = always_active,
     });
 }
 

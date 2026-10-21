@@ -73,9 +73,7 @@ const entries_per_body: usize = 2;
 /// into it.
 const strip_count: u32 = 1 << 16;
 
-fn hotStoreCapacity(min_len: usize) usize {
-    return std.mem.alignForwardAnyAlign(usize, min_len, collision_range_alignment_items);
-}
+const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;
 
 /// The sweep's y partition: horizontal strips of `height` world units on every level.
 pub const CollisionStrips = struct {
@@ -4073,7 +4071,7 @@ test "threaded collision matches serial contact order" {
     try expectSameContacts(serial_contacts.mergedItems(), threaded_contacts.mergedItems());
 }
 
-test "threaded collision records one sample into each stage tuner and none into the shared tuner" {
+test "threaded collision records one sample into each stage tuner" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     for (0..64) |index| {
@@ -4096,8 +4094,6 @@ test "threaded collision records one sample into each stage tuner and none into 
         try std.testing.expectEqual(@as(usize, 1), tuner.sample_count);
         try std.testing.expect(tuner.last_request != null);
     }
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "threaded collision broadphase overflow-replay matches serial contacts" {

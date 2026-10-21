@@ -194,7 +194,13 @@ fn stageContract(stage: StageId) StageContract {
         // Stimulus writes (promote, dig append, footstep) run inside this stage,
         // before perception reads the live bus.
         .dig_world_edit => .{ .reads = .empty, .writes = resources(&.{ .world_tiles, .world_events, .stimuli }) },
-        .scope_advance_and_ai_gather => .{ .reads = .empty, .writes = resources(&.{.ai_halo_indices}) },
+        // Filters the AI rows by the previous step's chunks, which this step's chunk_derive
+        // writes later.
+        .scope_advance_and_ai_gather => .{
+            .reads = .empty,
+            .writes = resources(&.{.ai_halo_indices}),
+            .carried = resources(&.{.chunk_columns}),
+        },
         // Indexes the halo at the previous step's positions and levels, which this
         // step's movement and plane traversal write later.
         .spatial_index_build => .{
@@ -438,9 +444,6 @@ pub const SimulationPipelineConfig = struct {
     stimuli: StimulusConfig = .{},
 };
 
-/// Borrowed per-step inputs for pipeline update.
-/// The pipeline owns systems and stage order, but not persistent game data,
-/// frame storage, app services, or state transitions.
 /// The plane-traversal stage: the NPC cell entries gathered on workers first, the dig
 /// controller's reserve and commit over only them (and the player's cell entry), and the
 /// landing carves, one event range, recorded as nav marks right after the write into room
@@ -467,6 +470,9 @@ pub fn runPlaneTraversal(
     try traversed;
 }
 
+/// Borrowed per-step inputs for pipeline update.
+/// The pipeline owns systems and stage order, but not persistent game data,
+/// frame storage, app services, or state transitions.
 pub const SimulationPipelineUpdateContext = struct {
     data: *DataSystem,
     frame: *SimulationFrame,
@@ -548,13 +554,10 @@ pub const SimulationPipelineStats = struct {
     destructibles_hit: usize = 0,
     perf: Perf = .{},
 
-    /// Kept only with `runtime_perf_log.enabled`: the think-set compaction
-    /// (`ai_cognition_order`), the plane stage's NPC cell-entry gather, and this step's
-    /// plane-traversal scratch and plane-entry window growths past their reservations
-    /// (the reservation short of the live population; zero in steady state).
+    /// Kept only with `runtime_perf_log.enabled`: this step's plane-traversal scratch and
+    /// plane-entry window growths past their reservations (the reservation short of the
+    /// live population; zero in steady state).
     pub const Perf = if (runtime_perf_log.enabled) struct {
-        cognition: BatchStats = .{},
-        plane_entry: BatchStats = .{},
         dig_plane_scratch_grows: usize = 0,
         plane_entry_window_grows: usize = 0,
     } else struct {};
@@ -1456,7 +1459,6 @@ pub const SimulationPipeline = struct {
         const index = self.spatial_index.view();
         const result = try self.scope.compactCognition(&index, step.stagger_step, step.cognition_region != null, context.thread_system, .{});
         step.ai_cognition_indices = result.cognition;
-        if (comptime runtime_perf_log.enabled) step.perf.cognition = result.batch;
     }
 
     /// Perception: hostile candidates within vision/FOV/line-of-sight
@@ -1655,7 +1657,6 @@ pub const SimulationPipeline = struct {
         const window_grows_before = if (comptime runtime_perf_log.enabled) self.plane_entry.perf.window_grows else 0;
         try runPlaneTraversal(&self.plane_entry, &self.dig, &self.pathfinding, context.world, context.data, context.player, context.frame, context.thread_system);
         if (comptime runtime_perf_log.enabled) {
-            step.perf.plane_entry = self.plane_entry.perf.last_batch;
             step.perf.plane_entry_window_grows = @intCast(self.plane_entry.perf.window_grows - window_grows_before);
             step.perf.dig_plane_scratch_grows = @intCast(self.dig.perf.plane_scratch_grows - scratch_grows_before);
         }
@@ -1750,6 +1751,9 @@ test "stage contracts split event families and carry out-of-graph inputs" {
     try std.testing.expect(decide.carried.contains(.interest_markers));
     try std.testing.expect(decide.carried.contains(.movement_positions));
     try std.testing.expect(decide.carried.contains(.world_level));
+    const gather = stageContract(.scope_advance_and_ai_gather);
+    try std.testing.expect(gather.carried.contains(.chunk_columns));
+    try std.testing.expect(!gather.reads.contains(.chunk_columns));
     const perception = stageContract(.perception_update);
     try std.testing.expect(perception.carried.contains(.movement_positions));
     try std.testing.expect(perception.carried.contains(.world_level));
@@ -6654,7 +6658,7 @@ test "the AI movement intent apply runs on workers in the pipeline, allocation-f
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_y), std.mem.sliceAsBytes(&threaded.velocity_y));
 }
 
-test "production steps on workers record nothing into the thread system's shared tuner" {
+test "a production step pinned onto workers runs every threaded pipeline stage on workers" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
@@ -6720,7 +6724,6 @@ test "production steps on workers record nothing into the thread system's shared
         stats.collision.narrowphase_batch,
     };
     for (stage_batches) |batch| try std.testing.expect(!batch.ran_inline);
-    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "after population growth, ~2 solid contacts per body on the multi-worker path allocate nothing" {

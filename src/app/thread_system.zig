@@ -846,7 +846,6 @@ pub const ThreadSystem = struct {
     // Batch state shared with the workers; jobs run over caller-owned ranges.
     shared: *Shared,
     workers: []WorkerRecord = &.{},
-    adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     owner_thread_id: std.Thread.Id,
     // Owner-only: read only after the caller matched `owner_thread_id`. True while the
     // owner runs ranges of one of this system's batches.
@@ -1014,7 +1013,8 @@ pub const ThreadSystem = struct {
     /// system's batches (a job on a worker or on the owner), it runs forced inline on the
     /// caller's `WorkerId` over the selected profile's ranges, or the untuned fixed shape
     /// when none is given, records no tuner, and returns `forced_inline` stats; called from
-    /// a foreign thread, it panics.
+    /// a foreign thread, it panics. From the owner with no `adaptive_tuner`, it runs the
+    /// untuned fixed shape: every stage owns its tuner, and none is shared.
     pub fn parallelForWithOptions(
         self: *ThreadSystem,
         item_count: usize,
@@ -1040,7 +1040,7 @@ pub const ThreadSystem = struct {
         const selection = if (options.selected_profile) |selected|
             self.selectedProfileShape(item_count, selected, options.max_worker_threads, range_alignment_items, if (options.adaptive) options.adaptive_tuner else null)
         else
-            self.resolveSelection(options.adaptive_tuner orelse &self.adaptive_tuner, .{
+            self.resolveSelection(options.adaptive_tuner, .{
                 .item_count = item_count,
                 .items_per_range = options.items_per_range,
                 .max_worker_threads = options.max_worker_threads,
@@ -1334,8 +1334,11 @@ const Completion = struct {
     done: std.Io.Event = .unset,
 };
 
+// One worker's record, written by main (`batch_generation`, `wake`) and by its worker
+// (`wake`, `thread_id`) every batch: a per-worker record, so it starts its own
+// `thread_shared_record_alignment` line and the next worker's record never shares one.
 const WorkerRecord = struct {
-    id: WorkerId = WorkerId.main,
+    id: WorkerId align(thread_shared_record_alignment) = WorkerId.main,
     shared: *Shared = undefined,
     wake: std.Io.Semaphore = .{},
     thread: ?std.Thread = null,
@@ -1345,6 +1348,11 @@ const WorkerRecord = struct {
     // Generation of the last batch that counted this worker, stored by main after that
     // batch is published; 0 before the first.
     batch_generation: std.atomic.Value(u64) = .init(0),
+
+    comptime {
+        std.debug.assert(@alignOf(WorkerRecord) == thread_shared_record_alignment);
+        std.debug.assert(@sizeOf(WorkerRecord) % thread_shared_record_alignment == 0);
+    }
 };
 
 fn workerMain(worker: *WorkerRecord) void {
@@ -2049,12 +2057,10 @@ test "parallel for options use provided adaptive work tuner" {
 
     const report = adaptive_tuner;
     try std.testing.expect(stats.item_count == hits.len);
-    // The provided tuner recorded this batch (proving it, not the ThreadSystem's
-    // built-in tuner, drove selection). It does not assert a threaded commit: ~128
-    // trivial items is far below any threading benefit, so correct policy keeps it
-    // inline.
+    // The provided tuner recorded this batch (proving it drove selection). It does not
+    // assert a threaded commit: ~128 trivial items is far below any threading benefit,
+    // so correct policy keeps it inline.
     try std.testing.expect(report.sample_count > 0 or report.baseline_mean_batch_duration_ns > 0);
-    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.best_mean_batch_duration_ns);
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
     }
@@ -2133,12 +2139,33 @@ test "single selected range runs inline even when worker threads exist" {
     });
     defer threads.deinit();
 
-    const stats = threads.parallelForWithOptions(hits.len, &context, markCoverage, .{});
+    var adaptive_tuner = AdaptiveWorkTuner.init(.{});
+    const stats = threads.parallelForWithOptions(hits.len, &context, markCoverage, .{ .adaptive_tuner = &adaptive_tuner });
 
     try std.testing.expect(stats.ran_inline);
     try std.testing.expectEqual(@as(usize, 1), stats.range_count);
     try std.testing.expectEqual(@as(usize, 0), stats.active_worker_threads);
     try std.testing.expectEqual(@as(usize, 0), stats.worker_thread_ranges);
+    for (&hits) |*hit| {
+        try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+    }
+}
+
+test "an adaptive batch with no tuner runs the untuned fixed shape on workers" {
+    var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
+    var context = CoverageContext{ .hits = hits[0..] };
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = 16,
+    });
+    defer threads.deinit();
+
+    const stats = threads.parallelForWithOptions(hits.len, &context, markCoverage, .{});
+
+    try std.testing.expect(!stats.ran_inline);
+    try std.testing.expectEqual(@as(usize, 16), stats.items_per_range);
+    try std.testing.expectEqual(@as(usize, 8), stats.range_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.active_worker_threads);
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
     }
@@ -3855,6 +3882,23 @@ test "shared batch blocks each start a cache line of their own and fit in it" {
     try std.testing.expectEqual(@as(usize, 0), @intFromPtr(threads.shared) % shared_line);
 }
 
+test "worker records each start a line of their own and a batch still covers every item" {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 16 });
+    defer threads.deinit();
+    for (threads.workers, 0..) |*worker, index| {
+        try std.testing.expectEqual(@as(usize, 0), @intFromPtr(worker) % thread_shared_record_alignment);
+        if (index > 0) try std.testing.expect(@intFromPtr(worker) - @intFromPtr(&threads.workers[index - 1]) >= thread_shared_record_alignment);
+    }
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(WorkerRecord) % thread_shared_record_alignment);
+
+    var hits: [256]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
+    var context = CoverageContext{ .hits = hits[0..] };
+    const stats = threads.parallelForWithOptions(hits.len, &context, markCoverage, .{ .adaptive = false });
+    try std.testing.expect(!stats.ran_inline);
+    try std.testing.expectEqual(@as(usize, 3), stats.active_worker_threads);
+    for (&hits) |*hit| try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+}
+
 const ParticipantRanges = struct {
     ranges: usize = 0,
     // The index of the first range this participant ran in the batch.
@@ -4380,11 +4424,11 @@ const TunerSnapshot = struct {
     }
 };
 
-// Per outer range: a nested stage dispatch under the stage tuner, then a nested generic
-// `parallelFor` that would use the shared tuner.
+// Per outer range: a nested stage dispatch under the stage tuner, then a nested
+// `parallelForWithOptions` that names no tuner.
 const TunerNestRecord = struct {
     stage: NestedRecord = .{},
-    shared: NestedRecord = .{},
+    untuned: NestedRecord = .{},
 };
 
 const TunerNestingOuter = struct {
@@ -4408,22 +4452,21 @@ fn tunerNestingOuterJob(context: *anyopaque, range: ParallelRange, id: WorkerId)
     record.stage.foreign_ranges = stage_inner.foreign_ranges;
     record.stage.out_of_order_ranges = stage_inner.out_of_order_ranges;
 
-    var shared_inner = NestedInner{ .hits = &record.shared.hits, .caller = id, .range_count = rangeCount(nested_inner_items, outer.threads.config.items_per_range) };
-    record.shared.batch = outer.threads.parallelForWithOptions(nested_inner_items, &shared_inner, nestedInnerJob, .{});
-    record.shared.nested = true;
-    record.shared.caller = id;
-    record.shared.ranges = shared_inner.ranges;
-    record.shared.foreign_ranges = shared_inner.foreign_ranges;
-    record.shared.out_of_order_ranges = shared_inner.out_of_order_ranges;
+    var untuned_inner = NestedInner{ .hits = &record.untuned.hits, .caller = id, .range_count = rangeCount(nested_inner_items, outer.threads.config.items_per_range) };
+    record.untuned.batch = outer.threads.parallelForWithOptions(nested_inner_items, &untuned_inner, nestedInnerJob, .{});
+    record.untuned.nested = true;
+    record.untuned.caller = id;
+    record.untuned.ranges = untuned_inner.ranges;
+    record.untuned.foreign_ranges = untuned_inner.foreign_ranges;
+    record.untuned.out_of_order_ranges = untuned_inner.out_of_order_ranges;
 }
 
-test "a nested batch leaves the stage tuner and the shared tuner untouched" {
+test "a nested batch leaves the stage tuner untouched and runs the untuned shape" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 8 });
     defer threads.deinit();
 
     var stage_tuner = AdaptiveWorkTuner.init(.{});
     const stage_before = TunerSnapshot.of(&stage_tuner);
-    const shared_before = TunerSnapshot.of(&threads.adaptive_tuner);
 
     var records: [16]TunerNestRecord = @splat(.{});
     var outer = TunerNestingOuter{ .threads = &threads, .stage_tuner = &stage_tuner, .records = &records };
@@ -4431,14 +4474,13 @@ test "a nested batch leaves the stage tuner and the shared tuner untouched" {
     try std.testing.expect(!stats.ran_inline);
 
     try std.testing.expectEqual(stage_before, TunerSnapshot.of(&stage_tuner));
-    try std.testing.expectEqual(shared_before, TunerSnapshot.of(&threads.adaptive_tuner));
-    try std.testing.expect(stage_tuner.last_request == null and threads.adaptive_tuner.last_request == null);
+    try std.testing.expect(stage_tuner.last_request == null);
     // Both nested requests are adaptive with no fixed range size: untuned, they run the
     // thread system's default range size.
     const untuned_range_count = rangeCount(nested_inner_items, threads.config.items_per_range);
     for (&records) |*record| {
         try record.stage.expectRanInlineOnCaller(nested_inner_items, untuned_range_count);
-        try record.shared.expectRanInlineOnCaller(nested_inner_items, untuned_range_count);
+        try record.untuned.expectRanInlineOnCaller(nested_inner_items, untuned_range_count);
     }
 }
 

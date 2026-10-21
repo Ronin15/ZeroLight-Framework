@@ -27,8 +27,12 @@ pub const particle_range_alignment_items: usize = hot_particle_column_alignment 
 const HotF32Slice = @import("../data_system.zig").HotF32Slice;
 const ConstHotF32Slice = @import("../data_system.zig").ConstHotF32Slice;
 
-fn hotStoreCapacity(min_len: usize) usize {
-    return std.mem.alignForwardAnyAlign(usize, min_len, particle_range_alignment_items);
+const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;
+
+comptime {
+    // Store capacities round to the shared hot-store quantum; each range's whole lane
+    // batches must still fit one.
+    std.debug.assert(@import("../data_system.zig").movement_range_alignment_items % particle_range_alignment_items == 0);
 }
 
 pub const ParticleSystemConfig = struct {
@@ -804,8 +808,6 @@ test "particle explicit items_per_range bypasses tuner" {
     try std.testing.expectEqual(particle_range_alignment_items, stats.batch.items_per_range);
     try std.testing.expectEqual(@as(usize, 0), particles.adaptive_tuner.sample_count);
     try std.testing.expect(particles.adaptive_tuner.last_request == null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "particle system owns adaptive tuner for default update" {
@@ -824,8 +826,6 @@ test "particle system owns adaptive tuner for default update" {
     try std.testing.expectEqual(particle_range_alignment_items * 8, stats.active_before);
     try std.testing.expectEqual(@as(usize, 1), particles.adaptive_tuner.sample_count);
     try std.testing.expect(particles.adaptive_tuner.last_request != null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "particle range only writes assigned rows" {

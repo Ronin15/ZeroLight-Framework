@@ -75,9 +75,7 @@ const ai_adaptive_tuner_config = AdaptiveWorkTunerConfig{
 /// `AiConfig.goal_requantization_hysteresis_distance`.
 pub const default_goal_requantization_hysteresis_distance: f32 = 56.0;
 
-fn hotStoreCapacity(min_len: usize) usize {
-    return std.mem.alignForwardAnyAlign(usize, min_len, ai_range_alignment_items);
-}
+const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;
 
 /// Cold personality gains (AiAgent), read once at gather time.
 const RowGains = struct {
@@ -1656,7 +1654,7 @@ test "ai processor uses committed adaptive threaded profiles with default thread
     try std.testing.expect(stats.intent_batch.active_worker_threads > 0);
 }
 
-test "ai update records one sample into each stage tuner and none into the shared tuner" {
+test "ai update records one sample into each stage tuner" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
 
@@ -1689,8 +1687,6 @@ test "ai update records one sample into each stage tuner and none into the share
         try std.testing.expectEqual(@as(usize, 1), tuner.sample_count);
         try std.testing.expect(tuner.last_request != null);
     }
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "wander amplitude scales steering perturbation against seek" {

@@ -1291,7 +1291,7 @@ test "parallel sprite prep matches serial vertices and draw groups" {
     try std.testing.expectEqual(@as(usize, 2), threaded.lastPrepStats().skipped_invalid_count);
 }
 
-test "sprite prep records one sample into its own tuner and none into the shared tuner" {
+test "sprite prep records one sample into its own tuner" {
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 16, .height = 16 } },
@@ -1321,8 +1321,6 @@ test "sprite prep records one sample into its own tuner and none into the shared
 
     try std.testing.expectEqual(@as(usize, 1), batch.adaptive_tuner.sample_count);
     try std.testing.expect(batch.adaptive_tuner.last_request != null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "sprite prep adaptive gate keeps cheap batches inline" {

@@ -61,7 +61,8 @@ pub const PerceptionStore = struct {
     }
 
     pub fn append(self: *PerceptionStore, allocator: std.mem.Allocator, entity: EntityId, perception: AiPerception) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyAiPerceptionRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -337,4 +338,10 @@ test "PerceptionStore sliceConst and mutable slice expose aligned columns" {
     try std.testing.expect(store.get(1).heard_stimulus);
     try std.testing.expectEqual(@as(f32, 1.5), store.get(1).heard_stimulus_x);
     try std.testing.expectEqual(@as(f32, 2.5), store.get(1).heard_stimulus_y);
+}
+
+const data_test_support = @import("test_support.zig");
+
+test "PerceptionStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(PerceptionStore, AiPerception{});
 }

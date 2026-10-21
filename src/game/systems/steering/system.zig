@@ -64,9 +64,7 @@ const steering_adaptive_tuner_config = AdaptiveWorkTunerConfig{
     .smallest_range_items = steering_range_alignment_items,
 };
 
-fn hotStoreCapacity(min_len: usize) usize {
-    return std.mem.alignForwardAnyAlign(usize, min_len, steering_range_alignment_items);
-}
+const hotStoreCapacity = @import("../../data_system.zig").hotStoreCapacity;
 
 /// Prefer the dense movement scope level (kept in sync with world_level) when the
 /// caller already has a movement row index — avoids a second entity slot resolve.

@@ -75,9 +75,7 @@ comptime {
     std.debug.assert(@sizeOf(PaddedSlot(OrderTally)) % thread_shared_record_alignment == 0);
 }
 
-fn hotStoreCapacity(min_len: usize) usize {
-    return std.mem.alignForwardAnyAlign(usize, min_len, ai_memory_range_alignment_items);
-}
+const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;
 
 // A think slot without both perception and memory. Unreachable as a row: an append past
 // `maxInt(u32) - 1` memory rows fails as `OutOfMemory`.
@@ -1158,7 +1156,7 @@ test "AiMemorySystem threaded update has no steady-state allocation after warmup
     try testing.expectEqual(agent_count, sys.memory_dense_indices.items.len);
 }
 
-test "AiMemorySystem each stage records one sample into its own tuner and none into the shared tuner" {
+test "AiMemorySystem each stage records one sample into its own tuner" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     for (0..64) |i| {
@@ -1182,8 +1180,6 @@ test "AiMemorySystem each stage records one sample into its own tuner and none i
         try testing.expectEqual(@as(usize, 1), tuner.sample_count);
         try testing.expect(tuner.last_request != null);
     }
-    try testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 const order_fixture_agents: usize = 200;

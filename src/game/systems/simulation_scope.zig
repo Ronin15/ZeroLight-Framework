@@ -1184,7 +1184,7 @@ test "threaded deriveChunks matches serial across the range block and tail" {
     }
 }
 
-test "threaded deriveChunks records one sample into its own tuner and none into the shared tuner" {
+test "threaded deriveChunks records one sample into its own tuner" {
     const allocator = std.testing.allocator;
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2 });
@@ -1205,8 +1205,6 @@ test "threaded deriveChunks records one sample into its own tuner and none into 
     try std.testing.expectEqual(count, stats.item_count);
     try std.testing.expectEqual(@as(usize, 1), sys.chunk_derive_tuner.sample_count);
     try std.testing.expect(sys.chunk_derive_tuner.last_request != null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "scoped collision excludes kinematic and dormant bodies from contacts" {

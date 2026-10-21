@@ -56,7 +56,8 @@ pub const MovementBodyStore = struct {
     }
 
     pub fn append(self: *MovementBodyStore, allocator: std.mem.Allocator, entity: EntityId, body: MovementBody) !u32 {
-        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyMovementBodyRows;
+        // `u32` row indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.rows.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
@@ -270,4 +271,10 @@ test "MovementBodyStore append is allocation-free after ensureCapacity reserves"
     }
     try std.testing.expectEqual(@as(usize, reserved), store.len());
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+const data_test_support = @import("test_support.zig");
+
+test "MovementBodyStore fails an append past its u32 row cap as OutOfMemory" {
+    try data_test_support.expectRowCapOutOfMemory(MovementBodyStore, MovementBody{});
 }

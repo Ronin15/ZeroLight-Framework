@@ -444,8 +444,6 @@ test "movement explicit items_per_range bypasses tuner" {
     try std.testing.expectEqual(data.movement_range_alignment_items, stats.batch.items_per_range);
     try std.testing.expectEqual(@as(usize, 0), system.adaptive_tuner.sample_count);
     try std.testing.expect(system.adaptive_tuner.last_request == null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "movement system owns adaptive tuner for default update" {
@@ -468,8 +466,6 @@ test "movement system owns adaptive tuner for default update" {
     try std.testing.expect(system.adaptive_tuner.last_request != null);
     try std.testing.expectEqual(@as(usize, 0), system.apply_intents_tuner.sample_count);
     try std.testing.expect(system.apply_intents_tuner.last_request == null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "movement range only writes assigned items" {
@@ -843,8 +839,6 @@ test "intent apply records into its own tuner" {
     try std.testing.expect(system.apply_intents_tuner.last_request != null);
     try std.testing.expectEqual(@as(usize, 0), system.adaptive_tuner.sample_count);
     try std.testing.expect(system.adaptive_tuner.last_request == null);
-    try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.sample_count);
-    try std.testing.expect(threads.adaptive_tuner.last_request == null);
 }
 
 test "empty intent stream applies nothing and records no batch" {

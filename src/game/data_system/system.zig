@@ -192,7 +192,8 @@ pub const DataSystem = struct {
             return EntityId.init(index, slot.generation) catch unreachable;
         }
 
-        if (self.slots.items.len >= std.math.maxInt(u32)) return error.TooManyEntities;
+        // `u32` slot indices: exhausting them fails at this growth seam as `OutOfMemory`.
+        if (self.slots.items.len >= std.math.maxInt(u32)) return error.OutOfMemory;
         const index: u32 = @intCast(self.slots.items.len);
         try self.slots.append(self.allocator, .{ .generation = 1, .alive = true });
         return EntityId.init(index, 1) catch unreachable;
@@ -337,9 +338,10 @@ pub const DataSystem = struct {
 
     /// Current full-active scope counters. Tier histograms come from the
     /// incrementally-maintained `tier_counts` (O(1), no per-step slot scan); stage
-    /// counts come free from dense slice lengths. `total_entities` is the count of
-    /// entities carrying a simulation tier (i.e. those with a movement body), not
-    /// the full live-entity set.
+    /// counts come free from dense slice lengths. The collision stage reads only the
+    /// dynamic bounds rows (static obstacles live in the static colliders), the same set
+    /// the scoped gather filters. `total_entities` is the count of entities carrying a
+    /// simulation tier (i.e. those with a movement body), not the full live-entity set.
     pub fn simulationScopeStatsFullActive(self: *const DataSystem) SimulationScopeStats {
         return .{
             .total_entities = self.tier_counts[0] + self.tier_counts[1] + self.tier_counts[2] + self.tier_counts[3],
@@ -348,7 +350,7 @@ pub const DataSystem = struct {
             .locomotion_entities = self.tier_counts[@backingInt(SimulationTier.locomotion)],
             .cognition_entities = self.tier_counts[@backingInt(SimulationTier.cognition)],
             .movement_stage_entities = self.movement_bodies.len(),
-            .collision_stage_entities = self.collision_bounds.len(),
+            .collision_stage_entities = self.collision_bounds.dynamic_ids.items.len,
             .collision_response_stage_entities = self.collision_responses.len(),
             .ai_stage_entities = self.ai_agents.len(),
             .steering_stage_entities = self.steering_agents.len(),
@@ -1149,32 +1151,24 @@ fn expectWorldLevelColumnsAligned(slice: ConstWorldLevelSlice) !void {
 
 const data_test_support = @import("test_support.zig");
 
-// The dense row of `id` in the store whose slot index field is `field`, or null when the
-// entity is dead or lacks the component.
-fn componentDenseRow(data: *const DataSystem, id: EntityId, comptime field: []const u8) ?usize {
-    const slot = data.resolveSlotConst(id) orelse return null;
-    const row = @field(slot.*, field) orelse return null;
-    return row;
-}
-
 fn primitiveVisualDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
-    return componentDenseRow(data, id, "primitive_visual_index");
+    return data_test_support.rowOf(data, id, "primitive_visual_index");
 }
 
 fn collisionBoundsDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
-    return componentDenseRow(data, id, "collision_bounds_index");
+    return data_test_support.rowOf(data, id, "collision_bounds_index");
 }
 
 fn collisionResponseDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
-    return componentDenseRow(data, id, "collision_response_index");
+    return data_test_support.rowOf(data, id, "collision_response_index");
 }
 
 fn steeringAgent(data: *const DataSystem, id: EntityId) ?SteeringAgent {
-    return data.steering_agents.get(componentDenseRow(data, id, "steering_agent_index") orelse return null);
+    return data.steering_agents.get(data_test_support.rowOf(data, id, "steering_agent_index") orelse return null);
 }
 
 fn destructibleDenseIndex(data: *const DataSystem, id: EntityId) ?usize {
-    return componentDenseRow(data, id, "destructible_index");
+    return data_test_support.rowOf(data, id, "destructible_index");
 }
 
 /// Per-tier counts from an O(rows) scan of the dense scope tier column: the parity
@@ -1433,6 +1427,20 @@ test "entity simulation metadata resets with retained capacity" {
     try std.testing.expectEqual(EntitySimulationMetadata{ .level = 0, .stagger_phase = 0 }, data_test_support.simulationMetadata(&data, reused).?);
 }
 
+test "createEntity fails past its u32 slot cap as OutOfMemory" {
+    // Every request fails but none may reach the allocator: the cap check, not a failed
+    // grow, must return the error.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var data = DataSystem.init(failing.allocator());
+    defer data.deinit();
+    // The slot count set to the cap over no storage, then restored, so the check runs
+    // without 2^32 real slots.
+    data.slots.items.len = std.math.maxInt(u32);
+    defer data.slots.items.len = 0;
+    try std.testing.expectError(error.OutOfMemory, data.createEntity());
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
 test "full active scope stats count tiers and current stage slices" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1449,14 +1457,21 @@ test "full active scope stats count tiers and current stage slices" {
     try data.setMovementBody(dormant, .{});
     try data.setSimulationMetadata(mover, .{ .tier = .locomotion });
     try data.setSimulationMetadata(dormant, .{ .tier = .dormant });
+    // A static obstacle: its bounds row is not in the collision stage's dynamic set.
+    const wall = try data.createEntity();
+    try data.setMovementBody(wall, .{});
+    try data.setCollisionBounds(wall, .{ .size = .{ .x = 8, .y = 8 } });
+    try data.setCollisionResponse(wall, .{ .mobility = .static });
+    try data.setSimulationMetadata(wall, .{ .tier = .dormant });
 
     const stats = data.simulationScopeStatsFullActive();
-    try std.testing.expectEqual(@as(usize, 3), stats.total_entities);
-    try std.testing.expectEqual(@as(usize, 1), stats.dormant_entities);
+    try std.testing.expectEqual(@as(usize, 4), stats.total_entities);
+    try std.testing.expectEqual(@as(usize, 2), stats.dormant_entities);
     try std.testing.expectEqual(@as(usize, 1), stats.locomotion_entities);
     try std.testing.expectEqual(@as(usize, 1), stats.cognition_entities);
     try std.testing.expectEqual(data.movementBodySliceConst().entities.len, stats.movement_stage_entities);
-    try std.testing.expectEqual(data.collisionBoundsSliceConst().entities.len, stats.collision_stage_entities);
+    try std.testing.expectEqual(@as(usize, 2), data.collisionBoundsSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 1), stats.collision_stage_entities);
     try std.testing.expectEqual(data.collisionResponseSliceConst().entities.len, stats.collision_response_stage_entities);
     try std.testing.expectEqual(data.aiAgentSliceConst().entities.len, stats.ai_stage_entities);
     try std.testing.expectEqual(data.steeringAgentSliceConst().entities.len, stats.steering_stage_entities);
