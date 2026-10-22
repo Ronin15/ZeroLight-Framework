@@ -1326,10 +1326,10 @@ pub const NavGraph = struct {
     /// Lands the one-way closure blocks the step's last relocating commit or level build left in
     /// the batch tail (`Connectivity.landResidents`, threaded per line), once at the end of a
     /// nav update, on its error path too, so the tail is empty after every update whose landing
-    /// succeeds. Never fails: on `OutOfMemory` the blocks stay valid in the tail,
-    /// `closure_land_deferrals` and `perf.land_deferrals` count it (the first logs once), and the
-    /// next prepare retries the landing, failing as an ordinary `OutOfMemory` with the graph
-    /// intact. Main work O(1) per block.
+    /// succeeds. Never fails: on `OutOfMemory` the blocks stay valid in the tail, the first
+    /// deferral logs once (with the perf log, the perf-only `closure_land_deferrals` and
+    /// `perf.land_deferrals` count each), and the next prepare retries the landing, failing as
+    /// an ordinary `OutOfMemory` with the graph intact. Main work O(1) per block.
     pub fn landClosure(self: *NavGraph, threads: ?NavUpdateThreads, stats: *NavUpdateStats) void {
         self.connectivity.landResidents(self.allocator, stageThreads(threads, .conn_closure_land), stats) catch {
             if (comptime runtime_perf_log.enabled) {
@@ -2527,11 +2527,12 @@ test "incremental nav update across distant chunks in one batch matches a full r
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
 }
 
-test "incremental nav update forced-parallel remask and patch match a serial full rebuild" {
+test "an incremental nav update on a forced-parallel schedule matches a serial full rebuild" {
     // The adaptive tuner usually runs a small dig inline, so the threaded remask/patch branches go
-    // unexercised. This pins both: forcing adaptive=false with items_per_range=1 over a multi-chunk
-    // dig drives the parallel path (asserted via ran_inline == false for BOTH stages), and the
-    // disjoint-window result must still be byte-identical to a fresh serial full rebuild.
+    // unexercised. Forcing adaptive=false with items_per_range=1 over a multi-chunk dig drives the
+    // parallel path (the remask asserted via ran_inline == false; the patch's dispatch is a
+    // perf-only batch the nav_update bench checks), and the disjoint-window result must still be
+    // byte-identical to a fresh serial full rebuild.
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2570,7 +2571,7 @@ test "incremental nav update forced-parallel remask and patch match a serial ful
     }
     const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
 
-    // Both stages must have actually threaded, not fallen back to the inline slot-0 path.
+    // The remask must have actually threaded, not fallen back to the inline slot-0 path.
     try std.testing.expect(!stats.remask_batch.ran_inline);
 
     var rebuilt = PathfindingSystem.init(std.testing.allocator);
@@ -3005,8 +3006,9 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
     // so the proof exercises the workers.
     system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
 
-    // Five cells in five distinct nav_chunk_tiles=4 chunks, so both the remask changed-chunk
-    // set and the patch dirty set exceed one chunk and actually fan out to workers.
+    // Five cells in five distinct nav_chunk_tiles=4 chunks: both the remask changed-chunk set
+    // and the patch dirty set exceed one chunk, so the forced schedule fans them out (the
+    // remask's dispatch asserted).
     const warm_cells = [_]struct { x: u16, y: u16 }{
         .{ .x = 1, .y = 1 },  .{ .x = 13, .y = 1 },
         .{ .x = 1, .y = 13 }, .{ .x = 13, .y = 13 },
@@ -3044,7 +3046,7 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
     }
     const stats = try system.applyBufferedNavUpdates(&colliders, &world, &threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    // The stages threaded under the failing allocator and allocated nothing.
+    // The remask threaded under the failing allocator, and the update allocated nothing.
     try std.testing.expect(!stats.remask_batch.ran_inline);
 
     system.graph.allocator = original;
@@ -4459,7 +4461,7 @@ test "the key plan equals the plan by definition for multi-chunk marks at level 
     }
 }
 
-test "a step's stats fold the plan, remask, and patch stages of its level build and its marks batch" {
+test "a step's remask batch folds the chunks of its level build and its marks batch" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
@@ -4477,5 +4479,7 @@ test "a step's stats fold the plan, remask, and patch stages of its level build 
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     const chunks = system.graph.chunkCount();
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
+    // The dug cell (5, 5) lies in one chunk: the marks batch remasked it with the build's.
+    try std.testing.expectEqual(@as(usize, 1), stats.dirty_chunks);
     try std.testing.expectEqual(chunks + stats.dirty_chunks, stats.remask_batch.item_count);
 }

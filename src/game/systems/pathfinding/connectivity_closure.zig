@@ -1021,13 +1021,8 @@ pub fn updateClosure(self: *Connectivity, allocator: std.mem.Allocator, levels: 
     touchClosure(self, levels, key_count);
     stats.addMain(.closure_ns, touch_timer.lap());
     if (self.closure.resolve_items.items.len == 0) {
-        // No link this batch, so it numbers no slot. The previous batch's scratch lengths
-        // are not this prepare's bound.
+        // No link this batch: it numbers no slot and runs no rows.
         const closure = &self.closure;
-        closure.slots.len = 0;
-        closure.pieces.len = 0;
-        closure.copy_items.clearRetainingCapacity();
-        closure.round_items.clearRetainingCapacity();
         if (comptime runtime_perf_log.enabled) closure.perf = .{};
         closure.last_rows_batch = .{};
         return counters;
@@ -2589,23 +2584,30 @@ fn latticeWall(chunks: u16, index: usize) [2]u16 {
 }
 
 // Asserts a nav update's closure stayed within the bound its batch prepared, not merely within
-// the reserved capacity: slots, pieces, resolve and loose lists, copy and rows items, and the
-// relocated blocks' caps; and every block landed. An update that also built levels checks only
-// the landing.
+// the reserved capacity: resolve and loose lists, and for a batch that resolved links its
+// slots, pieces, copy and rows items, and the relocated blocks' caps; and every block landed.
+// A batch resolving no link writes no slot, piece, or row item, so the earlier batch's
+// lengths stay and are not checked. An update that also built levels checks only the landing.
 fn expectWithinBounds(closure: *const Closure, stats: NavUpdateStats) !void {
     const t = std.testing;
-    try t.expectEqual(@as(usize, 0), closure.residents.items.len);
-    try t.expectEqual(@as(usize, 0), closure.tail.items.len);
+    try expectLanded(closure);
     if (!closure.active or stats.levels_built != 0) return;
     const limits = closure.limits;
+    try t.expect(closure.resolve_items.items.len <= limits.e_t and closure.loose.items.len <= limits.loose);
+    if (closure.resolve_items.items.len == 0) return;
     try t.expect(closure.slots.len <= limits.k_c + limits.n_net);
     try t.expect(closure.slots.len <= limits.k_b and closure.pieces.len <= limits.pieces);
-    try t.expect(closure.resolve_items.items.len <= limits.e_t and closure.loose.items.len <= limits.loose);
     try t.expect(closure.copy_items.items.len <= limits.copy_items and closure.round_items.items.len <= limits.round_items);
     const pieces = closure.pieces.slice();
     for (pieces.items(.relocated), pieces.items(.k_cap)) |relocated, k_cap| {
         if (relocated) try t.expect(k_cap <= limits.q_max);
     }
+}
+
+// Every block the update relocated landed: the tail and its residents are empty.
+fn expectLanded(closure: *const Closure) !void {
+    try std.testing.expectEqual(@as(usize, 0), closure.residents.items.len);
+    try std.testing.expectEqual(@as(usize, 0), closure.tail.items.len);
 }
 
 // Applies `system`'s buffered nav updates and asserts its closure stayed within its bound.
@@ -2682,14 +2684,23 @@ test "two hundred seeded random steps of one-way links, endpoint toggles, and wa
     const rooms = @as(usize, chunks) * test_chunk / 2 * (@as(usize, chunks) * test_chunk / 2);
     var fixture = try latticeWorld(chunks, 2);
     defer fixture.deinit();
-    // The per-step bound check reads the batch's limits. A closing release window clears
-    // them, so the window outlives the run.
-    var capacity = test_support.abstractCapacity();
-    capacity.capacity_shrink_window = steps + 1;
-    var system = try fixture.build(capacity);
+    // A short release window closes many times in the run, and lighter windows follow denser
+    // ones, so some releases free staging that later batches regrow.
+    const window: u32 = 10;
+    var system = try fixture.build(windowCapacity(window));
     defer system.deinit();
+    var releases: usize = 0;
+    var freeing: usize = 0;
+    var regrown: usize = 0;
+    // The staging a freeing release left, until a later batch grows past it.
+    var freed_to: ?usize = null;
+    var checked: usize = 0;
+    var full_checks: usize = 0;
     for (0..steps) |step| {
-        for (0..1 + random.uintLessThan(usize, 3)) |_| {
+        // One step of every fourth window is dense; the light window after it frees the
+        // staging it grew.
+        const edits = if (step % (4 * window) == 5) 48 else 1 + random.uintLessThan(usize, 3);
+        for (0..edits) |_| {
             const level = random.uintLessThan(u16, 2);
             switch (random.uintLessThan(u8, 3)) {
                 // A room closed or opened.
@@ -2719,10 +2730,40 @@ test "two hundred seeded random steps of one-way links, endpoint toggles, and wa
                 .bidirectional = random.uintLessThan(u8, 5) == 0,
             });
         }
+        const staging_before = system.graph.connectivity.stagingBytes();
         const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-        try expectWithinBounds(&system.graph.connectivity.closure, stats);
+        // A step that closed the release window started the next (no step counted), and its
+        // release reset the batch limits the bound check reads, so it checks only the landing;
+        // so does a step that ran no batch (no chunk remasked or patched), whose lists and
+        // limits are an earlier step's.
+        const closed = system.graph.connectivity.staging_window.steps == 0;
+        releases += @intFromBool(closed);
+        const staging_after = system.graph.connectivity.stagingBytes();
+        if (freed_to) |bytes| if (staging_after > bytes) {
+            regrown += 1;
+            freed_to = null;
+        };
+        if (closed and staging_after < staging_before) {
+            freeing += 1;
+            freed_to = staging_after;
+        }
+        if (closed or stats.dirty_chunks + stats.chunks_patched == 0) {
+            try expectLanded(&system.graph.connectivity.closure);
+        } else {
+            checked += 1;
+            // A batch that resolved links also checks its slots, pieces, and row items.
+            const closure = &system.graph.connectivity.closure;
+            full_checks += @intFromBool(closure.active and closure.resolve_items.items.len != 0);
+            try expectWithinBounds(&system.graph.connectivity.closure, stats);
+        }
         try fixture.expectMatchesRebuild(&system);
     }
+    // Every window closed, a release freed staging that a later batch regrew,
+    // most steps ran a batch the bound check read, and a share of them resolved links, so the
+    // slot, piece, and row bounds were read.
+    try std.testing.expectEqual(@as(usize, steps / window), releases);
+    try std.testing.expect(freeing >= 1 and regrown >= 1);
+    try std.testing.expect(checked >= steps / 2 and full_checks >= steps / 4);
     // The run grew real one-way systems.
     try std.testing.expect(test_support.closureTermCount(system.graph.connectivity.closure) > 8);
 }
@@ -2827,7 +2868,8 @@ test "a dig touching no one-way system leaves every block and word in place; a w
     try fixture.setCell(&system, 0, wall[0], wall[1], fixture.grass);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_rows_batch.item_count);
-    // The dig resolves no link, so the build's slot scratch must not outlive its own bound.
+    // The dig resolves no link, so it numbers no slot and runs no rows.
+    try std.testing.expectEqual(@as(usize, 0), closure.resolve_items.items.len);
     try expectWithinBounds(closure, stats);
     try std.testing.expectEqual(block, closure.hcomp.block[id].ptr);
     try std.testing.expectEqualSlices(u32, words, closure.hcomp.block[id]);

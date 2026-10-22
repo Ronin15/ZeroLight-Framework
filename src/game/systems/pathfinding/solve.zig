@@ -1163,7 +1163,7 @@ fn reconstructLocalPath(scratch: *SearchScratch, goal_slot: u32) void {
 // Writes a plain path whole into this request's output stripe at its solve ordinal,
 // with its registry runs. The local solve bounds a path at one cell per explored node,
 // which the stripe holds.
-fn recordPath(system: *PathfindingSystem, ordinal: usize, path: []const u32, path_level: u16, goal_cell: u32) void {
+pub fn recordPath(system: *PathfindingSystem, ordinal: usize, path: []const u32, path_level: u16, goal_cell: u32) void {
     const stripe_words = system.stripe_words;
     const offset = ordinal * stripe_words;
     std.debug.assert(path.len <= stripe_words);
@@ -1185,7 +1185,7 @@ fn recordPath(system: *PathfindingSystem, ordinal: usize, path: []const u32, pat
 // is the start level and `goal_cell` the live goal it was solved toward. stitchCorridor's cap
 // (at most max_stitched_path_cells) bounds it at the stripe, asserted so a drift fails loud
 // instead of truncating the corridor.
-fn recordStitched(system: *PathfindingSystem, ordinal: usize, stitched: []const StitchedCell, start_level: u16, goal_cell: u32) void {
+pub fn recordStitched(system: *PathfindingSystem, ordinal: usize, stitched: []const StitchedCell, start_level: u16, goal_cell: u32) void {
     const stripe_words = system.stripe_words;
     const offset = ordinal * stripe_words;
     std.debug.assert(types.stitchedWords(stitched.len) <= stripe_words);

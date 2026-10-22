@@ -109,6 +109,8 @@ const no_index = @import("connectivity_closure.zig").no_index;
 const CellCoord = @import("../../world/system.zig").CellCoord;
 const types = @import("types.zig");
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
+const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
+const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const Connectivity = @import("connectivity.zig").Connectivity;
 const StagingSizes = @import("connectivity.zig").StagingSizes;
@@ -1118,57 +1120,67 @@ pub fn publishTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []co
     _ = try publish.flushRegistry(system, null, null);
 }
 
-/// `publishTestPath` without its flush: the path is claimed and stored, and its runs wait
-/// in one publish range for the caller's flush.
-pub fn stageTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []const u32, step: u32, stats: *PathfindingStats) !void {
-    system.completed.core.beginPublish();
-    const claimed = system.completed.claim(key, path.len, 0, 0, .{ .level = 0, .cell = path[path.len - 1] }, path[path.len - 1], step, stats);
-    @memcpy(system.completed.destination(claimed)[0..path.len], path);
-    const starts = try std.testing.allocator.alloc(u16, path.len);
-    defer std.testing.allocator.free(starts);
-    var counts: [registry_shard_count]u32 = @splat(0);
-    const geometry = system.graph.chunkGeometry();
-    const run_count = solve.splitRuns(geometry, path, null, 0, starts, &counts);
-    var records: std.ArrayList(RegRecord) = .empty;
-    defer records.deinit(std.testing.allocator);
-    for (starts[0..run_count]) |start| {
-        try records.append(std.testing.allocator, .{
-            .key = chunkKey(0, geometry.chunkOfCell(path[start])),
-            .owner = claimed.owner,
-            .order = start,
-        });
-    }
-    try stageRegistryRuns(system, records.items);
+/// Stores the stitched `corridor` for `key` at `step` as one publish would, its registry runs
+/// included, and flushes the registry.
+pub fn publishTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: []const StitchedCell, step: u32, stats: *PathfindingStats) !void {
+    try stageTestStitched(system, key, corridor, step, stats);
+    _ = try publish.flushRegistry(system, null, null);
 }
 
-/// One publish range of `records`, shard-ordered the way `publish_copy` writes them, with
-/// each shard's inverse pool reserved for the adds. The caller flushes.
-pub fn stageRegistryRuns(system: *PathfindingSystem, records: []const RegRecord) !void {
-    var counts: [registry_shard_count]u32 = @splat(0);
-    for (records) |record| counts[registryShard(record.key)] += 1;
-    if (system.publish_bands.capacity < 1) try system.publish_bands.ensureTotalCapacity(system.allocator, 1);
-    if (system.publish_range_bases.capacity < 1) try system.publish_range_bases.ensureTotalCapacity(system.allocator, 1);
-    if (system.reg_buckets.capacity < records.len) try system.reg_buckets.ensureTotalCapacity(system.allocator, @max(records.len, 1));
-    system.publish_bands.items.len = 1;
-    system.publish_range_bases.items.len = 1;
-    system.publish_range_bases.items[0] = 0;
-    system.reg_buckets.items.len = records.len;
-    var cursors: [registry_shard_count]usize = undefined;
-    var next: usize = 0;
-    for (&cursors, counts) |*cursor, count| {
-        cursor.* = next;
-        next += count;
+/// `publishTestPath` without its flush: the plain level-0 `path` is the step's one solved
+/// result, recorded by production (`solve.recordPath`) at solve ordinal 0 and published
+/// through production (`publishSolved`); its runs wait in one publish range for the
+/// caller's flush.
+pub fn stageTestPath(system: *PathfindingSystem, key: PathQueryKey, path: []const u32, step: u32, stats: *PathfindingStats) !void {
+    const stripe = try solvedStripe(system);
+    if (path.len == 0 or path.len > stripe.len) return error.TestUnexpectedResult;
+    system.solved_paths.items.len = 1;
+    solve.recordPath(system, 0, path, 0, path[path.len - 1]);
+    try publishSolved(system, key, step, stats);
+}
+
+// `stageTestPath` of the stitched `corridor` (`solve.recordStitched`), starting on its first
+// cell's level.
+fn stageTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: []const StitchedCell, step: u32, stats: *PathfindingStats) !void {
+    const stripe = try solvedStripe(system);
+    if (corridor.len == 0 or types.stitchedWords(corridor.len) > stripe.len) return error.TestUnexpectedResult;
+    system.solved_paths.items.len = 1;
+    solve.recordStitched(system, 0, corridor, corridor[0].level, corridor[corridor.len - 1].cell);
+    try publishSolved(system, key, step, stats);
+}
+
+// Solve ordinal 0's output stripe in the reserved solve pool; the reserved solve slots hold
+// the step's one result, which the caller opens for the production writer and
+// `publishSolved` empties.
+fn solvedStripe(system: *PathfindingSystem) ![]u32 {
+    const words = system.stripe_words;
+    if (words == 0 or system.worker_path_pool.items.len < words or system.worker_run_starts.items.len < words) return error.TestUnexpectedResult;
+    if (system.solve_results.capacity < 1 or system.solved_paths.capacity < 1) return error.TestUnexpectedResult;
+    return system.worker_path_pool.items[0..words];
+}
+
+// Publishes the result recorded at solve ordinal 0 as the step's one result for `key` through
+// the production publish: `reservePublish`, `claimPublish` at `step`, and `publish_copy` on
+// one inline range. The step's solve slots are emptied after it, so nothing later reads them.
+fn publishSolved(system: *PathfindingSystem, key: PathQueryKey, step: u32, stats: *PathfindingStats) !void {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var tuner: AdaptiveWorkTuner = .init(.{});
+    defer {
+        system.solve_results.clearRetainingCapacity();
+        system.solved_paths.clearRetainingCapacity();
+        system.publish_records.clearRetainingCapacity();
     }
-    for (records) |record| {
-        const shard = registryShard(record.key);
-        system.reg_buckets.items[cursors[shard]] = record;
-        cursors[shard] += 1;
-    }
-    system.publish_bands.items[0] = .{ .counts = counts };
-    system.publish_ranges = 1;
-    var shard_registrations: [registry_shard_count]usize = undefined;
-    for (&shard_registrations, counts) |*total, count| total.* = count;
-    _ = try publish.reserveRegistryRuns(system, shard_registrations);
+    system.solve_results.items.len = 1;
+    system.solve_results.items[0] = .{ .available = key };
+    try publish.reservePublish(system);
+    const step_counter = system.step_counter;
+    system.step_counter = step;
+    publish.claimPublish(system, stats);
+    system.step_counter = step_counter;
+    if (system.publish_records.items[0] == null) return error.TestUnexpectedResult;
+    const batch = publish.publishCopy(system, Dispatch.init(&threads, &tuner, .{ .adaptive = false }));
+    try std.testing.expect(batch.ran_inline and system.publish_ranges == 1);
 }
 
 /// Solves `goals` from cellWorld(1, 2) in one serial step with the default budgets.

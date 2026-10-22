@@ -43,8 +43,6 @@ const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const StageTimer = runtime_perf_log.StageTimer;
 const no_owner = @import("types.zig").no_owner;
 const CellCursor = @import("types.zig").CellCursor;
-const registry_shard_count = @import("types.zig").registry_shard_count;
-const RegRecord = @import("types.zig").RegRecord;
 const evict_range_alignment_items = @import("types.zig").evict_range_alignment_items;
 const hit_window_alignment_items = @import("types.zig").hit_window_alignment_items;
 
@@ -431,7 +429,6 @@ const EntityId = @import("../../data_system.zig").EntityId;
 const WorldSystem = @import("../../world/system.zig").WorldSystem;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
-const solve = @import("solve.zig");
 const PathfindingStats = @import("types.zig").PathfindingStats;
 const PathQueryKey = @import("types.zig").PathQueryKey;
 const emptyKey = @import("types.zig").emptyKey;
@@ -449,6 +446,7 @@ const pocket_world_side = test_support.pocket_world_side;
 const pocketGoal = test_support.pocketGoal;
 const pocketWorld = test_support.pocketWorld;
 const publishTestPath = test_support.publishTestPath;
+const publishTestStitched = test_support.publishTestStitched;
 const registryRouteKey = test_support.registryRouteKey;
 const registrySystem = test_support.registrySystem;
 const registrySystemWith = test_support.registrySystemWith;
@@ -688,30 +686,6 @@ test "a cached corridor is evicted only by a change on its own level's cells" {
     try std.testing.expect(system.completed.slotIndex(keys[1]) != null);
     try std.testing.expect(system.completed.slotIndex(keys[2]) == null);
     try expectRegistryMatchesCache(&system);
-}
-
-// Stores the stitched `corridor` for `key` at `step` as one publish would, its registry
-// runs included, and flushes the registry.
-fn publishTestStitched(system: *PathfindingSystem, key: PathQueryKey, corridor: []const types.StitchedCell, step: u32, stats: *PathfindingStats) !void {
-    system.completed.core.beginPublish();
-    const claimed = system.completed.claim(key, 0, corridor.len, corridor[0].level, corridor[corridor.len - 1], corridor[corridor.len - 1].cell, step, stats);
-    types.writeStitched(system.completed.destination(claimed), corridor);
-    const view = types.stitchedView(system.completed.destination(claimed), corridor.len);
-    var starts: [64]u16 = undefined;
-    var counts: [registry_shard_count]u32 = @splat(0);
-    const geometry = system.graph.chunkGeometry();
-    const run_count = solve.splitRuns(geometry, view.cells, view.levels, 0, &starts, &counts);
-    var records: std.ArrayList(RegRecord) = .empty;
-    defer records.deinit(std.testing.allocator);
-    for (starts[0..run_count]) |start| {
-        try records.append(std.testing.allocator, .{
-            .key = chunkKey(view.levels[start], geometry.chunkOfCell(view.cells[start])),
-            .owner = claimed.owner,
-            .order = start,
-        });
-    }
-    try test_support.stageRegistryRuns(system, records.items);
-    _ = try publish.flushRegistry(system, null, null);
 }
 
 // Flips one cell in each of 20 chunks (a 5 x 4 chunk block) of a 24-tile registry world.
