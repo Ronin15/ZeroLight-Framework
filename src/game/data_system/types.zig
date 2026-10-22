@@ -830,6 +830,32 @@ fn metric(value: usize) u64 {
 /// movement body position plus collision bounds offset/size (`math.aabbFromOffsetSize`).
 pub const ObstacleWorldRect = math.Aabb;
 
+/// The store columns `DataSystem.staticObstacleAt` reads, sliced once per pass by
+/// `DataSystem.staticObstacleColumns`. Valid until the stores change.
+pub const StaticObstacleColumns = struct {
+    position_x: ConstHotF32Slice,
+    position_y: ConstHotF32Slice,
+    offset_x: ConstHotF32Slice,
+    offset_y: ConstHotF32Slice,
+    size_x: ConstHotF32Slice,
+    size_y: ConstHotF32Slice,
+    mobilities: []const CollisionResponseMobility,
+    levels: []const u16,
+};
+
+/// A static navigation obstacle: its id, its world level (`world_level`, else 0), and the
+/// inputs of its `ObstacleWorldRect` (position, bounds offset, bounds size).
+pub const StaticObstacle = struct {
+    entity: EntityId,
+    level: u16,
+    x: f32,
+    y: f32,
+    offset_x: f32,
+    offset_y: f32,
+    size_x: f32,
+    size_y: f32,
+};
+
 pub const StructuralEntityDestroyedChange = struct {
     entity: EntityId,
     component_mask: ComponentMask,

@@ -566,6 +566,58 @@ fn loadUint4PrefixScalar(values: []const u32, count: usize) [lane_count]u32 {
     return lanes;
 }
 
+/// A lane loop's batch of `count` values from `values`: one vector load of a full batch
+/// (`count >= lane_count`), else the masked tail's live prefix with `+0` in the other lanes
+/// (`loadFloat4Prefix`). Reads only `values[0..min(count, lane_count)]`.
+pub inline fn loadFloat4Lanes(values: []const f32, count: usize) Float4 {
+    if (count >= lane_count) return loadFloat4(values);
+    return loadFloat4Prefix(values, count);
+}
+
+/// Scalar form of `loadFloat4Lanes`.
+fn loadFloat4LanesScalar(values: []const f32, count: usize) [lane_count]f32 {
+    var lanes = [_]f32{ 0, 0, 0, 0 };
+    for (0..@min(count, lane_count)) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// `loadFloat4Lanes` over u32 values, zero in the inactive lanes.
+pub inline fn loadUint4Lanes(values: []const u32, count: usize) Uint4 {
+    if (count >= lane_count) return loadUint4(values);
+    return loadUint4Prefix(values, count);
+}
+
+/// Scalar form of `loadUint4Lanes`.
+fn loadUint4LanesScalar(values: []const u32, count: usize) [lane_count]u32 {
+    var lanes = [_]u32{ 0, 0, 0, 0 };
+    for (0..@min(count, lane_count)) |lane| lanes[lane] = values[lane];
+    return lanes;
+}
+
+/// A lane loop's batch store of `count` values to `values`: one store of a full batch
+/// (`count >= lane_count`), else the masked tail's live lanes only (`storeFloat4Prefix`).
+/// Writes only `values[0..min(count, lane_count)]`.
+pub inline fn storeFloat4Lanes(values: []f32, vector: Float4, count: usize) void {
+    if (count >= lane_count) return storeFloat4Slice(values, vector);
+    storeFloat4Prefix(values, vector, count);
+}
+
+/// Scalar form of `storeFloat4Lanes`.
+fn storeFloat4LanesScalar(values: []f32, lanes: [lane_count]f32, count: usize) void {
+    for (0..@min(count, lane_count)) |lane| values[lane] = lanes[lane];
+}
+
+/// `storeFloat4Lanes` over u32 values.
+pub inline fn storeUint4Lanes(values: []u32, vector: Uint4, count: usize) void {
+    if (count >= lane_count) return storeUint4Slice(values, vector);
+    storeUint4Prefix(values, vector, count);
+}
+
+/// Scalar form of `storeUint4Lanes`.
+fn storeUint4LanesScalar(values: []u32, lanes: [lane_count]u32, count: usize) void {
+    for (0..@min(count, lane_count)) |lane| values[lane] = lanes[lane];
+}
+
 /// Writes the lanes set in `lanes`. Distinctness is asserted only for those lanes,
 /// so an inactive index may alias a live one.
 pub fn scatterFloat4Masked(values: []f32, indices: [lane_count]usize, vector: Float4, lanes: MaskBits) void {
@@ -1374,5 +1426,44 @@ test "shiftLeftUint4 and shiftRightUint4 match a per-lane shift" {
             try std.testing.expectEqual(words[lane] << amount, left[lane]);
             try std.testing.expectEqual(words[lane] >> amount, right[lane]);
         }
+    }
+}
+
+test "lane batch loads and stores match their scalar forms and touch only the live lanes, full batches and every tail" {
+    const floats = [_]f32{ -0.0, 1.5, std.math.inf(f32), -3.25, 7, 8 };
+    const words = [_]u32{ 0, std.math.maxInt(u32), 0x8000_0001, 5, 6, 7 };
+    const float_lanes = [lane_count]f32{ 9.5, -0.0, std.math.floatMax(f32), 2 };
+    const word_lanes = [lane_count]u32{ 11, 0, std.math.maxInt(u32), 0x7fff_ffff };
+    const float_vector = loadFloat4(&float_lanes);
+    const word_vector = loadUint4(&word_lanes);
+    for (0..lane_count + 3) |count| {
+        const live = @min(count, lane_count);
+        // A load reads only a slice of `count` values, zero past the live lanes.
+        const loaded_floats = toFloatArray(loadFloat4Lanes(floats[0..count], count));
+        const scalar_floats = loadFloat4LanesScalar(floats[0..count], count);
+        for (loaded_floats, scalar_floats, 0..) |lane, scalar, index| {
+            try std.testing.expectEqual(@as(u32, @bitCast(scalar)), @as(u32, @bitCast(lane)));
+            const expected: f32 = if (index < live) floats[index] else 0;
+            try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(lane)));
+        }
+        const loaded_words = toUintArray(loadUint4Lanes(words[0..count], count));
+        try std.testing.expectEqual(loadUint4LanesScalar(words[0..count], count), loaded_words);
+        for (loaded_words, 0..) |lane, index| try std.testing.expectEqual(if (index < live) words[index] else 0, lane);
+
+        var stored_floats = [_]f32{ 4, 4, 4, 4, 4, 4 };
+        var scalar_stored_floats = stored_floats;
+        storeFloat4Lanes(stored_floats[0..], float_vector, count);
+        storeFloat4LanesScalar(scalar_stored_floats[0..], toFloatArray(float_vector), count);
+        for (stored_floats, scalar_stored_floats, 0..) |stored, scalar, index| {
+            try std.testing.expectEqual(@as(u32, @bitCast(scalar)), @as(u32, @bitCast(stored)));
+            const expected: f32 = if (index < live) float_lanes[index] else 4;
+            try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(stored)));
+        }
+        var stored_words = [_]u32{ 3, 3, 3, 3, 3, 3 };
+        var scalar_stored_words = stored_words;
+        storeUint4Lanes(stored_words[0..], word_vector, count);
+        storeUint4LanesScalar(scalar_stored_words[0..], toUintArray(word_vector), count);
+        try std.testing.expectEqual(scalar_stored_words, stored_words);
+        for (stored_words, 0..) |stored, index| try std.testing.expectEqual(if (index < live) word_lanes[index] else 3, stored);
     }
 }

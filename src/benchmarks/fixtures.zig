@@ -31,6 +31,8 @@ const PathRequest = @import("../game/simulation.zig").PathRequest;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
+const RebuildStage = @import("../game/systems/static_colliders.zig").RebuildStage;
+const rebuild_range_alignment = @import("../game/systems/static_colliders.zig").rebuild_range_alignment;
 const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const level_z_step = @import("../game/world/system.zig").level_z_step;
@@ -175,10 +177,13 @@ pub const StaticMove = struct {
     }
 };
 
-/// Gives the static colliders' chunk-rewrite stage a fresh tuner and the range controls
-/// for `case`.
+/// Gives each of the static colliders' sync and rebuild stages a fresh tuner, and every stage
+/// the range controls for `case`.
 pub fn setSpliceTuners(colliders: *StaticColliderSystem, case: suite.BenchmarkCase) void {
-    colliders.chunk_rewrite = suite.adaptiveTunerForCase(case, splice_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    colliders.tuners.set(.rewrite, suite.adaptiveTunerForCase(case, splice_range_alignment_items) orelse AdaptiveWorkTuner.init(.{}));
+    for (std.enums.values(RebuildStage)) |stage| {
+        colliders.rebuild_tuners.set(stage, suite.adaptiveTunerForCase(case, rebuild_range_alignment.get(stage)) orelse AdaptiveWorkTuner.init(.{}));
+    }
     colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
 }
 

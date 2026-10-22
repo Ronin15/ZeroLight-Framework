@@ -373,6 +373,48 @@ pub const DataSystem = struct {
         return math.aabbFromOffsetSize(body.position, bounds.offset, bounds.size);
     }
 
+    /// The columns `staticObstacleAt` reads, sliced once. O(1).
+    pub fn staticObstacleColumns(self: *const DataSystem) types.StaticObstacleColumns {
+        const movement = self.movementBodySliceConst();
+        const bounds = self.collisionBoundsSliceConst();
+        return .{
+            .position_x = movement.position_x,
+            .position_y = movement.position_y,
+            .offset_x = bounds.offset_x,
+            .offset_y = bounds.offset_y,
+            .size_x = bounds.size_x,
+            .size_y = bounds.size_y,
+            .mobilities = self.collisionResponseSliceConst().mobilities,
+            .levels = self.worldLevelSliceConst().levels,
+        };
+    }
+
+    /// The static navigation obstacle at entity slot `index` (below `slots.items.len`), under
+    /// the slot's live id:
+    /// a live slot with a movement body, collision bounds, and a static collision response,
+    /// read through `columns` (`staticObstacleColumns`); null otherwise. Its rect is
+    /// `staticObstacleWorldRect`'s, and its level `worldLevelConst`'s or 0. One slot read and
+    /// one row read per store, no slice built; safe on workers while the stores are unchanged.
+    pub fn staticObstacleAt(self: *const DataSystem, index: usize, columns: types.StaticObstacleColumns) ?types.StaticObstacle {
+        const slot = &self.slots.items[index];
+        if (!slot.alive) return null;
+        const body = slot.movement_body_index orelse return null;
+        const bounds = slot.collision_bounds_index orelse return null;
+        const response = slot.collision_response_index orelse return null;
+        if (columns.mobilities[response] != .static) return null;
+        return .{
+            // Entity slots stay below maxInt(u32), the invalid index.
+            .entity = .{ .index = @intCast(index), .generation = slot.generation },
+            .level = if (slot.world_level_index) |level| columns.levels[level] else 0,
+            .x = columns.position_x[body],
+            .y = columns.position_y[body],
+            .offset_x = columns.offset_x[bounds],
+            .offset_y = columns.offset_y[bounds],
+            .size_x = columns.size_x[bounds],
+            .size_y = columns.size_y[bounds],
+        };
+    }
+
     pub fn clearRetainingCapacity(self: *DataSystem) void {
         // Reset invalidates all existing IDs while keeping allocated component
         // columns warm for the next state/session.
@@ -1621,6 +1663,65 @@ test "bodyLevelFaction matches movementBodyDenseIndex, worldLevelConst, and fact
     try std.testing.expect(data.bodyLevelFaction(bodiless) == null);
     try std.testing.expect(data.bodyLevelFaction(stale) == null);
     try std.testing.expect(data.bodyLevelFaction(EntityId.invalid) == null);
+}
+
+test "a static obstacle resolves only for a live slot with body, bounds, and a static response" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const bounds = CollisionBounds{ .offset = .{ .x = -2, .y = 3 }, .size = .{ .x = 5, .y = 7 } };
+    const static_response = CollisionResponse{ .mobility = .static };
+
+    const surface = try data.createEntity();
+    try data.setMovementBody(surface, testBody(1));
+    try data.setCollisionBounds(surface, bounds);
+    try data.setCollisionResponse(surface, static_response);
+    const leveled = try data.createEntity();
+    try data.setWorldLevel(leveled, 4);
+    try data.setMovementBody(leveled, testBody(2));
+    try data.setCollisionBounds(leveled, bounds);
+    try data.setCollisionResponse(leveled, static_response);
+    const dynamic = try data.createEntity();
+    try data.setMovementBody(dynamic, testBody(3));
+    try data.setCollisionBounds(dynamic, bounds);
+    try data.setCollisionResponse(dynamic, .{});
+    const boundless = try data.createEntity();
+    try data.setMovementBody(boundless, testBody(4));
+    try data.setCollisionResponse(boundless, static_response);
+    const bodiless = try data.createEntity();
+    try data.setCollisionBounds(bodiless, bounds);
+    try data.setCollisionResponse(bodiless, static_response);
+    const responseless = try data.createEntity();
+    try data.setMovementBody(responseless, testBody(5));
+    try data.setCollisionBounds(responseless, bounds);
+    const destroyed = try data.createEntity();
+    try data.setMovementBody(destroyed, testBody(6));
+    try data.setCollisionBounds(destroyed, bounds);
+    try data.setCollisionResponse(destroyed, static_response);
+    try std.testing.expect(data.destroyEntity(destroyed));
+
+    const columns = data.staticObstacleColumns();
+    for ([_]EntityId{ surface, leveled }) |entity| {
+        const found = data.staticObstacleAt(entity.index, columns).?;
+        try std.testing.expect(found.entity.eql(entity));
+        try std.testing.expectEqual(data.worldLevelConst(entity) orelse 0, found.level);
+        const rect = math.aabbFromOffsetSize(.{ .x = found.x, .y = found.y }, .{ .x = found.offset_x, .y = found.offset_y }, .{ .x = found.size_x, .y = found.size_y });
+        try std.testing.expectEqual(data.staticObstacleWorldRect(entity).?, rect);
+        try std.testing.expect(data.isStaticNavigationObstacle(entity));
+    }
+    try std.testing.expectEqual(@as(u16, 0), data.staticObstacleAt(surface.index, columns).?.level);
+    try std.testing.expectEqual(@as(u16, 4), data.staticObstacleAt(leveled.index, columns).?.level);
+    for ([_]EntityId{ dynamic, boundless, bodiless, responseless, destroyed }) |entity| {
+        try std.testing.expect(!data.isStaticNavigationObstacle(entity));
+        try std.testing.expect(data.staticObstacleAt(entity.index, columns) == null);
+    }
+    // A reused slot resolves under its new id.
+    const reused = try data.createEntity();
+    try std.testing.expectEqual(destroyed.index, reused.index);
+    try data.setMovementBody(reused, testBody(7));
+    try data.setCollisionBounds(reused, bounds);
+    try data.setCollisionResponse(reused, static_response);
+    const refreshed = data.staticObstacleColumns();
+    try std.testing.expect(data.staticObstacleAt(destroyed.index, refreshed).?.entity.eql(reused));
 }
 
 test "movementVisualDenseIndices resolves both rows from one slot lookup" {

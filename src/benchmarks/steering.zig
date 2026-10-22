@@ -319,7 +319,7 @@ fn measureCase(
         last_stats = try step(&system, context, thread_ptr, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        const off_main_ns = stagesOffMainNs(last_stats) + offMainNs(steering.colliders.last_batches.get(.rewrite));
+        const off_main_ns = stagesOffMainNs(last_stats) + static_colliders_test_support.lastOffMainNs(steering.colliders);
         main_total += elapsed_ns -| off_main_ns;
         accumulator.record(elapsed_ns, last_stats.perf.batch);
         try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(steering_range_alignment_items), &.{

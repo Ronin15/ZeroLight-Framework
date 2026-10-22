@@ -39,7 +39,6 @@ const CollisionResponseMobility = @import("../game/data_system.zig").CollisionRe
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
-const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const SimulationEvent = @import("../game/simulation.zig").SimulationEvent;
 const TileEdit = @import("../game/systems/pathfinding/test_support.zig").TileEdit;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
@@ -603,8 +602,7 @@ const StaticDenseFixture = struct {
         };
         if (recreated_at != self.recreated.items.len) return error.StaticRecreatesMissing;
         self.shifted = !self.shifted;
-        const splice = self.colliders.last_batches.get(.rewrite);
-        const splice_off_main_ns = offMainNs(splice);
+        const splice_off_main_ns = static_colliders_test_support.lastOffMainNs(self.colliders);
         return .{
             .ns = suite.elapsedNs(start_ns, end_ns),
             .commit_ns = suite.elapsedNs(start_ns, sync_start_ns),
@@ -744,7 +742,7 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     fixtures.setSpliceTuners(&fixture.colliders, case);
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next((fixture.colliders.chunk_rewrite.phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.plan).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled))) _ = try fixture.changeAndReact(io, thread_ptr);
+    while (warm.next((fixture.colliders.tuners.getPtrConst(.rewrite).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.plan).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) and (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled))) _ = try fixture.changeAndReact(io, thread_ptr);
     const remask_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) else false;
     const patch_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled) else false;
 

@@ -2000,16 +2000,16 @@ fn writeStaticHitContacts(
     var index: usize = 0;
     while (index < full) {
         const group = @min(simd.lane_count, full - index);
-        const hit_min_x = loadFillFloat4(hits.min_x, index, group);
-        const hit_min_y = loadFillFloat4(hits.min_y, index, group);
-        const hit_max_x = loadFillFloat4(hits.max_x, index, group);
-        const hit_max_y = loadFillFloat4(hits.max_y, index, group);
-        const hit_vx = loadFillFloat4(hits.velocity_x, index, group);
-        const hit_vy = loadFillFloat4(hits.velocity_y, index, group);
-        const entity = loadFillUint4(hits.entity, index, group);
-        const movement = loadFillUint4(hits.movement_index, index, group);
-        const generation = loadFillUint4(hits.generation, index, group);
-        const allow = loadFillUint4(hits.allow, index, group);
+        const hit_min_x = simd.loadFloat4Lanes(hits.min_x[index..], group);
+        const hit_min_y = simd.loadFloat4Lanes(hits.min_y[index..], group);
+        const hit_max_x = simd.loadFloat4Lanes(hits.max_x[index..], group);
+        const hit_max_y = simd.loadFloat4Lanes(hits.max_y[index..], group);
+        const hit_vx = simd.loadFloat4Lanes(hits.velocity_x[index..], group);
+        const hit_vy = simd.loadFloat4Lanes(hits.velocity_y[index..], group);
+        const entity = simd.loadUint4Lanes(hits.entity[index..], group);
+        const movement = simd.loadUint4Lanes(hits.movement_index[index..], group);
+        const generation = simd.loadUint4Lanes(hits.generation[index..], group);
+        const allow = simd.loadUint4Lanes(hits.allow[index..], group);
 
         var key_static = [_]u128{ 0, 0, 0, 0 };
         var dynamic_is_a_lanes = [_]bool{ false, false, false, false };
@@ -2624,31 +2624,11 @@ fn firstKey(strips: CollisionStrips, row: ResolvedSlot) u128 {
     return packKey(runOf(row.level, strip), math.orderedBits(min_x), math.orderedBits(min_y), row.entity.index);
 }
 
-// Stores `values`' lanes in `lanes` to `column[start..]`: one store for a full group, lane
-// by lane for the masked last one.
-fn storeFloatLanes(column: []f32, start: usize, values: simd.Float4, lanes: simd.MaskBits) void {
-    if (lanes == simd.lanesBelow(simd.lane_count)) return simd.storeFloat4Slice(column[start..], values);
-    inline for (0..simd.lane_count) |lane| {
-        if (lanes & (1 << lane) != 0) column[start + lane] = values[lane];
-    }
-}
-
 // The copies a fill range wrote to its slot windows.
 const FillCounts = struct {
     firsts: usize = 0,
     seconds: usize = 0,
 };
-
-// A full group, or the masked tail's live prefix with zeros in the inactive lanes.
-inline fn loadFillFloat4(column: []const f32, group: usize, count: usize) simd.Float4 {
-    if (count >= simd.lane_count) return simd.loadFloat4(column[group..]);
-    return simd.loadFloat4Prefix(column[group..], count);
-}
-
-inline fn loadFillUint4(column: []const u32, group: usize, count: usize) simd.Uint4 {
-    if (count >= simd.lane_count) return simd.loadUint4(column[group..]);
-    return simd.loadUint4Prefix(column[group..], count);
-}
 
 // One scalar pass over `[start, end)`: the warm-order input, then that input's bounds and
 // movement row. Writes the proxy identity columns and the packed lane inputs. An unresolved
@@ -2712,16 +2692,15 @@ fn fillSlots(fill: *const FillContext, start: usize, end: usize, firsts: []SortE
     var group = start;
     while (group < end) : (group += simd.lane_count) {
         const count = end - group;
-        const lanes = simd.lanesBelow(count);
-        const x = loadFillFloat4(inputs.x, group, count);
-        const y = loadFillFloat4(inputs.y, group, count);
-        const offset_x = loadFillFloat4(inputs.offset_x, group, count);
-        const offset_y = loadFillFloat4(inputs.offset_y, group, count);
-        const size_x = loadFillFloat4(inputs.size_x, group, count);
-        const size_y = loadFillFloat4(inputs.size_y, group, count);
-        const level = loadFillUint4(inputs.level, group, count);
-        const entity_index = loadFillUint4(inputs.entity_index, group, count);
-        const filled_words = loadFillUint4(inputs.filled, group, count);
+        const x = simd.loadFloat4Lanes(inputs.x[group..], count);
+        const y = simd.loadFloat4Lanes(inputs.y[group..], count);
+        const offset_x = simd.loadFloat4Lanes(inputs.offset_x[group..], count);
+        const offset_y = simd.loadFloat4Lanes(inputs.offset_y[group..], count);
+        const size_x = simd.loadFloat4Lanes(inputs.size_x[group..], count);
+        const size_y = simd.loadFloat4Lanes(inputs.size_y[group..], count);
+        const level = simd.loadUint4Lanes(inputs.level[group..], count);
+        const entity_index = simd.loadUint4Lanes(inputs.entity_index[group..], count);
+        const filled_words = simd.loadUint4Lanes(inputs.filled[group..], count);
         var filled: simd.MaskBits = 0;
         inline for (0..simd.lane_count) |lane| {
             if (filled_words[lane] != 0) filled |= 1 << lane;
@@ -2730,10 +2709,10 @@ fn fillSlots(fill: *const FillContext, start: usize, end: usize, firsts: []SortE
         const min_y = y + offset_y;
         const max_x = min_x + size_x;
         const max_y = min_y + size_y;
-        storeFloatLanes(proxies.min_x, group, min_x, lanes);
-        storeFloatLanes(proxies.min_y, group, min_y, lanes);
-        storeFloatLanes(proxies.max_x, group, max_x, lanes);
-        storeFloatLanes(proxies.max_y, group, max_y, lanes);
+        simd.storeFloat4Lanes(proxies.min_x[group..], min_x, count);
+        simd.storeFloat4Lanes(proxies.min_y[group..], min_y, count);
+        simd.storeFloat4Lanes(proxies.max_x[group..], max_x, count);
+        simd.storeFloat4Lanes(proxies.max_y[group..], max_y, count);
         // Clamped strips are in [0, strip_count - 1], so non-negative.
         const first_strip: simd.Uint4 = @bitCast(simd.worldPosToCell4(min_y, height, strip_count));
         const last_strip: simd.Uint4 = @bitCast(simd.lastCellOfSpan4(min_y, max_y, height, strip_count));

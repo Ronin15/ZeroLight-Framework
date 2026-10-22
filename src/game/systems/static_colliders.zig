@@ -28,10 +28,28 @@ const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const StageControls = @import("../../app/thread_system.zig").StageControls;
+const StageThreads = @import("../../app/thread_system.zig").StageThreads;
 const runShaped = @import("../../app/thread_system.zig").runShaped;
 const stageShape = @import("../../app/thread_system.zig").stageShape;
+const StageShape = @import("../../app/thread_system.zig").StageShape;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
+const SlotList = @import("../../app/thread_system.zig").SlotList;
+const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
+const setRowCount = @import("../../app/thread_system.zig").setRowCount;
+const compactRowWindows = @import("../../app/thread_system.zig").compactRowWindows;
+const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
+const banded_sort = @import("banded_sort.zig");
+const band_count = banded_sort.band_count;
+const BandOffsets = banded_sort.BandOffsets;
+const OwnedBands = banded_sort.OwnedBands;
+const StampedTable = @import("../stamped_table.zig").StampedTable;
+const hashTableSlots = @import("../stamped_table.zig").hashTableSlots;
+const hashTableShift = @import("../stamped_table.zig").hashTableShift;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
+const StaticObstacle = @import("../data_system/types.zig").StaticObstacle;
+const StaticObstacleColumns = @import("../data_system/types.zig").StaticObstacleColumns;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const ChunkDirectory = @import("chunk_list_map.zig").ChunkDirectory;
 const chunkKey = @import("chunk_list_map.zig").chunkKey;
@@ -43,8 +61,6 @@ const PayloadSlabs = @import("chunk_list_map.zig").PayloadSlabs;
 const PayloadSlot = @import("chunk_list_map.zig").PayloadSlot;
 const splice_range_alignment_items = @import("chunk_list_map.zig").splice_range_alignment_items;
 const max_chunk_size_tiles = @import("../world/system.zig").max_chunk_size_tiles;
-// A rebuild's fill ranges per participant at the fixed shape (`fixedFillDispatch`).
-const fixed_fill_ranges_per_participant: usize = 4;
 const ChunkGeometry = @import("../world/terrain.zig").ChunkGeometry;
 
 const no_row: u32 = std.math.maxInt(u32);
@@ -143,6 +159,23 @@ pub const ColliderGeometry = struct {
             if (aabb.max_x - edge <= aabb.min_x and aabb.max_y - edge <= aabb.min_y) return class;
         }
         return top;
+    }
+
+    // `queryClass` of the lanes below `count`, bit-identical lane for lane: each lane's
+    // smallest class below `top` whose cell edge covers its AABB on both axes, else `top`.
+    // Stops once every live lane has its class: at most `top + 1` iterations.
+    fn queryClass4(self: ColliderGeometry, top: u6, min_x: simd.Float4, min_y: simd.Float4, max_x: simd.Float4, max_y: simd.Float4, count: usize) simd.Int4 {
+        var classes = simd.splatInt4(top);
+        var unresolved = simd.lanesBelow(count);
+        var class: u6 = 0;
+        while (class < top and unresolved != 0) : (class += 1) {
+            const edge = simd.splatFloat4(self.classEdge(class));
+            const covers = simd.lessEqualFloat4(max_x - edge, min_x) & simd.lessEqualFloat4(max_y - edge, min_y);
+            const resolved = simd.maskBits(covers) & unresolved;
+            classes = simd.selectInt4(@bitCast(resolved), simd.splatInt4(class), classes);
+            unresolved &= ~resolved;
+        }
+        return classes;
     }
 
     /// The query-tier key of a row on `level` in class `class` whose clamped footprint
@@ -310,8 +343,19 @@ const CoarseDir = ChunkDirectory(QueryRun, false);
 const empty_chunk = StaticChunk{};
 const empty_run = QueryRun{};
 
-/// The stages `rebuild` and `sync` dispatch, each with its last batch shape.
-pub const ColliderStage = enum { rewrite };
+/// The stages `rebuild` and `sync` dispatch, each with its last batch shape: a rebuild runs
+/// every one, a sync `rewrite` only.
+pub const ColliderStage = enum { select, plan, touch, group, rewrite, install };
+
+/// The stages `rebuild` runs, each under its own tuner: every collider stage.
+pub const RebuildStage = ColliderStage;
+
+/// The stages `sync` runs, each under its own tuner, separate from the rebuild's.
+pub const SyncStage = enum { rewrite };
+
+// A rebuild's thread system and the shared range controls; each stage dispatches under its
+// own rebuild tuner.
+const RebuildThreads = StageThreads(StageControls);
 
 /// The nav spans listed on one chunk, entity-index order. Empty when the chunk has none.
 pub const ChunkSpans = struct {
@@ -808,17 +852,50 @@ pub const StaticColliderSystem = struct {
     nav_inserts: std.ArrayList(SpanInsert) = .empty,
     query_inserts: std.ArrayList(AabbInsert) = .empty,
     coarse_inserts: std.ArrayList(AabbInsert) = .empty,
-    unit_starts: std.ArrayList(usize) = .empty,
+    // Where the fill finds the call's items, band by band, and their fill units.
+    item_bands: ItemBands = .{},
+    // A rebuild's stage scratch, freed before the swap (`freeRebuildScratch`). The select
+    // writes each range's statics into its window of `plan_inputs`; the main thread
+    // compacts them to ranks `[0, S)` in entity-index order, each static's row.
+    plan_inputs: std.MultiArrayList(PlanInput) = .{},
+    select_tallies: SlotList(SelectTally) = .empty,
+    // Per rank: its query class, and its touches' offsets in each tier past its plan
+    // range's base (`PlanTally`).
+    plan_class: std.ArrayList(u16) = .empty,
+    plan_items_per_range: usize = 1,
+    plan_touch_local: [tier_count]std.ArrayList(u32) = @splat(.empty),
+    plan_tallies: SlotList(PlanTally) = .empty,
+    // Each tier's touches in plan order, and staged by band per touch range, with each
+    // range's band offsets into its staging window, absolute. Each touch range's window
+    // starts on its own cache line (`touchWindowStart`).
+    chunk_touches: TouchList(ChunkTouch) = .empty,
+    chunk_staging: TouchList(ChunkTouch) = .empty,
+    coarse_touches: TouchList(CoarseTouch) = .empty,
+    coarse_staging: TouchList(CoarseTouch) = .empty,
+    touch_band_offsets: [tier_count]SlotList(BandOffsets) = @splat(.empty),
+    touch_splitters: [tier_count]TouchSplitters = @splat(@splat(0)),
+    // Per tier, band b's touches start at `touch_start[tier][b]` of the tier's touch order;
+    // its items, inserts, and level entries take windows there, its resource entries at
+    // twice that, past the chunk tier's for the coarse tier.
+    touch_start: [tier_count][band_count + 1]u32 = @splat(@splat(0)),
+    // Band b's key table: `group_slots[region_start[tier][b]..region_start[tier][b + 1]]`.
+    region_start: [tier_count][band_count + 1]usize = @splat(@splat(0)),
+    group_slots: std.ArrayList(GroupSlot) = .empty,
+    group_generation: u32 = 0,
+    group_tallies: SlotList(GroupTally) = .empty,
+    resource_entries: std.ArrayList(ResourceEntry) = .empty,
+    level_entries: std.ArrayList(u32) = .empty,
     // Rows per query class, and the classes holding any row (refreshed after every sync
     // and rebuild).
     query_class_rows: [max_query_classes]u32 = @splat(0),
     query_class_mask: QueryClassMask = .empty,
     query_top_class: u6 = 0,
     revision: u64 = 0,
-    // The chunk rewrite, run by `sync` and `rebuild`: `sync`'s tuner (a rebuild runs at a
-    // fixed shape and keeps it), the shared range controls (production runs adaptive;
-    // benches pin a fixed partition), and each stage's last batch shape.
-    chunk_rewrite: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // `sync`'s stage tuners and `rebuild`'s (each samples once per rebuild, carried across
+    // rebuilds), the shared range controls (production runs adaptive; benches pin a fixed
+    // partition), and each stage's last batch shape.
+    tuners: std.EnumArray(SyncStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(.{})),
+    rebuild_tuners: std.EnumArray(RebuildStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(.{})),
     splice_controls: StageControls = .{},
     last_batches: std.EnumArray(ColliderStage, BatchStats) = .initFill(.{}),
     perf: Perf = .{},
@@ -839,8 +916,8 @@ pub const StaticColliderSystem = struct {
     payload_growth_logged: bool = false,
 
     /// Kept only with `runtime_perf_log.enabled`, across rebuilds: row-pool growths, and
-    /// payload growths (a level's directory opened, a block pool grown, or a payload slab
-    /// allocated).
+    /// payload growths (a level's directory opened, a block pool grown, a payload slab
+    /// allocated, or one of sync's rewrite item and insert lists grown).
     pub const Perf = if (runtime_perf_log.enabled) struct {
         row_grows: u64 = 0,
         payload_grows: u64 = 0,
@@ -857,7 +934,7 @@ pub const StaticColliderSystem = struct {
         for (&self.coarse) |*dir| dir.deinit(self.allocator);
         self.chunks.deinit(self.allocator);
         self.payloads.deinit(self.allocator);
-        self.unit_starts.deinit(self.allocator);
+        self.freeRebuildScratch();
         self.coarse_inserts.deinit(self.allocator);
         self.query_inserts.deinit(self.allocator);
         self.nav_inserts.deinit(self.allocator);
@@ -934,55 +1011,693 @@ pub const StaticColliderSystem = struct {
 
     /// Replaces every row with the statics `data` holds now, placed on `geometry`, and
     /// builds each footprint chunk's span and query columns. An error leaves the system
-    /// unchanged. Drops pending changes. Main is O(1) per entity slot and per footprint
-    /// chunk: rows are placed in entity-index order with no sort, and the chunk and coarse
-    /// fills are one dispatch on `thread_system`'s workers, or inline as one range without
-    /// one. A rebuild is a one-off (world create, nav reaction), so the fill runs at a fixed
-    /// shape sized from its work units, outside the `chunk_rewrite` tuner `sync` trains.
+    /// unchanged. Drops pending changes. Each stage runs on `thread_system`'s workers under
+    /// its own rebuild tuner (one sample per rebuild; the tuners carry across rebuilds and
+    /// never reach sync's), or inline as one range without one: `select` (every entity
+    /// slot's static, packed by range), `plan` (each static's row, footprint, query class,
+    /// and touch counts in lanes), `touch` (each footprint chunk and coarse cell, placed by
+    /// band), `group` (each band's key table zeroed, then its chunks and cells into items,
+    /// their inserts, payload claims, and levels), `rewrite` (the fill), and `install`. Main
+    /// holds the reserves, prefixes over ranges and bands, the claim merge, one open per
+    /// level touched, and two ns-per-item passes: the per-index reset and the window
+    /// compaction.
     pub fn rebuild(self: *StaticColliderSystem, data: *const DataSystem, geometry: ColliderGeometry, thread_system: ?*ThreadSystem) error{OutOfMemory}!void {
         std.debug.assert(geometry.grid.chunk_tiles != 0 and std.math.isPowerOfTwo(geometry.grid.chunk_tiles));
         // Anchor words hold the fine classes of a chunk up to this edge.
         std.debug.assert(geometry.grid.chunk_tiles <= max_chunk_size_tiles);
-        var fresh = StaticColliderSystem.init(self.allocator);
+        var fresh = self.freshFor(geometry);
         errdefer fresh.deinit();
+        const stages = fresh.rebuildStages(thread_system);
+        try fresh.prepareRebuild(data, stages);
+        fresh.finishRebuild(stages);
+        self.deinit();
+        self.* = fresh;
+    }
+
+    // An empty system on `geometry` carrying `self`'s revision, growth logs and counters,
+    // tuners, and stage controls.
+    fn freshFor(self: *const StaticColliderSystem, geometry: ColliderGeometry) StaticColliderSystem {
+        var fresh = StaticColliderSystem.init(self.allocator);
         fresh.geometry = geometry;
         fresh.revision = self.revision +% 1;
         fresh.query_top_class = geometry.topQueryClass();
         fresh.row_growth_logged = self.row_growth_logged;
         fresh.payload_growth_logged = self.payload_growth_logged;
         if (comptime runtime_perf_log.enabled) fresh.perf = self.perf;
-        fresh.chunk_rewrite = self.chunk_rewrite;
+        fresh.tuners = self.tuners;
+        fresh.rebuild_tuners = self.rebuild_tuners;
         fresh.splice_controls = self.splice_controls;
-        // Every entity index `data` holds, as `reserveForCommit` sizes them.
-        try fresh.reserveIndices(data.slots.items.len);
-        // Each static's response row, parked at its entity index until its row is claimed,
-        // so the rows are claimed in index order.
-        const responses = data.collisionResponseSliceConst();
-        var static_count: usize = 0;
-        for (responses.entities, responses.mobilities, 0..) |entity, mobility, response_row| {
-            if (mobility != .static or !data.isStaticNavigationObstacle(entity)) continue;
-            // One response row per entity, so rows stay below the slot count and `no_row`.
-            fresh.row_of_index.items[entity.index] = @intCast(response_row);
-            static_count += 1;
-        }
-        try fresh.ensureFreeRows(static_count);
-        for (fresh.row_of_index.items, 0..) |response_row, index| {
-            if (response_row == no_row) continue;
-            const entity = responses.entities[response_row];
-            fresh.row_of_index.items[index] = no_row;
-            const placement = fresh.placementOf(data, entity).?;
-            const aabb = data.staticObstacleWorldRect(entity).?;
-            const row = fresh.claimRow(entity.index);
-            fresh.writeRow(row, entity, placement, aabb);
-            const class = geometry.queryClass(fresh.query_top_class, aabb);
-            fresh.query_class_rows[class] += 1;
-        }
-        fresh.refreshQueryClassMask();
-        try fresh.buildAllRuns(thread_system);
-        self.deinit();
-        self.* = fresh;
+        return fresh;
     }
 
+    // The thread system and range controls a rebuild's stages dispatch on; each stage takes
+    // its own rebuild tuner (`rebuildDispatch`).
+    fn rebuildStages(self: *const StaticColliderSystem, thread_system: ?*ThreadSystem) ?RebuildThreads {
+        const threads = thread_system orelse return null;
+        return .{ .thread_system = threads, .config = self.splice_controls };
+    }
+
+    // Rebuild stage `stage`'s dispatch of `item_count` items under its own tuner, or null
+    // (inline) without a thread system or items: an empty stage selects nothing and touches
+    // no tuner. Only rebuild tuners are reachable here.
+    fn rebuildDispatch(self: *StaticColliderSystem, threads: ?RebuildThreads, stage: RebuildStage, item_count: usize) ?Dispatch {
+        const stages = threads orelse return null;
+        if (item_count == 0) return null;
+        return stages.stage(self.rebuild_tuners.getPtr(stage));
+    }
+
+    // Every rebuild stage before the fill, and every reserve: after it nothing fails.
+    fn prepareRebuild(self: *StaticColliderSystem, data: *const DataSystem, stages: ?RebuildThreads) error{OutOfMemory}!void {
+        const touches = try self.planStatics(data, stages);
+        try self.groupFootprints(stages, touches, self.touchSplitters());
+    }
+
+    // `select` and `plan`: every static's row, and each tier's touch count.
+    fn planStatics(self: *StaticColliderSystem, data: *const DataSystem, stages: ?RebuildThreads) error{OutOfMemory}!TierCounts {
+        // Every entity index `data` holds, as `reserveForCommit` sizes them.
+        const slot_count = data.slots.items.len;
+        try self.reserveIndices(slot_count);
+        try self.reserveSelect(slot_count);
+        self.selectStatics(data, stages, slot_count);
+        const static_count = self.plan_inputs.len;
+        try self.reserveRebuildRows(static_count);
+        try self.reservePlan(static_count);
+        self.planRows(stages, static_count);
+        return self.mergePlanTallies();
+    }
+
+    // `touch` and `group` under the band `splitters` of each tier, then the growth seam
+    // before the fill. Every id and layout is the same for any splitters, range size, and
+    // worker count but the block and slot ids, which follow the bands.
+    fn groupFootprints(self: *StaticColliderSystem, stages: ?RebuildThreads, touches: TierCounts, splitters: [tier_count]TouchSplitters) error{OutOfMemory}!void {
+        const static_count = self.rows.len;
+        // The touch windows are sized from the selection the dispatch runs; an error past it
+        // discards this system and the tuner's selection with it (`rebuild`).
+        const dispatch = self.rebuildDispatch(stages, .touch, static_count);
+        const shape = stageShape(dispatch, static_count, touch_range_alignment_items);
+        try self.reserveTouches(touches, shape.range_count);
+        self.touch_splitters = splitters;
+        self.touchFootprints(dispatch, shape, static_count);
+        try self.reserveGroup(touches);
+        self.groupTouches(stages, touches);
+        try self.reservePayloads();
+    }
+
+    // The fill, its claims, and the install, then the scratch freed. Allocates nothing.
+    fn finishRebuild(self: *StaticColliderSystem, stages: ?RebuildThreads) void {
+        self.rewriteItems(self.rebuildDispatch(stages, .rewrite, self.item_bands.unitCount()), self.resource_entries.items);
+        self.commitClaims();
+        self.installItems(stages);
+        self.freeRebuildScratch();
+    }
+
+    // Frees a rebuild's stage scratch and the item lists; nothing in them outlives the call.
+    fn freeRebuildScratch(self: *StaticColliderSystem) void {
+        self.plan_inputs.clearAndFree(self.allocator);
+        self.select_tallies.clearAndFree(self.allocator);
+        self.plan_class.clearAndFree(self.allocator);
+        for (&self.plan_touch_local) |*local| local.clearAndFree(self.allocator);
+        self.plan_tallies.clearAndFree(self.allocator);
+        self.chunk_touches.clearAndFree(self.allocator);
+        self.chunk_staging.clearAndFree(self.allocator);
+        self.coarse_touches.clearAndFree(self.allocator);
+        self.coarse_staging.clearAndFree(self.allocator);
+        for (&self.touch_band_offsets) |*offsets| offsets.clearAndFree(self.allocator);
+        self.group_slots.clearAndFree(self.allocator);
+        self.group_tallies.clearAndFree(self.allocator);
+        self.resource_entries.clearAndFree(self.allocator);
+        self.level_entries.clearAndFree(self.allocator);
+        self.chunk_items.clearAndFree(self.allocator);
+        self.coarse_items.clearAndFree(self.allocator);
+        self.nav_inserts.clearAndFree(self.allocator);
+        self.query_inserts.clearAndFree(self.allocator);
+        self.coarse_inserts.clearAndFree(self.allocator);
+    }
+
+    // The select's windows: one per range over `slot_count` slots, each range's statics at
+    // its start, and a tally per range. Lane-aligned, as the plan lanes read the columns.
+    fn reserveSelect(self: *StaticColliderSystem, slot_count: usize) error{OutOfMemory}!void {
+        try self.plan_inputs.ensureTotalCapacity(self.allocator, std.mem.alignForward(usize, slot_count, select_range_alignment_items));
+        try self.select_tallies.ensureTotalCapacity(self.allocator, maxRangeCount(slot_count, select_range_alignment_items));
+        std.debug.assert(self.plan_inputs.capacity >= slot_count);
+        setRowCount(PlanInput, &self.plan_inputs, slot_count);
+    }
+
+    // `select`: every entity slot's static into its range's window, then the windows
+    // compacted on main, so `plan_inputs` holds the statics in entity-index order.
+    fn selectStatics(self: *StaticColliderSystem, data: *const DataSystem, stages: ?RebuildThreads, slot_count: usize) void {
+        const dispatch = self.rebuildDispatch(stages, .select, slot_count);
+        const shape = stageShape(dispatch, slot_count, select_range_alignment_items);
+        std.debug.assert(shape.range_count <= self.select_tallies.capacity);
+        setSlotCount(SelectTally, &self.select_tallies, shape.range_count);
+        var job = SelectJob{
+            .data = data,
+            .columns = data.staticObstacleColumns(),
+            .inputs = PlanColumns.of(&self.plan_inputs),
+            .tallies = self.select_tallies.items,
+            .items_per_range = shape.items_per_range,
+        };
+        self.last_batches.set(.select, runShaped(dispatch, shape, slot_count, select_range_alignment_items, &job, selectJob));
+        compactRowWindows(PlanInput, SelectTally, &self.plan_inputs, self.select_tallies.items, shape.items_per_range);
+    }
+
+    // Rows `[0, static_count)`, each the rank of its static in entity-index order. The free
+    // list's capacity covers every row; nothing is pushed. Geometric and counted.
+    fn reserveRebuildRows(self: *StaticColliderSystem, static_count: usize) error{OutOfMemory}!void {
+        // At most one static per entity slot, and slots stay below maxInt(u32).
+        std.debug.assert(static_count < no_row);
+        if (static_count > self.rows.capacity) {
+            try self.rows.ensureTotalCapacity(self.allocator, static_count);
+            // The pool moved: the column views follow it before anything else can fail.
+            self.refreshColumns();
+            self.countRowGrowth();
+        }
+        try self.row_free.ensureTotalCapacity(self.allocator, self.rows.capacity);
+        setRowCount(Row, &self.rows, static_count);
+        self.refreshColumns();
+    }
+
+    // The plan's per-rank columns and per-range tallies.
+    fn reservePlan(self: *StaticColliderSystem, static_count: usize) error{OutOfMemory}!void {
+        try self.plan_class.ensureTotalCapacity(self.allocator, static_count);
+        for (&self.plan_touch_local) |*local| try local.ensureTotalCapacity(self.allocator, static_count);
+        try self.plan_tallies.ensureTotalCapacity(self.allocator, maxRangeCount(static_count, plan_range_alignment_items));
+        self.plan_class.items.len = static_count;
+        for (&self.plan_touch_local) |*local| local.items.len = static_count;
+    }
+
+    // `plan`: each rank's row, `row_of_index`, query class, touch offsets, and its range's
+    // touch and class counts.
+    fn planRows(self: *StaticColliderSystem, stages: ?RebuildThreads, static_count: usize) void {
+        const dispatch = self.rebuildDispatch(stages, .plan, static_count);
+        const shape = stageShape(dispatch, static_count, plan_range_alignment_items);
+        std.debug.assert(shape.range_count <= self.plan_tallies.capacity);
+        setSlotCount(PlanTally, &self.plan_tallies, shape.range_count);
+        self.plan_items_per_range = shape.items_per_range;
+        var job = PlanJob{ .colliders = self, .inputs = PlanColumns.of(&self.plan_inputs) };
+        self.last_batches.set(.plan, runShaped(dispatch, shape, static_count, plan_range_alignment_items, &job, planJob));
+    }
+
+    // Each plan range's touch bases in each tier, and the rows per query class, in range
+    // order. A total of 2^31 touches or more fails as `OutOfMemory`, so every count the
+    // later stages index fits u32. O(ranges * classes).
+    fn mergePlanTallies(self: *StaticColliderSystem) error{OutOfMemory}!TierCounts {
+        var totals: [tier_count]u64 = @splat(0);
+        for (self.plan_tallies.items) |slot| {
+            for (&totals, slot.value.touches) |*total, touches| total.* += touches;
+        }
+        if (totals[chunk_tier] + totals[coarse_tier] >= max_rebuild_touches) return error.OutOfMemory;
+        var bases: [tier_count]u32 = @splat(0);
+        self.query_class_rows = @splat(0);
+        for (self.plan_tallies.items) |*slot| {
+            slot.value.bases = bases;
+            // Below the checked total.
+            for (&bases, slot.value.touches) |*base, touches| base.* += @intCast(touches);
+            for (&self.query_class_rows, slot.value.class_rows) |*rows, added| rows.* += added;
+        }
+        self.refreshQueryClassMask();
+        return bases;
+    }
+
+    // Each tier's touch scratch and staging over `range_count` touch ranges, each range's
+    // window rounded up to a cache line (at most a line's worth of padding per range), and
+    // the ranges' band offsets.
+    fn reserveTouches(self: *StaticColliderSystem, touches: TierCounts, range_count: usize) error{OutOfMemory}!void {
+        const chunk_len = touchExtent(ChunkTouch, touches[chunk_tier], range_count);
+        const coarse_len = touchExtent(CoarseTouch, touches[coarse_tier], range_count);
+        try self.chunk_touches.ensureTotalCapacity(self.allocator, chunk_len);
+        try self.chunk_staging.ensureTotalCapacity(self.allocator, chunk_len);
+        try self.coarse_touches.ensureTotalCapacity(self.allocator, coarse_len);
+        try self.coarse_staging.ensureTotalCapacity(self.allocator, coarse_len);
+        for (&self.touch_band_offsets) |*offsets| try offsets.ensureTotalCapacity(self.allocator, range_count);
+        self.chunk_touches.items.len = chunk_len;
+        self.chunk_staging.items.len = chunk_len;
+        self.coarse_touches.items.len = coarse_len;
+        self.coarse_staging.items.len = coarse_len;
+    }
+
+    // The band splitters of each tier: the band quantiles of the first-touch keys of a fixed
+    // sample of ranks (`banded_sort.sampleSlot`), so they never depend on the partition.
+    // Fixed work on main.
+    fn touchSplitters(self: *const StaticColliderSystem) [tier_count]TouchSplitters {
+        const geometry = self.geometry.?;
+        const shift = geometry.grid.shift;
+        const static_count = self.rows.len;
+        var chunk_samples: [banded_sort.splitter_sample_count]u64 = undefined;
+        var coarse_samples: [banded_sort.splitter_sample_count]u64 = undefined;
+        var chunk_count: usize = 0;
+        var coarse_count: usize = 0;
+        for (0..banded_sort.sampleCount(static_count)) |sample| {
+            const rank: u32 = @intCast(banded_sort.sampleSlot(sample, static_count));
+            const placement = self.rowPlacement(rank);
+            const rect = geometry.chunkRect(placement);
+            chunk_samples[chunk_count] = chunkKey(placement.level, rect.min_y * rect.chunks_x + rect.min_x);
+            chunk_count += 1;
+            // A query class fits u6.
+            const class: u6 = @intCast(self.plan_class.items[rank]);
+            if (class <= shift) continue;
+            coarse_samples[coarse_count] = geometry.queryKey(placement.level, class, placement.cells);
+            coarse_count += 1;
+        }
+        return .{
+            ChunkTouchSort.splittersFromSamples(chunk_samples[0..chunk_count]),
+            CoarseTouchSort.splittersFromSamples(coarse_samples[0..coarse_count]),
+        };
+    }
+
+    // `touch` at `shape`: each rank's footprint chunks and coarse cell, written in plan order
+    // into its range's line-aligned window, then placed by band into the same staging window.
+    fn touchFootprints(self: *StaticColliderSystem, dispatch: ?Dispatch, shape: StageShape, static_count: usize) void {
+        for (&self.touch_band_offsets) |*offsets| {
+            std.debug.assert(shape.range_count <= offsets.capacity);
+            setSlotCount(BandOffsets, offsets, shape.range_count);
+        }
+        var job = TouchJob{ .colliders = self, .range_count = shape.range_count };
+        self.last_batches.set(.touch, runShaped(dispatch, shape, static_count, touch_range_alignment_items, &job, touchJob));
+    }
+
+    // Each tier's band starts over every touch range's band offsets (O(ranges * bands)), each
+    // band's key table region, and the group's item, insert, entry, level, and tally windows.
+    // A region holds a band's keys plus one level marker per item at load at most 1/2. The
+    // table grows uninitialized: each band zeros its own region on its worker before its
+    // first claim (`BandTable.init`), so main writes no slot.
+    fn reserveGroup(self: *StaticColliderSystem, touches: TierCounts) error{OutOfMemory}!void {
+        var slots: usize = 0;
+        for (0..tier_count) |tier| {
+            var counts: [band_count]u32 = @splat(0);
+            for (self.touch_band_offsets[tier].items) |slot| {
+                const offsets = &slot.value.offsets;
+                for (&counts, offsets[0..band_count], offsets[1..]) |*count, start, end| count.* += end - start;
+            }
+            const starts = &self.touch_start[tier];
+            const regions = &self.region_start[tier];
+            starts[0] = 0;
+            for (counts, 0..) |count, band| {
+                starts[band + 1] = starts[band] + count;
+                regions[band] = slots;
+                if (count != 0) slots += try hashTableSlots(2 * @as(usize, count));
+            }
+            regions[band_count] = slots;
+            std.debug.assert(starts[band_count] == touches[tier]);
+        }
+        const table_len = self.group_slots.items.len;
+        if (slots > table_len) {
+            try self.group_slots.ensureTotalCapacity(self.allocator, slots);
+            self.group_slots.items.len = slots;
+        }
+        const touch_total = @as(usize, touches[chunk_tier]) + touches[coarse_tier];
+        try self.chunk_items.ensureTotalCapacity(self.allocator, touches[chunk_tier]);
+        try self.coarse_items.ensureTotalCapacity(self.allocator, touches[coarse_tier]);
+        try self.nav_inserts.ensureTotalCapacity(self.allocator, touches[chunk_tier]);
+        try self.query_inserts.ensureTotalCapacity(self.allocator, touches[chunk_tier]);
+        try self.coarse_inserts.ensureTotalCapacity(self.allocator, touches[coarse_tier]);
+        try self.resource_entries.ensureTotalCapacity(self.allocator, entries_per_touch * touch_total);
+        try self.level_entries.ensureTotalCapacity(self.allocator, touch_total);
+        try self.group_tallies.ensureTotalCapacity(self.allocator, tier_count * band_count);
+        self.chunk_items.items.len = touches[chunk_tier];
+        self.coarse_items.items.len = touches[coarse_tier];
+        self.nav_inserts.items.len = touches[chunk_tier];
+        self.query_inserts.items.len = touches[chunk_tier];
+        self.coarse_inserts.items.len = touches[coarse_tier];
+        self.resource_entries.items.len = entries_per_touch * touch_total;
+        self.level_entries.items.len = touch_total;
+    }
+
+    // `group`: each range owns, per tier, the bands starting in its span of the touches, in a
+    // new generation of the key table.
+    fn groupTouches(self: *StaticColliderSystem, stages: ?RebuildThreads, touches: TierCounts) void {
+        const touch_total = @as(usize, touches[chunk_tier]) + touches[coarse_tier];
+        const dispatch = self.rebuildDispatch(stages, .group, touch_total);
+        const shape = stageShape(dispatch, touch_total, group_range_alignment_items);
+        std.debug.assert(self.group_tallies.capacity >= tier_count * band_count);
+        setSlotCount(GroupTally, &self.group_tallies, tier_count * band_count);
+        GroupTable.advance(self.group_slots.items, &self.group_generation);
+        var job = GroupJob{ .colliders = self, .range_count = shape.range_count };
+        self.last_batches.set(.group, runShaped(dispatch, shape, touch_total, group_range_alignment_items, &job, groupJob));
+    }
+
+    // The group's merge and the growth seam before the fill: each tier's item and unit
+    // starts per band; each resource entry's claim base, band by band in order, so every
+    // claim ordinal is its band's base plus its first-touch rank there; one open per
+    // (band, level) entry; and one reserve per slab class and directory claimed. O(bands +
+    // entries + levels + classes). Grown slabs and block pools count as payload growth as
+    // they grow, and stay on error.
+    fn reservePayloads(self: *StaticColliderSystem) error{OutOfMemory}!void {
+        const bands = &self.item_bands;
+        var units: usize = 0;
+        var claims: [resource_count]u32 = @splat(0);
+        for (0..tier_count) |tier| {
+            bands.item_start[tier][0] = 0;
+            for (0..band_count) |band| {
+                const tally = self.group_tallies.items[tier * band_count + band].value;
+                bands.band_base[tier][band] = self.touch_start[tier][band];
+                bands.item_start[tier][band + 1] = bands.item_start[tier][band] + tally.items;
+                bands.unit_start[tier][band] = units;
+                units += tally.units;
+                const window = self.resource_entries.items[self.entryWindow(tier, band)..][0..tally.entries];
+                for (window) |*entry| {
+                    entry.claim_base = claims[entry.resource];
+                    // Claims stay below the touch count, under 2^31.
+                    claims[entry.resource] += entry.claims;
+                }
+            }
+            bands.unit_start[tier][band_count] = units;
+        }
+        for (0..tier_count) |tier| {
+            for (0..band_count) |band| {
+                const tally = self.group_tallies.items[tier * band_count + band].value;
+                const levels = self.level_entries.items[self.levelWindow(tier, band)..][0..tally.levels];
+                for (levels) |entry| switch (tier) {
+                    chunk_tier => try self.openChunkLevel(@intCast(entry)),
+                    // A coarse entry is `class << 16 | level`.
+                    else => try self.openCoarseLevel(@intCast(entry >> 16), @truncate(entry)),
+                };
+            }
+        }
+        const tally = &self.claim_tally;
+        tally.* = .{};
+        const slabs_before = self.payloads.slab_count;
+        defer self.countPayloadGrowth(self.payloads.slab_count - slabs_before);
+        for (claims[0..max_payload_classes], 0..) |count, class| {
+            if (count == 0) continue;
+            tally.slot_classes.set(class);
+            tally.slot_claims[class] = count;
+            try self.payloads.reserve(self.allocator, @intCast(class), count);
+        }
+        tally.chunk_blocks.claims = claims[chunk_directory_resource];
+        try self.reserveBlocks(&self.chunks, tally.chunk_blocks.claims);
+        for (0..max_query_classes) |class| {
+            const count = claims[coarseDirectoryResource(@intCast(class))];
+            if (count == 0) continue;
+            tally.coarse_classes.set(class);
+            tally.coarse_blocks[class].claims = count;
+            try self.reserveBlocks(&self.coarse[class], count);
+        }
+    }
+
+    // Band `band`'s first resource entry of `tier`: twice its touch start, the coarse tier's
+    // past the chunk tier's.
+    fn entryWindow(self: *const StaticColliderSystem, tier: usize, band: usize) usize {
+        return entries_per_touch * (self.tierTouchBase(tier) + self.touch_start[tier][band]);
+    }
+
+    // Band `band`'s first level entry of `tier`: its touch start, the coarse tier's past the
+    // chunk tier's.
+    fn levelWindow(self: *const StaticColliderSystem, tier: usize, band: usize) usize {
+        return self.tierTouchBase(tier) + self.touch_start[tier][band];
+    }
+
+    fn tierTouchBase(self: *const StaticColliderSystem, tier: usize) usize {
+        return if (tier == chunk_tier) 0 else self.touch_start[chunk_tier][band_count];
+    }
+
+    // `install`: each range owns, per tier, the bands whose first item lies in its span of
+    // the items, and installs their fresh blocks.
+    fn installItems(self: *StaticColliderSystem, stages: ?RebuildThreads) void {
+        const item_count = self.item_bands.itemCount();
+        const dispatch = self.rebuildDispatch(stages, .install, item_count);
+        const shape = stageShape(dispatch, item_count, install_range_alignment_items);
+        var job = InstallJob{ .colliders = self, .range_count = shape.range_count };
+        self.last_batches.set(.install, runShaped(dispatch, shape, item_count, install_range_alignment_items, &job, installJob));
+    }
+
+    // The plan lanes over ranks `[start, end)`, from the packed inputs: each static's AABB
+    // (as `math.aabbFromOffsetSize`), footprint cells (as `ColliderGeometry.footprint`), chunk
+    // rect touch count, coarse touch count, and query class (as `queryClass`), stored to its
+    // row, its touch counts to `plan_touch_local` (the scan turns them into offsets), and its
+    // class to `plan_class`.
+    // SIMD verdict: lanes, the last group one masked batch. The u16 class store is a per-lane
+    // store loop: `simd.zig` has no narrowing u16 lane store, and a system declares no raw
+    // vector (`memory-performance.md` § SIMD and core math); four scalar stores per batch.
+    fn planLanes(self: *StaticColliderSystem, inputs: PlanColumns, start: usize, end: usize) void {
+        const geometry = self.geometry.?;
+        const grid = geometry.grid;
+        // Cells to chunks as `chunkRect`, `>> shift`: the chunk edge is a power of two
+        // (`rebuild`), so the shift equals the division bit for bit.
+        std.debug.assert(@as(u32, 1) << grid.shift == grid.chunk_tiles);
+        const chunk_shift: u5 = grid.shift;
+        const one = simd.splatUint4(1);
+        const top_fine_class = simd.splatInt4(grid.shift);
+        const chunk_counts = self.plan_touch_local[chunk_tier].items;
+        const coarse_counts = self.plan_touch_local[coarse_tier].items;
+        var group = start;
+        while (group < end) : (group += simd.lane_count) {
+            const count = end - group;
+            const min_x = simd.loadFloat4Lanes(inputs.x[group..], count) + simd.loadFloat4Lanes(inputs.offset_x[group..], count);
+            const min_y = simd.loadFloat4Lanes(inputs.y[group..], count) + simd.loadFloat4Lanes(inputs.offset_y[group..], count);
+            const max_x = min_x + simd.loadFloat4Lanes(inputs.size_x[group..], count);
+            const max_y = min_y + simd.loadFloat4Lanes(inputs.size_y[group..], count);
+            simd.storeFloat4Lanes(self.row_min_x[group..], min_x, count);
+            simd.storeFloat4Lanes(self.row_min_y[group..], min_y, count);
+            simd.storeFloat4Lanes(self.row_max_x[group..], max_x, count);
+            simd.storeFloat4Lanes(self.row_max_y[group..], max_y, count);
+            // Clamped cells lie in `[0, edge - 1]`, so non-negative.
+            const cell_min_x: simd.Uint4 = @bitCast(simd.worldPosToCell4(min_x, geometry.cell_size, grid.width));
+            const cell_min_y: simd.Uint4 = @bitCast(simd.worldPosToCell4(min_y, geometry.cell_size, grid.height));
+            const cell_max_x: simd.Uint4 = @bitCast(simd.lastCellOfSpan4(min_x, max_x, geometry.cell_size, grid.width));
+            const cell_max_y: simd.Uint4 = @bitCast(simd.lastCellOfSpan4(min_y, max_y, geometry.cell_size, grid.height));
+            simd.storeUint4Lanes(self.row_cell_min_x[group..], cell_min_x, count);
+            simd.storeUint4Lanes(self.row_cell_min_y[group..], cell_min_y, count);
+            simd.storeUint4Lanes(self.row_cell_max_x[group..], cell_max_x, count);
+            simd.storeUint4Lanes(self.row_cell_max_y[group..], cell_max_y, count);
+            // The chunk rect's count: a level's chunks number below 2^32.
+            const chunks_wide = (cell_max_x >> @splat(chunk_shift)) - (cell_min_x >> @splat(chunk_shift)) + one;
+            const chunks_high = (cell_max_y >> @splat(chunk_shift)) - (cell_min_y >> @splat(chunk_shift)) + one;
+            simd.storeUint4Lanes(chunk_counts[group..], chunks_wide * chunks_high, count);
+            const classes = geometry.queryClass4(self.query_top_class, min_x, min_y, max_x, max_y, count);
+            const coarse = simd.selectInt4(simd.greaterThanInt4(classes, top_fine_class), simd.splatInt4(1), simd.splatInt4(0));
+            simd.storeUint4Lanes(coarse_counts[group..], @bitCast(coarse), count);
+            inline for (0..simd.lane_count) |lane| {
+                // A class is at most 32.
+                if (lane < count) self.plan_class.items[group + lane] = @intCast(classes[lane]);
+            }
+        }
+    }
+
+    // The plan's scan over ranks `[start, end)`: each rank's row entity and level, its
+    // `row_of_index` entry, its touches' offsets in its range (over the counts the lanes
+    // stored), and the range's touch and class counts.
+    // SIMD verdict: scalar. A running prefix (a data dependency on the running total), and a
+    // class histogram and `row_of_index`, scattered writes; the copies are `@memcpy`.
+    fn planScan(self: *StaticColliderSystem, inputs: PlanColumns, start: usize, end: usize, tally: *PlanTally) void {
+        @memcpy(self.row_entity[start..end], inputs.entity[start..end]);
+        @memcpy(self.row_level[start..end], inputs.level[start..end]);
+        var running: [tier_count]u64 = @splat(0);
+        for (start..end) |rank| {
+            // Ranks stay below the row count, under `no_row`.
+            self.row_of_index.items[inputs.entity[rank].index] = @intCast(rank);
+            for (&self.plan_touch_local, &running) |*local, *total| {
+                const touches = local.items[rank];
+                // Read only once the main thread's merge keeps the total below 2^31.
+                local.items[rank] = @truncate(total.*);
+                total.* += touches;
+            }
+            tally.class_rows[self.plan_class.items[rank]] += 1;
+        }
+        tally.touches = running;
+    }
+
+    // The offset of rank `rank`'s first touch of `tier` in the tier's plan order; the
+    // tier's touch count past the last rank.
+    fn touchOffset(self: *const StaticColliderSystem, tier: usize, rank: usize) usize {
+        if (rank == self.rows.len) return self.tierTouchCount(tier);
+        const base = self.plan_tallies.items[rank / self.plan_items_per_range].value.bases[tier];
+        return @as(usize, base) + self.plan_touch_local[tier].items[rank];
+    }
+
+    // The tier's touch count: the last plan range's base plus its touches.
+    fn tierTouchCount(self: *const StaticColliderSystem, tier: usize) usize {
+        const last = self.plan_tallies.items[self.plan_tallies.items.len - 1].value;
+        // Below the merge's checked total.
+        return @as(usize, last.bases[tier]) + @as(usize, @intCast(last.touches[tier]));
+    }
+
+    // The touches of ranks `[start, end)` in rank order, written from `at` in each tier: each
+    // footprint chunk row-major, the query record on its anchor chunk, then a coarse class's
+    // query cell. Returns each tier's end.
+    // SIMD verdict: scalar. A variable emission per rank (a compaction), with integer key and
+    // anchor packing.
+    fn emitTouches(self: *StaticColliderSystem, start: usize, end: usize, at: [tier_count]usize) [tier_count]usize {
+        const geometry = self.geometry.?;
+        const shift = geometry.grid.shift;
+        var chunk_at = at[chunk_tier];
+        var coarse_at = at[coarse_tier];
+        for (start..end) |rank| {
+            // Ranks stay below the row count, under `no_row`.
+            const row: u32 = @intCast(rank);
+            const placement = self.rowPlacement(row);
+            const aabb = self.rowAabb(row);
+            // A query class fits u6.
+            const class: u6 = @intCast(self.plan_class.items[rank]);
+            const entity = self.row_entity[rank].index;
+            const query_key = geometry.queryKey(placement.level, class, placement.cells);
+            const anchor: ?AnchorBit = if (class <= shift) geometry.anchorBit(query_key) else null;
+            const rect = geometry.chunkRect(placement);
+            var chunk_y = rect.min_y;
+            while (chunk_y <= rect.max_y) : (chunk_y += 1) {
+                var chunk_x = rect.min_x;
+                while (chunk_x <= rect.max_x) : (chunk_x += 1) {
+                    const key = chunkKey(rect.level, chunk_y * rect.chunks_x + chunk_x);
+                    const query_record = if (anchor) |bit| bit.chunk_key == key else false;
+                    self.chunk_touches.items[chunk_at] = .{
+                        .key = key,
+                        .entity = entity,
+                        // An anchor bit indexes the u16-counted anchor block.
+                        .bit = if (query_record) @intCast(anchor.?.bit) else 0,
+                        .query_record = query_record,
+                        .cells = placement.cells,
+                        .aabb = aabb,
+                    };
+                    chunk_at += 1;
+                }
+            }
+            if (class > shift) {
+                self.coarse_touches.items[coarse_at] = .{ .key = query_key, .entity = entity, .aabb = aabb };
+                coarse_at += 1;
+            }
+        }
+        return .{ chunk_at, coarse_at };
+    }
+
+    // One chunk-tier group band: its touches' chunks into items in first-touch order (pass
+    // 1), each item's columns, payload claims, insert windows, fill units, and level marker
+    // (pass 2), then the inserts (pass 3), and the band's tally. A chunk's inserts arrive in
+    // entity order.
+    // SIMD verdict: scalar. Hash point lookups per touch, first-touch item creation, and a
+    // cursor scatter (a data dependency on each item's cursor).
+    fn groupChunkBand(self: *StaticColliderSystem, band: usize) void {
+        const start = self.touch_start[chunk_tier][band];
+        const count = self.touch_start[chunk_tier][band + 1] - start;
+        var table = BandTable.init(self, chunk_tier, band, count);
+        const items = self.chunk_items.items[start..][0..count];
+        const source = ChunkTouchSort.WindowSource{ .staging = self.chunk_staging.items, .band_offsets = self.touch_band_offsets[chunk_tier].items, .window_stride = 0 };
+        var item_count: u32 = 0;
+        for (0..source.rangeCount()) |range_index| {
+            for (source.segment(range_index, band)) |touch| {
+                const claimed = table.claim(touch.key);
+                if (claimed.fresh) {
+                    table.slots[claimed.slot].item = item_count;
+                    items[item_count] = .{ .level = keyLevel(touch.key), .slot = keyChunk(touch.key) };
+                    item_count += 1;
+                }
+                const item = &items[table.slots[claimed.slot].item];
+                item.nav_insert_count += 1;
+                item.query_insert_count += @intFromBool(touch.query_record);
+            }
+        }
+        var entries = BandEntries{ .window = self.resource_entries.items[self.entryWindow(chunk_tier, band)..][0 .. entries_per_touch * count], .base = self.entryWindow(chunk_tier, band) };
+        const level_window = self.level_entries.items[self.levelWindow(chunk_tier, band)..][0..count];
+        var levels: u32 = 0;
+        var nav_at = start;
+        var query_at = start;
+        var units: usize = 0;
+        for (items[0..item_count]) |*item| {
+            const cap = geometric(item.nav_insert_count) catch unreachable; // lint:allow catch-unreachable: a chunk's inserts stay below max_rebuild_touches, whose power of two fits u32
+            const query_cap = geometric(item.query_insert_count) catch unreachable; // lint:allow catch-unreachable: as the nav capacity
+            const slab_class = PayloadSlabs.classFor(chunkPayloadBytes(cap, query_cap)) catch unreachable; // lint:allow catch-unreachable: columns of 2^31 records stay below the last class
+            const slot_claim = entries.claim(slab_class);
+            const block_claim = entries.claim(chunk_directory_resource);
+            item.payload_plan = .{
+                .slab_class = slab_class,
+                .cap = cap,
+                .query_cap = query_cap,
+                .slot_entry = slot_claim.entry,
+                .slot_claim = slot_claim.ordinal,
+                .block_entry = block_claim.entry,
+                .block_claim = block_claim.ordinal,
+            };
+            item.nav_insert_at = nav_at;
+            item.nav_cursor = nav_at;
+            nav_at += item.nav_insert_count;
+            item.query_insert_at = query_at;
+            item.query_cursor = query_at;
+            query_at += item.query_insert_count;
+            item.unit_local = units;
+            units += @as(usize, item.nav_insert_count) + item.query_insert_count + 1;
+            if (table.claim(level_marker_bit | item.level).fresh) {
+                level_window[levels] = item.level;
+                levels += 1;
+            }
+        }
+        for (0..source.rangeCount()) |range_index| {
+            for (source.segment(range_index, band)) |touch| {
+                const item = &items[table.itemOf(touch.key)];
+                self.nav_inserts.items[item.nav_cursor] = .{ .entity = touch.entity, .min_x = touch.cells.min_x, .min_y = touch.cells.min_y, .max_x = touch.cells.max_x, .max_y = touch.cells.max_y };
+                item.nav_cursor += 1;
+                if (!touch.query_record) continue;
+                self.query_inserts.items[item.query_cursor] = .{ .entity = touch.entity, .bit = touch.bit, .min_x = touch.aabb.min_x, .min_y = touch.aabb.min_y, .max_x = touch.aabb.max_x, .max_y = touch.aabb.max_y };
+                item.query_cursor += 1;
+            }
+        }
+        for (items[0..item_count]) |item| {
+            std.debug.assert(item.nav_cursor == item.nav_insert_at + item.nav_insert_count);
+            std.debug.assert(item.query_cursor == item.query_insert_at + item.query_insert_count);
+        }
+        self.group_tallies.items[chunk_tier * band_count + band].value = .{ .items = item_count, .units = units, .entries = entries.count, .levels = levels };
+    }
+
+    // One coarse-tier group band, as `groupChunkBand`: its cells' items, each item's run
+    // capacity, payload claims, insert window, fill units, and level marker, then the
+    // inserts.
+    // SIMD verdict: scalar, as `groupChunkBand`.
+    fn groupCoarseBand(self: *StaticColliderSystem, band: usize) void {
+        const start = self.touch_start[coarse_tier][band];
+        const count = self.touch_start[coarse_tier][band + 1] - start;
+        var table = BandTable.init(self, coarse_tier, band, count);
+        const items = self.coarse_items.items[start..][0..count];
+        const source = CoarseTouchSort.WindowSource{ .staging = self.coarse_staging.items, .band_offsets = self.touch_band_offsets[coarse_tier].items, .window_stride = 0 };
+        var item_count: u32 = 0;
+        for (0..source.rangeCount()) |range_index| {
+            for (source.segment(range_index, band)) |touch| {
+                const claimed = table.claim(touch.key);
+                if (claimed.fresh) {
+                    table.slots[claimed.slot].item = item_count;
+                    // A query key's class bits hold a class below 64.
+                    items[item_count] = .{ .class = @intCast((touch.key >> 48) & 0x3f), .level = queryKeyLevel(touch.key), .slot = keyChunk(touch.key) };
+                    item_count += 1;
+                }
+                items[table.slots[claimed.slot].item].insert_count += 1;
+            }
+        }
+        var entries = BandEntries{ .window = self.resource_entries.items[self.entryWindow(coarse_tier, band)..][0 .. entries_per_touch * count], .base = self.entryWindow(coarse_tier, band) };
+        const level_window = self.level_entries.items[self.levelWindow(coarse_tier, band)..][0..count];
+        var levels: u32 = 0;
+        var insert_at = start;
+        var units: usize = 0;
+        for (items[0..item_count]) |*item| {
+            const cap = geometric(item.insert_count) catch unreachable; // lint:allow catch-unreachable: a cell's inserts stay below max_rebuild_touches, whose power of two fits u32
+            const slab_class = PayloadSlabs.classFor(queryRunBytes(cap)) catch unreachable; // lint:allow catch-unreachable: a run of 2^31 records stays below the last class
+            const slot_claim = entries.claim(slab_class);
+            const block_claim = entries.claim(coarseDirectoryResource(item.class));
+            item.payload_plan = .{
+                .slab_class = slab_class,
+                .cap = cap,
+                .slot_entry = slot_claim.entry,
+                .slot_claim = slot_claim.ordinal,
+                .block_entry = block_claim.entry,
+                .block_claim = block_claim.ordinal,
+            };
+            item.insert_at = insert_at;
+            item.cursor = insert_at;
+            insert_at += item.insert_count;
+            item.unit_local = units;
+            units += @as(usize, item.insert_count) + 1;
+            const level_entry = @as(u32, item.class) << 16 | item.level;
+            if (table.claim(level_marker_bit | level_entry).fresh) {
+                level_window[levels] = level_entry;
+                levels += 1;
+            }
+        }
+        for (0..source.rangeCount()) |range_index| {
+            for (source.segment(range_index, band)) |touch| {
+                const item = &items[table.itemOf(touch.key)];
+                self.coarse_inserts.items[item.cursor] = .{ .entity = touch.entity, .min_x = touch.aabb.min_x, .min_y = touch.aabb.min_y, .max_x = touch.aabb.max_x, .max_y = touch.aabb.max_y };
+                item.cursor += 1;
+            }
+        }
+        for (items[0..item_count]) |item| std.debug.assert(item.cursor == item.insert_at + item.insert_count);
+        self.group_tallies.items[coarse_tier * band_count + band].value = .{ .items = item_count, .units = units, .entries = entries.count, .levels = levels };
+    }
     // Fixed 33 compares.
     fn refreshQueryClassMask(self: *StaticColliderSystem) void {
         self.query_class_mask = .empty;
@@ -1098,7 +1813,7 @@ pub const StaticColliderSystem = struct {
     /// Applies every captured change from `data`'s final state. Main is O(1) per dirty
     /// static and per footprint chunk: it plans the chunks and coarse cells to rewrite,
     /// keeps each installed payload whose columns hold its records plus the inserts and
-    /// plans a pooled slot claim for any other, then one `chunk_rewrite` dispatch fills them. A
+    /// plans a pooled slot claim for any other, then one `rewrite` dispatch fills them. A
     /// row whose chunks, AABB, and query key are unchanged is written in place and rewrites
     /// nothing. On error nothing is installed and the dirty list stays for the next sync.
     /// The change list resets on every call.
@@ -1131,110 +1846,24 @@ pub const StaticColliderSystem = struct {
 
     fn applySync(self: *StaticColliderSystem, thread_system: *ThreadSystem) void {
         self.applyRows();
-        self.rewriteItems(thread_system, .tuned);
+        self.rewriteItems(Dispatch.init(thread_system, self.tuners.getPtr(.rewrite), self.splice_controls), &absolute_claims);
         self.commitClaims();
         self.installFresh();
         self.finishPending();
         self.clearItems();
     }
 
-    const FillShape = enum { tuned, fixed };
-
-    // A one-off fill's fixed shape, outside the tuner: about `fixed_fill_ranges_per_participant`
-    // ranges of work units per participant the dispatch may wake (the spare ranges absorb a
-    // late worker's wake), never below the thread system's untuned range size, so a small fill
-    // wakes few or no workers. Controls that pin a range size or turn the tuner off keep
-    // theirs. O(1).
-    fn fixedFillDispatch(stage: Dispatch, units: usize) Dispatch {
-        if (!stage.adaptive or stage.items_per_range != null) return stage;
-        const workers = stage.thread_system.workerThreadCount();
-        const participants = @min(stage.max_worker_threads orelse workers, workers) + 1;
-        var fixed = stage;
-        fixed.items_per_range = @max(
-            @divCeil(@max(units, 1), participants * fixed_fill_ranges_per_participant),
-            stage.thread_system.config.items_per_range,
-        );
-        return fixed;
-    }
-
-    // The chunk rewrite stage: one dispatch fills every planned chunk and coarse item, on
-    // `thread_system`'s workers, or inline as one range without one. `sync` runs it under the
-    // `chunk_rewrite` tuner; a `rebuild` (`.fixed`) is a one-off, so it runs at the fixed
-    // shape (`fixedFillDispatch`) and never samples the tuner.
-    fn rewriteItems(self: *StaticColliderSystem, thread_system: ?*ThreadSystem, shape_mode: FillShape) void {
-        const chunk_count = self.chunk_items.items.len;
-        const item_count = chunk_count + self.coarse_items.items.len;
-        if (item_count == 0) return;
-        const total = self.unit_starts.items[item_count];
-        var job = RewriteJob{
-            .colliders = self,
-            .range_count = 0,
-            .unit_starts = self.unit_starts.items,
-            .chunk_count = chunk_count,
-        };
-        const tuned: ?Dispatch = if (thread_system) |threads| Dispatch.init(threads, &self.chunk_rewrite, self.splice_controls) else null;
-        const dispatch: ?Dispatch = if (tuned) |stage| switch (shape_mode) {
-            .tuned => stage,
-            .fixed => fixedFillDispatch(stage, total),
-        } else null;
-        const shape = stageShape(dispatch, total, splice_range_alignment_items);
+    // The chunk rewrite stage: one dispatch fills every planned chunk and coarse item
+    // (`item_bands`) under `dispatch`, or inline as one range without one. `entries` holds
+    // the claim bases the items' ordinals are relative to. `sync` runs it under its rewrite
+    // tuner, a `rebuild` under the rebuild's.
+    fn rewriteItems(self: *StaticColliderSystem, dispatch: ?Dispatch, entries: []const ResourceEntry) void {
+        const units = self.item_bands.unitCount();
+        if (units == 0) return;
+        var job = RewriteJob{ .colliders = self, .entries = entries, .range_count = 0 };
+        const shape = stageShape(dispatch, units, splice_range_alignment_items);
         job.range_count = shape.range_count;
-        self.last_batches.set(.rewrite, runShaped(dispatch, shape, total, splice_range_alignment_items, &job, rewriteJob));
-    }
-
-    // Every live row, as a create into empty directories, through the rewrite stage.
-    fn buildAllRuns(self: *StaticColliderSystem, thread_system: ?*ThreadSystem) error{OutOfMemory}!void {
-        errdefer self.discardPlan();
-        var counts = PlanCounts{};
-        for (self.row_of_index.items) |row| {
-            if (row == no_row) continue;
-            const added = try self.countLiveRow(row);
-            counts.chunk_touches += added.chunk_touches;
-            counts.nav_inserts += added.nav_inserts;
-            counts.query_inserts += added.query_inserts;
-            counts.coarse_inserts += added.coarse_inserts;
-            counts.coarse_touches += added.coarse_touches;
-        }
-        try self.reserveRewriteScratch(counts);
-        for (self.row_of_index.items) |row| {
-            if (row == no_row) continue;
-            const placement = self.rowPlacement(row);
-            const aabb = self.rowAabb(row);
-            self.touchPlacement(placement, self.queryPlacement(placement, aabb));
-        }
-        self.assignInsertRanges();
-        for (self.row_of_index.items, 0..) |row, index| {
-            if (row == no_row) continue;
-            const placement = self.rowPlacement(row);
-            const aabb = self.rowAabb(row);
-            self.writePlacementInserts(@intCast(index), placement, aabb, self.queryPlacement(placement, aabb));
-        }
-        self.finishInsertCursors();
-        try self.planPayloads();
-        self.buildUnits();
-        self.rewriteItems(thread_system, .fixed);
-        self.commitClaims();
-        self.installFresh();
-        self.bumpStamps();
-        self.clearItems();
-    }
-
-    fn countLiveRow(self: *StaticColliderSystem, row: u32) !PlanCounts {
-        const placement = self.rowPlacement(row);
-        const aabb = self.rowAabb(row);
-        const rect = self.geometry.?.chunkRect(placement);
-        const query = self.queryPlacement(placement, aabb);
-        var counts = PlanCounts{
-            .chunk_touches = rect.count(),
-            .nav_inserts = rect.count(),
-        };
-        if (query.class <= self.geometry.?.grid.shift) counts.query_inserts = 1 else {
-            counts.coarse_inserts = 1;
-            counts.coarse_touches = 1;
-        }
-        try self.ensureChunkLevel(placement.level);
-        if (query.class > self.geometry.?.grid.shift) try self.ensureCoarseLevel(query.class, placement.level);
-        return counts;
+        self.last_batches.set(.rewrite, runShaped(dispatch, shape, units, splice_range_alignment_items, &job, rewriteJob));
     }
 
     fn planPending(self: *StaticColliderSystem, data: *const DataSystem) !PlanCounts {
@@ -1295,19 +1924,32 @@ pub const StaticColliderSystem = struct {
         return counts;
     }
 
+    // The rewrite's item and insert lists, grown geometrically here at the commit seam. A
+    // rebuild frees them, so the first sync after one grows them again: each list whose
+    // capacity changes counts as one payload growth, on error too.
     fn reserveRewriteScratch(self: *StaticColliderSystem, counts: PlanCounts) !void {
+        const before = self.rewriteScratchCapacities();
+        defer self.countPayloadGrowth(changedCapacities(before, self.rewriteScratchCapacities()));
         try self.chunk_items.ensureTotalCapacity(self.allocator, counts.chunk_touches);
         try self.coarse_items.ensureTotalCapacity(self.allocator, counts.coarse_touches);
         try self.nav_inserts.ensureTotalCapacity(self.allocator, counts.nav_inserts);
         try self.query_inserts.ensureTotalCapacity(self.allocator, counts.query_inserts);
         try self.coarse_inserts.ensureTotalCapacity(self.allocator, counts.coarse_inserts);
-        try self.unit_starts.ensureTotalCapacity(self.allocator, counts.chunk_touches + counts.coarse_touches + 1);
         std.debug.assert(self.chunk_items.capacity >= counts.chunk_touches);
         std.debug.assert(self.coarse_items.capacity >= counts.coarse_touches);
         std.debug.assert(self.nav_inserts.capacity >= counts.nav_inserts);
         std.debug.assert(self.query_inserts.capacity >= counts.query_inserts);
         std.debug.assert(self.coarse_inserts.capacity >= counts.coarse_inserts);
-        std.debug.assert(self.unit_starts.capacity >= counts.chunk_touches + counts.coarse_touches + 1);
+    }
+
+    fn rewriteScratchCapacities(self: *const StaticColliderSystem) [5]usize {
+        return .{ self.chunk_items.capacity, self.coarse_items.capacity, self.nav_inserts.capacity, self.query_inserts.capacity, self.coarse_inserts.capacity };
+    }
+
+    fn changedCapacities(before: [5]usize, after: [5]usize) usize {
+        var changed: usize = 0;
+        for (before, after) |old, new| changed += @intFromBool(old != new);
+        return changed;
     }
 
     fn touchPending(self: *StaticColliderSystem) void {
@@ -1613,30 +2255,31 @@ pub const StaticColliderSystem = struct {
         while (directories.next()) |class| self.coarse[class].commitReleases(tally.coarse_blocks[class].releases);
     }
 
-    // The fill's work units, as prefix sums in item order: an item's old records and inserts
-    // plus one. An emptied item's fill returns at once, so it is one unit. Runs after
-    // `planPayloads`. O(items).
+    // The fill's work units, each item's offset in its tier: its old records and inserts
+    // plus one. An emptied item's fill returns at once, so it is one unit. The sync's items
+    // are each tier's one band. Runs after `planPayloads`. O(items).
     fn buildUnits(self: *StaticColliderSystem) void {
-        self.unit_starts.clearRetainingCapacity();
-        var units: usize = 0;
-        self.unit_starts.appendAssumeCapacity(units);
-        for (self.chunk_items.items) |item| {
-            if (item.payload_plan.kind != .emptied) units += @as(usize, item.old_nav) + item.nav_insert_count + item.old_query + item.query_insert_count;
-            units += 1;
-            self.unit_starts.appendAssumeCapacity(units);
+        var chunk_units: usize = 0;
+        for (self.chunk_items.items) |*item| {
+            item.unit_local = chunk_units;
+            if (item.payload_plan.kind != .emptied) chunk_units += @as(usize, item.old_nav) + item.nav_insert_count + item.old_query + item.query_insert_count;
+            chunk_units += 1;
         }
-        for (self.coarse_items.items) |item| {
-            if (item.payload_plan.kind != .emptied) units += @as(usize, item.old_len) + item.insert_count;
-            units += 1;
-            self.unit_starts.appendAssumeCapacity(units);
+        var coarse_units: usize = 0;
+        for (self.coarse_items.items) |*item| {
+            item.unit_local = coarse_units;
+            if (item.payload_plan.kind != .emptied) coarse_units += @as(usize, item.old_len) + item.insert_count;
+            coarse_units += 1;
         }
+        // Item lists stay below the touch counts the reserve sized, under u32.
+        self.item_bands = ItemBands.single(.{ @intCast(self.chunk_items.items.len), @intCast(self.coarse_items.items.len) }, .{ chunk_units, coarse_units });
     }
 
     // Writes the item's descriptor in its block: an in-place item's live one; a replacing
     // item's old block, after reading its old columns; a fresh chunk's claimed block,
-    // written whole. A fresh slot is the planned claim of its class. An emptied item writes
-    // nothing; install releases its block and slot.
-    fn fillChunkItem(self: *StaticColliderSystem, index: usize) void {
+    // written whole. A fresh slot or block is the claim at its entry's base in `entries` plus
+    // its ordinal there. An emptied item writes nothing; install releases its block and slot.
+    fn fillChunkItem(self: *StaticColliderSystem, index: usize, entries: []const ResourceEntry) void {
         const item = &self.chunk_items.items[index];
         const plan = item.payload_plan;
         if (plan.kind == .emptied) return;
@@ -1655,14 +2298,14 @@ pub const StaticColliderSystem = struct {
                 break :in_place live;
             },
             .fresh_slot => fresh: {
-                const slot = PayloadSlot{ .class = plan.slab_class, .id = self.payloads.claimedId(plan.slab_class, plan.slot_claim) };
+                const slot = PayloadSlot{ .class = plan.slab_class, .id = self.payloads.claimedId(plan.slab_class, plan.slotOrdinal(entries)) };
                 const columns = splitChunk(self.payloads.bytesOf(slot), slot, plan.cap, plan.query_cap);
                 var old_nav = NavRecords.of(&empty_chunk);
                 var old_query = QueryRecords.of(&empty_chunk);
                 var old_nav_len: u32 = 0;
                 var old_query_len: u32 = 0;
                 const target = if (item.old_block == empty_block) claimed: {
-                    item.block = self.chunks.claimedBlock(plan.block_claim);
+                    item.block = self.chunks.claimedBlock(plan.blockOrdinal(entries));
                     break :claimed self.chunks.writeClaimed(item.block, columns);
                 } else replaced: {
                     const live = self.chunks.payloadMut(item.old_block);
@@ -1682,7 +2325,7 @@ pub const StaticColliderSystem = struct {
         emitGroups(payload);
     }
 
-    fn fillCoarseItem(self: *StaticColliderSystem, index: usize) void {
+    fn fillCoarseItem(self: *StaticColliderSystem, index: usize, entries: []const ResourceEntry) void {
         const item = &self.coarse_items.items[index];
         const plan = item.payload_plan;
         if (plan.kind == .emptied) return;
@@ -1699,12 +2342,12 @@ pub const StaticColliderSystem = struct {
                 break :in_place live;
             },
             .fresh_slot => fresh: {
-                const slot = PayloadSlot{ .class = plan.slab_class, .id = self.payloads.claimedId(plan.slab_class, plan.slot_claim) };
+                const slot = PayloadSlot{ .class = plan.slab_class, .id = self.payloads.claimedId(plan.slab_class, plan.slotOrdinal(entries)) };
                 const columns = splitQueryRun(self.payloads.bytesOf(slot), slot, plan.cap);
                 var old = RunRecords.of(&empty_run);
                 var old_len: u32 = 0;
                 const target = if (item.old_block == empty_block) claimed: {
-                    item.block = dir.claimedBlock(plan.block_claim);
+                    item.block = dir.claimedBlock(plan.blockOrdinal(entries));
                     break :claimed dir.writeClaimed(item.block, columns);
                 } else replaced: {
                     const live = dir.payloadMut(item.old_block);
@@ -1776,7 +2419,6 @@ pub const StaticColliderSystem = struct {
         self.nav_inserts.clearRetainingCapacity();
         self.query_inserts.clearRetainingCapacity();
         self.coarse_inserts.clearRetainingCapacity();
-        self.unit_starts.clearRetainingCapacity();
     }
 
     // Drops a call's planned items and bumps the stamps. Nothing is claimed before the fill,
@@ -1800,23 +2442,39 @@ pub const StaticColliderSystem = struct {
         }
     }
 
-    fn ensureChunkLevel(self: *StaticColliderSystem, level: u16) !void {
+    // `level`'s chunk directory, opened once; an opening counts as payload growth.
+    fn openChunkLevel(self: *StaticColliderSystem, level: u16) error{OutOfMemory}!void {
         const slot_count = self.geometry.?.grid.chunkCount();
         const before = self.chunks.slotCount(level);
         try self.chunks.openLevel(self.allocator, level, slot_count);
         if (self.chunks.slotCount(level) != before) self.countPayloadGrowth(1);
-        try self.ensureStamps(&self.chunk_stamps, level, slot_count);
     }
 
-    fn ensureCoarseLevel(self: *StaticColliderSystem, class: u6, level: u16) !void {
-        const geometry = self.geometry.?;
-        const count_u = geometry.classCellsX(class) * geometry.classCellsY(class);
-        if (count_u >= empty_block) return error.OutOfMemory;
-        const slot_count: usize = @intCast(count_u);
+    // Class `class`'s coarse directory of `level`, opened once; an opening counts as payload
+    // growth. A level whose class cells reach `empty_block` fails as `OutOfMemory`.
+    fn openCoarseLevel(self: *StaticColliderSystem, class: u6, level: u16) error{OutOfMemory}!void {
+        const slot_count = try self.coarseSlotCount(class);
         const before = self.coarse[class].slotCount(level);
         try self.coarse[class].openLevel(self.allocator, level, slot_count);
         if (self.coarse[class].slotCount(level) != before) self.countPayloadGrowth(1);
-        try self.ensureStamps(&self.coarse_stamps[class], level, slot_count);
+    }
+
+    fn coarseSlotCount(self: *const StaticColliderSystem, class: u6) error{OutOfMemory}!usize {
+        const geometry = self.geometry.?;
+        const count = geometry.classCellsX(class) * geometry.classCellsY(class);
+        if (count >= empty_block) return error.OutOfMemory;
+        // Below `empty_block`.
+        return @intCast(count);
+    }
+
+    fn ensureChunkLevel(self: *StaticColliderSystem, level: u16) !void {
+        try self.openChunkLevel(level);
+        try self.ensureStamps(&self.chunk_stamps, level, self.geometry.?.grid.chunkCount());
+    }
+
+    fn ensureCoarseLevel(self: *StaticColliderSystem, class: u6, level: u16) !void {
+        try self.openCoarseLevel(class, level);
+        try self.ensureStamps(&self.coarse_stamps[class], level, try self.coarseSlotCount(class));
     }
 
     fn ensureStamps(self: *StaticColliderSystem, lists: *std.ArrayList([]SlotStamp), level: u16, slot_count: usize) !void {
@@ -1918,7 +2576,39 @@ const PayloadPlan = struct {
     block_claim: u32 = 0,
     block_release: u32 = 0,
     slot_release: u32 = 0,
+    // The resource entries the slot and block claims are ordinals of: each claim takes its
+    // entry's base plus its ordinal (`absolute_claims` for absolute ordinals).
+    slot_entry: u32 = 0,
+    block_entry: u32 = 0,
+
+    fn slotOrdinal(self: PayloadPlan, entries: []const ResourceEntry) usize {
+        return @as(usize, entries[self.slot_entry].claim_base) + self.slot_claim;
+    }
+
+    fn blockOrdinal(self: PayloadPlan, entries: []const ResourceEntry) usize {
+        return @as(usize, entries[self.block_entry].claim_base) + self.block_claim;
+    }
 };
+
+// One resource's claims in one group band (or a sync's whole call): the claim count and,
+// from the main thread's merge, the base of its ordinals in the resource.
+const ResourceEntry = struct {
+    resource: u16 = 0,
+    claims: u32 = 0,
+    claim_base: u32 = 0,
+};
+
+// A sync plans its claims on main as absolute ordinals: one entry of base 0.
+const absolute_claims = [_]ResourceEntry{.{}};
+
+// Resource ids of a call's claims: each payload slab class, then the chunk directory, then
+// each coarse class's directory.
+const chunk_directory_resource: u16 = max_payload_classes;
+const resource_count: usize = max_payload_classes + 1 + max_query_classes;
+
+fn coarseDirectoryResource(class: u6) u16 {
+    return chunk_directory_resource + 1 + @as(u16, class);
+}
 
 // One call's ordinal claims and releases per payload slab class and per directory, taken
 // in item order on main before the fill, committed after it.
@@ -1985,6 +2675,8 @@ fn installItem(comptime Dir: type, dir: *Dir, payloads: *const PayloadSlabs, lev
 const ChunkItem = struct {
     level: u16,
     slot: u32,
+    // The item's first fill unit past its band's (`ItemBands.unit_start`).
+    unit_local: usize = 0,
     old_block: u32 = empty_block,
     // The claimed block of an item with no block, resolved by the fill.
     block: u32 = empty_block,
@@ -2029,6 +2721,8 @@ const CoarseItem = struct {
     class: u6,
     level: u16,
     slot: u32,
+    // The item's first fill unit past its band's (`ItemBands.unit_start`).
+    unit_local: usize = 0,
     old_block: u32 = empty_block,
     // The claimed block of an item with no block, resolved by the fill.
     block: u32 = empty_block,
@@ -2049,21 +2743,48 @@ const CoarseItem = struct {
 
 const RewriteJob = struct {
     colliders: *StaticColliderSystem,
+    entries: []const ResourceEntry,
     range_count: usize,
-    unit_starts: []const usize,
-    chunk_count: usize,
 };
 
+// A range fills every item whose first unit lies in it, tier by tier.
 fn rewriteJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *RewriteJob = @ptrCast(@alignCast(context));
     const colliders = job.colliders;
-    const item_count = colliders.chunk_items.items.len + colliders.coarse_items.items.len;
-    const starts = job.unit_starts[0..item_count];
     std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.start <= range.end and range.end <= job.unit_starts[item_count]);
-    var item = std.sort.lowerBound(usize, starts, range.start, orderUnit);
-    while (item < item_count and starts[item] < range.end) : (item += 1) {
-        if (item < job.chunk_count) colliders.fillChunkItem(item) else colliders.fillCoarseItem(item - job.chunk_count);
+    std.debug.assert(range.start <= range.end and range.end <= colliders.item_bands.unitCount());
+    fillTierRange(ChunkItem, colliders, colliders.chunk_items.items, chunk_tier, range, job.entries, StaticColliderSystem.fillChunkItem);
+    fillTierRange(CoarseItem, colliders, colliders.coarse_items.items, coarse_tier, range, job.entries, StaticColliderSystem.fillCoarseItem);
+}
+
+// Fills `tier`'s items whose first unit lies in `range`: the band holding the range's first
+// unit (`upperBound` over the band starts), its first such item (`lowerBound` over the band's
+// unit offsets), then on in band order. O(log bands + log items) to locate.
+fn fillTierRange(
+    comptime Item: type,
+    colliders: *StaticColliderSystem,
+    items: []const Item,
+    tier: usize,
+    range: ParallelRange,
+    entries: []const ResourceEntry,
+    comptime fill: fn (*StaticColliderSystem, usize, []const ResourceEntry) void,
+) void {
+    const bands = &colliders.item_bands;
+    const starts = &bands.unit_start[tier];
+    if (range.start >= starts[band_count] or range.end <= starts[0]) return;
+    const first_unit = @max(range.start, starts[0]);
+    // `starts[0] <= first_unit < starts[band_count]`, so the bound lies in `[1, band_count]`.
+    var band = std.sort.upperBound(usize, starts[0..band_count], first_unit, orderUnit) - 1;
+    var local = firstItemFrom(Item, bands.bandItems(Item, items, tier, band), first_unit - starts[band]);
+    while (band < band_count) : ({
+        band += 1;
+        local = 0;
+    }) {
+        const band_items = bands.bandItems(Item, items, tier, band);
+        while (local < band_items.len) : (local += 1) {
+            if (starts[band] + band_items[local].unit_local >= range.end) return;
+            fill(colliders, bands.band_base[tier][band] + local, entries);
+        }
     }
 }
 
@@ -2071,6 +2792,440 @@ fn orderUnit(unit: usize, start: usize) std.math.Order {
     return std.math.order(unit, start);
 }
 
+// The first of `items` (ascending in `unit_local`) whose first unit is at or past `unit`.
+// Hand-rolled: std's bounds pass each item by value, a whole-struct read racing the other
+// ranges' fills of the fields they own; this reads `unit_local` alone.
+fn firstItemFrom(comptime Item: type, items: []const Item, unit: usize) usize {
+    var low: usize = 0;
+    var high: usize = items.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (items[middle].unit_local < unit) low = middle + 1 else high = middle;
+    }
+    return low;
+}
+
+// The touch tiers: footprint chunks, and coarse query cells.
+const tier_count: usize = 2;
+const chunk_tier: usize = 0;
+const coarse_tier: usize = 1;
+// A count per tier.
+const TierCounts = [tier_count]u32;
+
+// A rebuild's touches stay below this, so every touch, item, insert, and entry index fits
+// u32 and every per-chunk record count's `geometric` capacity exists. A total at it fails as
+// `OutOfMemory`; unreachable, as the touch scratch alone would pass 100 GB.
+const max_rebuild_touches: u64 = 1 << 31;
+// Resource entries per touch of a band's window: each item claims one slab class and one
+// directory, and a band has at most one item per touch.
+const entries_per_touch: usize = 2;
+
+// The range alignment of a stage writing per-item elements of the `rows`' columns and of the
+// `elements` types: each range spans at least a cache line of its narrowest written column,
+// and at least one lane batch.
+fn stageAlignment(comptime rows: []const type, comptime elements: []const type) usize {
+    comptime {
+        const line = thread_shared_record_alignment;
+        var narrowest: usize = line;
+        for (rows) |Columns| {
+            for (@typeInfo(Columns).@"struct".field_types) |Column| narrowest = @min(narrowest, @as(usize, @sizeOf(Column)));
+        }
+        for (elements) |Element| narrowest = @min(narrowest, @as(usize, @sizeOf(Element)));
+        const items: usize = @max(simd.lane_count, (line + narrowest - 1) / narrowest);
+        for (rows) |Columns| {
+            for (@typeInfo(Columns).@"struct".field_types) |Column| std.debug.assert(items * @as(usize, @sizeOf(Column)) >= line);
+        }
+        for (elements) |Element| std.debug.assert(items * @as(usize, @sizeOf(Element)) >= line);
+        return items;
+    }
+}
+
+/// Each rebuild stage's range alignment, from the narrowest column it writes per item
+/// (`stageAlignment`): `select` writes the packed plan inputs; `plan` the rows,
+/// `row_of_index`, the query class, and the touch offsets; `touch` each tier's touches, a
+/// variable count per rank, so each range's windows start their own cache lines
+/// (`touchWindowStart`) and the alignment is the lane batch the elements give; `group` the
+/// key table, items, inserts, resource and level entries; `rewrite` the payloads, at the
+/// splice's; `install` the directory slots.
+pub const rebuild_range_alignment = std.EnumArray(RebuildStage, usize).init(.{
+    .select = stageAlignment(&.{PlanInput}, &.{}),
+    .plan = stageAlignment(&.{Row}, &.{ u32, u16 }),
+    .touch = stageAlignment(&.{}, &.{ ChunkTouch, CoarseTouch }),
+    .group = stageAlignment(&.{}, &.{ GroupSlot, ChunkItem, CoarseItem, SpanInsert, AabbInsert, ResourceEntry, u32 }),
+    .rewrite = splice_range_alignment_items,
+    .install = stageAlignment(&.{}, &.{u32}),
+});
+const select_range_alignment_items = rebuild_range_alignment.get(.select);
+const plan_range_alignment_items = rebuild_range_alignment.get(.plan);
+const touch_range_alignment_items = rebuild_range_alignment.get(.touch);
+const group_range_alignment_items = rebuild_range_alignment.get(.group);
+const install_range_alignment_items = rebuild_range_alignment.get(.install);
+
+comptime {
+    // The plan lanes read the select's windows whole, and both stages step whole lane batches.
+    std.debug.assert(select_range_alignment_items % simd.lane_count == 0);
+    std.debug.assert(plan_range_alignment_items % simd.lane_count == 0);
+}
+
+// One static's packed plan input: its entity, level, and AABB inputs.
+const PlanInput = StaticObstacle;
+
+// `plan_inputs`' columns, sliced once per stage.
+const PlanColumns = struct {
+    entity: []EntityId,
+    level: []u16,
+    x: []f32,
+    y: []f32,
+    offset_x: []f32,
+    offset_y: []f32,
+    size_x: []f32,
+    size_y: []f32,
+
+    fn of(inputs: *std.MultiArrayList(PlanInput)) PlanColumns {
+        const columns = inputs.slice();
+        return .{
+            .entity = columns.items(.entity),
+            .level = columns.items(.level),
+            .x = columns.items(.x),
+            .y = columns.items(.y),
+            .offset_x = columns.items(.offset_x),
+            .offset_y = columns.items(.offset_y),
+            .size_x = columns.items(.size_x),
+            .size_y = columns.items(.size_y),
+        };
+    }
+};
+
+// One select range's statics, at the front of its window.
+const SelectTally = struct { kept: usize = 0 };
+
+// One plan range's touches per tier and rows per query class; the main thread then writes
+// the range's touch bases per tier.
+const PlanTally = struct {
+    touches: [tier_count]u64 = @splat(0),
+    class_rows: [max_query_classes]u32 = @splat(0),
+    bases: TierCounts = @splat(0),
+};
+
+// One footprint chunk of a static, as `touch` emits it: the chunk's key, the static's entity
+// index, footprint, and AABB, and whether its query record anchors here, at `bit`.
+const ChunkTouch = struct {
+    key: u64,
+    entity: u32,
+    bit: u16,
+    query_record: bool,
+    cells: CellSpan,
+    aabb: math.Aabb,
+};
+
+// A coarse-class static's query cell: the cell's key, the static's entity index and AABB.
+const CoarseTouch = struct {
+    key: u64,
+    entity: u32,
+    aabb: math.Aabb,
+};
+
+fn chunkTouchKey(touch: ChunkTouch) u64 {
+    return touch.key;
+}
+
+fn coarseTouchKey(touch: CoarseTouch) u64 {
+    return touch.key;
+}
+
+const ChunkTouchSort = banded_sort.BandedSort(ChunkTouch, chunkTouchKey);
+const CoarseTouchSort = banded_sort.BandedSort(CoarseTouch, coarseTouchKey);
+const TouchSplitters = ChunkTouchSort.Splitters;
+
+comptime {
+    std.debug.assert(TouchSplitters == CoarseTouchSort.Splitters);
+}
+
+// One key of a band's table: a chunk or cell key and its item, or a level marker.
+const GroupSlot = struct { key: u64, item: u32, stamp: u32 };
+const GroupTable = StampedTable(GroupSlot, "key");
+
+fn groupSlotOf(key: u64, stamp: u32) GroupSlot {
+    return .{ .key = key, .item = 0, .stamp = stamp };
+}
+
+// A level marker key sets bit 63, which no chunk or query key sets.
+const level_marker_bit: u64 = 1 << 63;
+
+// One group band's items, fill units, resource entries, and level entries.
+const GroupTally = struct {
+    items: u32 = 0,
+    units: usize = 0,
+    entries: u32 = 0,
+    levels: u32 = 0,
+};
+
+// Where the fill and install find a call's items: tier `tier`'s band b holds items
+// `[band_base[tier][b], band_base[tier][b] + item_start[tier][b + 1] - item_start[tier][b])`
+// of the tier's item list, and its fill units start at `unit_start[tier][b]`, the coarse
+// tier's past the chunk tier's.
+const ItemBands = struct {
+    item_start: [tier_count][band_count + 1]u32 = @splat(@splat(0)),
+    unit_start: [tier_count][band_count + 1]usize = @splat(@splat(0)),
+    band_base: [tier_count][band_count]u32 = @splat(@splat(0)),
+
+    // Each tier's items as one band at the list's front.
+    fn single(items: TierCounts, units: [tier_count]usize) ItemBands {
+        var bands = ItemBands{};
+        var unit_base: usize = 0;
+        for (0..tier_count) |tier| {
+            bands.item_start[tier] = @splat(items[tier]);
+            bands.item_start[tier][0] = 0;
+            bands.unit_start[tier] = @splat(unit_base + units[tier]);
+            bands.unit_start[tier][0] = unit_base;
+            unit_base += units[tier];
+        }
+        return bands;
+    }
+
+    fn unitCount(self: *const ItemBands) usize {
+        return self.unit_start[coarse_tier][band_count];
+    }
+
+    fn itemCount(self: *const ItemBands) usize {
+        return @as(usize, self.item_start[chunk_tier][band_count]) + self.item_start[coarse_tier][band_count];
+    }
+
+    fn bandItems(self: *const ItemBands, comptime Item: type, items: []const Item, tier: usize, band: usize) []const Item {
+        return items[self.band_base[tier][band]..][0 .. self.item_start[tier][band + 1] - self.item_start[tier][band]];
+    }
+};
+
+const SelectJob = struct {
+    data: *const DataSystem,
+    columns: StaticObstacleColumns,
+    inputs: PlanColumns,
+    tallies: []PaddedSlot(SelectTally),
+    items_per_range: usize,
+};
+
+// `select`: one range of entity slots. Keeps each slot's static at the front of the range's
+// window, in slot order.
+// SIMD verdict: scalar. One slot read (alive, components) and one row read per store per
+// entity, a filter with a compaction: the one gather that packs the plan lanes' inputs.
+fn selectJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *SelectJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.tallies.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.inputs.entity.len and range.end <= job.data.slots.items.len);
+    const inputs = job.inputs;
+    var kept = range.start;
+    for (range.start..range.end) |slot| {
+        const obstacle = job.data.staticObstacleAt(slot, job.columns) orelse continue;
+        inputs.entity[kept] = obstacle.entity;
+        inputs.level[kept] = obstacle.level;
+        inputs.x[kept] = obstacle.x;
+        inputs.y[kept] = obstacle.y;
+        inputs.offset_x[kept] = obstacle.offset_x;
+        inputs.offset_y[kept] = obstacle.offset_y;
+        inputs.size_x[kept] = obstacle.size_x;
+        inputs.size_y[kept] = obstacle.size_y;
+        kept += 1;
+    }
+    job.tallies[range.index].value = .{ .kept = kept - range.start };
+}
+
+const PlanJob = struct {
+    colliders: *StaticColliderSystem,
+    inputs: PlanColumns,
+};
+
+// `plan`: one range of ranks: the lanes, then the scan.
+fn planJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *PlanJob = @ptrCast(@alignCast(context));
+    const colliders = job.colliders;
+    std.debug.assert(range.index < colliders.plan_tallies.items.len);
+    std.debug.assert(range.start == range.index * colliders.plan_items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= colliders.rows.len and range.end <= job.inputs.entity.len);
+    std.debug.assert(range.end <= colliders.plan_class.items.len);
+    for (colliders.plan_touch_local) |local| std.debug.assert(range.end <= local.items.len);
+    colliders.planLanes(job.inputs, range.start, range.end);
+    colliders.planScan(job.inputs, range.start, range.end, &colliders.plan_tallies.items[range.index].value);
+}
+
+// A touch tier's list, line-aligned so every touch range's window starts a cache line.
+fn TouchList(comptime Touch: type) type {
+    return std.array_list.Aligned(Touch, .fromByteUnits(thread_shared_record_alignment));
+}
+
+// A tier's touches per window quantum: the fewest whose bytes end on a cache line.
+fn touchWindowQuantum(comptime Touch: type) usize {
+    return comptime thread_shared_record_alignment / std.math.gcd(thread_shared_record_alignment, @sizeOf(Touch));
+}
+
+// The start of touch range `range_index`'s window, whose first touch is `first` in plan
+// order: `first` past `range_index` quanta of slack, rounded up to the quantum, so every
+// range's window starts its own cache line and never reaches the next range's start. O(1).
+fn touchWindowStart(comptime Touch: type, first: usize, range_index: usize) usize {
+    const quantum = touchWindowQuantum(Touch);
+    return std.mem.alignForward(usize, first + range_index * (quantum - 1), quantum);
+}
+
+// The extent of a tier's `touches` over `range_count` padded windows.
+fn touchExtent(comptime Touch: type, touches: usize, range_count: usize) usize {
+    return touches + range_count * (touchWindowQuantum(Touch) - 1);
+}
+
+const TouchJob = struct {
+    colliders: *StaticColliderSystem,
+    range_count: usize,
+};
+
+// `touch`: one range of ranks. Writes their touches in plan order into the range's window of
+// each tier (`touchWindowStart`), then places them by band into the same window of the
+// tier's staging and records the window's band offsets, absolute.
+fn touchJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *TouchJob = @ptrCast(@alignCast(context));
+    const colliders = job.colliders;
+    std.debug.assert(range.index < job.range_count);
+    for (colliders.touch_band_offsets) |offsets| std.debug.assert(range.index < offsets.items.len);
+    std.debug.assert(range.start <= range.end and range.end <= colliders.rows.len);
+    var starts: [tier_count]usize = undefined;
+    var ends: [tier_count]usize = undefined;
+    for (&starts, &ends, 0..) |*start, *end, tier| {
+        const first = colliders.touchOffset(tier, range.start);
+        const count = colliders.touchOffset(tier, range.end) - first;
+        start.* = switch (tier) {
+            chunk_tier => touchWindowStart(ChunkTouch, first, range.index),
+            else => touchWindowStart(CoarseTouch, first, range.index),
+        };
+        end.* = start.* + count;
+    }
+    std.debug.assert(ends[chunk_tier] <= colliders.chunk_touches.items.len and ends[chunk_tier] <= colliders.chunk_staging.items.len);
+    std.debug.assert(ends[coarse_tier] <= colliders.coarse_touches.items.len and ends[coarse_tier] <= colliders.coarse_staging.items.len);
+    const written = colliders.emitTouches(range.start, range.end, starts);
+    std.debug.assert(std.mem.eql(usize, &written, &ends));
+    colliders.touch_band_offsets[chunk_tier].items[range.index].value = placeWindow(ChunkTouchSort, &colliders.touch_splitters[chunk_tier], colliders.chunk_touches.items, colliders.chunk_staging.items, starts[chunk_tier], ends[chunk_tier]);
+    colliders.touch_band_offsets[coarse_tier].items[range.index].value = placeWindow(CoarseTouchSort, &colliders.touch_splitters[coarse_tier], colliders.coarse_touches.items, colliders.coarse_staging.items, starts[coarse_tier], ends[coarse_tier]);
+}
+
+// Places `touches[start..end]` by band into `staging[start..end]`; the band offsets are
+// absolute in `staging`, so every range's segments read with a window stride of 0.
+fn placeWindow(comptime Sort: type, splitters: *const TouchSplitters, touches: anytype, staging: anytype, start: usize, end: usize) BandOffsets {
+    var placed = Sort.placeByBand(splitters, touches[start..end], staging[start..end]);
+    // Touch offsets stay below `max_rebuild_touches`.
+    for (&placed.offsets) |*offset| offset.* += @intCast(start);
+    return placed;
+}
+
+const GroupJob = struct {
+    colliders: *StaticColliderSystem,
+    range_count: usize,
+};
+
+// `group`: one range of the touches, chunk tier then coarse tier. The range owns, per tier,
+// every nonempty band whose first touch lies in its span, so each band has one owner.
+fn groupJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *GroupJob = @ptrCast(@alignCast(context));
+    const colliders = job.colliders;
+    const chunk_total: usize = colliders.touch_start[chunk_tier][band_count];
+    const coarse_total: usize = colliders.touch_start[coarse_tier][band_count];
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end and range.end <= chunk_total + coarse_total);
+    std.debug.assert(colliders.group_tallies.items.len == tier_count * band_count);
+    std.debug.assert(chunk_total <= colliders.chunk_items.items.len and chunk_total <= colliders.nav_inserts.items.len and chunk_total <= colliders.query_inserts.items.len);
+    std.debug.assert(coarse_total <= colliders.coarse_items.items.len and coarse_total <= colliders.coarse_inserts.items.len);
+    std.debug.assert(entries_per_touch * (chunk_total + coarse_total) <= colliders.resource_entries.items.len);
+    std.debug.assert(chunk_total + coarse_total <= colliders.level_entries.items.len);
+    var chunk_bands = OwnedBands.init(&colliders.touch_start[chunk_tier], @min(range.start, chunk_total), @min(range.end, chunk_total));
+    while (chunk_bands.next()) |band| colliders.groupChunkBand(band);
+    var coarse_bands = OwnedBands.init(&colliders.touch_start[coarse_tier], @min(range.start -| chunk_total, coarse_total), @min(range.end -| chunk_total, coarse_total));
+    while (coarse_bands.next()) |band| colliders.groupCoarseBand(band);
+}
+
+// One band's key table: its region of `group_slots` this call's generation, with room for
+// its keys and level markers, at most two per touch. The band's owner zeros the region
+// first, O(the band's touches): `reserveGroup` leaves the table uninitialized.
+const BandTable = struct {
+    slots: []GroupSlot,
+    shift: u6,
+    generation: u32,
+    used: usize = 0,
+    budget: usize,
+
+    fn init(colliders: *const StaticColliderSystem, tier: usize, band: usize, touches: u32) BandTable {
+        const region = colliders.group_slots.items[colliders.region_start[tier][band]..colliders.region_start[tier][band + 1]];
+        // `reserveGroup` sized the region from the band's touches at load at most 1/2.
+        std.debug.assert(region.len >= 2 * 2 * @as(usize, touches));
+        @memset(std.mem.sliceAsBytes(region), 0);
+        return .{ .slots = region, .shift = hashTableShift(region.len), .generation = colliders.group_generation, .budget = 2 * @as(usize, touches) };
+    }
+
+    fn claim(self: *BandTable, key: u64) GroupTable.Claim {
+        return GroupTable.claim(self.slots, self.shift, self.generation, &self.used, self.budget, key, groupSlotOf) orelse unreachable; // lint:allow catch-unreachable: a band claims at most one key and one level marker per touch, its budget
+    }
+
+    // The item of a key this band claimed.
+    fn itemOf(self: *BandTable, key: u64) u32 {
+        const claimed = self.claim(key);
+        std.debug.assert(!claimed.fresh);
+        return self.slots[claimed.slot].item;
+    }
+};
+
+// One band's resource entries in first-claim order: its window of `resource_entries` and
+// each resource's entry there.
+const BandEntries = struct {
+    window: []ResourceEntry,
+    base: usize,
+    count: u32 = 0,
+    entry_of: [resource_count]u32 = @splat(unclaimed_resource),
+
+    const unclaimed_resource: u32 = std.math.maxInt(u32);
+    const Claim = struct { entry: u32, ordinal: u32 };
+
+    // The band's next claim of `resource`: its entry's index in `resource_entries` and its
+    // ordinal there.
+    fn claim(self: *BandEntries, resource: u16) Claim {
+        if (self.entry_of[resource] == unclaimed_resource) {
+            std.debug.assert(self.count < self.window.len);
+            self.entry_of[resource] = self.count;
+            self.window[self.count] = .{ .resource = resource };
+            self.count += 1;
+        }
+        const local = self.entry_of[resource];
+        const entry = &self.window[local];
+        defer entry.claims += 1;
+        // Entry indices stay below twice `max_rebuild_touches`.
+        return .{ .entry = @intCast(self.base + local), .ordinal = entry.claims };
+    }
+};
+
+const InstallJob = struct {
+    colliders: *StaticColliderSystem,
+    range_count: usize,
+};
+
+// `install`: one range of the items, chunk tier then coarse tier. The range owns, per tier,
+// every nonempty band whose first item lies in its span; a band's chunks or cells are one key
+// window, so owners write disjoint directory slots.
+// SIMD verdict: scalar. One scattered slot write per item.
+fn installJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *InstallJob = @ptrCast(@alignCast(context));
+    const colliders = job.colliders;
+    const bands = &colliders.item_bands;
+    const chunk_total: usize = bands.item_start[chunk_tier][band_count];
+    const coarse_total: usize = bands.item_start[coarse_tier][band_count];
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end and range.end <= chunk_total + coarse_total);
+    var chunk_bands = OwnedBands.init(&bands.item_start[chunk_tier], @min(range.start, chunk_total), @min(range.end, chunk_total));
+    while (chunk_bands.next()) |band| {
+        for (bands.bandItems(ChunkItem, colliders.chunk_items.items, chunk_tier, band)) |item| {
+            installItem(ChunkDir, &colliders.chunks, &colliders.payloads, item.level, item.slot, item.old_block, item.block, item.payload_plan);
+        }
+    }
+    var coarse_bands = OwnedBands.init(&bands.item_start[coarse_tier], @min(range.start -| chunk_total, coarse_total), @min(range.end -| chunk_total, coarse_total));
+    while (coarse_bands.next()) |band| {
+        for (bands.bandItems(CoarseItem, colliders.coarse_items.items, coarse_tier, band)) |item| {
+            installItem(CoarseDir, &colliders.coarse[item.class], &colliders.payloads, item.level, item.slot, item.old_block, item.block, item.payload_plan);
+        }
+    }
+}
 fn bumpSliceGeneration(generation: *u32, slices: []const []SlotStamp) void {
     generation.* +%= 1;
     if (generation.* != 0) return;
@@ -4337,7 +5492,29 @@ test "rebuild runs out of memory at every allocation and leaves the structure un
     }
 }
 
-test "a rebuild on a fresh system fills at the fixed shape on workers and leaves the sync tuner unsampled" {
+test "each touch range's window starts its own cache line in both tiers, ends before the next range's, and fits the reserved extent" {
+    var prng = std.Random.DefaultPrng.init(0x70c4);
+    const random = prng.random();
+    inline for (.{ ChunkTouch, CoarseTouch }) |Touch| {
+        for (0..64) |_| {
+            const range_count = random.intRangeAtMost(usize, 1, 40);
+            var first: usize = 0;
+            var previous_end: usize = 0;
+            for (0..range_count) |range_index| {
+                // Coarse ranges often write nothing or one touch; chunk ranges a few.
+                const count = random.uintAtMost(usize, 9);
+                const start = touchWindowStart(Touch, first, range_index);
+                try std.testing.expectEqual(@as(usize, 0), start * @sizeOf(Touch) % thread_shared_record_alignment);
+                try std.testing.expect(start >= previous_end);
+                previous_end = start + count;
+                first += count;
+            }
+            try std.testing.expect(previous_end <= touchExtent(Touch, first, range_count));
+        }
+    }
+}
+
+test "a rebuild samples each stage's own rebuild tuner once, carries them to the next rebuild, and samples no sync tuner" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var prng = std.Random.DefaultPrng.init(0x51f1);
@@ -4348,29 +5525,316 @@ test "a rebuild on a fresh system fills at the fixed shape on workers and leaves
     defer commands.deinit(std.testing.allocator);
     for (0..120) |_| try commands.append(std.testing.allocator, randomStatic(random));
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, commands.items);
-    // Production's controls and an untrained tuner, as world create builds the system.
+    // Production's controls and untrained tuners, as world create builds the system.
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
-    try colliders.rebuild(&fixture.data, test_geometry, &threads);
-    const batch = colliders.last_batches.get(.rewrite);
-    // Three participants, four ranges each.
-    const expected_range = std.mem.alignForward(usize, @divCeil(batch.item_count, 3 * fixed_fill_ranges_per_participant), splice_range_alignment_items);
-    try std.testing.expect(!batch.ran_inline and batch.worker_thread_ranges != 0);
-    try std.testing.expectEqual(expected_range, batch.items_per_range);
-    try std.testing.expectEqual(@as(usize, 0), colliders.chunk_rewrite.sample_count);
-    try std.testing.expect(colliders.chunk_rewrite.last_request == null);
-    try expectSameRows(&colliders, &fixture.colliders, 1);
-    // A fill no larger than the thread system's untuned range size wakes no worker.
-    var coarse_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = batch.item_count });
-    defer coarse_threads.deinit();
-    var small = StaticColliderSystem.init(std.testing.allocator);
-    defer small.deinit();
-    try small.rebuild(&fixture.data, test_geometry, &coarse_threads);
-    try std.testing.expect(small.last_batches.get(.rewrite).active_worker_threads == 0);
-    try std.testing.expectEqual(@as(usize, 1), small.last_batches.get(.rewrite).range_count);
-    try expectSameRows(&small, &fixture.colliders, 1);
+    for (1..3) |rebuilds| {
+        try colliders.rebuild(&fixture.data, test_geometry, &threads);
+        for (std.meta.tags(RebuildStage)) |stage| {
+            const batch = colliders.last_batches.get(stage);
+            try std.testing.expect(batch.item_count != 0);
+            // The stage selected through its own tuner, at its items and alignment, and
+            // recorded one sample per rebuild into it, the earlier rebuild's carried over.
+            const tuner = colliders.rebuild_tuners.getPtrConst(stage);
+            const request = tuner.last_request orelse return error.RebuildStageSkippedItsTuner;
+            try std.testing.expectEqual(batch.item_count, request.item_count);
+            try std.testing.expectEqual(batch.range_alignment_items, request.range_alignment_items);
+            try std.testing.expectEqual(rebuilds, tuner.sample_count);
+        }
+        try std.testing.expectEqual(@as(usize, 0), colliders.tuners.get(.rewrite).sample_count);
+        try std.testing.expect(colliders.tuners.get(.rewrite).last_request == null);
+        try expectSameRows(&colliders, &fixture.colliders, 1);
+    }
+    // An empty stage selects through no tuner: a rebuild of no entities samples nothing.
+    var empty = DataSystem.init(std.testing.allocator);
+    defer empty.deinit();
+    const before = colliders.rebuild_tuners;
+    try colliders.rebuild(&empty, test_geometry, &threads);
+    try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(colliders));
+    for (std.meta.tags(RebuildStage)) |stage| {
+        try std.testing.expectEqual(@as(usize, 0), colliders.last_batches.get(stage).item_count);
+        try std.testing.expectEqual(before.get(stage).sample_count, colliders.rebuild_tuners.get(stage).sample_count);
+        try std.testing.expectEqual(before.get(stage).last_request.?.item_count, colliders.rebuild_tuners.get(stage).last_request.?.item_count);
+    }
 }
 
+// `count` statics on levels below `levels`: sizes from a sliver to past the level (fine and
+// coarse classes, chunk borders crossed), positions from off the level to beyond it.
+fn appendRandomLeveledStatics(random: std.Random, count: usize, levels: u16, commands: *std.ArrayList(StructuralCommand)) !void {
+    for (0..count) |_| {
+        const template = staticTemplateOn(randomStaticPosition(random), randomStaticSize(random), random.uintLessThan(u16, levels));
+        try commands.append(std.testing.allocator, .{ .create_entity = template });
+    }
+}
+
+// Whether `a` and `b` hold the same rows, column by column, bit for bit.
+fn expectSameRowColumns(a: *const StaticColliderSystem, b: *const StaticColliderSystem) !void {
+    try std.testing.expectEqual(a.rows.len, b.rows.len);
+    const columns_a = a.rows.slice();
+    const columns_b = b.rows.slice();
+    inline for (comptime std.meta.tags(std.MultiArrayList(Row).Field)) |field| {
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(columns_a.items(field)), std.mem.sliceAsBytes(columns_b.items(field)));
+    }
+    try std.testing.expectEqualSlices(u32, &a.query_class_rows, &b.query_class_rows);
+}
+
+fn expectSameBits(expected: f32, actual: f32) !void {
+    try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(actual)));
+}
+
+fn planInput(x: f32, y: f32, offset_x: f32, offset_y: f32, size_x: f32, size_y: f32) PlanInput {
+    return .{ .entity = EntityId.invalid, .level = 0, .x = x, .y = y, .offset_x = offset_x, .offset_y = offset_y, .size_x = size_x, .size_y = size_y };
+}
+
+test "the plan lanes place every static as the scalar footprint and query class, tails and non-finite extents included" {
+    const geometry = test_geometry;
+    const cell = geometry.cell_size;
+    const chunk_edge = cell * @as(f32, @floatFromInt(geometry.grid.chunk_tiles));
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    const inputs = [_]PlanInput{
+        planInput(40, 40, 0, 0, 8, 8),
+        // Across a chunk corner.
+        planInput(chunk_edge - 10, chunk_edge - 10, 0, 0, 20, 20),
+        // Extents exactly a class edge, from a cell-aligned min: the smaller class.
+        planInput(cell, 2 * cell, 0, 0, 2 * cell, 4 * cell),
+        // One ulp past a class edge: the next class.
+        planInput(cell, cell, 0, 0, std.math.nextAfter(f32, 2 * cell, inf), cell),
+        // A max edge on a cell boundary excludes the cell starting there.
+        planInput(0, 0, cell, cell, cell, cell),
+        // Coarse: wider than a chunk, and past the whole level.
+        planInput(100, 300, -20, 5, 3 * chunk_edge, 10),
+        planInput(-500, -500, 0, 0, 5000, 5000),
+        // Off the level on both sides.
+        planInput(-300, 10, 0, 0, 50, 50),
+        planInput(5000, 5000, 0, 0, 50, 50),
+        // Non-finite positions and extents.
+        planInput(nan, 10, 0, 0, 8, 8),
+        planInput(10, 10, 0, 0, inf, 8),
+        planInput(10, 10, -inf, 0, 8, 8),
+        planInput(10, nan, 0, 0, 8, nan),
+        // Empty and inverted extents.
+        planInput(64, 64, 0, 0, 0, 0),
+        planInput(64, 64, 0, 0, -16, 8),
+    };
+    const top = geometry.topQueryClass();
+    // Every count, so the masked tail holds one to three lanes after whole batches.
+    for (1..inputs.len + 1) |count| {
+        var colliders = StaticColliderSystem.init(std.testing.allocator);
+        defer colliders.deinit();
+        colliders.geometry = geometry;
+        colliders.query_top_class = top;
+        try colliders.plan_inputs.ensureTotalCapacity(std.testing.allocator, count);
+        for (inputs[0..count]) |input| colliders.plan_inputs.appendAssumeCapacity(input);
+        try colliders.reserveRebuildRows(count);
+        try colliders.reservePlan(count);
+        colliders.planLanes(PlanColumns.of(&colliders.plan_inputs), 0, count);
+        for (inputs[0..count], 0..) |input, rank| {
+            const aabb = math.aabbFromOffsetSize(.{ .x = input.x, .y = input.y }, .{ .x = input.offset_x, .y = input.offset_y }, .{ .x = input.size_x, .y = input.size_y });
+            const row: u32 = @intCast(rank);
+            const lanes = colliders.rowAabb(row);
+            try expectSameBits(aabb.min_x, lanes.min_x);
+            try expectSameBits(aabb.min_y, lanes.min_y);
+            try expectSameBits(aabb.max_x, lanes.max_x);
+            try expectSameBits(aabb.max_y, lanes.max_y);
+            const cells = geometry.footprint(aabb);
+            try std.testing.expectEqual(cells, colliders.rowPlacement(row).cells);
+            const class = geometry.queryClass(top, aabb);
+            try std.testing.expectEqual(@as(u16, class), colliders.plan_class.items[rank]);
+            const rect = geometry.chunkRect(.{ .level = 0, .cells = cells });
+            try std.testing.expectEqual(rect.count(), colliders.plan_touch_local[chunk_tier].items[rank]);
+            try std.testing.expectEqual(@as(u32, @intFromBool(class > geometry.grid.shift)), colliders.plan_touch_local[coarse_tier].items[rank]);
+        }
+    }
+}
+
+test "a rebuild lays out the same rows, block ids, slot ids, and bytes on workers as inline across range sizes and worker counts" {
+    var prng = std.Random.DefaultPrng.init(0x5e1ec7);
+    const random = prng.random();
+    var fixture = try SeamFixture.init();
+    defer fixture.deinit();
+    var commands: std.ArrayList(StructuralCommand) = .empty;
+    defer commands.deinit(std.testing.allocator);
+    try appendRandomLeveledStatics(random, 160, 3, &commands);
+    // Non-static slots between the statics: the select's windows keep only statics.
+    for (0..40) |index| try commands.append(std.testing.allocator, .{ .create_entity = .{ .movement_body = .{ .position = .{ .x = @floatFromInt(index * 7), .y = 5 } } } });
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, commands.items);
+    var inline_rebuilt = try fixture.rebuilt();
+    defer inline_rebuilt.deinit();
+    try expectSameRows(&inline_rebuilt, &fixture.colliders, 3);
+    for ([_]usize{ 0, 2, 3 }) |workers| {
+        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers, .items_per_range = 1 });
+        defer threads.deinit();
+        for ([_]usize{ 1, 8, 64 }) |items_per_range| {
+            var rebuilt = try fixture.rebuiltOn(&threads, items_per_range);
+            defer rebuilt.deinit();
+            try expectIdenticalLayout(&inline_rebuilt, &rebuilt, 3);
+            try expectSameRowColumns(&inline_rebuilt, &rebuilt);
+            if (workers == 0) continue;
+            for (std.meta.tags(ColliderStage)) |stage| {
+                const batch = rebuilt.last_batches.get(stage);
+                if (batch.item_count > batch.items_per_range) try std.testing.expect(!batch.ran_inline);
+            }
+        }
+    }
+}
+
+test "statics spanning chunk borders and coarse classes list every footprint chunk and coarse cell, threaded equal to inline" {
+    var fixture = try SeamFixture.init();
+    defer fixture.deinit();
+    const chunk_edge = test_geometry.cell_size * @as(f32, @floatFromInt(test_geometry.grid.chunk_tiles));
+    const placed = [_]struct { position: math.Vec2, size: math.Vec2, level: u16 }{
+        // Two by two chunks around a chunk corner.
+        .{ .position = .{ .x = chunk_edge - 20, .y = chunk_edge - 20 }, .size = .{ .x = 40, .y = 40 }, .level = 0 },
+        // A coarse class wider than a chunk, one level up.
+        .{ .position = .{ .x = 10, .y = 10 }, .size = .{ .x = 3 * chunk_edge, .y = 30 }, .level = 1 },
+        // The whole level and past it: the top class.
+        .{ .position = .{ .x = -100, .y = -100 }, .size = .{ .x = 5000, .y = 5000 }, .level = 0 },
+        // One cell on a third level.
+        .{ .position = .{ .x = 300, .y = 300 }, .size = .{ .x = 8, .y = 8 }, .level = 2 },
+    };
+    var commands: [placed.len]StructuralCommand = undefined;
+    for (&commands, placed) |*command, static| command.* = .{ .create_entity = staticTemplateOn(static.position, static.size, static.level) };
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &commands);
+    var rebuilt = try fixture.rebuilt();
+    defer rebuilt.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    var threaded = try fixture.rebuiltOn(&threads, 1);
+    defer threaded.deinit();
+    try expectIdenticalLayout(&rebuilt, &threaded, 3);
+    try expectSameRows(&rebuilt, &fixture.colliders, 3);
+    try expectQueryTier(&rebuilt);
+    // Every footprint chunk lists its static, and no other chunk does.
+    var listed: std.ArrayList(u32) = .empty;
+    defer listed.deinit(std.testing.allocator);
+    var footprint_chunks: usize = 0;
+    for (fixture.colliders.changesThisStep()) |change| {
+        const placement = placementOfIndex(&rebuilt, change.entity.index).?;
+        const rect = test_geometry.chunkRect(placement);
+        footprint_chunks += rect.count();
+        var chunk_y = rect.min_y;
+        while (chunk_y <= rect.max_y) : (chunk_y += 1) {
+            var chunk_x = rect.min_x;
+            while (chunk_x <= rect.max_x) : (chunk_x += 1) {
+                try listedIndices(&rebuilt, placement.level, chunk_y * rect.chunks_x + chunk_x, &listed);
+                try std.testing.expect(std.mem.indexOfScalar(u32, listed.items, change.entity.index) != null);
+            }
+        }
+    }
+    try std.testing.expectEqual(footprint_chunks, listEntryCount(&rebuilt));
+}
+
+test "touch grouping under any band splitters gives the same rows as a rebuild" {
+    var prng = std.Random.DefaultPrng.init(0x5b11);
+    const random = prng.random();
+    var fixture = try SeamFixture.init();
+    defer fixture.deinit();
+    var commands: std.ArrayList(StructuralCommand) = .empty;
+    defer commands.deinit(std.testing.allocator);
+    try appendRandomLeveledStatics(random, 150, 3, &commands);
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, commands.items);
+    var expected = try fixture.rebuilt();
+    defer expected.deinit();
+    var random_splitters: TouchSplitters = undefined;
+    for (&random_splitters) |*splitter| splitter.* = random.uintLessThan(u64, chunkKey(3, 0));
+    std.sort.pdq(u64, &random_splitters, {}, std.sort.asc(u64));
+    const splitter_sets = [_]TouchSplitters{
+        // Every touch in band 0: one region holds every key, so keys collide there.
+        @splat(ChunkTouchSort.max_key),
+        // Every touch in the last band.
+        @splat(0),
+        random_splitters,
+        // Every splitter on one level's first chunk: bands 0 and 63 only.
+        @splat(chunkKey(1, 0)),
+    };
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
+    defer threads.deinit();
+    var base = StaticColliderSystem.init(std.testing.allocator);
+    defer base.deinit();
+    base.splice_controls = .{ .adaptive = false, .items_per_range = 8 };
+    for (splitter_sets) |splitters| {
+        for ([_]?*ThreadSystem{ null, &threads }) |thread_system| {
+            var built = base.freshFor(test_geometry);
+            defer built.deinit();
+            const stages = built.rebuildStages(thread_system);
+            const touches = try built.planStatics(&fixture.data, stages);
+            try built.groupFootprints(stages, touches, .{ splitters, splitters });
+            built.finishRebuild(stages);
+            try expectSameRows(&built, &expected, 3);
+        }
+    }
+}
+
+test "a rebuild opens the directories of only the levels and coarse classes its statics enter" {
+    var fixture = try SeamFixture.init();
+    defer fixture.deinit();
+    const coarse_size = test_geometry.cell_size * 4 * @as(f32, @floatFromInt(test_geometry.grid.chunk_tiles));
+    var commands: [12]StructuralCommand = undefined;
+    // Ten fine statics on level 0 and one on level 3, and one coarse static on level 3.
+    for (commands[0..10], 0..) |*command, at| command.* = .{ .create_entity = staticTemplateOn(.{ .x = @floatFromInt(at * 150 + 4), .y = 40 }, .{ .x = 8, .y = 8 }, 0) };
+    commands[10] = .{ .create_entity = staticTemplateOn(.{ .x = 40, .y = 40 }, .{ .x = 8, .y = 8 }, 3) };
+    commands[11] = .{ .create_entity = staticTemplateOn(.{ .x = 40, .y = 600 }, .{ .x = coarse_size, .y = 8 }, 3) };
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &commands);
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try std.testing.expect(!colliders.payload_growth_logged);
+    try colliders.rebuild(&fixture.data, test_geometry, null);
+    try std.testing.expect(colliders.payload_growth_logged);
+    const chunk_count = test_geometry.grid.chunkCount();
+    try std.testing.expectEqual(@as(usize, 4), colliders.chunks.levelCount());
+    for ([_]usize{ chunk_count, 0, 0, chunk_count }, 0..) |slots, level| try std.testing.expectEqual(slots, colliders.chunks.slotCount(@intCast(level)));
+    const coarse_row = colliders.row_of_index.items[fixture.colliders.changesThisStep()[11].entity.index];
+    const coarse_class = colliders.queryPlacement(colliders.rowPlacement(coarse_row), colliders.rowAabb(coarse_row)).class;
+    try std.testing.expect(coarse_class > test_geometry.grid.shift);
+    for (&colliders.coarse, 0..) |*dir, class| {
+        for (0..4) |level| {
+            const opened = class == coarse_class and level == 3;
+            try std.testing.expectEqual(opened, dir.slotCount(@intCast(level)) != 0);
+        }
+    }
+    try expectSameRows(&colliders, &fixture.colliders, 4);
+}
+
+// After every reserve of a rebuild, each reserve again at the sizes it holds and the fill and
+// install allocate nothing.
+fn expectWarmRebuildAllocatesNothing(thread_system: ?*ThreadSystem, data: *const DataSystem, expected: *const StaticColliderSystem) !void {
+    var base = StaticColliderSystem.init(std.testing.allocator);
+    defer base.deinit();
+    base.splice_controls = .{ .adaptive = false, .items_per_range = 8 };
+    var built = base.freshFor(test_geometry);
+    defer built.deinit();
+    const stages = built.rebuildStages(thread_system);
+    try built.prepareRebuild(data, stages);
+    {
+        // Warm, every reserve finds its capacity, so `select`, `plan`, `touch`, `group`, the
+        // fill, and the install all run under the armed allocator.
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        built.allocator = failing.allocator();
+        defer built.allocator = std.testing.allocator;
+        try built.prepareRebuild(data, stages);
+        built.finishRebuild(stages);
+        try std.testing.expect(!failing.has_induced_failure);
+    }
+    try expectIdenticalLayout(expected, &built, 3);
+    try expectSameRowColumns(expected, &built);
+}
+
+test "a warmed rebuild runs every stage, fills, and installs without allocating, inline and on a multi-worker ThreadSystem (FailingAllocator)" {
+    var prng = std.Random.DefaultPrng.init(0xfa11);
+    const random = prng.random();
+    var fixture = try SeamFixture.init();
+    defer fixture.deinit();
+    var commands: std.ArrayList(StructuralCommand) = .empty;
+    defer commands.deinit(std.testing.allocator);
+    try appendRandomLeveledStatics(random, 120, 3, &commands);
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, commands.items);
+    var expected = try fixture.rebuilt();
+    defer expected.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    for ([_]?*ThreadSystem{ null, &threads }) |thread_system| try expectWarmRebuildAllocatesNothing(thread_system, &fixture.data, &expected);
+}
 // `collectOverlaps` over `box` into `out`, recording the walk's ids into `ids` in Debug.
 fn collectRecorded(view: ColliderView, box: math.Aabb, out: *TestOverlaps, ids: *std.ArrayList(u32), required: *usize) usize {
     if (comptime builtin.mode == .debug) {
