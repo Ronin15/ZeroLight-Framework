@@ -21,9 +21,9 @@ destroyed in play and own their storage. Terrain and nav are owned per chunk
 `(level, cx, cy)` (64G). So every contract below holds per world instance,
 and the checksum and saves cover every world instance and all
 simulated state, including far-simulation state
-(`.grok/rules/engine-design.md` § Target scale).
+(`.claude/rules/engine-design.md` § Target scale).
 
-**Sizing** follows `.grok/rules/budgets-capacities.md`: runtime stores
+**Sizing** follows `.claude/rules/budgets-capacities.md`: runtime stores
 (anchors, nodes, projectiles, populations, plan buffers, the inventory slot
 arena) start content-sized and grow at the commit seam; terrain, nav, and
 level links are chunk-owned; the 512-slot text-label pool is a presentation

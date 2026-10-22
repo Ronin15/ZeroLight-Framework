@@ -55,10 +55,10 @@ Goal:
   function names in the shipped binary.
 - Platform owns every OS binding; `main.zig` gains only root declarations;
   `Engine` installs the reporter and window icon once on the main thread
-  (`.grok/rules/engine-design.md`).
+  (`.claude/rules/engine-design.md`).
 - The reporter's state is the documented process-global exception:
   module-level, fixed-size, documented at the site
-  (`.grok/rules/budgets-capacities.md`). Everything the crash path needs
+  (`.claude/rules/budgets-capacities.md`). Everything the crash path needs
   is resolved at install; the crash path allocates nothing, joins no paths,
   reads no clock, and is bounded in time, so any interruption leaves a
   partial but parseable report.
@@ -67,11 +67,11 @@ Goal:
   options.
 - A crash-probe dev executable (never packaged) drives every crash shape;
   the game exe gains no crash trigger
-  (`.grok/rules/tests-benchmarks.md` § Tests).
+  (`.claude/rules/tests-benchmarks.md` § Tests).
 - The window icon resolves through `AssetStore` as an asset-root path, is
   Linux-only (Windows uses the resource icon, macOS the bundle icon), and a
   missing icon logs once and never blocks startup
-  (`.grok/rules/assets-audio.md`).
+  (`.claude/rules/assets-audio.md`).
 - VoidLight reference: port `SDL_LoadPNG` + `SDL_SetWindowIcon`
   (`GameEngine.cpp:279-424`) and `dsymutil`; not its worker-thread icon
   load, every-OS icon call, Debug-only dSYM, or disabled stripping.

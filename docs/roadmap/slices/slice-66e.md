@@ -35,13 +35,13 @@ tags pass it before Steam `staging` is promoted to `default`.
 - Every number comes from `zig build bench`; sizes are sample points on a
   curve, never targets, capacities, or acceptance thresholds; a regression
   is a change beyond the run-to-run spread measured by 3 interleaved reps
-  and medians (`.grok/rules/tests-benchmarks.md`).
+  and medians (`.claude/rules/tests-benchmarks.md`).
 - Each gated group runs at least three sizes far enough apart to show its
   shape, so a cost that starts growing with world size, depth, or world
   count fails even when one size looks fine. The gate set covers the
   scaling groups that exist at landing, including 64G's `chunk-scale` and
   the world-instance and far-simulation groups (74, 75) when present, plus
-  the multi-worker cases (`.grok/rules/threading.md`).
+  the multi-worker cases (`.claude/rules/threading.md`).
 - Tolerances come from the recorded spread and are never widened to absorb
   a regression; a row too noisy to gate after the bounded repetition
   ladder is removed from the gate with its noise recorded and stays as
@@ -80,7 +80,7 @@ tags pass it before Steam `staging` is promoted to `default`.
       promotion), the "trend data vs authoritative" distinction, the
       Release Checklist line.
 - [ ] Add the perf-gate spread/shape and baseline-promotion rule to
-      `.grok/rules/build-validation.md` when this lands.
+      `.claude/rules/build-validation.md` when this lands.
 
 ### Acceptance checks
 

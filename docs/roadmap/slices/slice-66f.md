@@ -22,17 +22,17 @@ Steam Deck readiness; a build without it is unchanged.
 
 ### Architecture notes
 
-- Ownership and dependency direction: `.grok/rules/engine-design.md`
+- Ownership and dependency direction: `.claude/rules/engine-design.md`
   § Ownership boundaries. The Steamworks SDK qualifies as a dependency only
   because neither stdlib nor SDL3 provides it.
 - The SDK and its redistributable libraries are never committed
-  (`.grok/rules/build-validation.md`); the build takes them from a local
+  (`.claude/rules/build-validation.md`); the build takes them from a local
   path, and packaging (52B, 66D) ships the redistributable beside the
   executable.
-- Steam calls stay off workers (`.grok/rules/threading.md`).
-- No Steam state feeds simulation (`.grok/rules/simulation.md`
+- Steam calls stay off workers (`.claude/rules/threading.md`).
+- No Steam state feeds simulation (`.claude/rules/simulation.md`
   § Determinism); simulation emits, Steam receives.
-- The callback pump and the service follow `.grok/rules/zig-style.md`
+- The callback pump and the service follow `.claude/rules/zig-style.md`
   § Logging.
 
 ### Checklist

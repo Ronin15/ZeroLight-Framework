@@ -59,7 +59,7 @@ allies (Slice 71A's help call).
   its own velocity.
 - The knockback stage is threaded with a serial twin and a SIMD kernel with
   scalar-tail parity; idle rows cost one small read
-  (`.grok/rules/threading.md`, `.grok/rules/memory-performance.md`).
+  (`.claude/rules/threading.md`, `.claude/rules/memory-performance.md`).
 - Retaliation is a memory entry separate from the sighting ring, so
   sightings never evict it; it ages on the memory cadence and expires after
   a fixed time; ingest is a watermark on `last_damage_step`, so each damage

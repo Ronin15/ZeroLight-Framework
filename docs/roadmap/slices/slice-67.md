@@ -25,17 +25,17 @@ text, settings, and saves backlog remains.
   seed domain, or persistent `DataSystem`/`WorldSystem` field, and never
   changes the checksum. Input resolves to `Action` before the simulation
   sees it; UI-originated gameplay requests stay with Slice
-  57B's queue (`.grok/rules/simulation.md`).
+  57B's queue (`.claude/rules/simulation.md`).
 - Debug overlays and the event log are read-only over simulation
-  (`.grok/rules/engine-design.md`).
+  (`.claude/rules/engine-design.md`).
 - Main thread only, except Slice 46's existing lane jobs for save write and
-  slot scan (`.grok/rules/threading.md`).
+  slot scan (`.claude/rules/threading.md`).
 - SDL calls live in `src/platform/` wrappers called from `src/app/`; GPU
   work stays behind `Renderer` facades; `src/game/ui/` consumes only typed
   per-event context that `Engine` resolves once
-  (`.grok/rules/engine-design.md`, `.grok/rules/render.md`).
+  (`.claude/rules/engine-design.md`, `.claude/rules/render.md`).
 - Per-event and per-frame paths are allocation-free; each sub-slice lists
-  its `FailingAllocator` proofs (`.grok/rules/memory-performance.md`).
+  its `FailingAllocator` proofs (`.claude/rules/memory-performance.md`).
 - Later slices that add user-facing text, an event arm, or a keyboard
   default carry the matching item in their own Checklist (log line or
   explicit none per 67B, `StringId` per 67E, scancode default per 67A).
@@ -44,7 +44,7 @@ text, settings, and saves backlog remains.
 
 - [ ] 67A, 67B, 67C, 67E archived.
 - [ ] Add the event-log line and action-name `StringId` coverage rule to
-      `.grok/rules/render.md` when this lands.
+      `.claude/rules/render.md` when this lands.
 
 ### Acceptance checks
 

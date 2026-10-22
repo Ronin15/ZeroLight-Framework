@@ -12,7 +12,7 @@ Goal: terrain and nav storage and work owned per chunk `(level, cx, cy)`, so a
 dig, ramp, cave-in, or explosion costs work only in the chunks it touches,
 memory follows content rather than level area, and nav processes per chunk so
 threading scales with any number of updates and path requests
-(`.grok/rules/engine-design.md` § Target scale).
+(`.claude/rules/engine-design.md` § Target scale).
 
 ### Current foundation
 
@@ -195,7 +195,7 @@ a design open for this slice):
 - Owner direction (2026-10-07, 2026-10-08): the chunk is the unit of terrain
   and nav storage, change, work, threading, and save; nav covers the whole
   world; nothing is evicted from the simulation
-  (`.grok/rules/engine-design.md`, `.grok/rules/budgets-capacities.md`).
+  (`.claude/rules/engine-design.md`, `.claude/rules/budgets-capacities.md`).
 - A level holds a directory of its chunks; nothing is sized to level area or
   world extent. Uniform and all-solid chunks stay cheap.
 - A local change touches only its chunks; a dense change processes its dirty
@@ -208,11 +208,11 @@ a design open for this slice):
   fallback rebuild.
 - Path requests fan out against the read-only chunked graph; a request's
   scratch follows its node budget, never level cells
-  (`.grok/rules/pathfinding.md`).
+  (`.claude/rules/pathfinding.md`).
 - Serial equals threaded, and incremental equals a full rebuild
-  (`.grok/rules/threading.md`, `.grok/rules/simulation.md`).
+  (`.claude/rules/threading.md`, `.claude/rules/simulation.md`).
 - Render presentation pools may be sized from the viewport; nothing in render
-  is sized to level area (`.grok/rules/render.md`).
+  is sized to level area (`.claude/rules/render.md`).
 - Provides: 65B copies and swaps only dirty chunks; 46 saves terrain per
   chunk; 64B rebuilds derived nav from chunk storage (perception holds no LOS
   state); 38 gets static collision bodies in nav on every level; 74 creates and
@@ -430,7 +430,7 @@ a design open for this slice):
 ### Acceptance checks
 
 - [x] `chunk-scale-*` bench groups at 256², 1024², 2048², and 8 / 32 / 128
-      levels (`.grok/rules/tests-benchmarks.md`): dig, ramp, cave-in, and
+      levels (`.claude/rules/tests-benchmarks.md`): dig, ramp, cave-in, and
       explosion fill flat across sizes; level create flat across depth and
       linear in its own chunks (level destroy and the world-count axis are
       74's).

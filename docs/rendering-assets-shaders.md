@@ -2,7 +2,7 @@
 
 The app uses SDL_GPU directly and calls no Vulkan or Metal APIs itself. SDL
 chooses the backend from the formats and drivers available at runtime. Rules:
-`.grok/rules/render.md` and `.grok/rules/assets-audio.md`.
+`.claude/rules/render.md` and `.claude/rules/assets-audio.md`.
 
 ## Shader Build
 
@@ -204,7 +204,7 @@ layers whose directories and a block per window chunk fit, and the sync draws
 only that many, dropping the deepest and logging once. The directory side is
 capped at `tile_store_max_side` (2^14, the largest side whose one directory
 fits); a chunk window wider than that is clipped to it, logged once. No world, level, layer,
-or terrain change is refused (`.grok/rules/budgets-capacities.md`); the store
+or terrain change is refused (`.claude/rules/budgets-capacities.md`); the store
 reports its resident bytes once per world.
 
 The world draws its resident layers as a small number of **composite** draws,
@@ -249,7 +249,7 @@ The camera lives in the vertex shader (Sprite Rendering's `position_transform`),
 so a pan never re-submits vertices: the quads are full-world and the chunk
 window is a store uniform. The quads re-submit on a layer or store change
 (`dense_quads_dirty`), an `active_level`/window change, or an interleave-depth
-change (`.grok/rules/render.md`).
+change (`.claude/rules/render.md`).
 
 `WorldSystem.syncDenseTileStore` runs once per frame in render prep, on the
 main thread before `ensureStaticGeometryCapacity`, `submitStaticDenseGeometry`,
@@ -543,7 +543,7 @@ Asset paths are relative to the configured asset root and reject empty paths,
 absolute paths, `.` components, and `..` traversal.
 
 PNG image loading uses core SDL3 `SDL_LoadPNG` support in the asset layer; this
-project does not use `SDL3_image` (`.grok/rules/engine-design.md`).
+project does not use `SDL3_image` (`.claude/rules/engine-design.md`).
 
 The asset cache maps validated relative PNG paths to renderer `TextureId`
 values. Loading the same path decodes PNG data through `AssetStore`, uploads

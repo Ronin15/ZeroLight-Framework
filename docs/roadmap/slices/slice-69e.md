@@ -29,7 +29,7 @@ it never reads render-time state.
   or wall clock. At zoom 1 emission is bit-identical to Slice 59.
 - Area scaling only lowers live counts (zoom ≥ 1), so Slice 59's derived pool
   capacity still bounds the pool; overflow drops stay counted
-  (`.grok/rules/budgets-capacities.md`, presentation pool).
+  (`.claude/rules/budgets-capacities.md`, presentation pool).
 - A zoom-out prefills the newly visible band at steady-state density with
   particles at random ages and terminal velocity, under a fixed per-step
   count; draws use the presentation weather seed.

@@ -11,7 +11,7 @@ that modifies combat, currency, consumable use, loot drops, and world items
 that can be picked up, plus the one inventory-transfer substrate (grants,
 trades, gifts) every later producer uses. Items at rest in the world are
 dormant: they cost nothing per step, persist wherever they lie, and decay
-slowly only outdoors (`.grok/rules/engine-design.md` § Target scale). All of
+slowly only outdoors (`.claude/rules/engine-design.md` § Target scale). All of
 it is deterministic and allocation-free after reserve.
 
 ### Current foundation
@@ -36,12 +36,12 @@ it is deterministic and allocation-free after reserve.
   change slowly (outdoor decay). Nothing about an item at rest depends on
   distance from the observer.
 - Item and loot-table identity is the authored numeric key, never load order;
-  names resolve once at load (`.grok/rules/assets-audio.md`). Catalog and
+  names resolve once at load (`.claude/rules/assets-audio.md`). Catalog and
   loot-table fingerprints feed Slice 46's content fingerprint.
 - Three appended components (inventory, equipment, world item) follow the
-  component-store pattern (`.grok/rules/simulation.md` § Persistent data).
+  component-store pattern (`.claude/rules/simulation.md` § Persistent data).
   Inventory slot storage grows at the structural-commit seam; only the index
-  width is a fixed ceiling (`.grok/rules/budgets-capacities.md`).
+  width is a fixed ceiling (`.claude/rules/budgets-capacities.md`).
 - The checksum hashes logical inventory contents, never allocation layout, so
   saves made after slot reuse load to the same checksum.
 - World items are created by every producer (loot, 57B drops, 58 dig yields,
@@ -60,7 +60,7 @@ it is deterministic and allocation-free after reserve.
   state; it lands here with tests, and Slice 61 wires its first producer and
   pipeline resource (no dead resource tags ship).
 - One new pipeline stage for inventory work, placed by its real reads
-  (`.grok/rules/simulation.md` § Pipeline); equipment changes take effect
+  (`.claude/rules/simulation.md` § Pipeline); equipment changes take effect
   next step.
 - Persistent: inventories, equipment, and world items are hashed and saved in
   the same change (Slices 49 / 46); unknown item keys reject a load.
@@ -88,7 +88,7 @@ it is deterministic and allocation-free after reserve.
 - [ ] Pickup and transfer commands past the structural share defer through
       [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an over-share
       pickup burst defers and the step succeeds
-      (`.grok/rules/budgets-capacities.md`).
+      (`.claude/rules/budgets-capacities.md`).
 - [ ] `use_item` player action.
 - [ ] The use-item latch is hashed (64B) and saved in
       Slice 46's `pipeline_history`.

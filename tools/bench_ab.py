@@ -3,7 +3,7 @@
 
 Runs only the named bench groups (never the full suite), a base git ref
 against the working tree, one run per side by default, and prints per-(group,
-item, case) times and a verdict (`.grok/rules/tests-benchmarks.md`). Base
+item, case) times and a verdict (`.claude/rules/tests-benchmarks.md`). Base
 export, reps and spread, the run cache, cases, the CPU floor, and output
 locations: `tools/README.md` § `bench_ab.py`. A run must name its config with
 `-- --items N` (or pass `--grid` for every config).
@@ -94,7 +94,7 @@ def export_base(root: Path, ref: str) -> Path:
             shutil.rmtree(target)
         target.mkdir(parents=True)
         archive = subprocess.Popen(["git", "archive", sha], cwd=root, stdout=subprocess.PIPE)
-        # Instruction files stay out: a nested AGENTS.md or .grok/rules loads when an agent reads the export.
+        # Instruction files stay out: a nested AGENTS.md, CLAUDE.md, or rules tree (.claude, or .grok in older bases) loads when an agent reads the export.
         subprocess.run(
             [
                 "tar",

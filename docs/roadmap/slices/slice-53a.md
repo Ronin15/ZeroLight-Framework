@@ -23,7 +23,7 @@ in Slice 67B.
   lifetime. `docs/rendering-assets-shaders.md` already records that this
   does not scale to high-cardinality text.
 - `TextService.initWithBackend` + `TextBackend` is the accepted cold-path
-  fn-pointer seam for headless tests (`.grok/rules/zig-style.md`).
+  fn-pointer seam for headless tests (`.claude/rules/zig-style.md`).
 - `src/render/renderer.zig`: `submitOrderedSprite`, grow-only
   `reserveSpriteCommands`, `drawablePixelScale` (drawable/window ratio, not
   the logical→drawable scale); every texture slot is released through
@@ -42,19 +42,19 @@ in Slice 67B.
 
 - Label storage, SDL_ttf, and atlas textures stay render-owned; game code
   holds only label ids, font roles, and draw requests, and never sees an SDL
-  handle (`.grok/rules/render.md`, `.grok/rules/engine-design.md`).
+  handle (`.claude/rules/render.md`, `.claude/rules/engine-design.md`).
 - No service keeps a pointer to a sibling (Engine is returned by value);
-  label calls take the renderer explicitly (`.grok/rules/engine-design.md`).
+  label calls take the renderer explicitly (`.claude/rules/engine-design.md`).
 - The label pool and glyph cache are presentation-only fixed pools with
-  deterministic overflow handling (`.grok/rules/budgets-capacities.md`);
+  deterministic overflow handling (`.claude/rules/budgets-capacities.md`);
   no simulation reads them. A stale id draws nothing and never resolves to
   another label.
 - State teardown receives no text service, so labels nobody draws are
   reclaimed by the label system; owners re-create from retained intent
-  (`.grok/rules/render.md` § Text).
+  (`.claude/rules/render.md` § Text).
 - Warmed draws allocate nothing and make no SDL_ttf or backend call;
   create/set-text/rebuild are cold and bounded by content changes
-  (`.grok/rules/memory-performance.md`).
+  (`.claude/rules/memory-performance.md`).
 - Text rasterizes at the exact committed presentation scale so glyph texels
   map 1:1 under the existing nearest sampler; a live resize settles before
   rebuilding. Atlas memory stays bounded to the current glyph set; the page

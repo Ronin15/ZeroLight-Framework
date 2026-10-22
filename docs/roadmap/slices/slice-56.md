@@ -55,19 +55,19 @@ projectiles (56B), equipment modifiers (57), knockback and retaliation
 
 - Health is integer so saves and goldens stay exact; `health` and
   `combat_stats` follow the component-store pattern, tags appended in
-  landing order (`.grok/rules/simulation.md` § Persistent data).
+  landing order (`.claude/rules/simulation.md` § Persistent data).
 - Absolute steps are stored as due steps with saturating "step after" and
   "step reached" helpers owned here; 56B, 57, 61, 62 reuse them.
 - One AI action emitter (`ai_action_select`): attack is Slice 73 behavior
   data that emits an action, not a behavior switch arm; 61, 71D add their
   actions the same way, never a second emitter or an `ai_decide` write of
-  `action_intents` (`.grok/rules/simulation.md` § Controllers and
+  `action_intents` (`.claude/rules/simulation.md` § Controllers and
   processors).
 - One claim set, fixed claim order trade (63) → harvest (61) → destructible
   (45) inside `action_react`, then combat consumes unclaimed attacks.
 - AI actions share a fixed per-step budget per world with deterministic
   rotating deferral (fairness priority from 68A); a deferred actor keeps its
-  cooldown and retries (`.grok/rules/budgets-capacities.md`).
+  cooldown and retries (`.claude/rules/budgets-capacities.md`).
 - Resolution is simultaneous: outcomes never depend on intent order; mutual
   kills in one step work; killer is the top contributor with a stable
   tie-break.
@@ -75,17 +75,17 @@ projectiles (56B), equipment modifiers (57), knockback and retaliation
   `seed.derive(.combat)` computed once at init (Slice 49); no literal seeds.
 - Combat work scaling with population runs through the thread system with
   serial and threaded paths; the main thread holds only ordered merge and
-  commit (`.grok/rules/threading.md`).
+  commit (`.claude/rules/threading.md`).
 - Damage reaches affect once per hit through a watermark on the victim
-  (`.grok/rules/simulation.md` § AI and affect); rows without health
+  (`.claude/rules/simulation.md` § AI and affect); rows without health
   contribute zero.
 - Kills preflight events and structural commands; commits are all-or-fail
-  (`.grok/rules/simulation.md` § Events and streams).
+  (`.claude/rules/simulation.md` § Events and streams).
 - Per-step hit and kill caps are fixed counts; excess hits defer
   deterministically to later steps, never dropped or refused; a kill
-  resolves when its hit applies (`.grok/rules/budgets-capacities.md`).
+  resolves when its hit applies (`.claude/rules/budgets-capacities.md`).
 - Player: `Action.attack` is a gameplay action under modal routing
-  (`.grok/rules/input-state.md`); death is downed-then-revived.
+  (`.claude/rules/input-state.md`); death is downed-then-revived.
 - New hashed stores are classified in Slice 49's lists and saved by Slice
   46 in the same change (Ground Rules; Tables T3/T6).
 - Knockback stays out of `combat_resolve`, which runs after `chunk_derive`;
@@ -119,7 +119,7 @@ projectiles (56B), equipment modifiers (57), knockback and retaliation
 - [ ] Kill commands past the structural share defer through
       [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an over-share
       kill burst defers and the step succeeds
-      (`.grok/rules/budgets-capacities.md`).
+      (`.claude/rules/budgets-capacities.md`).
 - [ ] Affect damage signal through the watermark; undamaged rows
       bit-identical.
 - [ ] `Action.attack` bindings, routing tests, and capture latch (classified in 64B and saved in 46's `pipeline_history`).

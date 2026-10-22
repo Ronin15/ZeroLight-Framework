@@ -46,13 +46,13 @@ seam, so a shot is never refused for capacity.
 - Fixed per-step counts for spawns, hits, and expiries; over-budget spawns
   defer with the cooldown kept, over-budget hits defer deterministically to
   later steps (never dropped or refused), over-budget expiries wait in dense
-  order (`.grok/rules/budgets-capacities.md`). No live-capacity refusal.
+  order (`.claude/rules/budgets-capacities.md`). No live-capacity refusal.
 - Expiry, tile impact, and leaving the world destroy the projectile;
   projectiles advance at every distance like any entity.
 - Collision and movement capacities include projectiles at their initial
-  size and grow with them at the seam (`.grok/rules/memory-performance.md`).
+  size and grow with them at the seam (`.claude/rules/memory-performance.md`).
 - Projectile work scaling with live count runs through the thread system
-  where the cost model says so (`.grok/rules/threading.md`).
+  where the cost model says so (`.claude/rules/threading.md`).
 - Ammo consumption lands in Slice 68C.
 - VoidLight reference: port owner, damage, lifetime (range / speed + slack),
   and the spawn offset; not embed-into-target, thread-local pending vectors,

@@ -65,7 +65,7 @@ Linux and macOS; no shader compilers are needed for a normal build.
   compile-checks. No runtime CPU check (start code is compiled for the
   target); the minimum spec is documented.
 - Float-mode lint rejects `@setFloatMode(.optimized)` and `@mulAdd` in `src/`
-  (enforces `.grok/rules/simulation.md` § Determinism).
+  (enforces `.claude/rules/simulation.md` § Determinism).
 - Zig pin: `.minimum_zig_version` is the single exact pin; a `build.zig` guard
   rejects another minor or a lower patch; `mise.toml` mirrors it, checked in
   `verify`. Upgrades move one minor at a time, framework first on its own
@@ -129,7 +129,7 @@ Linux and macOS; no shader compilers are needed for a normal build.
 - [ ] (added by Slice 66) "windows-gnu LTO links" on the upgrade re-check list.
 - [ ] The `addCallgrindBenchRun` doc comment points to
       `docs/development-workflow.md § Profiling` (`build.zig:789`) (code
-      audit L9, docs audit L14; `.grok/rules/zig-style.md` § Comments).
+      audit L9, docs audit L14; `.claude/rules/zig-style.md` § Comments).
       Failure scenario: the section moves or is renamed, and the comment
       sends readers to nothing. Pass: the comment states the step's contract
       only.
@@ -138,7 +138,7 @@ Linux and macOS; no shader compilers are needed for a normal build.
       `docs/setup.md`; `docs/rendering-assets-shaders.md` Shader Build;
       `README.md` requirements; `AGENTS.md` commands.
 - [ ] Rule additions when this lands: release CPU baseline and toolchain
-      upgrade policy (`.grok/rules/build-validation.md`).
+      upgrade policy (`.claude/rules/build-validation.md`).
 
 ### Acceptance checks
 

@@ -1,7 +1,7 @@
 # State Stack And Input
 
 How states, transitions, and input routing work. Rules:
-`.grok/rules/input-state.md`.
+`.claude/rules/input-state.md`.
 
 ## State Shape
 

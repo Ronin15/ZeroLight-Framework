@@ -32,29 +32,29 @@ render pick it up the same step as any other terrain change.
   (`recordTerrainNavEvents`). The dig stage and plane traversal follow it.
 - The runtime perf log has no stage for the dense terrain write: the
   `terrain_edit_write` cost-driver entry was deferred until a gameplay producer
-  calls it (`.grok/rules/threading.md`).
+  calls it (`.claude/rules/threading.md`).
 - The dense path emits one `WorldTileChangedEvent` per changed cell, so a
   large collapse can exceed a fixed per-step event capacity.
 
 ### Architecture notes
 
 - Owner: `DestructibleController`, the destruction controller for terrain
-  and entities (`.grok/rules/simulation.md` § Controllers and
+  and entities (`.claude/rules/simulation.md` § Controllers and
   processors). `DigController` stays dig intent → dig edit.
 - Support is evaluated after the step's terrain changes, from every cause,
   only in the chunks those changes touched and their neighbours; cost
   follows what changed, never level size, depth, or world count
-  (`.grok/rules/engine-design.md`, `.grok/rules/budgets-capacities.md`).
+  (`.claude/rules/engine-design.md`, `.claude/rules/budgets-capacities.md`).
 - A collapse that removes more support defers the next wave to the next
-  step (`.grok/rules/simulation.md` § Events and streams).
+  step (`.claude/rules/simulation.md` § Events and streams).
 - A collapse writes through `applyDenseCellWrites`; scalable support
   evaluation runs on the thread system with serial and threaded paths
-  (`.grok/rules/threading.md`). Results are deterministic
-  (`.grok/rules/simulation.md` § Determinism).
+  (`.claude/rules/threading.md`). Results are deterministic
+  (`.claude/rules/simulation.md` § Determinism).
 - Never refused for capacity; over-budget evaluation defers
-  deterministically (`.grok/rules/budgets-capacities.md`).
+  deterministically (`.claude/rules/budgets-capacities.md`).
 - Collapses keep advancing in every world and at any distance from the
-  observer (`.grok/rules/engine-design.md` § Target scale).
+  observer (`.claude/rules/engine-design.md` § Target scale).
 
 ### Checklist
 
@@ -78,7 +78,7 @@ render pick it up the same step as any other terrain change.
 - [ ] Collapse entity commands past the structural share defer through
       [Slice 88](slice-88.md)'s deferral (docs audit M7); test: an over-share
       collapse defers its entity commands and the step succeeds
-      (`.grok/rules/budgets-capacities.md`).
+      (`.claude/rules/budgets-capacities.md`).
 - [ ] Tests: serial equals threaded; OOM leaves terrain intact and the
       retry gives the same result; a collapse spanning chunks and levels in
       one step; repeated dig/collapse/refill; a chain collapse advances one

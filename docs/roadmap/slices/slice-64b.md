@@ -47,8 +47,8 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
   count (harness, 64C runner, 52C soak). NaN-free columns hash as raw bytes.
   Vector NaN primitives live in `core/simd.zig`.
 - Terrain hashes per chunk on the thread system; serial equals threaded
-  (`.grok/rules/threading.md`); nothing is sized to level area or world
-  extent (`.grok/rules/budgets-capacities.md`); no allocation; owner thread
+  (`.claude/rules/threading.md`); nothing is sized to level area or world
+  extent (`.claude/rules/budgets-capacities.md`); no allocation; owner thread
   only. Tag is live + 1 (Table T6).
 - `buildFingerprint()` (app version, Zig version, checksum tag) is the only
   build fingerprint; its consumer is 46's save header.
@@ -104,8 +104,8 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
       classes, normalization); `docs/architecture.md` Gameplay Data; DW bench
       case.
 - [ ] Rule additions when this lands: checksum field classification and
-      normalized saves (`.grok/rules/simulation.md`); normalize completeness
-      (`.grok/rules/pathfinding.md`).
+      normalized saves (`.claude/rules/simulation.md`); normalize completeness
+      (`.claude/rules/pathfinding.md`).
 
 ### Acceptance checks
 
@@ -118,4 +118,4 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
       --details`: cost grows linearly with hashed state across at least three
       sizes (level size, depth, population), the threaded case is at or below
       serial, and serial shows no regression beyond spread against 49's v1
-      (`.grok/rules/tests-benchmarks.md`).
+      (`.claude/rules/tests-benchmarks.md`).

@@ -36,9 +36,9 @@ with no lane thread, 58's threaded path runs unchanged.
   adoption step.
 - Each chunk job is a pure function of its index and commit order is
   ascending job index, so batch size, lane speed, refusal, and timing never
-  change the world (`.grok/rules/simulation.md` § Determinism).
+  change the world (`.claude/rules/simulation.md` § Determinism).
 - The per-step commit budget is a fixed count, never derived from world size
-  (`.grok/rules/budgets-capacities.md`).
+  (`.claude/rules/budgets-capacities.md`).
 - Lane jobs read only immutable inputs owned by the stream (the spec and its
   arena move into heap-shared stream state; nothing points into
   `LoadingState` or stack memory) and write only their own outputs. The world

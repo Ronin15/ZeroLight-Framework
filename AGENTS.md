@@ -5,12 +5,13 @@
 A 2D game framework on **Zig 0.17** and **SDL3 / SDL_GPU** with a fixed-step
 **60Hz** data-oriented simulation: engine core for a fully simulated,
 multi-world colony simulator (target and the demo's role:
-`.grok/rules/engine-design.md` § Target scale).
+`.claude/rules/engine-design.md` § Target scale).
 
 ## Rules And Docs
 
-- **Rules** live only in `.grok/rules/`, one topic per file
-  (`engine-design.md`). Every rule file loads every session.
+- **Rules** live only in `.claude/rules/`, one topic per file
+  (`engine-design.md`). `engine-design.md` loads every session; each other
+  rule loads with the files its `paths:` frontmatter names.
 - Docs, briefs, plans, and reports cite rule files by name and never restate
   them; a plan cites the rule each decision meets, a review the rule each
   standards finding breaks.
@@ -35,7 +36,7 @@ Add code under the owning module: boundaries in `engine-design.md`
 ## Agent Pipeline
 
 Non-trivial Zig design, implementation, review, and debugging goes through the
-`.grok/agents/` specialists. Spawn one with `spawn_subagent` and
+`.claude/agents/` specialists. Spawn one with the Agent tool and
 `subagent_type` set to its name. The child does not see this session, so the
 brief file is the whole task. Trivial means a local fix in 1–2 files with no
 design question; the main session may do that inline. The main session
@@ -43,7 +44,7 @@ orchestrates, verifies every agent claim against live code, and reports.
 
 - A non-trivial brief names the files in scope, the declarations to read,
   and the change's cost-model questions (what its work and memory grow
-  with). Write it to `.grok/reports/<topic>-brief.md`. The spawn prompt
+  with). Write it to `.claude/reports/<topic>-brief.md`. The spawn prompt
   cites that path and does not paste the brief.
 - `zig-design-specialist` runs only when a design is open or the existing
   structure fails the cost model, and plans right before implementation,
@@ -93,7 +94,7 @@ orchestrates, verifies every agent claim against live code, and reports.
   (`docs-specialist`) writes them once from the code as landed (checklist
   check-offs, durable docs, tables).
 - Agents work from live code and the sources the brief names (plans and
-  reports in `.grok/reports/`, commit bodies), never from memory or chat
+  reports in `.claude/reports/`, commit bodies), never from memory or chat
   summaries. They cannot spawn agents: each reports what is outside its role
   and recommends handoffs; the main session routes them.
 - An explanation of a failure or bench result is a hypothesis until a
@@ -108,10 +109,10 @@ Zig 0.17.0 minimum. `zig build -l` lists the steps;
 `zig build bench -- --group <name>` targets one bench group. Details: DW.
 Validation cadence and modes: `build-validation.md`.
 
-## Grok Tooling (`.grok/`)
+## Claude Code Tooling (`.claude/`)
 
 - Agent names stay stable: `.claude/workflows/` calls them by name (`agentType`).
-- Plans, reviews, unit briefs, and landing reports go in `.grok/reports/`
+- Plans, reviews, unit briefs, and landing reports go in `.claude/reports/`
   (gitignored). Design and review agents write theirs; the main session
   writes `<topic>-brief.md`; `zig-specialist` writes `<topic>-landing.md`
   unless the brief names another path. A spawn prompt cites the file.
@@ -120,6 +121,6 @@ Validation cadence and modes: `build-validation.md`.
   replacement keeps its SIMD shape; slower cases get their verdict per
   `tests-benchmarks.md`, and ReleaseFast runs only for a SIMD-vs-scalar tie
   or a SIMD shape slower in Debug (`build-validation.md`). Never revert implemented work without the owner.
-- `hooks/zig-fmt.sh` runs `zig fmt` on each `.zig`/`.zon` file a
-  `search_replace` or `write` just edited (needs `jq`); it does not replace
+- `hooks/zig-fmt.sh` runs `zig fmt` on each `.zig`/`.zon` file an `Edit` or
+  `Write` just edited (`settings.json`; needs `jq`); it does not replace
   validation.

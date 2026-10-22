@@ -94,8 +94,8 @@ and serial runs differ.
       key bits, FP environment); `docs/architecture.md`
       Coordination Boundaries (pause freezes presentation only).
 - [ ] Rule additions when this lands: float min/max/clamp and transcendental
-      routing (`.grok/rules/memory-performance.md`); float key bits, pause
-      invisibility, and FP environment (`.grok/rules/simulation.md`).
+      routing (`.claude/rules/memory-performance.md`); float key bits, pause
+      invisibility, and FP environment (`.claude/rules/simulation.md`).
 
 ### Acceptance checks
 

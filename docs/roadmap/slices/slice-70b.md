@@ -50,14 +50,14 @@ None of this touches the simulation anchor, `sim_view`, or the checksum.
   choice when startup falls back, so one launch on an unsupported GPU never
   overwrites it; a user edit wins.
 - The re-layout is cold and main-thread, never inside a frame; it touches only
-  the scene target (`.grok/rules/render.md`).
+  the scene target (`.claude/rules/render.md`).
 - Pad defaults keep one action per input. Migration moves old trigger defaults before
   filling zoom, and an explicit user binding always beats a default fill.
 - The fade-out hold freezes the outgoing stack: no updates, events to states,
   or pause while holding; the accumulator is drained so no catch-up burst
   reaches the new state; the swap applies after the fade completes. It is
   presentation only and runs no simulation steps, like pause
-  (`.grok/rules/input-state.md`). Every replace fades; quit applies
+  (`.claude/rules/input-state.md`). Every replace fades; quit applies
   immediately.
 - Sharp-bilinear is selected purely from mode, viewport scale, and zoom; it
   adds one sampler and one composite parameter vector, keeping the exact
@@ -94,7 +94,7 @@ None of this touches the simulation anchor, `sim_view`, or the checksum.
 - [ ] Docs: `docs/rendering-assets-shaders.md`, `docs/state-stack-and-input.md`,
       `docs/architecture.md`, `docs/development-workflow.md`.
 - [ ] Add the explicit-beats-default-fill rule to
-      `.grok/rules/input-state.md` when this lands.
+      `.claude/rules/input-state.md` when this lands.
 
 ### Acceptance checks
 

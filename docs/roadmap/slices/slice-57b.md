@@ -28,7 +28,7 @@ action is deterministic step input.
 
 - A live modal overlay preset: gameplay keeps updating and rendering below,
   input routes to the modal, held gameplay input is released
-  (`.grok/rules/input-state.md`).
+  (`.claude/rules/input-state.md`).
 - The panel reads only const gameplay views and writes only to a pending
   player-action queue; its signatures prove it, checked at comptime.
 - Pending player actions drain into `action_intents` in input capture, in
@@ -39,7 +39,7 @@ action is deterministic step input.
   budget; an unequip with no free slot is refused and counted (inventory
   space, not storage capacity).
 - Panel labels re-text only when the player's inventory changes, never per
-  frame (`.grok/rules/render.md` § Text).
+  frame (`.claude/rules/render.md` § Text).
 - Toasts are presentation-only: a fixed pool, frame-count timed, fed from
   pickup events; they never read or write simulation state.
 - VoidLight: port the grid-plus-gear layout; do not port string IDs,
@@ -57,7 +57,7 @@ action is deterministic step input.
 - [ ] (added by Slice 67) Strings as `StringId`s if this lands after 67E.
 - [ ] Docs: `docs/state-stack-and-input.md` (preset, queue),
       `docs/architecture.md` (UI → gameplay boundary).
-- [ ] Add the read-only UI panel signature rule to `.grok/rules/render.md`
+- [ ] Add the read-only UI panel signature rule to `.claude/rules/render.md`
       when this lands.
 
 ### Acceptance checks

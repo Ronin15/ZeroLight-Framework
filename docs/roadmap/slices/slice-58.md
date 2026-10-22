@@ -44,14 +44,14 @@ same golden hash on serial and threaded runs and in Debug and ReleaseFast.
 - Owner direction: chunk `(level, cx, cy)` is the unit of storage and work;
   worlds are created and destroyed in play. Generation writes chunks, never a
   level-sized array, and nothing is sized to world extent
-  (`.grok/rules/budgets-capacities.md`).
+  (`.claude/rules/budgets-capacities.md`).
 - Generation is integer-only and order-independent: every draw is a pure
   function of seed, cell, and level, so chunks generate independently and in
-  parallel (`.grok/rules/threading.md`, `.grok/rules/simulation.md` §
+  parallel (`.claude/rules/threading.md`, `.claude/rules/simulation.md` §
   Determinism). Integer value noise is a new `core` primitive.
 - Populations, nodes, features, and markers follow content density in the
   spec; nothing is truncated by a cap and nothing is sized from a demo
-  constant (`.grok/rules/engine-design.md` § Target scale). Spec tables
+  constant (`.claude/rules/engine-design.md` § Target scale). Spec tables
   have load-time format bounds only.
 - Uniform (all-open, all-blocking) chunks stay on 64G's cheap path; mixed
   chunks (water beside grass, veined strata) stay correct for nav and
@@ -112,4 +112,4 @@ same golden hash on serial and threaded runs and in Debug and ReleaseFast.
 - [ ] (added by Slices 68A–68C) The 68A re-baseline procedure is run on a
       generated world and its rows recorded.
 - [ ] Unit tests stay within the fixture rule
-      (`.grok/rules/tests-benchmarks.md`); `zig build verify` passes.
+      (`.claude/rules/tests-benchmarks.md`); `zig build verify` passes.

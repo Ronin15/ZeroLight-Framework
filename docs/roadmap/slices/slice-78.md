@@ -25,8 +25,8 @@ frame.
 
 ### Architecture notes
 
-- Findings follow `.grok/rules/zig-style.md` and
-  `.grok/rules/memory-performance.md` (hot paths do no per-item dynamic
+- Findings follow `.claude/rules/zig-style.md` and
+  `.claude/rules/memory-performance.md` (hot paths do no per-item dynamic
   dispatch or repeated validation); a moved check keeps its behavior and
   tests.
 - An assessment first; changes land per owning module, each with its tests.

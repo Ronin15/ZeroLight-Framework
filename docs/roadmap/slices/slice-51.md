@@ -34,7 +34,7 @@ with tests, and its consumers land with their slices.
 - Placement: the lane lives in `src/app/` and knows nothing of simulation
   steps; the step-keyed handoff helper lives in `src/game/`. Engine owns the lane and passes it through `UpdateContext`.
   Everything the lane thread touches is heap-allocated, so a moved `Engine`
-  stays valid (`.grok/rules/engine-design.md` § Ownership boundaries).
+  stays valid (`.claude/rules/engine-design.md` § Ownership boundaries).
 - Thread policy (decided): one dedicated lane thread, not taken from the
   pool; jobs never run on pool workers, where a long job would stall every
   fork-join batch. 65A lowers the lane's OS priority and fixes the pool rule.
@@ -43,7 +43,7 @@ with tests, and its consumers land with their slices.
   or world size) and applies the result at the start of `s + k` in the
   main-thread input phase, stealing a queued job or waiting on a running one.
   Result and step are identical with a fast, slow, full, or absent lane
-  (`.grok/rules/simulation.md` § Determinism).
+  (`.claude/rules/simulation.md` § Determinism).
 - Polling: simulation consumers observe a job only at its due step. A
   readiness query exists only for app-layer consumers whose result never
   enters a running simulation (46 save status, load staging, 65C at load).
@@ -52,10 +52,10 @@ with tests, and its consumers land with their slices.
   borrow 65B and 65C use); it writes only its own outputs and reaches no
   `ThreadSystem`, renderer, SDL handle, or live `DataSystem`/`WorldSystem`.
   Work on the lane is serial; work that scales with population, terrain
-  change, or world size stays on the pool (`.grok/rules/threading.md`).
+  change, or world size stays on the pool (`.claude/rules/threading.md`).
 - No allocation per submit. A full lane never changes a result: the consumer
   runs the job inline and still applies it at `s + k`
-  (`.grok/rules/budgets-capacities.md`).
+  (`.claude/rules/budgets-capacities.md`).
 - Pause: due steps do not advance while paused; app-layer work that must
   progress while paused uses the app-layer surface, never the step handoff.
 - Lifetime: each consumer completes or cancels its jobs in its own teardown;
@@ -91,7 +91,7 @@ with tests, and its consumers land with their slices.
       `docs/development-workflow.md` TSan group.
 - [ ] Add the background-lane rule (polling, step handoff, job inputs with
       the frozen borrow, refusal fallback, pause, ticket lifetime) to
-      `.grok/rules/threading.md` when this lands.
+      `.claude/rules/threading.md` when this lands.
 
 ### Acceptance checks
 

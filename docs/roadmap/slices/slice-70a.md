@@ -38,16 +38,16 @@ game-facing renderer API is renamed.
 
 - The index buffer is a fixed render resource built once at init; it never
   grows with sprite count, capacity, or world size, and larger draw groups
-  split into consecutive chunked draws (`.grok/rules/render.md`,
-  `.grok/rules/budgets-capacities.md`).
+  split into consecutive chunked draws (`.claude/rules/render.md`,
+  `.claude/rules/budgets-capacities.md`).
 - Triangle-list topology only; a future strip material must not reuse the
   shared buffer (documented in the material steps).
 - Color packs once per sprite through a new `core` conversion that
-  `text.zig` reuses (`.grok/rules/memory-performance.md` § SIMD and core
+  `text.zig` reuses (`.claude/rules/memory-performance.md` § SIMD and core
   math).
 - Three SoA streams stay (slot contract and worker seams); threaded emit
   columns get 64-byte bases so every 4-command seam is a cache line
-  (`.grok/rules/threading.md`).
+  (`.claude/rules/threading.md`).
 - Draw groups stay in vertex units; batch reservation keeps its live-count
   reserve with geometric growth at the pre-reserve seam.
 - No GLSL change; a guard test pins the vertex attribute declarations.

@@ -14,7 +14,7 @@ world depth, or cognition scope.
 ### Battle-scale perf watch (2048 movers)
 
 ReleaseSafe dumps are diagnostic trend data, never a perf claim
-(`.grok/rules/tests-benchmarks.md`); they are captured and re-baselined per
+(`.claude/rules/tests-benchmarks.md`); they are captured and re-baselined per
 [Slice 68A](slices/slice-68a.md) §3. If stage lines move while selected and
 observer counts hold, suspect new code; if those counts jump, suspect scope
 density.
@@ -41,6 +41,6 @@ Known costs inside the band: the full agent snapshot each cognition step
 - [ ] **Perception tail.** Stage avg ~0.16 ms, max ~2.4 ms (earlier
       ReleaseSafe dump). A later single demo run showing max 0.549 ms does
       not close it: demo perf logs are never acceptance
-      (`.grok/rules/tests-benchmarks.md`). Awaits a benchmark: a denser
+      (`.claude/rules/tests-benchmarks.md`). Awaits a benchmark: a denser
       observer case in the `perception` groups before touching the gather;
       the FOV runs in the query's lanes (Slice 84). (`perception.zig`)

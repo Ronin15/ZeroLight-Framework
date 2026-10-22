@@ -53,7 +53,7 @@ instances, dispatches through this pool, so its safety is engine-wide.
   (including a participant of a different `ThreadSystem`, whose scratch slot
   can exceed this system's) panics in every build mode, because no safe
   execution exists for it. Forced inline keeps the range set and indices, so
-  output stays deterministic (`.grok/rules/threading.md`).
+  output stays deterministic (`.claude/rules/threading.md`).
 - Consequence: Slice 51's lane thread is a foreign thread, so lane jobs run
   serial code paths, never `parallelFor`.
 - Forced inline is visible: a per-batch stat, a per-system counter, and one
@@ -105,7 +105,7 @@ instances, dispatches through this pool, so its safety is engine-wide.
       forced inline, foreign-thread panic, worker names);
       `docs/development-workflow.md` "Thread Sanitizer" and the bench group
       (the Slice 50 docs commit).
-- [x] Rule additions to `.grok/rules/threading.md`: singleton cache-line
+- [x] Rule additions to `.claude/rules/threading.md`: singleton cache-line
       padding (`a66d87c`); nesting and foreign-thread behavior and the TSan
       suppression policy (the Slice 50 docs commit).
 
@@ -129,7 +129,7 @@ instances, dispatches through this pool, so its safety is engine-wide.
       claim (`a66d87c`).
 - [x] `thread-dispatch` and `movement --case thread-small-range` show no
       regression beyond run-to-run spread on adjacent commits in ReleaseFast
-      (`.grok/rules/tests-benchmarks.md`). `thread-dispatch` ReleaseFast,
+      (`.claude/rules/tests-benchmarks.md`). `thread-dispatch` ReleaseFast,
       3 reps: `a66d87c` nothing slower (262,144 fixed-2 −19.5%, fixed-auto
       −16.5%); `b42ef15` at 16,384 fixed-auto within spread. `movement
       --case thread-small-range` ReleaseFast, 3 reps, `5673672` vs the slice

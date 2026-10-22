@@ -42,7 +42,7 @@ every existing agent is byte-identical.
 - Per-agent post data is one optional component; home and alert level are
   derived, never stored.
 - Route count and length are content-sized
-  (`.grok/rules/budgets-capacities.md`); 71A adds route data to markers,
+  (`.claude/rules/budgets-capacities.md`); 71A adds route data to markers,
   whose store 58 grows with content.
 - The leash has hysteresis read from the agent's active behavior, so a
   target at the boundary cannot cause flapping; flee is never leashed.
@@ -57,7 +57,7 @@ every existing agent is byte-identical.
   allies through the shared spatial index under a fixed per-query budget,
   plus one deferred `alarm` stimulus heard by every stagger cohort.
   Over-budget alarms defer to the next step, never drop
-  (`.grok/rules/budgets-capacities.md`). A guard is a homed agent that can
+  (`.claude/rules/budgets-capacities.md`). A guard is a homed agent that can
   fight (gain rule, not a content list).
 - Spatial rows map to entities through the index's own entity column, never
   halo positions (rows are compacted).

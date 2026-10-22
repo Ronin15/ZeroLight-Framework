@@ -41,14 +41,14 @@ cover the new features.
 ### Architecture notes
 
 - Owner direction: chunks own terrain; worlds are created in play
-  (`.grok/rules/budgets-capacities.md`). Caves, stamps, and entrances are
+  (`.claude/rules/budgets-capacities.md`). Caves, stamps, and entrances are
   chunk content generated with the world; nothing is sized to world extent.
 - Every placement is content: sites, structures, sockets, entrances, and
   walls follow spec density and site geometry and are never truncated by a
   cap; spec tables have load-time format bounds only.
 - Placements are confined to their own site cell, so no two overlap by
   construction; site selection reads only pure functions of seed and spec,
-  and jobs read it as immutable input (`.grok/rules/threading.md`).
+  and jobs read it as immutable input (`.claude/rules/threading.md`).
 - Entrances are ordinary ramp links (dig's shape), so plane traversal and
   nav need no new path.
 - Cross-level goals are 73's (archetype data); a goal in another pocket may

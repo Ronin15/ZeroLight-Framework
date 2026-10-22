@@ -127,7 +127,7 @@ groups measure it.
       procedure; `docs/architecture.md` core line; `AGENTS.md` command.
 - [ ] Add the SIMD codegen and determinism rule (inline Mask4, select-form
       min/max, no libm builtins or estimates, `simd-asm-check`, scalar/SIMD
-      bit identity) to `.grok/rules/memory-performance.md` when this lands.
+      bit identity) to `.claude/rules/memory-performance.md` when this lands.
 
 ### Acceptance checks
 

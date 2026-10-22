@@ -29,19 +29,19 @@ results never depend on a chunk's form.
 
 - Owner direction: residency is a chunk's storage form, never whether it
   simulates; nothing is evicted from the simulation; worlds are created and
-  destroyed in play (`.grok/rules/engine-design.md` § Target scale).
+  destroyed in play (`.claude/rules/engine-design.md` § Target scale).
 - A level's size is fixed at creation; this slice does not make worlds grow
-  or stream new territory (`.grok/rules/budgets-capacities.md`). World
+  or stream new territory (`.claude/rules/budgets-capacities.md`). World
   extent is bounded only by coordinate and index widths, checked loudly at
   world creation.
 - Every form answers the terrain and nav queries simulation needs; a form
   change costs the chunk changed, never the level or world, and runs at a
   named seam (main-thread commit or a designed deferred boundary; I/O off
-  the step path) (`.grok/rules/threading.md`).
+  the step path) (`.claude/rules/threading.md`).
 - Form choice reads only fixed-step state (the observer's `sim_view`, chunk
   activity), never the render window or wall clock; same seed and inputs
   give bit-identical persistent state for any form history
-  (`.grok/rules/simulation.md` § Determinism).
+  (`.claude/rules/simulation.md` § Determinism).
 - Needs: 64G's chunk storage and per-chunk render upload; 58's pure
   generator for regenerable forms; 46's per-chunk terrain save (every
   chunk); 74's world lifetime; 75's distance-from-observer fidelity.

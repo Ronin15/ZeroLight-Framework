@@ -39,13 +39,13 @@ the HUD primitives. Allocation-free after warmup.
 
 - Screens are retained, state-owned, and declared once as data with enum
   widget identity; no string IDs, callbacks, or per-frame identity hashing
-  (`.grok/rules/memory-performance.md`). Focus moves synchronously in
+  (`.claude/rules/memory-performance.md`). Focus moves synchronously in
   `handleEvent` so consumption is decided at event time; activations become
   typed events the owner drains in `update`. Layout runs only when
   something is dirty.
 - Modal focus scoping is the state stack; dialogs are modal states, not
   widgets. Menus act on resolved `Action`s, and states receive the press
-  resolved once per event by `Engine` (`.grok/rules/input-state.md`), so
+  resolved once per event by `Engine` (`.claude/rules/input-state.md`), so
   Slice 44 changes only the table behind it.
 - Screens consume UI actions only; pause, the debug toggle, and gameplay
   actions keep their current paths. Pause resume goes through a transition
@@ -53,18 +53,18 @@ the HUD primitives. Allocation-free after warmup.
 - UI never writes simulation state; HUD widgets read gameplay values and
   push them on change. UI-originated gameplay requests arrive with Slice
   57B. HUD and screen draw caches are render-side state, never `DataSystem`
-  (`.grok/rules/simulation.md`, `.grok/rules/render.md`).
+  (`.claude/rules/simulation.md`, `.claude/rules/render.md`).
 - Per-screen capacity is the screen's own widget enum; draw reservation is a
   bound fixed at build time, never live text length; the stacked-UI
   headroom guess is retired so every reserve term is a build-time bound or
-  the overlay headroom (`.grok/rules/budgets-capacities.md`). Draws stay in
-  nondecreasing `RenderOrder` (`.grok/rules/render.md`).
+  the overlay headroom (`.claude/rules/budgets-capacities.md`). Draws stay in
+  nondecreasing `RenderOrder` (`.claude/rules/render.md`).
 - The theme is a developer asset: strictly parsed at startup and fatal when
-  missing or invalid, like atlas sidecars (`.grok/rules/assets-audio.md`).
+  missing or invalid, like atlas sidecars (`.claude/rules/assets-audio.md`).
 - `LoadingState` covers startup and session load. A world created in play
   (Slice 74) never blocks other worlds' stepping, so any progress it shows
   uses HUD primitives, not a modal that halts the session
-  (`.grok/rules/engine-design.md` § Target scale).
+  (`.claude/rules/engine-design.md` § Target scale).
 - Main thread, serial; cost is per widget and fixed per screen.
 - Documented behavior changes: Esc/B in pause resumes instead of quitting;
   Esc on the main menu confirms before quitting.

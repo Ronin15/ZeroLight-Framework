@@ -64,7 +64,7 @@ in its owning slice.
       together (level, cell), whatever the spawn order; a test with a
       spawn order whose period shares a factor with
       `cognition_stagger_n` that would fail with the index stripe
-      (`.grok/rules/tests-benchmarks.md` § Tests); serial == threaded; the
+      (`.claude/rules/tests-benchmarks.md` § Tests); serial == threaded; the
       `production-step` bench samples whole stagger cycles (a sample of
       fewer steps than one cycle, such as 3 iterations < 4, depends on which
       steps it lands on) and reports per-step ai/steering max (or spread)
@@ -81,7 +81,7 @@ in its owning slice.
       real figure).
 - [ ] DataSystem hot-pass data layout (contiguity audit H5): the stores stay
       dense SoA; the stagger assignment and the cross-store reads are fixed in
-      the layout (`.grok/rules/memory-performance.md` § Data-oriented
+      the layout (`.claude/rules/memory-performance.md` § Data-oriented
       design). Failure: every component store appends and swap-removes
       (`data_system/movement.zig:168`, `agents.zig:159`,
       `faction_level.zig:61`, `:122`), so no store is ordered by the keys
@@ -104,9 +104,9 @@ in its owning slice.
       chunk order further, and the scope index lists inherit the scatter.
       Pass: each phase is a contiguous row run the think set reads in order;
       no consumer above reads another store per row outside a once-per-stage
-      gather (`.grok/rules/memory-performance.md` § Data-oriented design); a
+      gather (`.claude/rules/memory-performance.md` § Data-oriented design); a
       structural command's apply cost stays independent of population
-      (`.grok/rules/engine-design.md` § Cost model); serial == threaded and
+      (`.claude/rules/engine-design.md` § Cost model); serial == threaded and
       deterministic. Coordinates with 75 (tier and cadence), 73 (think
       interval), 68A (gathers off main), 86 (collision gather), and 35
       (`world_gate`). The think set arrives in the index's cell-major order
@@ -122,7 +122,7 @@ in its owning slice.
       (`systems/affect.zig:259-307`) walks the think set on the main thread,
       resolving the affect, perception, and memory rows per entity and
       appending one row each, per-item work beyond an ordered merge
-      (`.grok/rules/threading.md`); the AI, perception, and memory gathers
+      (`.claude/rules/threading.md`); the AI, perception, and memory gathers
       already run on workers. Failure scenario: once 75 thinks every agent,
       main pays three slot lookups per agent in the world every step. Pass: a
       windowed threaded gather merged in range order, serial == threaded, a
@@ -133,7 +133,7 @@ in its owning slice.
       in ascending memory row and reads `target_visible`, `nearest_threat`,
       and `last_seen_*` at each member's perception row, which ascends only
       while the perception and memory stores share a row order
-      (`.grok/rules/memory-performance.md` § Data-oriented design). Failure
+      (`.claude/rules/memory-performance.md` § Data-oriented design). Failure
       scenario (derived): swap-remove churn on either store makes every
       member's perception reads scattered, every step. Pass: the stores share
       the H5 order, so the pass reads both as forward streams; an
@@ -144,7 +144,7 @@ in its owning slice.
       cost, handle and generation churn, and per-step walks a store forces on
       its consumers. Each finding becomes an item here.
 - [ ] A store's `u32` row cap fails as `OutOfMemory` at its growth seam
-      (`.grok/rules/budgets-capacities.md`). Failure: past `maxInt(u32)`
+      (`.claude/rules/budgets-capacities.md`). Failure: past `maxInt(u32)`
       rows the stores return distinct errors: `data_system/movement.zig:59`,
       `agents.zig:102`, `:220`, `collision.zig:55`, `:129`,
       `faction_level.zig:35`, `:96`, `affect.zig:79`, `destructible.zig:31`,
@@ -163,7 +163,7 @@ in its owning slice.
 - [ ] Commands past the `.structural_commit` share defer deterministically to
       a later step at the commit seam, one deferral every producer uses (56,
       57, 61, 62, 76, and 77 depend on it;
-      `.grok/rules/budgets-capacities.md`; docs audit M7). Failure: a commit
+      `.claude/rules/budgets-capacities.md`; docs audit M7). Failure: a commit
       past the share fails before mutation (`simulation.zig:491`) and the
       error fails the step (`game_demo_state.zig:689`, through `:647`).
       Failure scenario (derived, no bench): a kill burst, collapse, or
@@ -174,7 +174,7 @@ in its owning slice.
       outside the stages, and any per-item work on main between stages.
       Each finding becomes an item here.
 - [ ] Core kernels (`simd.zig`, `math.zig`, `rng.zig`; and `logging.zig`
-      against `.grok/rules/zig-style.md` § Logging, which no other pass
+      against `.claude/rules/zig-style.md` § Logging, which no other pass
       covers; docs audit L5): primitive coverage
       for the reworked hot loops of 84–87, scalar/SIMD parity tests, and any
       hand-rolled primitive left in a system. Each finding becomes an item
@@ -187,14 +187,14 @@ in its owning slice.
       (`PopulationRowCounts.population`, `data_system/types.zig:46`); the
       index only ever holds AI halo rows, and the perception, AI, affect, and
       AI-memory scratch reserve the same (`:810-813`)
-      (`.grok/rules/engine-design.md` § Cost model,
-      `.grok/rules/budgets-capacities.md`). Failure scenario (derived): a
+      (`.claude/rules/engine-design.md` § Cost model,
+      `.claude/rules/budgets-capacities.md`). Failure scenario (derived): a
       colony with 1M items at rest and 10k agents reserves index storage for
       1M slots. Pass: a logical AI-row capacity at the seam sizes the index
       and the per-AI scratch; a reserve test shows their bytes follow AI
       rows.
 - [ ] The runtime perf log carries only change-path cost-driver stages (code
-      audit L1, its log-policy remainder; `.grok/rules/threading.md`).
+      audit L1, its log-policy remainder; `.claude/rules/threading.md`).
       Failure: `BatchStage` (`src/app/runtime_perf_log.zig:225-252`) carries
       non-driver stages (perception, AI, steering, movement, particles, and
       others), recorded each step (`simulation_pipeline.zig:548-633` in the 84
@@ -210,18 +210,18 @@ in its owning slice.
       bench OOM or leak sweep reports the fixture's leak. Pass: the state is
       created first, or a guarded errdefer covers `world` until
       `initWithWorld` takes ownership
-      (`.grok/rules/memory-performance.md` § Allocator discipline).
+      (`.claude/rules/memory-performance.md` § Allocator discipline).
 - [ ] One `hotStoreCapacity` (code audit L8). Failure: eight private copies
       wrap `std.mem.alignForwardAnyAlign` (`systems/ai.zig:81`,
       `perception.zig:106`, `affect.zig:92`, `ai_memory.zig:71`,
       `particle.zig:31`, `collision.zig:76`, `collision_response.zig:59`,
       `steering/system.zig:67`) beside the shared
-      `data_system/types.zig:28` (`.grok/rules/memory-performance.md`,
-      `.grok/rules/engine-design.md` § Changes and docs). Failure scenario:
+      `data_system/types.zig:28` (`.claude/rules/memory-performance.md`,
+      `.claude/rules/engine-design.md` § Changes and docs). Failure scenario:
       an alignment change lands in one copy, and a stage's scratch aligns
       differently from its store. Pass: every site calls the shared helper.
 - [ ] Benches at the worst-case shape each finding's bound names, with the
-      shape asserts landing with each fix (`.grok/rules/tests-benchmarks.md`).
+      shape asserts landing with each fix (`.claude/rules/tests-benchmarks.md`).
 - [ ] Docs: `docs/architecture.md` (DataSystem, pipeline);
       `docs/simulation-tiers-and-pipeline.md`.
 

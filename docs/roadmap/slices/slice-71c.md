@@ -45,11 +45,11 @@ byte-identical to today.
   archer stopping near the marker is always in reach; an empty band falls
   back to the normal pursue goal.
 - Constants are fixed, never derived from world or content size; queries
-  carry a fixed per-query budget (`.grok/rules/budgets-capacities.md`).
+  carry a fixed per-query budget (`.claude/rules/budgets-capacities.md`).
 - Flee and pursue already wake coasting agents, so Slice 55 needs no change.
 - No new persistent state; cover markers are already hashed with the marker
   store.
-- Serial == threaded (`.grok/rules/threading.md`).
+- Serial == threaded (`.claude/rules/threading.md`).
 - VoidLight reference: the idea of fleeing toward an authored safe point;
   not its direction blend, crowd-scaled distances, or delta-time modifiers.
   Ranged cover-holding is a ZeroLight extension.

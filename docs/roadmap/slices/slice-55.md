@@ -61,11 +61,11 @@ Slice 75's distance bands are another.
   exemption in Slice 49's determinism contract).
 - Fixed power-of-two intervals and a fixed distance band, never scaled to
   population, world size, or cost; coasting only removes work, so there is
-  no cap or deferral (`.grok/rules/budgets-capacities.md`).
+  no cap or deferral (`.claude/rules/budgets-capacities.md`).
 - The decide set never depends on the render window
-  (`.grok/rules/simulation.md` § Scope and tiers).
+  (`.claude/rules/simulation.md` § Scope and tiers).
 - Threaded gather with a serial twin, range-ordered merge
-  (`.grok/rules/threading.md`).
+  (`.claude/rules/threading.md`).
 - Provides: idle coasting as one input to 73's per-agent think interval
   (75's distance bands are another); the decide set that Slice 68A's shared
   table is walked by. 75 replaces the halo bound on the think set.
@@ -110,5 +110,5 @@ Slice 75's distance bands are another.
 - [ ] `ai-idle-coast` decides the analytic fraction of think rows, and its
       per-step cost tracks decided rows at three population sizes against
       `ai-idle-stagger`; `ai` is unchanged
-      (`.grok/rules/tests-benchmarks.md`).
+      (`.claude/rules/tests-benchmarks.md`).
 - [ ] `zig build verify` passes.

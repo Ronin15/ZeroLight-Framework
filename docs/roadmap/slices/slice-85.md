@@ -50,13 +50,13 @@ keeps the apply local.
 
 ### Architecture notes
 
-- Neighbor queries use the shared index (`.grok/rules/simulation.md`);
+- Neighbor queries use the shared index (`.claude/rules/simulation.md`);
   steering's private grid is not an allowed exception.
-- A create costs work in what it changed (`.grok/rules/engine-design.md`
+- A create costs work in what it changed (`.claude/rules/engine-design.md`
   § Cost model).
-- Each hot loop carries a SIMD verdict (`.grok/rules/memory-performance.md`
+- Each hot loop carries a SIMD verdict (`.claude/rules/memory-performance.md`
   § SIMD).
-- Serial == threaded bitwise (`.grok/rules/threading.md`).
+- Serial == threaded bitwise (`.claude/rules/threading.md`).
 
 ### Checklist
 
@@ -68,8 +68,8 @@ keeps the apply local.
       `max_agent_candidate_checks` (64, `avoidance.zig:44`) at `:395`, before
       its level gate at `:400`, then reads 5 snapshot columns per candidate
       through the row index (contiguity audit H1, code audit H2;
-      `.grok/rules/memory-performance.md` § Data-oriented design,
-      `.grok/rules/simulation.md` § Controllers and processors). Failure
+      `.claude/rules/memory-performance.md` § Data-oriented design,
+      `.claude/rules/simulation.md` § Controllers and processors). Failure
       scenario (derived): a shaft of L levels with k agents per cell at the
       same xy; checks per agent grow with L up to the 64 cap, and with L·k >
       64 the cap is spent on other-level rows, so a same-level neighbor gives
@@ -90,21 +90,21 @@ keeps the apply local.
       which this slice rewrites onto 84's index, runs its per-neighbor float
       math scalar with no verdict at the site; the rewritten loop is a
       gather-bound per-agent loop, so it ships SIMD
-      (`.grok/rules/memory-performance.md` § Data-oriented design, § SIMD
+      (`.claude/rules/memory-performance.md` § Data-oriented design, § SIMD
       and core math). Failure scenario: avoidance's per-neighbor math stays
       scalar at population scale. Pass: the accumulate runs through `simd.zig`
       over the index's lane groups, ending in their masked last batch,
       bit-identical to its scalar form; scalar/SIMD and
       serial/threaded parity tests; any scratch it reserves has a
       `FailingAllocator` proof over the real multi-worker `ThreadSystem`
-      (`.grok/rules/memory-performance.md` § Allocator discipline).
+      (`.claude/rules/memory-performance.md` § Allocator discipline).
 - [ ] Movement intents reach the apply in movement-row order. Failure
       scenario: `frame.intents` is written in steering's selected order
       (`avoidance.zig:216`), so the apply resolves each intent's movement row
       (`movement.zig:133`) and writes the rows scattered (contiguity audit M3;
-      `.grok/rules/memory-performance.md` § Data-oriented design,
-      `.grok/rules/threading.md`). Measured gain above (ReleaseFast only;
-      Debug numbers come first, `.grok/rules/build-validation.md`). Pass:
+      `.claude/rules/memory-performance.md` § Data-oriented design,
+      `.claude/rules/threading.md`). Measured gain above (ReleaseFast only;
+      Debug numbers come first, `.claude/rules/build-validation.md`). Pass:
       the apply walks its intents in row order with no per-intent row lookup;
       `movement-apply-intents` within spread of `-sorted`, with the ordering
       cost counted in steering.
@@ -118,7 +118,7 @@ keeps the apply local.
       steering reads the previous step's positions and levels
       (`steering/system.zig:350`) before `apply_ai_movement_intents` writes
       positions, but its arm (`simulation_pipeline.zig:236`) declares no
-      `carried` (`.grok/rules/simulation.md` § Pipeline and stage
+      `carried` (`.claude/rules/simulation.md` § Pipeline and stage
       ordering). Failure scenario: moved after a position or level writer, it
       still compiles and reads this step's poses against the previous step's
       index. Pass: the arm carries `movement_positions` and `world_level`
@@ -127,7 +127,7 @@ keeps the apply local.
 - [ ] No per-step width error (84's L1 review). Failure: the step returns
       `error.Overflow` past `max_step_items` (`steering/system.zig:298-299`)
       behind an assert, a distinct per-step error where the bound is a format
-      width (`.grok/rules/budgets-capacities.md`). Failure scenario: a
+      width (`.claude/rules/budgets-capacities.md`). Failure scenario: a
       caller that handles growth failures as `OutOfMemory` meets a different
       error from the hot path. Pass: the width is proven where rows grow
       (the population seam or `reserve`, as `OutOfMemory`) and the step keeps
@@ -135,7 +135,7 @@ keeps the apply local.
 - [ ] `select_claim` dispatches items that track its work (84's audit).
       Failure: its items are bands (`steering/selection.zig:77`, `:89`), at
       most a fixed band count of `BandPartition` at scale, whatever the
-      intents behind them (`.grok/rules/threading.md`: never a fixed
+      intents behind them (`.claude/rules/threading.md`: never a fixed
       partition count whose work varies behind it). Failure scenario: at
       large populations the tuner samples a fixed band count while each
       band's intents grow. Pass: the stage's items are units whose count
@@ -148,7 +148,7 @@ keeps the apply local.
       and the `data_system/movement.zig` and `data_system/agents.zig` stores.
       Each finding becomes an item here.
 - [ ] `buildAgentGridDirect` (`steering/agent_grid.zig:38-59`) is a separate
-      no-worker entry from `buildAgentGrid` (`.grok/rules/tests-benchmarks.md`
+      no-worker entry from `buildAgentGrid` (`.claude/rules/tests-benchmarks.md`
       § Test and production code, point 1). If this slice keeps the grid it is
       deleted; the grid itself goes with the first item. Deleting it makes the
       one-band fast path (`steering/avoidance.zig:389`) dead, and
@@ -159,7 +159,7 @@ keeps the apply local.
 - [ ] A no-worker serial branch in steering selection
       (`steering/selection.zig:52`, the `orelse` of `withWorkers` calling
       `resolveAndClaim` once;
-      `.grok/rules/tests-benchmarks.md` § Test and production code, point
+      `.claude/rules/tests-benchmarks.md` § Test and production code, point
       1). Pass: removed after a cost check that the stage run inline does no
       worse (`steering`, same mode).
 - [ ] Tests: steering output on today's fixtures unchanged, or changed only by

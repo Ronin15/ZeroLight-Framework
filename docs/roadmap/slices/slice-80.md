@@ -20,7 +20,7 @@ traversal, and audio treat it through the same paths as any entity.
 
 - The rule already states the target: a player entity is optional, and the
   observer is the camera focus or a player when a game has one
-  (`.grok/rules/engine-design.md` § Target scale).
+  (`.claude/rules/engine-design.md` § Target scale).
 - `Player` (`src/game/player.zig:16`) holds `entity` and `current_level`;
   `GameDemoState` always spawns one.
 - Camera: `cameraForPlayer` (`src/game/game_demo_state.zig:634`) always
@@ -53,21 +53,21 @@ traversal, and audio treat it through the same paths as any entity.
 ### Architecture notes
 
 - Scope derives only from the fixed-step `sim_view`, never the render window
-  (`.grok/rules/simulation.md` § Scope and tiers); the observer supplies
+  (`.claude/rules/simulation.md` § Scope and tiers); the observer supplies
   that rect, and its source (free camera or followed entity) never changes
   how it is computed. Slice 60's rig drives the observer's camera; Slice 74
   binds it to the viewed world; Slice 75's bands read it.
 - Swapping the observer's source happens at a between-step seam and changes
   only fidelity bands, never whether anything advances
-  (`.grok/rules/engine-design.md` § Target scale).
+  (`.claude/rules/engine-design.md` § Target scale).
 - A player character is a controller that writes `navigation_intents` or
   `intents` and `action_intents` like any producer
-  (`.grok/rules/simulation.md` § Controllers and processors); no stage
+  (`.claude/rules/simulation.md` § Controllers and processors); no stage
   reads a player handle, and no store or event holds one.
 - Input stays `InputState` → controller; app commands stay in
-  `FrameCommands` (`.grok/rules/input-state.md`).
+  `FrameCommands` (`.claude/rules/input-state.md`).
 - Gameplay logic stays in states, controllers, and processors, never in
-  `Engine` (`.grok/rules/engine-design.md` § Ownership boundaries).
+  `Engine` (`.claude/rules/engine-design.md` § Ownership boundaries).
 - Open owner question: in a game with no player character, how dig and build
   orders are issued (cursor designations, a job system, or both); this slice
   keeps today's dig behind the player controller until that is decided.

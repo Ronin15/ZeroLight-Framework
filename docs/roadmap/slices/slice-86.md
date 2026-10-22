@@ -69,24 +69,24 @@ the current bench.
 ### Architecture notes
 
 - Per-item work that grows (gather, sort) threads; main keeps only the
-  ordered merge (`.grok/rules/threading.md`).
+  ordered merge (`.claude/rules/threading.md`).
 - Work per body follows what is near it on its own level, never the level's
-  height or the level count (`.grok/rules/engine-design.md` § Cost model).
+  height or the level count (`.claude/rules/engine-design.md` § Cost model).
 - Rows at rest cost work only when they change; static rows change only
-  through structural commands (`.grok/rules/simulation.md`).
+  through structural commands (`.claude/rules/simulation.md`).
 - Contact streams are deterministic from range order and sized to the pair
-  bound at the seam (`.grok/rules/threading.md`,
-  `.grok/rules/budgets-capacities.md`).
+  bound at the seam (`.claude/rules/threading.md`,
+  `.claude/rules/budgets-capacities.md`).
 - The static split landed in `b126599`. Solid static×static pairs are not
   contacts. A static trigger over a static keeps its trigger event
   (`collision_response.zig:684`). Dynamic × static capacity terms from 61
   and 62 stay.
 - A static body moves only through structural commands
-  (`.grok/rules/simulation.md` § Controllers and processors); a Debug
+  (`.claude/rules/simulation.md` § Controllers and processors); a Debug
   verification catches an out-of-band move.
 - Static-hit overlap runs in the query's worker ranges
   (`writeStaticHitContacts`). Main merges those range windows
-  (`.grok/rules/threading.md`).
+  (`.claude/rules/threading.md`).
 - From [72](slice-72.md) D1: the destructible resolve answered by the
   shared static-collider query. From 75: collision fidelity per band.
 
@@ -102,7 +102,7 @@ the current bench.
       sorted by `(min_x, min_y, entity)` (`:1059`) with no level key, and the
       proxies stay in gather order, so every 4-lane candidate block is a
       `gatherFloat4` through it (`:752-757`, `:877-882`) (contiguity audit H2;
-      `.grok/rules/memory-performance.md` § Data-oriented design). A level
+      `.claude/rules/memory-performance.md` § Data-oriented design). A level
       key alone leaves the tall shape failing (derived); the order is this
       slice's design. Measured: the per-body growth in `collision-tall` and
       `collision-stacked` above. Pass: time per body flat in aspect and in
@@ -149,13 +149,13 @@ the current bench.
       entity-index order (`:669-683`) and `sync` relinks from the free pools,
       so a cell's entries are adjacent only when its statics hold consecutive
       entity indices and no sync has relinked them
-      (`.grok/rules/memory-performance.md` § Data-oriented design). Failure
+      (`.claude/rules/memory-performance.md` § Data-oriented design). Failure
       scenario (derived): a dense base (16 statics per chunk) built in
       interleaved order, or walls built and torn down in play: every agent's
       box query pays a scattered entry load and a scattered row gather per
       listed static, every step. Pass: a box query and a chunk's row walk read
       contiguous runs; a static change re-derives only its own chunks at
-      `sync` (`.grok/rules/budgets-capacities.md`); `steering-static-dense`
+      `sync` (`.claude/rules/budgets-capacities.md`); `steering-static-dense`
       gains interleaved-creation and churned variants whose per-agent query
       cost matches the chunk-ordered one. Steering (85) and nav are the
       consumers; the path registry item and the two items below build on this
@@ -290,7 +290,7 @@ the current bench.
       `nav_evict` jobs (`pathfinding/eviction.zig:250`, `:303`) and the cold
       `evictLevel` (`:60`) walk each changed key's linked list; the site's
       verdict names the pointer chase (`eviction.zig:301-302`)
-      (`.grok/rules/memory-performance.md` § Data-oriented design, § Hot
+      (`.claude/rules/memory-performance.md` § Data-oriented design, § Hot
       paths). Failure scenario: after publish churn, an explosion's
       multi-chunk change evicts through scattered entries. Pass: eviction
       reads each key's registrations as one contiguous run. Landed with the
@@ -302,7 +302,7 @@ the current bench.
       The consumer streams packed columns; that item is below.
       Failure: it dispatches one item per fixed band (`collision_response.zig:296`,
       `:307`; at most `max_bands` 64, `:56`), a fixed partition count whose work
-      varies behind it (`.grok/rules/threading.md`: "A stage's items are units
+      varies behind it (`.claude/rules/threading.md`: "A stage's items are units
       whose count tracks its work (runs, keys, rows), never a fixed partition
       count whose work varies behind it"). Failure scenario: a step of 16 intents
       and one of 16,384 both dispatch at most 64 items (one per band), and a
@@ -342,14 +342,14 @@ the current bench.
       `pdq`, O(E log(E/64)) on an already-settled order, where `buildDirect`
       (`collision.zig:726-731`) sorts the three runs separately and merges them
       (`mergeIntoSorted`, `:731-732`), O(E) on a warm order
-      (`.grok/rules/engine-design.md` § Cost model). Measured (scratch
+      (`.claude/rules/engine-design.md` § Cost model). Measured (scratch
       comparison count, not a bench group): 14 / 17 / 21 comparisons per item
       at n = 4K / 32K / 256K, against a flat 2 for the merge. Pass: each band
       sorts each run and merges them (a merge buffer with its reserve and a
       `FailingAllocator` proof), measured by the collision bench groups at warm
       shapes, serial and threaded.
 - [x] After the item above, collision has one path. Landed in `5595275`.
-      (`.grok/rules/tests-benchmarks.md` § Test and production code, point
+      (`.claude/rules/tests-benchmarks.md` § Test and production code, point
       1). Delete `updateDirect` (`collision.zig:628`), `buildDirect` (`:704`),
       `buildBroadphaseCandidatesDirect` (`:1045`), the no-worker branch in
       `update` (`:587-588`), and the test helper `buildForTest` (`:1697`, which
@@ -361,12 +361,12 @@ the current bench.
       their own window.
       (lands with the response gather rework, which edits the same run;
       `collision_response.zig:270`, the `else` of `withWorkers`;
-      `.grok/rules/tests-benchmarks.md` § Test and production code, point
+      `.claude/rules/tests-benchmarks.md` § Test and production code, point
       1). Pass: it is removed after a cost check that the stage run inline
       does no worse (`collision-response-stage`, serial and inline, same
       mode).
 - [x] Benches at the worst-case shapes (thin, tall, deep, dense), with the
-      shape asserts landing with each fix (`.grok/rules/tests-benchmarks.md`).
+      shape asserts landing with each fix (`.claude/rules/tests-benchmarks.md`).
       Debug tuned, fixed 4,096 bodies except stacked, which grows levels:
       tall per body 340 / 346 / 307 ns at aspect 1 / 16 / 256; thin 326 /
       319 / 281 ns; stacked 588 / 329 / 286 ns at 1 / 4 / 16 levels

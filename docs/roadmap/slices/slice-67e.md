@@ -37,13 +37,13 @@ nothing here builds for it beyond the accessor bodies it will replace.
 - English is compiled in, so it never fails to load and a later per-locale
   loader only adds tables beside it without touching a call site.
 - String IDs are build-local: no ID is ever persisted in saves or settings
-  (`.grok/rules/simulation.md` § Persistent data).
+  (`.claude/rules/simulation.md` § Persistent data).
 - A tag without English text, malformed placeholders, or text over the
   label cap fails the build.
 - Value-bearing text is one ID with placeholders; no wording branches on a
   count (plural forms belong to the deferred work and resolve inside the
   accessor). Formatting runs only on value change, never per frame, and
-  allocates nothing (`.grok/rules/memory-performance.md`).
+  allocates nothing (`.claude/rules/memory-performance.md`).
 - Controls action names come from an exhaustive switch, so a new `Action`
   cannot compile without a name decision.
 - Stays unlocalized: key and button labels, the OS window title, and debug
@@ -76,7 +76,7 @@ nothing here builds for it beyond the accessor bodies it will replace.
       `src/tests.zig`.
 - [ ] Add the UI text rule (user-facing text uses string IDs, value-bearing
       text goes through the formatter, debug tooling stays English) to
-      `.grok/rules/render.md` when this lands.
+      `.claude/rules/render.md` when this lands.
 
 ### Acceptance checks
 

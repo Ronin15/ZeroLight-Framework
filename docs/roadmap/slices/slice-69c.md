@@ -28,7 +28,7 @@ result is deterministic.
 ### Architecture notes
 
 - `Action.rest` is a gameplay action, rising-edge latched, and a refused press is consumed
-  (`.grok/rules/input-state.md`). The latch is hashed and saved (64B / 46)
+  (`.claude/rules/input-state.md`). The latch is hashed and saved (64B / 46)
   so a save taken with the key held never produces a spurious rest on load.
 - The target is the next dawn or dusk phase start, always within two days
   (pure, validated calendar).
@@ -36,9 +36,9 @@ result is deterministic.
   at reduced fidelity (75's cadences); step-domain schedules, memory, affect,
   and cognition advance across the interval. How the interval is stepped is
   set by the design pass with a cost model
-  (`.grok/rules/engine-design.md`); results never depend on render cadence
-  or worker count (`.grok/rules/simulation.md` § Determinism,
-  `.grok/rules/threading.md`). Other worlds are untouched.
+  (`.claude/rules/engine-design.md`); results never depend on render cadence
+  or worker count (`.claude/rules/simulation.md` § Determinism,
+  `.claude/rules/threading.md`). Other worlds are untouched.
 - In a game with a player, a skip is refused only when a same-level NPC near
   the player (within the maximum perception range) currently targets it;
   stale far entries never block. The check reads committed state on the main

@@ -3,8 +3,8 @@
 This document describes the implemented fixed-step simulation support in
 `src/game/simulation.zig`. It is a current-code contract for
 `SimulationFrame`, typed transient streams, structural command publication, and
-domain events. Rules: `.grok/rules/simulation.md` and
-`.grok/rules/threading.md`. Roadmap status is in the roadmap (index
+domain events. Rules: `.claude/rules/simulation.md` and
+`.claude/rules/threading.md`. Roadmap status is in the roadmap (index
 `docs/framework-implementation-slices.md`; the planned merged `stage_order` is
 Table T4 in `docs/roadmap/tracks/voidlight-port.md`).
 
@@ -354,7 +354,7 @@ Current event stages are:
 - `domain_reaction`
 
 Events carry stable IDs, enum tags, and small value payloads only
-(`.grok/rules/simulation.md`).
+(`.claude/rules/simulation.md`).
 
 World tile and obstacle events carry compact level/cell regions plus old/new
 tile and obstacle flags. They wake explicit reaction points such as pathfinding
@@ -390,7 +390,7 @@ or perception/memory/affect state — belong in component columns or transient
 range streams; only state transitions (such as acquiring or losing a target,
 or a drive crossing a threshold) become events. This keeps the event stream
 bounded and the per-frame data path allocation-free. Emission order rules are
-in `.grok/rules/threading.md`.
+in `.claude/rules/threading.md`.
 
 ## Structural Commands
 
@@ -520,7 +520,7 @@ Tests for this module prove the stream contracts directly:
 - structural command commits publish events only after successful `DataSystem`
   mutation;
 - no test-only payload tags or fake stages in production contracts
-  (`.grok/rules/tests-benchmarks.md`).
+  (`.claude/rules/tests-benchmarks.md`).
 
 The pipeline's threaded-profile tests pin every stage tuner through a comptime
 walk of `SimulationPipeline`'s fields (`pinPipelineThreadedProfiles`): a tuner

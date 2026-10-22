@@ -15,7 +15,7 @@ the world at reduced fidelity (69C); and keep three gated features specified
 as intent: scripted weather override (69D), a per-zoom weather spawn rect
 (69E), and chunk storage forms for worlds whose chunks do not all fit
 expanded in memory (69F). Every generated and environment value is a pure
-function of seed, spec, and clock (`.grok/rules/simulation.md` § Determinism).
+function of seed, spec, and clock (`.claude/rules/simulation.md` § Determinism).
 
 | Concern | Outcome | Owner |
 | --- | --- | --- |

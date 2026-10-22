@@ -37,12 +37,12 @@ Sizes as landed, at `5aec1ce` (lines):
 ### Architecture notes
 
 - File moves and splits only: no behavior, order, layout, or allocation change;
-  identical results, serial and threaded (`.grok/rules/simulation.md`
+  identical results, serial and threaded (`.claude/rules/simulation.md`
   § Determinism). World render state stays in `WorldSystem`'s render path
-  (`.grok/rules/render.md`; `docs/architecture.md` § Source Layout).
-- Tests stay beside the code they cover (`.grok/rules/tests-benchmarks.md`);
+  (`.claude/rules/render.md`; `docs/architecture.md` § Source Layout).
+- Tests stay beside the code they cover (`.claude/rules/tests-benchmarks.md`);
   shared fixtures stay in the world test support file.
-- Imports are direct, with no bridge aliases (`.grok/rules/zig-style.md`).
+- Imports are direct, with no bridge aliases (`.claude/rules/zig-style.md`).
 - A seam is one a design pass finds in the code as landed, never a target line
   count.
 

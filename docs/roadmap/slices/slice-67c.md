@@ -45,7 +45,7 @@ Goal:
 - Thumbnail and name are presentation data outside Slice 49's checksum and
   the saved simulation; neither holds a path or handle, and `src/game/`
   stores no pixels and `DataSystem` no `TextureId`
-  (`.grok/rules/simulation.md` § Persistent data).
+  (`.claude/rules/simulation.md` § Persistent data).
 - A save covers the whole session, every world in it (Slice 46); the
   thumbnail shows only the player's view. The session is paused while the
   save menu is open, so the capture matches the saved state.
@@ -54,7 +54,7 @@ Goal:
   idle wait or frame stall, at any frames-in-flight count, and in either
   Slice 70B scene-resolution mode. Only UNORM swapchain formats are
   accepted (an sRGB one would double-encode); anything else saves without
-  a picture (`.grok/rules/render.md`).
+  a picture (`.claude/rules/render.md`).
 - Capture failure or timeout is a state, not an error: the save proceeds
   without a picture. A damaged thumbnail never blocks a load.
 - Header-only bump policy: the previous version loads as "no thumbnail,
@@ -65,12 +65,12 @@ Goal:
   from a per-frame claim, so no state can leave it running; frames that
   cannot render keep the current state. Editing is by code point, not
   grapheme (documented). SDL text-input calls stay in `src/platform/`
-  (`.grok/rules/input-state.md`, `.grok/rules/engine-design.md`).
+  (`.claude/rules/input-state.md`, `.claude/rules/engine-design.md`).
 - Draw reservation for a field is fixed at build time, never live text
-  (`.grok/rules/budgets-capacities.md`).
+  (`.claude/rules/budgets-capacities.md`).
 - Capture, readback, editing, and the claim run on the main thread; slot
   scan and write stay on 46's lane with lent buffers
-  (`.grok/rules/threading.md`). Warmed edits, claims, and repeat captures
+  (`.claude/rules/threading.md`). Warmed edits, claims, and repeat captures
   allocate nothing.
 - Requires of 46: save-mode menus use `render_below` policies so the world
   renders under them (folded into Slice 46).

@@ -3,14 +3,14 @@
 The project is organized for SDL_GPU-first 2D game work: thin executable
 timing, app coordination under `src/app/`, GPU work under `src/render/`, and
 game-specific behavior under `src/game/`. This doc describes how the engine is
-built; the rules it follows live in `.grok/rules/`.
+built; the rules it follows live in `.claude/rules/`.
 
 ## Target Model
 
 The engine core serves a fully simulated game of many worlds that keeps
 growing; the demo state is a harness that exercises this model, not the model.
 Designs start here, then read the live structure below (rules:
-`.grok/rules/engine-design.md` § Target scale and § Cost model).
+`.claude/rules/engine-design.md` § Target scale and § Cost model).
 
 - **Fully simulated:** everything that exists keeps advancing, in every
   world; distance from the observer (the camera focus, or a player when a
@@ -81,7 +81,7 @@ Designs start here, then read the live structure below (rules:
   each public method defined in a sibling file is a declaration alias on the
   type (`pub const setDenseTile = world_edit.setDenseTile;`) with its `///` doc
   on the definition, so method syntax resolves straight to it with no forwarder
-  frame in any mode (`.grok/rules/zig-style.md`). `world/`, `data_system/`,
+  frame in any mode (`.claude/rules/zig-style.md`). `world/`, `data_system/`,
   and `pathfinding/` use it; in `pathfinding/`, `Connectivity`'s home file is
   `connectivity.zig`.
 - `src/game/world/` holds `WorldSystem`'s state-local world/tile data, with no
@@ -252,7 +252,7 @@ Designs start here, then read the live structure below (rules:
   live under the same traversal-safe asset root.
 - `src/core/math.zig` and `src/core/simd.zig` contain small shared math and portable SIMD helpers.
 - `src/core/sort.zig` holds `pdq` and `insertion`, std's sorts with
-  whole-element swaps; production sorts use them (`.grok/rules/zig-style.md`
+  whole-element swaps; production sorts use them (`.claude/rules/zig-style.md`
   § Style).
 - `src/core/rng.zig` provides a deterministic, stateless, seeded per-entity RNG
   facility (`mix64`/`uniformF32`/`boundedU32`/`unitVec2`) for reproducible
@@ -295,7 +295,7 @@ pacing, and clears that policy after a later frame is submitted. Occluded or
 unfocused visible windows keep rendering but apply a 60Hz cap to avoid
 background render runaway.
 Frame pacing policy is explicit and situational
-(`.grok/rules/memory-performance.md`).
+(`.claude/rules/memory-performance.md`).
 
 Each submitted frame computes presentation from the acquired SDL_GPU swapchain
 texture size and current SDL window size. World and logical UI draws are
@@ -303,7 +303,7 @@ transformed through that presentation into drawable pixels, then clipped to the
 logical viewport; drawable overlays use raw swapchain pixels. Swapchain
 presentation state lives in the SDL_GPU renderer path, world render state in
 `WorldSystem`'s render path, and debug UI state in the debug overlay and
-render-service path (`.grok/rules/render.md`).
+render-service path (`.claude/rules/render.md`).
 
 ## Coordination Boundaries
 
@@ -314,7 +314,7 @@ state-owned dynamic render prep, then both streams are merged by world z before
 commands reach `SpriteBatch`. Window, GPU device, swapchain, shader, texture,
 text, and frame submission code lives under `src/render/` and `src/app/`;
 ownership wrappers may centralize cleanup at the owning site
-(`.grok/rules/engine-design.md`, `.grok/rules/zig-style.md`).
+(`.claude/rules/engine-design.md`, `.claude/rules/zig-style.md`).
 
 `Renderer` preserves strict ordered submission while delegating sprite-specific
 CPU prep to `SpriteBatch`. SDL_GPU command-buffer acquisition, swapchain
@@ -386,7 +386,7 @@ comes only from the fixed-step camera (`GameDemoState.simViewRect()` passed as
 render visibility window, which follows the interpolated render camera and so
 depends on frame pacing. Scope pin metadata
 may keep an entity in a higher sim band off-camera without bypassing render
-visibility (`.grok/rules/simulation.md`). Open scaling gaps (collect scan cost, dense-floor layer quads,
+visibility (`.claude/rules/simulation.md`). Open scaling gaps (collect scan cost, dense-floor layer quads,
 movement contiguous-path vs dormant rows, per-entity depth alignment, component
 mask headroom) are consolidated under **Scaling Gaps And Hardening Frontier** in
 [`docs/roadmap/scaling-gaps.md`](roadmap/scaling-gaps.md).
@@ -461,7 +461,7 @@ renderer, asset, audio, text, state, pause, input, and thread-system services.
 Logging uses the scoped categories in `src/core/logging.zig`, with the default
 log level chosen from build options; diagnostics cover startup, configuration,
 fallback, lifecycle, and failure context, and hot paths stay quiet
-(`.grok/rules/zig-style.md`).
+(`.claude/rules/zig-style.md`).
 
 ## Thread System
 
@@ -498,7 +498,7 @@ caller (O(1) for the owner, O(workers) for any other thread):
 - any other thread (a participant of a different `ThreadSystem` included)
   panics in every build mode before touching shared or tuner state. Slice
   51's lane thread is foreign, so lane jobs run serial code paths
-  (`.grok/rules/threading.md`).
+  (`.claude/rules/threading.md`).
 
 Workers name themselves `zl-worker-<index>` after their startup permit
 (Darwin can name only the calling thread); the main thread is never renamed,
@@ -506,7 +506,7 @@ since on Linux that renames the process.
 
 Shared batch state is four blocks, each one `std.atomic.cache_line` (128 B on
 x86_64 and aarch64; comptime asserts pin the layout, 512 B per system;
-`.grok/rules/threading.md`): the descriptor (written only by main: `io`,
+`.claude/rules/threading.md`): the descriptor (written only by main: `io`,
 `accepting_work`, the published batch), the claim (`next_range` alone), the
 completion state (`pending`, `worker_ranges`, the `done` event), and a cold
 control block (the forced-inline counter and warning flag). Each participant
@@ -556,7 +556,7 @@ window judges it: at or above the gate, with the profile still dispatching threa
 at that count, the profile is restored at once and the bound rule is suppressed
 until the next retune probe or sustained shift; otherwise the demotion stands. Main
 waiting on workers never demotes a stage. There are no static item-count floors
-(`.grok/rules/threading.md`);
+(`.claude/rules/threading.md`);
 slower hardware or expensive small-N processors train their own threaded
 profile. The tuner counts closed probe windows and demotions for `--details`
 (`probes=`, `demotes=`); the counters compile to nothing in ReleaseFast and
@@ -589,7 +589,7 @@ for the batch barrier.
 Every production stage dispatches through a `Dispatch` built on a tuner its
 system owns (`Dispatch.init` or `StageThreads.stage`), scope's `chunk_derive`
 included, so no stage trains on another's batch timings
-(`.grok/rules/threading.md`). No config field carries a tuner, and no stage
+(`.claude/rules/threading.md`). No config field carries a tuner, and no stage
 falls back to `ThreadSystem.adaptive_tuner`: that shared tuner serves only
 generic callers, a `parallelForWithOptions` call that passes none. Batches
 can still force explicit fixed profiles through `items_per_range`,
@@ -603,7 +603,7 @@ stage (broadphase and narrowphase; AI gather, separation, and decision
 emission; the index's bucket, sort, and link). A stage
 that preselects a profile passes it with its own tuner, so inline samples still
 train that stage, and diagnostics report inline stages as `inline`
-(`.grok/rules/threading.md`).
+(`.claude/rules/threading.md`).
 
 `thread_system.zig` holds the one copy of the stage pattern: `StageControls`
 (`items_per_range`, `max_worker_threads`, `adaptive`; every stage takes a per-stage
@@ -661,7 +661,7 @@ columns. Component masks decide whether an entity belongs to a system; hot
 processors iterate the SoA columns.
 
 A new per-entity concept follows the component-store pattern
-(`.grok/rules/simulation.md`); `PerceptionStore` in
+(`.claude/rules/simulation.md`); `PerceptionStore` in
 `data_system/perception.zig` is the compact example. Each piece lives in
 `data_system/`:
 
@@ -732,7 +732,7 @@ arrive grouped by chunk (`groupDenseCellWrites` groups a batch given in any orde
 in O(1) per write through each level's ordered chunk set, with no sort), storage
 is reserved on the main thread first (`reserveDenseCellWrites`), chunks are written in parallel on the
 `ThreadSystem`, and results merge in a fixed order, so threaded equals serial
-(`.grok/rules/threading.md`). A write marks its block changed and, on a layer
+(`.claude/rules/threading.md`). A write marks its block changed and, on a layer
 resident in the GPU tile store, flags the layer for the next
 `syncDenseTileStore`, which uploads each changed window chunk once; edits hold
 no render memory. Dense layers can be added in play. Visibility is the
@@ -751,7 +751,7 @@ The current gameplay fixed-step pipeline is:
 1. Clear `SimulationFrame` and mark the step active.
 2. Apply main-thread player input and queue fixed-step audio commands.
 3. `SimulationPipeline` runs its comptime-checked `stage_order` (see
-   `.grok/rules/simulation.md` and
+   `.claude/rules/simulation.md` and
    `docs/simulation-tiers-and-pipeline.md` for the full contract):
    at step open: promote prior-step deferred impacts onto the live bus, then
    `dig_world_edit` (author world-tile edits from player digging), then at most
@@ -791,7 +791,7 @@ stage order, scope stats, budgets, and processor handoff for one gameplay state
 instance, while `StateStack` remains the dispatch/lifetime owner. Domain
 features are concrete pipeline-owned controllers; the pipeline is a thin
 composer and each controller and system owns its own internals
-(`.grok/rules/simulation.md`).
+(`.claude/rules/simulation.md`).
 
 Simulation tiers and active scope belong in the same pipeline boundary. Tier and
 chunk metadata are dense SoA columns on the movement-body store
@@ -816,7 +816,7 @@ remain visible; the think set is the indexed rows on this step's phase
 stream. Tier wake/sleep changes flow through deferred
 `set_simulation_tier` structural commands at the commit seam, never inside worker
 ranges. Scope bounds active work per step; benches at large counts show how
-each stage scales (`.grok/rules/tests-benchmarks.md`).
+each stage scales (`.claude/rules/tests-benchmarks.md`).
 
 The durable tier model is capability-based, not visibility-based:
 `dormant` entities exist but do not enter normal active scope (today every
@@ -855,7 +855,7 @@ agent's own `AiAgent.gain_*` personality gains. `AiConfig.affect_slice`
 threads `DataSystem.aiAffectSliceConst()` into `AiSystem`, and
 `stageContract(.ai_decide)` reads `affect_drives` (written one stage earlier
 by `affect_update`, per `stage_order`). Adding a feeling:
-`.grok/rules/simulation.md` § AI and affect (roadmap
+`.claude/rules/simulation.md` § AI and affect (roadmap
 [Slice 42](roadmap/slices/slice-42.md)). See the
 [Emergent AI Track Overview](roadmap/tracks/emergent-ai.md).
 
@@ -864,7 +864,7 @@ features such as combat, spawning, rules, encounters, or other gameplay
 domains. Controllers own feature orchestration: small queues, budgets,
 cooldowns, priority/conflict policy, and handoff between processors. They
 emit `SimulationFrame` outputs or deferred structural commands and call
-processors with typed `DataSystem` views (`.grok/rules/simulation.md`).
+processors with typed `DataSystem` views (`.claude/rules/simulation.md`).
 
 Landed pipeline-owned domain controllers (beside processors):
 
@@ -988,7 +988,7 @@ impacts and collision audio, replacing two scans of every contact.
 `SpatialIndexSystem` (`src/game/systems/spatial_index.zig`) is the pipeline's one
 neighbor index. `spatial_index_build` builds it each step from the unstaggered
 cognition halo at the previous step's positions and levels, and every neighbor
-query that step reads it (`.grok/rules/simulation.md`).
+query that step reads it (`.claude/rules/simulation.md`).
 
 - **Key and records.** Each entry sorts by one 128-bit key: level | chunk_y |
   chunk_x | faction | local_y | local_x | slot. Cells tile the world's chunk grid
@@ -996,7 +996,7 @@ query that step reads it (`.grok/rules/simulation.md`).
   chunk edge), and positions off the grid clamp to its edge cells. Level and
   chunk group entries by their storage unit; faction orders them ahead of
   position inside the chunk because every hot query filters on it
-  (`.grok/rules/memory-performance.md` § Data-oriented design). The entry
+  (`.claude/rules/memory-performance.md` § Data-oriented design). The entry
   columns (`x`, `y`, `entity_index`, `entity_generation`, `population_row`,
   `cognition_phase`) are dense in key order. Each populated chunk has one
   `ChunkRecord`: per faction, a 64-bit row mask (bit y set when the faction holds
@@ -1018,7 +1018,7 @@ query that step reads it (`.grok/rules/simulation.md`).
 - **Shared blocks.** A query's key is (level, own cell, scan box, factions); radius
   and budget stay out of it. Consecutive queries with one key share one
   `NeighborBlock`, a stack copy of the key's entry stream filled on demand, so the
-  agents of one cell walk their neighborhood once (`.grok/rules/engine-design.md`
+  agents of one cell walk their neighborhood once (`.claude/rules/engine-design.md`
   § Cost model) while each still tests its own position, radius, budget, and FOV.
   AI keeps one block per query kind per range, perception one per range; each
   counts its fills.
@@ -1037,7 +1037,7 @@ query that step reads it (`.grok/rules/simulation.md`).
   over cells (row parts, records, directory slots). Main picks the splitters, sums
   the band prefixes, and fits the directories; `buildSerial` runs one band on the
   calling thread. Only the sort, the build's cost driver, records
-  `.spatial_index_build` in the runtime perf log (`.grok/rules/threading.md`).
+  `.spatial_index_build` in the runtime perf log (`.claude/rules/threading.md`).
 
 `PerceptionSystem` (`src/game/systems/perception.zig`, Slice 29) runs over the
 think set's `AiPerception` rows. Each observer queries the shared index for the
@@ -1143,7 +1143,7 @@ Player movement remains direct input with no steering component, while collision
 response still resolves after movement.
 
 `PathfindingSystem` (`src/game/systems/pathfinding/`) is a frame-delayed, Z-aware
-grid pathfinding processor (rules: `.grok/rules/pathfinding.md`). It runs two
+grid pathfinding processor (rules: `.claude/rules/pathfinding.md`). It runs two
 solver modes per request kind: budget-bounded goal-keyed A* for individual goals,
 and a demand-driven shared-goal reverse-Dijkstra flow field for declared `group`
 requests. It owns the nav graph (§ Nav Graph And Reaction), the pending queue (a
@@ -1217,7 +1217,7 @@ cell on the agent's level. A two-tier ladder bounds each attempt: tier 0 runs in
 the participant's corridor scratch at 4096 abstract nodes and 512 stitched cells;
 exhausting it promotes the request once to tier 1, which runs in the tier-1 pool
 entry of its escalated admission index at fixed caps of 16384 nodes and 2048 cells,
-never derived from world size (`.grok/rules/budgets-capacities.md`). At tier 1:
+never derived from world size (`.claude/rules/budgets-capacities.md`). At tier 1:
 
 - a stitch stopped by its cell or segment cap publishes its prefix as `.partial`
   when the prefix leaves its start cell, else drops;
@@ -1262,7 +1262,7 @@ h = min(max(h_short, crossing distance), long term):
   heuristic nothing. Links are append-only; a future removal seam refolds both
   from the remaining links.
 
-The result cache (`caches.zig`) is goal-keyed (`.grok/rules/pathfinding.md`): a
+The result cache (`caches.zig`) is goal-keyed (`.claude/rules/pathfinding.md`): a
 `CacheCore` slot table and entry records (4 results per agent; round-robin victims,
 never a refusal; TTL 300 steps) whose record index is the owner id in the path
 registry. Each entry stores its path exactly in a paged inline stripe of
@@ -1345,7 +1345,7 @@ boundary. The current event payloads cover structural
 entity/component changes, world tile/obstacle changes, and navigation-region
 invalidation. Event records carry only stable entity IDs, component enums,
 reason enums, compact coordinates, and small scalar payloads
-(`.grok/rules/simulation.md`).
+(`.claude/rules/simulation.md`).
 
 High-volume streams stay specialized. Collision contacts, collision triggers,
 navigation intents, movement intents, path requests, render-prep commands, and
@@ -1365,7 +1365,7 @@ nav graph (§ Nav Graph And Reaction).
 
 The nav graph (`nav_graph.zig`, `nav_grid.zig`, `connectivity.zig`, the one-way
 closure in `connectivity_closure.zig`) is stored per chunk
-(`.grok/rules/budgets-capacities.md`). With a world, a nav cell is a tile and
+(`.claude/rules/budgets-capacities.md`). With a world, a nav cell is a tile and
 a nav chunk the world's chunk (`NavExtent.world`, one `ChunkGeometry`);
 bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
 
@@ -1379,7 +1379,7 @@ bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
   4 × ceil(E / 2)), its open link-endpoint portals, the links leaving them, and one
   connectivity node per portal-bearing label. Records, link slots, and nodes are
   pools with exact free lists (`growPool`), so a release never allocates. Graph
-  node ids never leave a batch (`.grok/rules/pathfinding.md`).
+  node ids never leave a batch (`.claude/rules/pathfinding.md`).
 - **Connectivity.** Each node's row holds a comp, and every comp hangs off one
   root, so two nodes connect over border mirrors and two-way links exactly when
   their comps share a root. Over the roots sits the exact one-way closure: a
@@ -1405,7 +1405,7 @@ bounds, `nav_cell_size`, and `nav_chunk_tiles` shape only a world-less build.
   its own footprint chunks, never the static count.
 
 `PathfindingSystem` owns the post-commit nav reaction end to end
-(`.grok/rules/pathfinding.md`; `nav_reaction.zig`, eviction in `eviction.zig`).
+(`.claude/rules/pathfinding.md`; `nav_reaction.zig`, eviction in `eviction.zig`).
 Writers record what changed, never the reaction: a terrain writer (the dig
 stage, plane traversal's carve batch) reserves its record before its world write
 (`reserveTerrainNavRecord`) and records its appended events right after it, even
@@ -1460,7 +1460,7 @@ equalize the family's claimed counts, and main merges claims, joins, and queue
 splices in item order at O(1) per item; every round runs under one profile selected
 once and recorded once (`RoundDispatch`). A removal therefore costs about its smaller
 side when it splits a component, or the reach until both floods meet when it does
-not, the reachability exception in `.grok/rules/budgets-capacities.md` (measured:
+not, the reachability exception in `.claude/rules/budgets-capacities.md` (measured:
 at most ~2.2× the smaller side, a thin tunnel ~2× its length, flat in level side
 256–2048, `e793590`). A change touching no one-way system does no closure work. A
 touched system re-resolves its links (threaded per link), masks the rows whose reach
@@ -1482,7 +1482,7 @@ Every stage has its own tuner and an inline path: `nav_mark` and the eviction tr
 graph's `NavStage` tuners (`plan`, `remask`, `patch`, `conn_seed`, `conn_gather`,
 `conn_flood`, `conn_closure_candidates`, `_resolve`, `_mask`, `_plan`, `_rows`,
 `_land`) under one `nav_controls`. The main thread keeps O(1) work per item
-(`.grok/rules/threading.md`); a single dominant one-way system's Tarjan is one
+(`.claude/rules/threading.md`); a single dominant one-way system's Tarjan is one
 item, so it runs where the thread system places one item, and its rows thread. The
 runtime perf log records `nav_remask`, `nav_connect` (the flood rounds), `nav_closure`
 (the closure rows), and `nav_evict`. `NavUpdateStats` folds the plan, remask, and
@@ -1525,4 +1525,4 @@ or NEON on ARM targets, when the target and optimization mode make that
 profitable. Platform intrinsics such as x86 or ARM-specific calls stay hidden
 from gameplay.
 
-When to use them: `.grok/rules/memory-performance.md`.
+When to use them: `.claude/rules/memory-performance.md`.

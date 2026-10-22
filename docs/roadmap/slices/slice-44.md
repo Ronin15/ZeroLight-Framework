@@ -31,7 +31,7 @@ nothing here touches simulation.
 
 - Bindings live in Slice 54's settings, never in saves (Ground Rules); the
   schema version bumps relative to its live value (Table T2,
-  `.grok/rules/simulation.md` § Persistent data).
+  `.claude/rules/simulation.md` § Persistent data).
 - The const default tables stay the reset source. An `Action` appended by a
   later slice (56, 57, 60, 69C) becomes a Controls row with its default from
   the const tables and no schema bump; a file that omits it keeps the
@@ -48,10 +48,10 @@ nothing here touches simulation.
   without a keyboard.
 - Right stick and triggers are routed under the same `InputRoutingPolicy`
   gate as the left stick; right-stick meaning stays a thin mapping, not a
-  new gameplay contract (`.grok/rules/input-state.md`).
+  new gameplay contract (`.claude/rules/input-state.md`).
 - Device labels and prompt text are rebuilt only on a binding, device, or
   pad-family change, never per frame
-  (`.grok/rules/memory-performance.md`).
+  (`.claude/rules/memory-performance.md`).
 - Resolution, capture, and a warmed Controls list are allocation-free.
 - Provides: the runtime binding table and `list` widget that 67A (pointer,
   scancodes) and 67B (denied cue) extend; the last-used device and prompt
@@ -88,7 +88,7 @@ nothing here touches simulation.
       `## Rebinding` (remove "no rebind UI yet"); `docs/architecture.md`
       input bullets; Table T2.
 - [ ] Add the new-action binding-defaults rule to
-      `.grok/rules/input-state.md` when this lands.
+      `.claude/rules/input-state.md` when this lands.
 
 ### Acceptance checks
 
