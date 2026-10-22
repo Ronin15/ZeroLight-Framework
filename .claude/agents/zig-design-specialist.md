@@ -108,7 +108,9 @@ section with nothing new is omitted.
 - **Stage shape on today's `ThreadSystem`**: each threaded stage fits the
   thread system and tuner as they are, never a change to them (owner). State
   the item unit and why its count tracks the work, with the dispatch figures
-  (`threading.md` § Building a stage).
+  (`threading.md` § Building a stage). Name each stage's own tuner; a tuner
+  two stages or phases share, or a dispatch at a fixed shape outside a
+  tuner, fails the plan.
 - **Main-thread and deferred boundaries**: what stays on the main thread and
   the deterministic merge (`threading.md`).
 - **Pre-implementation check** (`engine-design.md` § Cost model) against the
