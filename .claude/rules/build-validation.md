@@ -46,6 +46,10 @@ Commands and options: `docs/development-workflow.md`.
   themselves (Debug against Debug, ReleaseFast against ReleaseFast). Any
   other slower Debug case gets its verdict per `tests-benchmarks.md`; Debug
   at a size stands in for release at larger sizes.
+- A cost that exists only in Debug (safety checks, allocator fills of
+  reserved or freed memory, lane-by-lane vector lowering) is never tuned or
+  redesigned. A Debug slowdown suspected to be one gets the same targeted
+  ReleaseFast run to confirm it, then is reported as Debug overhead.
 - ReleaseSafe is for soaks, which are diagnostics, not an every-edit step.
   Before a ReleaseFast release candidate, a multi-hour ReleaseSafe soak across
   realistic to extreme entity counts and spawn/despawn churn must pass;
