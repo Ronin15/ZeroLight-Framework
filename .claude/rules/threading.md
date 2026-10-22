@@ -34,7 +34,11 @@ How the thread system works: `docs/architecture.md` § Thread System.
   a local variant.
 - A stage's items are units of its work (rows, runs, keys), so the item count
   tracks the work; never a fixed partition count with varying work behind it.
-- Each production stage owns its tuner and reports its own timing. A step's
+- Each production stage owns its tuner and reports its own timing. A
+  distinct phase is a distinct stage even when it runs the same job (a
+  rebuild and its incremental path, a world-create build and a per-step
+  patch), so no two phases share a tuner and no production dispatch runs at
+  a fixed shape outside a tuner. A step's
   work reaches the tuner as one sample, judged against the gate per dispatch,
   never per step total. A design states dispatches per step, items per
   dispatch, and per-item cost at each bench size.
