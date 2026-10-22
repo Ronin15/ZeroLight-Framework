@@ -3050,7 +3050,7 @@ test "a 1x1 border chunk turning uniform at another tile reads back from the GPU
     try std.testing.expectEqual(@as(?TileId, tiles.cave), testGpuTile(&world, &gpu_store, layer, 4, 4));
 }
 
-test "a one-chunk batched dense edit runs inline" {
+test "a one-chunk batched dense edit over two layers applies every write and emits one event per write" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
@@ -3070,6 +3070,7 @@ test "a one-chunk batched dense edit runs inline" {
     try events.ensureTotalCapacity(std.testing.allocator, writes.len);
     try world.applyDenseCellWrites(&chunks, testEditThreads(&world, &threads), &events);
     try std.testing.expectEqual(@as(usize, 3), events.items.len);
+    for (writes) |write| try std.testing.expectEqual(write.tile, world.denseTile(write.layer, write.x, write.y));
     try std.testing.expect(world.levelBlocksMovement(0, 2, 1));
 }
 

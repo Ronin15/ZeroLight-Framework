@@ -39,8 +39,8 @@ const FactionSet = @import("../game/faction.zig").FactionSet;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
 const IndexPopulation = @import("../game/systems/spatial_index.zig").IndexPopulation;
-const chunk_slot_bytes = @import("../game/systems/spatial_index.zig").chunk_slot_bytes;
 const spatial_index_test_support = @import("../game/systems/spatial_index_test_support.zig");
+const chunk_slot_bytes = spatial_index_test_support.chunk_slot_bytes;
 const NeighborQuery = @import("../game/systems/spatial_index.zig").NeighborQuery;
 const NeighborLanes = @import("../game/systems/spatial_index.zig").NeighborLanes;
 const NeighborBlock = @import("../game/systems/spatial_index.zig").NeighborBlock;
@@ -176,14 +176,14 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_stats.perf.bucket_batch);
-        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(spatial_index_range_alignment_items), &.{ last_stats.perf.bucket_batch, last_stats.sort_batch, last_stats.perf.link_batch });
-        main_total += elapsed_ns -| (offMainNs(last_stats.perf.bucket_batch) + offMainNs(last_stats.sort_batch) + offMainNs(last_stats.perf.link_batch));
+        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(spatial_index_range_alignment_items), &.{ last_stats.perf.bucket_batch, last_stats.perf.sort_batch, last_stats.perf.link_batch });
+        main_total += elapsed_ns -| (offMainNs(last_stats.perf.bucket_batch) + offMainNs(last_stats.perf.sort_batch) + offMainNs(last_stats.perf.link_batch));
     }
 
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
-    stats.output_count = last_stats.entity_count;
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.sort_batch);
+    stats.output_count = system.view().entryCount();
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.sort_batch);
     stats.splice_batch = suite.batchSummaryFromBatch(last_stats.perf.link_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.bucket_tuner), bucket_settled_before_measurement);

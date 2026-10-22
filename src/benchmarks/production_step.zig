@@ -39,6 +39,11 @@
 //! holds at the measured steps' index input (the pre-measure snapshot, each row widened by
 //! the cells it crossed since; `drift=` is the most cells any row crossed per axis), and that
 //! bound below the query's check budget, so a query that also reads other levels fails it.
+//!
+//! Dispatch check, on a case with workers: after the measured steps every `GameDemoState`
+//! tuner is pinned to a one-item threaded profile over all workers and one more step runs;
+//! every stage it records whose calls cover more ranges than calls must have run every call
+//! on workers, or the case fails. `--details` lists the checked stages as `pinned dispatch:`.
 
 const std = @import("std");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
@@ -61,6 +66,7 @@ const placeSpawnedMover = @import("../game/game_demo_state.zig").placeSpawnedMov
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const data_test_support = @import("../game/data_system/test_support.zig");
+const pinTunersIn = @import("../game/simulation_pipeline_test_support.zig").pinTunersIn;
 const keep_stagger_phase = @import("../game/simulation_scope.zig").keep_stagger_phase;
 const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
 const separation_radius = @import("../game/systems/ai.zig").separation_radius;
@@ -706,7 +712,32 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         try record.expectRowsUnchanged(&state.data);
         try checkStackedSeparation(allocator, &stats.production_step.?, fields, record);
     }
+    if (threads.workerThreadCount() > 0) try checkPinnedDispatch(&step, &stats.details);
     return stats;
+}
+
+// The items per range every tuner is pinned to: one item, so every stage whose items span
+// more than one aligned range has a multi-range partition to dispatch.
+const pinned_items_per_range: usize = 1;
+
+// The step's dispatch check: with every `GameDemoState` tuner pinned to a threaded profile
+// of all workers, one more step runs, and every stage it records whose calls cover more
+// ranges than calls ran every call on workers. Each checked stage is listed in `details`.
+fn checkPinnedDispatch(step: *StepRunner, details: *suite.DetailLines) !void {
+    pinTunersIn(GameDemoState, step.state, .{ .worker_threads = step.threads.workerThreadCount(), .items_per_range = pinned_items_per_range });
+    _ = try step.run();
+    details.print("pinned dispatch:", .{});
+    for (std.meta.tags(BatchStage)) |stage| try checkPinnedStage(details, @tagName(stage), step.perf_log.batches[@backingInt(stage)]);
+    for (std.meta.tags(BenchBatchStage)) |stage| try checkPinnedStage(details, @tagName(stage), step.step_batches.batches[@backingInt(stage)]);
+    details.print("\n", .{});
+}
+
+fn checkPinnedStage(details: *suite.DetailLines, name: []const u8, batch: anytype) !void {
+    if (batch.ranges <= batch.calls) return;
+    details.print(" {s}:threaded={}/{}", .{ name, batch.threaded_calls, batch.calls });
+    if (batch.threaded_calls == batch.calls) return;
+    std.debug.print("production-step: stage {s} ran {} of {} calls over {} ranges inline under a threaded pin\n", .{ name, batch.calls - batch.threaded_calls, batch.calls, batch.ranges });
+    return error.PinnedStageRanInline;
 }
 
 const timing_count = std.meta.tags(Timing).len;

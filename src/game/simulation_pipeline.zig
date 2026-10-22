@@ -14,8 +14,6 @@ const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkProfile = @import("../app/thread_system.zig").AdaptiveWorkProfile;
-const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWorkTunerConfig;
-const rangeCount = @import("../app/thread_system.zig").rangeCount;
 const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
 const DataSystem = @import("data_system.zig").DataSystem;
 const hotStoreCapacity = @import("data_system.zig").hotStoreCapacity;
@@ -589,7 +587,7 @@ pub const SimulationPipelineStats = struct {
         }
 
         // The sort is the build's cost driver; the bucket and link stages stay bench-only.
-        perf.recordBatch(.spatial_index_build, spatial_index_stats.sort_batch);
+        if (comptime runtime_perf_log.enabled) perf.recordBatch(.spatial_index_build, spatial_index_stats.perf.sort_batch);
 
         if (comptime runtime_perf_log.enabled) {
             perf.recordMetric(.perception_observers, metric(perception_stats.perf.observer_count));
@@ -670,7 +668,7 @@ pub const SimulationPipelineStats = struct {
         }
 
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
-        perf.recordBenchBatch(.movement, movement_stats.batch);
+        if (comptime runtime_perf_log.enabled) perf.recordBenchBatch(.movement, movement_stats.perf.batch);
         perf.recordBenchBatch(.chunk_derive, self.chunk_derive);
 
         perf.recordMetric(.collision_bodies, metric(collision_stats.body_count));
@@ -2682,7 +2680,8 @@ const denseTileBlocksMovement = @import("world/test_support.zig").denseTileBlock
 const PathRequest = @import("simulation.zig").PathRequest;
 const RangeOutputStream = @import("simulation.zig").RangeOutputStream;
 const contactsNaming = @import("systems/collision_response_test_support.zig").contactsNaming;
-const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const pinPipelineThreadedProfiles = @import("simulation_pipeline_test_support.zig").pinPipelineThreadedProfiles;
+const pinThreadedProfile = @import("simulation_pipeline_test_support.zig").pinThreadedProfile;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
 const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
@@ -3050,69 +3049,6 @@ const TestAllocatorSwap = struct {
     }
 };
 
-/// Pins every pipeline batch tuner to one settled threaded `profile` that never
-/// re-probes, demotes, or resets on item-count drift, so the multi-worker path runs a
-/// deterministic multi-range partition. The tuners would otherwise pick the shape from
-/// timing (inline below `threaded_batch_ns`). The tuners are found by walking the
-/// pipeline's fields at comptime, so a tuner a system adds is pinned with it.
-/// Test-only fixture.
-fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: AdaptiveWorkProfile) void {
-    pinTunersIn(SimulationPipeline, pipeline, profile);
-}
-
-// Pins every `AdaptiveWorkTuner` `value` holds by value: itself, or in a struct field, an
-// array element, or a set optional, at any depth. A single pointer is not owned, so it is
-// not walked. Test-only fixture.
-fn pinTunersIn(comptime T: type, value: *T, profile: AdaptiveWorkProfile) void {
-    if (T == AdaptiveWorkTuner) return pinThreadedProfile(value, profile);
-    switch (@typeInfo(T)) {
-        .@"struct" => |info| inline for (info.field_names, info.field_types) |name, Field| {
-            if (comptime holdsTuner(Field)) pinTunersIn(Field, &@field(value, name), profile);
-        },
-        .array => |info| for (value) |*element| pinTunersIn(info.child, element, profile),
-        .optional => |info| if (value.*) |*payload| pinTunersIn(info.child, payload, profile),
-        else => {},
-    }
-}
-
-// Whether a `T` holds an `AdaptiveWorkTuner` where `pinTunersIn` walks. A tuner the walk
-// cannot reach fails the build: in a union (which variant is live), behind a slice or
-// many-item pointer (owned heap rows), or in an error-union payload.
-fn holdsTuner(comptime T: type) bool {
-    @setEvalBranchQuota(100_000);
-    if (T == AdaptiveWorkTuner) return true;
-    return switch (@typeInfo(T)) {
-        .@"struct" => |info| for (info.field_types) |Field| {
-            if (holdsTuner(Field)) break true;
-        } else false,
-        .array => |info| holdsTuner(info.child),
-        .optional => |info| holdsTuner(info.child),
-        .@"union" => |info| for (info.field_types) |Field| {
-            if (holdsTuner(Field)) @compileError("pinTunersIn cannot walk a tuner in union " ++ @typeName(T));
-        } else false,
-        .pointer => |info| switch (info.size) {
-            .one => false,
-            .slice, .many, .c => if (holdsTuner(info.child)) @compileError("pinTunersIn cannot walk a tuner behind " ++ @typeName(T)) else false,
-        },
-        .error_union => |info| if (holdsTuner(info.payload)) @compileError("pinTunersIn cannot walk a tuner in error union " ++ @typeName(T)) else false,
-        else => false,
-    };
-}
-
-// Pins one tuner as `pinPipelineThreadedProfiles` does. Test-only fixture.
-fn pinThreadedProfile(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void {
-    tuner.config.threaded_batch_ns = 0;
-    tuner.config.retune_after_settled_windows = std.math.maxInt(usize);
-    tuner.config.item_count_reset_percent = std.math.maxInt(u8);
-    tuner.phase = .settled;
-    tuner.has_threaded_profile = true;
-    tuner.current_profile = profile;
-    tuner.best_profile = profile;
-    tuner.candidate_profile = null;
-    // Forget the pre-pin item count so the first pinned batch does not reset.
-    tuner.learned_item_count = 0;
-}
-
 /// One non-failing counting allocator per `TestAllocatorSwap` owner, to see which
 /// owners allocate during a step. Counts fresh allocations plus in-place
 /// resizes/remaps (a grown list can remap without a fresh allocation). Test-only fixture.
@@ -3418,10 +3354,6 @@ fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: AdaptiveW
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(pathing_crowd_count, second_stats.path_goals.distinct);
     try std.testing.expectEqual(pathing_crowd_count, second_stats.steering.path_request_count);
-    for ([_]BatchStats{ second_stats.pathfinding.intake_batch, second_stats.pathfinding.registry_flush_batch }) |batch| {
-        try std.testing.expect(!batch.ran_inline);
-        try std.testing.expect(batch.range_count > 1);
-    }
 }
 
 /// A pursuer of the sealed player (`addSealedGoalBoxes`) for the range-binding scenario:
@@ -3623,8 +3555,6 @@ fn runContactBoundScenario(mode: CollisionResponseMode) !void {
     const stats = try result;
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    try std.testing.expect(!stats.collision.broadphase_batch.ran_inline);
-    try std.testing.expect(!stats.collision.narrowphase_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 3 * (2 * 21 - 3)), stats.collision.contact_count);
     try std.testing.expect(stats.collision.contact_count > population);
     try std.testing.expectEqual(stats.collision.contact_count, stats.collision_response.contact_count);
@@ -6449,15 +6379,11 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     if (prove_zero_alloc) counting_swap.install(targets, counters.allocators());
     const first_result = pipeline.update(context);
     if (prove_zero_alloc) counting_swap.restore(targets);
-    const first_stats = try first_result;
+    _ = try first_result;
     // The zero-allocation proof covers perception and affect only if they ran: the
     // 5 observers' stagger phases cover all four, so every step thinks at least one.
     try std.testing.expect(pipeline.perception.rows.len >= 1);
     try std.testing.expect(pipeline.affect.rows.len >= 1);
-    if (max_worker_threads > 0) {
-        try std.testing.expect(!first_stats.movement.batch.ran_inline);
-        try std.testing.expectEqual(rangeCount(37, first_items_per_range), first_stats.movement.batch.range_count);
-    }
     // The seam reserved every capacity for every partition (per-range
     // outputs are item-count windows, tallies and broadphase slots are reserved to
     // `maxRangeCount`), so the first post-growth step allocates nothing on any owner.
@@ -6472,8 +6398,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
         if (prove_zero_alloc) retune_swap.install(targets, .uniform(retune_failing.allocator()));
         const retune_result = pipeline.update(context);
         if (prove_zero_alloc) retune_swap.restore(targets);
-        const retune_stats = try retune_result;
-        try std.testing.expectEqual(rangeCount(37, profile.items_per_range), retune_stats.movement.batch.range_count);
+        _ = try retune_result;
         try std.testing.expect(pipeline.perception.rows.len >= 1);
         try std.testing.expect(pipeline.affect.rows.len >= 1);
         try std.testing.expectEqual(@as(usize, 0), retune_failing.allocations);
@@ -6660,71 +6585,6 @@ test "the AI movement intent apply runs on workers in the pipeline, allocation-f
     const threaded = try runApplyIntentsScenario(2);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_x), std.mem.sliceAsBytes(&threaded.velocity_x));
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_y), std.mem.sliceAsBytes(&threaded.velocity_y));
-}
-
-test "a production step pinned onto workers runs every threaded pipeline stage on workers" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var player = try Player.spawn(&data);
-    // Alternating factions so observers sense hostiles; 4 px apart under 16 px bounds, so
-    // every body overlaps its nearest neighbours and the narrowphase spans several ranges.
-    const agent_count: usize = 64;
-    for (0..agent_count) |index| {
-        const agent = try addShareTestAgent(&data, 40 + @as(f32, @floatFromInt(index)) * 4, if (index % 2 == 0) .player else .hostile, true);
-        try data.setAiAffect(agent, .{});
-        try data.setSteeringAgent(agent, growthSteeringTemplate(.{ 0, 0 }).create_entity.steering_agent.?);
-        const npc = growthNpcTemplate(.{ 0, 0 }).create_entity;
-        try data.setCollisionBounds(agent, npc.collision_bounds.?);
-        try data.setCollisionResponse(agent, npc.collision_response.?);
-    }
-    // One agent per index cell past the crowd, so the index's link stage spans ranges too.
-    const spread_count: usize = 32;
-    for (0..spread_count) |index| _ = try addShareTestAgent(&data, 400 + @as(f32, @floatFromInt(index)) * 40, .player, false);
-    const body_count = agent_count + spread_count;
-    try markAllAlwaysActive(&data);
-
-    var world = try shareTestWorld();
-    defer world.deinit();
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
-    defer threads.deinit();
-    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{
-        .contact_capacity = body_count * 8,
-        .pathfinding = .{ .max_group_fields = 1, .worker_participant_count = threads.participantSlotCount() },
-    });
-    defer pipeline.deinit();
-    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, body_count, body_count * 8, 4, 4);
-    try frame.reservePathRequests(1, body_count);
-    try pipeline.reserve(&frame, body_count);
-
-    const context: SimulationPipelineUpdateContext = .{
-        .data = &data,
-        .frame = &frame,
-        .world = &world,
-        .player = &player,
-        .thread_system = &threads,
-        .delta_seconds = 0.016,
-        .bounds_width = 2048,
-        .bounds_height = 450,
-        .sim_view = fullWorldSimView(&world),
-    };
-    // One sample window under the default stage tuners, then a step pinned onto workers.
-    for (0..(AdaptiveWorkTunerConfig{}).sample_window) |_| {
-        frame.beginStep();
-        _ = try pipeline.update(context);
-    }
-    pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
-    frame.beginStep();
-    const stats = try pipeline.update(context);
-    const stage_batches = [_]BatchStats{
-        stats.spatial_index.sort_batch,
-        stats.movement.batch,
-        stats.chunk_derive,
-        stats.collision.broadphase_batch,
-        stats.collision.narrowphase_batch,
-    };
-    for (stage_batches) |batch| try std.testing.expect(!batch.ran_inline);
 }
 
 test "after population growth, ~2 solid contacts per body on the multi-worker path allocate nothing" {
@@ -6918,8 +6778,6 @@ test "a pipeline built over steering agents sizes pathfinding for them, so its f
     system.graph.allocator = real_allocator;
     threads.allocator = threads_allocator;
     const intake_stats = try first;
-    try std.testing.expect(!intake_stats.intake_batch.ran_inline);
-    try std.testing.expect(intake_stats.intake_batch.range_count > 1);
     // Every request's distinct goal is pending: none dropped.
     try std.testing.expectEqual(@as(usize, agent_count), system.pending.len);
     try std.testing.expectEqual(@as(u64, 0), intake_stats.resize_ns);

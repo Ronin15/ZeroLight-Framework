@@ -17,14 +17,16 @@ const suite = @import("suite.zig");
 const delta_seconds: f32 = 1.0 / 60.0;
 
 // `movement`: one `MovementSystem` update over N movement bodies with varied velocities,
-// with no reset between iterations. Prints no workload fields. Pass shape: time linear in
-// bodies; asserts check each step covers every body.
+// with no reset between iterations. `--details` prints `main=`, the time outside an
+// integrate that ran on workers, and `main_per_item=`. Pass shape: time linear in bodies
+// and main per body flat; asserts check each step covers every body, and a fixed threaded
+// case dispatches the integrate to workers.
 pub const group = suite.BenchmarkGroup{
     .name = "movement",
     .item_label = "movement bodies",
     .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
-    .write_workload = suite.writeNoWorkload,
+    .write_workload = writeMovementWorkload,
 };
 
 pub fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
@@ -75,15 +77,20 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     const settled_before_measurement = if (case.adaptive) (system.adaptive_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         const batch = runOnce(&system, &data, &threads, case);
-        const end_ns = suite.nowNs(io);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         std.debug.assert(batch.item_count == item_count);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
+        try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(movement_range_alignment_items), batch);
+        accumulator.record(elapsed_ns, batch);
+        // Main is everything but an integrate that ran on workers.
+        main_total += if (batch.ran_inline) elapsed_ns else elapsed_ns -| batch.batch_duration_ns;
     }
 
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.adaptive_tuner), settled_before_measurement);
     }
@@ -103,7 +110,12 @@ fn runOnce(
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });
-    return stats.batch;
+    return stats.perf.batch;
+}
+
+fn writeMovementWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    if (view == .summary) return;
+    try suite.writeMainShare(writer, stats, stats.item_count);
 }
 
 // `movement-apply-intents`: one AI movement intent per moving agent, written once in a

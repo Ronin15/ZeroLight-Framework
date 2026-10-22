@@ -9,7 +9,7 @@ const sprite_batch = @import("../render/sprite_batch.zig");
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
-const sprite_prep_range_alignment_items: usize = 1;
+const sprite_prep_range_alignment_items = sprite_batch.sprite_prep_range_alignment_items;
 const ordered_workload_total_parts: usize = 10;
 const ordered_workload_world_parts: usize = 8;
 const ordered_workload_ui_parts: usize = 1;
@@ -21,8 +21,10 @@ const ordered_ui_depths = [_]sprite_batch.UiDepth{ .background, .panel, .highlig
 // 23rd on a dead texture) into one `SpriteBatch`, then snapshots, emits vertices (the
 // threaded stage), and builds draw groups. Prints `vertices=`, `sprites=` (valid),
 // `skipped=` (unresolved textures), `groups=`, and the bench's own phase timers
-// (`ordered_submit`, `snapshot`, `vertex_emit`, `draw_groups`). Pass shape: time linear in
-// commands; asserts check every command is emitted or skipped, the dead-texture ones skipped.
+// (`ordered_submit`, `snapshot`, `vertex_emit`, `draw_groups`); `--details` adds `main=`,
+// the time outside a vertex emit that ran on workers, and `main_per_item=`. Pass shape:
+// time linear in commands and main per command flat; asserts check every command is emitted or skipped, the dead-texture ones
+// skipped, and a fixed threaded case dispatches the vertex emit to workers.
 pub const group = suite.BenchmarkGroup{
     .name = "render-prep",
     .item_label = "draw commands",
@@ -58,11 +60,16 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var accumulator = suite.StatsAccumulator.init(item_count);
     var phase_accumulator = fixtures.PhaseAccumulator(suite.RenderPrepPhaseSummary){};
     var last_prep = sprite_batch.SpritePrepStats{};
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         const measured = try runMeasuredOnce(item_count, &batch, table.resolver(), &threads, case, io);
-        const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), measured.stats.batch);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        const emit_batch = measured.stats.perf.batch;
+        try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(sprite_prep_range_alignment_items), emit_batch);
+        accumulator.record(elapsed_ns, emit_batch);
+        // Main is everything but a vertex emit that ran on workers.
+        main_total += if (emit_batch.ran_inline) elapsed_ns else elapsed_ns -| emit_batch.batch_duration_ns;
         phase_accumulator.record(measured.phases);
         last_prep = measured.stats;
     }
@@ -72,6 +79,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         std.debug.assert(last_prep.valid_sprite_count + last_prep.skipped_invalid_count == item_count);
     }
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.candidate_pairs = last_prep.vertex_count;
     stats.output_count = last_prep.valid_sprite_count;
     stats.deferred_count = last_prep.skipped_invalid_count;
@@ -188,8 +196,10 @@ fn orderedBenchmarkOrder(index: usize, count: usize) sprite_batch.RenderOrder {
     return sprite_batch.RenderOrder.debug(.overlay);
 }
 
-fn writeRenderPrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+fn writeRenderPrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("vertices={} sprites={} skipped={} groups={}", .{ stats.candidate_pairs, stats.output_count, stats.deferred_count, stats.sample_count });
-    const phases = stats.render_prep_phases orelse return;
-    try writer.print(" phases ordered_submit={f} snapshot={f} vertex_emit={f} draw_groups={f}", .{ suite.formatDuration(phases.ordered_submit_ns), suite.formatDuration(phases.snapshot_ns), suite.formatDuration(phases.vertex_emit_ns), suite.formatDuration(phases.draw_group_ns) });
+    if (stats.render_prep_phases) |phases| {
+        try writer.print(" phases ordered_submit={f} snapshot={f} vertex_emit={f} draw_groups={f}", .{ suite.formatDuration(phases.ordered_submit_ns), suite.formatDuration(phases.snapshot_ns), suite.formatDuration(phases.vertex_emit_ns), suite.formatDuration(phases.draw_group_ns) });
+    }
+    if (view == .details) try suite.writeMainShare(writer, stats, stats.item_count);
 }

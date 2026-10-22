@@ -201,14 +201,12 @@ pub const NeighborQuery = struct {
 };
 
 pub const SpatialIndexStats = struct {
-    /// Entries built: the population's slots with a movement body.
-    entity_count: usize = 0,
-    sort_batch: BatchStats = .{},
     perf: Perf = .{},
 
-    /// The bucket and link batches, kept only with `runtime_perf_log.enabled`.
+    /// The bucket, sort, and link batches, kept only with `runtime_perf_log.enabled`.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         bucket_batch: BatchStats = .{},
+        sort_batch: BatchStats = .{},
         link_batch: BatchStats = .{},
     } else struct {};
 };
@@ -776,11 +774,9 @@ pub const ChunkSlot = struct {
     factions: FactionSet = .empty,
 };
 
-/// Bytes of one directory slot: a level's directory is this times its world's chunks.
-pub const chunk_slot_bytes: usize = @sizeOf(ChunkSlot);
-
 comptime {
-    std.debug.assert(chunk_slot_bytes == 16);
+    // A level's directory is this slot's bytes times its world's chunks.
+    std.debug.assert(@sizeOf(ChunkSlot) == 16);
 }
 
 // One populated chunk's row parts by faction index f: bit y of `row_masks[f]` is set when
@@ -1137,8 +1133,13 @@ pub const SpatialIndexSystem = struct {
         }
         const entry_count = band_start[band_count];
         self.setEntryCount(entry_count);
+        // A failed directory growth leaves an empty index (no entries, no factions), never
+        // entries without records.
+        errdefer {
+            self.setEntryCount(0);
+            self.factions = .empty;
+        }
         setSlotCount(BandTally, &self.band_tallies, band_count);
-        stats.entity_count = entry_count;
         if (entry_count == 0) return self.finishEmptyBuild(stats);
         const sort_selection = stages.sort.select(entry_count, spatial_index_range_alignment_items);
         var sort = SortJob{
@@ -1148,7 +1149,8 @@ pub const SpatialIndexSystem = struct {
             .tallies = self.band_tallies.items,
             .range_count = sort_selection.range_count,
         };
-        stats.sort_batch = stages.sort.run(sort_selection, entry_count, spatial_index_range_alignment_items, &sort, sortJob);
+        const sort_batch = stages.sort.run(sort_selection, entry_count, spatial_index_range_alignment_items, &sort, sortJob);
+        if (comptime runtime_perf_log.enabled) stats.perf.sort_batch = sort_batch;
 
         var tallies: [band_count]BandTally = undefined;
         for (&tallies, self.band_tallies.items) |*tally, slot| tally.* = slot.value;
@@ -2117,8 +2119,7 @@ test "serial and threaded index builds match across layouts, splitters, range si
 
         var reference_system = SpatialIndexSystem.init(testing.allocator);
         defer reference_system.deinit();
-        const reference_stats = try buildInline(&reference_system, &data, population, layout_geometry, config);
-        try testing.expect(reference_stats.sort_batch.ran_inline);
+        _ = try buildInline(&reference_system, &data, population, layout_geometry, config);
         var reference = try TestCapture.capture(&reference_system);
         defer reference.deinit();
         // The one cell holds every faction, each its own cell.
@@ -2135,9 +2136,7 @@ test "serial and threaded index builds match across layouts, splitters, range si
                 for ([_]usize{ 16, 1024 }) |sort_items| {
                     for ([_]usize{ 16, 1024 }) |link_items| {
                         _ = try system.beginBuild(population, layout_geometry, config);
-                        const stats = try system.buildBanded(&data, population, testStages(&threads, &tuners, workers, bucket_items, sort_items, link_items), chooseSplitters(&data, population, system.grid));
-                        // A layout's entries span more than one 16-key sort range.
-                        if (sort_items == 16) try testing.expect(!stats.sort_batch.ran_inline);
+                        _ = try system.buildBanded(&data, population, testStages(&threads, &tuners, workers, bucket_items, sort_items, link_items), chooseSplitters(&data, population, system.grid));
                         try expectIndexMatches(&system, &reference, &reference_system);
                     }
                 }
@@ -2148,18 +2147,14 @@ test "serial and threaded index builds match across layouts, splitters, range si
         const stages = testStages(&threads, &tuners, 3, 64, 64, 16);
         for (std.meta.tags(TestSplitters)) |set| {
             _ = try system.beginBuild(population, layout_geometry, config);
-            const stats = try system.buildBanded(&data, population, stages, testSplitters(set, reference.cell_keys.items));
-            try testing.expect(!stats.sort_batch.ran_inline);
+            _ = try system.buildBanded(&data, population, stages, testSplitters(set, reference.cell_keys.items));
             try expectIndexMatches(&system, &reference, &reference_system);
         }
 
         // The production build, and a config that allows no worker builds inline.
-        const threaded_stats = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .items_per_range = 16, .max_worker_threads = 3, .adaptive = false });
-        try testing.expect(!threaded_stats.sort_batch.ran_inline);
-        // The link stage partitions the cells: one range of them may run inline.
+        _ = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .items_per_range = 16, .max_worker_threads = 3, .adaptive = false });
         try expectIndexMatches(&system, &reference, &reference_system);
-        const inline_stats = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .max_worker_threads = 0 });
-        try testing.expect(inline_stats.sort_batch.ran_inline);
+        _ = try system.build(&data, population, layout_geometry, &threads, .{ .cell_size = layout_cell_size, .max_worker_threads = 0 });
         try expectIndexMatches(&system, &reference, &reference_system);
     }
 }
@@ -2178,19 +2173,20 @@ test "the threaded index splits a one-row corridor, a cluster with a far outlier
         _ = try system.beginBuild(population, layout_geometry, testConfig(layout_cell_size));
         const splitters = chooseSplitters(&data, population, system.grid);
         var tuners: [3]AdaptiveWorkTuner = @splat(AdaptiveWorkTuner.init(.{}));
-        const stats = try system.buildBanded(&data, population, testStages(&threads, &tuners, 3, 64, 64, 64), splitters);
-        try testing.expect(stats.entity_count > 0);
+        _ = try system.buildBanded(&data, population, testStages(&threads, &tuners, 3, 64, 64, 64), splitters);
+        const entry_count = system.view().entryCount();
+        try testing.expect(entry_count > 0);
         // The largest band's entries, counted from the splitters over the sorted keys.
         var largest: usize = 0;
         var band_start: usize = 0;
         for (0..band_count) |band| {
             var band_end: usize = band_start;
-            while (band_end < stats.entity_count and KeySort.bandOfKey(&splitters, system.keys.items[band_end]) == band) band_end += 1;
+            while (band_end < entry_count and KeySort.bandOfKey(&splitters, system.keys.items[band_end]) == band) band_end += 1;
             largest = @max(largest, band_end - band_start);
             band_start = band_end;
         }
-        try testing.expectEqual(stats.entity_count, band_start);
-        try testing.expect(largest <= stats.entity_count / 8);
+        try testing.expectEqual(entry_count, band_start);
+        try testing.expect(largest <= entry_count / 8);
     }
 }
 
@@ -2253,8 +2249,7 @@ test "serial and threaded builds over population rows match, each entry carrying
     var tuners: [3]AdaptiveWorkTuner = @splat(AdaptiveWorkTuner.init(.{}));
     for ([_]TestSplitters{ .stride, .straddle_chunk }) |set| {
         _ = try system.beginBuild(population, layout_geometry, config);
-        const stats = try system.buildBanded(&data, population, testStages(&threads, &tuners, 3, 16, 16, 16), testSplitters(set, reference.cell_keys.items));
-        try testing.expect(!stats.sort_batch.ran_inline);
+        _ = try system.buildBanded(&data, population, testStages(&threads, &tuners, 3, 16, 16, 16), testSplitters(set, reference.cell_keys.items));
         try expectIndexMatches(&system, &reference, &reference_system);
     }
 }
@@ -2442,9 +2437,9 @@ test "an index over population rows maps each slot to its row's entity, skips bo
     const rows = [_]u32{ 3, 2, 0 };
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
-    const stats = try buildInline(&system, &data, .{ .entities = data.aiAgentSliceConst().entities, .rows = &rows }, testGeometry(10, 4, 1), testConfig(10));
-    try testing.expectEqual(@as(usize, 2), stats.entity_count);
+    _ = try buildInline(&system, &data, .{ .entities = data.aiAgentSliceConst().entities, .rows = &rows }, testGeometry(10, 4, 1), testConfig(10));
     const index = system.view();
+    try testing.expectEqual(@as(usize, 2), index.entryCount());
     // Level 0's cell (0, 0) holds slot 2 (`near`), level 2's cell (1, 0) slot 0 (`far`),
     // each its chunk's one neutral or hostile row part; level 2 has a directory though the
     // geometry has one level.
@@ -2910,8 +2905,8 @@ test "index keys in lanes match keyForPosition, including the scalar tail, at 12
         const geometry = IndexGeometry{ .tile_size = tile_size, .chunk_size_tiles = 16, .chunks_x = 2, .chunks_y = 2, .level_count = 1 };
         var system = SpatialIndexSystem.init(testing.allocator);
         defer system.deinit();
-        const stats = try buildInline(&system, &data, aiPopulation(&data), geometry, .{});
-        try testing.expectEqual(@as(usize, 25), stats.entity_count);
+        _ = try buildInline(&system, &data, aiPopulation(&data), geometry, .{});
+        try testing.expectEqual(@as(usize, 25), system.view().entryCount());
         try testing.expectEqual(@as(u32, if (tile_size == 24) 12 else 16), system.grid.cells_per_chunk);
         try testing.expectEqual(@as(f32, 32), system.grid.cell_size);
         for (system.keys.items[0..system.view().entryCount()]) |key| {
@@ -3021,7 +3016,6 @@ test "a reused block gives bit-identical visits to a fresh block, and a key chan
         try testing.expectEqual(fresh_stats, reused_stats);
         try fresh_visits.expectEqual(&reused_visits);
     }
-    // One fill per key change: dense, other, dense, other.
 }
 
 test "a block at capacity ends at the budget" {
@@ -3205,11 +3199,10 @@ test "a build after a populated one leaves no stale cells or slots, serial and t
         for ([_]bool{ false, true }) |threaded| {
             _ = try buildInline(&system, &data, aiPopulation(&data), geometry, .{});
             try testing.expect(system.view().entryCount() == 40);
-            const stats = if (threaded)
+            _ = if (threaded)
                 try system.build(&empty_data, empty, geometry, &threads, .{ .items_per_range = 16, .adaptive = false })
             else
                 try buildInline(&system, &empty_data, empty, geometry, .{});
-            try testing.expectEqual(@as(usize, 0), stats.entity_count);
             const index = system.view();
             try testing.expectEqual(@as(usize, 0), index.entryCount());
             try testing.expectEqual(@as(usize, 0), index.rows.len);
@@ -3244,7 +3237,7 @@ test "the level directories follow the geometry: reset on a grid change, grown f
     defer system.deinit();
     _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
     try testing.expectEqual(@as(usize, 2), system.level_slots.items.len);
-    try testing.expectEqual(2 * 16 * chunk_slot_bytes, spatial_index_test_support.directoryBytes(&system));
+    try testing.expectEqual(2 * 16 * spatial_index_test_support.chunk_slot_bytes, spatial_index_test_support.directoryBytes(&system));
 
     // A body on a level past the geometry's gets its directory, and the next build without
     // it releases the tail.
@@ -3274,13 +3267,13 @@ test "the level directories follow the geometry: reset on a grid change, grown f
             try data.setWorldLevel(body, 4);
             _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 4, 2), .{});
             try testing.expectEqual(@as(usize, 5), system.level_slots.items.len);
-            const stats = if (threaded)
+            _ = if (threaded)
                 try system.build(empty.data, empty.population, testGeometry(32, 4, 2), &threads, .{ .items_per_range = 16, .adaptive = false })
             else
                 try buildInline(&system, empty.data, empty.population, testGeometry(32, 4, 2), .{});
-            try testing.expectEqual(@as(usize, 0), stats.entity_count);
+            try testing.expectEqual(@as(usize, 0), system.view().entryCount());
             try testing.expectEqual(@as(usize, 2), system.level_slots.items.len);
-            try testing.expectEqual(2 * 16 * chunk_slot_bytes, spatial_index_test_support.directoryBytes(&system));
+            try testing.expectEqual(2 * 16 * spatial_index_test_support.chunk_slot_bytes, spatial_index_test_support.directoryBytes(&system));
         }
     }
     try data.setWorldLevel(body, 1);
@@ -3288,8 +3281,53 @@ test "the level directories follow the geometry: reset on a grid change, grown f
     // A grid change rebuilds every directory at the new chunk count.
     _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 8, 3), .{});
     try testing.expectEqual(@as(usize, 3), system.level_slots.items.len);
-    try testing.expectEqual(3 * 64 * chunk_slot_bytes, spatial_index_test_support.directoryBytes(&system));
+    try testing.expectEqual(3 * 64 * spatial_index_test_support.chunk_slot_bytes, spatial_index_test_support.directoryBytes(&system));
     for (system.level_slots.items) |slots| try testing.expectEqual(@as(usize, 64), slots.len);
+    try expectRecordsAgree(&system);
+}
+
+test "a build whose level directory growth runs out of memory leaves an empty index, and the retry builds it" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const near = try addTestBody(&data, 10, 10);
+    const deep = try addTestBody(&data, 50, 50);
+    try data.setWorldLevel(deep, 3);
+    const geometry = testGeometry(32, 4, 1);
+
+    var reference = SpatialIndexSystem.init(testing.allocator);
+    defer reference.deinit();
+    _ = try buildInline(&reference, &data, aiPopulation(&data), geometry, .{});
+
+    var system = SpatialIndexSystem.init(testing.allocator);
+    defer system.deinit();
+    try system.reserve(data.aiAgentSliceConst().entities.len);
+    try system.reserveGeometry(geometry, .{});
+    // Every buffer is reserved: the first allocation is the deep body's level directory,
+    // grown after the sort has sized the entries.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const original_allocator = system.allocator;
+    system.allocator = failing.allocator();
+    try testing.expectError(error.OutOfMemory, buildInline(&system, &data, aiPopulation(&data), geometry, .{}));
+    system.allocator = original_allocator;
+    try testing.expect(failing.has_induced_failure);
+
+    const failed = system.view();
+    try testing.expectEqual(@as(usize, 0), failed.entryCount());
+    try testing.expectEqual(@as(u32, 0), failed.cellMajorSpan(0, failed.entryCount()).remaining);
+    try testing.expect(failed.factions.eql(.empty));
+    var visitor = RecordingVisitor{};
+    _ = testQuery(failed, .{ .x = 10, .y = 10, .level = 0, .radius = 64, .max_candidate_checks = 64 }, &visitor);
+    try testing.expectEqual(@as(usize, 0), visitor.count);
+
+    _ = try buildInline(&system, &data, aiPopulation(&data), geometry, .{});
+    try testing.expectEqualSlices(u32, reference.view().entity_index, system.view().entity_index);
+    try testing.expectEqual(@as(usize, 4), system.level_slots.items.len);
+    for ([_]struct { entity: EntityId, level: u16, x: f32 }{ .{ .entity = near, .level = 0, .x = 10 }, .{ .entity = deep, .level = 3, .x = 50 } }) |expected| {
+        var found = RecordingVisitor{};
+        _ = testQuery(system.view(), .{ .x = expected.x, .y = expected.x, .level = expected.level, .radius = 8, .max_candidate_checks = 8 }, &found);
+        try testing.expectEqual(@as(usize, 1), found.count);
+        try testing.expect(system.view().entityAt(found.entries[0]).eql(expected.entity));
+    }
     try expectRecordsAgree(&system);
 }
 
@@ -3326,8 +3364,7 @@ test "the index builds correctly above a small reserved capacity" {
     var system = SpatialIndexSystem.init(testing.allocator);
     defer system.deinit();
     try system.reserve(4);
-    const stats = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 4, 1), .{});
-    try testing.expectEqual(@as(usize, 40), stats.entity_count);
+    _ = try buildInline(&system, &data, aiPopulation(&data), testGeometry(32, 4, 1), .{});
     try testing.expectEqual(@as(usize, 40), system.view().entryCount());
     try testing.expect(system.view().rows.len > 0);
 }
@@ -3364,14 +3401,13 @@ test "after reserve and reserveGeometry, threaded builds at 2 and 4 partitions p
     defer system.allocator = original_allocator;
 
     for ([_]usize{ 32, 16 }) |items_per_range| {
-        const stats = try system.build(&data, population, geometry, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
-        try testing.expectEqual(population_count, stats.entity_count);
-        try testing.expectEqual(population_count / items_per_range, stats.sort_batch.range_count);
+        _ = try system.build(&data, population, geometry, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
+        try testing.expectEqual(population_count, system.view().entryCount());
         try testing.expectEqualSlices(u32, reference.view().entity_index, system.view().entity_index);
         try testing.expectEqualSlices(u32, reference.view().entity_generation, system.view().entity_generation);
     }
-    const serial_stats = try buildInline(&system, &data, population, geometry, .{});
-    try testing.expectEqual(population_count, serial_stats.entity_count);
+    _ = try buildInline(&system, &data, population, geometry, .{});
+    try testing.expectEqual(population_count, system.view().entryCount());
     var visitor = RecordingVisitor{};
     const full_stats = testQuery(system.view(), .{ .x = 0, .y = 0, .level = 0, .radius = 400, .max_candidate_checks = 16 }, &visitor);
     try testing.expectEqual(@as(u16, 16), full_stats.candidate_checks);

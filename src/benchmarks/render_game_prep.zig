@@ -43,7 +43,7 @@ const sprite_batch = @import("../render/sprite_batch.zig");
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
-const render_game_prep_range_alignment_items: usize = 1;
+const sprite_prep_range_alignment_items = sprite_batch.sprite_prep_range_alignment_items;
 const world_overscan_chunks: u16 = 1;
 /// Viewport used for world chunk visibility during sparse-layer emit only.
 const bench_viewport_w: f32 = 800;
@@ -176,7 +176,7 @@ fn runCaseWithConfig(
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
 
-    if (suite.adaptiveTunerForCase(case, render_game_prep_range_alignment_items)) |tuner| {
+    if (suite.adaptiveTunerForCase(case, sprite_prep_range_alignment_items)) |tuner| {
         batch.adaptive_tuner = tuner;
     }
 
@@ -212,7 +212,7 @@ fn runCaseWithConfig(
             case,
             allocator,
         );
-        accumulator.record(measured.timed_ns, measured.stats.batch);
+        accumulator.record(measured.timed_ns, measured.stats.perf.batch);
         phase_accumulator.record(measured.phases);
         last_prep = measured.stats;
         last_sparse_submitted = measured.sparse_submitted;
@@ -318,7 +318,7 @@ fn emitVertices(
     case: suite.BenchmarkCase,
 ) BatchStats {
     return batch.emitVerticesAssumeCapacity(thread_system, .{
-        .items_per_range = case.stageItemsPerRange(render_game_prep_range_alignment_items),
+        .items_per_range = case.stageItemsPerRange(sprite_prep_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });

@@ -133,6 +133,16 @@ pub const Position = [2]f32;
 pub const Uv = [2]f32;
 pub const VertexColor = [4]f32;
 
+/// Vertex emission's range alignment in prepared commands: each range spans whole cache lines
+/// of bytes in every vertex column, so neighbouring ranges share at most their boundary line.
+pub const sprite_prep_range_alignment_items: usize = 4;
+
+comptime {
+    for ([_]usize{ @sizeOf(Position), @sizeOf(Uv), @sizeOf(VertexColor) }) |vertex_bytes| {
+        std.debug.assert(sprite_prep_range_alignment_items * 6 * vertex_bytes % 64 == 0);
+    }
+}
+
 // Mutable column views threaded into vertex emission (workers write disjoint
 // ranges; the world builds 6-corner static spans).
 pub const VertexColumns = struct {
@@ -243,7 +253,10 @@ pub const SpritePrepStats = struct {
     /// 1 when this reserved frame's submits exceeded its command reservation
     /// (reservation drift), else 0. Always 0 in shipping builds (`ReservationDrift`).
     command_overflow_grows: usize = 0,
-    batch: BatchStats = .{},
+    perf: Perf = .{},
+
+    /// The emit batch, kept only with `runtime_perf_log.enabled`.
+    pub const Perf = if (perf_diagnostics_enabled) struct { batch: BatchStats = .{} } else struct {};
 };
 
 /// Sprite-command reservation drift: a reserved frame whose submits exceed its command
@@ -488,18 +501,15 @@ pub const SpriteBatch = struct {
                 .max_worker_threads = prep_config.max_worker_threads,
                 .adaptive = prep_config.adaptive,
             });
-            // Align range boundaries to 4 commands (192/192/384 B per column,
-            // all divisible by 64) so no worker range straddles a cache line in
-            // any of the three columns — avoids false sharing on the seams.
             // Pre-select so the job context can dual-assert range.index against
             // the dispatched range count.
-            const selection = prep.select(valid_count, 4);
+            const selection = prep.select(valid_count, sprite_prep_range_alignment_items);
             var context = SpritePrepJobContext{
                 .commands = self.prepared_commands.items,
                 .columns = columns,
                 .range_count = selection.range_count,
             };
-            batch = prep.run(selection, valid_count, 4, &context, writePreparedSpritesJob);
+            batch = prep.run(selection, valid_count, sprite_prep_range_alignment_items, &context, writePreparedSpritesJob);
         }
         return batch;
     }
@@ -516,7 +526,7 @@ pub const SpriteBatch = struct {
             .vertex_count = self.positions.items.len,
             .draw_group_count = self.draw_groups.items.len,
             .command_overflow_grows = self.reservation_drift.frameGrows(),
-            .batch = batch,
+            .perf = if (comptime perf_diagnostics_enabled) .{ .batch = batch } else .{},
         };
         return self.last_prep_stats;
     }
@@ -1264,27 +1274,19 @@ test "parallel sprite prep matches serial vertices and draw groups" {
 
     var inline_threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer inline_threads.deinit();
-    const serial_stats = try prepare(&serial, table.resolver(), &inline_threads, .{});
-    try std.testing.expect(serial_stats.batch.ran_inline);
-    try std.testing.expectEqual(@as(usize, 0), serial_stats.batch.active_worker_threads);
-    try std.testing.expectEqual(@as(usize, 4), serial_stats.batch.range_alignment_items);
+    _ = try prepare(&serial, table.resolver(), &inline_threads, .{});
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{
         .max_worker_threads = 2,
         .items_per_range = 1,
     });
     defer threads.deinit();
-    const stats = try prepare(&threaded, table.resolver(), &threads, .{
+    _ = try prepare(&threaded, table.resolver(), &threads, .{
         .items_per_range = 1,
         .max_worker_threads = 2,
         .adaptive = false,
     });
 
-    try std.testing.expect(stats.batch.active_worker_threads > 0);
-    // The emit path requests 4-command range alignment so worker range seams stay
-    // cache-line-aligned across all three columns; guard the knob so a regression
-    // back to 1 is caught here, not only by a false-sharing slowdown.
-    try std.testing.expectEqual(@as(usize, 4), stats.batch.range_alignment_items);
     try expectEqualVertices(batchColumns(&serial), batchColumns(&threaded));
     try expectEqualDrawGroups(serial.draw_groups.items, threaded.draw_groups.items);
     try std.testing.expectEqual(serial.lastPrepStats().valid_sprite_count, threaded.lastPrepStats().valid_sprite_count);
@@ -1356,13 +1358,13 @@ test "sprite prep adaptive gate keeps cheap batches inline" {
     batch.adaptive_tuner.config.threaded_batch_ns = std.math.maxInt(u64);
 
     const warmup_windows = batch.adaptive_tuner.config.sample_window * 4;
-    var last_stats: SpritePrepStats = .{};
     var window: usize = 0;
     while (window < warmup_windows) : (window += 1) {
-        last_stats = try prepare(&batch, table.resolver(), &threads, .{});
+        _ = try prepare(&batch, table.resolver(), &threads, .{});
     }
 
-    try std.testing.expectEqual(@as(usize, 0), last_stats.batch.active_worker_threads);
+    try std.testing.expect(batch.adaptive_tuner.last_request != null);
+    try std.testing.expect(!batch.adaptive_tuner.has_threaded_profile);
 }
 
 test "warmed multi-worker sprite prep does not allocate" {
@@ -1409,7 +1411,7 @@ test "warmed multi-worker sprite prep does not allocate" {
         .adaptive = false,
     });
 
-    try std.testing.expect(stats.batch.active_worker_threads > 0);
+    try std.testing.expectEqual(command_capacity, stats.valid_sprite_count);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(command_capacity, batch.commands.items.len);

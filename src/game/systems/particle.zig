@@ -18,7 +18,6 @@ const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 
 pub const hot_particle_column_alignment: usize = 64;
@@ -49,13 +48,16 @@ pub const ParticleUpdateStats = struct {
     active_before: usize = 0,
     active_after: usize = 0,
     removed_count: usize = 0,
-    batch: BatchStats = .{},
+    perf: Perf = .{},
+
+    /// The update batch, kept only with `runtime_perf_log.enabled`.
+    pub const Perf = if (runtime_perf_log.enabled) struct { batch: BatchStats = .{} } else struct {};
 
     pub fn recordTo(self: ParticleUpdateStats, perf: runtime_perf_log.Context) void {
         perf.recordMetric(.particle_active_before, metric(self.active_before));
         perf.recordMetric(.particle_active_after, metric(self.active_after));
         perf.recordMetric(.particle_removed, metric(self.removed_count));
-        perf.recordBenchBatch(.particles, self.batch);
+        if (comptime runtime_perf_log.enabled) perf.recordBenchBatch(.particles, self.perf.batch);
     }
 };
 
@@ -397,7 +399,7 @@ pub const ParticleSystem = struct {
             .active_before = active_before,
             .active_after = self.activeCount(),
             .removed_count = removed,
-            .batch = batch,
+            .perf = if (comptime runtime_perf_log.enabled) .{ .batch = batch } else .{},
         };
     }
 
@@ -448,9 +450,10 @@ fn particleJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     processRange(&job.particles, range, job.delta_seconds);
 }
 
+// Updates `range` in lane batches; its last batch is the same kernel masked to the rows
+// left, so no lane reads or writes past the range. A masked-off lane loads `+0` and so
+// divides by a zero lifetime; that lane is never stored.
 fn processRange(particles: *ParticleSlice, range: ParallelRange, delta_seconds: f32) void {
-    // SIMD handles full lane groups, then scalar tail code preserves exact
-    // behavior for counts that are not lane-aligned.
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= particles.len());
 
@@ -459,57 +462,54 @@ fn processRange(particles: *ParticleSlice, range: ParallelRange, delta_seconds: 
     const zero = simd.splatFloat4(0);
     const one = simd.splatFloat4(1);
 
-    while (index + simd.lane_count <= range.end) : (index += simd.lane_count) {
-        const position_x = simd.loadFloat4(particles.position_x[index..]);
-        const position_y = simd.loadFloat4(particles.position_y[index..]);
-        const velocity_x = simd.loadFloat4(particles.velocity_x[index..]);
-        const velocity_y = simd.loadFloat4(particles.velocity_y[index..]);
-        const acceleration_x = simd.loadFloat4(particles.acceleration_x[index..]);
-        const acceleration_y = simd.loadFloat4(particles.acceleration_y[index..]);
+    while (index < range.end) : (index += simd.lane_count) {
+        const count = range.end - index;
+        const position_x = simd.loadFloat4Lanes(particles.position_x[index..], count);
+        const position_y = simd.loadFloat4Lanes(particles.position_y[index..], count);
+        const velocity_x = simd.loadFloat4Lanes(particles.velocity_x[index..], count);
+        const velocity_y = simd.loadFloat4Lanes(particles.velocity_y[index..], count);
+        const acceleration_x = simd.loadFloat4Lanes(particles.acceleration_x[index..], count);
+        const acceleration_y = simd.loadFloat4Lanes(particles.acceleration_y[index..], count);
 
         const next_velocity_x = simd.addFloat4(velocity_x, simd.mulFloat4(acceleration_x, dt));
         const next_velocity_y = simd.addFloat4(velocity_y, simd.mulFloat4(acceleration_y, dt));
         const next_position_x = simd.addFloat4(position_x, simd.mulFloat4(next_velocity_x, dt));
         const next_position_y = simd.addFloat4(position_y, simd.mulFloat4(next_velocity_y, dt));
-        const next_age = simd.addFloat4(simd.loadFloat4(particles.age[index..]), dt);
-        const normalized_age = simd.clampFloat4(simd.divFloat4(next_age, simd.loadFloat4(particles.lifetime[index..])), zero, one);
+        const next_age = simd.addFloat4(simd.loadFloat4Lanes(particles.age[index..], count), dt);
+        const normalized_age = simd.clampFloat4(simd.divFloat4(next_age, simd.loadFloat4Lanes(particles.lifetime[index..], count)), zero, one);
 
-        simd.storeFloat4Slice(particles.previous_x[index..], position_x);
-        simd.storeFloat4Slice(particles.previous_y[index..], position_y);
-        simd.storeFloat4Slice(particles.velocity_x[index..], next_velocity_x);
-        simd.storeFloat4Slice(particles.velocity_y[index..], next_velocity_y);
-        simd.storeFloat4Slice(particles.position_x[index..], next_position_x);
-        simd.storeFloat4Slice(particles.position_y[index..], next_position_y);
-        simd.storeFloat4Slice(particles.age[index..], next_age);
-        simd.storeFloat4Slice(particles.size[index..], simd.lerpFloat4(
-            simd.loadFloat4(particles.start_size[index..]),
-            simd.loadFloat4(particles.end_size[index..]),
+        simd.storeFloat4Lanes(particles.previous_x[index..], position_x, count);
+        simd.storeFloat4Lanes(particles.previous_y[index..], position_y, count);
+        simd.storeFloat4Lanes(particles.velocity_x[index..], next_velocity_x, count);
+        simd.storeFloat4Lanes(particles.velocity_y[index..], next_velocity_y, count);
+        simd.storeFloat4Lanes(particles.position_x[index..], next_position_x, count);
+        simd.storeFloat4Lanes(particles.position_y[index..], next_position_y, count);
+        simd.storeFloat4Lanes(particles.age[index..], next_age, count);
+        simd.storeFloat4Lanes(particles.size[index..], simd.lerpFloat4(
+            simd.loadFloat4Lanes(particles.start_size[index..], count),
+            simd.loadFloat4Lanes(particles.end_size[index..], count),
             normalized_age,
-        ));
-        simd.storeFloat4Slice(particles.color_r[index..], simd.lerpFloat4(
-            simd.loadFloat4(particles.start_color_r[index..]),
-            simd.loadFloat4(particles.end_color_r[index..]),
+        ), count);
+        simd.storeFloat4Lanes(particles.color_r[index..], simd.lerpFloat4(
+            simd.loadFloat4Lanes(particles.start_color_r[index..], count),
+            simd.loadFloat4Lanes(particles.end_color_r[index..], count),
             normalized_age,
-        ));
-        simd.storeFloat4Slice(particles.color_g[index..], simd.lerpFloat4(
-            simd.loadFloat4(particles.start_color_g[index..]),
-            simd.loadFloat4(particles.end_color_g[index..]),
+        ), count);
+        simd.storeFloat4Lanes(particles.color_g[index..], simd.lerpFloat4(
+            simd.loadFloat4Lanes(particles.start_color_g[index..], count),
+            simd.loadFloat4Lanes(particles.end_color_g[index..], count),
             normalized_age,
-        ));
-        simd.storeFloat4Slice(particles.color_b[index..], simd.lerpFloat4(
-            simd.loadFloat4(particles.start_color_b[index..]),
-            simd.loadFloat4(particles.end_color_b[index..]),
+        ), count);
+        simd.storeFloat4Lanes(particles.color_b[index..], simd.lerpFloat4(
+            simd.loadFloat4Lanes(particles.start_color_b[index..], count),
+            simd.loadFloat4Lanes(particles.end_color_b[index..], count),
             normalized_age,
-        ));
-        simd.storeFloat4Slice(particles.color_a[index..], simd.lerpFloat4(
-            simd.loadFloat4(particles.start_color_a[index..]),
-            simd.loadFloat4(particles.end_color_a[index..]),
+        ), count);
+        simd.storeFloat4Lanes(particles.color_a[index..], simd.lerpFloat4(
+            simd.loadFloat4Lanes(particles.start_color_a[index..], count),
+            simd.loadFloat4Lanes(particles.end_color_a[index..], count),
             normalized_age,
-        ));
-    }
-
-    while (index < range.end) : (index += 1) {
-        processParticleScalar(particles, index, delta_seconds);
+        ), count);
     }
 }
 
@@ -522,8 +522,8 @@ fn processRangeScalar(particles: *ParticleSlice, range: ParallelRange, delta_sec
     }
 }
 
+// Scalar reference for the lane kernel.
 fn processParticleScalar(particles: *ParticleSlice, index: usize, delta_seconds: f32) void {
-    // Scalar update mirrors the SIMD path for tests and lane tails.
     const position_x = particles.position_x[index];
     const position_y = particles.position_y[index];
     particles.previous_x[index] = position_x;
@@ -568,7 +568,6 @@ fn updateSerialScalarForTest(system: *ParticleSystem, delta_seconds: f32) Partic
         .active_before = active_before,
         .active_after = system.activeCount(),
         .removed_count = removed,
-        .batch = inlineBatch(active_before, particle_range_alignment_items),
     };
 }
 
@@ -605,23 +604,13 @@ fn expectParticleColumnsAligned(system: *const ParticleSystem) !void {
     try std.testing.expectEqual(count, particles.z.len);
 }
 
-fn expectParticlesApproxEqual(actual: *const ParticleSystem, expected: *const ParticleSystem) !void {
+// Every updated column of `actual` bit-identical to `expected`'s.
+fn expectParticlesBitsEqual(actual: *const ParticleSystem, expected: *const ParticleSystem) !void {
     const actual_particles = actual.sliceConst();
     const expected_particles = expected.sliceConst();
     try std.testing.expectEqual(expected_particles.len(), actual_particles.len());
-    for (0..actual_particles.len()) |index| {
-        try std.testing.expectApproxEqAbs(expected_particles.position_x[index], actual_particles.position_x[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_particles.position_y[index], actual_particles.position_y[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_particles.previous_x[index], actual_particles.previous_x[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_particles.previous_y[index], actual_particles.previous_y[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_particles.velocity_x[index], actual_particles.velocity_x[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_particles.velocity_y[index], actual_particles.velocity_y[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_particles.age[index], actual_particles.age[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_particles.size[index], actual_particles.size[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_particles.color_r[index], actual_particles.color_r[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_particles.color_g[index], actual_particles.color_g[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_particles.color_b[index], actual_particles.color_b[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_particles.color_a[index], actual_particles.color_a[index], 0.001);
+    inline for (.{ "position_x", "position_y", "previous_x", "previous_y", "velocity_x", "velocity_y", "age", "size", "color_r", "color_g", "color_b", "color_a" }) |column| {
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(@field(expected_particles, column)), std.mem.sliceAsBytes(@field(actual_particles, column)));
     }
 }
 
@@ -707,8 +696,8 @@ test "particle render z saturates extreme emitter base z" {
     try std.testing.expectEqual(std.math.minInt(i32), slice_data.z[1]);
 }
 
-test "serial particle simd path matches scalar path" {
-    inline for (.{ 0, 3, 4, 9 }) |count| {
+test "inline particle lane batches, the masked tail included, match the scalar update bit for bit" {
+    inline for (.{ 0, 1, 3, 4, 5, 9 }) |count| {
         var simd_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = count });
         defer simd_particles.deinit();
         var scalar_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = count });
@@ -719,17 +708,18 @@ test "serial particle simd path matches scalar path" {
         _ = try updateInline(&simd_particles, 0.25);
         _ = updateSerialScalarForTest(&scalar_particles, 0.25);
 
-        try expectParticlesApproxEqual(&simd_particles, &scalar_particles);
+        try expectParticlesBitsEqual(&simd_particles, &scalar_particles);
     }
 }
 
-test "threaded particle update matches serial update" {
-    var threaded_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = particle_range_alignment_items * 8 });
+test "threaded particle update matches serial update, the last range ending in the masked tail" {
+    const count = particle_range_alignment_items * 8 + 3;
+    var threaded_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = count });
     defer threaded_particles.deinit();
-    var serial_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = particle_range_alignment_items * 8 });
+    var serial_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = count });
     defer serial_particles.deinit();
-    fillParticles(&threaded_particles, particle_range_alignment_items * 8);
-    fillParticles(&serial_particles, particle_range_alignment_items * 8);
+    fillParticles(&threaded_particles, count);
+    fillParticles(&serial_particles, count);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -737,25 +727,20 @@ test "threaded particle update matches serial update" {
     });
     defer threads.deinit();
 
-    const stats = threaded_particles.update(&threads, 0.25, .{
+    _ = threaded_particles.update(&threads, 0.25, .{
         .items_per_range = particle_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
     });
     _ = try updateInline(&serial_particles, 0.25);
 
-    try std.testing.expect(!stats.batch.ran_inline);
-    try std.testing.expectEqual(particle_range_alignment_items, stats.batch.items_per_range);
-    try expectParticlesApproxEqual(&threaded_particles, &serial_particles);
+    try expectParticlesBitsEqual(&threaded_particles, &serial_particles);
 }
 
 test "threaded particle update matches serial across multiple range splits and worker counts" {
-
-    // The single-split parity test above pins one fixed split; the AdaptiveWorkTuner
-    // instead picks range/worker counts dynamically, and its probe-driven choice is not
-    // reproducible in a unit test. This asserts the split-INVARIANCE the tuner relies on:
-    // every explicit partition and worker count must reproduce the serial reference.
-    const item_count = particle_range_alignment_items * 8;
+    // Every explicit partition and worker count reproduces the serial reference: the
+    // split invariance the tuner's choice relies on. The last range ends in the masked tail.
+    const item_count = particle_range_alignment_items * 8 + 3;
     var serial_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = item_count });
     defer serial_particles.deinit();
     fillParticles(&serial_particles, item_count);
@@ -777,15 +762,12 @@ test "threaded particle update matches serial across multiple range splits and w
         var threaded_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = item_count });
         defer threaded_particles.deinit();
         fillParticles(&threaded_particles, item_count);
-        const stats = threaded_particles.update(&threads, 0.25, .{
+        _ = threaded_particles.update(&threads, 0.25, .{
             .items_per_range = split.items_per_range,
             .max_worker_threads = split.workers,
             .adaptive = false,
         });
-        // Real workers partitioned the batch (not the inline fallback), so this split
-        // exercised the multi-range, multi-worker path it claims to.
-        try std.testing.expect(!stats.batch.ran_inline);
-        try expectParticlesApproxEqual(&threaded_particles, &serial_particles);
+        try expectParticlesBitsEqual(&threaded_particles, &serial_particles);
     }
 }
 
@@ -800,12 +782,11 @@ test "particle explicit items_per_range bypasses tuner" {
     });
     defer threads.deinit();
 
-    const stats = particles.update(&threads, 0.25, .{
+    _ = particles.update(&threads, 0.25, .{
         .items_per_range = particle_range_alignment_items,
         .max_worker_threads = 2,
     });
 
-    try std.testing.expectEqual(particle_range_alignment_items, stats.batch.items_per_range);
     try std.testing.expectEqual(@as(usize, 0), particles.adaptive_tuner.sample_count);
     try std.testing.expect(particles.adaptive_tuner.last_request == null);
 }
@@ -828,27 +809,39 @@ test "particle system owns adaptive tuner for default update" {
     try std.testing.expect(particles.adaptive_tuner.last_request != null);
 }
 
-test "particle range only writes assigned rows" {
-    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 8 });
+test "a particle range writes only its rows, a masked last batch included" {
+    // Whole batches, a whole batch then a one-row tail, and a tail alone.
+    for ([_]ParallelRange{ .{ .start = 2, .end = 6 }, .{ .start = 2, .end = 7 }, .{ .start = 5, .end = 8 } }) |range| {
+        try expectParticleRangeWritesOnlyItsRows(range);
+    }
+}
+
+fn expectParticleRangeWritesOnlyItsRows(range: ParallelRange) !void {
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 12 });
     defer particles.deinit();
-    fillParticles(&particles, 8);
+    fillParticles(&particles, 12);
+
+    var untouched = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 12 });
+    defer untouched.deinit();
+    fillParticles(&untouched, 12);
 
     var particle_slice = particles.slice();
-    processRange(&particle_slice, .{ .start = 2, .end = 6 }, 1.0);
+    processRange(&particle_slice, range, 1.0);
 
     const data = particles.sliceConst();
+    const before = untouched.sliceConst();
     for (0..data.len()) |index| {
         const base: f32 = @floatFromInt(index);
-        if (index >= 2 and index < 6) {
+        if (index >= range.start and index < range.end) {
             try std.testing.expectEqual(base * 2, data.previous_x[index]);
             try std.testing.expectEqual(base * -3, data.previous_y[index]);
             try std.testing.expect(data.position_x[index] != base * 2);
             try std.testing.expect(data.position_y[index] != base * -3);
         } else {
-            try std.testing.expectEqual(base * 2, data.position_x[index]);
-            try std.testing.expectEqual(base * -3, data.position_y[index]);
-            try std.testing.expectEqual(base * 2, data.previous_x[index]);
-            try std.testing.expectEqual(base * -3, data.previous_y[index]);
+            // Every column the kernel writes keeps its bits outside the range.
+            inline for (.{ "position_x", "position_y", "previous_x", "previous_y", "velocity_x", "velocity_y", "age", "size", "color_r", "color_g", "color_b", "color_a" }) |column| {
+                try std.testing.expectEqual(@as(u32, @bitCast(@field(before, column)[index])), @as(u32, @bitCast(@field(data, column)[index])));
+            }
         }
     }
 }
@@ -881,7 +874,6 @@ test "warmed particle update and emission do not allocate" {
 
     try std.testing.expectEqual(@as(usize, 2), emitted);
     try std.testing.expectEqual(@as(usize, 18), stats.active_before);
-    try std.testing.expect(stats.batch.ran_inline);
 }
 
 test "threaded multi-worker particle update has no steady-state allocation after warmup (FailingAllocator)" {
@@ -896,12 +888,11 @@ test "threaded multi-worker particle update has no steady-state allocation after
     });
     defer threads.deinit();
 
-    const warmup = particles.update(&threads, 0.016, .{
+    _ = particles.update(&threads, 0.016, .{
         .items_per_range = particle_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
     });
-    try std.testing.expect(!warmup.batch.ran_inline);
 
     const original_particle_allocator = particles.allocator;
     const original_thread_allocator = threads.allocator;
@@ -918,6 +909,5 @@ test "threaded multi-worker particle update has no steady-state allocation after
         .max_worker_threads = 2,
         .adaptive = false,
     });
-    try std.testing.expect(!stats.batch.ran_inline);
     try std.testing.expectEqual(count, stats.active_before);
 }

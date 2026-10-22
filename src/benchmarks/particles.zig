@@ -15,14 +15,16 @@ const delta_seconds: f32 = 1.0 / 60.0;
 const benchmark_particle_depths = [_]WorldDepth{ .actor, .effect, .marker };
 
 // `particles`: one `ParticleSystem` update over N particles across three render depths,
-// each living past the run so every row stays live. Prints no workload fields. Pass shape:
-// time linear in rows; asserts check every row stays live and each step covers them all.
+// each living past the run so every row stays live. `--details` prints `main=`, the time
+// outside an update batch that ran on workers, and `main_per_item=`. Pass shape: time
+// linear in rows and main per row flat; asserts check every row stays live and each step
+// covers them all, and a fixed threaded case dispatches the update to workers.
 pub const group = suite.BenchmarkGroup{
     .name = "particles",
     .item_label = "particle rows",
     .item_counts = &suite.event_scale_counts,
     .runCase = runCase,
-    .write_workload = suite.writeNoWorkload,
+    .write_workload = writeParticleWorkload,
 };
 
 pub fn createFixture(allocator: std.mem.Allocator, count: usize) !ParticleSystem {
@@ -76,16 +78,21 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     const settled_before_measurement = if (case.adaptive) (particles.adaptive_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         const batch = runOnce(&particles, &threads, case);
-        const end_ns = suite.nowNs(io);
+        const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         std.debug.assert(batch.item_count == item_count);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
+        try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(particle_range_alignment_items), batch);
+        accumulator.record(elapsed_ns, batch);
+        // Main is everything but an update batch that ran on workers.
+        main_total += if (batch.ran_inline) elapsed_ns else elapsed_ns -| batch.batch_duration_ns;
     }
     std.debug.assert(particles.activeCount() == item_count);
 
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&particles.adaptive_tuner), settled_before_measurement);
     }
@@ -97,5 +104,10 @@ fn runOnce(particles: *ParticleSystem, thread_system: *ThreadSystem, case: suite
         .items_per_range = case.stageItemsPerRange(particle_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
-    }).batch;
+    }).perf.batch;
+}
+
+fn writeParticleWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    if (view == .summary) return;
+    try suite.writeMainShare(writer, stats, stats.item_count);
 }

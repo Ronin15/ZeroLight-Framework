@@ -27,7 +27,10 @@ const MovementThreads = @import("../../app/thread_system.zig").StageThreads(Move
 
 pub const MovementStats = struct {
     body_count: usize = 0,
-    batch: BatchStats = .{},
+    perf: Perf = .{},
+
+    /// The integrate batch, kept only with `runtime_perf_log.enabled`.
+    pub const Perf = if (runtime_perf_log.enabled) struct { batch: BatchStats = .{} } else struct {};
 };
 
 pub const MovementIntentStats = struct {
@@ -150,27 +153,36 @@ const IntentLanes = struct {
         self.count += 1;
     }
 
-    // A full block in lanes, a partial block per intent; both compare, select, and
-    // multiply once, so they are bit-identical.
+    // One lane batch; a partial block is the same kernel masked to its live lanes, which
+    // gather the first live row and are never stored.
     fn flush(self: *IntentLanes, slice: *const data.MovementBodySlice) void {
+        if (self.count == 0) return;
+        for (self.rows[self.count..], self.dir_x[self.count..], self.dir_y[self.count..]) |*row, *direction_x, *direction_y| {
+            row.* = self.rows[0];
+            direction_x.* = 0;
+            direction_y.* = 0;
+        }
+        const speed = simd.gatherFloat4(slice.speed, self.rows);
+        const effective_speed = simd.selectFloat4(
+            simd.greaterThanFloat4(speed, simd.splatFloat4(0)),
+            speed,
+            simd.splatFloat4(default_intent_speed),
+        );
+        const velocity_x = simd.mulFloat4(simd.loadFloat4(&self.dir_x), effective_speed);
+        const velocity_y = simd.mulFloat4(simd.loadFloat4(&self.dir_y), effective_speed);
         if (self.count == simd.lane_count) {
-            const speed = simd.gatherFloat4(slice.speed, self.rows);
-            const effective_speed = simd.selectFloat4(
-                simd.greaterThanFloat4(speed, simd.splatFloat4(0)),
-                speed,
-                simd.splatFloat4(default_intent_speed),
-            );
-            simd.scatterFloat4(slice.velocity_x, self.rows, simd.mulFloat4(simd.loadFloat4(&self.dir_x), effective_speed));
-            simd.scatterFloat4(slice.velocity_y, self.rows, simd.mulFloat4(simd.loadFloat4(&self.dir_y), effective_speed));
+            simd.scatterFloat4(slice.velocity_x, self.rows, velocity_x);
+            simd.scatterFloat4(slice.velocity_y, self.rows, velocity_y);
         } else {
-            for (self.rows[0..self.count], self.dir_x[0..self.count], self.dir_y[0..self.count]) |row, direction_x, direction_y| {
-                applyIntentScalar(slice, row, direction_x, direction_y);
-            }
+            const live = simd.lanesBelow(self.count);
+            simd.scatterFloat4Masked(slice.velocity_x, self.rows, velocity_x, live);
+            simd.scatterFloat4Masked(slice.velocity_y, self.rows, velocity_y, live);
         }
         self.count = 0;
     }
 };
 
+// Scalar reference for the lane kernel.
 fn applyIntentScalar(slice: *const data.MovementBodySlice, row: usize, direction_x: f32, direction_y: f32) void {
     const speed = slice.speed[row];
     const effective_speed = if (speed > 0) speed else default_intent_speed;
@@ -219,7 +231,7 @@ fn updateMovementBodies(
     const batch = integrate.run(selection, slice.entities.len, data.movement_range_alignment_items, &context, movementJob);
     return .{
         .body_count = slice.entities.len,
-        .batch = batch,
+        .perf = if (comptime runtime_perf_log.enabled) .{ .batch = batch } else .{},
     };
 }
 
@@ -238,36 +250,31 @@ fn movementJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     processRange(&job.slice, range, job.delta_seconds);
 }
 
+// Integrates `range` in lane batches; its last batch is the same kernel masked to the rows
+// left, so no lane reads or writes past the range.
 fn processRange(slice: *data.MovementBodySlice, range: ParallelRange, delta_seconds: f32) void {
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= slice.entities.len);
 
     var index = range.start;
     const dt = simd.splatFloat4(delta_seconds);
-    while (index + simd.lane_count <= range.end) : (index += simd.lane_count) {
-        const position_x = simd.loadFloat4(slice.position_x[index..]);
-        const position_y = simd.loadFloat4(slice.position_y[index..]);
-        const velocity_x = simd.loadFloat4(slice.velocity_x[index..]);
-        const velocity_y = simd.loadFloat4(slice.velocity_y[index..]);
+    while (index < range.end) : (index += simd.lane_count) {
+        const count = range.end - index;
+        const position_x = simd.loadFloat4Lanes(slice.position_x[index..], count);
+        const position_y = simd.loadFloat4Lanes(slice.position_y[index..], count);
+        const velocity_x = simd.loadFloat4Lanes(slice.velocity_x[index..], count);
+        const velocity_y = simd.loadFloat4Lanes(slice.velocity_y[index..], count);
         const next_x = simd.addFloat4(position_x, simd.mulFloat4(velocity_x, dt));
         const next_y = simd.addFloat4(position_y, simd.mulFloat4(velocity_y, dt));
 
-        simd.storeFloat4Slice(slice.previous_x[index..], position_x);
-        simd.storeFloat4Slice(slice.previous_y[index..], position_y);
-        simd.storeFloat4Slice(slice.position_x[index..], next_x);
-        simd.storeFloat4Slice(slice.position_y[index..], next_y);
-    }
-
-    while (index < range.end) : (index += 1) {
-        const position_x = slice.position_x[index];
-        const position_y = slice.position_y[index];
-        slice.previous_x[index] = position_x;
-        slice.previous_y[index] = position_y;
-        slice.position_x[index] = position_x + slice.velocity_x[index] * delta_seconds;
-        slice.position_y[index] = position_y + slice.velocity_y[index] * delta_seconds;
+        simd.storeFloat4Lanes(slice.previous_x[index..], position_x, count);
+        simd.storeFloat4Lanes(slice.previous_y[index..], position_y, count);
+        simd.storeFloat4Lanes(slice.position_x[index..], next_x, count);
+        simd.storeFloat4Lanes(slice.position_y[index..], next_y, count);
     }
 }
 
+// Scalar reference for the lane kernel.
 fn processRangeScalar(slice: *data.MovementBodySlice, range: ParallelRange, delta_seconds: f32) void {
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= slice.entities.len);
@@ -302,17 +309,14 @@ fn fillMovementData(data_system: *data.DataSystem, count: usize) !void {
     }
 }
 
-fn expectMovementDataApproxEqual(actual: *const data.DataSystem, expected: *const data.DataSystem) !void {
+fn expectMovementDataBitsEqual(actual: *const data.DataSystem, expected: *const data.DataSystem) !void {
     const actual_slice = actual.movementBodySliceConst();
     const expected_slice = expected.movementBodySliceConst();
     try std.testing.expectEqual(expected_slice.entities.len, actual_slice.entities.len);
-
-    for (0..actual_slice.entities.len) |index| {
-        try std.testing.expectApproxEqAbs(expected_slice.previous_x[index], actual_slice.previous_x[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_slice.previous_y[index], actual_slice.previous_y[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_slice.position_x[index], actual_slice.position_x[index], 0.001);
-        try std.testing.expectApproxEqAbs(expected_slice.position_y[index], actual_slice.position_y[index], 0.001);
-    }
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected_slice.previous_x), std.mem.sliceAsBytes(actual_slice.previous_x));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected_slice.previous_y), std.mem.sliceAsBytes(actual_slice.previous_y));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected_slice.position_x), std.mem.sliceAsBytes(actual_slice.position_x));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected_slice.position_y), std.mem.sliceAsBytes(actual_slice.position_y));
 }
 
 // `MovementSystem.update` inline as one range: a thread system with no workers.
@@ -331,8 +335,8 @@ fn applyIntentsInline(bodies: *data.DataSystem, frame: *const SimulationFrame) !
     _ = system.applyIntents(bodies, frame, &threads, .{});
 }
 
-test "serial movement uses simd lanes and scalar tails like scalar integration" {
-    inline for (.{ 0, 3, 4, 9 }) |count| {
+test "inline movement lane batches, the masked tail included, match scalar integration bit for bit" {
+    inline for (.{ 0, 1, 3, 4, 5, 9 }) |count| {
         var simd_data = data.DataSystem.init(std.testing.allocator);
         defer simd_data.deinit();
         var scalar_data = data.DataSystem.init(std.testing.allocator);
@@ -346,17 +350,17 @@ test "serial movement uses simd lanes and scalar tails like scalar integration" 
         var scalar_slice = scalar_data.movementBodySlice();
         processRangeScalar(&scalar_slice, .{ .start = 0, .end = scalar_slice.entities.len }, 0.25);
 
-        try expectMovementDataApproxEqual(&simd_data, &scalar_data);
+        try expectMovementDataBitsEqual(&simd_data, &scalar_data);
     }
 }
 
-test "threaded movement matches serial movement" {
+test "threaded movement matches serial movement, the last range ending in the masked tail" {
     var threaded_data = data.DataSystem.init(std.testing.allocator);
     defer threaded_data.deinit();
     var serial_data = data.DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
-    try fillMovementData(&threaded_data, data.movement_range_alignment_items * 8);
-    try fillMovementData(&serial_data, data.movement_range_alignment_items * 8);
+    try fillMovementData(&threaded_data, data.movement_range_alignment_items * 8 + 3);
+    try fillMovementData(&serial_data, data.movement_range_alignment_items * 8 + 3);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -375,18 +379,13 @@ test "threaded movement matches serial movement" {
     try updateInline(&serial_slice, 0.5);
 
     try std.testing.expectEqual(serial_data.movementBodySliceConst().entities.len, stats.body_count);
-    try std.testing.expect(!stats.batch.ran_inline);
-    try std.testing.expectEqual(data.movement_range_alignment_items, stats.batch.items_per_range);
-    try expectMovementDataApproxEqual(&threaded_data, &serial_data);
+    try expectMovementDataBitsEqual(&threaded_data, &serial_data);
 }
 
 test "threaded movement matches serial across multiple range splits and worker counts" {
-
-    // The single-split parity test above pins one fixed split; the AdaptiveWorkTuner
-    // instead picks range/worker counts dynamically, and its probe-driven choice is not
-    // reproducible in a unit test. This asserts the split-INVARIANCE the tuner relies on:
-    // every explicit partition and worker count must reproduce the serial reference.
-    const item_count = data.movement_range_alignment_items * 8;
+    // Every explicit partition and worker count reproduces the serial reference: the
+    // split invariance the tuner's choice relies on. The last range ends in the masked tail.
+    const item_count = data.movement_range_alignment_items * 8 + 3;
     var serial_data = data.DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
     try fillMovementData(&serial_data, item_count);
@@ -411,15 +410,12 @@ test "threaded movement matches serial across multiple range splits and worker c
         defer threaded_data.deinit();
         try fillMovementData(&threaded_data, item_count);
         var threaded_slice = threaded_data.movementBodySlice();
-        const stats = system.update(&threaded_slice, &threads, 0.5, .{
+        _ = system.update(&threaded_slice, &threads, 0.5, .{
             .items_per_range = split.items_per_range,
             .max_worker_threads = split.workers,
             .adaptive = false,
         });
-        // Real workers partitioned the batch (not the inline fallback), so this split
-        // exercised the multi-range, multi-worker path it claims to.
-        try std.testing.expect(!stats.batch.ran_inline);
-        try expectMovementDataApproxEqual(&threaded_data, &serial_data);
+        try expectMovementDataBitsEqual(&threaded_data, &serial_data);
     }
 }
 
@@ -436,12 +432,11 @@ test "movement explicit items_per_range bypasses tuner" {
 
     var system = MovementSystem.init();
     var slice = game_data.movementBodySlice();
-    const stats = system.update(&slice, &threads, 0.5, .{
+    _ = system.update(&slice, &threads, 0.5, .{
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
     });
 
-    try std.testing.expectEqual(data.movement_range_alignment_items, stats.batch.items_per_range);
     try std.testing.expectEqual(@as(usize, 0), system.adaptive_tuner.sample_count);
     try std.testing.expect(system.adaptive_tuner.last_request == null);
 }
@@ -468,17 +463,24 @@ test "movement system owns adaptive tuner for default update" {
     try std.testing.expect(system.apply_intents_tuner.last_request == null);
 }
 
-test "movement range only writes assigned items" {
+test "a movement range writes only its rows, a masked last batch included" {
+    // Whole batches, a whole batch then a one-row tail, and a tail alone.
+    for ([_]ParallelRange{ .{ .start = 2, .end = 6 }, .{ .start = 2, .end = 7 }, .{ .start = 5, .end = 8 } }) |range| {
+        try expectMovementRangeWritesOnlyItsRows(range);
+    }
+}
+
+fn expectMovementRangeWritesOnlyItsRows(range: ParallelRange) !void {
     var game_data = data.DataSystem.init(std.testing.allocator);
     defer game_data.deinit();
-    try fillMovementData(&game_data, 8);
+    try fillMovementData(&game_data, 12);
 
     var slice = game_data.movementBodySlice();
-    processRange(&slice, .{ .start = 2, .end = 6 }, 1.0);
+    processRange(&slice, range, 1.0);
 
     for (0..slice.entities.len) |index| {
         const base: f32 = @floatFromInt(index);
-        if (index >= 2 and index < 6) {
+        if (index >= range.start and index < range.end) {
             try std.testing.expectEqual(base * 2, slice.previous_x[index]);
             try std.testing.expectEqual(base * -3, slice.previous_y[index]);
             try std.testing.expectEqual(base * 2 + base + 1, slice.position_x[index]);
@@ -539,7 +541,6 @@ test "warmed movement update does not allocate" {
         .items_per_range = data.movement_range_alignment_items,
     });
     try std.testing.expectEqual(@as(usize, 32), stats.body_count);
-    try std.testing.expect(stats.batch.ran_inline);
 }
 
 test "threaded multi-worker movement update has no steady-state allocation after warmup (FailingAllocator)" {
@@ -555,12 +556,11 @@ test "threaded multi-worker movement update has no steady-state allocation after
 
     var system = MovementSystem.init();
     var slice = game_data.movementBodySlice();
-    const warmup = system.update(&slice, &threads, 0.016, .{
+    _ = system.update(&slice, &threads, 0.016, .{
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
     });
-    try std.testing.expect(!warmup.batch.ran_inline);
 
     // Movement writes only into the caller's SoA columns and ThreadSystem
     // work queues (both reserved at init); swap both to a failing allocator.
@@ -580,7 +580,6 @@ test "threaded multi-worker movement update has no steady-state allocation after
         .max_worker_threads = 2,
         .adaptive = false,
     });
-    try std.testing.expect(!stats.batch.ran_inline);
     try std.testing.expectEqual(data.movement_range_alignment_items * 8, stats.body_count);
 }
 

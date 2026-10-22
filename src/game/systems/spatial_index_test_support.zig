@@ -12,7 +12,7 @@ const SpatialIndexSystem = @import("spatial_index.zig").SpatialIndexSystem;
 const IndexPopulation = @import("spatial_index.zig").IndexPopulation;
 const SpatialIndexConfig = @import("spatial_index.zig").SpatialIndexConfig;
 const SpatialIndexStats = @import("spatial_index.zig").SpatialIndexStats;
-const chunk_slot_bytes = @import("spatial_index.zig").chunk_slot_bytes;
+const ChunkSlot = @import("spatial_index.zig").ChunkSlot;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const default_chunk_size_tiles = @import("../world/system.zig").default_chunk_size_tiles;
 
@@ -47,6 +47,9 @@ pub fn buildInline(system: *SpatialIndexSystem, data: *const DataSystem, populat
     defer threads.deinit();
     return system.build(data, population, geometry, &threads, config);
 }
+
+/// Bytes of one directory slot: a level's directory is this times its world's chunks.
+pub const chunk_slot_bytes: usize = @sizeOf(ChunkSlot);
 
 /// Bytes the index's level directories hold.
 pub fn directoryBytes(system: *const SpatialIndexSystem) usize {
