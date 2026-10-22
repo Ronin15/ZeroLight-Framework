@@ -38,6 +38,9 @@ const chunkKey = @import("chunk_list_map.zig").chunkKey;
 const keyChunk = @import("chunk_list_map.zig").keyChunk;
 const keyLevel = @import("chunk_list_map.zig").keyLevel;
 const empty_block = @import("chunk_list_map.zig").empty_block;
+const max_payload_classes = @import("chunk_list_map.zig").max_payload_classes;
+const PayloadSlabs = @import("chunk_list_map.zig").PayloadSlabs;
+const PayloadSlot = @import("chunk_list_map.zig").PayloadSlot;
 const splice_range_alignment_items = @import("chunk_list_map.zig").splice_range_alignment_items;
 const max_chunk_size_tiles = @import("../world/system.zig").max_chunk_size_tiles;
 // A rebuild's fill ranges per participant at the fixed shape (`fixedFillDispatch`).
@@ -263,8 +266,10 @@ pub const BoxQueryCounts = struct { hits: u16 = 0, entries: u16 = 0, work: u16 =
 const QueryGroup = struct { bit: u16, start: u32, count: u32 };
 
 /// Span columns and query columns of one chunk, plus the anchor words. Slices are the
-/// allocated columns; `nav_len` and `query_len` are the live prefixes.
+/// columns of the payload slot `slot` holds; `nav_len` and `query_len` are the live
+/// prefixes.
 const StaticChunk = struct {
+    slot: PayloadSlot = .none,
     nav_len: u32 = 0,
     nav_cap: u32 = 0,
     query_len: u32 = 0,
@@ -285,9 +290,10 @@ const StaticChunk = struct {
     groups: []QueryGroup = &.{},
 };
 
-/// One coarse cell's query AABBs, entity-index order. Slices are the allocated columns;
-/// `len` is the live prefix.
+/// One coarse cell's query AABBs, entity-index order. Slices are the columns of the payload
+/// slot `slot` holds; `len` is the live prefix.
 const QueryRun = struct {
+    slot: PayloadSlot = .none,
     len: u32 = 0,
     cap: u32 = 0,
     entity: []u32 = &.{},
@@ -299,6 +305,13 @@ const QueryRun = struct {
 
 const ChunkDir = ChunkDirectory(StaticChunk, false);
 const CoarseDir = ChunkDirectory(QueryRun, false);
+
+// The old columns of a chunk or cell that held no block.
+const empty_chunk = StaticChunk{};
+const empty_run = QueryRun{};
+
+/// The stages `rebuild` and `sync` dispatch, each with its last batch shape.
+pub const ColliderStage = enum { rewrite };
 
 /// The nav spans listed on one chunk, entity-index order. Empty when the chunk has none.
 pub const ChunkSpans = struct {
@@ -351,11 +364,11 @@ pub const ColliderView = struct {
         };
     }
 
-    fn chunkPayload(self: ColliderView, level: u16, chunk: u32) ?StaticChunk {
+    fn chunkPayload(self: ColliderView, level: u16, chunk: u32) ?*const StaticChunk {
         const chunks = self.chunks orelse return null;
         const block = chunks.slot(level, chunk);
         if (block == empty_block) return null;
-        return chunks.payload(block);
+        return chunks.payloadConst(block);
     }
 
     /// Writes into `hits`, in query order, the AABB of every row on `level` that meets the
@@ -530,7 +543,7 @@ const BoxWalk = struct {
     // scans that bit's query columns. One binary search per chunk visit finds the first
     // group at or after the walk's first cell; the cursor then only moves forward. The
     // search is not a work step.
-    fn walkAnchoredCells(self: *BoxWalk, cells: ClassCells, payload: StaticChunk, class_offset: usize, per_chunk_shift: u6) bool {
+    fn walkAnchoredCells(self: *BoxWalk, cells: ClassCells, payload: *const StaticChunk, class_offset: usize, per_chunk_shift: u6) bool {
         const cell_mask = (@as(u64, 1) << per_chunk_shift) - 1;
         const words = &payload.anchors.words;
         const groups = payload.groups[0..payload.group_len];
@@ -583,19 +596,18 @@ const BoxWalk = struct {
                 const cell: u32 = @intCast(cell_y * cells_x + cell_x);
                 const block = coarse[class].slot(self.level, cell);
                 if (block == empty_block) continue;
-                const run = coarse[class].payload(block);
-                if (!self.scanRun(run)) return false;
+                if (!self.scanRun(coarse[class].payloadConst(block))) return false;
             }
         }
         return true;
     }
 
-    fn scanQuery(self: *BoxWalk, payload: StaticChunk, start: u32, count: u32) bool {
+    fn scanQuery(self: *BoxWalk, payload: *const StaticChunk, start: u32, count: u32) bool {
         if (self.uncapped) return self.scanUncapped(payload.query_entity[start..], payload.query_min_x[start..], payload.query_min_y[start..], payload.query_max_x[start..], payload.query_max_y[start..], count);
         return self.scanCapped(payload.query_min_x[start..], payload.query_min_y[start..], payload.query_max_x[start..], payload.query_max_y[start..], count);
     }
 
-    fn scanRun(self: *BoxWalk, run: QueryRun) bool {
+    fn scanRun(self: *BoxWalk, run: *const QueryRun) bool {
         if (self.uncapped) return self.scanUncapped(run.entity, run.min_x, run.min_y, run.max_x, run.max_y, run.len);
         return self.scanCapped(run.min_x, run.min_y, run.max_x, run.max_y, run.len);
     }
@@ -780,6 +792,11 @@ pub const StaticColliderSystem = struct {
     sync_plan: std.ArrayList(SyncPlan) = .empty,
     chunks: ChunkDir = .{},
     coarse: [max_query_classes]CoarseDir = @splat(.{}),
+    // Chunk and coarse payload bytes, one slot per occupied block; freed slots pool for
+    // reuse and the slabs go with the system.
+    payloads: PayloadSlabs = .{},
+    // The running call's claims and releases per slab class and directory.
+    claim_tally: ClaimTally = .{},
     // Per opened level, one stamp per slot. `generation` matches the directory's generation
     // only for slots listed in this sync; `item` is the index in the fresh-item list.
     chunk_stamps: std.ArrayList([]SlotStamp) = .empty,
@@ -800,10 +817,10 @@ pub const StaticColliderSystem = struct {
     revision: u64 = 0,
     // The chunk rewrite, run by `sync` and `rebuild`: `sync`'s tuner (a rebuild runs at a
     // fixed shape and keeps it), the shared range controls (production runs adaptive;
-    // benches pin a fixed partition), and the last batch shape.
+    // benches pin a fixed partition), and each stage's last batch shape.
     chunk_rewrite: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     splice_controls: StageControls = .{},
-    last_splice_batch: BatchStats = .{},
+    last_batches: std.EnumArray(ColliderStage, BatchStats) = .initFill(.{}),
     perf: Perf = .{},
     // Column views refreshed whenever the row pool grows.
     row_entity: []EntityId = &.{},
@@ -822,8 +839,8 @@ pub const StaticColliderSystem = struct {
     payload_growth_logged: bool = false,
 
     /// Kept only with `runtime_perf_log.enabled`, across rebuilds: row-pool growths, and
-    /// payload growths (a level's directory opened, the block pool grown, or a chunk's or
-    /// coarse cell's columns allocated because none held its records).
+    /// payload growths (a level's directory opened, a block pool grown, or a payload slab
+    /// allocated).
     pub const Perf = if (runtime_perf_log.enabled) struct {
         row_grows: u64 = 0,
         payload_grows: u64 = 0,
@@ -834,11 +851,12 @@ pub const StaticColliderSystem = struct {
     }
 
     pub fn deinit(self: *StaticColliderSystem) void {
-        self.discardFresh();
+        self.discardPlan();
         self.freeStampList(&self.chunk_stamps);
         for (&self.coarse_stamps) |*stamps| self.freeStampList(stamps);
         for (&self.coarse) |*dir| dir.deinit(self.allocator);
         self.chunks.deinit(self.allocator);
+        self.payloads.deinit(self.allocator);
         self.unit_starts.deinit(self.allocator);
         self.coarse_inserts.deinit(self.allocator);
         self.query_inserts.deinit(self.allocator);
@@ -1080,7 +1098,7 @@ pub const StaticColliderSystem = struct {
     /// Applies every captured change from `data`'s final state. Main is O(1) per dirty
     /// static and per footprint chunk: it plans the chunks and coarse cells to rewrite,
     /// keeps each installed payload whose columns hold its records plus the inserts and
-    /// allocates a fresh one for any other, then one `chunk_rewrite` dispatch fills them. A
+    /// plans a pooled slot claim for any other, then one `chunk_rewrite` dispatch fills them. A
     /// row whose chunks, AABB, and query key are unchanged is written in place and rewrites
     /// nothing. On error nothing is installed and the dirty list stays for the next sync.
     /// The change list resets on every call.
@@ -1088,17 +1106,17 @@ pub const StaticColliderSystem = struct {
     // and a sort of that chunk's inserts on the worker.
     pub fn sync(self: *StaticColliderSystem, data: *const DataSystem, thread_system: *ThreadSystem) error{OutOfMemory}!void {
         self.changes.clearRetainingCapacity();
-        self.last_splice_batch = .{};
+        self.last_batches = .initFill(.{});
         if (self.pending_dirty.items.len == 0) return;
         try self.reserveSync(data);
         self.applySync(thread_system);
         self.revision +%= 1;
     }
 
-    // Plans, opens levels, and allocates fresh payloads. Installed runs stay as they are.
-    // On error the fresh payloads are freed and any blocks claimed for them return to the pool.
+    // Plans, opens levels, and reserves the payload slots and blocks the fill claims.
+    // Installed runs stay as they are. On error nothing is claimed; reserved storage stays.
     fn reserveSync(self: *StaticColliderSystem, data: *const DataSystem) error{OutOfMemory}!void {
-        errdefer self.discardFresh();
+        errdefer self.discardPlan();
         self.changes.clearRetainingCapacity();
         const counts = try self.planPending(data);
         try self.ensureFreeRows(counts.adds);
@@ -1107,17 +1125,14 @@ pub const StaticColliderSystem = struct {
         self.touchPending();
         self.assignInsertRanges();
         self.writePendingInserts();
-        const fresh = try self.allocFreshPayloads();
-        try self.claimFreshBlocks();
-        // Counted once the reserve holds: a sync retried after an OOM here allocates
-        // these payloads again and counts them once.
-        self.countPayloadGrowth(fresh);
+        try self.planPayloads();
         self.buildUnits();
     }
 
     fn applySync(self: *StaticColliderSystem, thread_system: *ThreadSystem) void {
         self.applyRows();
         self.rewriteItems(thread_system, .tuned);
+        self.commitClaims();
         self.installFresh();
         self.finishPending();
         self.clearItems();
@@ -1164,12 +1179,12 @@ pub const StaticColliderSystem = struct {
         } else null;
         const shape = stageShape(dispatch, total, splice_range_alignment_items);
         job.range_count = shape.range_count;
-        self.last_splice_batch = runShaped(dispatch, shape, total, splice_range_alignment_items, &job, rewriteJob);
+        self.last_batches.set(.rewrite, runShaped(dispatch, shape, total, splice_range_alignment_items, &job, rewriteJob));
     }
 
     // Every live row, as a create into empty directories, through the rewrite stage.
     fn buildAllRuns(self: *StaticColliderSystem, thread_system: ?*ThreadSystem) error{OutOfMemory}!void {
-        errdefer self.discardFresh();
+        errdefer self.discardPlan();
         var counts = PlanCounts{};
         for (self.row_of_index.items) |row| {
             if (row == no_row) continue;
@@ -1195,11 +1210,10 @@ pub const StaticColliderSystem = struct {
             self.writePlacementInserts(@intCast(index), placement, aabb, self.queryPlacement(placement, aabb));
         }
         self.finishInsertCursors();
-        const fresh = try self.allocFreshPayloads();
-        try self.claimFreshBlocks();
-        self.countPayloadGrowth(fresh);
+        try self.planPayloads();
         self.buildUnits();
         self.rewriteItems(thread_system, .fixed);
+        self.commitClaims();
         self.installFresh();
         self.bumpStamps();
         self.clearItems();
@@ -1346,8 +1360,8 @@ pub const StaticColliderSystem = struct {
         }
         const block = self.chunks.slot(level, chunk);
         if (!insert and block == empty_block) return;
-        const old_nav: u32 = if (block == empty_block) 0 else self.chunks.payload(block).nav_len;
-        const old_query: u32 = if (block == empty_block) 0 else self.chunks.payload(block).query_len;
+        const old_nav: u32 = if (block == empty_block) 0 else self.chunks.payloadConst(block).nav_len;
+        const old_query: u32 = if (block == empty_block) 0 else self.chunks.payloadConst(block).query_len;
         stamp.generation = self.chunk_stamp_generation;
         stamp.item = @intCast(self.chunk_items.items.len);
         self.chunk_items.appendAssumeCapacity(.{
@@ -1370,7 +1384,7 @@ pub const StaticColliderSystem = struct {
         }
         const block = self.coarse[class].slot(level, cell);
         if (!insert and block == empty_block) return;
-        const old_len: u32 = if (block == empty_block) 0 else self.coarse[class].payload(block).len;
+        const old_len: u32 = if (block == empty_block) 0 else self.coarse[class].payloadConst(block).len;
         stamp.generation = self.coarse_stamp_generation;
         stamp.item = @intCast(self.coarse_items.items.len);
         self.coarse_items.appendAssumeCapacity(.{
@@ -1484,161 +1498,237 @@ pub const StaticColliderSystem = struct {
         return &self.coarse_items.items[stamp.item];
     }
 
-    // An installed payload whose columns hold its kept records plus every insert is
-    // rewritten in place, allocating nothing; any other gets fresh geometric columns.
-    // Returns the fresh payload count, which the caller counts as payload growth once its
-    // reserve holds.
-    fn allocFreshPayloads(self: *StaticColliderSystem) !usize {
-        var fresh: usize = 0;
+    // Plans each item's payload, in item order: in place when its slot's columns hold the
+    // kept records plus every insert, emptied when no record remains, otherwise a fresh
+    // slot of the smallest class holding geometric columns (and a block for a chunk or cell
+    // holding none). Each claim and release takes the next ordinal of its slab class or
+    // directory. Then reserves each class and directory with claims once, so the fill and
+    // install allocate nothing. Grown slabs and block pools count as payload growth as they
+    // grow, and stay on error. O(items) plus O(classes and directories used).
+    // SIMD verdict: scalar. Per item, a branchy integer classification (in place, emptied, or
+    // fresh) with a class lookup and tally bumps; nothing lane-shaped.
+    fn planPayloads(self: *StaticColliderSystem) error{OutOfMemory}!void {
+        const tally = &self.claim_tally;
+        tally.* = .{};
         for (self.chunk_items.items) |*item| {
             const nav_need = item.navLen();
             const query_need = item.queryLen();
+            var plan = PayloadPlan{};
             if (item.old_block != empty_block) {
-                const old = self.chunks.payload(item.old_block);
-                if (nav_need <= old.nav_cap and query_need <= old.query_cap) {
-                    item.payload = old;
-                    item.in_place = true;
+                const old = self.chunks.payloadConst(item.old_block);
+                plan.old_slot = old.slot;
+                if (nav_need == 0) {
+                    // A query record sits in its anchor chunk, inside its row's footprint.
+                    std.debug.assert(query_need == 0);
+                    plan.kind = .emptied;
+                    plan.block_release = tally.chunk_blocks.release();
+                    plan.slot_release = tally.releaseSlot(old.slot);
+                    item.payload_plan = plan;
                     continue;
                 }
+                if (nav_need <= old.nav_cap and query_need <= old.query_cap) {
+                    plan.kind = .in_place;
+                    item.payload_plan = plan;
+                    continue;
+                }
+                plan.slot_release = tally.releaseSlot(old.slot);
+            } else {
+                // A chunk with no block is listed only by an insert.
+                std.debug.assert(nav_need != 0);
+                plan.block_claim = tally.chunk_blocks.claim();
             }
-            const nav_cap = try geometric(nav_need);
-            const query_cap = try geometric(query_need);
-            item.bytes = try allocPayload(self.allocator, chunkPayloadBytes(nav_cap, query_cap));
-            item.payload = splitChunk(item.bytes, nav_cap, query_cap);
-            fresh += 1;
+            plan.cap = try geometric(nav_need);
+            plan.query_cap = try geometric(query_need);
+            plan.slab_class = try PayloadSlabs.classFor(chunkPayloadBytes(plan.cap, plan.query_cap));
+            plan.slot_claim = tally.claimSlot(plan.slab_class);
+            item.payload_plan = plan;
         }
         for (self.coarse_items.items) |*item| {
             const need = item.len();
+            var plan = PayloadPlan{};
             if (item.old_block != empty_block) {
-                const old = self.coarse[item.class].payload(item.old_block);
-                if (need <= old.cap) {
-                    item.payload = old;
-                    item.in_place = true;
+                const old = self.coarse[item.class].payloadConst(item.old_block);
+                plan.old_slot = old.slot;
+                if (need == 0) {
+                    plan.kind = .emptied;
+                    plan.block_release = tally.coarseBlocks(item.class).release();
+                    plan.slot_release = tally.releaseSlot(old.slot);
+                    item.payload_plan = plan;
                     continue;
                 }
+                if (need <= old.cap) {
+                    plan.kind = .in_place;
+                    item.payload_plan = plan;
+                    continue;
+                }
+                plan.slot_release = tally.releaseSlot(old.slot);
+            } else {
+                // A cell with no block is listed only by an insert.
+                std.debug.assert(need != 0);
+                plan.block_claim = tally.coarseBlocks(item.class).claim();
             }
-            const cap = try geometric(need);
-            item.bytes = try allocPayload(self.allocator, queryRunBytes(cap));
-            item.payload = splitQueryRun(item.bytes, cap);
-            fresh += 1;
+            plan.cap = try geometric(need);
+            plan.slab_class = try PayloadSlabs.classFor(queryRunBytes(plan.cap));
+            plan.slot_claim = tally.claimSlot(plan.slab_class);
+            item.payload_plan = plan;
         }
-        return fresh;
+        const slabs_before = self.payloads.slab_count;
+        defer self.countPayloadGrowth(self.payloads.slab_count - slabs_before);
+        var classes = tally.slot_classes.iterator(.{});
+        while (classes.next()) |class| {
+            const claims = tally.slot_claims[class];
+            if (claims != 0) try self.payloads.reserve(self.allocator, @intCast(class), claims);
+        }
+        try self.reserveBlocks(&self.chunks, tally.chunk_blocks.claims);
+        var directories = tally.coarse_classes.iterator(.{});
+        while (directories.next()) |class| try self.reserveBlocks(&self.coarse[class], tally.coarse_blocks[class].claims);
     }
 
-    fn claimFreshBlocks(self: *StaticColliderSystem) !void {
-        for (self.chunk_items.items) |*item| {
-            if (item.old_block != empty_block) continue;
-            if (item.nav_insert_count + item.query_insert_count == 0) continue;
-            const before = self.chunks.blocks.capacity;
-            item.block = try self.chunks.claim(self.allocator);
-            item.claimed_new = true;
-            if (self.chunks.blocks.capacity > before) self.countPayloadGrowth(1);
-        }
-        for (self.coarse_items.items) |*item| {
-            if (item.old_block != empty_block) continue;
-            if (item.insert_count == 0) continue;
-            const before = self.coarse[item.class].blocks.capacity;
-            item.block = try self.coarse[item.class].claim(self.allocator);
-            item.claimed_new = true;
-            if (self.coarse[item.class].blocks.capacity > before) self.countPayloadGrowth(1);
-        }
+    // Reserves `claims` ordinal block claims in `dir`. A grown block pool counts as one
+    // payload growth from the capacity before the reserve, on error too, as the slabs do.
+    fn reserveBlocks(self: *StaticColliderSystem, dir: anytype, claims: u32) error{OutOfMemory}!void {
+        if (claims == 0) return;
+        const before = dir.blocks.capacity;
+        defer if (dir.blocks.capacity != before) self.countPayloadGrowth(1);
+        try dir.reserveClaims(self.allocator, claims);
     }
 
+    // The call's claims, once the fill has read them. O(classes and directories used).
+    fn commitClaims(self: *StaticColliderSystem) void {
+        const tally = &self.claim_tally;
+        var classes = tally.slot_classes.iterator(.{});
+        while (classes.next()) |class| self.payloads.commitClaims(@intCast(class), tally.slot_claims[class]);
+        self.chunks.commitClaims(tally.chunk_blocks.claims);
+        var directories = tally.coarse_classes.iterator(.{});
+        while (directories.next()) |class| self.coarse[class].commitClaims(tally.coarse_blocks[class].claims);
+    }
+
+    // The call's releases, once install has written them. O(classes and directories used).
+    fn commitReleases(self: *StaticColliderSystem) void {
+        const tally = &self.claim_tally;
+        var classes = tally.slot_classes.iterator(.{});
+        while (classes.next()) |class| self.payloads.commitReleases(@intCast(class), tally.slot_releases[class]);
+        self.chunks.commitReleases(tally.chunk_blocks.releases);
+        var directories = tally.coarse_classes.iterator(.{});
+        while (directories.next()) |class| self.coarse[class].commitReleases(tally.coarse_blocks[class].releases);
+    }
+
+    // The fill's work units, as prefix sums in item order: an item's old records and inserts
+    // plus one. An emptied item's fill returns at once, so it is one unit. Runs after
+    // `planPayloads`. O(items).
     fn buildUnits(self: *StaticColliderSystem) void {
         self.unit_starts.clearRetainingCapacity();
         var units: usize = 0;
         self.unit_starts.appendAssumeCapacity(units);
         for (self.chunk_items.items) |item| {
-            units += @as(usize, item.old_nav) + item.nav_insert_count + item.old_query + item.query_insert_count + 1;
+            if (item.payload_plan.kind != .emptied) units += @as(usize, item.old_nav) + item.nav_insert_count + item.old_query + item.query_insert_count;
+            units += 1;
             self.unit_starts.appendAssumeCapacity(units);
         }
         for (self.coarse_items.items) |item| {
-            units += @as(usize, item.old_len) + item.insert_count + 1;
+            if (item.payload_plan.kind != .emptied) units += @as(usize, item.old_len) + item.insert_count;
+            units += 1;
             self.unit_starts.appendAssumeCapacity(units);
         }
     }
 
-    // An in-place item's payload and `old` share their columns.
+    // Writes the item's descriptor in its block: an in-place item's live one; a replacing
+    // item's old block, after reading its old columns; a fresh chunk's claimed block,
+    // written whole. A fresh slot is the planned claim of its class. An emptied item writes
+    // nothing; install releases its block and slot.
     fn fillChunkItem(self: *StaticColliderSystem, index: usize) void {
         const item = &self.chunk_items.items[index];
-        const old = if (item.old_block == empty_block) StaticChunk{} else self.chunks.payload(item.old_block);
+        const plan = item.payload_plan;
+        if (plan.kind == .emptied) return;
         const nav = self.nav_inserts.items[item.nav_insert_at..][0..item.nav_insert_count];
         const query = self.query_inserts.items[item.query_insert_at..][0..item.query_insert_count];
         pdq(SpanInsert, nav, {}, spanLess);
         pdq(AabbInsert, query, {}, aabbLess);
         const stamps = self.relink_stamp.items;
         const generation = self.relink_generation;
-        item.payload.nav_len = rewriteRecords(NavRecords, .of(item.payload), .of(old), old.nav_len, nav, stamps, generation, item.in_place);
-        item.payload.query_len = rewriteRecords(QueryRecords, .of(item.payload), .of(old), old.query_len, query, stamps, generation, item.in_place);
-        std.debug.assert(item.payload.nav_len == item.navLen() and item.payload.query_len == item.queryLen());
-        emitGroups(&item.payload);
+        const payload = switch (plan.kind) {
+            .emptied => unreachable,
+            .in_place => in_place: {
+                const live = self.chunks.payloadMut(item.old_block);
+                live.nav_len = rewriteRecords(NavRecords, .of(live), .of(live), live.nav_len, nav, stamps, generation, true);
+                live.query_len = rewriteRecords(QueryRecords, .of(live), .of(live), live.query_len, query, stamps, generation, true);
+                break :in_place live;
+            },
+            .fresh_slot => fresh: {
+                const slot = PayloadSlot{ .class = plan.slab_class, .id = self.payloads.claimedId(plan.slab_class, plan.slot_claim) };
+                const columns = splitChunk(self.payloads.bytesOf(slot), slot, plan.cap, plan.query_cap);
+                var old_nav = NavRecords.of(&empty_chunk);
+                var old_query = QueryRecords.of(&empty_chunk);
+                var old_nav_len: u32 = 0;
+                var old_query_len: u32 = 0;
+                const target = if (item.old_block == empty_block) claimed: {
+                    item.block = self.chunks.claimedBlock(plan.block_claim);
+                    break :claimed self.chunks.writeClaimed(item.block, columns);
+                } else replaced: {
+                    const live = self.chunks.payloadMut(item.old_block);
+                    old_nav = .of(live);
+                    old_query = .of(live);
+                    old_nav_len = live.nav_len;
+                    old_query_len = live.query_len;
+                    live.* = columns;
+                    break :replaced live;
+                };
+                target.nav_len = mergeForward(NavRecords, .of(target), old_nav, old_nav_len, nav, stamps, generation);
+                target.query_len = mergeForward(QueryRecords, .of(target), old_query, old_query_len, query, stamps, generation);
+                break :fresh target;
+            },
+        };
+        std.debug.assert(payload.nav_len == item.navLen() and payload.query_len == item.queryLen());
+        emitGroups(payload);
     }
 
     fn fillCoarseItem(self: *StaticColliderSystem, index: usize) void {
         const item = &self.coarse_items.items[index];
-        const old = if (item.old_block == empty_block) QueryRun{} else self.coarse[item.class].payload(item.old_block);
+        const plan = item.payload_plan;
+        if (plan.kind == .emptied) return;
+        const dir = &self.coarse[item.class];
         const inserts = self.coarse_inserts.items[item.insert_at..][0..item.insert_count];
         pdq(AabbInsert, inserts, {}, entityLess);
-        item.payload.len = rewriteRecords(RunRecords, .of(item.payload), .of(old), old.len, inserts, self.relink_stamp.items, self.relink_generation, item.in_place);
-        std.debug.assert(item.payload.len == item.len());
+        const stamps = self.relink_stamp.items;
+        const generation = self.relink_generation;
+        const run = switch (plan.kind) {
+            .emptied => unreachable,
+            .in_place => in_place: {
+                const live = dir.payloadMut(item.old_block);
+                live.len = rewriteRecords(RunRecords, .of(live), .of(live), live.len, inserts, stamps, generation, true);
+                break :in_place live;
+            },
+            .fresh_slot => fresh: {
+                const slot = PayloadSlot{ .class = plan.slab_class, .id = self.payloads.claimedId(plan.slab_class, plan.slot_claim) };
+                const columns = splitQueryRun(self.payloads.bytesOf(slot), slot, plan.cap);
+                var old = RunRecords.of(&empty_run);
+                var old_len: u32 = 0;
+                const target = if (item.old_block == empty_block) claimed: {
+                    item.block = dir.claimedBlock(plan.block_claim);
+                    break :claimed dir.writeClaimed(item.block, columns);
+                } else replaced: {
+                    const live = dir.payloadMut(item.old_block);
+                    old = .of(live);
+                    old_len = live.len;
+                    live.* = columns;
+                    break :replaced live;
+                };
+                target.len = mergeForward(RunRecords, .of(target), old, old_len, inserts, stamps, generation);
+                break :fresh target;
+            },
+        };
+        std.debug.assert(run.len == item.len());
     }
 
+    // Installs the fill in item order: each fresh block's slot, and each emptied block and
+    // each replaced or emptied payload slot released at its planned position. Then commits
+    // the releases.
+    // SIMD verdict: scalar. Per item, a switch on its plan kind and at most a slot write and
+    // two scattered free-list writes; nothing lane-shaped.
     fn installFresh(self: *StaticColliderSystem) void {
-        for (self.chunk_items.items) |*item| self.installChunk(item);
-        for (self.coarse_items.items) |*item| self.installCoarse(item);
-    }
-
-    fn installChunk(self: *StaticColliderSystem, item: *ChunkItem) void {
-        if (item.payload.nav_len == 0 and item.payload.query_len == 0) {
-            freePayload(self.allocator, item.bytes);
-            item.bytes = &.{};
-            if (item.old_block != empty_block) {
-                self.chunks.setSlot(item.level, item.slot, empty_block);
-                self.chunks.release(self.allocator, item.old_block);
-            }
-            if (item.claimed_new) self.chunks.release(self.allocator, item.block);
-            return;
-        }
-        if (item.in_place) {
-            self.chunks.payloadMut(item.old_block).* = item.payload;
-            return;
-        }
-        if (item.old_block != empty_block) {
-            const old_bytes = self.chunks.blockBytes(item.old_block);
-            self.chunks.setPayload(item.old_block, item.bytes, item.payload);
-            freePayload(self.allocator, old_bytes);
-        } else {
-            self.chunks.setPayload(item.block, item.bytes, item.payload);
-            self.chunks.setSlot(item.level, item.slot, item.block);
-        }
-        item.bytes = &.{};
-    }
-
-    fn installCoarse(self: *StaticColliderSystem, item: *CoarseItem) void {
-        const dir = &self.coarse[item.class];
-        if (item.payload.len == 0) {
-            freePayload(self.allocator, item.bytes);
-            item.bytes = &.{};
-            if (item.old_block != empty_block) {
-                dir.setSlot(item.level, item.slot, empty_block);
-                dir.release(self.allocator, item.old_block);
-            }
-            if (item.claimed_new) dir.release(self.allocator, item.block);
-            return;
-        }
-        if (item.in_place) {
-            dir.payloadMut(item.old_block).* = item.payload;
-            return;
-        }
-        if (item.old_block != empty_block) {
-            const old_bytes = dir.blockBytes(item.old_block);
-            dir.setPayload(item.old_block, item.bytes, item.payload);
-            freePayload(self.allocator, old_bytes);
-        } else {
-            dir.setPayload(item.block, item.bytes, item.payload);
-            dir.setSlot(item.level, item.slot, item.block);
-        }
-        item.bytes = &.{};
+        for (self.chunk_items.items) |item| installItem(ChunkDir, &self.chunks, &self.payloads, item.level, item.slot, item.old_block, item.block, item.payload_plan);
+        for (self.coarse_items.items) |item| installItem(CoarseDir, &self.coarse[item.class], &self.payloads, item.level, item.slot, item.old_block, item.block, item.payload_plan);
+        self.commitReleases();
     }
 
     fn applyRows(self: *StaticColliderSystem) void {
@@ -1689,15 +1779,9 @@ pub const StaticColliderSystem = struct {
         self.unit_starts.clearRetainingCapacity();
     }
 
-    fn discardFresh(self: *StaticColliderSystem) void {
-        for (self.chunk_items.items) |item| {
-            freePayload(self.allocator, item.bytes);
-            if (item.claimed_new) self.chunks.release(self.allocator, item.block);
-        }
-        for (self.coarse_items.items) |item| {
-            freePayload(self.allocator, item.bytes);
-            if (item.claimed_new) self.coarse[item.class].release(self.allocator, item.block);
-        }
+    // Drops a call's planned items and bumps the stamps. Nothing is claimed before the fill,
+    // so nothing returns to a pool.
+    fn discardPlan(self: *StaticColliderSystem) void {
         self.clearItems();
         self.bumpStamps();
     }
@@ -1818,14 +1902,93 @@ const AabbInsert = struct {
     max_y: f32,
 };
 
+// How the fill and install treat one item's payload, planned on main.
+const PayloadPlan = struct {
+    kind: enum { fresh_slot, in_place, emptied } = .fresh_slot,
+    // The installed payload's slot, released when the item replaces or empties it.
+    old_slot: PayloadSlot = .none,
+    // A fresh slot's class, its claim ordinal there, and its column capacities: nav (or a
+    // coarse run's) and query.
+    slab_class: u8 = 0,
+    slot_claim: u32 = 0,
+    cap: u32 = 0,
+    query_cap: u32 = 0,
+    // Ordinals in the directory: the block claim of an item with no block, and the old
+    // block's release when emptied; and in `old_slot`'s class, its release.
+    block_claim: u32 = 0,
+    block_release: u32 = 0,
+    slot_release: u32 = 0,
+};
+
+// One call's ordinal claims and releases per payload slab class and per directory, taken
+// in item order on main before the fill, committed after it.
+const ClaimTally = struct {
+    slot_claims: [max_payload_classes]u32 = @splat(0),
+    slot_releases: [max_payload_classes]u32 = @splat(0),
+    // Slab classes with a claim or a release this call.
+    slot_classes: std.StaticBitSet(max_payload_classes) = .empty,
+    chunk_blocks: BlockTally = .{},
+    coarse_blocks: [max_query_classes]BlockTally = @splat(.{}),
+    // Coarse directories with a claim or a release this call.
+    coarse_classes: QueryClassMask = .empty,
+
+    fn claimSlot(self: *ClaimTally, class: u8) u32 {
+        self.slot_classes.set(class);
+        defer self.slot_claims[class] += 1;
+        return self.slot_claims[class];
+    }
+
+    fn releaseSlot(self: *ClaimTally, slot: PayloadSlot) u32 {
+        // Every block holding records holds a slot.
+        std.debug.assert(!slot.isNone());
+        self.slot_classes.set(slot.class);
+        defer self.slot_releases[slot.class] += 1;
+        return self.slot_releases[slot.class];
+    }
+
+    fn coarseBlocks(self: *ClaimTally, class: u6) *BlockTally {
+        self.coarse_classes.set(class);
+        return &self.coarse_blocks[class];
+    }
+};
+
+const BlockTally = struct {
+    claims: u32 = 0,
+    releases: u32 = 0,
+
+    fn claim(self: *BlockTally) u32 {
+        defer self.claims += 1;
+        return self.claims;
+    }
+
+    fn release(self: *BlockTally) u32 {
+        defer self.releases += 1;
+        return self.releases;
+    }
+};
+
+// Installs one planned item into `dir`: a fresh block's slot, or the planned releases.
+fn installItem(comptime Dir: type, dir: *Dir, payloads: *const PayloadSlabs, level: u16, slot: u32, old_block: u32, block: u32, plan: PayloadPlan) void {
+    switch (plan.kind) {
+        .in_place => {},
+        .emptied => {
+            dir.setSlot(level, slot, empty_block);
+            dir.releaseBlockAt(plan.block_release, old_block);
+            payloads.releaseAt(plan.old_slot, plan.slot_release);
+        },
+        .fresh_slot => if (old_block == empty_block) {
+            dir.setSlot(level, slot, block);
+        } else payloads.releaseAt(plan.old_slot, plan.slot_release),
+    }
+}
+
 const ChunkItem = struct {
     level: u16,
     slot: u32,
     old_block: u32 = empty_block,
+    // The claimed block of an item with no block, resolved by the fill.
     block: u32 = empty_block,
-    claimed_new: bool = false,
-    // `payload` is the installed one, rewritten in place; `bytes` stays empty.
-    in_place: bool = false,
+    payload_plan: PayloadPlan = .{},
     old_nav: u32 = 0,
     old_query: u32 = 0,
     nav_insert_at: u32 = 0,
@@ -1837,8 +2000,6 @@ const ChunkItem = struct {
     // Listed records of relinked rows, which the rewrite drops.
     nav_remove_count: u32 = 0,
     query_remove_count: u32 = 0,
-    bytes: []align(4) u8 = &.{},
-    payload: StaticChunk = .{},
 
     // The rewritten lengths: kept old records plus inserts.
     fn navLen(self: ChunkItem) usize {
@@ -1869,18 +2030,15 @@ const CoarseItem = struct {
     level: u16,
     slot: u32,
     old_block: u32 = empty_block,
+    // The claimed block of an item with no block, resolved by the fill.
     block: u32 = empty_block,
-    claimed_new: bool = false,
-    // `payload` is the installed one, rewritten in place; `bytes` stays empty.
-    in_place: bool = false,
+    payload_plan: PayloadPlan = .{},
     old_len: u32 = 0,
     insert_at: u32 = 0,
     insert_count: u32 = 0,
     cursor: u32 = 0,
     // Listed records of relinked rows, which the rewrite drops.
     remove_count: u32 = 0,
-    bytes: []align(4) u8 = &.{},
-    payload: QueryRun = .{},
 
     // The rewritten length: kept old records plus inserts.
     fn len(self: CoarseItem) usize {
@@ -2007,7 +2165,7 @@ const NavRecords = struct {
 
     const Insert = SpanInsert;
 
-    fn of(payload: StaticChunk) NavRecords {
+    fn of(payload: *const StaticChunk) NavRecords {
         return .{ .entity = payload.nav_entity, .min_x = payload.nav_min_x, .min_y = payload.nav_min_y, .max_x = payload.nav_max_x, .max_y = payload.nav_max_y };
     }
 
@@ -2045,7 +2203,7 @@ const QueryRecords = struct {
 
     const Insert = AabbInsert;
 
-    fn of(payload: StaticChunk) QueryRecords {
+    fn of(payload: *const StaticChunk) QueryRecords {
         return .{ .entity = payload.query_entity, .bit = payload.query_bit, .min_x = payload.query_min_x, .min_y = payload.query_min_y, .max_x = payload.query_max_x, .max_y = payload.query_max_y };
     }
 
@@ -2083,7 +2241,7 @@ const RunRecords = struct {
 
     const Insert = AabbInsert;
 
-    fn of(run: QueryRun) RunRecords {
+    fn of(run: *const QueryRun) RunRecords {
         return .{ .entity = run.entity, .min_x = run.min_x, .min_y = run.min_y, .max_x = run.max_x, .max_y = run.max_y };
     }
 
@@ -2128,24 +2286,13 @@ fn emitGroups(payload: *StaticChunk) void {
     payload.anchors = anchors;
 }
 
+// The power-of-two column capacity holding `needed` records; a capacity past 2^31 fails
+// as `OutOfMemory`.
 fn geometric(needed: usize) error{OutOfMemory}!u32 {
     if (needed == 0) return 0;
     if (needed >= empty_block) return error.OutOfMemory;
-    // `needed` is below 2^32, so the ceil log fits a usize shift.
-    const shift: u6 = @intCast(std.math.log2_int_ceil(usize, needed));
-    const cap = @as(usize, 1) << shift;
-    if (cap >= empty_block) return error.OutOfMemory;
-    return @intCast(cap);
-}
-
-fn allocPayload(allocator: std.mem.Allocator, size: usize) error{OutOfMemory}![]align(4) u8 {
-    if (size == 0) return &.{};
-    return try allocator.alignedAlloc(u8, .@"4", size);
-}
-
-fn freePayload(allocator: std.mem.Allocator, bytes: []align(4) u8) void {
-    if (bytes.len == 0) return;
-    allocator.free(bytes);
+    // `needed` is below 2^32.
+    return std.math.ceilPowerOfTwo(u32, @intCast(needed)) catch error.OutOfMemory;
 }
 
 fn chunkPayloadBytes(nav_cap: u32, query_cap: u32) usize {
@@ -2168,9 +2315,9 @@ fn queryRunBytes(cap: u32) usize {
     return offset;
 }
 
-fn splitChunk(bytes: []align(4) u8, nav_cap: u32, query_cap: u32) StaticChunk {
+fn splitChunk(bytes: []align(4) u8, slot: PayloadSlot, nav_cap: u32, query_cap: u32) StaticChunk {
     var offset: usize = 0;
-    var payload = StaticChunk{ .nav_cap = nav_cap, .query_cap = query_cap };
+    var payload = StaticChunk{ .slot = slot, .nav_cap = nav_cap, .query_cap = query_cap };
     payload.nav_entity = take(u32, bytes, &offset, nav_cap);
     payload.nav_min_x = take(u32, bytes, &offset, nav_cap);
     payload.nav_min_y = take(u32, bytes, &offset, nav_cap);
@@ -2187,9 +2334,10 @@ fn splitChunk(bytes: []align(4) u8, nav_cap: u32, query_cap: u32) StaticChunk {
     return payload;
 }
 
-fn splitQueryRun(bytes: []align(4) u8, cap: u32) QueryRun {
+fn splitQueryRun(bytes: []align(4) u8, slot: PayloadSlot, cap: u32) QueryRun {
     var offset: usize = 0;
     return .{
+        .slot = slot,
         .cap = cap,
         .entity = take(u32, bytes, &offset, cap),
         .min_x = take(f32, bytes, &offset, cap),
@@ -2297,8 +2445,8 @@ fn levelChunkCount(geometry: ColliderGeometry) usize {
     return geometry.grid.chunkCount();
 }
 
-// Whether `a` and `b` hold identical rows, change lists, and chunk bytes (block ids
-// included) over `levels` levels.
+// Whether `a` and `b` hold identical rows, change lists, and chunk bytes (block and payload
+// slot ids included) over `levels` levels.
 fn expectIdenticalLayout(a: *const StaticColliderSystem, b: *const StaticColliderSystem, levels: u16) !void {
     try std.testing.expectEqualSlices(u32, a.row_of_index.items, b.row_of_index.items);
     try std.testing.expectEqual(a.changes.items.len, b.changes.items.len);
@@ -2326,6 +2474,7 @@ fn expectIdenticalLayout(a: *const StaticColliderSystem, b: *const StaticCollide
 }
 
 fn expectSameChunkBytes(a: StaticChunk, b: StaticChunk) !void {
+    try std.testing.expectEqual(a.slot, b.slot);
     try std.testing.expectEqual(a.nav_len, b.nav_len);
     try std.testing.expectEqual(a.query_len, b.query_len);
     try std.testing.expectEqual(a.group_len, b.group_len);
@@ -2348,6 +2497,7 @@ fn expectSameChunkBytes(a: StaticChunk, b: StaticChunk) !void {
 }
 
 fn expectSameRun(a: QueryRun, b: QueryRun) !void {
+    try std.testing.expectEqual(a.slot, b.slot);
     try std.testing.expectEqual(a.len, b.len);
     const count: usize = a.len;
     try std.testing.expectEqualSlices(u32, a.entity[0..count], b.entity[0..count]);
@@ -2455,25 +2605,76 @@ fn expectGroupsMatchAnchors(payload: StaticChunk) !void {
     try std.testing.expectEqual(anchors, payload.anchors);
 }
 
-// A chunk's anchor words equal its query groups, and every pooled block is installed or free.
+// A chunk's anchor words equal its query groups, every pooled chunk and coarse block is
+// installed or free, and every payload slot is held by one live block or free.
 fn expectAnchors(colliders: *const StaticColliderSystem) !void {
-    var seen = try std.DynamicBitSet.initEmpty(std.testing.allocator, colliders.chunks.blocks.items.len);
+    try expectPayloadSlotsOwned(colliders);
+    try expectBlocksInstalledOrFree(ChunkDir, &colliders.chunks);
+    for (&colliders.coarse) |*dir| try expectBlocksInstalledOrFree(CoarseDir, dir);
+    for (0..colliders.chunks.levelCount()) |level| {
+        for (0..colliders.chunks.slotCount(@intCast(level))) |chunk| {
+            const block = colliders.chunks.slot(@intCast(level), chunk);
+            if (block != empty_block) try expectGroupsMatchAnchors(colliders.chunks.payload(block));
+        }
+    }
+}
+
+// Every block of `dir` is installed in exactly one slot or free, never both, and a free block
+// holds a reset descriptor: no bytes, no slot, no columns.
+fn expectBlocksInstalledOrFree(comptime Dir: type, dir: *const Dir) !void {
+    var seen = try std.DynamicBitSet.initEmpty(std.testing.allocator, dir.blocks.items.len);
     defer seen.deinit();
+    for (0..dir.levelCount()) |level| {
+        for (0..dir.slotCount(@intCast(level))) |index| {
+            const block = dir.slot(@intCast(level), index);
+            if (block == empty_block) continue;
+            try std.testing.expect(block < dir.blocks.items.len and !seen.isSet(block));
+            seen.set(block);
+        }
+    }
+    for (dir.block_free.items) |block| {
+        try std.testing.expect(block < dir.blocks.items.len and !seen.isSet(block));
+        seen.set(block);
+        try std.testing.expectEqualDeep(Dir.Block{}, dir.blocks.items[block]);
+    }
+    try std.testing.expectEqual(dir.blocks.items.len, seen.count());
+}
+
+// Each slab class's ids below its next id are each held by exactly one live chunk or
+// coarse block, or free, never both; a live block holds no bytes of its directory.
+fn expectPayloadSlotsOwned(colliders: *const StaticColliderSystem) !void {
+    var owned: [max_payload_classes]std.DynamicBitSet = undefined;
+    for (&owned, &colliders.payloads.classes) |*ids, held| ids.* = try std.DynamicBitSet.initEmpty(std.testing.allocator, held.claims.next_id);
+    defer for (&owned) |*ids| ids.deinit();
     for (0..colliders.chunks.levelCount()) |level| {
         for (0..colliders.chunks.slotCount(@intCast(level))) |chunk| {
             const block = colliders.chunks.slot(@intCast(level), chunk);
             if (block == empty_block) continue;
-            try std.testing.expect(block < colliders.chunks.blocks.items.len and !seen.isSet(block));
-            seen.set(block);
-            try expectGroupsMatchAnchors(colliders.chunks.payload(block));
+            try std.testing.expectEqual(@as(usize, 0), colliders.chunks.blockBytes(block).len);
+            try ownSlot(&owned, colliders.chunks.payloadConst(block).slot);
         }
     }
-    for (colliders.chunks.block_free.items) |block| {
-        try std.testing.expect(block < colliders.chunks.blocks.items.len and !seen.isSet(block));
-        seen.set(block);
-        try std.testing.expectEqual(@as(usize, 0), colliders.chunks.blockBytes(block).len);
+    for (&colliders.coarse) |*dir| {
+        for (0..dir.levelCount()) |level| {
+            for (0..dir.slotCount(@intCast(level))) |cell| {
+                const block = dir.slot(@intCast(level), cell);
+                if (block == empty_block) continue;
+                try std.testing.expectEqual(@as(usize, 0), dir.blockBytes(block).len);
+                try ownSlot(&owned, dir.payloadConst(block).slot);
+            }
+        }
     }
-    try std.testing.expectEqual(colliders.chunks.blocks.items.len, seen.count());
+    for (&owned, &colliders.payloads.classes, 0..) |*ids, held, class| {
+        for (held.claims.free.items) |id| try ownSlot(&owned, .{ .class = @intCast(class), .id = id });
+        try std.testing.expectEqual(@as(usize, held.claims.next_id), ids.count());
+    }
+}
+
+fn ownSlot(owned: *[max_payload_classes]std.DynamicBitSet, slot: PayloadSlot) !void {
+    try std.testing.expect(!slot.isNone());
+    const ids = &owned[slot.class];
+    try std.testing.expect(slot.id < ids.capacity() and !ids.isSet(slot.id));
+    ids.set(slot.id);
 }
 
 // Whether `a` and `b` hold the same anchor words per chunk over `levels` (block ids may differ).
@@ -2780,7 +2981,7 @@ fn expectSyncOutOfMemorySafe(thread_system: *ThreadSystem) !void {
         fixture.colliders.allocator = std.testing.allocator;
         if (result) |_| {
             try std.testing.expect(!failing.has_induced_failure);
-            if (thread_system.workerThreadCount() != 0) try std.testing.expect(!fixture.colliders.last_splice_batch.ran_inline);
+            if (thread_system.workerThreadCount() != 0) try std.testing.expect(!fixture.colliders.last_batches.get(.rewrite).ran_inline);
             // The swept sync grew the block pool.
             try std.testing.expect(fixture.colliders.chunks.blocks.items.len > blocks_before);
             var after = try fixture.rebuilt();
@@ -2821,9 +3022,9 @@ test "sync after reserve allocates nothing (FailingAllocator)" {
     try std.testing.expect(fixture.colliders.chunks.slot(0, kept_chunk) != empty_block);
 
     // The seam's reserve runs with the real allocator before the commit, as the pipeline
-    // does. Fresh payloads allocate inside the sync's reserve; the fill after that
-    // allocates nothing while claiming blocks for the new chunks and releasing the
-    // destroyed static's.
+    // does. Payload slabs and block pools grow inside the sync's reserve; the fill and
+    // install after that allocate nothing while claiming slots and blocks for the new
+    // chunks and releasing the destroyed static's.
     var commands: [17]StructuralCommand = undefined;
     @memcpy(commands[0..16], &templates);
     commands[16] = .{ .destroy_entity = kept };
@@ -2840,8 +3041,7 @@ test "sync after reserve allocates nothing (FailingAllocator)" {
     fixture.colliders.capture(&fixture.frame);
     try fixture.colliders.reserveSync(&fixture.data);
     {
-        // Frees of the payloads the reserve just allocated still belong to the testing
-        // allocator. Any new allocation fails.
+        // Any new allocation fails.
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
         fixture.colliders.allocator = failing.allocator();
         defer fixture.colliders.allocator = std.testing.allocator;
@@ -2929,8 +3129,8 @@ test "a dense mixed collider sync lists every chunk in entity order, threaded eq
         var threaded_rebuilt = try serial.rebuiltOn(&threads, 8);
         defer threaded_rebuilt.deinit();
         try expectIdenticalLayout(&rebuilt, &threaded_rebuilt, 3);
-        try std.testing.expect(!threaded_rebuilt.last_splice_batch.ran_inline and threaded_rebuilt.last_splice_batch.range_count > 1);
-        const batch = threaded.colliders.last_splice_batch;
+        try std.testing.expect(!threaded_rebuilt.last_batches.get(.rewrite).ran_inline and threaded_rebuilt.last_batches.get(.rewrite).range_count > 1);
+        const batch = threaded.colliders.last_batches.get(.rewrite);
         if (!batch.ran_inline and batch.range_count > 1) threaded_ranges += 1;
     }
     try std.testing.expect(threaded_ranges != 0);
@@ -2963,8 +3163,8 @@ test "a splice worker cap of zero keeps the chunk splice inline on a multi-worke
         try commitForTestWith(&uncapped.frame, &uncapped.data, &uncapped.colliders, commands.items, &threads);
         try commitForTestWith(&capped.frame, &capped.data, &capped.colliders, commands.items, &threads);
         try expectIdenticalLayout(&uncapped.colliders, &capped.colliders, 3);
-        const capped_batch = capped.colliders.last_splice_batch;
-        const batch = uncapped.colliders.last_splice_batch;
+        const capped_batch = capped.colliders.last_batches.get(.rewrite);
+        const batch = uncapped.colliders.last_batches.get(.rewrite);
         try std.testing.expectEqual(batch.item_count, capped_batch.item_count);
         try std.testing.expect(capped_batch.ran_inline and capped_batch.active_worker_threads == 0);
         if (!batch.ran_inline and batch.worker_thread_ranges != 0) threaded_ranges += 1;
@@ -3012,7 +3212,7 @@ test "a move inside its footprint chunks rewrites those spans and no other chunk
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .set_movement_body = .{ .entity = entity, .body = .{ .position = position, .previous_position = position } } }});
     const change = fixture.colliders.changesThisStep()[0];
     try std.testing.expect(!std.meta.eql(change.old.?.cells, change.new.?.cells));
-    try std.testing.expect(fixture.colliders.last_splice_batch.item_count > 0);
+    try std.testing.expect(fixture.colliders.last_batches.get(.rewrite).item_count > 0);
     try std.testing.expectEqual(live_before, listEntryCount(&fixture.colliders));
     try std.testing.expect(chunkPayloadOf(&fixture.colliders, 0, 15 * 16 + 15) == null);
     try std.testing.expectEqual(change.new.?, placementOfIndex(&fixture.colliders, entity.index).?);
@@ -3035,6 +3235,41 @@ test "a destroy-heavy sync grows no rows" {
     try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(fixture.colliders));
     try std.testing.expectEqual(pooled, fixture.colliders.rows.len);
     try std.testing.expectEqual(capacity, fixture.colliders.rows.capacity);
+}
+
+test "a sync that empties every block dispatches one fill unit per emptied item" {
+    var fixture = try SeamFixture.init();
+    defer fixture.deinit();
+    var creates: [32]StructuralCommand = undefined;
+    for (&creates, 0..) |*command, at| command.* = .{ .create_entity = staticTemplate(.{ .x = @floatFromInt(at * 60), .y = 100 }, .{ .x = 8, .y = 8 }) };
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &creates);
+    // Each installed chunk and coarse block becomes one emptied item, holding at least one
+    // record, so the old count of its records plus one would exceed this.
+    try std.testing.expectEqual(@as(usize, 1), fixture.colliders.chunks.levelCount());
+    var installed: usize = 0;
+    for (0..fixture.colliders.chunks.slotCount(0)) |chunk| installed += @intFromBool(fixture.colliders.chunks.slot(0, chunk) != empty_block);
+    for (&fixture.colliders.coarse) |*dir| {
+        for (0..dir.slotCount(0)) |cell| installed += @intFromBool(dir.slot(0, cell) != empty_block);
+    }
+    try std.testing.expect(installed > 0);
+    var destroys: [32]StructuralCommand = undefined;
+    for (fixture.colliders.changesThisStep(), &destroys) |change, *command| command.* = .{ .destroy_entity = change.entity };
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &destroys);
+    try std.testing.expectEqual(installed, fixture.colliders.last_batches.get(.rewrite).item_count);
+    try expectAnchors(&fixture.colliders);
+}
+
+test "a block pool that grows before its free list's reserve fails counts as payload growth" {
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    // The pool's capacity is the first allocation, the free list's the second.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    colliders.allocator = failing.allocator();
+    defer colliders.allocator = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, colliders.reserveBlocks(&colliders.chunks, 4));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(colliders.chunks.blocks.capacity >= 4);
+    try std.testing.expect(colliders.payload_growth_logged);
 }
 
 test "a threaded sync after its reserves allocates nothing on a multi-worker ThreadSystem (FailingAllocator)" {
@@ -3078,7 +3313,7 @@ test "a threaded sync after its reserves allocates nothing on a multi-worker Thr
         defer fixture.colliders.allocator = std.testing.allocator;
         fixture.colliders.applySync(&threads);
         try std.testing.expect(!failing.has_induced_failure);
-        try std.testing.expect(!fixture.colliders.last_splice_batch.ran_inline and fixture.colliders.last_splice_batch.range_count > 1);
+        try std.testing.expect(!fixture.colliders.last_batches.get(.rewrite).ran_inline and fixture.colliders.last_batches.get(.rewrite).range_count > 1);
     }
     try std.testing.expectEqual(@as(usize, 48), static_colliders_test_support.liveRowCount(fixture.colliders));
     try std.testing.expect(fixture.colliders.chunks.blocks.items.len != 0);
@@ -3521,7 +3756,7 @@ test "a move across a tile inside its chunk rewrites that chunk's query bit" {
     try std.testing.expect(block != empty_block);
     const bits_before = fixture.colliders.chunks.payload(block).anchors;
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(entity, .{ .x = 72, .y = 40 })});
-    try std.testing.expect(fixture.colliders.last_splice_batch.item_count > 0);
+    try std.testing.expect(fixture.colliders.last_batches.get(.rewrite).item_count > 0);
     // The chunk keeps its block; the anchor bit moved one cell over.
     try std.testing.expectEqual(block, fixture.colliders.chunks.slot(0, 0));
     const bits_after = fixture.colliders.chunks.payload(block).anchors;
@@ -3533,7 +3768,7 @@ test "a move across a tile inside its chunk rewrites that chunk's query bit" {
     const cells_before = fixture.colliders.view().chunkRows(0, 0);
     const nav_before = cells_before.min_x[0];
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(entity, .{ .x = 73, .y = 41 })});
-    try std.testing.expect(fixture.colliders.last_splice_batch.item_count > 0);
+    try std.testing.expect(fixture.colliders.last_batches.get(.rewrite).item_count > 0);
     try std.testing.expectEqual(nav_before, fixture.colliders.view().chunkRows(0, 0).min_x[0]);
     var rebuilt_again = try fixture.rebuilt();
     defer rebuilt_again.deinit();
@@ -3678,6 +3913,58 @@ test "a chunk's anchor block is released when its last anchor leaves and reused 
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
 }
 
+test "a payload that outgrows its class moves to a larger slot and frees the old one for reuse" {
+    var fixture = try SeamFixture.init();
+    defer fixture.deinit();
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 40, .y = 40 }, .{ .x = 8, .y = 8 }) }});
+    const block = fixture.colliders.chunks.slot(0, 0);
+    const small = fixture.colliders.chunks.payloadConst(block).slot;
+    try std.testing.expect(!small.isNone());
+    // A second static in the chunk outgrows its one-record columns: the chunk keeps its
+    // block and takes a slot of a larger class.
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 72, .y = 40 }, .{ .x = 8, .y = 8 }) }});
+    try std.testing.expectEqual(block, fixture.colliders.chunks.slot(0, 0));
+    const grown = fixture.colliders.chunks.payloadConst(block).slot;
+    try std.testing.expect(grown.class > small.class);
+    try std.testing.expectEqual(@as(u32, 2), fixture.colliders.chunks.payloadConst(block).nav_len);
+    try std.testing.expectEqualSlices(u32, &.{small.id}, fixture.colliders.payloads.classes[small.class].claims.free.items);
+    // A static alone in a fresh chunk takes the freed slot.
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 296, .y = 40 }, .{ .x = 8, .y = 8 }) }});
+    const fresh = fixture.colliders.chunks.slot(0, 2);
+    try std.testing.expect(fresh != empty_block);
+    try std.testing.expectEqual(small, fixture.colliders.chunks.payloadConst(fresh).slot);
+    try std.testing.expectEqual(@as(usize, 0), fixture.colliders.payloads.classes[small.class].claims.free.items.len);
+    var rebuilt = try fixture.rebuilt();
+    defer rebuilt.deinit();
+    try expectSameRows(&fixture.colliders, &rebuilt, 1);
+}
+
+test "an emptied chunk returns its block and payload slot, and the next fresh chunk reuses them" {
+    var fixture = try SeamFixture.init();
+    defer fixture.deinit();
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{
+        .{ .create_entity = staticTemplate(.{ .x = 40, .y = 40 }, .{ .x = 8, .y = 8 }) },
+        .{ .create_entity = staticTemplate(.{ .x = 168, .y = 40 }, .{ .x = 8, .y = 8 }) },
+    });
+    const leaving = fixture.colliders.changesThisStep()[1].entity;
+    const block = fixture.colliders.chunks.slot(0, 1);
+    const slot = fixture.colliders.chunks.payloadConst(block).slot;
+    try std.testing.expect(block != empty_block and !slot.isNone());
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .destroy_entity = leaving }});
+    try std.testing.expectEqual(empty_block, fixture.colliders.chunks.slot(0, 1));
+    try std.testing.expectEqualSlices(u32, &.{block}, fixture.colliders.chunks.block_free.items);
+    try std.testing.expect(fixture.colliders.chunks.payloadConst(block).slot.isNone());
+    try std.testing.expectEqualSlices(u32, &.{slot.id}, fixture.colliders.payloads.classes[slot.class].claims.free.items);
+    try expectAnchors(&fixture.colliders);
+    try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .create_entity = staticTemplate(.{ .x = 296, .y = 40 }, .{ .x = 8, .y = 8 }) }});
+    try std.testing.expectEqual(block, fixture.colliders.chunks.slot(0, 2));
+    try std.testing.expectEqual(slot, fixture.colliders.chunks.payloadConst(block).slot);
+    try std.testing.expectEqual(@as(usize, 0), fixture.colliders.chunks.block_free.items.len);
+    var rebuilt = try fixture.rebuilt();
+    defer rebuilt.deinit();
+    try expectSameRows(&fixture.colliders, &rebuilt, 1);
+}
+
 test "queryBox skips a covered chunk without anchors" {
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
@@ -3732,7 +4019,7 @@ test "a static whose clamped min corner sits in a level's last partial chunk is 
     }
 }
 
-test "a block reserve fails as OutOfMemory at 2^32 - 1 blocks before asking the allocator, and one block short of it reaches the allocator" {
+test "a block claim reserve fails as OutOfMemory at 2^32 - 1 blocks before asking the allocator, and one block short of it reaches the allocator" {
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
@@ -3748,7 +4035,7 @@ test "a block reserve fails as OutOfMemory at 2^32 - 1 blocks before asking the 
     for ([_]usize{ empty_block - 1, empty_block - 2 }) |held| {
         colliders.chunks.blocks.items = (&spare).ptr[0..held];
         colliders.chunks.blocks.capacity = empty_block - 1;
-        try std.testing.expectError(error.OutOfMemory, colliders.chunks.ensureFree(colliders.allocator, 1));
+        try std.testing.expectError(error.OutOfMemory, colliders.chunks.reserveClaims(colliders.allocator, 1));
         try std.testing.expectEqual(held, colliders.chunks.blocks.items.len);
         try std.testing.expectEqual(@as(usize, 0), colliders.chunks.block_free.items.len);
         // At the limit nothing is asked of the allocator; one short, the free list's growth is.
@@ -3866,7 +4153,7 @@ test "a chunk rewrite matches across range sizes and worker counts" {
         threaded.colliders.splice_controls = .{ .adaptive = false, .items_per_range = items_per_range };
         try commitForTestWith(&threaded.frame, &threaded.data, &threaded.colliders, commands.items, &threads);
         try expectIdenticalLayout(&baseline.colliders, &threaded.colliders, 1);
-        if (items_per_range < 64) try std.testing.expect(!threaded.colliders.last_splice_batch.ran_inline);
+        if (items_per_range < 64) try std.testing.expect(!threaded.colliders.last_batches.get(.rewrite).ran_inline);
     }
 }
 
@@ -3887,7 +4174,7 @@ fn expectWarmMoveInsideChunkAllocatesNothing(thread_system: *ThreadSystem) !void
     for (positions) |position| try commitForTestWith(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(moved, position)}, thread_system);
     const block = fixture.colliders.chunks.slot(0, 0);
     try std.testing.expect(block != empty_block);
-    const bytes = fixture.colliders.chunks.blockBytes(block);
+    const columns = fixture.colliders.chunks.payloadConst(block).nav_entity.ptr;
 
     try commitAndCapture(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(moved, positions[0])});
     {
@@ -3897,10 +4184,10 @@ fn expectWarmMoveInsideChunkAllocatesNothing(thread_system: *ThreadSystem) !void
         try fixture.colliders.sync(&fixture.data, thread_system);
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     }
-    if (thread_system.workerThreadCount() != 0) try std.testing.expect(!fixture.colliders.last_splice_batch.ran_inline);
+    if (thread_system.workerThreadCount() != 0) try std.testing.expect(!fixture.colliders.last_batches.get(.rewrite).ran_inline);
     try std.testing.expectEqual(@as(usize, 1), fixture.colliders.changesThisStep().len);
     try std.testing.expectEqual(block, fixture.colliders.chunks.slot(0, 0));
-    try std.testing.expectEqual(bytes.ptr, fixture.colliders.chunks.blockBytes(block).ptr);
+    try std.testing.expectEqual(columns, fixture.colliders.chunks.payloadConst(block).nav_entity.ptr);
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
@@ -3924,7 +4211,8 @@ test "a sync that shrinks, regrows, and reorders a chunk in place matches a rebu
     var statics: [12]EntityId = undefined;
     for (fixture.colliders.changesThisStep(), &statics) |change, *entity| entity.* = change.entity;
     const block = fixture.colliders.chunks.slot(0, 0);
-    const bytes = fixture.colliders.chunks.blockBytes(block);
+    const slot = fixture.colliders.chunks.payloadConst(block).slot;
+    const columns = fixture.colliders.chunks.payloadConst(block).nav_entity.ptr;
     // Destroy the first and last, move the second to the last cell, and create two: drops
     // at both ends, a relinked record, and new records merged among the kept.
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{
@@ -3934,7 +4222,8 @@ test "a sync that shrinks, regrows, and reorders a chunk in place matches a rebu
         .{ .create_entity = staticTemplate(.{ .x = 68, .y = 100 }, .{ .x = 8, .y = 8 }) },
         .{ .create_entity = staticTemplate(.{ .x = 36, .y = 100 }, .{ .x = 8, .y = 8 }) },
     });
-    try std.testing.expectEqual(bytes.ptr, fixture.colliders.chunks.blockBytes(block).ptr);
+    try std.testing.expectEqual(slot, fixture.colliders.chunks.payloadConst(block).slot);
+    try std.testing.expectEqual(columns, fixture.colliders.chunks.payloadConst(block).nav_entity.ptr);
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
@@ -3943,7 +4232,8 @@ test "a sync that shrinks, regrows, and reorders a chunk in place matches a rebu
     for (statics[2..11], destroys[0..9]) |entity, *command| command.* = .{ .destroy_entity = entity };
     destroys[9] = moveCommand(statics[1], .{ .x = 4, .y = 4 });
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &destroys);
-    try std.testing.expectEqual(bytes.ptr, fixture.colliders.chunks.blockBytes(block).ptr);
+    try std.testing.expectEqual(slot, fixture.colliders.chunks.payloadConst(block).slot);
+    try std.testing.expectEqual(columns, fixture.colliders.chunks.payloadConst(block).nav_entity.ptr);
     var shrunk = try fixture.rebuilt();
     defer shrunk.deinit();
     try expectSameRows(&fixture.colliders, &shrunk, 1);
@@ -3961,15 +4251,16 @@ test "a chunk at exactly its capacity takes an in-chunk move in place" {
     try std.testing.expectEqual(@as(u32, 16), payload.nav_len);
     try std.testing.expectEqual(payload.nav_cap, payload.nav_len);
     try std.testing.expectEqual(payload.query_cap, payload.query_len);
-    const bytes = fixture.colliders.chunks.blockBytes(block);
+    const slot = payload.slot;
     // A move inside its own cell relinks it: one record leaves and one enters, so the
     // full columns hold the result.
     const moved = fixture.colliders.changesThisStep()[5].entity;
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(moved, .{ .x = 52, .y = 52 })});
     try std.testing.expectEqual(@as(usize, 1), fixture.colliders.changesThisStep().len);
     try std.testing.expectEqual(block, fixture.colliders.chunks.slot(0, 0));
-    try std.testing.expectEqual(bytes.ptr, fixture.colliders.chunks.blockBytes(block).ptr);
-    try std.testing.expectEqual(@as(u32, 16), fixture.colliders.chunks.payload(block).nav_cap);
+    try std.testing.expectEqual(slot, fixture.colliders.chunks.payloadConst(block).slot);
+    try std.testing.expectEqual(payload.nav_entity.ptr, fixture.colliders.chunks.payloadConst(block).nav_entity.ptr);
+    try std.testing.expectEqual(@as(u32, 16), fixture.colliders.chunks.payloadConst(block).nav_cap);
     var rebuilt = try fixture.rebuilt();
     defer rebuilt.deinit();
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
@@ -4003,7 +4294,7 @@ fn expectRebuildOutOfMemorySafe(thread_system: *ThreadSystem) !void {
         colliders.allocator = std.testing.allocator;
         if (result) |_| {
             try std.testing.expect(!failing.has_induced_failure);
-            if (thread_system.workerThreadCount() != 0) try std.testing.expect(!colliders.last_splice_batch.ran_inline);
+            if (thread_system.workerThreadCount() != 0) try std.testing.expect(!colliders.last_batches.get(.rewrite).ran_inline);
             try expectSameRows(&colliders, &expected, 1);
             break;
         } else |err| {
@@ -4036,7 +4327,7 @@ test "rebuild runs out of memory at every allocation and leaves the structure un
         const result = colliders.rebuild(&fixture.data, test_geometry, null);
         colliders.allocator = std.testing.allocator;
         if (result) |_| {
-            try std.testing.expect(colliders.last_splice_batch.ran_inline);
+            try std.testing.expect(colliders.last_batches.get(.rewrite).ran_inline);
             try expectSameRows(&colliders, &fixture.colliders, 1);
             break;
         } else |err| {
@@ -4061,7 +4352,7 @@ test "a rebuild on a fresh system fills at the fixed shape on workers and leaves
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
     try colliders.rebuild(&fixture.data, test_geometry, &threads);
-    const batch = colliders.last_splice_batch;
+    const batch = colliders.last_batches.get(.rewrite);
     // Three participants, four ranges each.
     const expected_range = std.mem.alignForward(usize, @divCeil(batch.item_count, 3 * fixed_fill_ranges_per_participant), splice_range_alignment_items);
     try std.testing.expect(!batch.ran_inline and batch.worker_thread_ranges != 0);
@@ -4075,8 +4366,8 @@ test "a rebuild on a fresh system fills at the fixed shape on workers and leaves
     var small = StaticColliderSystem.init(std.testing.allocator);
     defer small.deinit();
     try small.rebuild(&fixture.data, test_geometry, &coarse_threads);
-    try std.testing.expect(small.last_splice_batch.active_worker_threads == 0);
-    try std.testing.expectEqual(@as(usize, 1), small.last_splice_batch.range_count);
+    try std.testing.expect(small.last_batches.get(.rewrite).active_worker_threads == 0);
+    try std.testing.expectEqual(@as(usize, 1), small.last_batches.get(.rewrite).range_count);
     try expectSameRows(&small, &fixture.colliders, 1);
 }
 

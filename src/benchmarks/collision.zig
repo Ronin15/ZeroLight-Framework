@@ -739,7 +739,7 @@ fn measureRebuild(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
         try colliders.rebuild(data, geometry, &threads);
         const end_ns = suite.nowNs(io);
         if (static_colliders_test_support.liveRowCount(colliders) != static_count) return error.WrongStaticCount;
-        const batch = colliders.last_splice_batch;
+        const batch = colliders.last_batches.get(.rewrite);
         // One fill unit per span, query record, and item: at least two per static.
         if (batch.item_count < 2 * static_count) return error.RebuildFillMissedStatics;
         try suite.checkStageDispatched(case, &threads, stage_range, batch);
@@ -901,7 +901,7 @@ const DenseChangeFixture = struct {
         if (commit.structural.components_set != self.moves.len) return error.DenseChangeNotApplied;
         try self.checkChanges();
         for (self.moves) |*move| move.advance();
-        return .{ .ns = suite.elapsedNs(clock.captured_ns, clock.synced_ns), .batch = self.colliders.last_splice_batch };
+        return .{ .ns = suite.elapsedNs(clock.captured_ns, clock.synced_ns), .batch = self.colliders.last_batches.get(.rewrite) };
     }
 
     // One change per moved static, each leaving its chunk for another in the region, and
@@ -1032,7 +1032,7 @@ const StaticMover = struct {
     }
 
     fn spliceOffMainNs(self: *const StaticMover) u64 {
-        return offMainNs(self.colliders.last_splice_batch);
+        return offMainNs(self.colliders.last_batches.get(.rewrite));
     }
 
     // The colliders' row-pool and payload growths so far.
@@ -1119,7 +1119,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
             offMainNs(perf.static_sort_batch) + offMainNs(perf.trigger_allow_batch);
         main_total += elapsed_ns -| off_main_ns -| mover_off_main_ns;
         static_stages.add(.{ perf.static_pairs_batch, perf.static_rect_batch, perf.static_sort_batch, perf.trigger_allow_batch });
-        if (inputs.mover) |static_mover| splice_stages.add(.{static_mover.colliders.last_splice_batch});
+        if (inputs.mover) |static_mover| splice_stages.add(.{static_mover.colliders.last_batches.get(.rewrite)});
     }
 
     if (system.perf.entry_bound_overflows != warm_overflows[0] or system.perf.pair_bound_overflows != warm_overflows[1]) return error.CollisionWarmStepOverflowed;

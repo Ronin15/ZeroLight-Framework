@@ -603,7 +603,7 @@ const StaticDenseFixture = struct {
         };
         if (recreated_at != self.recreated.items.len) return error.StaticRecreatesMissing;
         self.shifted = !self.shifted;
-        const splice = self.colliders.last_splice_batch;
+        const splice = self.colliders.last_batches.get(.rewrite);
         const splice_off_main_ns = offMainNs(splice);
         return .{
             .ns = suite.elapsedNs(start_ns, end_ns),
@@ -774,7 +774,7 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
-    stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_splice_batch);
+    stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders.last_batches.get(.rewrite));
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         // Plan: the commit; write: the collider sync and record; nav: the reaction.

@@ -1170,7 +1170,7 @@ pub const SimulationPipeline = struct {
     /// after the commit seam it is this step's, empty (and not recorded) when no static
     /// changed.
     pub fn recordStaticColliderSyncTo(self: *const SimulationPipeline, perf: runtime_perf_log.Context) void {
-        perf.recordBatch(.static_collider_splice, self.static_colliders.last_splice_batch);
+        perf.recordBatch(.static_collider_splice, self.static_colliders.last_batches.get(.rewrite));
     }
 
     /// Orchestrates the post-commit nav reaction by delegating to the nav-owning
@@ -7428,7 +7428,7 @@ test "a static move splices its collider's chunk lists, and a seam with no stati
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
     try pipeline.syncStaticColliders(&data, &serial_threads);
-    try std.testing.expect(pipeline.static_colliders.last_splice_batch.item_count > 0);
+    try std.testing.expect(pipeline.static_colliders.last_batches.get(.rewrite).item_count > 0);
 
     // A seam with no static change resets the batch.
     frame.beginStep();
@@ -7436,7 +7436,7 @@ test "a static move splices its collider's chunk lists, and a seam with no stati
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
     try pipeline.syncStaticColliders(&data, &serial_threads);
-    try std.testing.expectEqual(@as(usize, 0), pipeline.static_colliders.last_splice_batch.item_count);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.static_colliders.last_batches.get(.rewrite).item_count);
 }
 
 test "a structural burst over its own event share fails the same whether other producers are idle or saturated" {
