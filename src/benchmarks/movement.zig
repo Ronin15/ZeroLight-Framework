@@ -29,7 +29,7 @@ pub const group = suite.BenchmarkGroup{
     .write_workload = writeMovementWorkload,
 };
 
-pub fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
+fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
@@ -56,7 +56,7 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
     return data;
 }
 
-pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     var data = try createFixture(allocator, item_count);

@@ -482,8 +482,12 @@ Group index (files under `src/benchmarks/`):
   bodies and applying AI intents.
 - `collision.zig`: `collision`, `collision-sparse`, `collision-tall`,
   `collision-stacked`, `collision-thin`, `collision-static-heavy-sap`,
-  `collision-static-heavy`, `collision-static-index-change`; the broadphase and
-  its worst-case shapes.
+  `collision-static-heavy`, `collision-static-index-change`,
+  `collision-static-rebuild`, `-rebuild-sparse`, `-dense-change`,
+  `-dense-spike`, `-triggers`; the broadphase and its worst-case shapes, the
+  static colliders' rebuild (the tuned case cold per rebuild: fresh tuners each
+  time, as at world create) and sync (the spike: one dense sync after tuners
+  settle on single-static syncs), and trigger contacts.
 - `collision_response.zig`: `collision-response-stage`; the response step.
 - `plane_traversal.zig`: `plane-traversal`, `-falls`, `-dense-falls`,
   `-dense-falls-banded`.

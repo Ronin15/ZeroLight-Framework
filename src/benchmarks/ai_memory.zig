@@ -93,7 +93,7 @@ fn perceivedEventCount(count: usize) usize {
     return @divCeil(count, ai_memory_event_stride);
 }
 
-pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
+fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
@@ -126,7 +126,7 @@ pub fn runShuffledCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     return runCaseImpl(allocator, io, options, case, item_count, .{ .think_set = think_set, .event_rows = null, .touched_words = @divCeil(item_count, word_bits) });
 }
 
-pub fn runSparseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runSparseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     const word_count = item_count / word_bits;
     if (word_count < sparse_touched_words) return error.SparseThinkSetExceedsMemoryRows;
     // Think rows are memory rows: the fixture adds every store's row in one order.

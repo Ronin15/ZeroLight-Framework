@@ -27,7 +27,7 @@ pub const group = suite.BenchmarkGroup{
     .write_workload = writeParticleWorkload,
 };
 
-pub fn createFixture(allocator: std.mem.Allocator, count: usize) !ParticleSystem {
+fn createFixture(allocator: std.mem.Allocator, count: usize) !ParticleSystem {
     var particles = try ParticleSystem.init(allocator, .{ .capacity = count });
     errdefer particles.deinit();
 
@@ -59,7 +59,7 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !ParticleSystem
     return particles;
 }
 
-pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     var particles = try createFixture(allocator, item_count);

@@ -89,7 +89,7 @@ const Fixture = struct {
     }
 };
 
-pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
+fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     return createFixtureInOrder(allocator, count, null);
 }
 

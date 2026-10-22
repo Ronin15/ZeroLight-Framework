@@ -57,6 +57,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     collision.static_rebuild_group,
     collision.static_rebuild_sparse_group,
     collision.static_dense_change_group,
+    collision.static_dense_spike_group,
     collision.static_triggers_group,
     collision_response.stage_group,
     pathfinding_requests.group,

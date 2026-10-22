@@ -38,9 +38,10 @@
 //! the warm syncs grow no collider rows or payloads (each rewrites its two chunks in place).
 //! - `collision-static-rebuild`: the clustered fixture's statics rebuilt whole each step
 //!   (`StaticColliderSystem.rebuild`, every stage on the case's thread system), each timed
-//!   rebuild into a fresh system carrying the rebuild tuners from the one before, as a live
-//!   system's rebuild carries them; the tuned case settles them first. Pass shape: time and
-//!   main per static flat in statics. Asserts: the row count; each stage's work (`select`
+//!   rebuild into a fresh system with fresh rebuild tuners, as a world create's one-off
+//!   rebuild runs (nothing settles; the warmup rebuilds warm caches only). Pass shape: time
+//!   and main per static flat in statics, and every stage with more than one aligned block
+//!   on workers in the tuned case. Asserts: the row count; each stage's work (`select`
 //!   every entity slot, `plan` and `touch` every static, `group` one touch per static, a fill
 //!   of at least two units per static, and `install` one item per occupied chunk); each
 //!   stage dispatched in the fixed-partition cases; and in the adaptive threaded cases each
@@ -70,8 +71,19 @@
 //!   region's chunks; each stage's work (`plan`, `touch`, and `apply` every change, `group`
 //!   a removal and an insert touch per change, `install` one item per region chunk); each
 //!   stage dispatched in the fixed-partition cases, and in the adaptive threaded cases each
-//!   stage's selection through its own sync tuner; and no row or payload growth after the
-//!   first measured sync.
+//!   stage's selection through its own sync tuner; and no row or payload growth in any
+//!   measured sync (warmup runs both directions).
+//! - `collision-static-dense-spike`: the dense-change fixture, serial and tuned cases only.
+//!   One untimed dense round trip grows the region chunks first; then fresh sync tuners
+//!   settle on single-static syncs (one static outside the region moved through the commit
+//!   seam, a quiet world's in-band load); each measured step runs one in-band single-static
+//!   sync, untimed, then, with the tuners still settled, times one dense sync of the change
+//!   count, an explosion after a quiet spell. Pass shape: main per changed static flat in
+//!   the change count, and every stage with more than one aligned block on workers in the
+//!   tuned case.
+//!   Asserts are fixture invariants only: each single sync commits and syncs its one change,
+//!   and leaves the tuned case's tuners settled; each dense sync's work as `collision-static-dense-change`, each stage's selection
+//!   through its own sync tuner, and no row or payload growth in any measured sync.
 //!
 //! `collision-static-triggers` holds the item count of stored trigger pairs: two overlapping
 //! one-tile triggers per pitch cell, 512 dynamics on the first cells (half on a trigger), and
@@ -103,7 +115,7 @@
 //! prints `per_change=`, and with `--details` the rewrite stage (its tuner in the tuned case),
 //! the main share per changed static (main is elapsed less every stage's worker time), and
 //! under each row every stage's shape and mean batch time and the timed syncs' `row_grows=`
-//! and `payload_grows=` counts.
+//! and `payload_grows=` counts; `collision-static-dense-spike` prints the same.
 
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
@@ -221,6 +233,15 @@ pub const static_dense_change_group = suite.BenchmarkGroup{
     .item_counts = &dense_change_counts,
     .runCase = runStaticDenseChangeCase,
     .write_workload = writeDenseChangeWorkload,
+};
+
+pub const static_dense_spike_group = suite.BenchmarkGroup{
+    .name = "collision-static-dense-spike",
+    .item_label = "statics changed in the spike",
+    .item_counts = &dense_change_counts,
+    .runCase = runStaticDenseSpikeCase,
+    .write_workload = writeDenseChangeWorkload,
+    .cases = &suite.serial_and_tuned_cases,
 };
 
 pub const static_triggers_group = suite.BenchmarkGroup{
@@ -346,7 +367,7 @@ fn createGridFixture(allocator: std.mem.Allocator, shape: GridShape) !DataSystem
     return data;
 }
 
-pub fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
+fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
     return createFixtureWithMode(allocator, count, .dense);
 }
 
@@ -360,11 +381,11 @@ fn createFixtureWithMode(allocator: std.mem.Allocator, count: usize, mode: Fixtu
     return data;
 }
 
-pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runCaseWithMode(allocator, io, options, case, item_count, .dense);
 }
 
-pub fn runSparseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+fn runSparseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     return runCaseWithMode(allocator, io, options, case, item_count, .sparse);
 }
 
@@ -687,9 +708,8 @@ fn runStaticTriggersCase(allocator: std.mem.Allocator, io: std.Io, options: suit
 
 // ----------------------------------------------------------------------------
 // Static rebuild: the whole collider structure built from the static-heavy fixture
-// (`SimulationPipeline.init`, `NavReaction`): each timed rebuild fills a fresh system that
-// carries the rebuild tuners from the rebuild before, as a live system's rebuild does, and
-// its teardown runs outside the window.
+// (`SimulationPipeline.init`): each timed rebuild fills a fresh system with fresh rebuild
+// tuners, as a world create's rebuild does, and its teardown runs outside the window.
 // ----------------------------------------------------------------------------
 
 fn runStaticRebuildCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, static_count: usize) !suite.RunStats {
@@ -732,37 +752,35 @@ fn runStaticRebuildSparseCase(allocator: std.mem.Allocator, io: std.Io, options:
 const rebuild_stages = [_]RebuildStage{ .select, .plan, .touch, .group, .rewrite, .install };
 
 // Times `rebuild` of `data`'s `static_count` one-tile statics on `geometry`, occupying
-// `chunk_count` chunks, each timed rebuild into a fresh system carrying the rebuild tuners.
+// `chunk_count` chunks, each timed rebuild into a fresh system with fresh rebuild tuners.
 fn measureRebuild(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *const DataSystem, geometry: ColliderGeometry, static_count: usize, chunk_count: usize) !suite.RunStats {
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
 
-    // The rebuild tuners train across rebuilds, so the tuned case settles them first; the
-    // warmup rebuilds warm the caches and the allocator too.
-    var tuners = rebuildTunersFor(allocator, case);
-    var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(rebuildTunersSettled(&tuners))) {
+    // Every rebuild is a world create's one-off on untrained tuners, so nothing settles;
+    // the warmup rebuilds warm the caches and the allocator only.
+    var warm = suite.Warmup.custom(case, options.warmup_iterations, 0);
+    while (warm.next(true)) {
         var colliders = freshRebuildSystem(allocator, case);
         defer colliders.deinit();
-        colliders.rebuild_tuners = tuners;
         try colliders.rebuild(data, geometry, &threads);
-        tuners = colliders.rebuild_tuners;
     }
-    const settled = case.adaptive and rebuildTunersSettled(&tuners);
 
     var accumulator = suite.StatsAccumulator.init(static_count);
     var main_total: u128 = 0;
     var stage_shapes = suite.StageShapes(rebuild_stages.len){};
     var stage_ns: [rebuild_stages.len]u128 = @splat(0);
     const stage_range = case.stageItemsPerRange(splice_range_alignment_items);
+    // The last timed rebuild's rewrite tuner, for the tuned case's tuning summary.
+    var rewrite_tuner: ?AdaptiveWorkTuner = null;
     for (0..options.iterations) |_| {
         var colliders = freshRebuildSystem(allocator, case);
         defer colliders.deinit();
-        colliders.rebuild_tuners = tuners;
         const start_ns = suite.nowNs(io);
         try colliders.rebuild(data, geometry, &threads);
         const end_ns = suite.nowNs(io);
-        tuners = colliders.rebuild_tuners;
+        const tuners = &colliders.rebuild_tuners;
+        rewrite_tuner = tuners.get(.rewrite);
         if (static_colliders_test_support.liveRowCount(colliders) != static_count) return error.WrongStaticCount;
         var batches: [rebuild_stages.len]BatchStats = undefined;
         for (&batches, rebuild_stages) |*batch, stage| batch.* = colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
@@ -778,7 +796,9 @@ fn measureRebuild(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.sample_count = static_count;
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(tuners.getPtrConst(.rewrite)), settled);
+    if (case.adaptive) {
+        if (rewrite_tuner) |*tuner| stats.work_tuning = suite.workTuningSummary(suite.tunerReport(tuner), false);
+    }
     printStageDetails(&stats, &rebuild_stages, &stage_shapes, &stage_ns);
     return stats;
 }
@@ -813,21 +833,8 @@ fn checkTunerSelected(case: suite.BenchmarkCase, threads: *const ThreadSystem, t
     if (request.item_count != batch.item_count) return error.ColliderStageSkippedItsTuner;
 }
 
-// The case's starting rebuild tuners: untrained in the tuned case, as a new system's are.
-fn rebuildTunersFor(allocator: std.mem.Allocator, case: suite.BenchmarkCase) std.EnumArray(RebuildStage, AdaptiveWorkTuner) {
-    var colliders = freshRebuildSystem(allocator, case);
-    defer colliders.deinit();
-    return colliders.rebuild_tuners;
-}
-
-fn rebuildTunersSettled(tuners: *const std.EnumArray(RebuildStage, AdaptiveWorkTuner)) bool {
-    for (rebuild_stages) |stage| {
-        if (tuners.getPtrConst(stage).phase != .settled) return false;
-    }
-    return true;
-}
-
-// An empty collider system with the case's stage controls and tuners.
+// An empty collider system with the case's stage controls and fresh tuners, as a new
+// world's is.
 fn freshRebuildSystem(allocator: std.mem.Allocator, case: suite.BenchmarkCase) StaticColliderSystem {
     var colliders = StaticColliderSystem.init(allocator);
     fixtures.setSpliceTuners(&colliders, case);
@@ -875,6 +882,8 @@ const DenseChangeFixture = struct {
     colliders: StaticColliderSystem,
     // The changed statics, each moved between its home tile and its away tile every step.
     moves: []fixtures.StaticMove,
+    // The world's last static, outside the region, moved alone by `changeOneAndSync`.
+    single: fixtures.StaticMove,
     commands: []StructuralCommand,
     // Chunks a side of the changed region, from the world's first chunk.
     region_side: usize,
@@ -891,6 +900,8 @@ const DenseChangeFixture = struct {
         const region_side = std.math.sqrt(region_chunks);
         if (region_side * region_side != region_chunks) return error.DenseChangeRegionNotSquare;
         if (region_side % 2 != 0 or region_side > dense_change_chunks_side) return error.DenseChangeRegionNotPaired;
+        // The single move's last chunk and its partner stay outside the region.
+        if (region_side + 2 > dense_change_chunks_side) return error.DenseChangeRegionCoversSingle;
 
         var data = DataSystem.init(allocator);
         errdefer data.deinit();
@@ -901,14 +912,16 @@ const DenseChangeFixture = struct {
         var touched = try std.DynamicBitSetUnmanaged.initEmpty(allocator, dense_change_chunks_side * dense_change_chunks_side);
         errdefer touched.deinit(allocator);
         var moved: usize = 0;
+        var single: fixtures.StaticMove = undefined;
         for (0..dense_change_side) |cell_y| for (0..dense_change_side) |cell_x| {
             const home = pitchCellOrigin(cell_x, cell_y);
             const entity = try fixtures.addBody(&data, home, .{ .x = static_size, .y = static_size }, .static);
-            if (cell_x / dense_change_chunk_cells >= region_side or cell_y / dense_change_chunk_cells >= region_side) continue;
             const away = math.Vec2{
                 .x = home.x + awayOffset(cell_x),
                 .y = home.y + awayOffset(cell_y),
             };
+            if (cell_x == dense_change_side - 1 and cell_y == dense_change_side - 1) single = .{ .entity = entity, .positions = .{ home, away } };
+            if (cell_x / dense_change_chunk_cells >= region_side or cell_y / dense_change_chunk_cells >= region_side) continue;
             moves[moved] = .{ .entity = entity, .positions = .{ home, away } };
             moved += 1;
         };
@@ -927,6 +940,7 @@ const DenseChangeFixture = struct {
             .frame = frame,
             .colliders = colliders,
             .moves = moves,
+            .single = single,
             .commands = commands,
             .region_side = region_side,
             .touched = touched,
@@ -971,6 +985,18 @@ const DenseChangeFixture = struct {
             .batches = batches,
             .off_main_ns = static_colliders_test_support.lastOffMainNs(self.colliders),
         };
+    }
+
+    // The single static moved as one commit through the commit seam and synced: an
+    // in-band sync for tuners that learned on single-static syncs. Untimed.
+    fn changeOneAndSync(self: *DenseChangeFixture, thread_system: *ThreadSystem) !void {
+        self.frame.beginStep();
+        const commands = [1]StructuralCommand{self.single.command()};
+        const seam = fixtures.CommitSeam{ .colliders = &self.colliders, .structural_headroom = fixtures.StaticMove.structural_headroom };
+        const commit = try seam.commit(&self.frame, &self.data, &commands, thread_system);
+        if (commit.structural.components_set != 1) return error.DenseSpikeSingleNotApplied;
+        if (self.colliders.changesThisStep().len != 1) return error.DenseSpikeSingleNotSynced;
+        self.single.advance();
     }
 
     // The sync's pass-shape counts on this fixture: every moved static planned and applied,
@@ -1029,17 +1055,48 @@ fn syncTunersSettled(colliders: *const StaticColliderSystem) bool {
     return true;
 }
 
+// What the sync tuners settle on before each measured dense sync.
+const DenseLoad = enum {
+    // Dense syncs: the tuners learn the timed shape (`collision-static-dense-change`).
+    sustained,
+    // Single-static syncs, and one more before each timed dense sync
+    // (`collision-static-dense-spike`).
+    spike,
+};
+
 fn runStaticDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize) !suite.RunStats {
+    return measureDenseSyncs(allocator, io, options, case, change_count, .sustained);
+}
+
+fn runStaticDenseSpikeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize) !suite.RunStats {
+    return measureDenseSyncs(allocator, io, options, case, change_count, .spike);
+}
+
+fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize, load: DenseLoad) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var fixture = try DenseChangeFixture.init(allocator, change_count, case);
     defer fixture.deinit();
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
 
-    // Sync's tuners train in play, so the tuned case settles all six first.
-    var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(syncTunersSettled(&fixture.colliders))) _ = try fixture.changeAndSync(io, &threads);
+    // The first dense sync grows the region chunks' payloads. A spike's warmup has no dense
+    // sync, so one untimed dense round trip takes that growth out of the timed syncs, and
+    // fresh tuners then settle on single-static syncs only.
+    if (load == .spike) {
+        for (0..2) |_| _ = try fixture.changeAndSync(io, &threads);
+        fixtures.setSpliceTuners(&fixture.colliders, case);
+    }
+    // Sync's tuners train in play, so the tuned case settles all six first: on dense syncs,
+    // or for a spike on single-static syncs. At least two steps, so the dense statics (or
+    // the single one) have been at both their tiles.
+    var warm = suite.Warmup.init(options, case, 2);
+    while (warm.next(syncTunersSettled(&fixture.colliders))) switch (load) {
+        .sustained => _ = try fixture.changeAndSync(io, &threads),
+        .spike => try fixture.changeOneAndSync(&threads),
+    };
     const settled = case.adaptive and syncTunersSettled(&fixture.colliders);
+    // A spike is measured only from settled tuners.
+    if (load == .spike and case.adaptive and !settled) return error.DenseSpikeTunersNotSettled;
 
     var accumulator = suite.StatsAccumulator.init(change_count);
     var main_total: u128 = 0;
@@ -1047,21 +1104,25 @@ fn runStaticDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, options: s
     var stage_ns: [sync_stages.len]u128 = @splat(0);
     const stage_range = case.stageItemsPerRange(splice_range_alignment_items);
     const warm_grows = fixture.grows();
-    var first_grows = warm_grows;
-    for (0..options.iterations) |iteration| {
+    for (0..options.iterations) |_| {
+        if (load == .spike) {
+            try fixture.changeOneAndSync(&threads);
+            // Every timed spike runs on tuners settled at the single-static count.
+            if (case.adaptive and !syncTunersSettled(&fixture.colliders)) return error.DenseSpikeTunersNotSettled;
+        }
         const sync = try fixture.changeAndSync(io, &threads);
         try fixture.checkSyncWork(sync.batches);
         try suite.checkStagesDispatched(case, &threads, stage_range, &sync.batches);
         for (sync.batches, sync_stages) |batch, stage| try checkTunerSelected(case, &threads, fixture.colliders.tuners.getPtrConst(stage), batch);
-        if (iteration == 0) first_grows = fixture.grows();
         accumulator.record(sync.ns, sync.batches[comptime std.mem.indexOfScalar(SyncStage, &sync_stages, .rewrite).?]);
         main_total += sync.ns -| sync.off_main_ns;
         stage_shapes.add(sync.batches);
         for (&stage_ns, sync.batches) |*total, batch| total.* += batch.batch_duration_ns;
     }
     const grows = fixture.grows();
-    // Past the first measured sync each one rewrites its region in place.
-    if (!std.mem.eql(u64, &grows, &first_grows)) return error.DenseChangeWarmSyncGrewColliders;
+    // Both directions' dense syncs ran before timing, so each measured one rewrites its
+    // region in place.
+    if (!std.mem.eql(u64, &grows, &warm_grows)) return error.DenseChangeWarmSyncGrewColliders;
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.sample_count = change_count;
@@ -1280,14 +1341,14 @@ fn writeStaticStageDetails(details: *suite.DetailLines, stages: *const suite.Sta
 }
 
 /// Gives each of `system`'s stage tuners the case's own tuner (an adaptive case only).
-pub fn useCaseTuners(system: *CollisionSystem, case: suite.BenchmarkCase) void {
+fn useCaseTuners(system: *CollisionSystem, case: suite.BenchmarkCase) void {
     for ([_]*AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner, &system.static_pair_tuner, &system.static_rect_tuner, &system.static_sort_tuner, &system.trigger_allow_tuner }) |tuner| {
         tuner.* = suite.adaptiveTunerForCase(case, collision_range_alignment_items) orelse return;
     }
 }
 
 /// Every stage tuner of `system` settled.
-pub fn stageTunersSettled(system: *const CollisionSystem) bool {
+fn stageTunersSettled(system: *const CollisionSystem) bool {
     return (system.fill_tuner.phase == .settled) and (system.sort_tuner.phase == .settled) and
         (system.broadphase_tuner.phase == .settled) and (system.narrowphase_tuner.phase == .settled) and
         (system.static_pair_tuner.sample_count == 0 or system.static_pair_tuner.phase == .settled) and
