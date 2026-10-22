@@ -224,8 +224,9 @@ pub const BatchStage = enum {
     path_registry_flush,
     // Capacity resize: the pathfinding update's shrink copy, its byte moves.
     path_resize_copy,
-    // A static add, move, or destroy: the commit seam's collider chunk-list splice.
-    static_collider_splice,
+    // A static add, move, or destroy, one or many in a step: the commit seam's collider sync
+    // plan (the changed statics' reads, lanes, and decisions), the sync's largest stage.
+    static_collider_plan,
     // Dig, build, and dense terrain change: the nav reaction's chunk remask, its
     // connectivity flood (rounds summed, the removal-shaped share), its one-way closure rows
     // (round 0 and its rounds summed), and the path-cache eviction halo walk.
@@ -258,6 +259,13 @@ pub const BenchBatchStage = enum {
     // Stored-trigger allow pack, on a step that packs a stale column.
     collision_trigger_allow,
     particles,
+    // The commit seam's collider sync stages after its plan: row claims and touch emission,
+    // the grouped touches, the row writes, the chunk-list splice, and the directory install.
+    static_collider_touch,
+    static_collider_group,
+    static_collider_apply,
+    static_collider_rewrite,
+    static_collider_install,
 };
 
 pub const FrameSample = struct {

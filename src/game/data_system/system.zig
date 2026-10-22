@@ -415,6 +415,13 @@ pub const DataSystem = struct {
         };
     }
 
+    /// `staticObstacleAt` of `id`'s slot when `id` is live (its slot's generation); null for
+    /// a stale or invalid id. O(1); safe on workers while the stores are unchanged.
+    pub fn staticObstacle(self: *const DataSystem, id: EntityId, columns: types.StaticObstacleColumns) ?types.StaticObstacle {
+        _ = self.resolveSlotConst(id) orelse return null;
+        return self.staticObstacleAt(id.index, columns);
+    }
+
     pub fn clearRetainingCapacity(self: *DataSystem) void {
         // Reset invalidates all existing IDs while keeping allocated component
         // columns warm for the next state/session.
@@ -1665,7 +1672,7 @@ test "bodyLevelFaction matches movementBodyDenseIndex, worldLevelConst, and fact
     try std.testing.expect(data.bodyLevelFaction(EntityId.invalid) == null);
 }
 
-test "a static obstacle resolves only for a live slot with body, bounds, and a static response" {
+test "a static obstacle resolves only for a live slot with body, bounds, and a static response, by index and by id" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const bounds = CollisionBounds{ .offset = .{ .x = -2, .y = 3 }, .size = .{ .x = 5, .y = 7 } };
@@ -1707,13 +1714,16 @@ test "a static obstacle resolves only for a live slot with body, bounds, and a s
         const rect = math.aabbFromOffsetSize(.{ .x = found.x, .y = found.y }, .{ .x = found.offset_x, .y = found.offset_y }, .{ .x = found.size_x, .y = found.size_y });
         try std.testing.expectEqual(data.staticObstacleWorldRect(entity).?, rect);
         try std.testing.expect(data.isStaticNavigationObstacle(entity));
+        try std.testing.expectEqual(found, data.staticObstacle(entity, columns).?);
     }
     try std.testing.expectEqual(@as(u16, 0), data.staticObstacleAt(surface.index, columns).?.level);
     try std.testing.expectEqual(@as(u16, 4), data.staticObstacleAt(leveled.index, columns).?.level);
     for ([_]EntityId{ dynamic, boundless, bodiless, responseless, destroyed }) |entity| {
         try std.testing.expect(!data.isStaticNavigationObstacle(entity));
         try std.testing.expect(data.staticObstacleAt(entity.index, columns) == null);
+        try std.testing.expect(data.staticObstacle(entity, columns) == null);
     }
+    try std.testing.expect(data.staticObstacle(EntityId.invalid, columns) == null);
     // A reused slot resolves under its new id.
     const reused = try data.createEntity();
     try std.testing.expectEqual(destroyed.index, reused.index);
@@ -1722,6 +1732,9 @@ test "a static obstacle resolves only for a live slot with body, bounds, and a s
     try data.setCollisionResponse(reused, static_response);
     const refreshed = data.staticObstacleColumns();
     try std.testing.expect(data.staticObstacleAt(destroyed.index, refreshed).?.entity.eql(reused));
+    // The destroyed id stays stale on the reused slot.
+    try std.testing.expect(data.staticObstacle(destroyed, refreshed) == null);
+    try std.testing.expect(data.staticObstacle(reused, refreshed).?.entity.eql(reused));
 }
 
 test "movementVisualDenseIndices resolves both rows from one slot lookup" {

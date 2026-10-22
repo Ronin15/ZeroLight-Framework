@@ -618,6 +618,27 @@ fn storeUint4LanesScalar(values: []u32, lanes: [lane_count]u32, count: usize) vo
     for (0..@min(count, lane_count)) |lane| values[lane] = lanes[lane];
 }
 
+/// `storeUint4Lanes` narrowed to u16 values: one store of a full batch (`count >=
+/// lane_count`), else the masked tail's live lanes only. Every live lane is at most
+/// `maxInt(u16)` (a checked narrowing). Writes only `values[0..min(count, lane_count)]`.
+pub inline fn storeUint4LanesU16(values: []u16, vector: Uint4, count: usize) void {
+    const Narrow = @Vector(lane_count, u16);
+    if (count >= lane_count) {
+        std.debug.assert(values.len >= lane_count);
+        const narrowed: Narrow = @intCast(vector);
+        values[0..lane_count].* = narrowed;
+        return;
+    }
+    std.debug.assert(values.len >= count);
+    const stored = toUintArray(vector);
+    for (0..count) |lane| values[lane] = @intCast(stored[lane]);
+}
+
+/// Scalar form of `storeUint4LanesU16`.
+fn storeUint4LanesU16Scalar(values: []u16, lanes: [lane_count]u32, count: usize) void {
+    for (0..@min(count, lane_count)) |lane| values[lane] = @intCast(lanes[lane]);
+}
+
 /// Writes the lanes set in `lanes`. Distinctness is asserted only for those lanes,
 /// so an inactive index may alias a live one.
 pub fn scatterFloat4Masked(values: []f32, indices: [lane_count]usize, vector: Float4, lanes: MaskBits) void {
@@ -1465,5 +1486,29 @@ test "lane batch loads and stores match their scalar forms and touch only the li
         storeUint4LanesScalar(scalar_stored_words[0..], toUintArray(word_vector), count);
         try std.testing.expectEqual(scalar_stored_words, stored_words);
         for (stored_words, 0..) |stored, index| try std.testing.expectEqual(if (index < live) word_lanes[index] else 3, stored);
+    }
+}
+
+test "narrowing u16 lane store matches its scalar form, keeps the max value, and touches only the live lanes" {
+    const max = std.math.maxInt(u16);
+    const lane_sets = [_][lane_count]u32{
+        .{ 0, max, 1, 0x8000 },
+        .{ max, max, max, max },
+        .{ 32, 0, 0x7fff, 7 },
+    };
+    for (lane_sets) |lanes| {
+        const vector = loadUint4(&lanes);
+        for (0..lane_count + 3) |count| {
+            const live = @min(count, lane_count);
+            var stored = [_]u16{ 0xabcd, 0xabcd, 0xabcd, 0xabcd, 0xabcd, 0xabcd };
+            var scalar = stored;
+            storeUint4LanesU16(stored[0..], vector, count);
+            storeUint4LanesU16Scalar(scalar[0..], lanes, count);
+            try std.testing.expectEqual(scalar, stored);
+            for (stored, 0..) |value, index| {
+                const expected: u16 = if (index < live) @intCast(lanes[index]) else 0xabcd;
+                try std.testing.expectEqual(expected, value);
+            }
+        }
     }
 }

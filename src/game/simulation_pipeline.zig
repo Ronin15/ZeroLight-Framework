@@ -1166,11 +1166,17 @@ pub const SimulationPipeline = struct {
         try self.collision.refreshCommittedTriggers(data, view, thread_system);
     }
 
-    /// Records the last collider sync's chunk-list splice batch. Every sync resets it, so
-    /// after the commit seam it is this step's, empty (and not recorded) when no static
-    /// changed.
+    /// Records the last collider sync's stage batches: its plan, the sync's cost driver, to
+    /// the log, and every later stage to a bench's sink. Every sync resets them, so after the
+    /// commit seam they are this step's, empty (and not recorded) when no static changed.
     pub fn recordStaticColliderSyncTo(self: *const SimulationPipeline, perf: runtime_perf_log.Context) void {
-        perf.recordBatch(.static_collider_splice, self.static_colliders.last_batches.get(.rewrite));
+        const batches = &self.static_colliders.last_batches;
+        perf.recordBatch(.static_collider_plan, batches.get(.plan));
+        perf.recordBenchBatch(.static_collider_touch, batches.get(.touch));
+        perf.recordBenchBatch(.static_collider_group, batches.get(.group));
+        perf.recordBenchBatch(.static_collider_apply, batches.get(.apply));
+        perf.recordBenchBatch(.static_collider_rewrite, batches.get(.rewrite));
+        perf.recordBenchBatch(.static_collider_install, batches.get(.install));
     }
 
     /// Orchestrates the post-commit nav reaction by delegating to the nav-owning
@@ -7398,7 +7404,7 @@ test "a static committed at the seam pushes steering agents on the next step" {
     try std.testing.expect(try steeringStageLateralForTest(&pipeline, context, agent) > 0.05);
 }
 
-test "a static move splices its collider's chunk lists, and a seam with no static change splices none" {
+test "a static move plans and splices its collider's chunk lists, and a seam with no static change records neither" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
     var world = try minimalSyncWorld();
@@ -7428,14 +7434,16 @@ test "a static move splices its collider's chunk lists, and a seam with no stati
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
     try pipeline.syncStaticColliders(&data, &serial_threads);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.static_colliders.last_batches.get(.plan).item_count);
     try std.testing.expect(pipeline.static_colliders.last_batches.get(.rewrite).item_count > 0);
 
-    // A seam with no static change resets the batch.
+    // A seam with no static change resets the batches.
     frame.beginStep();
     try pipeline.reserveStaticColliders(&frame, &data);
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
     try pipeline.syncStaticColliders(&data, &serial_threads);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.static_colliders.last_batches.get(.plan).item_count);
     try std.testing.expectEqual(@as(usize, 0), pipeline.static_colliders.last_batches.get(.rewrite).item_count);
 }
 

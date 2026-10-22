@@ -20,3 +20,11 @@ pub fn lastOffMainNs(colliders: anytype) u64 {
     for (std.meta.tags(ColliderStage)) |stage| total += offMainNs(colliders.last_batches.get(stage));
     return total;
 }
+
+/// The `ColliderStage` a rebuild or sync stage (`RebuildStage`, `SyncStage`) records its
+/// `last_batches` entry under: the stage of the same name.
+pub fn colliderStage(stage: anytype) ColliderStage {
+    return switch (stage) {
+        inline else => |tag| @field(ColliderStage, @tagName(tag)),
+    };
+}

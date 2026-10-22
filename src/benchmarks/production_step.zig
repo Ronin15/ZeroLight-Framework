@@ -151,7 +151,10 @@ fn stageBatches(stage: Timing) StageBatches {
         .pipeline_collision => .{ .bench = &.{ .collision_fill, .collision_sort, .collision_broadphase, .collision_narrowphase, .collision_static_pairs, .collision_static_rect, .collision_trigger_allow } },
         .pipeline_chunk_derive => .{ .bench = &.{.chunk_derive} },
         .gameplay_particles => .{ .bench = &.{.particles} },
-        .gameplay_structural => .{ .logged = &.{ .static_collider_splice, .nav_remask, .nav_connect, .nav_closure, .nav_evict } },
+        .gameplay_structural => .{
+            .logged = &.{ .static_collider_plan, .nav_remask, .nav_connect, .nav_closure, .nav_evict },
+            .bench = &.{ .static_collider_touch, .static_collider_group, .static_collider_apply, .static_collider_rewrite, .static_collider_install },
+        },
         else => .{},
     };
 }

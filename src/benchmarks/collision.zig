@@ -60,14 +60,18 @@
 //!   column (row) back one chunk less one tile, so every destination is a free tile, no two
 //!   coincide, every region chunk gets its own count of inserts in both directions, and the
 //!   next step moves each back. One sample times the collider sync
-//!   (`StaticColliderSystem.sync`, capture to synced), its chunk rewrite on the case's thread
-//!   system under the rewrite tuner, which the tuned case settles first. Pass shape:
+//!   (`StaticColliderSystem.sync`, capture to synced), every stage on the case's thread
+//!   system under its own sync tuner; the tuned case settles all six first. Pass shape:
 //!   main per changed static flat in the change count, the chunks outside the region a
 //!   control: a term in the world's chunk count shows as a per-change intercept falling with
 //!   the change count. A move is a remove and an insert across chunks, a superset of an
-//!   explosion's per-change destroys. Asserts check fixture invariants only: every move
-//!   commits, and the sync records one change per moved static, each leaving its chunk, with
-//!   the changes touching exactly the region's chunks.
+//!   explosion's per-change destroys. Asserts: every move commits, and the sync records one
+//!   change per moved static, each leaving its chunk, with the changes touching exactly the
+//!   region's chunks; each stage's work (`plan`, `touch`, and `apply` every change, `group`
+//!   a removal and an insert touch per change, `install` one item per region chunk); each
+//!   stage dispatched in the fixed-partition cases, and in the adaptive threaded cases each
+//!   stage's selection through its own sync tuner; and no row or payload growth after the
+//!   first measured sync.
 //!
 //! `collision-static-triggers` holds the item count of stored trigger pairs: two overlapping
 //! one-tile triggers per pitch cell, 512 dynamics on the first cells (half on a trigger), and
@@ -95,9 +99,11 @@
 //! `row_grows=` and `payload_grows=` counts. `collision-static-rebuild` and
 //! `collision-static-rebuild-sparse` print `per_static=`, and with `--details` the rewrite
 //! stage and the main share per static (main is elapsed less every stage's worker time), and
-//! under each row every stage's shape and mean batch time; `collision-static-dense-change` prints `per_change=`, and
-//! with `--details` the rewrite stage (its tuner in the tuned case), the main share per
-//! changed static, and the timed syncs' `row_grows=` and `payload_grows=` counts.
+//! under each row every stage's shape and mean batch time; `collision-static-dense-change`
+//! prints `per_change=`, and with `--details` the rewrite stage (its tuner in the tuned case),
+//! the main share per changed static (main is elapsed less every stage's worker time), and
+//! under each row every stage's shape and mean batch time and the timed syncs' `row_grows=`
+//! and `payload_grows=` counts.
 
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
@@ -121,6 +127,7 @@ const ColliderGeometry = @import("../game/systems/static_colliders.zig").Collide
 const ColliderView = @import("../game/systems/static_colliders.zig").ColliderView;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const RebuildStage = @import("../game/systems/static_colliders.zig").RebuildStage;
+const SyncStage = @import("../game/systems/static_colliders.zig").SyncStage;
 const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const tile_size = @import("../assets/world_tileset_meta.zig").required_tile_size;
@@ -758,10 +765,10 @@ fn measureRebuild(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
         tuners = colliders.rebuild_tuners;
         if (static_colliders_test_support.liveRowCount(colliders) != static_count) return error.WrongStaticCount;
         var batches: [rebuild_stages.len]BatchStats = undefined;
-        for (&batches, rebuild_stages) |*batch, stage| batch.* = colliders.last_batches.get(stage);
+        for (&batches, rebuild_stages) |*batch, stage| batch.* = colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
         try checkRebuildWork(batches, data.slots.items.len, static_count, chunk_count);
         try suite.checkStagesDispatched(case, &threads, stage_range, &batches);
-        for (batches, rebuild_stages) |batch, stage| try checkRebuildTunerSelected(case, &threads, tuners.getPtrConst(stage), batch);
+        for (batches, rebuild_stages) |batch, stage| try checkTunerSelected(case, &threads, tuners.getPtrConst(stage), batch);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, colliders.last_batches.get(.rewrite));
         main_total += elapsed_ns -| static_colliders_test_support.lastOffMainNs(colliders);
@@ -772,13 +779,18 @@ fn measureRebuild(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.sample_count = static_count;
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(tuners.getPtrConst(.rewrite)), settled);
+    printStageDetails(&stats, &rebuild_stages, &stage_shapes, &stage_ns);
+    return stats;
+}
+
+// Each stage's busiest shape and mean batch time over the measured calls, on one line.
+fn printStageDetails(stats: *suite.RunStats, stages: anytype, shapes: anytype, stage_ns: anytype) void {
     var label_buffer: [48]u8 = undefined;
-    for (rebuild_stages, 0..) |stage, index| {
+    for (stages, 0..) |stage, index| {
         const mean_ns: u64 = if (stats.iterations > 0) @intCast(stage_ns[index] / stats.iterations) else 0;
-        stats.details.print("{s}={s}({f}) ", .{ @tagName(stage), stage_shapes.label(index, &label_buffer), suite.formatDuration(mean_ns) });
+        stats.details.print("{s}={s}({f}) ", .{ @tagName(stage), shapes.label(index, &label_buffer), suite.formatDuration(mean_ns) });
     }
     stats.details.print("\n", .{});
-    return stats;
 }
 
 // The rebuild's pass-shape counts on this fixture: every entity slot selected, every static
@@ -793,12 +805,12 @@ fn checkRebuildWork(batches: [rebuild_stages.len]BatchStats, slot_count: usize, 
     if (install.item_count != chunk_count) return error.RebuildInstallMissedChunks;
 }
 
-// An adaptive case's rebuild stage, whenever the case allows a worker, selects its shape
-// through its own rebuild tuner at the stage's items.
-fn checkRebuildTunerSelected(case: suite.BenchmarkCase, threads: *const ThreadSystem, tuner: *const AdaptiveWorkTuner, batch: BatchStats) error{RebuildStageSkippedItsTuner}!void {
+// An adaptive case's rebuild or sync stage, whenever the case allows a worker, selects its
+// shape through its own tuner at the stage's items.
+fn checkTunerSelected(case: suite.BenchmarkCase, threads: *const ThreadSystem, tuner: *const AdaptiveWorkTuner, batch: BatchStats) error{ColliderStageSkippedItsTuner}!void {
     if (!case.adaptive or batch.item_count == 0 or threads.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
-    const request = tuner.last_request orelse return error.RebuildStageSkippedItsTuner;
-    if (request.item_count != batch.item_count) return error.RebuildStageSkippedItsTuner;
+    const request = tuner.last_request orelse return error.ColliderStageSkippedItsTuner;
+    if (request.item_count != batch.item_count) return error.ColliderStageSkippedItsTuner;
 }
 
 // The case's starting rebuild tuners: untrained in the tuned case, as a new system's are.
@@ -942,7 +954,7 @@ const DenseChangeFixture = struct {
     }
 
     // Every move as one commit through the commit seam; returns the collider sync's time
-    // (capture to synced) and its rewrite batch.
+    // (capture to synced) and its stages' batches.
     fn changeAndSync(self: *DenseChangeFixture, io: std.Io, thread_system: *ThreadSystem) !DenseSync {
         self.frame.beginStep();
         for (self.moves, self.commands) |*move, *command| command.* = move.command();
@@ -952,11 +964,25 @@ const DenseChangeFixture = struct {
         if (commit.structural.components_set != self.moves.len) return error.DenseChangeNotApplied;
         try self.checkChanges();
         for (self.moves) |*move| move.advance();
+        var batches: [sync_stages.len]BatchStats = undefined;
+        for (&batches, sync_stages) |*batch, stage| batch.* = self.colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
         return .{
             .ns = suite.elapsedNs(clock.captured_ns, clock.synced_ns),
-            .batch = self.colliders.last_batches.get(.rewrite),
+            .batches = batches,
             .off_main_ns = static_colliders_test_support.lastOffMainNs(self.colliders),
         };
+    }
+
+    // The sync's pass-shape counts on this fixture: every moved static planned and applied,
+    // a removal and an insert touch each (one-tile statics: one chunk, no coarse cell), and
+    // one installed item per region chunk, each its leavers' source and its arrivals'
+    // destination.
+    fn checkSyncWork(self: *const DenseChangeFixture, batches: [sync_stages.len]BatchStats) !void {
+        const plan, const touch, const group_batch, const apply, _, const install = batches;
+        if (plan.item_count != self.moves.len or touch.item_count != self.moves.len) return error.DenseChangePlanMissedChanges;
+        if (apply.item_count != self.moves.len) return error.DenseChangeApplyMissedChanges;
+        if (group_batch.item_count != 2 * self.moves.len) return error.DenseChangeGroupMissedTouches;
+        if (install.item_count != self.region_side * self.region_side) return error.DenseChangeInstallMissedChunks;
     }
 
     // One change per moved static, each leaving its chunk for another in the region, and
@@ -986,12 +1012,22 @@ const DenseChangeFixture = struct {
     }
 };
 
+// A sync's stages in dispatch order.
+const sync_stages = [_]SyncStage{ .plan, .touch, .group, .apply, .rewrite, .install };
+
 const DenseSync = struct {
     ns: u64,
-    batch: BatchStats,
+    batches: [sync_stages.len]BatchStats,
     // Every stage's worker dispatch time.
     off_main_ns: u64,
 };
+
+fn syncTunersSettled(colliders: *const StaticColliderSystem) bool {
+    for (sync_stages) |stage| {
+        if (colliders.tuners.getPtrConst(stage).phase != .settled) return false;
+    }
+    return true;
+}
 
 fn runStaticDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
@@ -1000,27 +1036,37 @@ fn runStaticDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, options: s
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
 
-    // Sync's tuner trains in play, so the tuned case settles it first.
+    // Sync's tuners train in play, so the tuned case settles all six first.
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(fixture.colliders.tuners.getPtrConst(.rewrite).phase == .settled)) _ = try fixture.changeAndSync(io, &threads);
-    const settled = case.adaptive and fixture.colliders.tuners.getPtrConst(.rewrite).phase == .settled;
+    while (warm.next(syncTunersSettled(&fixture.colliders))) _ = try fixture.changeAndSync(io, &threads);
+    const settled = case.adaptive and syncTunersSettled(&fixture.colliders);
 
     var accumulator = suite.StatsAccumulator.init(change_count);
     var main_total: u128 = 0;
+    var stage_shapes = suite.StageShapes(sync_stages.len){};
+    var stage_ns: [sync_stages.len]u128 = @splat(0);
     const stage_range = case.stageItemsPerRange(splice_range_alignment_items);
     const warm_grows = fixture.grows();
-    for (0..options.iterations) |_| {
+    var first_grows = warm_grows;
+    for (0..options.iterations) |iteration| {
         const sync = try fixture.changeAndSync(io, &threads);
-        try suite.checkStageDispatched(case, &threads, stage_range, sync.batch);
-        accumulator.record(sync.ns, sync.batch);
+        try fixture.checkSyncWork(sync.batches);
+        try suite.checkStagesDispatched(case, &threads, stage_range, &sync.batches);
+        for (sync.batches, sync_stages) |batch, stage| try checkTunerSelected(case, &threads, fixture.colliders.tuners.getPtrConst(stage), batch);
+        if (iteration == 0) first_grows = fixture.grows();
+        accumulator.record(sync.ns, sync.batches[comptime std.mem.indexOfScalar(SyncStage, &sync_stages, .rewrite).?]);
         main_total += sync.ns -| sync.off_main_ns;
+        stage_shapes.add(sync.batches);
+        for (&stage_ns, sync.batches) |*total, batch| total.* += batch.batch_duration_ns;
     }
     const grows = fixture.grows();
+    // Past the first measured sync each one rewrites its region in place.
+    if (!std.mem.eql(u64, &grows, &first_grows)) return error.DenseChangeWarmSyncGrewColliders;
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.sample_count = change_count;
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.colliders.tuners.getPtr(.rewrite)), settled);
-    // The timed syncs' growths: reported, not asserted.
+    printStageDetails(&stats, &sync_stages, &stage_shapes, &stage_ns);
     stats.details.print("row_grows={} payload_grows={}\n", .{ grows[0] - warm_grows[0], grows[1] - warm_grows[1] });
     return stats;
 }
