@@ -44,7 +44,9 @@ than working from a compaction summary.
    brief lists; a needed file outside the list stops the work and is
    reported, never edited first.
 4. Add the tests and scaling benches the rules require, placed per
-   `tests-benchmarks.md` § Test and production code. Edit no docs: put the
+   `tests-benchmarks.md` § Test and production code. Tests are fast logic
+   tests; a stability, convergence, work-bound, or perf proof goes in its
+   bench group (`tests-benchmarks.md` § Tests). Edit no docs: put the
    doc changes as notes in the report (`AGENTS.md` § Agent Pipeline).
 5. Validate per `build-validation.md`. While iterating, run `zig build check`
    and, when test bodies changed, `zig build test-compile` with no

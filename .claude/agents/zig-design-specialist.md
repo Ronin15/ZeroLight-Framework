@@ -117,11 +117,13 @@ section with nothing new is omitted.
   live code at the design's HEAD.
 - **Tests, benches, diagnostics** (`tests-benchmarks.md`, `threading.md`):
   each claimed growth order names the scaling bench group and the `--grid`
-  sizes that measure it. The tuned case is the verdict. A new test whose
-  name does not contain the module filter gets its own `-Dtest-filter`
-  text. A slice that replaces a structure measures the old one first, so
-  the baseline is measured, not derived (the bench lands first, on today's
-  code). Name each change path's cost-driver stage, the one that gets a
+  sizes that measure it. The tuned case is the verdict. Tests are fast
+  logic tests; a stability, convergence, work-bound, or perf proof is a
+  bench pass-shape assert, and a plan that puts one in a test fails. A new
+  test whose name does not contain the module filter gets its own
+  `-Dtest-filter` text. A slice that replaces a structure measures the old
+  one first, so the baseline is measured, not derived (the bench lands
+  first, on today's code). Name each change path's cost-driver stage, the one that gets a
   `runtime_perf_log` entry.
 - **Std usage** (`zig-style.md` std-first): every container, heap, bitset,
   sort, search, hash, or parse the plan adds or changes names the `std` API it

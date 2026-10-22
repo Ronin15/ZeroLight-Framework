@@ -27,6 +27,10 @@ The standard Zig layout; every change, plan, and review follows it.
 
 ## Tests
 
+- Tests prove logic and stay fast: each drives one behavior or branch with a
+  few crafted inputs. Stability, convergence, and work-bound proofs (seed
+  sweeps, long or repeated workloads, settle and probe bounds, soaks) and
+  every perf check are bench pass-shape asserts, never tests.
 - Prefer focused window-free contract tests; display/GPU checks belong in
   `gpu-smoke`.
 - A fix ships with a test that would fail without it, judged from the code,

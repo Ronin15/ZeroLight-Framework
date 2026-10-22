@@ -107,10 +107,12 @@ scope only where the diff relies on it.
 4. **Tests**: for a weak test, name the untested contract and a narrow
    scenario that would expose a regression. For each new test, name the
    mutation it catches, from the code; one that would pass with the change
-   reverted is a finding. A threaded stage's tests and bench output meet
-   `threading.md` and `tests-benchmarks.md`; an inline run proves no threaded
-   parity. A change path whose named cost-driver stage has no
-   `runtime_perf_log` entry is a finding; so is logging stages beyond the cost
+   reverted is a finding. A test that proves stability, convergence, a work
+   bound, or perf (seed sweeps, long runs, settle or probe bounds) instead
+   of logic is a finding: it moves to its bench group. A threaded stage's
+   tests and bench output meet `threading.md` and `tests-benchmarks.md`; an
+   inline run proves no threaded parity. A change path whose named
+   cost-driver stage has no `runtime_perf_log` entry is a finding; so is logging stages beyond the cost
    drivers (`threading.md`). A tuner reached by two stages or phases, or a
    production dispatch at a fixed shape outside a tuner, is a finding.
    **Test and production code**, every review: check every touched file
