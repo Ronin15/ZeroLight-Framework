@@ -34,7 +34,7 @@ const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const rebuild_tuner_config = @import("../../app/thread_system.zig").rebuild_tuner_config;
 const runShaped = @import("../../app/thread_system.zig").runShaped;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
-const stageShape = @import("../../app/thread_system.zig").stageShape;
+const StageShape = @import("../../app/thread_system.zig").StageShape;
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const logging = @import("../../core/logging.zig");
 const pdqSort = @import("../../core/sort.zig").pdq;
@@ -1445,7 +1445,7 @@ pub const TriggerStore = struct {
     fn writeOutputs(self: *TriggerStore, leaf_dispatch: Dispatch, node_dispatch: Dispatch) WriteBatches {
         const pages = self.heights[0].outputs;
         const leaf_stage = if (pages == 0) null else leaf_dispatch;
-        const leaf_shape = stageShape(leaf_stage, pages, rewrite_range_alignment_items);
+        const leaf_shape = StageShape.select(leaf_stage, pages, rewrite_range_alignment_items);
         var leaf_job = LeafJob{
             .store = self,
             .runs = self.runs.items[self.heights[0].runs_lo..self.heights[0].runs_hi],
@@ -1538,7 +1538,7 @@ pub const TriggerStore = struct {
         const epoch = data.collision_allow_epoch;
         if (self.pair_count == 0 or (self.refreshed_epoch != null and self.refreshed_epoch.? == epoch)) return false;
         const dispatch = threads.stage(self.tuners.getPtr(.refresh));
-        const shape = stageShape(dispatch, self.pair_count, refresh_range_alignment_items);
+        const shape = StageShape.select(dispatch, self.pair_count, refresh_range_alignment_items);
         std.debug.assert(self.refresh_sums.capacity >= shape.range_count);
         setSlotCount(RefreshSums, &self.refresh_sums, shape.range_count);
         var job = RefreshJob{

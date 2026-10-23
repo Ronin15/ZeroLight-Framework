@@ -17,7 +17,7 @@ const SlotList = @import("../../app/thread_system.zig").SlotList;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const runShaped = @import("../../app/thread_system.zig").runShaped;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
-const stageShape = @import("../../app/thread_system.zig").stageShape;
+const StageShape = @import("../../app/thread_system.zig").StageShape;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 
 /// Partition width of a banded sort, not a capacity: the sorted result is the same for any
@@ -248,7 +248,7 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
             }
             try staging.ensureTotalCapacity(allocator, total);
             staging.items.len = total;
-            const place = stageShape(place_dispatch, total, range_alignment_items);
+            const place = StageShape.select(place_dispatch, total, range_alignment_items);
             try offsets.ensureTotalCapacity(allocator, place.range_count);
             setSlotCount(BandOffsets, offsets, place.range_count);
             var place_job = PlaceJob{
@@ -261,7 +261,7 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
             };
             var batches = SortBatches{};
             batches.place = runShaped(place_dispatch, place, total, range_alignment_items, &place_job, placeJob);
-            const sort = stageShape(sort_dispatch, total, range_alignment_items);
+            const sort = StageShape.select(sort_dispatch, total, range_alignment_items);
             var sort_job = SortJob{
                 .source = .{ .staging = staging.items, .band_offsets = offsets.items, .window_stride = place.items_per_range },
                 .dest = dest,

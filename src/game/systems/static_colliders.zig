@@ -31,7 +31,6 @@ const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const StageControls = @import("../../app/thread_system.zig").StageControls;
 const StageThreads = @import("../../app/thread_system.zig").StageThreads;
 const runShaped = @import("../../app/thread_system.zig").runShaped;
-const stageShape = @import("../../app/thread_system.zig").stageShape;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const StageShape = @import("../../app/thread_system.zig").StageShape;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
@@ -1094,7 +1093,7 @@ pub const StaticColliderSystem = struct {
         // The touch windows are sized from the selection the dispatch runs; an error past it
         // discards this system and the tuner's selection with it (`rebuild`).
         const dispatch = self.rebuildDispatch(stages, .touch, static_count);
-        const shape = stageShape(dispatch, static_count, touch_range_alignment_items);
+        const shape = StageShape.select(dispatch, static_count, touch_range_alignment_items);
         try self.reserveTouches(touches, shape.range_count);
         self.touch_splitters = splitters;
         self.touchFootprints(dispatch, shape, .rebuild);
@@ -1147,7 +1146,7 @@ pub const StaticColliderSystem = struct {
     // compacted on main, so `plan_inputs` holds the statics in entity-index order.
     fn selectStatics(self: *StaticColliderSystem, data: *const DataSystem, stages: ?ColliderThreads, slot_count: usize) void {
         const dispatch = self.rebuildDispatch(stages, .select, slot_count);
-        const shape = stageShape(dispatch, slot_count, select_range_alignment_items);
+        const shape = StageShape.select(dispatch, slot_count, select_range_alignment_items);
         std.debug.assert(shape.range_count <= self.select_tallies.capacity);
         setSlotCount(SelectTally, &self.select_tallies, shape.range_count);
         var job = SelectJob{
@@ -1191,7 +1190,7 @@ pub const StaticColliderSystem = struct {
     // touch and class counts.
     fn planRows(self: *StaticColliderSystem, stages: ?ColliderThreads, static_count: usize) void {
         const dispatch = self.rebuildDispatch(stages, .plan, static_count);
-        const shape = stageShape(dispatch, static_count, plan_range_alignment_items);
+        const shape = StageShape.select(dispatch, static_count, plan_range_alignment_items);
         std.debug.assert(shape.range_count <= self.plan_tallies.capacity);
         setSlotCount(PlanTally, &self.plan_tallies, shape.range_count);
         self.plan_item_count = static_count;
@@ -1339,7 +1338,7 @@ pub const StaticColliderSystem = struct {
     // the touches, in a new generation of the key table.
     fn groupTouches(self: *StaticColliderSystem, dispatch: ?Dispatch, touches: TierCounts) void {
         const touch_total = tierTotal(touches);
-        const shape = stageShape(dispatch, touch_total, group_range_alignment_items);
+        const shape = StageShape.select(dispatch, touch_total, group_range_alignment_items);
         std.debug.assert(self.group_tallies.capacity >= tier_count * band_count);
         setSlotCount(GroupTally, &self.group_tallies, tier_count * band_count);
         GroupTable.advance(self.group_slots.items, &self.group_generation);
@@ -1431,7 +1430,7 @@ pub const StaticColliderSystem = struct {
     // in its span of the items, and installs their fresh blocks and writes their releases.
     fn installItems(self: *StaticColliderSystem, dispatch: ?Dispatch) void {
         const item_count = self.item_bands.itemCount();
-        const shape = stageShape(dispatch, item_count, install_range_alignment_items);
+        const shape = StageShape.select(dispatch, item_count, install_range_alignment_items);
         var job = InstallJob{ .colliders = self, .range_count = shape.range_count };
         self.last_batches.set(.install, runShaped(dispatch, shape, item_count, install_range_alignment_items, &job, installJob));
     }
@@ -2029,7 +2028,7 @@ pub const StaticColliderSystem = struct {
         const pending = self.plan_item_count;
         // The touch windows are sized from the selection the dispatch runs.
         const dispatch = self.syncDispatch(threads, .touch, pending);
-        const shape = stageShape(dispatch, pending, touch_range_alignment_items);
+        const shape = StageShape.select(dispatch, pending, touch_range_alignment_items);
         try self.reserveTouches(touches, shape.range_count);
         self.touch_splitters = splitters;
         self.touchFootprints(dispatch, shape, .sync);
@@ -2093,7 +2092,7 @@ pub const StaticColliderSystem = struct {
     // lanes, the relink decision, and its range's touch, add, release, and class counts.
     fn planPending(self: *StaticColliderSystem, data: *const DataSystem, threads: ColliderThreads, pending: usize) void {
         const dispatch = self.syncDispatch(threads, .plan, pending);
-        const shape = stageShape(dispatch, pending, sync_plan_range_alignment_items);
+        const shape = StageShape.select(dispatch, pending, sync_plan_range_alignment_items);
         std.debug.assert(shape.range_count <= self.plan_tallies.capacity);
         setSlotCount(PlanTally, &self.plan_tallies, shape.range_count);
         self.plan_item_count = pending;
@@ -2259,7 +2258,7 @@ pub const StaticColliderSystem = struct {
     // `apply` under `dispatch` over the pending indices.
     fn applyPending(self: *StaticColliderSystem, dispatch: ?Dispatch) void {
         const pending = self.plan_item_count;
-        const shape = stageShape(dispatch, pending, apply_range_alignment_items);
+        const shape = StageShape.select(dispatch, pending, apply_range_alignment_items);
         var job = ApplyJob{ .colliders = self, .inputs = PlanColumns.of(&self.plan_inputs), .outputs = LaneOutputs.ofSyncRows(&self.sync_rows), .range_count = shape.range_count };
         self.last_batches.set(.apply, runShaped(dispatch, shape, pending, apply_range_alignment_items, &job, applyJob));
     }
@@ -2311,7 +2310,7 @@ pub const StaticColliderSystem = struct {
         const units = self.item_bands.unitCount();
         if (units == 0) return;
         var job = RewriteJob{ .colliders = self, .entries = entries, .range_count = 0 };
-        const shape = stageShape(dispatch, units, splice_range_alignment_items);
+        const shape = StageShape.select(dispatch, units, splice_range_alignment_items);
         job.range_count = shape.range_count;
         self.last_batches.set(.rewrite, runShaped(dispatch, shape, units, splice_range_alignment_items, &job, rewriteJob));
     }

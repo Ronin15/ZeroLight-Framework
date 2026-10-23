@@ -15,7 +15,7 @@ const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
-const stageShape = @import("../../../app/thread_system.zig").stageShape;
+const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const NavGrid = @import("nav_grid.zig").NavGrid;
@@ -67,7 +67,7 @@ pub fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest, g
     if (comptime runtime_perf_log.enabled) stats.perf.dropped_requests += requests.len - item_count;
     if (item_count == 0) return stats;
     const dispatch = threads.stage(&self.tuners.intake);
-    const shape = stageShape(dispatch, item_count, intake_range_alignment_items);
+    const shape = StageShape.select(dispatch, item_count, intake_range_alignment_items);
     std.debug.assert(self.intake_records.capacity >= item_count);
     std.debug.assert(self.intake_group_counts.capacity >= item_count);
     std.debug.assert(self.intake_tallies.capacity >= shape.range_count);

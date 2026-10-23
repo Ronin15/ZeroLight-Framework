@@ -1741,14 +1741,14 @@ pub const StageShape = struct {
     selection: ?BatchSelection = null,
     items_per_range: usize = 1,
     range_count: usize = 0,
-};
 
-/// Selects `item_count` items' shape under `dispatch`, or one inline range without one.
-pub fn stageShape(dispatch: ?Dispatch, item_count: usize, range_alignment_items: usize) StageShape {
-    const stage = dispatch orelse return .{ .items_per_range = @max(item_count, 1), .range_count = @intFromBool(item_count != 0) };
-    const selection = stage.select(item_count, range_alignment_items);
-    return .{ .selection = selection, .items_per_range = selection.items_per_range, .range_count = selection.range_count };
-}
+    /// Selects `item_count` items' shape under `dispatch`, or one inline range without one.
+    pub fn select(dispatch: ?Dispatch, item_count: usize, range_alignment_items: usize) StageShape {
+        const stage = dispatch orelse return .{ .items_per_range = @max(item_count, 1), .range_count = @intFromBool(item_count != 0) };
+        const selection = stage.select(item_count, range_alignment_items);
+        return .{ .selection = selection, .items_per_range = selection.items_per_range, .range_count = selection.range_count };
+    }
+};
 
 /// Runs `job` over `item_count` items at `shape`: dispatched with its selection, or inline
 /// as one timed range on the calling thread.
@@ -1771,7 +1771,7 @@ pub fn runShaped(dispatch: ?Dispatch, shape: StageShape, item_count: usize, rang
 /// can assert against it; an empty batch selects nothing and leaves it untouched.
 pub fn runStage(dispatch: ?Dispatch, item_count: usize, range_alignment_items: usize, context: *anyopaque, range_count: *usize, job: JobFn) BatchStats {
     if (item_count == 0) return .{};
-    const shape = stageShape(dispatch, item_count, range_alignment_items);
+    const shape = StageShape.select(dispatch, item_count, range_alignment_items);
     range_count.* = shape.range_count;
     return runShaped(dispatch, shape, item_count, range_alignment_items, context, job);
 }

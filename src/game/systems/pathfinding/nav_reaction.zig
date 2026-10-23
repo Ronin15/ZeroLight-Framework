@@ -20,7 +20,7 @@ const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
-const stageShape = @import("../../../app/thread_system.zig").stageShape;
+const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const StageTimer = runtime_perf_log.StageTimer;
@@ -358,7 +358,7 @@ fn markNavEvents(self: *PathfindingSystem, events: []const SimulationEvent, worl
     std.debug.assert(self.nav_marks.capacity - self.nav_marks.items.len >= events.len);
     var section = StageTimer.begin();
     const dispatch = navDispatch(self, thread_system, &self.tuners.nav_mark);
-    const shape = stageShape(dispatch, events.len, nav_mark_range_alignment_items);
+    const shape = StageShape.select(dispatch, events.len, nav_mark_range_alignment_items);
     std.debug.assert(self.nav_mark_staging.capacity >= events.len);
     std.debug.assert(self.nav_mark_tallies.capacity >= shape.range_count);
     self.nav_mark_staging.items.len = events.len;

@@ -21,7 +21,7 @@ const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
-const stageShape = @import("../../../app/thread_system.zig").stageShape;
+const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const dilateChanged3x3 = @import("nav_grid.zig").dilateChanged3x3;
 const bitIsSet = @import("../../world/terrain.zig").bitIsSet;
@@ -117,7 +117,7 @@ pub fn prepareEviction(self: *PathfindingSystem, thread_system: ?*ThreadSystem, 
     self.evict_items.items.len = keys.len;
     @memset(self.evict_items.items, .{});
     const count_dispatch = navDispatch(self, thread_system, &self.tuners.nav_evict_count);
-    const count_shape = stageShape(count_dispatch, keys.len, evict_range_alignment_items);
+    const count_shape = StageShape.select(count_dispatch, keys.len, evict_range_alignment_items);
     var job = EvictCountJob{
         .changed_keys = keys,
         .directory = &self.path_index.directory,
@@ -130,7 +130,7 @@ pub fn prepareEviction(self: *PathfindingSystem, thread_system: ?*ThreadSystem, 
     if (comptime runtime_perf_log.enabled) stats.perf.evict_count_batch = count_batch;
     section = StageTimer.begin();
     // The walk's shape now, so each of its ranges' hit windows starts on a line.
-    self.evict_shape = stageShape(navDispatch(self, thread_system, &self.tuners.nav_evict), keys.len, evict_range_alignment_items);
+    self.evict_shape = StageShape.select(navDispatch(self, thread_system, &self.tuners.nav_evict), keys.len, evict_range_alignment_items);
     const field_count = self.group_fields.items.len;
     var total: usize = 0;
     for (self.evict_items.items, 0..) |*item, index| {

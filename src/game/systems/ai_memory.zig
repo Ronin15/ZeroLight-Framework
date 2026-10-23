@@ -43,7 +43,7 @@ const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const runShaped = @import("../../app/thread_system.zig").runShaped;
 const runStage = @import("../../app/thread_system.zig").runStage;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
-const stageShape = @import("../../app/thread_system.zig").stageShape;
+const StageShape = @import("../../app/thread_system.zig").StageShape;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
 const ConstPerceptionSlice = @import("../data_system.zig").ConstPerceptionSlice;
@@ -324,7 +324,7 @@ pub const AiMemorySystem = struct {
         std.debug.assert(self.memory_dense_indices.capacity >= window_len and self.perception_dense_indices.capacity >= window_len);
         self.memory_dense_indices.items.len = window_len;
         self.perception_dense_indices.items.len = window_len;
-        const shape = stageShape(dispatch, touched_count, ai_memory_order_range_alignment_items);
+        const shape = StageShape.select(dispatch, touched_count, ai_memory_order_range_alignment_items);
         std.debug.assert(self.order_tallies.capacity >= shape.range_count);
         setSlotCount(OrderTally, &self.order_tallies, shape.range_count);
         var job = OrderJob{

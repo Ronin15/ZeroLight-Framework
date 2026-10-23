@@ -25,7 +25,6 @@ const StageControls = @import("../../../app/thread_system.zig").StageControls;
 const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
-const stageShape = @import("../../../app/thread_system.zig").stageShape;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
@@ -943,7 +942,7 @@ pub const PathfindingSystem = struct {
         for (std.enums.values(TraversalClass)) |traversal| graphs.set(traversal, self.graphFor(traversal));
         const scan_dispatch = threads.stage(&self.tuners.goal_scan);
         // An empty stage has no shape to select.
-        const scan_shape: StageShape = if (intents.len == 0) .{} else stageShape(scan_dispatch, intents.len, goal_table.scan_range_alignment_items);
+        const scan_shape: StageShape = if (intents.len == 0) .{} else StageShape.select(scan_dispatch, intents.len, goal_table.scan_range_alignment_items);
         self.goals.beginScan(intents.len, scan_shape.range_count);
         var scan = goal_table.ScanJob(Intent){
             .intents = intents,
@@ -959,7 +958,7 @@ pub const PathfindingSystem = struct {
         stats.blocked = self.goals.mergeScan(scan_shape.items_per_range);
         const distinct = self.goals.refs.items.len;
         const project_dispatch = threads.stage(&self.tuners.goal_project);
-        const project_shape: StageShape = if (distinct == 0) .{} else stageShape(project_dispatch, distinct, goal_table.project_range_alignment_items);
+        const project_shape: StageShape = if (distinct == 0) .{} else StageShape.select(project_dispatch, distinct, goal_table.project_range_alignment_items);
         var project = goal_table.ProjectJob{
             .refs = self.goals.refs.items,
             .live = self.goals.live.items,
@@ -1164,7 +1163,7 @@ pub const PathfindingSystem = struct {
         const moves = self.completed.pendingMoves();
         var batch = BatchStats{};
         if (moves.len != 0) {
-            const shape = stageShape(dispatch, moves.len, 1);
+            const shape = StageShape.select(dispatch, moves.len, 1);
             var job = ResizeCopyJob{ .cache = &self.completed, .moves = moves, .range_count = shape.range_count };
             batch = runShaped(dispatch, shape, moves.len, 1, &job, resizeCopyJob);
         }

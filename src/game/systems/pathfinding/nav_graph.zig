@@ -30,7 +30,7 @@ const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const StageControls = @import("../../../app/thread_system.zig").StageControls;
 const accumulateBatch = @import("../../../app/thread_system.zig").accumulateBatch;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
-const stageShape = @import("../../../app/thread_system.zig").stageShape;
+const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const runStage = @import("../../../app/thread_system.zig").runStage;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
@@ -1434,7 +1434,7 @@ pub const NavGraph = struct {
         for (std.meta.tags(PlanStream)) |stream| self.keyList(stream).clearRetainingCapacity();
         if (item_count == 0) return;
         var section = StageTimer.begin();
-        const selection = stageShape(threads, item_count, 1);
+        const selection = StageShape.select(threads, item_count, 1);
 
         // Windows: each range's key bounds, starting on a cache line.
         self.staging_window.note(.ranges, selection.range_count);

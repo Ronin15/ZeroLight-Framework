@@ -22,7 +22,7 @@ const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
-const stageShape = @import("../../../app/thread_system.zig").stageShape;
+const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const ChunkGeometry = @import("../../world/terrain.zig").ChunkGeometry;
 const chunk_list_map = @import("../chunk_list_map.zig");
@@ -565,7 +565,7 @@ pub fn publishCopy(self: *PathfindingSystem, dispatch: Dispatch) BatchStats {
     // finished at the next update's top (`recoverRegistry`) before any publish.
     std.debug.assert(self.publish_ranges == 0);
     if (item_count == 0) return .{};
-    const shape = stageShape(dispatch, item_count, 1);
+    const shape = StageShape.select(dispatch, item_count, 1);
     std.debug.assert(self.publish_range_bases.capacity >= shape.range_count);
     std.debug.assert(self.publish_bands.capacity >= shape.range_count);
     self.publish_range_bases.items.len = shape.range_count;
@@ -892,7 +892,7 @@ fn runRegistryCount(
     const counted = unitStarts(weights);
     try reserveCountWindows(self, pair_adds, index.retire_node_count);
     const count_dispatch: ?Dispatch = if (dispatch) |stage| shapedDispatch(stage.apply, counted.total, fix, stage.count_tuner) else null;
-    const shape = stageShape(count_dispatch, counted.total, 1);
+    const shape = StageShape.select(count_dispatch, counted.total, 1);
     var job = RegistryCountJob{
         .system = self,
         .ops = ops,
@@ -946,7 +946,7 @@ fn runRegistryRename(self: *PathfindingSystem, dispatch: ?Dispatch) BatchStats {
     }
     const blocks = index.directory.blocks.items;
     const rename_dispatch: ?Dispatch = if (dispatch) |stage| shapedDispatch(stage, blocks.len, true, stage.tuner) else null;
-    const shape = stageShape(rename_dispatch, blocks.len, 1);
+    const shape = StageShape.select(rename_dispatch, blocks.len, 1);
     var job = RegistryRenameJob{
         .blocks = blocks,
         .rename_to = plan.rename_to.items,
@@ -997,7 +997,7 @@ fn runRegistryApply(
 ) BatchStats {
     const counted = unitStarts(weights);
     const apply_dispatch: ?Dispatch = if (dispatch) |stage| shapedDispatch(stage, counted.total, fix, stage.tuner) else null;
-    const shape = stageShape(apply_dispatch, counted.total, 1);
+    const shape = StageShape.select(apply_dispatch, counted.total, 1);
     var job = RegistryApplyJob{
         .system = self,
         .ops = ops,
