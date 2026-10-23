@@ -393,7 +393,8 @@ pub const CollisionStats = struct {
         /// range held more than `broadphase_pairs_per_item` pairs per entry its slot was
         /// reserved for (the slot grew and the broadphase replayed), a static query range
         /// outgrew its pair or hit rows (the slot grew and the query replayed), or the
-        /// stored and dynamic contacts exceeded the bound (the contact stream grew). Set
+        /// stored and dynamic contacts exceeded the contact bound (the pair bound plus
+        /// `CollisionSystem.reserved_trigger_bound`; the contact stream grew). Set
         /// once per step, with one `CollisionSystem.perf.pair_bound_overflows` count.
         pair_bound_exceeded: bool = false,
         broadphase_visits: usize = 0,
@@ -773,8 +774,8 @@ pub const CollisionSystem = struct {
     trigger_query_slots: SlotList(TriggerQuerySlot) = .empty,
     trigger_edit_sources: std.ArrayList(EditSource) = .empty,
     emit_ranges: SlotList(EmitRange) = .empty,
-    /// The last patch query's batch shape; `syncCommittedTriggers` resets it first, so after
-    /// a seam that rebuilt or did nothing it holds none.
+    /// The last patch query's batch shape; `resetSeamBatches` clears it at seam entry, so
+    /// after a seam that rebuilt or did nothing it holds none.
     trigger_query_batch: BatchStats = .{},
     /// The last rebuild query's batch shape; reset by every rebuild.
     trigger_rebuild_query_batch: BatchStats = .{},
@@ -788,6 +789,10 @@ pub const CollisionSystem = struct {
     /// The entry bound `reserve` declared (`entries_per_body` per body, grow-only); 0 until
     /// `reserve` runs.
     reserved_entry_bound: usize = 0,
+    /// The stored trigger contacts the commit seam declared (`reserveTriggerContacts`,
+    /// grow-only); 0 until a seam tops it up. The contact bound every contact-sized reserve
+    /// covers is `reserved_pair_bound +| reserved_trigger_bound`.
+    reserved_trigger_bound: usize = 0,
     pair_bound_warned: bool = false,
     static_slot_warned: bool = false,
     entry_bound_warned: bool = false,
@@ -806,7 +811,8 @@ pub const CollisionSystem = struct {
         /// under the pipeline) grew, or a range's pairs outgrew its broadphase slot, so the
         /// slot grew and the broadphase replayed, or a static query range outgrew its slot,
         /// so the slot grew and the query replayed, or the stored and dynamic contacts
-        /// exceeded the bound, so the contact stream and its emission ranges grew.
+        /// exceeded the contact bound (`reserved_pair_bound +| reserved_trigger_bound`), so
+        /// the contact stream and its emission ranges grew.
         pair_bound_overflows: u64 = 0,
         /// Reserved steps whose entries exceeded `reserved_entry_bound` (the keys and entries
         /// grew the first time) or whose fill spilled past a range's spill slot (the slot
@@ -875,8 +881,9 @@ pub const CollisionSystem = struct {
     /// pair, one window per range), and its tallies hold the pair bound over the body
     /// capacity (`broadphasePairBound`). Static query slots hold the same per-range pair
     /// bound, and one query's hit rows (`reserved_query_hits`, at most the slot's pairs).
-    /// The stored-trigger emission's range records cover the pair bound's ranges. A denser
-    /// or taller scene, in total or inside one range, takes the counted grow paths (`Perf`).
+    /// The stored-trigger emission's range records cover the contact bound's ranges (the
+    /// pair bound plus `reserved_trigger_bound`). A denser or taller scene, in total or
+    /// inside one range, takes the counted grow paths (`Perf`).
     pub fn reserve(self: *CollisionSystem, body_capacity: usize) !void {
         if (body_capacity == 0) return;
         // The u32 slots, sources, and pair indices are exhausted only past maxInt(u32)
@@ -924,18 +931,37 @@ pub const CollisionSystem = struct {
         // The static place runs over up to the pair bound's items.
         const pair_ranges = maxRangeCount(pair_capacity, collision_range_alignment_items);
         try self.sort_offsets.ensureTotalCapacity(self.allocator, pair_ranges);
-        try self.emit_ranges.ensureTotalCapacity(self.allocator, pair_ranges);
+        try self.emit_ranges.ensureTotalCapacity(self.allocator, maxRangeCount(pair_capacity +| self.reserved_trigger_bound, collision_range_alignment_items));
         self.reserved_pair_bound = @max(self.reserved_pair_bound, pair_capacity);
         self.reserved_entry_bound = @max(self.reserved_entry_bound, entry_capacity);
     }
 
-    /// Reserves a contact stream to the pair bound for `body_capacity` bodies: its
-    /// values to `estimateContactCapacity` and its ranges to the emission's range bound
-    /// over those pairs (`update` streams one range per emission range, at most
-    /// `maxRangeCount(pairs, collision_range_alignment_items)`). Grow-only.
-    pub fn reserveContactStream(contacts: *RangeOutputStream(CollisionContact), body_capacity: usize) !void {
-        const contact_capacity = estimateContactCapacity(body_capacity);
+    /// Reserves a contact stream for `contact_capacity` contacts: its values to that count
+    /// and its ranges to the emission's range bound over it (`update` streams one range per
+    /// emission range, at most `maxRangeCount(contacts, collision_range_alignment_items)`).
+    /// Callers pass the contact bound (`estimateContactCapacity` plus any stored trigger
+    /// bound). Grow-only.
+    pub fn reserveContactStream(contacts: *RangeOutputStream(CollisionContact), contact_capacity: usize) !void {
         try contacts.reserve(maxRangeCount(contact_capacity, collision_range_alignment_items), contact_capacity);
+    }
+
+    /// Declares `bound` stored trigger contacts on top of the pair bound: grows the emission's
+    /// range records to the summed contact bound, then raises `reserved_trigger_bound` last,
+    /// so an OOM leaves it unchanged. The caller reserves the contact-sized streams to the
+    /// same sum first. Grow-only; main thread, at the commit seam.
+    pub fn reserveTriggerContacts(self: *CollisionSystem, bound: usize) error{OutOfMemory}!void {
+        if (bound <= self.reserved_trigger_bound) return;
+        const range_bound = maxRangeCount(self.reserved_pair_bound +| bound, collision_range_alignment_items);
+        try self.emit_ranges.ensureTotalCapacity(self.allocator, range_bound);
+        std.debug.assert(self.emit_ranges.capacity >= range_bound);
+        self.reserved_trigger_bound = bound;
+    }
+
+    /// Clears the seam's trigger batch records (the patch query's and the store's stages), so
+    /// a seam that fails, rebuilds, or does nothing leaves none from an earlier seam.
+    pub fn resetSeamBatches(self: *CollisionSystem) void {
+        self.trigger_query_batch = .{};
+        self.trigger_store.last_batches = .initFill(.{});
     }
 
     /// Brings the trigger store up to `view` after a collider sync; a view with no geometry
@@ -950,8 +976,7 @@ pub const CollisionSystem = struct {
     /// error.
     pub fn syncCommittedTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, thread_system: *ThreadSystem) error{OutOfMemory}!void {
         // Reset first: the seam's patch batches are recorded every step, patched or not.
-        self.trigger_query_batch = .{};
-        self.trigger_store.last_batches = .initFill(.{});
+        self.resetSeamBatches();
         if (view.geometry == null) return;
         try self.syncTriggers(data, view, .{
             .thread_system = thread_system,
@@ -1896,7 +1921,7 @@ pub const CollisionSystem = struct {
         }
         // Covers both grows below: the values are at most `items`, and the ranges at most
         // `maxRangeCount(items, collision_range_alignment_items)`.
-        if (self.reserved_pair_bound != 0 and items > self.reserved_pair_bound) self.noteContactBoundOverflow(stats, items);
+        if (self.reserved_pair_bound != 0 and items > self.reserved_pair_bound +| self.reserved_trigger_bound) self.noteContactBoundOverflow(stats, items);
         const dispatch = threads.stage(&self.emit_tuner);
         const selection = dispatch.select(items, collision_range_alignment_items);
         const range_count = selection.range_count;
@@ -1939,16 +1964,16 @@ pub const CollisionSystem = struct {
         return stored_emitted + dynamic.len;
     }
 
-    // A step whose stored and dynamic contacts outgrew the reserved pair bound: the contact
-    // stream and the emission ranges grow on main.
+    // A step whose stored and dynamic contacts outgrew the reserved contact bound: the
+    // contact stream and the emission ranges grow on main.
     fn noteContactBoundOverflow(self: *CollisionSystem, stats: *CollisionStats, items: usize) void {
         @branchHint(.cold);
         self.markPairBoundExceeded(stats);
         if (self.contact_bound_warned) return;
         self.contact_bound_warned = true;
         if (comptime logging.enabled(.warn)) logging.game.warn(
-            "collision: {d} stored trigger and dynamic contacts outgrew the reserved pair bound {d}; the contact stream grew in-stage",
-            .{ items, self.reserved_pair_bound },
+            "collision: {d} stored trigger and dynamic contacts outgrew the reserved contact bound {d}; the contact stream grew in-stage",
+            .{ items, self.reserved_pair_bound +| self.reserved_trigger_bound },
         );
     }
 };
@@ -4174,7 +4199,7 @@ test "after a spill slot grows, later multi-worker steps allocate nothing" {
     try system.reserve(body_count);
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    try CollisionSystem.reserveContactStream(&contacts, body_count);
+    try CollisionSystem.reserveContactStream(&contacts, CollisionSystem.estimateContactCapacity(body_count));
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
     const config: CollisionConfig = .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false };
@@ -4211,7 +4236,7 @@ test "after reserve, a multi-worker step over bodies on two strips allocates not
     try system.reserve(body_count);
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    try CollisionSystem.reserveContactStream(&contacts, body_count);
+    try CollisionSystem.reserveContactStream(&contacts, CollisionSystem.estimateContactCapacity(body_count));
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
 
@@ -4758,7 +4783,7 @@ test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body
     try system.reserve(body_count);
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    try CollisionSystem.reserveContactStream(&contacts, body_count);
+    try CollisionSystem.reserveContactStream(&contacts, CollisionSystem.estimateContactCapacity(body_count));
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
 
@@ -4812,7 +4837,7 @@ test "a broadphase slot replay within the total pair bound matches serial and th
     try std.testing.expect(reference_stats.candidate_pair_count <= system.reserved_pair_bound);
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    try CollisionSystem.reserveContactStream(&contacts, body_count);
+    try CollisionSystem.reserveContactStream(&contacts, CollisionSystem.estimateContactCapacity(body_count));
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
 
@@ -4918,7 +4943,7 @@ test "candidate pairs past the reserved pair bound match serial on every step of
 test "a contact stream reserved for a body capacity holds the pair bound" {
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    try CollisionSystem.reserveContactStream(&contacts, 64);
+    try CollisionSystem.reserveContactStream(&contacts, CollisionSystem.estimateContactCapacity(64));
     const pair_bound = CollisionSystem.broadphasePairBound(64);
     try std.testing.expectEqual(pair_bound, CollisionSystem.estimateContactCapacity(64));
     try std.testing.expect(contacts.values.capacity >= pair_bound);
@@ -6063,7 +6088,7 @@ test "a reserved warm static step allocates nothing" {
     try system.reserve(8);
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
-    try CollisionSystem.reserveContactStream(&contacts, 8);
+    try CollisionSystem.reserveContactStream(&contacts, CollisionSystem.estimateContactCapacity(8));
     _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
     try std.testing.expect(system.trigger_store.ready);
     try std.testing.expect(contacts.mergedItems().len > 0);
@@ -6096,7 +6121,7 @@ test "a reserved warm static step allocates nothing" {
     try worker_system.reserve(worker_bodies);
     var worker_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer worker_contacts.deinit();
-    try CollisionSystem.reserveContactStream(&worker_contacts, worker_bodies);
+    try CollisionSystem.reserveContactStream(&worker_contacts, CollisionSystem.estimateContactCapacity(worker_bodies));
     _ = try updateView(&worker_system, &worker_data, &worker_contacts, worker_colliders.view(), 2, collision_range_alignment_items);
 
     var worker_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });

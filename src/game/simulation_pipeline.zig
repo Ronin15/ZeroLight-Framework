@@ -45,6 +45,7 @@ const AffectSystem = @import("systems/affect.zig").AffectSystem;
 const CollisionStats = @import("systems/collision.zig").CollisionStats;
 const CollisionStrips = @import("systems/collision.zig").CollisionStrips;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
+const collision_range_alignment_items = @import("systems/collision.zig").collision_range_alignment_items;
 const CollisionResponseStats = @import("systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("systems/collision_response.zig").CollisionResponseSystem;
 const estimateTriggerCapacity = @import("systems/collision_response.zig").estimateTriggerCapacity;
@@ -727,8 +728,8 @@ fn metric(value: usize) u64 {
     return @intCast(value);
 }
 
-/// The population seam's geometric growth target: 1.5x plus one 16-row alignment
-/// block, hot-store aligned (e.g. 12 -> 48, 37 -> 80, 7 -> 32).
+/// The seams' geometric growth target (population rows, stored trigger pairs): 1.5x plus
+/// one 16-row alignment block, hot-store aligned (e.g. 12 -> 48, 37 -> 80, 7 -> 32).
 fn grownPopulationCapacity(rows: usize) usize {
     return hotStoreCapacity(rows + rows / 2 + movement_range_alignment_items);
 }
@@ -791,6 +792,8 @@ pub const SimulationPipeline = struct {
     movement_body_capacity: usize,
     /// Once-only flag for the first population-seam growth log.
     population_growth_logged: bool = false,
+    /// Once-only flag for the first stored-trigger contact bound growth log.
+    trigger_bound_logged: bool = false,
     /// This pipeline's share of `frame.events`' `capacity_limit` for perception,
     /// passed through as `PerceptionConfig.max_events_per_step`. Derived share
     /// (`perception_events_per_observer_max` x tracked `AiPerception` rows), exact at
@@ -933,18 +936,57 @@ pub const SimulationPipeline = struct {
     }
 
     /// Reserves `frame.contacts`, `frame.collision_triggers` and the response's intent,
-    /// order, trigger, observer, and gather-range staging to `CollisionSystem.estimateContactCapacity(movement_body_capacity)`,
-    /// the pair bound `collision.reserve` sizes the collision stores to (contacts are a
-    /// subset of candidate pairs, triggers of contacts). Every scene within that bound
+    /// order, trigger, observer, and gather-range staging to the contact bound:
+    /// `CollisionSystem.estimateContactCapacity(movement_body_capacity)`, the pair bound
+    /// `collision.reserve` sizes the collision stores to (dynamic contacts are a subset of
+    /// candidate pairs, triggers of contacts), plus the stored trigger contacts the commit
+    /// seam declared (`collision.reserved_trigger_bound`). Every scene within that bound
     /// runs `collision_detect` and `collision_respond` allocation-free under every
     /// partition; past it the main-thread grow paths run, counted by the collision
     /// system's `pair_bound_overflows`. Grow-only.
     fn reserveContactStreams(self: *SimulationPipeline, frame: *SimulationFrame) !void {
-        const contact_capacity = CollisionSystem.estimateContactCapacity(self.movement_body_capacity);
-        try CollisionSystem.reserveContactStream(&frame.contacts, self.movement_body_capacity);
+        try self.reserveContactStreamsFor(frame, self.collision.reserved_trigger_bound);
+    }
+
+    // Reserves the contact-sized streams to the pair bound over the tracked bodies plus
+    // `trigger_bound` stored trigger contacts.
+    fn reserveContactStreamsFor(self: *SimulationPipeline, frame: *SimulationFrame, trigger_bound: usize) !void {
+        const contact_capacity = CollisionSystem.estimateContactCapacity(self.movement_body_capacity) +| trigger_bound;
+        try CollisionSystem.reserveContactStream(&frame.contacts, contact_capacity);
         // Response writes the trigger stream as one range.
         try frame.collision_triggers.reserve(1, estimateTriggerCapacity(contact_capacity));
         try self.collision_response.reserveForContacts(contact_capacity, self.pathfinding.capacity.worker_participant_count);
+    }
+
+    // The seam's check: stored pairs past the declared trigger bound grow it geometrically.
+    // O(1) when they fit.
+    fn topUpTriggerContactBound(self: *SimulationPipeline, frame: *SimulationFrame) !void {
+        const pairs: usize = self.collision.trigger_store.pair_count;
+        if (pairs <= self.collision.reserved_trigger_bound) return;
+        try self.growTriggerContactBound(frame, pairs);
+    }
+
+    // Reserves every contact-sized stream to the grown sum first, then declares the bound,
+    // which `reserveTriggerContacts` raises last: an OOM leaves the bound unchanged and the
+    // next seam retries.
+    fn growTriggerContactBound(self: *SimulationPipeline, frame: *SimulationFrame, pairs: usize) !void {
+        @branchHint(.cold);
+        // The streams' pair bound and the one collision counts against are the same figure.
+        std.debug.assert(self.collision.reserved_pair_bound == CollisionSystem.estimateContactCapacity(self.movement_body_capacity));
+        const bound = grownPopulationCapacity(pairs);
+        try self.reserveContactStreamsFor(frame, bound);
+        const contact_capacity = self.collision.reserved_pair_bound +| bound;
+        std.debug.assert(frame.contacts.values.capacity >= contact_capacity);
+        std.debug.assert(frame.contacts.counts.capacity >= maxRangeCount(contact_capacity, collision_range_alignment_items));
+        std.debug.assert(frame.collision_triggers.values.capacity >= estimateTriggerCapacity(contact_capacity));
+        try self.collision.reserveTriggerContacts(bound);
+        if (!self.trigger_bound_logged) {
+            self.trigger_bound_logged = true;
+            if (comptime logging.enabled(.info)) logging.game.info(
+                "collision seam grew the stored trigger contact bound to {d}",
+                .{bound},
+            );
+        }
     }
 
     /// The most ranges steering's avoidance pass appends to `frame.intents` and to
@@ -1151,19 +1193,24 @@ pub const SimulationPipeline = struct {
         self.static_colliders.capture(frame);
     }
 
-    /// Applies the captured static changes, records them for nav, then syncs collision's
-    /// stored triggers to this revision so the next step's update does not patch. The chunk
-    /// rewrite, the trigger query, and the store's page rewrite thread under
-    /// `thread_system`. A warm patch's main work is O(1) per edit record and touched page,
-    /// flat in stored pairs. A collider sync error leaves the rows unchanged and keeps the
-    /// changes. A trigger sync error leaves the synced rows and nav marks in place; the next
-    /// update or seam retries it.
-    pub fn syncStaticColliders(self: *SimulationPipeline, data: *const DataSystem, thread_system: *ThreadSystem) !void {
+    /// Clears the seam's trigger batch records, applies the captured static changes, records
+    /// them for nav, then syncs collision's stored triggers to this revision so the next
+    /// step's update does not patch. Last, stored pairs past the declared trigger contact
+    /// bound grow it, with every contact-sized stream in `frame` and the response, so the
+    /// next step emits them allocation-free. The chunk rewrite, the trigger query, and the
+    /// store's page rewrite thread under `thread_system`. A warm patch's main work is O(1)
+    /// per edit record and touched page, flat in stored pairs; the bound check is O(1) and
+    /// its growth geometric. A collider sync error leaves the rows unchanged and keeps the
+    /// changes. A trigger sync or bound growth error leaves the synced rows and nav marks in
+    /// place; the next update or seam retries the sync, and the next seam the growth.
+    pub fn syncStaticColliders(self: *SimulationPipeline, frame: *SimulationFrame, data: *const DataSystem, thread_system: *ThreadSystem) !void {
+        self.collision.resetSeamBatches();
         try self.static_colliders.sync(data, thread_system);
         self.pathfinding.recordStaticColliderChanges(self.static_colliders.changesThisStep());
         const view = self.static_colliders.view();
         try self.collision.reserveDebugRects(view.row_of_index.len);
         try self.collision.syncCommittedTriggers(data, view, thread_system);
+        try self.topUpTriggerContactBound(frame);
     }
 
     /// Records the commit seam's stage batches: the collider sync's plan and the trigger
@@ -3130,7 +3177,7 @@ fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame,
     _ = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
     pipeline.captureStaticColliderChanges(frame);
     const sync = pipeline.syncPopulationCapacity(frame, data);
-    const colliders = pipeline.syncStaticColliders(data, &serial_threads);
+    const colliders = pipeline.syncStaticColliders(frame, data, &serial_threads);
     const nav_update = if (sync) |_| (if (colliders) |_| pipeline.reactToPostCommitNavEvents(frame, world, &serial_threads) else |err| err) else |err| err;
     pipeline.reactToPostCommitSteeringEvents(frame);
     const sync_stats = try sync;
@@ -3273,7 +3320,7 @@ fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: AdaptiveW
     defer frame.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
-    const headroom: usize = 16 * pathing_crowd_count;
+    const headroom: usize = structuralEventHeadroom(pathing_crowd_count, 0);
     const bounds_width = world.worldWidthPixels();
     const bounds_height = world.worldHeightPixels();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, bounds_width, bounds_height, .{
@@ -7267,7 +7314,7 @@ test "a static committed at the seam pushes steering agents on the next step" {
     try std.testing.expectApproxEqAbs(@as(f32, 0), try steeringStageLateralForTest(&pipeline, context, agent), 0.001);
 
     // After the seam's sync, the stage pushes the agent away from the box (+y).
-    try pipeline.syncStaticColliders(&data, &serial_threads);
+    try pipeline.syncStaticColliders(&frame, &data, &serial_threads);
     pipeline.reactToPostCommitSteeringEvents(&frame);
     try std.testing.expect(try steeringStageLateralForTest(&pipeline, context, agent) > 0.05);
 }
@@ -7301,7 +7348,7 @@ test "a static move plans and splices its collider's chunk lists, and a seam wit
     try pipeline.reserveStaticColliders(&frame, &data);
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
-    try pipeline.syncStaticColliders(&data, &serial_threads);
+    try pipeline.syncStaticColliders(&frame, &data, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), pipeline.static_colliders.last_batches.get(.plan).item_count);
     try std.testing.expect(pipeline.static_colliders.last_batches.get(.rewrite).item_count > 0);
 
@@ -7310,9 +7357,109 @@ test "a static move plans and splices its collider's chunk lists, and a seam wit
     try pipeline.reserveStaticColliders(&frame, &data);
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
-    try pipeline.syncStaticColliders(&data, &serial_threads);
+    try pipeline.syncStaticColliders(&frame, &data, &serial_threads);
     try std.testing.expectEqual(@as(usize, 0), pipeline.static_colliders.last_batches.get(.plan).item_count);
     try std.testing.expectEqual(@as(usize, 0), pipeline.static_colliders.last_batches.get(.rewrite).item_count);
+}
+
+test "a step after a growing trigger sync at the collider seam allocates nothing" {
+    // 32 static solids stacked on one spot turn into triggers in one mode-only commit,
+    // storing 32 * 31 / 2 = 496 pairs past the pair bound of the grown body capacity, with
+    // the population and shape of the warmed step unchanged. The seam's top-up covers them,
+    // so the next step emits every stored contact on a real 2-worker partition with every
+    // contact-sized allocator failing.
+    const trigger_count: usize = 32;
+    const headroom: usize = structuralEventHeadroom(trigger_count, 0);
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = headroom,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + headroom);
+    try frame.reservePathRequests(1, 4);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 4);
+    var player_state = player;
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player_state,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+        .sim_view = fullWorldSimView(&world),
+    };
+    // Warm step and seam at the initial population.
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+
+    const spot = math.Vec2{ .x = 600, .y = 300 };
+    var creates: [trigger_count]StructuralCommand = undefined;
+    for (&creates) |*command| command.* = .{ .create_entity = .{
+        .movement_body = .{ .position = spot, .previous_position = spot, .velocity = .{}, .speed = 0 },
+        .collision_bounds = .{ .size = .{ .x = 20, .y = 20 } },
+        .collision_response = .{ .mode = .solid, .mobility = .static },
+        .world_level = 0,
+    } };
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &creates);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.collision.trigger_store.pair_count);
+
+    // Warm step and seam at the final population and shape.
+    try markAllAlwaysActive(&data);
+    pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+
+    var mode_changes: [trigger_count]StructuralCommand = undefined;
+    var changed: usize = 0;
+    for (data.movementBodySliceConst().entities) |entity| {
+        if (entity.eql(player.entity)) continue;
+        mode_changes[changed] = .{ .set_collision_response = .{ .entity = entity, .response = .{ .mode = .trigger, .mobility = .static } } };
+        changed += 1;
+    }
+    try std.testing.expectEqual(trigger_count, changed);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &mode_changes);
+    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    const pair_count: usize = pipeline.collision.trigger_store.pair_count;
+    try std.testing.expectEqual(@as(usize, trigger_count * (trigger_count - 1) / 2), pair_count);
+    try std.testing.expect(pair_count > pipeline.collision.reserved_pair_bound);
+    try std.testing.expect(pipeline.collision.reserved_trigger_bound >= pair_count);
+
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var to = TestAllocatorSwap.get(targets);
+    to.collision = failing.allocator();
+    to.contacts = failing.allocator();
+    to.collision_triggers = failing.allocator();
+    to.collision_response = failing.allocator();
+    var swap: TestAllocatorSwap = .{};
+    swap.install(targets, to);
+    const result = pipeline.update(context);
+    swap.restore(targets);
+    const stats = try result;
+
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(stats.collision.contact_count > pipeline.collision.reserved_pair_bound);
+    try std.testing.expectEqual(stats.collision.contact_count, frame.contacts.mergedItems().len);
 }
 
 test "a structural burst over its own event share fails the same whether other producers are idle or saturated" {

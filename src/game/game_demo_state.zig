@@ -663,14 +663,16 @@ const DemoCommitResult = struct {
 
 /// The demo's structural-commit seam, in order: the static-collider and static nav-mark
 /// reserve, the budgeted commit, the collider capture of the step's static changes, the
-/// population growth seam, the collider sync and its nav record (run even when the growth
-/// seam failed, so the step's static changes land and reach nav), then the post-commit
-/// reactions. The nav apply runs only after a successful growth seam and collider sync,
-/// keeping every recorded mark for the next step otherwise; the steering reaction
-/// (allocation-free flag setting) always runs, and the first growth, collider, or nav error
-/// is returned only after it. Steering reads the synced collider rows, so a growth or nav
-/// failure still leaves it on the committed statics; a failed collider sync keeps steering
-/// on the pre-commit rows and keeps its changes for the next step's sync, which converges.
+/// population growth seam, the collider sync with its nav record and the stored-trigger
+/// contact bound growth (run even when the growth seam failed, so the step's static changes
+/// land and reach nav), then the post-commit reactions. The nav apply runs only after a
+/// successful growth seam and collider sync, keeping every recorded mark for the next step
+/// otherwise (a failed trigger bound growth counts as a failed sync and retries next seam);
+/// the steering reaction (allocation-free flag setting) always runs, and the first growth,
+/// collider, or nav error is returned only after it. Steering reads the synced collider
+/// rows, so a growth or nav failure still leaves it on the committed statics; a failed
+/// collider sync keeps steering on the pre-commit rows and keeps its changes for the next
+/// step's sync, which converges.
 fn commitStructuralAndReact(
     pipeline: *SimulationPipeline,
     frame: *SimulationFrame,
@@ -690,7 +692,7 @@ fn commitStructuralAndReact(
     // Population growth seam: the post-commit reactions and the next step see grown
     // capacities. O(1) when the committed rows fit the tracked capacities.
     const population_sync = pipeline.syncPopulationCapacity(frame, data);
-    const collider_sync = pipeline.syncStaticColliders(data, thread_system);
+    const collider_sync = pipeline.syncStaticColliders(frame, data, thread_system);
     const nav_update = if (population_sync) |_|
         (if (collider_sync) |_| pipeline.reactToPostCommitNavEvents(frame, world, thread_system) else |err| err)
     else |err|

@@ -537,7 +537,7 @@ fn checkSlotReplayFlag(allocator: std.mem.Allocator, io: std.Io) !void {
     try system.reserve(body_count);
     var contacts = RangeOutputStream(CollisionContact).init(allocator);
     defer contacts.deinit();
-    try CollisionSystem.reserveContactStream(&contacts, body_count);
+    try CollisionSystem.reserveContactStream(&contacts, CollisionSystem.estimateContactCapacity(body_count));
     const config: CollisionConfig = .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false };
     const replayed = try system.update(&data, &contacts, &threads, config);
     if (replayed.candidate_pair_count != 120 + 64 or replayed.candidate_pair_count > system.reserved_pair_bound) return error.CollisionReplayFixtureMismatch;
