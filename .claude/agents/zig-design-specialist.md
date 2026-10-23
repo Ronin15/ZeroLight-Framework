@@ -110,7 +110,9 @@ section with nothing new is omitted.
   the item unit and why its count tracks the work, with the dispatch figures
   (`threading.md` § Building a stage). Name each pass's own tuner; a tuner
   or selection two passes share, or a dispatch at a fixed shape outside a
-  tuner, fails the plan.
+  tuner, fails the plan. Give each threaded pass's work per dispatch at a
+  small and a typical size against the gate; a pass that sits near the gate
+  is fused or batched across units, never threaded as is (batch shape).
 - **Main-thread and deferred boundaries**: what stays on the main thread and
   the deterministic merge (`threading.md`).
 - **Pre-implementation check** (`engine-design.md` § Cost model) against the

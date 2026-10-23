@@ -114,7 +114,8 @@ scope only where the diff relies on it.
    inline run proves no threaded parity. A change path whose named
    cost-driver stage has no `runtime_perf_log` entry is a finding; so is logging stages beyond the cost
    drivers (`threading.md`). A tuner or selection reached by two passes, or
-   a production dispatch at a fixed shape outside a tuner, is a finding.
+   a production dispatch at a fixed shape outside a tuner, is a finding; so
+   is a threaded pass whose dispatches sit near the gate (batch shape).
    **Test and production code**, every review: check every touched file
    against `tests-benchmarks.md` § Test and production code; each departure
    is a finding.
