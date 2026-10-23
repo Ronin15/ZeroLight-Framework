@@ -23,7 +23,7 @@ const logging = @import("../../core/logging.zig");
 const pdq = @import("../../core/sort.zig").pdq;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
-const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
+const rebuild_tuner_config = @import("../../app/thread_system.zig").rebuild_tuner_config;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
@@ -36,6 +36,7 @@ const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const StageShape = @import("../../app/thread_system.zig").StageShape;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
+const changedCapacities = @import("../../app/thread_system.zig").changedCapacities;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const setRowCount = @import("../../app/thread_system.zig").setRowCount;
 const compactRowWindows = @import("../../app/thread_system.zig").compactRowWindows;
@@ -802,10 +803,6 @@ fn orderGroupBit(bit: u16, group: QueryGroup) std.math.Order {
 }
 
 pub const StaticColliderSystem = struct {
-    /// A rebuild stage's tuner config: a world-create rebuild is a one-off, so a fresh
-    /// tuner's first rebuild dispatches on the full pool instead of inline on main.
-    pub const rebuild_tuner_config = AdaptiveWorkTunerConfig{ .first_selection = .full_pool };
-
     allocator: std.mem.Allocator,
     geometry: ?ColliderGeometry = null,
     rows: std.MultiArrayList(Row) = .{},
@@ -2078,12 +2075,6 @@ pub const StaticColliderSystem = struct {
             self.coarse_items.capacity,          self.nav_inserts.capacity,         self.query_inserts.capacity,
             self.coarse_inserts.capacity,        self.changes.capacity,
         };
-    }
-
-    fn changedCapacities(before: []const usize, after: []const usize) usize {
-        var changed: usize = 0;
-        for (before, after) |old, new| changed += @intFromBool(old != new);
-        return changed;
     }
 
     // The sync plan's scratch, one entry per pending index, its columns lane-aligned.

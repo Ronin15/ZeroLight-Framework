@@ -28,6 +28,7 @@ const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const rebuild_tuner_config = @import("../../app/thread_system.zig").rebuild_tuner_config;
 const setRowCount = @import("../../app/thread_system.zig").setRowCount;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
@@ -61,9 +62,8 @@ const TriggerStore = collision_triggers.TriggerStore;
 const StoreThreads = collision_triggers.StoreThreads;
 const EditSource = collision_triggers.EditSource;
 const InsertEdit = collision_triggers.InsertEdit;
-const TreePath = collision_triggers.TreePath;
+const PageLocation = collision_triggers.PageLocation;
 const DropPiece = collision_triggers.DropPiece;
-const no_entry = @import("chunk_list_map.zig").no_entry;
 
 pub const collision_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -528,7 +528,7 @@ const HitColumns = struct {
 
 // Exactly `n` rows. `setCapacity` allocates even when the capacity already matches,
 // so a warm slot only sets the row count.
-fn ensureHitRows(hits: *std.MultiArrayList(HitRow), allocator: std.mem.Allocator, n: usize) !void {
+fn ensureHitRows(hits: *std.MultiArrayList(HitRow), allocator: std.mem.Allocator, n: usize) error{OutOfMemory}!void {
     if (hits.capacity < n) try hits.setCapacity(allocator, n);
     setRowCount(HitRow, hits, n);
 }
@@ -614,13 +614,14 @@ const trigger_records_per_item: usize = broadphase_pairs_per_item;
 const TriggerQueryMode = enum { patch, rebuild };
 
 // One trigger query range's edits in item order, and one query's hits and kernel contacts.
-// Grow-only for the system's life, so each slot keeps its lists' capacity.
+// Grow-only across patches, so each slot keeps its lists' capacity; a rebuild frees what
+// only its query reserved (`releaseRebuildQuerySlots`).
 const TriggerQuerySlot = struct {
     hits: std.MultiArrayList(HitRow) = .{},
     contacts: std.ArrayList(KeyedContact) = .empty,
     inserts: std.ArrayList(InsertEdit) = .empty,
-    // Patch only: `inserts[i]`'s located path.
-    insert_paths: std.ArrayList(TreePath) = .empty,
+    // Patch only: the page `inserts[i]`'s key falls in.
+    insert_pages: std.ArrayList(PageLocation) = .empty,
     drops: std.ArrayList(DropPiece) = .empty,
     // The records the range's items owe, held or not.
     insert_need: usize = 0,
@@ -634,7 +635,7 @@ const TriggerQuerySlot = struct {
     fn clear(self: *TriggerQuerySlot) void {
         self.contacts.clearRetainingCapacity();
         self.inserts.clearRetainingCapacity();
-        self.insert_paths.clearRetainingCapacity();
+        self.insert_pages.clearRetainingCapacity();
         self.drops.clearRetainingCapacity();
         self.insert_need = 0;
         self.drop_need = 0;
@@ -646,22 +647,22 @@ const TriggerQuerySlot = struct {
         self.hits.deinit(allocator);
         self.contacts.deinit(allocator);
         self.inserts.deinit(allocator);
-        self.insert_paths.deinit(allocator);
+        self.insert_pages.deinit(allocator);
         self.drops.deinit(allocator);
     }
 
-    // `path` is null in a rebuild, which locates nothing.
-    fn pushInsert(self: *TriggerQuerySlot, edit: InsertEdit, path: ?TreePath) void {
+    // `page` is null in a rebuild, which locates nothing.
+    fn pushInsert(self: *TriggerQuerySlot, edit: InsertEdit, page: ?PageLocation) void {
         self.insert_need += 1;
         if (self.overflowed) return;
         const fits = self.inserts.items.len < self.inserts.capacity and
-            (path == null or self.insert_paths.items.len < self.insert_paths.capacity);
+            (page == null or self.insert_pages.items.len < self.insert_pages.capacity);
         if (!fits) {
             self.overflowed = true;
             return;
         }
         self.inserts.appendAssumeCapacity(edit);
-        if (path) |located| self.insert_paths.appendAssumeCapacity(located);
+        if (page) |located| self.insert_pages.appendAssumeCapacity(located);
     }
 
     fn pushDrop(self: *TriggerQuerySlot, piece: DropPiece) void {
@@ -747,9 +748,7 @@ pub const CollisionSystem = struct {
     static_place_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     static_sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     trigger_query_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    // A collider rebuild is a one-off, so a fresh tuner's first rebuild query takes the full
-    // pool instead of running inline on main.
-    trigger_query_rebuild_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{ .first_selection = .full_pool }),
+    trigger_query_rebuild_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(rebuild_tuner_config),
     emit_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     strips: CollisionStrips = .default,
     static_pair_slots: SlotList(StaticPairBuffer) = .empty,
@@ -769,12 +768,16 @@ pub const CollisionSystem = struct {
     trigger_store: TriggerStore,
     // The strips the stored keys were built with.
     trigger_strips: CollisionStrips = .default,
-    // Per trigger query range; grow-only, never reset through `setSlotCount`.
+    // Per trigger query range; never reset through `setSlotCount`, so a slot keeps its
+    // lists. Patches only grow them; a rebuild trims them to the patches' slots.
     trigger_query_slots: SlotList(TriggerQuerySlot) = .empty,
     trigger_edit_sources: std.ArrayList(EditSource) = .empty,
     emit_ranges: SlotList(EmitRange) = .empty,
-    /// The last seam trigger query's batch shape; reset by every `refreshCommittedTriggers`.
+    /// The last patch query's batch shape; `syncCommittedTriggers` resets it first, so after
+    /// a seam that rebuilt or did nothing it holds none.
     trigger_query_batch: BatchStats = .{},
+    /// The last rebuild query's batch shape; reset by every rebuild.
+    trigger_rebuild_query_batch: BatchStats = .{},
     // By entity index: the `change_generation` that last stamped it as changed.
     change_mark: std.ArrayList(u32) = .empty,
     change_generation: u32 = 1,
@@ -789,11 +792,12 @@ pub const CollisionSystem = struct {
     static_slot_warned: bool = false,
     entry_bound_warned: bool = false,
     contact_bound_warned: bool = false,
+    trigger_slot_growth_logged: bool = false,
     perf: Perf = .{},
 
     /// Telemetry, kept only with `runtime_perf_log.enabled`. Every grow path it counts runs on
     /// the main thread between batches; the contacts are identical either way, and each
-    /// warns once.
+    /// logs once.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         /// Reserved steps that outgrew the pair bound (perf metric
         /// `collision_pair_bound_exceeded`), counted once per step. Either the candidate
@@ -808,6 +812,9 @@ pub const CollisionSystem = struct {
         /// grew the first time) or whose fill spilled past a range's spill slot (the slot
         /// grew and the fill replayed), counted once per step.
         entry_bound_overflows: u64 = 0,
+        /// Trigger queries whose range slots grew, before the query or for its replay,
+        /// counted once per query.
+        trigger_slot_grows: u64 = 0,
     } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) CollisionSystem {
@@ -937,14 +944,16 @@ pub const CollisionSystem = struct {
     /// touch. Anything else rebuilds from the row pool. Growth is this call's, on this
     /// thread; the query and the store's stages use `thread_system` and run inline below
     /// their gates. Strips are the last collision step's, the engine tile until one has run.
-    /// The next `update` with this revision does not patch. An error leaves the stored
-    /// pairs and revision unchanged.
-    pub fn refreshCommittedTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, thread_system: *ThreadSystem) !void {
-        // Reset first: the seam's batches are recorded every step, refresh or not.
+    /// The next `update` with this revision does not patch. A patch error leaves the stored
+    /// pairs and revision unchanged; a rebuild error leaves the store empty and not ready.
+    /// Either way the next call, or the next `update`, retries: a rebuild after a rebuild
+    /// error.
+    pub fn syncCommittedTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, thread_system: *ThreadSystem) error{OutOfMemory}!void {
+        // Reset first: the seam's patch batches are recorded every step, patched or not.
         self.trigger_query_batch = .{};
         self.trigger_store.last_batches = .initFill(.{});
         if (view.geometry == null) return;
-        try self.refreshTriggers(data, view, .{
+        try self.syncTriggers(data, view, .{
             .thread_system = thread_system,
             .config = .{ .strips = self.strips, .static_colliders = view },
         });
@@ -1491,7 +1500,7 @@ pub const CollisionSystem = struct {
     fn gatherStaticPairs(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, exclude_tiers: bool, stats: *CollisionStats) !bool {
         self.static_pairs.clearRetainingCapacity();
         if (view.geometry == null) return false;
-        try self.refreshTriggers(data, view, threads);
+        try self.syncTriggers(data, view, threads);
         if (self.trigger_store.refresh(storeThreads(threads), data)) {
             if (comptime runtime_perf_log.enabled) stats.perf.trigger_refresh_batch = self.trigger_store.last_batches.get(.refresh);
         }
@@ -1623,9 +1632,11 @@ pub const CollisionSystem = struct {
     }
 
     // Brings the trigger store up to `view`: nothing at its revision, a patch for the next
-    // revision with changes at the same strips, else a rebuild. Allocates only before the
-    // store's first stored mutation, so an error leaves it at its revision for the retry.
-    fn refreshTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
+    // revision with changes at the same strips, else a rebuild. A patch allocates only
+    // before the store's first stored mutation, so its error keeps the stored pairs and
+    // revision; a rebuild's error leaves the store empty and not ready, so the retry
+    // rebuilds.
+    fn syncTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) error{OutOfMemory}!void {
         const store = &self.trigger_store;
         const same = store.ready and self.trigger_strips.height == self.strips.height;
         if (same and view.revision == store.seen_revision) return;
@@ -1642,17 +1653,17 @@ pub const CollisionSystem = struct {
     }
 
     // A rebuild is a cold one-off over the row pool: frees what its query reserved past the
-    // patch query's, so the slots follow changes, not rows. A patch reserves `insert_paths`
+    // patch query's, so the slots follow changes, not rows. A patch reserves `insert_pages`
     // with `inserts` in every range it runs, so the slots patches used are the prefix
-    // holding paths; the rest are the rebuild's alone. Cannot fail: a shrink that cannot
+    // holding pages; the rest are the rebuild's alone. Cannot fail: a shrink that cannot
     // move keeps its capacity.
     fn releaseRebuildQuerySlots(self: *CollisionSystem) void {
         const slots = self.trigger_query_slots.items;
         var patch_slots: usize = 0;
-        while (patch_slots < slots.len and slots[patch_slots].value.insert_paths.capacity != 0) patch_slots += 1;
+        while (patch_slots < slots.len and slots[patch_slots].value.insert_pages.capacity != 0) patch_slots += 1;
         for (slots[0..patch_slots]) |*padded| {
             const slot = &padded.value;
-            if (slot.inserts.capacity > slot.insert_paths.capacity) slot.inserts.clearAndFree(self.allocator);
+            if (slot.inserts.capacity > slot.insert_pages.capacity) slot.inserts.clearAndFree(self.allocator);
         }
         for (slots[patch_slots..]) |*padded| padded.value.deinit(self.allocator);
         self.trigger_query_slots.shrinkAndFree(self.allocator, patch_slots);
@@ -1662,10 +1673,15 @@ pub const CollisionSystem = struct {
     }
 
     // The trigger query stage over the revision's changes or the row pool, under that mode's
-    // tuner; returns its range count. A range past its slot grows it and the stage replays,
-    // and only the pass that wrote every record is recorded.
-    fn runTriggerQuery(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, mode: TriggerQueryMode) !usize {
-        self.trigger_query_batch = .{};
+    // tuner and into that mode's batch record; returns its range count. A range past its
+    // slot grows it and the stage replays, and only the pass that wrote every record is
+    // recorded.
+    fn runTriggerQuery(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, mode: TriggerQueryMode) error{OutOfMemory}!usize {
+        const record = switch (mode) {
+            .patch => &self.trigger_query_batch,
+            .rebuild => &self.trigger_rebuild_query_batch,
+        };
+        record.* = .{};
         const items = switch (mode) {
             .patch => view.changes.len,
             .rebuild => view.row_entity.len,
@@ -1706,14 +1722,25 @@ pub const CollisionSystem = struct {
             grew = true;
         }
         if (selection.active_tuner) |active| active.record(batch);
-        self.trigger_query_batch = batch;
-        if (grew) self.trigger_store.countSlotGrowth();
+        record.* = batch;
+        if (grew) self.noteTriggerSlotGrowth();
         return selection.range_count;
+    }
+
+    // A trigger query whose range slots grew. `reserve` does not size these slots (a patch's
+    // records follow its changes), so growth is their designed warm-up and logs at info, as
+    // the spill slots do.
+    fn noteTriggerSlotGrowth(self: *CollisionSystem) void {
+        @branchHint(.cold);
+        if (comptime runtime_perf_log.enabled) self.perf.trigger_slot_grows += 1;
+        if (self.trigger_slot_growth_logged) return;
+        self.trigger_slot_growth_logged = true;
+        if (comptime logging.enabled(.info)) logging.game.info("collision trigger query slots grew", .{});
     }
 
     // Reserves every range's slot at the selection: `trigger_records_per_item` edit records
     // per item it covers and one query's hit rows. Grow-only; returns whether any list grew.
-    fn prepareTriggerQuerySlots(self: *CollisionSystem, selection: BatchSelection, items: usize, mode: TriggerQueryMode) !bool {
+    fn prepareTriggerQuerySlots(self: *CollisionSystem, selection: BatchSelection, items: usize, mode: TriggerQueryMode) error{OutOfMemory}!bool {
         const range_count = selection.range_count;
         var grew = false;
         if (self.trigger_query_slots.capacity < range_count) {
@@ -1726,7 +1753,7 @@ pub const CollisionSystem = struct {
             const records = trigger_records_per_item * rangeLenForIndex(items, selection.items_per_range, range_index);
             grew = try reserveRecords(InsertEdit, &slot.inserts, self.allocator, records) or grew;
             if (mode == .patch) {
-                grew = try reserveRecords(TreePath, &slot.insert_paths, self.allocator, records) or grew;
+                grew = try reserveRecords(PageLocation, &slot.insert_pages, self.allocator, records) or grew;
                 grew = try reserveRecords(DropPiece, &slot.drops, self.allocator, records) or grew;
             }
             if (slot.hits.len < reserved_query_hits) {
@@ -1744,7 +1771,7 @@ pub const CollisionSystem = struct {
 
     // Grows each slot the last pass outgrew, before its replay: hit rows geometrically past
     // its largest query (its contacts with them), and each record list past its need.
-    fn growTriggerQuerySlots(self: *CollisionSystem, range_count: usize, mode: TriggerQueryMode) !bool {
+    fn growTriggerQuerySlots(self: *CollisionSystem, range_count: usize, mode: TriggerQueryMode) error{OutOfMemory}!bool {
         var grew = false;
         for (self.trigger_query_slots.items[0..range_count]) |*padded| {
             const slot = &padded.value;
@@ -1754,7 +1781,7 @@ pub const CollisionSystem = struct {
                 grew = true;
             }
             grew = try reserveRecords(InsertEdit, &slot.inserts, self.allocator, slot.insert_need) or grew;
-            if (mode == .patch) grew = try reserveRecords(TreePath, &slot.insert_paths, self.allocator, slot.insert_need) or grew;
+            if (mode == .patch) grew = try reserveRecords(PageLocation, &slot.insert_pages, self.allocator, slot.insert_need) or grew;
             grew = try reserveRecords(DropPiece, &slot.drops, self.allocator, slot.drop_need) or grew;
         }
         return grew;
@@ -1768,7 +1795,7 @@ pub const CollisionSystem = struct {
             std.debug.assert(!slot.overflowed);
             self.trigger_edit_sources.appendAssumeCapacity(.{
                 .inserts = slot.inserts.items,
-                .insert_paths = if (mode == .patch) slot.insert_paths.items else &.{},
+                .insert_pages = if (mode == .patch) slot.insert_pages.items else &.{},
                 .drops = slot.drops.items,
             });
         }
@@ -1777,7 +1804,7 @@ pub const CollisionSystem = struct {
 
     // Stamps every changed entity index with a fresh generation, growing the column to the
     // highest changed index. O(changes).
-    fn markChanges(self: *CollisionSystem, changes: []const ColliderChange) !void {
+    fn markChanges(self: *CollisionSystem, changes: []const ColliderChange) error{OutOfMemory}!void {
         self.change_generation +%= 1;
         if (self.change_generation == 0) {
             @memset(self.change_mark.items, 0);
@@ -1793,38 +1820,24 @@ pub const CollisionSystem = struct {
     }
 
     // The static place, then the sort back into `static_pairs`, each under its own tuner.
-    fn sortStaticPairs(self: *CollisionSystem, threads: Threads, stats: *CollisionStats) !void {
-        const count = self.static_pairs.items.len;
-        if (count == 0) return;
-        const place_stage = threads.stage(&self.static_place_tuner);
-        const place = place_stage.select(count, collision_range_alignment_items);
-        try self.sort_staging.ensureTotalCapacity(self.allocator, count);
-        self.sort_staging.items.len = count;
-        try self.sort_offsets.ensureTotalCapacity(self.allocator, place.range_count);
-        while (self.sort_offsets.items.len < place.range_count) self.sort_offsets.appendAssumeCapacity(.{});
+    fn sortStaticPairs(self: *CollisionSystem, threads: Threads, stats: *CollisionStats) error{OutOfMemory}!void {
         const segments = [_][]const KeyedContact{self.static_pairs.items};
         const segment_starts = [_]usize{0};
-        var place_job = PairSort.PlaceJob{
-            .splitters = PairSort.segmentSplitters(&segments, &segment_starts, count),
-            .segments = &segments,
-            .segment_starts = &segment_starts,
-            .staging = self.sort_staging.items,
-            .items_per_range = place.items_per_range,
-            .offsets = self.sort_offsets.items,
-        };
-        const place_batch = place_stage.run(place, count, collision_range_alignment_items, &place_job, PairSort.placeJob);
-        if (comptime runtime_perf_log.enabled) stats.perf.static_place_batch = place_batch;
-        const sort_stage = threads.stage(&self.static_sort_tuner);
-        const sort = sort_stage.select(count, collision_range_alignment_items);
-        // The place copied every pair into the staging windows, so the sort writes them back.
-        var sort_job = PairSort.SortJob{
-            .source = .{ .staging = self.sort_staging.items, .band_offsets = self.sort_offsets.items[0..place.range_count], .window_stride = place.items_per_range },
-            .dest = self.static_pairs.items,
-            .starts = banded_sort.sumBandOffsets(self.sort_offsets.items[0..place.range_count]),
-            .range_count = sort.range_count,
-        };
-        const batch = sort_stage.run(sort, count, collision_range_alignment_items, &sort_job, PairSort.sortJob);
-        if (comptime runtime_perf_log.enabled) stats.perf.static_sort_batch = batch;
+        const batches = try PairSort.sortSegments(
+            self.allocator,
+            threads.stage(&self.static_place_tuner),
+            threads.stage(&self.static_sort_tuner),
+            &segments,
+            &segment_starts,
+            collision_range_alignment_items,
+            &self.sort_staging,
+            &self.sort_offsets,
+            self.static_pairs.items,
+        );
+        if (comptime runtime_perf_log.enabled) {
+            stats.perf.static_place_batch = batches.place;
+            stats.perf.static_sort_batch = batches.sort;
+        }
     }
 
     // The dynamic side of the emission in key order: the sorted static pairs alone, or the
@@ -1948,7 +1961,7 @@ fn storeThreads(threads: Threads) StoreThreads {
 }
 
 // Grows `list` to hold `count` records; true when it allocated.
-fn reserveRecords(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, count: usize) !bool {
+fn reserveRecords(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, count: usize) error{OutOfMemory}!bool {
     if (list.capacity >= count) return false;
     try list.ensureTotalCapacity(allocator, count);
     return true;
@@ -2044,15 +2057,15 @@ fn queryNewTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, ro
             .rebuild => partner_trigger,
         };
         if (partner_queries and partner_is_a) continue;
-        const allow = scope.tier[contact.a_movement_index].allowsCollision() and scope.tier[contact.b_movement_index].allowsCollision();
-        const emit = collision_triggers.emit_valid | if (allow) collision_triggers.emit_allowed else 0;
-        switch (job.mode) {
-            .patch => {
-                const located = job.store.locateKey(keyed.key);
-                slot.pushInsert(.{ .key = keyed.key, .contact = contact, .leaf_start = located.leaf_start, .emit = emit }, located.path);
-            },
-            .rebuild => slot.pushInsert(.{ .key = keyed.key, .contact = contact, .leaf_start = 0, .emit = emit }, null),
-        }
+        const edit = InsertEdit{
+            .key = keyed.key,
+            .contact = contact,
+            .emit = collision_triggers.emitBits(scope.tier[contact.a_movement_index].allowsCollision(), scope.tier[contact.b_movement_index].allowsCollision()),
+        };
+        slot.pushInsert(edit, switch (job.mode) {
+            .patch => job.store.locateKey(keyed.key).page,
+            .rebuild => null,
+        });
     }
 }
 
@@ -2075,7 +2088,6 @@ fn queryOldTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, ol
         .max_x = edgePastCell(old.cells.max_x, geometry.grid.width, geometry.cell_size),
         .max_y = edgePastCell(old.cells.max_y, geometry.grid.height, geometry.cell_size),
     };
-    const level_start = store.levelStart(old.level);
     var strip = stripOf(job.strips, old.min_y);
     const last_strip = stripOf(job.strips, reach.max_y);
     while (strip <= last_strip) : (strip += 1) {
@@ -2096,7 +2108,7 @@ fn queryOldTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, ol
             const offset = cursor.offset;
             var end = offset;
             while (end < cursor.page_len and keys[end] <= bounds[1]) end += 1;
-            if (end > offset) slot.pushDrop(.{ .path = cursor.path, .leaf_start = cursor.page_start - level_start, .lo = @intCast(offset), .hi = @intCast(end) });
+            if (end > offset) slot.pushDrop(cursor.dropPiece(offset, end));
             if (end == offset or end < cursor.page_len) break;
             cursor.nextPage();
             if (!cursor.valid()) break;
@@ -2115,11 +2127,7 @@ fn queryOldTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, ol
         const partner_run = bodyRunKey(hits.min_x[hit], hits.min_y[hit], partner);
         if (partner_run >= old_run) continue;
         const key = contactOrderKey(old.level, stripOf(job.strips, @max(hits.min_y[hit], old.min_y)), partner_run, old_run);
-        const located = store.locateKey(key);
-        if (located.path.leaf == no_entry) continue;
-        const keys = store.pageKeys(located.path.leaf)[0..located.page_len];
-        const at = std.sort.lowerBound(u256, keys, key, orderKey);
-        if (at < keys.len and keys[at] == key) slot.pushDrop(.{ .path = located.path, .leaf_start = located.leaf_start, .lo = @intCast(at), .hi = @intCast(at + 1) });
+        if (store.storedPiece(key)) |piece| slot.pushDrop(piece);
     }
 }
 
@@ -2131,10 +2139,6 @@ fn edgePastCell(cell: u32, cells: u32, cell_size: f32) f32 {
 
 fn stripOf(strips: CollisionStrips, y: f32) u32 {
     return math.worldPosToCell(y, strips.height, strip_count);
-}
-
-fn orderKey(key: u256, item: u256) std.math.Order {
-    return std.math.order(key, item);
 }
 
 // ---- Stored-trigger emission (workers) --------------------------------------------------
@@ -2180,11 +2184,6 @@ const EmitJob = struct {
     }
 };
 
-fn emitsStored(emit: u8, exclude: bool) bool {
-    const both = collision_triggers.emit_valid | collision_triggers.emit_allowed;
-    return if (exclude) emit == both else emit & collision_triggers.emit_valid != 0;
-}
-
 // Sizes each range's window: its dynamic contacts plus its stored pairs that pass the
 // filter, whole pages from their header sums.
 // SIMD verdict: scalar. One header load per whole page and at most two partial pages of u8
@@ -2203,7 +2202,7 @@ fn emitCountJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             if (cursor.offset == 0 and take == cursor.page_len) {
                 stored += if (job.exclude) page.header.allowed else page.header.valid;
             } else {
-                for (page.emit[cursor.offset..][0..take]) |emit| stored += @intFromBool(emitsStored(emit, job.exclude));
+                for (page.emit[cursor.offset..][0..take]) |emit| stored += @intFromBool(collision_triggers.emits(emit, job.exclude));
             }
             at += take;
             if (at == bounds.stored_end) break;
@@ -2242,17 +2241,7 @@ fn emitWriteJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             continue;
         }
         const slot = cursor.offset;
-        if (emitsStored(page.emit[slot], job.exclude)) writer.write(.{
-            .a = page.a[slot],
-            .b = page.b[slot],
-            .a_movement_index = page.a_row[slot],
-            .b_movement_index = page.b_row[slot],
-            .normal_x = page.normal_x[slot],
-            .normal_y = page.normal_y[slot],
-            .penetration = page.penetration[slot],
-            .pre_response_max_speed_sq = page.max_speed_sq[slot],
-            .pre_response_relative_speed_sq = page.rel_speed_sq[slot],
-        });
+        if (collision_triggers.emits(page.emit[slot], job.exclude)) writer.write(page.contactAt(slot));
         stored += 1;
         if (stored < bounds.stored_end) {
             cursor.next();
@@ -6136,17 +6125,7 @@ fn storedPairs(system: *const CollisionSystem, arena: std.mem.Allocator) !Stored
         try std.testing.expect(cursor.valid());
         const page = cursor.page();
         const slot = cursor.offset;
-        pair.* = .{ .key = page.keys[slot], .contact = .{
-            .a = page.a[slot],
-            .b = page.b[slot],
-            .a_movement_index = page.a_row[slot],
-            .b_movement_index = page.b_row[slot],
-            .normal_x = page.normal_x[slot],
-            .normal_y = page.normal_y[slot],
-            .penetration = page.penetration[slot],
-            .pre_response_max_speed_sq = page.max_speed_sq[slot],
-            .pre_response_relative_speed_sq = page.rel_speed_sq[slot],
-        } };
+        pair.* = .{ .key = page.keys[slot], .contact = page.contactAt(slot) };
         emit.* = page.emit[slot];
         if (index != 0) try std.testing.expect(walked.pairs[index - 1].key < pair.key);
         cursor.next();
@@ -6203,7 +6182,7 @@ fn expectPatchMatchesRebuild(
     try std.testing.expectEqual(revision + 1, view.revision);
     try std.testing.expect(view.changes.len != 0);
     try std.testing.expect(patched.trigger_store.ready and patched.trigger_store.seen_revision == revision);
-    try patched.refreshCommittedTriggers(data, view, threads);
+    try patched.syncCommittedTriggers(data, view, threads);
     try std.testing.expectEqual(view.revision, patched.trigger_store.seen_revision);
     try updateOn(patched, data, patched_contacts, view, threads, workers);
 
@@ -6616,7 +6595,7 @@ test "collision trigger warm patch allocates nothing on a 2-worker pool" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     setTestAllocator(&fixture.patched, failing.allocator());
     defer setTestAllocator(&fixture.patched, std.testing.allocator);
-    try fixture.patched.refreshCommittedTriggers(&data, fixture.colliders.view(), &fixture.threads);
+    try fixture.patched.syncCommittedTriggers(&data, fixture.colliders.view(), &fixture.threads);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(fixture.colliders.view().revision, fixture.patched.trigger_store.seen_revision);
 }
@@ -6641,14 +6620,46 @@ test "collision trigger rebuild releases its row-pool query records and keeps th
     // Two commits with no seam refresh skip a revision, so the next refresh rebuilds.
     try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 10, 10)});
     try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 20, 20)});
-    try fixture.patched.refreshCommittedTriggers(&data, fixture.colliders.view(), &fixture.threads);
+    try fixture.patched.syncCommittedTriggers(&data, fixture.colliders.view(), &fixture.threads);
     try std.testing.expectEqual(fixture.colliders.view().revision, fixture.patched.trigger_store.seen_revision);
     try std.testing.expectEqual(patch_slots, fixture.patched.trigger_query_slots.items.len);
     for (fixture.patched.trigger_query_slots.items) |padded| {
-        try std.testing.expect(padded.value.inserts.capacity <= padded.value.insert_paths.capacity);
+        try std.testing.expect(padded.value.inserts.capacity <= padded.value.insert_pages.capacity);
     }
     // The next patch re-reserves its records and still matches a rebuild.
     try fixture.commit(&data, &.{movedBody(&data, moved, 10, 10)});
+}
+
+test "collision trigger seam that rebuilt holds no patch batches, and the next seam's patch records its changes" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const moved = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 30, .y = 30, .w = 40, .h = 40 }, .static, .trigger);
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, 0);
+    defer fixture.deinit();
+    const patched = &fixture.patched;
+    // A seam patch fills the patch batches.
+    try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 20, 20)});
+    try patched.syncCommittedTriggers(&data, fixture.colliders.view(), &fixture.threads);
+    try std.testing.expect(patched.trigger_query_batch.item_count != 0);
+    // Two commits with no seam refresh skip a revision, so the next seam rebuilds over a
+    // nonempty row pool.
+    try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 10, 10)});
+    try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 20, 20)});
+    const rebuild_view = fixture.colliders.view();
+    try std.testing.expect(rebuild_view.row_entity.len != 0);
+    try patched.syncCommittedTriggers(&data, rebuild_view, &fixture.threads);
+    try std.testing.expectEqual(rebuild_view.revision, patched.trigger_store.seen_revision);
+    try std.testing.expectEqual(@as(usize, 0), patched.trigger_query_batch.item_count);
+    try std.testing.expectEqual(rebuild_view.row_entity.len, patched.trigger_rebuild_query_batch.item_count);
+    for (patched.trigger_store.last_batches.values) |batch| try std.testing.expectEqual(@as(usize, 0), batch.item_count);
+    // One commit later the seam patches, and its query batch covers exactly the changes.
+    try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 10, 10)});
+    const patch_view = fixture.colliders.view();
+    try std.testing.expect(patch_view.changes.len != 0);
+    try patched.syncCommittedTriggers(&data, patch_view, &fixture.threads);
+    try std.testing.expectEqual(patch_view.changes.len, patched.trigger_query_batch.item_count);
 }
 
 fn expectPatchFailuresKeepStore(workers: usize) !void {
@@ -6672,7 +6683,7 @@ fn expectPatchFailuresKeepStore(workers: usize) !void {
     while (true) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         setTestAllocator(&fixture.patched, failing.allocator());
-        const result = fixture.patched.refreshCommittedTriggers(&data, view, &fixture.threads);
+        const result = fixture.patched.syncCommittedTriggers(&data, view, &fixture.threads);
         setTestAllocator(&fixture.patched, std.testing.allocator);
         if (result) |_| break else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expectEqual(revision, fixture.patched.trigger_store.seen_revision);

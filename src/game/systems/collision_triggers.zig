@@ -19,7 +19,6 @@
 
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
-const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
@@ -30,7 +29,9 @@ const StageControls = @import("../../app/thread_system.zig").StageControls;
 const StageThreads = @import("../../app/thread_system.zig").StageThreads;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
+const changedCapacities = @import("../../app/thread_system.zig").changedCapacities;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const rebuild_tuner_config = @import("../../app/thread_system.zig").rebuild_tuner_config;
 const runShaped = @import("../../app/thread_system.zig").runShaped;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const stageShape = @import("../../app/thread_system.zig").stageShape;
@@ -50,18 +51,31 @@ const payload_slot_alignment = @import("chunk_list_map.zig").payload_slot_alignm
 pub const page_capacity: u32 = 64;
 /// Entries per inner node (F): the largest fanout whose node fits the 2560 B slot class and
 /// whose touched-children set is one u64.
-pub const node_capacity: u32 = 62;
+const node_capacity: u32 = 62;
 // The B+-tree fill bounds of a non-root page and node.
 const page_min: u32 = page_capacity / 2;
 const node_min: u32 = node_capacity / 2;
-/// Inner nodes on a page's path: with u32 pair counts and the fill bounds, a level tree is at
-/// most 6 high, so this is a format width, not a cap.
-pub const max_tree_height = 7;
-/// A stored row whose entity has no movement body.
-pub const no_row: u32 = std.math.maxInt(u32);
-/// `emit` bit 0: both rows resolve. Bit 1: both tiers allow collision.
-pub const emit_valid: u8 = 1;
-pub const emit_allowed: u8 = 2;
+// Inner nodes on a page's path: with u32 pair counts and the fill bounds, a level tree is at
+// most 6 high, so this is a format width, not a cap.
+const max_tree_height = 7;
+// A stored row whose entity has no movement body.
+const no_row: u32 = std.math.maxInt(u32);
+// `emit` bit 0: both rows resolve. Bit 1: both tiers allow collision.
+const emit_valid: u8 = 1;
+const emit_allowed: u8 = 2;
+
+/// The emit bits of a stored pair whose rows both resolve, from each side's tier allowing
+/// collision.
+pub fn emitBits(a_allows: bool, b_allows: bool) u8 {
+    return emit_valid | if (a_allows and b_allows) emit_allowed else 0;
+}
+
+/// True when a stored pair with emit bits `emit` emits a contact: its rows resolve and, with
+/// `exclude`, both tiers allow collision. The page headers' `valid` and `allowed` sums count
+/// this without and with `exclude`.
+pub fn emits(emit: u8, exclude: bool) bool {
+    return if (exclude) emit == emit_valid | emit_allowed else emit & emit_valid != 0;
+}
 
 // Insert place and sort ranges start on cache-line boundaries of the staging and destination
 // windows and span at least one line, as the static pair sort's ranges do.
@@ -164,6 +178,21 @@ pub const Page = struct {
         }
         return view;
     }
+
+    /// Slot `slot`'s pair as a contact, its stored rows widened (`writeInsert`'s inverse).
+    pub fn contactAt(self: Page, slot: usize) CollisionContact {
+        return .{
+            .a = self.a[slot],
+            .b = self.b[slot],
+            .a_movement_index = self.a_row[slot],
+            .b_movement_index = self.b_row[slot],
+            .normal_x = self.normal_x[slot],
+            .normal_y = self.normal_y[slot],
+            .penetration = self.penetration[slot],
+            .pre_response_max_speed_sq = self.max_speed_sq[slot],
+            .pre_response_relative_speed_sq = self.rel_speed_sq[slot],
+        };
+    }
 };
 
 const Node = struct {
@@ -210,52 +239,55 @@ fn levelFirstKey(level: u16) u256 {
     return @as(u256, level) << key_level_shift;
 }
 
-/// One stored pair to insert, with its rows and emit bits current at the patch, located to
-/// the page its key falls in.
+/// One stored pair to insert, with its rows and emit bits current at the patch.
 pub const InsertEdit = struct {
     key: u256,
     contact: CollisionContact,
-    /// Pairs of the key's level before the located page (0 for an empty level).
-    leaf_start: u32,
     emit: u8,
 };
 
-/// A page's place in its level tree: `nodes[h]` is its ancestor at height h + 1 and
-/// `entries[h]` the entry taken there; `nodes[height - 1]` is the level's root. `leaf` is
-/// `no_entry` on an empty level.
-pub const TreePath = struct {
+// A page's place in its level tree: `nodes[h]` is its ancestor at height h + 1 and
+// `entries[h]` the entry taken there; `nodes[height - 1]` is the level's root. `leaf` is
+// `no_entry` on an empty level.
+const TreePath = struct {
     level: u16 = 0,
     leaf: u32 = no_entry,
     nodes: [max_tree_height]u32 = @splat(no_entry),
     entries: [max_tree_height]u8 = @splat(0),
 };
 
-/// Stored slots `[lo, hi)` of the page at `path` to drop.
-pub const DropPiece = struct {
+/// A page's place in its level: its tree path and the pairs of its level before it (0 on an
+/// empty level).
+pub const PageLocation = struct {
     path: TreePath,
     leaf_start: u32,
+};
+
+/// Stored slots `[lo, hi)` of the page at `page` to drop.
+pub const DropPiece = struct {
+    page: PageLocation,
     lo: u8,
     hi: u8,
 };
 
-/// One query range's edits, in range order. `insert_paths[i]` is `inserts[i]`'s path.
+/// One query range's edits, in range order. A patch's `insert_pages[i]` is the page
+/// `inserts[i]`'s key falls in; a rebuild locates nothing and leaves it empty.
 pub const EditSource = struct {
     inserts: []const InsertEdit = &.{},
-    insert_paths: []const TreePath = &.{},
+    insert_pages: []const PageLocation = &.{},
     drops: []const DropPiece = &.{},
 };
 
-/// Where a key falls: its page (the last whose first key is at or below it, else the
-/// level's first), the pairs of its level before that page, and the page's length.
-pub const Locate = struct {
-    path: TreePath,
-    leaf_start: u32,
+// Where a key falls: its page (the last whose first key is at or below it, else the
+// level's first) and the page's length.
+const Locate = struct {
+    page: PageLocation,
     page_len: u32,
 };
 
-/// One level's tree: its root (a page at height 0), its height, and its pair count. An empty
-/// level has root `no_entry`.
-pub const LevelTree = struct {
+// One level's tree: its root (a page at height 0), its height, and its pair count. An empty
+// level has root `no_entry`.
+const LevelTree = struct {
     root: u32 = no_entry,
     pair_count: u32 = 0,
     height: u8 = 0,
@@ -336,10 +368,10 @@ const LevelRank = struct {
 
 // ---- Stages ---------------------------------------------------------------------------
 
-/// A patch or step stage of the store, each under its own tuner.
-pub const TriggerStage = enum { insert_place, insert_sort, leaf, node, refresh };
-/// A rebuild's stages, each under its own rebuild tuner.
-pub const TriggerRebuildStage = enum { insert_place, insert_sort, leaf, node };
+// A patch or step stage of the store, each under its own tuner.
+const TriggerStage = enum { insert_place, insert_sort, leaf, node, refresh };
+// A rebuild's stages, each under its own rebuild tuner.
+const TriggerRebuildStage = enum { insert_place, insert_sort, leaf, node };
 /// The thread system and range controls the store's stages dispatch on.
 pub const StoreThreads = StageThreads(StageControls);
 
@@ -469,18 +501,17 @@ const RefreshSums = struct {
 
 /// One world's stored trigger pairs. Its lifetime is the collision system's: a rebuild
 /// resets it and `deinit` frees it. Not thread-safe: patches, rebuilds and refreshes run on
-/// main and dispatch their own stages; readers (`cursorAt`, `locateKey`, `seek`) may run on
-/// workers while no patch, rebuild or refresh runs.
+/// main and dispatch their own stages; readers (`cursorAt`, `locateKey`, `storedPiece`,
+/// `seek`) may run on workers while no patch, rebuild or refresh runs.
 pub const TriggerStore = struct {
-    // A rebuild stage's tuner config: a world-create rebuild is a one-off, so a fresh
-    // tuner's first rebuild dispatches on the full pool instead of inline on main.
-    const rebuild_tuner_config = AdaptiveWorkTunerConfig{ .first_selection = .full_pool };
-
+    /// Growth counts, kept only with `runtime_perf_log.enabled`: pool slabs the pages and
+    /// nodes grew by, level table growths, refresh range slot growths, and patch plan
+    /// scratch lists a patch grew (each list once per patch, on error too).
     pub const Perf = if (runtime_perf_log.enabled) struct {
         page_grows: u64 = 0,
         level_grows: u64 = 0,
         slot_grows: u64 = 0,
-        max_height: u8 = 0,
+        scratch_grows: u64 = 0,
     } else struct {};
 
     allocator: std.mem.Allocator,
@@ -504,12 +535,16 @@ pub const TriggerStore = struct {
     ready: bool = false,
     tuners: std.EnumArray(TriggerStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(.{})),
     rebuild_tuners: std.EnumArray(TriggerRebuildStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(rebuild_tuner_config)),
-    /// Each stage's last batch shape; reset per patch or rebuild.
+    /// Each patch or step stage's last batch shape; reset by every patch and rebuild, so
+    /// after a rebuild the patch stages hold none.
     last_batches: std.EnumArray(TriggerStage, BatchStats) = .initFill(.{}),
+    /// Each rebuild stage's last batch shape; reset by every rebuild.
+    last_rebuild_batches: std.EnumArray(TriggerRebuildStage, BatchStats) = .initFill(.{}),
     perf: Perf = .{},
     page_growth_logged: bool = false,
     level_growth_logged: bool = false,
     slot_growth_logged: bool = false,
+    scratch_growth_logged: bool = false,
 
     // Patch scratch, grow-only and kept warm.
     touched_levels: std.ArrayList(TouchedLevel) = .empty,
@@ -591,8 +626,9 @@ pub const TriggerStore = struct {
     pub fn locateKey(self: *const TriggerStore, key: u256) Locate {
         const level = keyLevel(key);
         const tree = self.levelTree(level);
-        var located = Locate{ .path = .{ .level = level }, .leaf_start = 0, .page_len = 0 };
+        var located = Locate{ .page = .{ .path = .{ .level = level }, .leaf_start = 0 }, .page_len = 0 };
         if (tree.root == no_entry) return located;
+        const path = &located.page.path;
         var id = tree.root;
         var height: usize = tree.height;
         located.page_len = tree.pair_count;
@@ -601,14 +637,26 @@ pub const TriggerStore = struct {
             const at = self.node(id);
             const count = at.header.count;
             const entry = std.sort.upperBound(u256, at.first_key[0..count], key, orderU256) -| 1;
-            located.path.nodes[height] = id;
-            located.path.entries[height] = @intCast(entry);
-            located.leaf_start += at.start[entry];
+            path.nodes[height] = id;
+            path.entries[height] = @intCast(entry);
+            located.page.leaf_start += at.start[entry];
             if (height == 0) located.page_len = at.entryPairs(entry);
             id = at.child[entry];
         }
-        located.path.leaf = id;
+        path.leaf = id;
         return located;
+    }
+
+    /// The one-slot drop piece of stored key `key`, or null when no stored pair has it.
+    /// O(H log F + log P).
+    pub fn storedPiece(self: *const TriggerStore, key: u256) ?DropPiece {
+        const located = self.locateKey(key);
+        if (located.page.path.leaf == no_entry) return null;
+        const keys = self.pageKeys(located.page.path.leaf)[0..located.page_len];
+        const slot = std.sort.lowerBound(u256, keys, key, orderU256);
+        if (slot == keys.len or keys[slot] != key) return null;
+        // A page holds at most `page_capacity` pairs.
+        return .{ .page = located.page, .lo = @intCast(slot), .hi = @intCast(slot + 1) };
     }
 
     /// A cursor on the first stored pair at or after `key`, over every level; invalid past
@@ -618,21 +666,22 @@ pub const TriggerStore = struct {
     /// O(log L + H log F).
     pub fn seek(self: *const TriggerStore, key: u256) Cursor {
         const level = keyLevel(key);
-        if (level >= self.levels.items.len) return .{ .store = self, .path = .{}, .height = 0, .page_len = 0, .page_start = self.pair_count, .offset = 0 };
+        if (level >= self.levels.items.len) return self.endCursor();
         const level_start = self.level_rank.prefix(level);
         const located = self.locateKey(key);
-        if (located.path.leaf == no_entry) {
+        if (located.page.path.leaf == no_entry) {
             // An empty level: the next level holding pairs starts at this level's ordinal.
             if (level_start < self.pair_count) return self.cursorAt(level_start);
-            return .{ .store = self, .path = .{}, .height = 0, .page_len = 0, .page_start = self.pair_count, .offset = 0 };
+            return self.endCursor();
         }
-        const keys = self.pageKeys(located.path.leaf)[0..located.page_len];
+        const keys = self.pageKeys(located.page.path.leaf)[0..located.page_len];
         var cursor = Cursor{
             .store = self,
-            .path = located.path,
+            .path = located.page.path,
             .height = self.levels.items[level].height,
             .page_len = located.page_len,
-            .page_start = level_start + located.leaf_start,
+            .leaf_start = located.page.leaf_start,
+            .page_start = level_start + located.page.leaf_start,
             // A page holds at most `page_capacity` pairs.
             .offset = @intCast(std.sort.lowerBound(u256, keys, key, orderU256)),
         };
@@ -641,11 +690,9 @@ pub const TriggerStore = struct {
         return cursor;
     }
 
-    /// The global ordinal of `level`'s first pair: `pair_count` at or past the table end.
-    /// O(log L).
-    pub fn levelStart(self: *const TriggerStore, level: u16) u32 {
-        if (level >= self.levels.items.len) return self.pair_count;
-        return self.level_rank.prefix(level);
+    // The invalid cursor past the last stored pair.
+    fn endCursor(self: *const TriggerStore) Cursor {
+        return .{ .store = self, .path = .{}, .height = 0, .page_len = 0, .leaf_start = 0, .page_start = self.pair_count, .offset = 0 };
     }
 
     /// A cursor on stored pair `ordinal` (below `pair_count`), over every level in key
@@ -659,6 +706,7 @@ pub const TriggerStore = struct {
             .path = .{ .level = found.level },
             .height = tree.height,
             .page_len = tree.pair_count,
+            .leaf_start = 0,
             .page_start = ordinal - found.local,
             .offset = found.local,
         };
@@ -675,6 +723,7 @@ pub const TriggerStore = struct {
             id = at.child[entry];
         }
         cursor.path.leaf = id;
+        cursor.leaf_start = found.local - cursor.offset;
         cursor.page_start = ordinal - cursor.offset;
         std.debug.assert(cursor.offset < cursor.page_len);
         return cursor;
@@ -686,25 +735,32 @@ pub const TriggerStore = struct {
     /// records `revision`. The drops are disjoint and name stored pairs; inserts are new
     /// keys located against this store. Allocates only before its first stored mutation:
     /// on error the store is unchanged and `seen_revision` is kept.
-    pub fn patch(self: *TriggerStore, threads: ?StoreThreads, edits: []const EditSource, revision: u64) error{OutOfMemory}!void {
+    pub fn patch(self: *TriggerStore, threads: StoreThreads, edits: []const EditSource, revision: u64) error{OutOfMemory}!void {
         errdefer self.discardPlan();
         self.last_batches = .initFill(.{});
+        const before = self.planScratchCapacities();
+        defer self.countScratchGrowth(changedCapacities(&before, &self.planScratchCapacities()));
         try self.bucket(edits);
         try self.collectInsertSegments(edits);
-        try self.sortInserts(self.stageDispatch(threads, .insert_place), self.stageDispatch(threads, .insert_sort));
+        const sorted = try self.sortInserts(threads.stage(self.tuners.getPtr(.insert_place)), threads.stage(self.tuners.getPtr(.insert_sort)));
+        self.last_batches.set(.insert_place, sorted.place);
+        self.last_batches.set(.insert_sort, sorted.sort);
         try self.orderLevels();
         try self.orderTouchedPages();
         try self.planHeights();
         try self.reservePlan();
-        self.writeOutputs(self.stageDispatch(threads, .leaf), self.stageDispatch(threads, .node));
+        const written = self.writeOutputs(threads.stage(self.tuners.getPtr(.leaf)), threads.stage(self.tuners.getPtr(.node)));
+        self.last_batches.set(.leaf, written.leaf);
+        self.last_batches.set(.node, written.node);
         self.install(.patch);
         self.seen_revision = revision;
     }
 
     /// Replaces every stored pair with `inserts` (each query range's inserts, in range
     /// order; rows and emit bits current at `allow_epoch`) and records `revision`. Each stage
-    /// dispatches under its own rebuild tuner. On error the store is empty and not ready.
-    pub fn rebuild(self: *TriggerStore, threads: ?StoreThreads, inserts: []const EditSource, revision: u64, allow_epoch: u64) error{OutOfMemory}!void {
+    /// dispatches under its own rebuild tuner and records into `last_rebuild_batches`. On
+    /// error the store is empty and not ready.
+    pub fn rebuild(self: *TriggerStore, threads: StoreThreads, inserts: []const EditSource, revision: u64, allow_epoch: u64) error{OutOfMemory}!void {
         errdefer {
             self.discardPlan();
             self.ready = false;
@@ -712,6 +768,7 @@ pub const TriggerStore = struct {
         self.discardPlan();
         self.ready = false;
         self.last_batches = .initFill(.{});
+        self.last_rebuild_batches = .initFill(.{});
         self.pool.resetClass(leaf_class);
         self.pool.resetClass(node_class);
         self.levels.clearRetainingCapacity();
@@ -720,26 +777,19 @@ pub const TriggerStore = struct {
         self.valid_count = 0;
         self.allowed_count = 0;
         try self.collectInsertSegments(inserts);
-        try self.sortInserts(self.rebuildDispatch(threads, .insert_place), self.rebuildDispatch(threads, .insert_sort));
+        const sorted = try self.sortInserts(threads.stage(self.rebuild_tuners.getPtr(.insert_place)), threads.stage(self.rebuild_tuners.getPtr(.insert_sort)));
+        self.last_rebuild_batches.set(.insert_place, sorted.place);
+        self.last_rebuild_batches.set(.insert_sort, sorted.sort);
         try self.touchRebuildLevels();
         try self.planHeights();
         try self.reservePlan();
-        self.writeOutputs(self.rebuildDispatch(threads, .leaf), self.rebuildDispatch(threads, .node));
+        const written = self.writeOutputs(threads.stage(self.rebuild_tuners.getPtr(.leaf)), threads.stage(self.rebuild_tuners.getPtr(.node)));
+        self.last_rebuild_batches.set(.leaf, written.leaf);
+        self.last_rebuild_batches.set(.node, written.node);
         self.install(.rebuild);
         self.seen_revision = revision;
         self.refreshed_epoch = allow_epoch;
         self.ready = true;
-    }
-
-    // A patch stage's dispatch under its own tuner, or null (inline) without threads.
-    fn stageDispatch(self: *TriggerStore, threads: ?StoreThreads, stage: TriggerStage) ?Dispatch {
-        const stages = threads orelse return null;
-        return stages.stage(self.tuners.getPtr(stage));
-    }
-
-    fn rebuildDispatch(self: *TriggerStore, threads: ?StoreThreads, stage: TriggerRebuildStage) ?Dispatch {
-        const stages = threads orelse return null;
-        return stages.stage(self.rebuild_tuners.getPtr(stage));
     }
 
     // Clears every pending entry and the plan scratch; the stored trees are untouched.
@@ -773,10 +823,10 @@ pub const TriggerStore = struct {
 
     fn bucket(self: *TriggerStore, edits: []const EditSource) error{OutOfMemory}!void {
         for (edits) |source| {
-            std.debug.assert(source.inserts.len == source.insert_paths.len);
+            std.debug.assert(source.inserts.len == source.insert_pages.len);
             for (source.drops) |piece| {
                 std.debug.assert(piece.lo < piece.hi and piece.hi <= page_capacity);
-                const record = try self.touchPage(piece.path, piece.leaf_start);
+                const record = try self.touchPage(piece.page);
                 const bits = slotMask(piece.lo, piece.hi);
                 const touched = &self.touched.items[record];
                 std.debug.assert(touched.id != no_entry and piece.hi <= touched.size);
@@ -785,9 +835,9 @@ pub const TriggerStore = struct {
                 touched.mask |= bits;
                 self.touched_levels.items[touched.level_record].dropped += piece.hi - piece.lo;
             }
-            for (source.inserts, source.insert_paths) |edit, path| {
-                std.debug.assert(keyLevel(edit.key) == path.level);
-                const record = try self.touchPage(path, edit.leaf_start);
+            for (source.inserts, source.insert_pages) |edit, page_at| {
+                std.debug.assert(keyLevel(edit.key) == page_at.path.level);
+                const record = try self.touchPage(page_at);
                 const touched = &self.touched.items[record];
                 touched.inserts += 1;
                 self.touched_levels.items[touched.level_record].inserts += 1;
@@ -824,8 +874,9 @@ pub const TriggerStore = struct {
         return index;
     }
 
-    // The touched record of the page at `path`, created with every untouched ancestor.
-    fn touchPage(self: *TriggerStore, path: TreePath, leaf_start: u32) error{OutOfMemory}!u32 {
+    // The touched record of the page at `location`, created with every untouched ancestor.
+    fn touchPage(self: *TriggerStore, location: PageLocation) error{OutOfMemory}!u32 {
+        const path = location.path;
         const level_record = try self.touchLevel(path.level);
         const level = &self.touched_levels.items[level_record];
         if (path.leaf == no_entry) {
@@ -839,7 +890,7 @@ pub const TriggerStore = struct {
         if (self.leaf_pending.items[path.leaf] != 0) return self.leaf_pending.items[path.leaf] - 1;
         const height = level.old.height;
         const len = if (height == 0) level.old.pair_count else self.node(path.nodes[0]).entryPairs(path.entries[0]);
-        const record = try self.addRecord(.{ .id = path.leaf, .level_record = level_record, .start = leaf_start, .pairs = len, .size = len, .height = 0 });
+        const record = try self.addRecord(.{ .id = path.leaf, .level_record = level_record, .start = location.leaf_start, .pairs = len, .size = len, .height = 0 });
         self.leaf_pending.items[path.leaf] = record + 1;
         // Link it and each new ancestor until one already touched.
         var child = record;
@@ -895,40 +946,23 @@ pub const TriggerStore = struct {
     }
 
     // The banded sort of every collected insert into `sorted_inserts`.
-    fn sortInserts(self: *TriggerStore, place_dispatch: ?Dispatch, sort_dispatch: ?Dispatch) error{OutOfMemory}!void {
-        const segments = self.insert_segments.items;
-        const starts = self.insert_segment_starts.items;
+    fn sortInserts(self: *TriggerStore, place_dispatch: Dispatch, sort_dispatch: Dispatch) error{OutOfMemory}!banded_sort.SortBatches {
         var total: usize = 0;
-        for (segments) |segment| total += segment.len;
+        for (self.insert_segments.items) |segment| total += segment.len;
         if (total >= no_entry) return error.OutOfMemory;
         try self.sorted_inserts.ensureTotalCapacity(self.allocator, total);
         self.sorted_inserts.items.len = total;
-        if (total <= 1) {
-            for (segments) |segment| @memcpy(self.sorted_inserts.items[0..segment.len], segment);
-            return;
-        }
-        try self.insert_staging.ensureTotalCapacity(self.allocator, total);
-        self.insert_staging.items.len = total;
-        const place = stageShape(place_dispatch, total, insert_range_alignment_items);
-        try self.band_offsets.ensureTotalCapacity(self.allocator, place.range_count);
-        setSlotCount(BandOffsets, &self.band_offsets, place.range_count);
-        var place_job = InsertSort.PlaceJob{
-            .splitters = InsertSort.segmentSplitters(segments, starts, total),
-            .segments = segments,
-            .segment_starts = starts,
-            .staging = self.insert_staging.items,
-            .items_per_range = place.items_per_range,
-            .offsets = self.band_offsets.items,
-        };
-        self.last_batches.set(.insert_place, runShaped(place_dispatch, place, total, insert_range_alignment_items, &place_job, InsertSort.placeJob));
-        const sort = stageShape(sort_dispatch, total, insert_range_alignment_items);
-        var sort_job = InsertSort.SortJob{
-            .source = .{ .staging = self.insert_staging.items, .band_offsets = self.band_offsets.items[0..place.range_count], .window_stride = place.items_per_range },
-            .dest = self.sorted_inserts.items,
-            .starts = banded_sort.sumBandOffsets(self.band_offsets.items[0..place.range_count]),
-            .range_count = sort.range_count,
-        };
-        self.last_batches.set(.insert_sort, runShaped(sort_dispatch, sort, total, insert_range_alignment_items, &sort_job, InsertSort.sortJob));
+        return InsertSort.sortSegments(
+            self.allocator,
+            place_dispatch,
+            sort_dispatch,
+            self.insert_segments.items,
+            self.insert_segment_starts.items,
+            insert_range_alignment_items,
+            &self.insert_staging,
+            &self.band_offsets,
+            self.sorted_inserts.items,
+        );
     }
 
     // ---- Plan (main; counts only) ----------------------------------------------------------
@@ -1366,19 +1400,49 @@ pub const TriggerStore = struct {
         if (comptime logging.enabled(.info)) logging.game.info("stored trigger level table grew", .{});
     }
 
-    /// Counts one growth of a range slot list feeding or run by the store, and logs the
-    /// first.
-    pub fn countSlotGrowth(self: *TriggerStore) void {
+    fn countSlotGrowth(self: *TriggerStore) void {
         if (comptime runtime_perf_log.enabled) self.perf.slot_grows += 1;
         if (self.slot_growth_logged) return;
         self.slot_growth_logged = true;
         if (comptime logging.enabled(.info)) logging.game.info("stored trigger range slots grew", .{});
     }
 
+    fn countScratchGrowth(self: *TriggerStore, lists: usize) void {
+        if (lists == 0) return;
+        if (comptime runtime_perf_log.enabled) self.perf.scratch_grows += lists;
+        if (self.scratch_growth_logged) return;
+        self.scratch_growth_logged = true;
+        if (comptime logging.enabled(.info)) logging.game.info("stored trigger patch scratch grew", .{});
+    }
+
+    // The plan scratch lists besides `level_outputs`.
+    const plan_scratch_lists = 16;
+
+    // The capacities of every plan scratch list a patch reserves, whose growth counts as
+    // scratch growth.
+    fn planScratchCapacities(self: *const TriggerStore) [plan_scratch_lists + max_tree_height + 1]usize {
+        const lists = [plan_scratch_lists]usize{
+            self.level_pending.capacity,  self.leaf_pending.capacity,    self.node_pending.capacity,
+            self.touched_levels.capacity, self.touched.capacity,         self.level_order.capacity,
+            self.units.capacity,          self.runs.capacity,            self.segments.capacity,
+            self.growth.capacity,         self.next_growth.capacity,     self.sorted_inserts.capacity,
+            self.insert_staging.capacity, self.insert_segments.capacity, self.insert_segment_starts.capacity,
+            self.band_offsets.capacity,
+        };
+        var outputs: [max_tree_height + 1]usize = undefined;
+        for (&outputs, &self.level_outputs) |*capacity, list| capacity.* = list.capacity;
+        return lists ++ outputs;
+    }
+
     // ---- Write (workers) and install (main) ----------------------------------------------
 
+    const WriteBatches = struct {
+        leaf: BatchStats = .{},
+        node: BatchStats = .{},
+    };
+
     // The leaf stage, then one node dispatch per height under one node tuner sample.
-    fn writeOutputs(self: *TriggerStore, leaf_dispatch: ?Dispatch, node_dispatch: ?Dispatch) void {
+    fn writeOutputs(self: *TriggerStore, leaf_dispatch: Dispatch, node_dispatch: Dispatch) WriteBatches {
         const pages = self.heights[0].outputs;
         const leaf_stage = if (pages == 0) null else leaf_dispatch;
         const leaf_shape = stageShape(leaf_stage, pages, rewrite_range_alignment_items);
@@ -1388,9 +1452,9 @@ pub const TriggerStore = struct {
             .outputs = self.level_outputs[0].items,
             .range_count = leaf_shape.range_count,
         };
-        self.last_batches.set(.leaf, runShaped(leaf_stage, leaf_shape, pages, rewrite_range_alignment_items, &leaf_job, leafJob));
+        var batches = WriteBatches{ .leaf = runShaped(leaf_stage, leaf_shape, pages, rewrite_range_alignment_items, &leaf_job, leafJob) };
         const nodes = self.nodeOutputs();
-        if (nodes == 0) return;
+        if (nodes == 0) return batches;
         var rounds = RoundDispatch.begin(node_dispatch, nodes);
         for (1..self.height_count) |height| {
             const plan = self.heights[height];
@@ -1404,7 +1468,8 @@ pub const TriggerStore = struct {
             };
             rounds.run(plan.outputs, &node_job, &node_job.range_count, nodeJob);
         }
-        self.last_batches.set(.node, rounds.finish(nodes));
+        batches.node = rounds.finish(nodes);
+        return batches;
     }
 
     const InstallMode = enum { patch, rebuild };
@@ -1453,7 +1518,6 @@ pub const TriggerStore = struct {
                 .height = level.new_height,
                 .pair_count = @intCast(@as(i64, level.old.pair_count) + level_delta),
             };
-            if (comptime runtime_perf_log.enabled) self.perf.max_height = @max(self.perf.max_height, level.new_height);
             if (mode == .patch) self.level_rank.add(level.level, level_delta);
             self.level_pending.items[level.level] = 0;
             delta += level_delta;
@@ -1470,10 +1534,10 @@ pub const TriggerStore = struct {
     /// Re-resolves every stored pair's rows and emit bits when `data`'s allow epoch moved
     /// past `refreshed_epoch`; true when it ran. Ranges own the pages that start in them.
     /// Never allocates: each commit reserves its range slots for the pairs it stores.
-    pub fn refresh(self: *TriggerStore, threads: ?StoreThreads, data: *const DataSystem) bool {
+    pub fn refresh(self: *TriggerStore, threads: StoreThreads, data: *const DataSystem) bool {
         const epoch = data.collision_allow_epoch;
         if (self.pair_count == 0 or (self.refreshed_epoch != null and self.refreshed_epoch.? == epoch)) return false;
-        const dispatch = self.stageDispatch(threads, .refresh);
+        const dispatch = threads.stage(self.tuners.getPtr(.refresh));
         const shape = stageShape(dispatch, self.pair_count, refresh_range_alignment_items);
         std.debug.assert(self.refresh_sums.capacity >= shape.range_count);
         setSlotCount(RefreshSums, &self.refresh_sums, shape.range_count);
@@ -1505,6 +1569,8 @@ pub const Cursor = struct {
     path: TreePath,
     height: u8,
     page_len: u32,
+    /// The pairs of the cursor's level before its page.
+    leaf_start: u32,
     /// The global ordinal of the page's first pair.
     page_start: u32,
     offset: u32,
@@ -1521,6 +1587,13 @@ pub const Cursor = struct {
     /// The cursor's page's key column alone.
     pub fn pageKeys(self: Cursor) *const [page_capacity]u256 {
         return self.store.pageKeys(self.path.leaf);
+    }
+
+    /// The drop piece of the cursor's page's slots `[lo, hi)`.
+    pub fn dropPiece(self: Cursor, lo: u32, hi: u32) DropPiece {
+        std.debug.assert(lo < hi and hi <= self.page_len);
+        // A page holds at most `page_capacity` pairs.
+        return .{ .page = .{ .path = self.path, .leaf_start = self.leaf_start }, .lo = @intCast(lo), .hi = @intCast(hi) };
     }
 
     /// The next stored pair.
@@ -1550,6 +1623,7 @@ pub const Cursor = struct {
                 child = store.node(child).child[0];
             }
             self.path.leaf = child;
+            self.leaf_start += self.page_len;
             self.page_start = next_start;
             self.offset = 0;
             self.page_len = store.node(self.path.nodes[0]).entryPairs(self.path.entries[0]);
@@ -1559,10 +1633,7 @@ pub const Cursor = struct {
             self.* = store.cursorAt(next_start);
             return;
         }
-        self.path.leaf = no_entry;
-        self.page_start = next_start;
-        self.offset = 0;
-        self.page_len = 0;
+        self.* = store.endCursor();
     }
 };
 
@@ -1707,8 +1778,8 @@ fn writePage(store: *const TriggerStore, runs: []const Run, output: u32) LevelOu
     var valid: u32 = 0;
     var allowed: u32 = 0;
     for (dest.emit[0..count]) |emit| {
-        valid += emit & emit_valid;
-        allowed += @intFromBool(emit == emit_valid | emit_allowed);
+        valid += @intFromBool(emits(emit, false));
+        allowed += @intFromBool(emits(emit, true));
     }
     dest.header.* = .{ .len = count, .valid = valid, .allowed = allowed };
     return .{ .first_key = dest.keys[0], .id = id, .pairs = count, .valid = valid, .allowed = allowed };
@@ -1860,10 +1931,9 @@ fn refreshJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             }
             at.a_row[slot] = storedRow(a_row.?);
             at.b_row[slot] = storedRow(b_row.?);
-            const allow = tier[a_row.?].allowsCollision() and tier[b_row.?].allowsCollision();
-            at.emit[slot] = emit_valid | if (allow) emit_allowed else 0;
+            at.emit[slot] = emitBits(tier[a_row.?].allowsCollision(), tier[b_row.?].allowsCollision());
             valid += 1;
-            allowed += @intFromBool(allow);
+            allowed += @intFromBool(emits(at.emit[slot], true));
         }
         at.header.valid = valid;
         at.header.allowed = allowed;
@@ -1878,13 +1948,16 @@ fn refreshJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 const testing = std.testing;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 
-// A contact key: level, strip, then small a and b run keys.
-fn testKey(level: u16, strip: u16, a: u32, b: u32) u256 {
-    return levelFirstKey(level) | (@as(u256, strip) << 224) | (@as(u256, a) << 96) | b;
+// The tests' own key layout under the level bits, which are all the store reads: a 16-bit
+// group just below the level, then a and b ordinals in the low 64 bits.
+const test_group_shift = key_level_shift - 16;
+
+fn testKey(level: u16, group: u16, a: u32, b: u32) u256 {
+    return levelFirstKey(level) | (@as(u256, group) << test_group_shift) | (@as(u256, a) << 32) | b;
 }
 
 fn testIndexA(key: u256) u32 {
-    return @truncate(key >> 96);
+    return @truncate(key >> 32);
 }
 
 fn testIndexB(key: u256) u32 {
@@ -1916,23 +1989,23 @@ fn testContact(key: u256) CollisionContact {
     };
 }
 
-fn testThreads(thread_system: ?*ThreadSystem) ?StoreThreads {
-    const threads = thread_system orelse return null;
-    return .{ .thread_system = threads, .config = .{ .items_per_range = 1, .max_worker_threads = threads.workerThreadCount(), .adaptive = false } };
+// Fixed smallest ranges on `thread_system`: a 0-worker system runs every stage inline.
+fn testThreads(thread_system: *ThreadSystem) StoreThreads {
+    return .{ .thread_system = thread_system, .config = .{ .items_per_range = 1, .max_worker_threads = thread_system.workerThreadCount(), .adaptive = false } };
 }
 
 // One patch's edits built against `store` through its production readers: inserts located
-// by `locateKey`, single drops by `locateKey` and a page search, and each range `[lo, hi]`
-// walked from `seek(lo)`, one piece per page. Records are dealt across
+// by `locateKey`, single drops by `storedPiece`, and each range `[lo, hi]` walked from
+// `seek(lo)`, one cursor piece per page. Records are dealt across
 // `source_count` sources in turn.
 const TestEdits = struct {
     sources: []EditSource,
 
     fn build(arena: std.mem.Allocator, store: *const TriggerStore, insert_keys: []const u256, drop_keys: []const u256, drop_ranges: []const [2]u256, source_count: usize) !TestEdits {
         const inserts = try arena.alloc(std.ArrayList(InsertEdit), source_count);
-        const paths = try arena.alloc(std.ArrayList(TreePath), source_count);
+        const pages = try arena.alloc(std.ArrayList(PageLocation), source_count);
         const drops = try arena.alloc(std.ArrayList(DropPiece), source_count);
-        for (inserts, paths, drops) |*a, *b, *c| {
+        for (inserts, pages, drops) |*a, *b, *c| {
             a.* = .empty;
             b.* = .empty;
             c.* = .empty;
@@ -1940,16 +2013,13 @@ const TestEdits = struct {
         for (insert_keys, 0..) |key, index| {
             const located = store.locateKey(key);
             const source = index % source_count;
-            try inserts[source].append(arena, .{ .key = key, .contact = testContact(key), .leaf_start = located.leaf_start, .emit = testEmit(key) });
-            try paths[source].append(arena, located.path);
+            try inserts[source].append(arena, .{ .key = key, .contact = testContact(key), .emit = testEmit(key) });
+            try pages[source].append(arena, located.page);
         }
         var turn: usize = 0;
         for (drop_keys) |key| {
-            const located = store.locateKey(key);
-            const keys = store.page(located.path.leaf).keys[0..located.page_len];
-            const slot = std.sort.lowerBound(u256, keys, key, orderU256);
-            try testing.expect(slot < keys.len and keys[slot] == key);
-            try drops[turn % source_count].append(arena, .{ .path = located.path, .leaf_start = located.leaf_start, .lo = @intCast(slot), .hi = @intCast(slot + 1) });
+            const piece = store.storedPiece(key) orelse return error.TestDropNotStored;
+            try drops[turn % source_count].append(arena, piece);
             turn += 1;
         }
         for (drop_ranges) |bounds| {
@@ -1959,29 +2029,28 @@ const TestEdits = struct {
                 var hi = lo;
                 const keys = cursor.page().keys;
                 while (hi < cursor.page_len and keys[hi] <= bounds[1]) hi += 1;
-                const leaf_start = cursor.page_start - store.level_rank.prefix(cursor.path.level);
-                try drops[turn % source_count].append(arena, .{ .path = cursor.path, .leaf_start = leaf_start, .lo = @intCast(lo), .hi = @intCast(hi) });
+                try drops[turn % source_count].append(arena, cursor.dropPiece(lo, hi));
                 turn += 1;
                 if (hi < cursor.page_len) break;
                 cursor.nextPage();
             }
         }
         const sources = try arena.alloc(EditSource, source_count);
-        for (sources, inserts, paths, drops) |*source, source_inserts, source_paths, source_drops| {
-            source.* = .{ .inserts = source_inserts.items, .insert_paths = source_paths.items, .drops = source_drops.items };
+        for (sources, inserts, pages, drops) |*source, source_inserts, source_pages, source_drops| {
+            source.* = .{ .inserts = source_inserts.items, .insert_pages = source_pages.items, .drops = source_drops.items };
         }
         return .{ .sources = sources };
     }
 };
 
-fn patchKeys(store: *TriggerStore, threads: ?StoreThreads, insert_keys: []const u256, drop_keys: []const u256, drop_ranges: []const [2]u256, source_count: usize, revision: u64) !void {
+fn patchKeys(store: *TriggerStore, threads: StoreThreads, insert_keys: []const u256, drop_keys: []const u256, drop_ranges: []const [2]u256, source_count: usize, revision: u64) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const edits = try TestEdits.build(arena_state.allocator(), store, insert_keys, drop_keys, drop_ranges, source_count);
     try store.patch(threads, edits.sources, revision);
 }
 
-fn rebuildKeys(store: *TriggerStore, threads: ?StoreThreads, keys: []const u256, source_count: usize) !void {
+fn rebuildKeys(store: *TriggerStore, threads: StoreThreads, keys: []const u256, source_count: usize) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1990,7 +2059,7 @@ fn rebuildKeys(store: *TriggerStore, threads: ?StoreThreads, keys: []const u256,
         const lo = keys.len * index / source_count;
         const hi = keys.len * (index + 1) / source_count;
         const inserts = try arena.alloc(InsertEdit, hi - lo);
-        for (inserts, keys[lo..hi]) |*edit, key| edit.* = .{ .key = key, .contact = testContact(key), .leaf_start = 0, .emit = testEmit(key) };
+        for (inserts, keys[lo..hi]) |*edit, key| edit.* = .{ .key = key, .contact = testContact(key), .emit = testEmit(key) };
         source.* = .{ .inserts = inserts };
     }
     try store.rebuild(threads, sources, 1, 0);
@@ -1998,8 +2067,10 @@ fn rebuildKeys(store: *TriggerStore, threads: ?StoreThreads, keys: []const u256,
 
 const SubtreeSummary = struct { first_key: u256, pairs: u32, valid: u32, allowed: u32 };
 
-// T1-T5 under one node or page: keys strictly increase past `previous` on `level`, fills
-// hold, first keys and start prefixes match the children, headers match the emit bytes.
+// The tree under one node or page: keys stay on `level` and strictly increase past
+// `previous`, non-root pages and nodes hold at least half, a root node holds at least two
+// entries, each entry's first key and start prefix match its child, totals match the
+// subtree's pairs, and page headers count the emit bytes.
 fn expectSubtreeValid(store: *const TriggerStore, level: u16, id: u32, height: u8, is_root: bool, previous: *?u256) !SubtreeSummary {
     if (height == 0) {
         const at = store.page(id);
@@ -2036,7 +2107,8 @@ fn expectSubtreeValid(store: *const TriggerStore, level: u16, id: u32, height: u
     return summary;
 }
 
-// T1-T7 over every level, the store sums, and empty pending scratch.
+// Every level's tree, each level's rank prefix and pair count, the store sums, and empty
+// pending scratch.
 fn expectTreeValid(store: *const TriggerStore) !void {
     try testing.expectEqual(store.levels.items.len, store.level_rank.sums.items.len);
     var pairs: u32 = 0;
@@ -2075,16 +2147,8 @@ fn expectStoredKeys(store: *const TriggerStore, reference: []const u256) !void {
         try testing.expectEqual(@as(u32, @intCast(ordinal)), cursor.page_start + cursor.offset);
         const at = cursor.page();
         const slot = cursor.offset;
-        const contact = testContact(key);
         try testing.expectEqual(key, at.keys[slot]);
-        try testing.expect(at.a[slot].eql(contact.a) and at.b[slot].eql(contact.b));
-        try testing.expectEqual(@as(u32, @intCast(contact.a_movement_index)), at.a_row[slot]);
-        try testing.expectEqual(@as(u32, @intCast(contact.b_movement_index)), at.b_row[slot]);
-        try testing.expectEqual(contact.normal_x, at.normal_x[slot]);
-        try testing.expectEqual(contact.normal_y, at.normal_y[slot]);
-        try testing.expectEqual(contact.penetration, at.penetration[slot]);
-        try testing.expectEqual(contact.pre_response_max_speed_sq, at.max_speed_sq[slot]);
-        try testing.expectEqual(contact.pre_response_relative_speed_sq, at.rel_speed_sq[slot]);
+        try testing.expectEqual(testContact(key), at.contactAt(slot));
         try testing.expectEqual(testEmit(key), at.emit[slot]);
         cursor.next();
     }
@@ -2105,8 +2169,13 @@ fn expectReadersMatch(store: *const TriggerStore, reference: []const u256) !void
             try expectSeekPastEnd(store, key + 1);
         }
         const located = store.locateKey(key);
-        try testing.expectEqual(cursor.path.leaf, located.path.leaf);
-        try testing.expectEqual(cursor.page_start - store.level_rank.prefix(keyLevel(key)), located.leaf_start);
+        try testing.expectEqual(cursor.path.leaf, located.page.path.leaf);
+        try testing.expectEqual(cursor.page_start - store.level_rank.prefix(keyLevel(key)), located.page.leaf_start);
+        try testing.expectEqual(located.page.leaf_start, cursor.leaf_start);
+        const piece = store.storedPiece(key).?;
+        try testing.expectEqual(located.page.leaf_start, piece.page.leaf_start);
+        try testing.expectEqual(cursor.offset, piece.lo);
+        try testing.expectEqual(sortedContains(reference, key + 1), store.storedPiece(key + 1) != null);
     }
     for (0..store.levels.items.len + 2) |level| {
         const first = levelFirstKey(@intCast(level));
@@ -2128,6 +2197,7 @@ fn expectSeekAt(store: *const TriggerStore, key: u256, expected: Cursor) !void {
     try testing.expectEqual(expected.offset, cursor.offset);
     try testing.expectEqual(expected.page_len, cursor.page_len);
     try testing.expectEqual(expected.height, cursor.height);
+    try testing.expectEqual(expected.leaf_start, cursor.leaf_start);
     try testing.expectEqual(expected.path.level, cursor.path.level);
     try testing.expectEqual(expected.path.leaf, cursor.path.leaf);
     try testing.expectEqualSlices(u32, expected.path.nodes[0..expected.height], cursor.path.nodes[0..cursor.height]);
@@ -2199,6 +2269,8 @@ test "collision trigger store level rank matches a naive prefix through add, app
 // and inserts dealt across several sources. A serial store and a 2-worker store match the
 // reference and each other after every patch.
 test "collision trigger store random patches across levels match a sorted reference, serial and 2 workers" {
+    var serial_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
+    defer serial_system.deinit();
     var thread_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
     defer thread_system.deinit();
     var serial = TriggerStore.init(testing.allocator);
@@ -2250,7 +2322,7 @@ test "collision trigger store random patches across levels match a sorted refere
             if (!in_range) try drops.append(testing.allocator, key);
         }
         const sources = 1 + round % 4;
-        try patchKeys(&serial, null, inserts.items, drops.items, ranges[0..range_count], sources, round + 1);
+        try patchKeys(&serial, testThreads(&serial_system), inserts.items, drops.items, ranges[0..range_count], sources, round + 1);
         try patchKeys(&threaded, testThreads(&thread_system), inserts.items, drops.items, ranges[0..range_count], sources, round + 1);
         for (drops.items) |key| sortedRemove(&reference, key);
         for (ranges[0..range_count]) |bounds| {
@@ -2270,16 +2342,35 @@ test "collision trigger store random patches across levels match a sorted refere
     try testing.expectEqual(@as(usize, 10), serial.levels.items.len);
 }
 
-// A reference and two stores (serial, 2 workers) patched in step, checked after each patch.
+// A 0-worker thread system for serial stores and a 2-worker one for threaded stores.
+// Initialized in place: a thread system stays where it started.
+const TestSystems = struct {
+    serial: ThreadSystem,
+    threaded: ThreadSystem,
+
+    fn init(self: *TestSystems) !void {
+        self.serial = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
+        errdefer self.serial.deinit();
+        self.threaded = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
+    }
+
+    fn deinit(self: *TestSystems) void {
+        self.threaded.deinit();
+        self.serial.deinit();
+    }
+};
+
+// A reference and two stores (serial on a 0-worker system, threaded on a 2-worker one)
+// patched in step, checked after each patch.
 const TestPair = struct {
     serial: TriggerStore,
     threaded: TriggerStore,
     reference: std.ArrayList(u256) = .empty,
-    thread_system: *ThreadSystem,
+    systems: *TestSystems,
     revision: u64 = 0,
 
-    fn init(thread_system: *ThreadSystem) TestPair {
-        return .{ .serial = .init(testing.allocator), .threaded = .init(testing.allocator), .thread_system = thread_system };
+    fn init(systems: *TestSystems) TestPair {
+        return .{ .serial = .init(testing.allocator), .threaded = .init(testing.allocator), .systems = systems };
     }
 
     fn deinit(self: *TestPair) void {
@@ -2289,8 +2380,8 @@ const TestPair = struct {
     }
 
     fn rebuild(self: *TestPair, keys: []const u256) !void {
-        try rebuildKeys(&self.serial, null, keys, 3);
-        try rebuildKeys(&self.threaded, testThreads(self.thread_system), keys, 3);
+        try rebuildKeys(&self.serial, testThreads(&self.systems.serial), keys, 3);
+        try rebuildKeys(&self.threaded, testThreads(&self.systems.threaded), keys, 3);
         self.reference.clearRetainingCapacity();
         try self.reference.appendSlice(testing.allocator, keys);
         std.sort.pdq(u256, self.reference.items, {}, std.sort.asc(u256));
@@ -2299,8 +2390,8 @@ const TestPair = struct {
 
     fn patch(self: *TestPair, inserts: []const u256, drops: []const u256, ranges: []const [2]u256) !void {
         self.revision += 1;
-        try patchKeys(&self.serial, null, inserts, drops, ranges, 2, self.revision);
-        try patchKeys(&self.threaded, testThreads(self.thread_system), inserts, drops, ranges, 2, self.revision);
+        try patchKeys(&self.serial, testThreads(&self.systems.serial), inserts, drops, ranges, 2, self.revision);
+        try patchKeys(&self.threaded, testThreads(&self.systems.threaded), inserts, drops, ranges, 2, self.revision);
         for (drops) |key| sortedRemove(&self.reference, key);
         for (ranges) |bounds| {
             const lo = std.sort.lowerBound(u256, self.reference.items, bounds[0], orderU256);
@@ -2326,16 +2417,17 @@ const TestPair = struct {
     }
 };
 
-// Keys `[first, first + count)` of a-runs on `level`, strip 0, b 0.
+// Keys `[first, first + count)` of a ordinals on `level`, group 0, b 0.
 fn testRunKeys(buffer: []u256, level: u16, first: u32) []u256 {
     for (buffer, 0..) |*key, index| key.* = testKey(level, 0, first + @as(u32, @intCast(index)), 0);
     return buffer;
 }
 
 test "collision trigger store page runs split, extend right and left, and merge runs" {
-    var thread_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
-    defer thread_system.deinit();
-    var pair = TestPair.init(&thread_system);
+    var systems: TestSystems = undefined;
+    try systems.init();
+    defer systems.deinit();
+    var pair = TestPair.init(&systems);
     defer pair.deinit();
     // Ten full pages under one root node: page p holds a-runs [64p, 64p + 64).
     var keys: [640]u256 = undefined;
@@ -2371,9 +2463,10 @@ test "collision trigger store page runs split, extend right and left, and merge 
 }
 
 test "collision trigger store a right absorption swallows the run it reaches" {
-    var thread_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
-    defer thread_system.deinit();
-    var pair = TestPair.init(&thread_system);
+    var systems: TestSystems = undefined;
+    try systems.init();
+    defer systems.deinit();
+    var pair = TestPair.init(&systems);
     defer pair.deinit();
     // Ten full pages under one root node: page p holds a-runs [64p, 64p + 64).
     var keys: [640]u256 = undefined;
@@ -2387,9 +2480,10 @@ test "collision trigger store a right absorption swallows the run it reaches" {
 }
 
 test "collision trigger store roots grow through three heights and collapse to a page and to empty" {
-    var thread_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
-    defer thread_system.deinit();
-    var pair = TestPair.init(&thread_system);
+    var systems: TestSystems = undefined;
+    try systems.init();
+    defer systems.deinit();
+    var pair = TestPair.init(&systems);
     defer pair.deinit();
     var keys: [1200]u256 = undefined;
     var seen: [3]bool = @splat(false);
@@ -2415,9 +2509,10 @@ test "collision trigger store roots grow through three heights and collapse to a
 }
 
 test "collision trigger store drops spanning one node's pages merge with a cousin across parents" {
-    var thread_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
-    defer thread_system.deinit();
-    var pair = TestPair.init(&thread_system);
+    var systems: TestSystems = undefined;
+    try systems.init();
+    defer systems.deinit();
+    var pair = TestPair.init(&systems);
     defer pair.deinit();
     // 80 full pages: a height-2 tree whose height-1 nodes hold 40 pages each.
     var keys: [80 * 64]u256 = undefined;
@@ -2436,9 +2531,10 @@ test "collision trigger store drops spanning one node's pages merge with a cousi
 }
 
 test "collision trigger store one patch touches three levels at different heights and the cursor crosses empty levels" {
-    var thread_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
-    defer thread_system.deinit();
-    var pair = TestPair.init(&thread_system);
+    var systems: TestSystems = undefined;
+    try systems.init();
+    defer systems.deinit();
+    var pair = TestPair.init(&systems);
     defer pair.deinit();
     var keys: [20 + 640 + 72 * 64]u256 = undefined;
     _ = testRunKeys(keys[0..20], 0, 0);
@@ -2472,6 +2568,8 @@ test "collision trigger store one patch touches three levels at different height
 }
 
 test "collision trigger store rebuild bulk loads across page, node and node-squared boundaries" {
+    var serial_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
+    defer serial_system.deinit();
     var store = TriggerStore.init(testing.allocator);
     defer store.deinit();
     const sizes = [_]u32{ 1, 64, 65, 64 * 62, 64 * 62 + 1 };
@@ -2481,7 +2579,7 @@ test "collision trigger store rebuild bulk loads across page, node and node-squa
     for (sizes, 0..) |size, level| {
         for (0..size) |index| try keys.append(testing.allocator, testKey(@intCast(level * 2), 0, @intCast(index), 0));
     }
-    try rebuildKeys(&store, null, keys.items, 4);
+    try rebuildKeys(&store, testThreads(&serial_system), keys.items, 4);
     try expectTreeValid(&store);
     try expectStoredKeys(&store, keys.items);
     for (heights, 0..) |height, level| try testing.expectEqual(height, store.levels.items[level * 2].height);
@@ -2489,7 +2587,7 @@ test "collision trigger store rebuild bulk loads across page, node and node-squa
     // One level past F² full pages grows a third inner height.
     keys.clearRetainingCapacity();
     for (0..64 * 62 * 62 + 1) |index| try keys.append(testing.allocator, testKey(1, 0, @intCast(index), 0));
-    try rebuildKeys(&store, null, keys.items, 1);
+    try rebuildKeys(&store, testThreads(&serial_system), keys.items, 1);
     try expectTreeValid(&store);
     try testing.expectEqual(@as(u8, 3), store.levels.items[1].height);
     try testing.expectEqual(@as(usize, 2), store.levels.items.len);
@@ -2539,7 +2637,7 @@ test "collision trigger store growing patch under every allocation failure leave
     try testing.expectEqual(@as(usize, 41), store.levels.items.len);
     var rebuilt = TriggerStore.init(testing.allocator);
     defer rebuilt.deinit();
-    try rebuildKeys(&rebuilt, null, expected.items, 1);
+    try rebuildKeys(&rebuilt, testThreads(&thread_system), expected.items, 1);
     try expectStoredKeys(&rebuilt, expected.items);
     try expectReadersMatch(&store, expected.items);
 }
@@ -2608,8 +2706,28 @@ test "collision trigger store warm patches allocate nothing on a 2-worker pool" 
     try testing.expect(!store.last_batches.get(.leaf).ran_inline and store.last_batches.get(.leaf).range_count > 1);
 }
 
+test "collision trigger store rebuild records only its own stage batches, and a patch only the patch's" {
+    var systems: TestSystems = undefined;
+    try systems.init();
+    defer systems.deinit();
+    var pair = TestPair.init(&systems);
+    defer pair.deinit();
+    var keys: [200]u256 = undefined;
+    try pair.patch(testRunKeys(&keys, 0, 0), &.{}, &.{});
+    const store = &pair.threaded;
+    try testing.expectEqual(@as(usize, 200), store.last_batches.get(.insert_place).item_count);
+    try pair.rebuild(testRunKeys(&keys, 1, 0));
+    for (std.enums.values(TriggerStage)) |stage| try testing.expectEqual(@as(usize, 0), store.last_batches.get(stage).item_count);
+    try testing.expectEqual(@as(usize, 200), store.last_rebuild_batches.get(.insert_sort).item_count);
+    try testing.expectEqual(@as(usize, 4), store.last_rebuild_batches.get(.leaf).item_count);
+    // A patch leaves the rebuild's record.
+    try pair.patch(&.{}, keys[0..10], &.{});
+    try testing.expectEqual(@as(usize, 1), store.last_batches.get(.leaf).item_count);
+    try testing.expectEqual(@as(usize, 4), store.last_rebuild_batches.get(.leaf).item_count);
+}
+
 // Stored pairs naming `entities` in a chain, every row hint stale (row 0).
-fn rebuildEntityPairs(store: *TriggerStore, threads: ?StoreThreads, entities: []const EntityId) !void {
+fn rebuildEntityPairs(store: *TriggerStore, threads: StoreThreads, entities: []const EntityId) !void {
     var inserts: std.ArrayList(InsertEdit) = .empty;
     defer inserts.deinit(testing.allocator);
     for (entities[0 .. entities.len - 1], entities[1..], 0..) |a, b, index| {
@@ -2619,7 +2737,7 @@ fn rebuildEntityPairs(store: *TriggerStore, threads: ?StoreThreads, entities: []
         contact.b = b;
         contact.a_movement_index = 0;
         contact.b_movement_index = 0;
-        try inserts.append(testing.allocator, .{ .key = key, .contact = contact, .leaf_start = 0, .emit = emit_valid | emit_allowed });
+        try inserts.append(testing.allocator, .{ .key = key, .contact = contact, .emit = emit_valid | emit_allowed });
     }
     std.sort.pdq(InsertEdit, inserts.items, {}, struct {
         fn less(_: void, lhs: InsertEdit, rhs: InsertEdit) bool {
@@ -2649,6 +2767,8 @@ fn expectRefreshed(store: *const TriggerStore, data: *const DataSystem) !void {
 }
 
 test "collision trigger store refresh re-resolves rows and emit bits over several ranges, serial and 2 workers, and allocates nothing warm" {
+    var serial_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
+    defer serial_system.deinit();
     var thread_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
     defer thread_system.deinit();
     var data = DataSystem.init(testing.allocator);
@@ -2664,17 +2784,17 @@ test "collision trigger store refresh re-resolves rows and emit bits over severa
     defer serial.deinit();
     var threaded = TriggerStore.init(testing.allocator);
     defer threaded.deinit();
-    try rebuildEntityPairs(&serial, null, &entities);
+    try rebuildEntityPairs(&serial, testThreads(&serial_system), &entities);
     try rebuildEntityPairs(&threaded, testThreads(&thread_system), &entities);
     // Uneven pages, so ranges start inside pages.
     var drops: [40]u256 = undefined;
     for (&drops, 0..) |*key, index| key.* = testKey(@intCast((index * 9) % 3), 0, @intCast(index * 9), 0);
-    try patchKeys(&serial, null, &.{}, &drops, &.{}, 1, 2);
+    try patchKeys(&serial, testThreads(&serial_system), &.{}, &drops, &.{}, 1, 2);
     try patchKeys(&threaded, testThreads(&thread_system), &.{}, &drops, &.{}, 1, 2);
     // Destroys swap rows and move the epoch; one entity is left without a movement row.
     try testing.expect(data.destroyEntity(entities[5]));
     try testing.expect(data.destroyEntity(entities[200]));
-    try testing.expect(serial.refresh(null, &data));
+    try testing.expect(serial.refresh(testThreads(&serial_system), &data));
     // The commits reserved the range slots: the first refresh allocates nothing.
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     threaded.allocator = failing.allocator();

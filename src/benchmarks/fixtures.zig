@@ -13,6 +13,7 @@ const math = @import("../core/math.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const rebuild_tuner_config = @import("../app/thread_system.zig").rebuild_tuner_config;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const Color = @import("../config.zig").Color;
 const resources = @import("../render/resources.zig");
@@ -187,7 +188,7 @@ pub fn setSpliceTuners(colliders: *StaticColliderSystem, case: suite.BenchmarkCa
         colliders.tuners.set(stage, suite.adaptiveTunerForCase(case, sync_range_alignment.get(stage)) orelse AdaptiveWorkTuner.init(.{}));
     }
     for (std.enums.values(RebuildStage)) |stage| {
-        colliders.rebuild_tuners.set(stage, suite.adaptiveTunerForCase(case, rebuild_range_alignment.get(stage)) orelse AdaptiveWorkTuner.init(StaticColliderSystem.rebuild_tuner_config));
+        colliders.rebuild_tuners.set(stage, suite.adaptiveTunerForCase(case, rebuild_range_alignment.get(stage)) orelse AdaptiveWorkTuner.init(rebuild_tuner_config));
     }
     colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
 }

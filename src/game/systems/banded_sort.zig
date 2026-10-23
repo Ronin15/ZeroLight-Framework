@@ -9,9 +9,15 @@
 
 const std = @import("std");
 const pdqSort = @import("../../core/sort.zig").pdq;
+const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const SlotList = @import("../../app/thread_system.zig").SlotList;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const runShaped = @import("../../app/thread_system.zig").runShaped;
+const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
+const stageShape = @import("../../app/thread_system.zig").stageShape;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 
 /// Partition width of a banded sort, not a capacity: the sorted result is the same for any
@@ -81,9 +87,16 @@ fn startsBefore(range_start: usize, band_start: u32) bool {
     return band_start < range_start;
 }
 
-/// Each band's start in the sorted order: band b's elements over every fill range precede
-/// band b + 1's. O(ranges × bands).
-pub fn sumBandOffsets(offsets: []const PaddedSlot(BandOffsets)) [band_count + 1]u32 {
+/// The batches of one banded sort's place and sort stages; empty for a stage that did not
+/// run.
+pub const SortBatches = struct {
+    place: BatchStats = .{},
+    sort: BatchStats = .{},
+};
+
+// Each band's start in the sorted order: band b's elements over every fill range precede
+// band b + 1's. O(ranges × bands).
+fn sumBandOffsets(offsets: []const PaddedSlot(BandOffsets)) [band_count + 1]u32 {
     var starts: [band_count + 1]u32 = @splat(0);
     for (offsets) |slot| {
         for (&starts, slot.value.offsets) |*start, offset| start.* += offset;
@@ -91,8 +104,8 @@ pub fn sumBandOffsets(offsets: []const PaddedSlot(BandOffsets)) [band_count + 1]
     return starts;
 }
 
-/// The segment of a concatenation holding `position`: the last whose start is at or
-/// before it. `segment_starts` is nondecreasing, one start per segment.
+// The segment of a concatenation holding `position`: the last whose start is at or
+// before it. `segment_starts` is nondecreasing, one start per segment.
 fn segmentAt(segment_starts: []const usize, position: usize) usize {
     std.debug.assert(segment_starts.len != 0 and segment_starts[0] <= position);
     return std.sort.partitionPoint(usize, segment_starts, position, startAtOrBefore) - 1;
@@ -140,12 +153,12 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
             return placeSegmentsByBand(splitters, &.{elements}, &.{0}, 0, elements.len, window);
         }
 
-        /// Places elements `[start, end)` of the concatenation of `segments` into `window`
-        /// by band of `splitters`, in concatenation order within a band, and returns the
-        /// band offsets. `segment_starts[s]` is the element count before segment s. Scalar:
-        /// a counting scatter, the band search run twice per element rather than stored (a
-        /// six-step binary search).
-        pub fn placeSegmentsByBand(splitters: *const Splitters, segments: []const []const Element, segment_starts: []const usize, start: usize, end: usize, window: []Element) BandOffsets {
+        // Places elements `[start, end)` of the concatenation of `segments` into `window`
+        // by band of `splitters`, in concatenation order within a band, and returns the
+        // band offsets. `segment_starts[s]` is the element count before segment s. Scalar:
+        // a counting scatter, the band search run twice per element rather than stored (a
+        // six-step binary search).
+        fn placeSegmentsByBand(splitters: *const Splitters, segments: []const []const Element, segment_starts: []const usize, start: usize, end: usize, window: []Element) BandOffsets {
             std.debug.assert(segments.len == segment_starts.len);
             std.debug.assert(start <= end and window.len >= end - start);
             var offsets: [band_count + 1]u32 = @splat(0);
@@ -192,9 +205,9 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
             }
         };
 
-        /// Band splitters sampled from the concatenation of `segments` (`total` elements;
-        /// `segment_starts` as in `placeSegmentsByBand`).
-        pub fn segmentSplitters(segments: []const []const Element, segment_starts: []const usize, total: usize) Splitters {
+        // Band splitters sampled from the concatenation of `segments` (`total` elements;
+        // `segment_starts` as in `placeSegmentsByBand`).
+        fn segmentSplitters(segments: []const []const Element, segment_starts: []const usize, total: usize) Splitters {
             var samples: [splitter_sample_count]Key = undefined;
             const count = sampleCount(total);
             for (samples[0..count], 0..) |*sample, index| {
@@ -205,9 +218,63 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
             return splittersFromSamples(samples[0..count]);
         }
 
-        /// One fill range of a banded sort: places its elements of the concatenation of
-        /// `segments` into its `staging` window by band and writes its band offsets.
-        pub const PlaceJob = struct {
+        /// Sorts the concatenation of `segments` by key into `dest` (its length): the place
+        /// stage under `place_dispatch` band-places each range's elements into `staging` and
+        /// its offsets into `offsets`, then the sort stage under `sort_dispatch` gathers and
+        /// sorts each band. Each stage selects and records through its own dispatch's tuner.
+        /// `dest` may alias a segment: the place copies every element into `staging` first.
+        /// Allocates only to grow `staging` and `offsets`, on the calling thread before each
+        /// dispatch; at most one element runs no stage.
+        pub fn sortSegments(
+            allocator: std.mem.Allocator,
+            place_dispatch: Dispatch,
+            sort_dispatch: Dispatch,
+            segments: []const []const Element,
+            segment_starts: []const usize,
+            range_alignment_items: usize,
+            staging: *std.ArrayList(Element),
+            offsets: *SlotList(BandOffsets),
+            dest: []Element,
+        ) error{OutOfMemory}!SortBatches {
+            const total = dest.len;
+            std.debug.assert(segment_starts.len == segments.len);
+            std.debug.assert(summedLength(segments) == total);
+            if (total <= 1) {
+                // Assigned, not copied: `dest` may be the one segment.
+                for (segments) |segment| {
+                    if (segment.len != 0) dest[0] = segment[0];
+                }
+                return .{};
+            }
+            try staging.ensureTotalCapacity(allocator, total);
+            staging.items.len = total;
+            const place = stageShape(place_dispatch, total, range_alignment_items);
+            try offsets.ensureTotalCapacity(allocator, place.range_count);
+            setSlotCount(BandOffsets, offsets, place.range_count);
+            var place_job = PlaceJob{
+                .splitters = segmentSplitters(segments, segment_starts, total),
+                .segments = segments,
+                .segment_starts = segment_starts,
+                .staging = staging.items,
+                .items_per_range = place.items_per_range,
+                .offsets = offsets.items,
+            };
+            var batches = SortBatches{};
+            batches.place = runShaped(place_dispatch, place, total, range_alignment_items, &place_job, placeJob);
+            const sort = stageShape(sort_dispatch, total, range_alignment_items);
+            var sort_job = SortJob{
+                .source = .{ .staging = staging.items, .band_offsets = offsets.items, .window_stride = place.items_per_range },
+                .dest = dest,
+                .starts = sumBandOffsets(offsets.items),
+                .range_count = sort.range_count,
+            };
+            batches.sort = runShaped(sort_dispatch, sort, total, range_alignment_items, &sort_job, sortJob);
+            return batches;
+        }
+
+        // One fill range of a banded sort: places its elements of the concatenation of
+        // `segments` into its `staging` window by band and writes its band offsets.
+        const PlaceJob = struct {
             splitters: Splitters,
             segments: []const []const Element,
             segment_starts: []const usize,
@@ -216,7 +283,7 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
             offsets: []PaddedSlot(BandOffsets),
         };
 
-        pub fn placeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+        fn placeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             const job: *PlaceJob = @ptrCast(@alignCast(context));
             std.debug.assert(range.index < job.offsets.len);
             std.debug.assert(range.start == range.index * job.items_per_range);
@@ -224,17 +291,17 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
             job.offsets[range.index].value = placeSegmentsByBand(&job.splitters, job.segments, job.segment_starts, range.start, range.end, job.staging[range.start..range.end]);
         }
 
-        /// One sort range of a banded sort: gathers each band it owns from `source` into
-        /// `dest` at the band's start and sorts it by key. Keys are distinct, so the order is
-        /// the same for any partition.
-        pub const SortJob = struct {
+        // One sort range of a banded sort: gathers each band it owns from `source` into
+        // `dest` at the band's start and sorts it by key. Keys are distinct, so the order is
+        // the same for any partition.
+        const SortJob = struct {
             source: WindowSource,
             dest: []Element,
             starts: [band_count + 1]u32,
             range_count: usize,
         };
 
-        pub fn sortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+        fn sortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             const job: *SortJob = @ptrCast(@alignCast(context));
             const total = job.starts[band_count];
             std.debug.assert(range.index < job.range_count);
@@ -247,6 +314,12 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
                 std.debug.assert(gathered == end - start);
                 pdqSort(Element, job.dest[start..end], {}, elementKeyLess);
             }
+        }
+
+        fn summedLength(segments: []const []const Element) usize {
+            var total: usize = 0;
+            for (segments) |segment| total += segment.len;
+            return total;
         }
 
         fn elementKeyLess(_: void, lhs: Element, rhs: Element) bool {
@@ -292,6 +365,9 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
 // ---- Tests --------------------------------------------------------------------
 
 const testing = std.testing;
+const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const StageControls = @import("../../app/thread_system.zig").StageControls;
+const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 
 const TestElement = struct { key: u64, tag: u32 };
 
@@ -485,5 +561,53 @@ test "sample slots cover every slot when they fit and stay below the slot count 
     for ([_]usize{ splitter_sample_count + 1, 10_000, 1 << 40 }) |slot_count| {
         try testing.expectEqual(splitter_sample_count, sampleCount(slot_count));
         for (0..splitter_sample_count) |sample| try testing.expect(sampleSlot(sample, slot_count) < slot_count);
+    }
+}
+
+// Sorts `segments` through both stages on `thread_system` at fixed 8-item ranges.
+fn sortTestSegments(thread_system: *ThreadSystem, allocator: std.mem.Allocator, tuners: *[2]AdaptiveWorkTuner, segments: []const []const TestElement, segment_starts: []const usize, staging: *std.ArrayList(TestElement), offsets: *SlotList(BandOffsets), dest: []TestElement) !SortBatches {
+    const controls = StageControls{ .items_per_range = 8, .max_worker_threads = thread_system.workerThreadCount(), .adaptive = false };
+    return TestSort.sortSegments(allocator, Dispatch.init(thread_system, &tuners[0], controls), Dispatch.init(thread_system, &tuners[1], controls), segments, segment_starts, 8, staging, offsets, dest);
+}
+
+test "segments sorted through the place and sort stages match a sort of their concatenation, inline and on 2 workers, and allocate nothing warm" {
+    var prng = std.Random.DefaultPrng.init(0x73_6f_72_74);
+    const random = prng.random();
+    var elements: [150]TestElement = undefined;
+    // Distinct keys in random order.
+    for (&elements, 0..) |*element, index| element.* = .{ .key = @as(u64, index) * 7919 % 1000, .tag = @intCast(index) };
+    random.shuffle(TestElement, &elements);
+    var expected = elements;
+    std.sort.pdq(TestElement, &expected, {}, struct {
+        fn less(_: void, lhs: TestElement, rhs: TestElement) bool {
+            return lhs.key < rhs.key;
+        }
+    }.less);
+    const segments = [_][]const TestElement{ elements[0..0], elements[0..70], elements[70..71], elements[71..] };
+    const segment_starts = [_]usize{ 0, 0, 70, 71 };
+    for ([_]usize{ 0, 2 }) |workers| {
+        var thread_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = workers });
+        defer thread_system.deinit();
+        var tuners: [2]AdaptiveWorkTuner = @splat(AdaptiveWorkTuner.init(.{}));
+        var staging: std.ArrayList(TestElement) = .empty;
+        defer staging.deinit(testing.allocator);
+        var offsets: SlotList(BandOffsets) = .empty;
+        defer offsets.deinit(testing.allocator);
+        var dest: [150]TestElement = undefined;
+        const batches = try sortTestSegments(&thread_system, testing.allocator, &tuners, &segments, &segment_starts, &staging, &offsets, &dest);
+        try testing.expectEqualSlices(TestElement, &expected, &dest);
+        // On workers, both stages split into several ranges.
+        if (workers != 0) try testing.expect(batches.place.range_count > 1 and batches.sort.range_count > 1);
+        // Warm: the same sort grows nothing.
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        dest = undefined;
+        _ = try sortTestSegments(&thread_system, failing.allocator(), &tuners, &segments, &segment_starts, &staging, &offsets, &dest);
+        try testing.expectEqual(@as(usize, 0), failing.allocations);
+        try testing.expectEqualSlices(TestElement, &expected, &dest);
+        // One element runs no stage; none leaves `dest` empty.
+        var one: [1]TestElement = undefined;
+        const lone = try sortTestSegments(&thread_system, failing.allocator(), &tuners, &.{ elements[0..0], elements[5..6] }, &.{ 0, 0 }, &staging, &offsets, &one);
+        try testing.expectEqual(elements[5], one[0]);
+        try testing.expectEqual(@as(usize, 0), lone.place.item_count + lone.sort.item_count);
     }
 }

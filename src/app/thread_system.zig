@@ -1520,6 +1520,15 @@ pub fn setSlotCount(comptime T: type, slots: *SlotList(T), count: usize) void {
     slots.appendNTimesAssumeCapacity(.{}, count);
 }
 
+/// How many of a stage's scratch capacities differ between two snapshots taken in the same
+/// order: each differing entry is one counted growth.
+pub fn changedCapacities(before: []const usize, after: []const usize) usize {
+    std.debug.assert(before.len == after.len);
+    var changed: usize = 0;
+    for (before, after) |old, new| changed += @intFromBool(old != new);
+    return changed;
+}
+
 /// Sets a MAL's row count within reserved capacity, never allocating; rows past the old
 /// count are undefined. Hand-written: `std.MultiArrayList` has no assume-capacity length
 /// set (`resize` takes an allocator).
@@ -1604,6 +1613,10 @@ pub const band_tuner_config = AdaptiveWorkTunerConfig{
     .initial_range_items = 1,
     .smallest_range_items = 1,
 };
+
+/// Tuner config of a world-create rebuild stage: the rebuild is a one-off, so a fresh
+/// tuner's first rebuild dispatches on the full pool instead of inline on main.
+pub const rebuild_tuner_config = AdaptiveWorkTunerConfig{ .first_selection = .full_pool };
 
 /// Batch stats of a stage that ran on the calling thread as one range, with no thread
 /// system or with work the inline path absorbed. An empty batch reports no range.

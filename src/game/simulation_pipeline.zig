@@ -1151,24 +1151,26 @@ pub const SimulationPipeline = struct {
         self.static_colliders.capture(frame);
     }
 
-    /// Applies the captured static changes, records them for nav, then refreshes collision's
-    /// triggers to this revision so the next step's patch does not allocate. The chunk
+    /// Applies the captured static changes, records them for nav, then syncs collision's
+    /// stored triggers to this revision so the next step's update does not patch. The chunk
     /// rewrite, the trigger query, and the store's page rewrite thread under
     /// `thread_system`. A warm patch's main work is O(1) per edit record and touched page,
-    /// flat in stored pairs. A sync error leaves the
-    /// rows unchanged and keeps the changes. A refresh error leaves the synced rows and
-    /// nav marks in place; the next sync retries the refresh.
+    /// flat in stored pairs. A collider sync error leaves the rows unchanged and keeps the
+    /// changes. A trigger sync error leaves the synced rows and nav marks in place; the next
+    /// update or seam retries it.
     pub fn syncStaticColliders(self: *SimulationPipeline, data: *const DataSystem, thread_system: *ThreadSystem) !void {
         try self.static_colliders.sync(data, thread_system);
         self.pathfinding.recordStaticColliderChanges(self.static_colliders.changesThisStep());
         const view = self.static_colliders.view();
         try self.collision.reserveDebugRects(view.row_of_index.len);
-        try self.collision.refreshCommittedTriggers(data, view, thread_system);
+        try self.collision.syncCommittedTriggers(data, view, thread_system);
     }
 
-    /// Records the last collider sync's stage batches: its plan, the sync's cost driver, to
-    /// the log, and every later stage to a bench's sink. Every sync resets them, so after the
-    /// commit seam they are this step's, empty (and not recorded) when no static changed.
+    /// Records the commit seam's stage batches: the collider sync's plan and the trigger
+    /// patch's leaf rewrite, each its path's cost driver, to the log, and every other collider
+    /// sync and trigger patch stage to a bench's sink. Every seam resets them, so they are
+    /// this step's, empty (and not recorded) when no static changed; a seam that rebuilt the
+    /// triggers records no trigger batch.
     pub fn recordStaticColliderSyncTo(self: *const SimulationPipeline, perf: runtime_perf_log.Context) void {
         const batches = &self.static_colliders.last_batches;
         perf.recordBatch(.static_collider_plan, batches.get(.plan));

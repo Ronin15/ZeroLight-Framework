@@ -106,15 +106,15 @@
 //! quarter of the stored pairs are kept but filtered from the contacts; same pass shape and
 //! asserts, the contact count less the dormant pairs and the wide dynamic's dormant hits.
 //!
-//! The trigger patch groups time only the trigger refresh after a commit seam
-//! (`fixtures.CommitSeam`, then `CollisionSystem.refreshCommittedTriggers`), on the case's
+//! The trigger patch groups time only the trigger sync after a commit seam
+//! (`fixtures.CommitSeam`, then `CollisionSystem.syncCommittedTriggers`), on the case's
 //! thread system, in a world fixed at the largest size's. They assert fixture invariants
 //! only, not their pass shapes: the cold store's pair count, that each sync changes exactly
 //! the moved statics, that the patch queried only the changes (not a rebuild over the row
 //! pool), and the stored pair count after every patch. They run `serial-direct` and the
 //! fixed worker-count cases only, no adaptive case. Each prints `per_change=`, and with
 //! `--details` the main share in `serial-direct` only (no worker exists, so the whole
-//! refresh is main) and, under each row, the query items and the stored pairs.
+//! sync is main) and, under each row, the query items and the stored pairs.
 //! - `collision-static-trigger-change`: the `collision-static-triggers` fixture's stored pairs
 //!   in the corner of the largest count's grid, plus one solid alternating between cell 0's
 //!   and cell 1's triggers (drops two pairs, adds two; queries the solid's one change).
@@ -140,7 +140,7 @@
 //! cell), then `entries=` (sweep entries), `visits_per_body=` (candidates the sweep tested,
 //! counted with the perf log only), and `main=` with `main_per_item=` per body: the time
 //! outside the stages' worker dispatches. The `--details` line under each row gives the
-//! measured steps' static query, Debug rect compare, static sort, and trigger allow pack
+//! measured steps' static query, Debug rect compare, static sort, and stored-trigger refresh
 //! shapes, and in `collision-static-index-change` the collider sync's splice shape and its
 //! `row_grows=` and `payload_grows=` counts. `collision-static-rebuild` and
 //! `collision-static-rebuild-sparse` print `per_static=`, and with `--details` the rewrite
@@ -819,7 +819,7 @@ fn runStaticTriggersCase(allocator: std.mem.Allocator, io: std.Io, options: suit
 // ----------------------------------------------------------------------------
 // Static trigger patches: statics moved through the commit seam, then the stored trigger
 // pairs brought up to the synced colliders through the seam entry
-// (`CollisionSystem.refreshCommittedTriggers`), timed alone.
+// (`CollisionSystem.syncCommittedTriggers`), timed alone.
 // ----------------------------------------------------------------------------
 
 // A solid's offset in its pitch cell: it overlaps both of the cell's triggers.
@@ -845,25 +845,25 @@ const trigger_wide_geometry = blk: {
     break :blk ColliderGeometry.init(tile_size, cells_x, cells_y, default_chunk_size_tiles);
 };
 
-// One timed trigger refresh: its time and the items its trigger query ran over.
+// One timed trigger sync: its time and the items its patch query ran over.
 const TriggerPatch = struct {
     ns: u64,
     query_items: usize,
 };
 
-// Brings `system`'s stored trigger pairs up to `colliders`' synced revision, timed. A
-// rebuild queries every row-pool id, so callers check the items for the warm patch.
-fn refreshTriggersTimed(system: *CollisionSystem, data: *const DataSystem, colliders: *const StaticColliderSystem, threads: *ThreadSystem, io: std.Io) !TriggerPatch {
+// Brings `system`'s stored trigger pairs up to `colliders`' synced revision, timed. A seam
+// that rebuilt records no patch query, so callers check the items for the warm patch.
+fn syncTriggersTimed(system: *CollisionSystem, data: *const DataSystem, colliders: *const StaticColliderSystem, threads: *ThreadSystem, io: std.Io) !TriggerPatch {
     const view = colliders.view();
     const start_ns = suite.nowNs(io);
-    try system.refreshCommittedTriggers(data, view, threads);
+    try system.syncCommittedTriggers(data, view, threads);
     const end_ns = suite.nowNs(io);
-    if (system.trigger_store.seen_revision != view.revision) return error.TriggerRefreshMissedRevision;
+    if (system.trigger_store.seen_revision != view.revision) return error.TriggerSyncMissedRevision;
     return .{ .ns = suite.elapsedNs(start_ns, end_ns), .query_items = system.trigger_query_batch.item_count };
 }
 
-// The timed refreshes of one case. Main time is known only on a thread system with no
-// workers, where the whole refresh runs on main.
+// The timed syncs of one case. Main time is known only on a thread system with no
+// workers, where the whole sync runs on main.
 const TriggerPatchSamples = struct {
     accumulator: suite.StatsAccumulator,
     last_query_items: ?usize = null,
@@ -953,7 +953,7 @@ fn runStaticTriggerWideCase(allocator: std.mem.Allocator, io: std.Io, options: s
 }
 
 // Builds the colliders and the cold trigger store, then moves `move`'s static through the
-// commit seam each step and times the trigger refresh after its sync.
+// commit seam each step and times the trigger sync after the collider sync.
 fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *DataSystem, geometry: ColliderGeometry, move: *fixtures.StaticMove, shape: TriggerPatchShape) !suite.RunStats {
     var frame = SimulationFrame.init(allocator);
     defer frame.deinit();
@@ -969,7 +969,7 @@ fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suit
     var system = CollisionSystem.init(allocator);
     defer system.deinit();
     // The cold store: a rebuild over every row.
-    try system.refreshCommittedTriggers(data, colliders.view(), &threads);
+    try system.syncCommittedTriggers(data, colliders.view(), &threads);
     if (system.trigger_store.pair_count != shape.stored_pairs) return error.TriggerPairCountMismatch;
 
     const seam = fixtures.CommitSeam{ .colliders = &colliders, .structural_headroom = fixtures.StaticMove.structural_headroom };
@@ -981,7 +981,7 @@ fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suit
     return samples.finish(&threads, 1, shape.stored_pairs);
 }
 
-// One move through the commit seam, then the timed refresh: the sync changes only the
+// One move through the commit seam, then the timed trigger sync: the sync changes only the
 // moved static, and the warm patch queries the shape's items and keeps its pair count.
 fn patchMovedStatic(system: *CollisionSystem, colliders: *StaticColliderSystem, frame: *SimulationFrame, data: *DataSystem, move: *fixtures.StaticMove, seam: fixtures.CommitSeam, threads: *ThreadSystem, io: std.Io, shape: TriggerPatchShape) !TriggerPatch {
     frame.beginStep();
@@ -990,7 +990,7 @@ fn patchMovedStatic(system: *CollisionSystem, colliders: *StaticColliderSystem, 
     const changes = colliders.changesThisStep();
     if (changes.len != 1 or !changes[0].entity.eql(move.entity)) return error.StaticChangeNotSynced;
     move.advance();
-    const patch = try refreshTriggersTimed(system, data, colliders, threads, io);
+    const patch = try syncTriggersTimed(system, data, colliders, threads, io);
     if (patch.query_items != shape.query_items) return error.TriggerPatchMissedQuery;
     if (system.trigger_store.pair_count != shape.stored_pairs) return error.TriggerPairCountMismatch;
     return patch;
@@ -1135,7 +1135,7 @@ fn checkTunerSelected(case: suite.BenchmarkCase, threads: *const ThreadSystem, t
 }
 
 // The tuned case's rebuild stage with more than one aligned range runs on workers: a fresh
-// rebuild tuner's first selection is the full pool (`StaticColliderSystem.rebuild_tuner_config`).
+// rebuild tuner's first selection is the full pool (`rebuild_tuner_config`).
 fn checkRebuildOnWorkers(case: suite.BenchmarkCase, threads: *const ThreadSystem, batch: BatchStats) error{RebuildStageRanInline}!void {
     if (case.adaptive_range_mode != .tuned or threads.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
     if (rangeCount(batch.item_count, batch.range_alignment_items) > 1 and batch.ran_inline) return error.RebuildStageRanInline;
@@ -1503,7 +1503,7 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
 }
 
 // The dense-change world with checkered triggers: each step's dense commit through the
-// commit seam, then the timed trigger refresh.
+// commit seam, then the timed trigger sync.
 fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var fixture = try DenseChangeFixture.init(allocator, change_count, case, .checkered_triggers);
@@ -1513,7 +1513,7 @@ fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, opt
     var system = CollisionSystem.init(allocator);
     defer system.deinit();
     // The cold store: a rebuild over every row, every static home.
-    try system.refreshCommittedTriggers(&fixture.data, fixture.colliders.view(), &threads);
+    try system.syncCommittedTriggers(&fixture.data, fixture.colliders.view(), &threads);
     const home_pairs = denseHomeTriggerPairs(.checkered_triggers);
     if (system.trigger_store.pair_count != home_pairs) return error.TriggerPairCountMismatch;
     // Untimed, once: the region moved away, then a cold rebuild at that revision is the away
@@ -1522,12 +1522,12 @@ fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, opt
     const away_pairs = blk: {
         var cold = CollisionSystem.init(allocator);
         defer cold.deinit();
-        try cold.refreshCommittedTriggers(&fixture.data, fixture.colliders.view(), &threads);
+        try cold.syncCommittedTriggers(&fixture.data, fixture.colliders.view(), &threads);
         break :blk cold.trigger_store.pair_count;
     };
     // Stored pairs with the region home and away.
     const pairs = [2]usize{ home_pairs, away_pairs };
-    _ = try denseTriggerRefresh(&fixture, &system, &threads, io, pairs);
+    _ = try denseTriggerSync(&fixture, &system, &threads, io, pairs);
 
     // Fixed worker-count cases only, so nothing settles; two steps run both directions.
     var warm = suite.Warmup.init(options, case, 2);
@@ -1537,17 +1537,17 @@ fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, opt
     return samples.finish(&threads, change_count, system.trigger_store.pair_count);
 }
 
-// One dense commit and its sync (`changeAndSync` checks every move synced), then the timed
-// refresh.
+// One dense commit and its collider sync (`changeAndSync` checks every move synced), then
+// the timed trigger sync.
 fn denseTriggerPatch(fixture: *DenseChangeFixture, system: *CollisionSystem, threads: *ThreadSystem, io: std.Io, pairs: [2]usize) !TriggerPatch {
     _ = try fixture.changeAndSync(io, threads);
-    return denseTriggerRefresh(fixture, system, threads, io, pairs);
+    return denseTriggerSync(fixture, system, threads, io, pairs);
 }
 
-// The timed refresh after a dense sync: the warm patch queries exactly the changed statics,
+// The timed trigger sync after a dense collider sync: the warm patch queries exactly the changed statics,
 // and keeps the stored pair count of the region's side.
-fn denseTriggerRefresh(fixture: *DenseChangeFixture, system: *CollisionSystem, threads: *ThreadSystem, io: std.Io, pairs: [2]usize) !TriggerPatch {
-    const patch = try refreshTriggersTimed(system, &fixture.data, &fixture.colliders, threads, io);
+fn denseTriggerSync(fixture: *DenseChangeFixture, system: *CollisionSystem, threads: *ThreadSystem, io: std.Io, pairs: [2]usize) !TriggerPatch {
+    const patch = try syncTriggersTimed(system, &fixture.data, &fixture.colliders, threads, io);
     if (patch.query_items != fixture.moves.len) return error.TriggerPatchMissedQuery;
     // `changeAndSync` advanced every move, so the first move's side is the region's.
     if (system.trigger_store.pair_count != pairs[@intFromBool(fixture.moves[0].at_second)]) return error.TriggerPairCountMismatch;
