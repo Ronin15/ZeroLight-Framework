@@ -971,6 +971,8 @@ pub const CollisionSystem = struct {
         thread_system: *ThreadSystem,
         config: CollisionConfig,
     ) !CollisionStats {
+        // The sweep and the trigger patch's half-open strip span need exact strip division.
+        std.debug.assert(std.math.frexp(config.strips.height).significand == 0.5);
         self.strips = config.strips;
         const view = config.static_colliders;
         if (comptime builtin.mode == .debug) {
@@ -2001,10 +2003,18 @@ fn triggerQueryJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void 
         .patch => {
             const change = view.changes[item];
             const entity_index = change.entity.index;
-            if (change.old) |old| queryOldTriggerPairs(job, slot, old, entity_index);
+            // A change whose level and box stay walks once: the old part's hits are the new
+            // part's.
+            var shared = false;
             if (change.new) |placement| {
                 std.debug.assert(entity_index < view.row_of_index.len and view.row_of_index[entity_index] != no_static_row);
-                queryNewTriggerPairs(job, slot, view.row_of_index[entity_index], placement.level);
+                if (change.old) |old| shared = old.level == placement.level and std.meta.eql(old.aabb, viewRowBox(view, view.row_of_index[entity_index]));
+            }
+            const shared_hits = if (change.old) |old| queryOldTriggerPairs(job, slot, old, entity_index, shared) else null;
+            if (change.new) |placement| {
+                // A shared walk that overflowed replays the range; the new part would too.
+                if (shared and shared_hits == null) continue;
+                queryNewTriggerPairs(job, slot, view.row_of_index[entity_index], placement.level, shared_hits);
             }
         },
         .rebuild => {
@@ -2012,18 +2022,19 @@ fn triggerQueryJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void 
             const row: u32 = @intCast(item);
             const entity = view.row_entity[row];
             if (entity.index >= view.row_of_index.len or view.row_of_index[entity.index] != row) continue;
-            queryNewTriggerPairs(job, slot, row, job.data.worldLevelConst(entity) orelse 0);
+            queryNewTriggerPairs(job, slot, row, job.data.worldLevelConst(entity) orelse 0, null);
         },
     };
 }
 
 // Inserts the stored pairs row `row` on `level` owns: each positive overlap with a partner
 // that has a movement row, where either side is a trigger, unless the partner also queries
-// and is the pair's a. Rows and emit bits are current now.
+// and is the pair's a. Rows and emit bits are current now. `collected` is the count of hits
+// already in the slot from a walk over this row's box and level, else null.
 // SIMD verdict: the overlap and contact math is the `writeStaticHitContacts` lane kernel;
 // the hit pack and the pair rule are scalar (pair-stream point lookups), and each kept
 // pair drains into a tree descent, which is irreducible.
-fn queryNewTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, row: u32, level: u16) void {
+fn queryNewTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, row: u32, level: u16, collected: ?usize) void {
     const data = job.data;
     const view = job.view;
     const entity = view.row_entity[row];
@@ -2031,9 +2042,9 @@ fn queryNewTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, ro
     const own_trigger = response.mode == .trigger;
     if (job.mode == .rebuild and !own_trigger) return;
     const own_move = data.movementBodyDenseIndex(entity) orelse return;
-    const box = math.Aabb{ .min_x = view.row_min_x[row], .min_y = view.row_min_y[row], .max_x = view.row_max_x[row], .max_y = view.row_max_y[row] };
+    const box = viewRowBox(view, row);
     const hits = HitColumns.of(slot.hits.slice());
-    const full = view.collectOverlaps(level, box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, idleSpanIds());
+    const full = collected orelse view.collectOverlaps(level, box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, idleSpanIds());
     if (full > slot.hits.len) {
         slot.noteHits(full);
         return;
@@ -2069,72 +2080,74 @@ fn queryNewTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, ro
     }
 }
 
+fn viewRowBox(view: ColliderView, row: u32) math.Aabb {
+    return .{ .min_x = view.row_min_x[row], .min_y = view.row_min_y[row], .max_x = view.row_max_x[row], .max_y = view.row_max_y[row] };
+}
+
 // Drops every stored pair entity index `entity_index` held at its old row: its a-pairs as
-// one key range per occupied strip its old box reaches, and its b-pairs by exact key
-// against each unchanged partner its old box can reach. A changed partner drops their pair
-// from its own a-range.
-// SIMD verdict: scalar. Tree descents and page searches per strip and per hit.
-fn queryOldTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, old: OldPlacement, entity_index: u32) void {
+// one key range per occupied strip of its old box, and its b-pairs by exact key against
+// each unchanged partner overlapping its old box. A changed partner drops their pair from
+// its own a-range. With `share_hits`, the old box's hits stay in the slot for the new part
+// and their count is returned; null otherwise or when the walk overflowed.
+// SIMD verdict: scalar. Tree descents and page searches per strip and per hit; the
+// per-hit overlap filter is a compaction feeding one tree descent per survivor, so lane
+// masks would drain into per-item descents (pair-stream exemption).
+fn queryOldTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, old: OldPlacement, entity_index: u32, share_hits: bool) ?usize {
     const store = job.store;
-    if (store.pair_count == 0) return;
+    if (store.pair_count == 0 and !share_hits) return null;
     const view = job.view;
-    const geometry = view.geometry.?;
-    const old_run = bodyRunKey(old.min_x, old.min_y, entity_index);
-    // The old box reached at most one cell past its last cell's far edge, which absorbs the
-    // f32 rounding of that edge; from a level's last cell a row may reach past the grid.
-    const reach = math.Aabb{
-        .min_x = old.min_x,
-        .min_y = old.min_y,
-        .max_x = edgePastCell(old.cells.max_x, geometry.grid.width, geometry.cell_size),
-        .max_y = edgePastCell(old.cells.max_y, geometry.grid.height, geometry.cell_size),
-    };
-    var strip = stripOf(job.strips, old.min_y);
-    const last_strip = stripOf(job.strips, reach.max_y);
-    while (strip <= last_strip) : (strip += 1) {
-        const bounds = keyRangeOfARun(old.level, strip, old_run);
-        var cursor = store.seek(bounds[0]);
-        if (!cursor.valid()) break;
-        var keys = cursor.pageKeys();
-        const first_key = keys[cursor.offset];
-        if (collision_triggers.keyLevel(first_key) != old.level) break;
-        // Jump to the next occupied strip, so the walk costs occupied strips, not the reach.
-        const first_strip = keyStrip(first_key);
-        if (first_strip > strip) {
-            if (first_strip > last_strip) break;
-            strip = first_strip - 1;
-            continue;
-        }
-        while (true) {
-            const offset = cursor.offset;
-            var end = offset;
-            while (end < cursor.page_len and keys[end] <= bounds[1]) end += 1;
-            if (end > offset) slot.pushDrop(cursor.dropPiece(offset, end));
-            if (end == offset or end < cursor.page_len) break;
-            cursor.nextPage();
+    const box = old.aabb;
+    const old_run = bodyRunKey(box.min_x, box.min_y, entity_index);
+    if (store.pair_count != 0) {
+        // A pair's key strip holds y in [box.min_y, box.max_y): the box's half-open strips.
+        var strip = stripOf(job.strips, box.min_y);
+        const last_strip = math.lastCellOfSpan(box.min_y, box.max_y, job.strips.height, strip_count);
+        while (strip <= last_strip) : (strip += 1) {
+            const bounds = keyRangeOfARun(old.level, strip, old_run);
+            var cursor = store.seek(bounds[0]);
             if (!cursor.valid()) break;
-            keys = cursor.pageKeys();
+            var keys = cursor.pageKeys();
+            const first_key = keys[cursor.offset];
+            if (collision_triggers.keyLevel(first_key) != old.level) break;
+            // Jump to the next occupied strip, so the walk costs occupied strips, not the box.
+            const first_strip = keyStrip(first_key);
+            if (first_strip > strip) {
+                if (first_strip > last_strip) break;
+                strip = first_strip - 1;
+                continue;
+            }
+            while (true) {
+                const offset = cursor.offset;
+                var end = offset;
+                while (end < cursor.page_len and keys[end] <= bounds[1]) end += 1;
+                if (end > offset) slot.pushDrop(cursor.dropPiece(offset, end));
+                if (end == offset or end < cursor.page_len) break;
+                cursor.nextPage();
+                if (!cursor.valid()) break;
+                keys = cursor.pageKeys();
+            }
         }
     }
     const hits = HitColumns.of(slot.hits.slice());
-    const full = view.collectOverlaps(old.level, reach, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, idleSpanIds());
+    const full = view.collectOverlaps(old.level, box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, idleSpanIds());
     if (full > slot.hits.len) {
         slot.noteHits(full);
-        return;
+        return null;
     }
-    for (0..full) |hit| {
-        const partner = hits.entity[hit];
-        if (partner == entity_index or job.changed(partner)) continue;
-        const partner_run = bodyRunKey(hits.min_x[hit], hits.min_y[hit], partner);
-        if (partner_run >= old_run) continue;
-        const key = contactOrderKey(old.level, stripOf(job.strips, @max(hits.min_y[hit], old.min_y)), partner_run, old_run);
-        if (store.storedPiece(key)) |piece| slot.pushDrop(piece);
+    if (store.pair_count != 0) {
+        for (0..full) |hit| {
+            const partner = hits.entity[hit];
+            if (partner == entity_index) continue;
+            // A stored pair overlaps positively on both axes; a touching hit holds none.
+            if (!(hits.min_x[hit] < box.max_x and box.min_x < hits.max_x[hit] and hits.min_y[hit] < box.max_y and box.min_y < hits.max_y[hit])) continue;
+            if (job.changed(partner)) continue;
+            const partner_run = bodyRunKey(hits.min_x[hit], hits.min_y[hit], partner);
+            if (partner_run >= old_run) continue;
+            const key = contactOrderKey(old.level, stripOf(job.strips, @max(hits.min_y[hit], box.min_y)), partner_run, old_run);
+            if (store.storedPiece(key)) |piece| slot.pushDrop(piece);
+        }
     }
-}
-
-// The world edge one cell past cell `cell`'s far edge, or +inf from the axis's last cell.
-fn edgePastCell(cell: u32, cells: u32, cell_size: f32) f32 {
-    if (cell + 1 >= cells) return std.math.inf(f32);
-    return @as(f32, @floatFromInt(cell + 2)) * cell_size;
+    return if (share_hits) full else null;
 }
 
 fn stripOf(strips: CollisionStrips, y: f32) u32 {
@@ -6438,6 +6451,26 @@ test "collision trigger patch of a solid turned trigger with no move matches a r
     try expectTurnedTriggerPatch(2);
 }
 
+fn expectEmptyStoreTurnedTriggerPatch(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const turned = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 30, .y = 30, .w = 40, .h = 40 }, .static, .solid);
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, workers);
+    defer fixture.deinit();
+    // All statics are solid: the store is ready with no pairs, yet the mode-only change's
+    // shared walk must still feed its new part.
+    try std.testing.expectEqual(@as(usize, 0), fixture.patched.trigger_store.pair_count);
+    try fixture.commit(&data, &.{.{ .set_collision_response = .{ .entity = turned, .response = .{ .mobility = .static, .mode = .trigger, .restitution = 0 } } }});
+    try std.testing.expectEqual(@as(usize, 1), fixture.patched.trigger_store.pair_count);
+}
+
+test "collision trigger patch of a solid turned trigger on an empty store matches a rebuild" {
+    try expectEmptyStoreTurnedTriggerPatch(0);
+    try expectEmptyStoreTurnedTriggerPatch(2);
+}
+
 fn expectIndexReusePatch(workers: usize) !void {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -6459,6 +6492,27 @@ fn expectIndexReusePatch(workers: usize) !void {
     // The create took the destroyed index: one change for it.
     try std.testing.expectEqual(@as(usize, 1), fixture.colliders.view().changes.len);
     try std.testing.expectEqual(doomed.index, fixture.colliders.view().changes[0].entity.index);
+    // The index reused at the same box and level: one walk serves the old and new parts,
+    // the old part drops the pair with the solid at (400,400), and the new one re-inserts it.
+    const reborn_id = fixture.colliders.view().changes[0].entity;
+    try std.testing.expect(data.isAlive(reborn_id));
+    try std.testing.expect(try storesPairNaming(&fixture.patched, reborn_id, null));
+    try fixture.commit(&data, &.{
+        .{ .destroy_entity = reborn_id },
+        .{ .create_entity = .{
+            .movement_body = .{ .position = reborn, .previous_position = reborn },
+            .collision_bounds = .{ .size = .{ .x = 40, .y = 40 } },
+            .collision_response = .{ .mobility = .static, .mode = .trigger, .restitution = 0 },
+        } },
+    });
+    const view = fixture.colliders.view();
+    const changes = view.changes;
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqual(doomed.index, changes[0].entity.index);
+    try std.testing.expect(!changes[0].entity.eql(reborn_id));
+    try std.testing.expectEqual(changes[0].old.?.level, changes[0].new.?.level);
+    try std.testing.expect(std.meta.eql(changes[0].old.?.aabb, viewRowBox(view, view.row_of_index[doomed.index])));
+    try std.testing.expect(try storesPairNaming(&fixture.patched, changes[0].entity, null));
 }
 
 test "collision trigger patch of a destroy and an index reuse in one commit matches a rebuild" {
@@ -6484,6 +6538,62 @@ fn expectOverlappingChangedTriggersPatch(workers: usize) !void {
 test "collision trigger patch of two overlapping changed triggers matches a rebuild" {
     try expectOverlappingChangedTriggersPatch(0);
     try expectOverlappingChangedTriggersPatch(2);
+}
+
+fn expectStripEdgePatch(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const strip_height = CollisionStrips.default.height;
+    // A trigger over two strips whose box ends on the second strip's far edge.
+    const edge = try addObstacle(&data, .{ .x = 100, .y = 0, .w = 40, .h = 2 * strip_height }, .static, .trigger);
+    // Its a-pair, keyed in its last strip.
+    _ = try addObstacle(&data, .{ .x = 120, .y = 2 * strip_height - 1, .w = 20, .h = 20 }, .static, .solid);
+    // Touching its far y edge in the next strip: no pair.
+    _ = try addObstacle(&data, .{ .x = 110, .y = 2 * strip_height, .w = 20, .h = 20 }, .static, .solid);
+    // Its b-pair, a sliver over its min x edge.
+    _ = try addObstacle(&data, .{ .x = 60, .y = 10, .w = 40.5, .h = 20 }, .static, .solid);
+    // Touching its min x edge: no pair.
+    _ = try addObstacle(&data, .{ .x = 60, .y = 40, .w = 40, .h = 10 }, .static, .solid);
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, workers);
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 2), fixture.patched.trigger_store.pair_count);
+    try fixture.commit(&data, &.{movedBody(&data, edge, 600, 600)});
+    try fixture.commit(&data, &.{movedBody(&data, edge, 100, 0)});
+}
+
+test "collision trigger patch of a static whose box ends on a strip edge matches a rebuild" {
+    try expectStripEdgePatch(0);
+    try expectStripEdgePatch(2);
+}
+
+fn expectModeOnlyOverflowPatch(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // A trigger over 80 solids, more than a query's reserved hit rows, and one trigger.
+    const columns: usize = 16;
+    const rows: usize = 5;
+    comptime std.debug.assert(columns * rows > reserved_query_hits);
+    for (0..columns * rows) |index| {
+        _ = try addObstacle(&data, .{ .x = @as(f32, @floatFromInt(index % columns)) * 32 + 1, .y = @as(f32, @floatFromInt(index / columns)) * 32 + 1, .w = 30, .h = 30 }, .static, .solid);
+    }
+    _ = try addObstacle(&data, .{ .x = 40, .y = 40, .w = 20, .h = 20 }, .static, .trigger);
+    const box = math.Vec2{ .x = @as(f32, @floatFromInt(columns)) * 32, .y = @as(f32, @floatFromInt(rows)) * 32 };
+    const turned = try addObstacle(&data, .{ .x = 0, .y = 0, .w = box.x, .h = box.y }, .static, .trigger);
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, workers);
+    defer fixture.deinit();
+    // Only the mode changes, so one walk serves the change's old and new parts; it outgrows
+    // the patch's fresh hit rows, so the range grows its slot and replays.
+    try std.testing.expectEqual(@as(usize, 0), fixture.patched.trigger_query_slots.items.len);
+    try fixture.commit(&data, &.{.{ .set_collision_response = .{ .entity = turned, .response = .{ .mobility = .static, .mode = .solid, .restitution = 0 } } }});
+    try std.testing.expect(fixture.patched.trigger_query_slots.items[0].value.hits.len > reserved_query_hits);
+    try fixture.commit(&data, &.{.{ .set_collision_response = .{ .entity = turned, .response = .{ .mobility = .static, .mode = .trigger, .restitution = 0 } } }});
+}
+
+test "collision trigger patch of a mode-only change over more partners than a query's reserved hits matches a rebuild" {
+    try expectModeOnlyOverflowPatch(0);
+    try expectModeOnlyOverflowPatch(2);
 }
 
 // A chain of 81 overlapping triggers (80 stored pairs) and 24 dynamics on every third one:

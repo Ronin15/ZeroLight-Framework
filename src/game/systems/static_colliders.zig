@@ -252,8 +252,8 @@ pub const CellSpan = struct { min_x: u32, min_y: u32, max_x: u32, max_y: u32 };
 /// Where a row sits: its level and the cells it covers.
 pub const Placement = struct { level: u16, cells: CellSpan };
 
-/// A row's placement before a sync, with its min corner: the box readers built keys from.
-pub const OldPlacement = struct { level: u16, cells: CellSpan, min_x: f32, min_y: f32 };
+/// A row's placement before a sync, with its box: the box readers built keys and overlaps from.
+pub const OldPlacement = struct { level: u16, cells: CellSpan, aabb: math.Aabb };
 
 /// One entity's row change at the last sync: its placement before (null when it had no
 /// row) and after (null when it has none now).
@@ -2139,7 +2139,7 @@ pub const StaticColliderSystem = struct {
             if (old_row != no_row) {
                 const placement = self.rowPlacement(old_row);
                 old_aabb = self.rowAabb(old_row);
-                plan.old = .{ .level = placement.level, .cells = placement.cells, .min_x = old_aabb.min_x, .min_y = old_aabb.min_y };
+                plan.old = .{ .level = placement.level, .cells = placement.cells, .aabb = old_aabb };
                 plan.old_rect = geometry.chunkRect(placement);
                 plan.old_query = self.queryPlacement(placement, old_aabb);
             }
@@ -2152,7 +2152,7 @@ pub const StaticColliderSystem = struct {
                 new_class = class;
                 const placement = outputs.placement(inputs.level[at], at);
                 const key = geometry.queryKey(placement.level, class, placement.cells);
-                plan.relink = if (plan.old_rect) |old_rect| !(old_rect.eql(geometry.chunkRect(placement)) and plan.old_query.?.key == key and aabbEql(old_aabb, outputs.aabb(at))) else true;
+                plan.relink = if (plan.old_rect) |old_rect| !(old_rect.eql(geometry.chunkRect(placement)) and plan.old_query.?.key == key and std.meta.eql(old_aabb, outputs.aabb(at))) else true;
                 if (old_row == no_row) {
                     // Adds stay below the pending count, under u32.
                     plan.add_local = tally.adds;
@@ -2502,7 +2502,7 @@ const SyncPlan = struct {
     // Whether its rows' chunks, AABB, or query key change, so the chunks and cells of both
     // rewrite it.
     relink: bool = false,
-    // The old row's placement and min corner, chunk rect, and query class and key.
+    // The old row's placement and box, chunk rect, and query class and key.
     old: ?OldPlacement = null,
     old_rect: ?ChunkRect = null,
     old_query: ?QueryPlacement = null,
@@ -3340,10 +3340,6 @@ fn applyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     colliders.applyRange(job.inputs, job.outputs, range.start, range.end);
 }
 
-fn aabbEql(a: math.Aabb, b: math.Aabb) bool {
-    return a.min_x == b.min_x and a.min_y == b.min_y and a.max_x == b.max_x and a.max_y == b.max_y;
-}
-
 fn spanLess(_: void, a: SpanInsert, b: SpanInsert) bool {
     return a.entity < b.entity;
 }
@@ -4158,31 +4154,32 @@ test "a destroy and a create reusing the index in one commit keep only the new r
     try expectSameRows(&fixture.colliders, &rebuilt, 1);
 }
 
-// Each change's old placement against `before`, the pre-commit row min corners by entity
-// index (null: no row then): present exactly when a row was, with that corner bit-exact.
-fn expectOldCorners(colliders: *const StaticColliderSystem, before: []const ?[2]f32) !void {
+// Each change's old placement against `before`, the pre-commit row boxes by entity index
+// (null: no row then): present exactly when a row was, with that box bit-exact.
+fn expectOldBoxes(colliders: *const StaticColliderSystem, before: []const ?math.Aabb) !void {
     for (colliders.changesThisStep()) |change| {
-        const corner = before[change.entity.index] orelse {
+        const box = before[change.entity.index] orelse {
             try std.testing.expect(change.old == null);
             continue;
         };
         const old = change.old orelse return error.TestExpectedOldPlacement;
-        try std.testing.expectEqual(@as(u32, @bitCast(corner[0])), @as(u32, @bitCast(old.min_x)));
-        try std.testing.expectEqual(@as(u32, @bitCast(corner[1])), @as(u32, @bitCast(old.min_y)));
+        const expected: [4]u32 = @bitCast([4]f32{ box.min_x, box.min_y, box.max_x, box.max_y });
+        const actual: [4]u32 = @bitCast([4]f32{ old.aabb.min_x, old.aabb.min_y, old.aabb.max_x, old.aabb.max_y });
+        try std.testing.expectEqual(expected, actual);
     }
 }
 
-// The row min corner of each entity index `corners` covers, or null without a row.
-fn rowCorners(colliders: *const StaticColliderSystem, corners: []?[2]f32) void {
-    for (corners, 0..) |*corner, index| {
-        corner.* = null;
+// The row box of each entity index `boxes` covers, or null without a row.
+fn rowBoxes(colliders: *const StaticColliderSystem, boxes: []?math.Aabb) void {
+    for (boxes, 0..) |*box, index| {
+        box.* = null;
         if (index >= colliders.row_of_index.items.len) continue;
         const row = colliders.row_of_index.items[index];
-        if (row != no_row) corner.* = .{ colliders.row_min_x[row], colliders.row_min_y[row] };
+        if (row != no_row) box.* = colliders.rowAabb(row);
     }
 }
 
-test "collider change carries the old row's min corner" {
+test "collider change carries the old row's box" {
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{
@@ -4192,9 +4189,9 @@ test "collider change carries the old row's min corner" {
     });
     var entities: [3]EntityId = undefined;
     for (fixture.colliders.changesThisStep(), &entities) |change, *entity| entity.* = change.entity;
-    var before: [8]?[2]f32 = undefined;
+    var before: [8]?math.Aabb = undefined;
     // A move, a mode-only response change, and a destroy with a create reusing its index.
-    rowCorners(&fixture.colliders, &before);
+    rowBoxes(&fixture.colliders, &before);
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{
         .{ .set_movement_body = .{ .entity = entities[0], .body = .{ .position = .{ .x = 200.5, .y = 210.25 }, .previous_position = .{ .x = 200.5, .y = 210.25 } } } },
         .{ .set_collision_response = .{ .entity = entities[1], .response = .{ .mode = .trigger, .mobility = .static } } },
@@ -4202,14 +4199,14 @@ test "collider change carries the old row's min corner" {
         .{ .create_entity = staticTemplate(.{ .x = 900.875, .y = 33.5 }, .{ .x = 8, .y = 8 }) },
     });
     try std.testing.expectEqual(@as(usize, 3), fixture.colliders.changesThisStep().len);
-    try expectOldCorners(&fixture.colliders, &before);
+    try expectOldBoxes(&fixture.colliders, &before);
     for (fixture.colliders.changesThisStep()) |change| try std.testing.expect(change.old != null and change.new != null);
     // A destroy.
-    rowCorners(&fixture.colliders, &before);
+    rowBoxes(&fixture.colliders, &before);
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .destroy_entity = entities[0] }});
     try std.testing.expectEqual(@as(usize, 1), fixture.colliders.changesThisStep().len);
     try std.testing.expect(fixture.colliders.changesThisStep()[0].new == null);
-    try expectOldCorners(&fixture.colliders, &before);
+    try expectOldBoxes(&fixture.colliders, &before);
 }
 
 test "chunk lists stay in entity order under any add/remove order" {

@@ -1470,9 +1470,9 @@ test "a static mark record after its reserve allocates nothing (FailingAllocator
     defer system.deinit();
     // A move, a create, and a destroy: four spans.
     const changes = [_]ColliderChange{
-        .{ .entity = try EntityId.init(1, 1), .old = .{ .level = 0, .cells = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, .min_x = 0, .min_y = 0 }, .new = .{ .level = 0, .cells = .{ .min_x = 4, .min_y = 0, .max_x = 5, .max_y = 1 } } },
+        .{ .entity = try EntityId.init(1, 1), .old = .{ .level = 0, .cells = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, .aabb = .{ .min_x = 0, .min_y = 0, .max_x = 0, .max_y = 0 } }, .new = .{ .level = 0, .cells = .{ .min_x = 4, .min_y = 0, .max_x = 5, .max_y = 1 } } },
         .{ .entity = try EntityId.init(2, 1), .old = null, .new = .{ .level = 1, .cells = .{ .min_x = 2, .min_y = 2, .max_x = 2, .max_y = 2 } } },
-        .{ .entity = try EntityId.init(3, 1), .old = .{ .level = 2, .cells = .{ .min_x = 7, .min_y = 7, .max_x = 9, .max_y = 8 }, .min_x = 0, .min_y = 0 }, .new = null },
+        .{ .entity = try EntityId.init(3, 1), .old = .{ .level = 2, .cells = .{ .min_x = 7, .min_y = 7, .max_x = 9, .max_y = 8 }, .aabb = .{ .min_x = 0, .min_y = 0, .max_x = 0, .max_y = 0 } }, .new = null },
     };
     try system.reserveStaticColliderMarks(changes.len);
     system.allocator = std.testing.failing_allocator;
