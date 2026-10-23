@@ -8,13 +8,16 @@
 //!   every agent in one chunk (one index record), whose ranges split the chunk. Pass shape: linear in the H indexed
 //!   rows in both layouts. The tuned case follows the production tuner and stays inline while
 //!   its batch is under the gate; the main thread's share (the window merges) is flat per row.
-//!   Asserts check a fixed threaded case dispatches the pass to workers, one record for
-//!   `dense_chunk`, every case's think set equal
-//!   to the serial pass's, and every indexed row counted once, thinking or skipped. Item
+//!   Asserts check a fixed threaded case dispatches the pass to workers at one range per
+//!   aligned range of rows, one record for `dense_chunk`, every case's think set equal
+//!   to the serial pass's, and every indexed row counted once, thinking or skipped; on
+//!   `spread`, untimed after the measured passes, the collision bounds and AI halo gathers,
+//!   the tier policy, and the chunk derive at the case's controls dispatch the same way. Item
 //!   code `layout * 10^6 + agents` (layout 0 `spread`, 1 `dense_chunk`). Prints `indexed=`
 //!   (H) and `thinking=`; `--details` adds `main=` with `main_per_item=` (per indexed row).
 
 const std = @import("std");
+const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
@@ -25,6 +28,8 @@ const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialI
 const CognitionResult = @import("../game/systems/simulation_scope.zig").CognitionResult;
 const SimulationScopeSystem = @import("../game/systems/simulation_scope.zig").SimulationScopeSystem;
 const ScopeConfig = @import("../game/systems/simulation_scope.zig").ScopeConfig;
+const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
+const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const scope_range_alignment_items = @import("../game/systems/simulation_scope.zig").scope_range_alignment_items;
 const ActiveRegion = @import("../game/simulation_scope.zig").ActiveRegion;
 const tierForChunkDistance = @import("../game/simulation_scope.zig").tierForChunkDistance;
@@ -101,6 +106,8 @@ fn createSpreadFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
             .y = 32.0 + @mod(row * 13.0, @as(f32, grid_tiles) * tile_size - 64.0),
         };
         try data.setMovementBody(entity, .{ .position = position, .previous_position = position });
+        // Bounds for the untimed gather checks; the think set reads only the index.
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 8, .y = 8 } });
         try data.setAiAgent(entity, .{
             .active_behavior = if (index % 3 == 0) .wander else .pursue,
             .wander_amplitude = 6.0 + @as(f32, @floatFromInt(index % 29)),
@@ -187,21 +194,23 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         const result = try runCognitionOnce(&scope, &view, thread_ptr, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        try suite.checkStageDispatched(case, thread_ptr, case.stageItemsPerRange(scope_range_alignment_items), result.batch);
-        accumulator.record(elapsed_ns, result.batch);
-        main_total += elapsed_ns -| offMainNs(result.batch);
+        try suite.checkStageDispatched(case, thread_ptr, case.stageItemsPerRange(scope_range_alignment_items), result.perf.batch);
+        try suite.checkFixedRangeCount(case, thread_ptr, case.stageItemsPerRange(scope_range_alignment_items), result.perf.batch);
+        accumulator.record(elapsed_ns, result.perf.batch);
+        main_total += elapsed_ns -| offMainNs(result.perf.batch);
         std.debug.assert(std.mem.eql(u32, serial_think, result.cognition));
         think_rows = result.cognition.len;
         // Every indexed row thinks or is skipped, once, and each range scans exactly its own
         // cell-major positions.
         std.debug.assert(think_rows + scope.perf.stagger_skips == indexed);
-        std.debug.assert(result.batch.range_count == scope.range_tallies.items.len);
+        std.debug.assert(result.perf.batch.range_count == scope.range_tallies.items.len);
         for (scope.range_tallies.items, 0..) |slot, range_index| {
-            const range_start = range_index * result.batch.items_per_range;
-            std.debug.assert(slot.tally.count + slot.tally.perf.stagger_skips == @min(result.batch.items_per_range, indexed - range_start));
+            const range_start = range_index * result.perf.batch.items_per_range;
+            std.debug.assert(slot.tally.count + slot.tally.perf.stagger_skips == @min(result.perf.batch.items_per_range, indexed - range_start));
         }
     }
 
+    if (fields.layout == .spread) try checkScopeStagesDispatched(allocator, &scope, &data, thread_ptr, case);
     var stats = accumulator.finish();
     stats.items_per_second = suite.itemsPerSecond(fields.agents, stats.mean_ns);
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
@@ -209,6 +218,26 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     stats.output_count = think_rows;
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&scope.cognition_tuner), settled_before_measurement);
     return stats;
+}
+
+// Untimed, after the measured passes: the collision bounds gather, the AI halo gather, the
+// tier policy, and the chunk derive at the case's controls over the spread layout's mixed
+// tiers. Each runs over its rows, and a fixed threaded case dispatches each, one range per
+// aligned range of rows.
+fn checkScopeStagesDispatched(allocator: std.mem.Allocator, scope: *SimulationScopeSystem, data: *DataSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !void {
+    const range = case.stageItemsPerRange(scope_range_alignment_items);
+    const collision = try scope.gatherCollisionBoundsIndices(data, thread_system, scopeConfig(case));
+    if (collision.indices == null) return error.ScopeGatherFixtureAllActive;
+    const ai = try scope.gatherAiPopulations(data, cognitionHaloRegion(), thread_system, scopeConfig(case));
+    var commands = RangeOutputStream(StructuralCommand).init(allocator);
+    defer commands.deinit();
+    const tier_policy = try scope.queueTierChanges(data, visibleRegion(), &commands, thread_system, scopeConfig(case));
+    const chunk_derive = scope.deriveChunks(data, thread_system, .{ .tile_size = tile_size, .chunk_size_tiles = chunk_size_tiles, .width = grid_tiles, .height = grid_tiles }, scopeConfig(case));
+    for ([_]BatchStats{ collision.perf.batch, ai.perf.batch, tier_policy, chunk_derive }) |batch| {
+        if (batch.item_count == 0) return error.ScopeStageSkipped;
+        try suite.checkStageDispatched(case, thread_system, range, batch);
+        try suite.checkFixedRangeCount(case, thread_system, range, batch);
+    }
 }
 
 fn runCognitionOnce(scope: *SimulationScopeSystem, view: *const SpatialIndexView, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !CognitionResult {

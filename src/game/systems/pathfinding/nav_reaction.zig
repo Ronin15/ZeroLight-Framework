@@ -541,7 +541,6 @@ fn navMarkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 // ----------------------------------------------------------------------------------------
 
 const math = @import("../../../core/math.zig");
-const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const EntityId = @import("../../data_system.zig").EntityId;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
@@ -942,7 +941,7 @@ test "nav build fails loudly when its chunk edge or index widths do not fit" {
     try std.testing.expectError(error.LevelCellIndexOverflow, system.graph.rebuild(.{}, huge_extent, null));
 }
 
-test "a nav update reports its marks batch's remask, and an update without marks reports none" {
+test "a nav update applies its marks batch, and an update without marks or with marks on no built level applies none" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -962,18 +961,15 @@ test "a nav update reports its marks batch's remask, and an update without marks
     const changed = (try world.setDenseTile(obstacle, 2, 2, tree)) orelse return error.TestExpectedEqual;
     const stats = try test_support.applyTileChange(&system, no_colliders, &world, changed);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    try std.testing.expect(stats.remask_batch.item_count > 0);
-    try std.testing.expectEqual(stats.dirty_chunks, stats.remask_batch.item_count);
+    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = 2, .y = 2 }));
 
-    // The graph keeps its last remask; an update with no batch must not report it again.
     const idle = try test_support.applyTileEdits(&system, no_colliders, &world, &.{});
     try std.testing.expectEqual(@as(usize, 0), idle.incremental_rebuilds);
-    try std.testing.expectEqual(BatchStats{}, idle.remask_batch);
 
     // A batch whose only mark misses every built level commits without changing the graph.
     const unbuilt = try test_support.applyTileEdits(&system, no_colliders, &world, &.{.{ .level = 99, .x = 2, .y = 2 }});
     try std.testing.expectEqual(@as(usize, 0), unbuilt.incremental_rebuilds);
-    try std.testing.expectEqual(BatchStats{}, unbuilt.remask_batch);
+    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = 2, .y = 2 }));
 }
 
 test "reactToPostCommitNavEvents preserves buffered marks across a failed apply instead of dropping them" {
@@ -1327,10 +1323,8 @@ test "pathfinding threaded incremental nav update is allocation-free at steady s
     const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
 
-    // Every stage must have actually threaded, not fallen back to the inline slot-0 path —
-    // otherwise this would silently retest the already-covered serial path. A plan over
-    // several ranges merges through the plan order set into its reserved key lists.
-    try std.testing.expect(!stats.remask_batch.ran_inline);
+    // A plan over several ranges merges through the plan order set into its reserved key
+    // lists.
     try std.testing.expect(system.graph.plan_tallies.items.len > 1);
 
     for (cells) |cell| {

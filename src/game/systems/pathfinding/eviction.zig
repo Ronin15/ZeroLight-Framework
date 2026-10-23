@@ -168,7 +168,8 @@ pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_syste
             .hits = self.evict_hits.items,
             .range_count = self.evict_shape.range_count,
         };
-        stats.evict_batch = runShaped(navDispatch(self, thread_system, &self.tuners.nav_evict), self.evict_shape, keys.len, evict_range_alignment_items, &job, evictJob);
+        const evict_batch = runShaped(navDispatch(self, thread_system, &self.tuners.nav_evict), self.evict_shape, keys.len, evict_range_alignment_items, &job, evictJob);
+        if (comptime runtime_perf_log.enabled) stats.perf.evict_batch = evict_batch;
         const removal_timer = StageTimer.begin();
         defer stats.addMain(.evict_ns, removal_timer.lap());
         for (self.evict_items.items) |item| {
@@ -198,7 +199,7 @@ pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_syste
         stats.perf.registry_flush_count_batch = count_batch;
         stats.addStageTime(count_batch);
         stats.addStageTime(stats.perf.evict_count_batch);
-        stats.addStageTime(stats.evict_batch);
+        stats.addStageTime(stats.perf.evict_batch);
         stats.addStageTime(flush_batch);
     }
 }
@@ -892,7 +893,7 @@ test "an eviction reserve out of memory leaves graph, cache, registry, and marks
     try expectSameRegistry(&reference, &system);
 }
 
-test "threaded eviction equals serial over a dense region (bounds, flags, hits, cache bytes), and the eviction stages run on workers" {
+test "threaded eviction equals serial over a dense region (bounds, flags, hits, cache bytes)" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
@@ -916,8 +917,7 @@ test "threaded eviction equals serial over a dense region (bounds, flags, hits, 
     const cached = serial.completed.count();
     _ = try serial.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(serial.completed.count() < cached);
-    const stats = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    try std.testing.expect(!stats.evict_batch.ran_inline and stats.evict_batch.range_count > 1);
+    _ = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     try std.testing.expectEqual(serial.evict_items.items.len, threaded.evict_items.items.len);
     for (serial.evict_items.items, threaded.evict_items.items) |a, b| {
         try std.testing.expectEqual(a.bound, b.bound);
@@ -1089,7 +1089,7 @@ const pocket_change_cells = blk: {
     break :blk cells;
 };
 
-test "threaded eviction with paths and fields equals serial over a dense change (bounds, flags, hits), and runs on workers" {
+test "threaded eviction with paths and fields equals serial over a dense change (bounds, flags, hits)" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
     var data = DataSystem.init(std.testing.allocator);
@@ -1122,8 +1122,7 @@ test "threaded eviction with paths and fields equals serial over a dense change 
     _ = try systems[0].applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expect(systems[0].completed.count() + 1 < cached);
     try std.testing.expect(group_service.groupFieldOf(&systems[0], field_key) == null);
-    const stats = try systems[1].applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    try std.testing.expect(!stats.evict_batch.ran_inline and stats.evict_batch.range_count > 1);
+    _ = try systems[1].applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     for (systems[0].evict_items.items, systems[1].evict_items.items) |a, b| {
         // Window bases follow each run's range shape.
         var a_unplaced = a;
@@ -1137,7 +1136,7 @@ test "threaded eviction with paths and fields equals serial over a dense change 
     for (&systems) |*system| try expectRegistryMatchesCache(system);
 }
 
-test "a nav worker cap of zero keeps the mark and eviction stages inline on a multi-worker ThreadSystem and changes no result" {
+test "a nav worker cap of zero on a multi-worker ThreadSystem changes no mark or eviction result" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1175,7 +1174,6 @@ test "a nav worker cap of zero keeps the mark and eviction stages inline on a mu
     var systems: [2]PathfindingSystem = undefined;
     var built: usize = 0;
     defer for (systems[0..built]) |*system| system.deinit();
-    var stats: [2]NavUpdateStats = undefined;
     for (&systems, caps) |*system, cap| {
         system.* = try evictionFixture(&data, &fixture, requester, threads.participantSlotCount(), 32);
         built += 1;
@@ -1187,10 +1185,8 @@ test "a nav worker cap of zero keeps the mark and eviction stages inline on a mu
     }
     try setRegistryCells(&systems[0], &fixture, &pocket_change_cells, fixture.tree);
     for (pocket_change_cells) |cell| try test_support.recordTileEdits(&systems[1], &fixture.world, &.{.{ .level = 0, .x = cell[0], .y = cell[1] }});
-    for (&systems, &stats) |*system, *step| step.* = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
-    try std.testing.expect(!stats[0].evict_batch.ran_inline and stats[0].evict_batch.range_count > 1);
-    try std.testing.expect(stats[1].evict_batch.ran_inline);
-    try std.testing.expectEqual(stats[0].evict_batch.item_count, stats[1].evict_batch.item_count);
+    for (&systems) |*system| _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expectEqual(systems[0].evict_items.items.len, systems[1].evict_items.items.len);
     try expectSameCache(&systems[0], &systems[1]);
     try expectSameRegistry(&systems[0], &systems[1]);
 }

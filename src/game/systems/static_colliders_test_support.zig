@@ -14,15 +14,15 @@ pub fn liveRowCount(colliders: anytype) usize {
 }
 
 /// The last `rebuild` or `sync`'s worker dispatch time over every stage (`offMainNs` of each
-/// `last_batches` entry): its elapsed time less this is its main-thread time.
+/// `Perf.last_batches` entry): its elapsed time less this is its main-thread time.
 pub fn lastOffMainNs(colliders: anytype) u64 {
     var total: u64 = 0;
-    for (std.meta.tags(ColliderStage)) |stage| total += offMainNs(colliders.last_batches.get(stage));
+    for (std.meta.tags(ColliderStage)) |stage| total += offMainNs(colliders.perf.last_batches.get(stage));
     return total;
 }
 
 /// The `ColliderStage` a rebuild or sync stage (`RebuildStage`, `SyncStage`) records its
-/// `last_batches` entry under: the stage of the same name.
+/// `Perf.last_batches` entry under: the stage of the same name.
 pub fn colliderStage(stage: anytype) ColliderStage {
     return switch (stage) {
         inline else => |tag| @field(ColliderStage, @tagName(tag)),

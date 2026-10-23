@@ -319,18 +319,18 @@ pub const NavUpdateStats = struct {
     levels_built: usize = 0,
     // Records the marks batch left holding portals.
     records_patched: usize = 0,
-    // The chunk remask, the connectivity flood (every round folded into one), the one-way
-    // closure's rows (rounds folded into one), and the eviction halo walk, summed over the
-    // level builds and the marks batch.
-    remask_batch: BatchStats = .{},
-    conn_flood_batch: BatchStats = .{},
-    conn_closure_rows_batch: BatchStats = .{},
-    evict_batch: BatchStats = .{},
     perf: Perf = .{},
 
-    /// The diagnostics `recordTo` does not read: kept only with `runtime_perf_log.enabled`,
-    /// zero-sized without it, so every write and read sits under that comptime gate.
+    /// Kept only with `runtime_perf_log.enabled`, zero-sized without it, so every write and
+    /// read sits under that comptime gate.
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        // The chunk remask, the connectivity flood (every round folded into one), the one-way
+        // closure's rows (rounds folded into one), and the eviction halo walk, summed over the
+        // level builds and the marks batch: the perf log's nav batches.
+        remask_batch: BatchStats = .{},
+        conn_flood_batch: BatchStats = .{},
+        conn_closure_rows_batch: BatchStats = .{},
+        evict_batch: BatchStats = .{},
         // Remask, patch, mark, and eviction dispatch time that ran on workers; inline stages
         // add nothing.
         off_main_stage_ns: u64 = 0,
@@ -395,6 +395,8 @@ pub const NavUpdateStats = struct {
         closure_land_deferrals: usize = 0,
         closure_live_words: usize = 0,
         closure_tail_capacity: usize = 0,
+        // The most rows (copy spans or round items) one closure rows round dispatched.
+        closure_rows_round_items_max: usize = 0,
         // Each the most over the update's closure batches: the tail words a batch's bound
         // reserved and its relocated blocks took, its candidate components' block words, and
         // the terminals it could number.
@@ -429,10 +431,12 @@ pub const NavUpdateStats = struct {
         perf.recordMetric(.nav_chunks_patched, metric(self.chunks_patched));
         perf.recordMetric(.nav_levels_built, metric(self.levels_built));
         perf.recordMetric(.nav_records_patched, metric(self.records_patched));
-        perf.recordBatch(.nav_remask, self.remask_batch);
-        perf.recordBatch(.nav_connect, self.conn_flood_batch);
-        perf.recordBatch(.nav_closure, self.conn_closure_rows_batch);
-        perf.recordBatch(.nav_evict, self.evict_batch);
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordBatch(.nav_remask, self.perf.remask_batch);
+            perf.recordBatch(.nav_connect, self.perf.conn_flood_batch);
+            perf.recordBatch(.nav_closure, self.perf.conn_closure_rows_batch);
+            perf.recordBatch(.nav_evict, self.perf.evict_batch);
+        }
     }
 };
 
@@ -540,14 +544,6 @@ pub const PathfindingConfig = struct {
 };
 
 pub const PathfindingStats = struct {
-    solve_batch: BatchStats = .{},
-    // Request classification (`path_intake`); inline stages report `ran_inline`.
-    intake_batch: BatchStats = .{},
-    // The path registry's owner ops and adds. `registry_flush` is the apply; the count
-    // dispatch is `Perf.registry_flush_count_batch` and a shrink's owner rename pass
-    // `Perf.registry_rename_batch`. A shrink's byte moves are `resize_copy`.
-    registry_flush_batch: BatchStats = .{},
-    resize_copy_batch: BatchStats = .{},
     // Per-phase update timings (ns); zero when perf logging is disabled. Recorded
     // as pathfinding_* sub-stage timers that break down pipeline_pathfinding.
     accept_ns: u64 = 0,
@@ -561,6 +557,14 @@ pub const PathfindingStats = struct {
     /// Diagnostic counts, kept only with `runtime_perf_log.enabled` and zero-sized without
     /// it; `SimulationPipelineStats.recordTo` logs the request and result counts.
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        solve_batch: BatchStats = .{},
+        // Request classification (`path_intake`); inline stages report `ran_inline`.
+        intake_batch: BatchStats = .{},
+        // The path registry's owner ops and adds. `registry_flush_batch` is the apply; the
+        // count dispatch is `registry_flush_count_batch` and a shrink's owner rename pass
+        // `registry_rename_batch`. A shrink's byte moves are `resize_copy_batch`.
+        registry_flush_batch: BatchStats = .{},
+        resize_copy_batch: BatchStats = .{},
         // The registry flush's count dispatch and its rename pass (a shrink's only): bench
         // output, not perf-log keys.
         registry_flush_count_batch: BatchStats = .{},

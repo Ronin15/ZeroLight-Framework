@@ -963,6 +963,27 @@ pub fn checkStageDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSy
     if (batch.item_count > aligned and batch.ran_inline) return error.BenchStageRanInline;
 }
 
+/// Fails when a fixed threaded case split a stage into other than one range per
+/// `items_per_range` (aligned to the batch's alignment) of its items, on a thread system with
+/// workers. Adaptive and serial cases, an empty batch, and a null control pass.
+pub fn checkFixedRangeCount(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats) error{BenchStageRangeShape}!void {
+    const range = items_per_range orelse return;
+    const threads = thread_system orelse return;
+    if (case.adaptive or threads.workerThreadCount() == 0 or batch.item_count == 0) return;
+    const aligned = std.mem.alignForwardAnyAlign(usize, @max(range, 1), @max(batch.range_alignment_items, 1));
+    if (batch.range_count != rangeCount(batch.item_count, aligned)) return error.BenchStageRangeShape;
+}
+
+/// Fails when a fixed threaded case ran every round of a round-folded stage inline although
+/// its widest round (`round_items_max`) spanned more than one `items_per_range` range, on a
+/// thread system with workers. Adaptive and serial cases and a null control pass.
+pub fn checkRoundsDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batch: BatchStats, round_items_max: usize) error{BenchStageRanInline}!void {
+    const range = items_per_range orelse return;
+    const threads = thread_system orelse return;
+    if (case.adaptive or threads.workerThreadCount() == 0) return;
+    if (round_items_max > @max(range, 1) and batch.worker_thread_ranges == 0) return error.BenchStageRanInline;
+}
+
 /// `checkStageDispatched` over each of `batches`.
 pub fn checkStagesDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batches: []const BatchStats) error{BenchStageRanInline}!void {
     for (batches) |batch| try checkStageDispatched(case, thread_system, items_per_range, batch);
@@ -1516,12 +1537,12 @@ fn writeNavConn(writer: *std.Io.Writer, summary: ?NavConnSummary) std.Io.Writer.
 /// tuner's workers when the case runs it adaptive (null otherwise; zero is inline).
 pub fn navConnSummary(stats: NavUpdateStats, flood_tuner_workers: ?usize) NavConnSummary {
     var summary = NavConnSummary{
-        .flood = batchSummaryFromBatch(stats.conn_flood_batch),
+        .flood = batchSummaryFromBatch(stats.perf.conn_flood_batch),
         .flood_tuner_workers = flood_tuner_workers,
         .chunks_patched = stats.chunks_patched,
         .records_patched = stats.records_patched,
-        .closure_rows = batchSummaryFromBatch(stats.conn_closure_rows_batch),
-        .closure_rows_off_main_ns = if (stats.conn_closure_rows_batch.ran_inline) 0 else stats.conn_closure_rows_batch.batch_duration_ns,
+        .closure_rows = batchSummaryFromBatch(stats.perf.conn_closure_rows_batch),
+        .closure_rows_off_main_ns = if (stats.perf.conn_closure_rows_batch.ran_inline) 0 else stats.perf.conn_closure_rows_batch.batch_duration_ns,
     };
     if (comptime diagnostics_enabled) {
         summary.seed = batchSummaryFromBatch(stats.perf.conn_seed_batch);

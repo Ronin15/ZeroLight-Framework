@@ -503,13 +503,12 @@ pub const Closure = struct {
     round_items: std.ArrayList(RowsItem) = .empty,
     // Usize: a batch's round items sum spans over every SCC and may pass u32.
     round_starts: std.ArrayList(usize) = .empty,
-    // Stage shape of the most recent batch's rows, its rounds folded into one.
-    last_rows_batch: BatchStats = .{},
-    // The most recent batch's resolve, mask, and plan stage shapes, kept only with
-    // `runtime_perf_log.enabled`.
+    // The most recent batch's rows (its rounds folded into one), resolve, mask, and plan
+    // stage shapes, kept only with `runtime_perf_log.enabled`.
     perf: Perf = .{},
 
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        last_rows_batch: BatchStats = .{},
         last_resolve_batch: BatchStats = .{},
         last_mask_batch: BatchStats = .{},
         last_plan_batch: BatchStats = .{},
@@ -1024,7 +1023,6 @@ pub fn updateClosure(self: *Connectivity, allocator: std.mem.Allocator, levels: 
         // No link this batch: it numbers no slot and runs no rows.
         const closure = &self.closure;
         if (comptime runtime_perf_log.enabled) closure.perf = .{};
-        closure.last_rows_batch = .{};
         return counters;
     }
     resolveLinks(self, levels, world, threads.resolve, stats);
@@ -1551,7 +1549,7 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
 
     // Rows: one sample for the step's copy spans and rounds; none when nothing moved.
     if (closure.copy_items.items.len + round_total == 0) {
-        closure.last_rows_batch = .{};
+        if (comptime runtime_perf_log.enabled) closure.perf.last_rows_batch = .{};
         commitClosure(self, allocator, slots, pieces, touched, preset, counters);
         stats.addMain(.closure_ns, section.lap());
         return;
@@ -1574,11 +1572,13 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
         };
         dispatch.run(round_slice.len, &rows, &rows.range_count, rowsJob);
     }
-    closure.last_rows_batch = dispatch.finish(closure.copy_items.items.len + round_total);
+    const rows_batch = dispatch.finish(closure.copy_items.items.len + round_total);
+    if (comptime runtime_perf_log.enabled) closure.perf.last_rows_batch = rows_batch;
     section = StageTimer.begin();
     if (comptime runtime_perf_log.enabled) {
         stats.perf.off_main_stage_ns += dispatch.off_main_ns;
         stats.perf.inline_stage_ns += dispatch.inline_ns;
+        stats.perf.closure_rows_round_items_max = @max(stats.perf.closure_rows_round_items_max, dispatch.round_items_max);
         counters.perf.rounds = rounds + @intFromBool(closure.copy_items.items.len != 0);
         for (closure.copy_items.items) |item| counters.perf.words_written += item.dst.len;
         for (closure.plan_items.items) |piece| counters.perf.words_written += @as(usize, pieces.a_count[piece]) * rowWords(pieces.k_cap[piece]);
@@ -2867,7 +2867,6 @@ test "a dig touching no one-way system leaves every block and word in place; a w
     const wall = latticeWall(chunks, 60);
     try fixture.setCell(&system, 0, wall[0], wall[1], fixture.grass);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-    try std.testing.expectEqual(@as(usize, 0), stats.conn_closure_rows_batch.item_count);
     // The dig resolves no link, so it numbers no slot and runs no rows.
     try std.testing.expectEqual(@as(usize, 0), closure.resolve_items.items.len);
     try expectWithinBounds(closure, stats);
@@ -2915,12 +2914,7 @@ fn markRoom(fixture: *TestWorld, systems: []const *PathfindingSystem, chunks: u1
     try markAll(fixture, systems, 0, room[0], room[1], tile);
 }
 
-// Whether a batch ran on workers.
-fn ranOnWorkers(batch: BatchStats) bool {
-    return batch.item_count != 0 and !batch.ran_inline and batch.worker_thread_ranges != 0;
-}
-
-test "threaded closure stages equal the inline ones word for word across worker counts and range sizes, and the rows run on workers" {
+test "threaded closure stages equal the inline ones word for word across worker counts and range sizes" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
     const chunks: u16 = 8;
@@ -2947,7 +2941,6 @@ test "threaded closure stages equal the inline ones word for word across worker 
             try threaded.rebuildStaticNavGridWithWorld(&fixture.data, &fixture.world, &threads);
             try expectSameColumns(&inline_system.graph, &threaded.graph);
             const systems = [_]*PathfindingSystem{ &inline_system, &threaded };
-            var rows_on_workers = false;
             // Every tail closed, then reopened; chain A wholly closed (its block dies); B's
             // tail closed; B's tail reopened while D loses all but 24 rooms (its block narrows
             // and lands).
@@ -2965,13 +2958,11 @@ test "threaded closure stages equal the inline ones word for word across worker 
                 const stats = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
                 try expectWithinBounds(&inline_system.graph.connectivity.closure, serial);
                 try expectWithinBounds(&threaded.graph.connectivity.closure, stats);
-                rows_on_workers = rows_on_workers or ranOnWorkers(stats.conn_closure_rows_batch);
                 // D's 24 rooms left narrow its block of 128, which landed in the reaction.
                 if (step == 4) try std.testing.expect(threaded.graph.connectivity.closure.hcomp.k_cap[roomHComp(&threaded, &fixture, chunks, 255)] < 128);
                 try expectSameColumns(&inline_system.graph, &threaded.graph);
                 try fixture.expectMatchesRebuild(&threaded);
             }
-            if (workers == 4 and items_per_range == 1) try std.testing.expect(rows_on_workers);
         }
     }
 }
@@ -3182,7 +3173,6 @@ test "a block narrowing prepared with the real allocator commits on a multi-work
     system.graph.allocator = original;
     system.nav_marks.clearRetainingCapacity();
     try std.testing.expect(!failing.has_induced_failure);
-    try std.testing.expect(!stats.conn_closure_rows_batch.ran_inline);
     // The narrowed block waits in the tail, readable, until the reaction's landing.
     const closure = &system.graph.connectivity.closure;
     try std.testing.expectEqual(@as(usize, 1), closure.residents.items.len);
@@ -3353,7 +3343,6 @@ test "a relocating batch committed under a failing allocator on a multi-worker T
     system.graph.allocator = failing.allocator();
     _ = system.graph.commitMarks(prepared, no_colliders.view(), nav_threads, &stats);
     try std.testing.expect(!failing.has_induced_failure);
-    try std.testing.expect(!stats.conn_closure_rows_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 1), closure.residents.items.len);
     try fixture.expectMatchesRebuild(&system);
     // Its landing fails: deferred, and the block stays in the tail.
@@ -3766,42 +3755,10 @@ test "a one-way link between unbuilt levels commits without allocating, stays de
     try fixture.expectMatchesRebuild(&system);
 }
 
-test "the post-commit nav reaction runs the closure rows on workers" {
-    const chunks: u16 = 8;
-    var fixture = try latticeWorld(chunks, 1);
-    defer fixture.deinit();
-    try addChain(&fixture, chunks, 0, 16, 16);
-    try addChain(&fixture, chunks, 0, 64, 16);
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4, .items_per_range = 1 });
-    defer threads.deinit();
-    var capacity = test_support.abstractCapacity();
-    capacity.worker_participant_count = threads.participantSlotCount();
-    var system = try fixture.build(capacity);
-    defer system.deinit();
-    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-    try setRoom(&fixture, &system, chunks, 0, 31, fixture.tree);
-    try setRoom(&fixture, &system, chunks, 0, 79, fixture.tree);
-    frame.beginStep();
-    const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, &threads);
-    try std.testing.expect(!stats.conn_closure_rows_batch.ran_inline and stats.conn_closure_rows_batch.worker_thread_ranges != 0);
-    try fixture.expectMatchesRebuild(&system);
-}
-
 // A post-commit nav reaction for the cap test: a lattice with two one-way chains each cut in
 // two by a closed room, a new block per chain landing (graph, connectivity, and closure
 // stages), or two rooms whose doors close (the flood).
 const CappedNavScenario = enum { closure, flood };
-
-// The stage names of every `BatchStats` of `NavUpdateStats`.
-const capped_nav_stages = blk: {
-    var names: []const []const u8 = &.{};
-    for (@typeInfo(NavUpdateStats).@"struct".field_names, @typeInfo(NavUpdateStats).@"struct".field_types) |name, field_type| {
-        if (field_type == BatchStats) names = names ++ .{name};
-    }
-    break :blk names;
-};
 
 fn runCappedNavScenario(scenario: CappedNavScenario, threads: *ThreadSystem, cap: ?usize) !NavUpdateStats {
     const chunks: u16 = 8;
@@ -3837,30 +3794,13 @@ fn runCappedNavScenario(scenario: CappedNavScenario, threads: *ThreadSystem, cap
     return stats;
 }
 
-test "a nav worker cap of zero keeps every graph, connectivity, and closure stage inline on a multi-worker ThreadSystem and changes no result" {
+test "a nav worker cap of zero on a multi-worker ThreadSystem changes no graph, connectivity, or closure result" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     for (std.meta.tags(CappedNavScenario)) |scenario| {
+        // Each run matches a full rebuild; the capped run patches the same records.
         const uncapped = try runCappedNavScenario(scenario, &threads, null);
         const capped = try runCappedNavScenario(scenario, &threads, 0);
-        // The fixed partition runs these stages on workers unless the cap holds them inline.
-        const on_workers: []const []const u8 = switch (scenario) {
-            .closure => &.{ "remask_batch", "conn_closure_rows_batch" },
-            .flood => &.{"conn_flood_batch"},
-        };
-        var matched: usize = 0;
-        inline for (capped_nav_stages) |name| {
-            const free = @field(uncapped, name);
-            const held = @field(capped, name);
-            try std.testing.expectEqual(free.item_count, held.item_count);
-            try std.testing.expect(held.ran_inline and held.active_worker_threads == 0);
-            for (on_workers) |wanted| {
-                if (!std.mem.eql(u8, wanted, name)) continue;
-                try std.testing.expect(!free.ran_inline and free.worker_thread_ranges != 0);
-                matched += 1;
-            }
-        }
-        try std.testing.expectEqual(on_workers.len, matched);
         try std.testing.expectEqual(uncapped.records_patched, capped.records_patched);
     }
 }

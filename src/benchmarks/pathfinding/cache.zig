@@ -10,6 +10,9 @@
 const std = @import("std");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const rangeCount = @import("../../app/thread_system.zig").rangeCount;
+const flush_pair_count = @import("../../game/systems/pathfinding/publish.zig").flush_pair_count;
+const pathfinding_range_alignment_items = @import("../../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const offMainNs = @import("../../app/thread_system.zig").offMainNs;
 const DataSystem = @import("../../game/data_system.zig").DataSystem;
 const EntityId = @import("../../game/data_system.zig").EntityId;
@@ -251,9 +254,9 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         for (fixture.system.evict_items.items) |evict_item| {
             if (evict_item.perf.visited > evict_item.bound) return error.EvictVisitPastHalo;
         }
-        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ reaction.stats.perf.evict_count_batch, reaction.stats.evict_batch, reaction.stats.perf.evict_flush_batch });
+        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ reaction.stats.perf.evict_count_batch, reaction.stats.perf.evict_batch, reaction.stats.perf.evict_flush_batch });
         last_stats = reaction.stats;
-        accumulator.record(reaction.elapsed_ns, reaction.stats.remask_batch);
+        accumulator.record(reaction.elapsed_ns, reaction.stats.perf.remask_batch);
         report.add(reaction);
         _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
@@ -269,7 +272,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.candidate_pairs = result_count;
     // Registry entries the reaction's eviction visited per second.
     stats.items_per_second = suite.itemsPerSecond(report.visited, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
+    stats.batch = suite.batchSummaryFromBatch(last_stats.perf.remask_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
     return stats;
 }
@@ -404,7 +407,7 @@ fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSys
         // Every goal is reachable, so each solve caches one result.
         if (step_stats.perf.unavailable_results != 0) return error.ElasticRampUnreachableGoal;
         ramp.solves += step_stats.perf.solved_requests;
-        if (step_stats.solve_batch.item_count > ramp.busiest_solve_batch.item_count) ramp.busiest_solve_batch = step_stats.solve_batch;
+        if (step_stats.perf.solve_batch.item_count > ramp.busiest_solve_batch.item_count) ramp.busiest_solve_batch = step_stats.perf.solve_batch;
         if (live == agent_total and step_stats.perf.cache_hits == agent_total) return ramp;
     }
     return error.ElasticRampStalled;
@@ -528,7 +531,7 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     var shrink_report = ShrinkReport{};
     for (0..coldIterations(options)) |_| {
         const shrink = try runElasticShrink(allocator, io, case, &system, capacity, &stream, requests, &cached, thread_ptr);
-        accumulator.record(shrink.step_ns, shrink.step_stats.intake_batch);
+        accumulator.record(shrink.step_ns, shrink.step_stats.perf.intake_batch);
         stage_report.add(shrink.step_ns, shrink.step_stats);
         shrink_report.add(shrink);
     }
@@ -584,7 +587,8 @@ fn runElasticShrink(
     const step_start_ns = suite.nowNs(io);
     shrink.step_stats = try runHeldStep(system, stream, thread_system, case, held.len);
     shrink.step_ns = suite.elapsedNs(step_start_ns, suite.nowNs(io));
-    shrink.copy_ns = offMainNs(shrink.step_stats.resize_copy_batch);
+    shrink.copy_ns = offMainNs(shrink.step_stats.perf.resize_copy_batch);
+    try checkShrinkFlushShape(case, thread_system, shrink.step_stats.perf.registry_flush_batch);
     shrink.agent_capacity_after = system.effective_agent_capacity;
     shrink.cache_capacity_after = system.completed.logicalCapacity();
     if (shrink.agent_capacity_after >= shrink.agent_capacity_before) return error.ElasticShrinkDidNotShrink;
@@ -609,6 +613,16 @@ fn runElasticShrink(
     // A shrink that moves entries rewrites their registrations' owners in one rename pass.
     if (shrink.moved != 0 and shrink.step_stats.perf.registry_rename_batch.item_count == 0) return error.ElasticShrinkRenamePassSkipped;
     return shrink;
+}
+
+// A shrink step's registry flush runs at its fixed shape on a thread system a worker may
+// join: the case's fixed range, or under the adaptive control one range per pair,
+// ceil(units / pairs) units each.
+fn checkShrinkFlushShape(case: suite.BenchmarkCase, thread_system: *const ThreadSystem, flush: BatchStats) !void {
+    if (flush.item_count == 0) return error.ShrinkFlushSkipped;
+    if (thread_system.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
+    const range = case.stageItemsPerRange(pathfinding_range_alignment_items) orelse @divCeil(flush.item_count, flush_pair_count);
+    if (flush.range_count != rangeCount(flush.item_count, range)) return error.ShrinkFlushShape;
 }
 
 // One step of the held agents, which must be served by cache hits alone.

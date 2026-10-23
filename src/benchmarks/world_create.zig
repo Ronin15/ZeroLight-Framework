@@ -340,7 +340,7 @@ fn createStaticsFixture(allocator: std.mem.Allocator, io: std.Io, statics: usize
 }
 
 const collider_rebuild_stages = std.enums.values(RebuildStage);
-const TriggerRebuildStage = @FieldType(TriggerStore, "last_rebuild_batches").Key;
+const TriggerRebuildStage = @FieldType(TriggerStore.Perf, "last_rebuild_batches").Key;
 const trigger_rebuild_stages = std.enums.values(TriggerRebuildStage);
 // The trigger build's stages: the rebuild query, then the store's.
 const trigger_stage_count = 1 + trigger_rebuild_stages.len;
@@ -362,13 +362,13 @@ const StaticsSample = struct {
 };
 
 fn triggerRebuildBatches(pipeline: *const SimulationPipeline) [trigger_stage_count]BatchStats {
-    const store_batches = pipeline.collision.trigger_store.last_rebuild_batches.values;
-    return [1]BatchStats{pipeline.collision.trigger_rebuild_query_batch} ++ store_batches;
+    const store_batches = pipeline.collision.trigger_store.perf.last_rebuild_batches.values;
+    return [1]BatchStats{pipeline.collision.perf.trigger_rebuild_query_batch} ++ store_batches;
 }
 
 fn colliderRebuildBatches(pipeline: *const SimulationPipeline) [collider_rebuild_stages.len]BatchStats {
     var batches: [collider_rebuild_stages.len]BatchStats = undefined;
-    for (&batches, collider_rebuild_stages) |*batch, stage| batch.* = pipeline.static_colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
+    for (&batches, collider_rebuild_stages) |*batch, stage| batch.* = pipeline.static_colliders.perf.last_batches.get(static_colliders_test_support.colliderStage(stage));
     return batches;
 }
 
@@ -390,14 +390,14 @@ fn checkInitTriggerBuild(pipeline: *const SimulationPipeline, world: *const Worl
     if (store.pair_count != cells) return error.TriggerPairCountMismatch;
     if (collision.reserved_trigger_bound < store.pair_count) return error.InitTriggerBoundNotToppedUp;
     if (batches[0].item_count != statics) return error.TriggerRebuildQueryMissedStatics;
-    const store_batches = &store.last_rebuild_batches;
+    const store_batches = &store.perf.last_rebuild_batches;
     if (store_batches.get(.insert_place).item_count != cells) return error.TriggerRebuildPlaceMissedPairs;
     if (store_batches.get(.insert_sort).item_count != cells) return error.TriggerRebuildSortMissedPairs;
     const pages = std.math.divCeil(usize, cells, trigger_page_capacity) catch unreachable; // lint:allow catch-unreachable: the page capacity is a nonzero constant
     if (store_batches.get(.leaf).item_count != pages) return error.TriggerRebuildLeafMissedPages;
     if (store_batches.get(.node).item_count < 1) return error.TriggerRebuildNodeSkipped;
-    if (collision.trigger_query_batch.item_count != 0) return error.InitTriggerBuildPatched;
-    for (store.last_batches.values) |batch| if (batch.item_count != 0) return error.InitTriggerBuildPatched;
+    if (collision.perf.trigger_query_batch.item_count != 0) return error.InitTriggerBuildPatched;
+    for (store.perf.last_batches.values) |batch| if (batch.item_count != 0) return error.InitTriggerBuildPatched;
 }
 
 // One create and first seam on `threads`, timed, then a collision step and the teardown,
@@ -427,7 +427,7 @@ fn createWithStatics(allocator: std.mem.Allocator, io: std.Io, fixture: *Statics
     const seam_end_ns = suite.nowNs(io);
     // The first seam rebuilt nothing: init's records stand, and it patched nothing.
     if (!std.meta.eql(triggerRebuildBatches(pipeline), trigger_batches)) return error.FirstSeamRebuiltTriggers;
-    if (pipeline.collision.trigger_query_batch.item_count != 0) return error.FirstSeamPatchedTriggers;
+    if (pipeline.collision.perf.trigger_query_batch.item_count != 0) return error.FirstSeamPatchedTriggers;
     if (pipeline.collision.trigger_store.pair_count != fixture.cells) return error.TriggerPairCountMismatch;
 
     // The first collision step emits every stored pair inside the declared bound.

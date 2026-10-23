@@ -68,6 +68,7 @@ const steering_range_alignment_items = @import("systems/steering/system.zig").st
 const ai_intent_range_alignment_items = @import("systems/ai.zig").ai_intent_range_alignment_items;
 const scope_range_alignment_items = @import("systems/simulation_scope.zig").scope_range_alignment_items;
 const StaticColliderSystem = @import("systems/static_colliders.zig").StaticColliderSystem;
+const ColliderView = @import("systems/static_colliders.zig").ColliderView;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const EventBudgetInputs = @import("simulation.zig").EventBudgetInputs;
 const StructuralCommitBudget = @import("simulation.zig").StructuralCommitBudget;
@@ -533,7 +534,6 @@ pub const SimulationPipelineStats = struct {
     pathfinding: PathfindingStats = .{},
     apply_intents: MovementIntentStats = .{},
     movement: MovementStats = .{},
-    chunk_derive: BatchStats = .{},
     collision: CollisionStats = .{},
     collision_response: CollisionResponseStats = .{},
     /// Live-bus stimuli dropped this step (promote and footstep optional
@@ -558,10 +558,11 @@ pub const SimulationPipelineStats = struct {
 
     /// Kept only with `runtime_perf_log.enabled`: this step's plane-traversal scratch and
     /// plane-entry window growths past their reservations (the reservation short of the
-    /// live population; zero in steady state).
+    /// live population; zero in steady state), and the chunk derive's batch.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         dig_plane_scratch_grows: usize = 0,
         plane_entry_window_grows: usize = 0,
+        chunk_derive: BatchStats = .{},
     } else struct {};
 
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
@@ -658,9 +659,11 @@ pub const SimulationPipelineStats = struct {
             perf.recordMetricMax(.path_max_distinct_group_keys, metric(pathfinding_stats.perf.distinct_group_keys));
             perf.recordMetric(.path_group_field_evictions, metric(pathfinding_stats.perf.group_field_evictions));
         }
-        perf.recordBenchBatch(.path_solve, pathfinding_stats.solve_batch);
-        perf.recordBatch(.path_intake, pathfinding_stats.intake_batch);
-        perf.recordBatch(.path_registry_flush, pathfinding_stats.registry_flush_batch);
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordBenchBatch(.path_solve, pathfinding_stats.perf.solve_batch);
+            perf.recordBatch(.path_intake, pathfinding_stats.perf.intake_batch);
+            perf.recordBatch(.path_registry_flush, pathfinding_stats.perf.registry_flush_batch);
+        }
         perf.recordTiming(.pathfinding_accept, pathfinding_stats.accept_ns);
         perf.recordTiming(.pathfinding_group_service, pathfinding_stats.group_service_ns);
         perf.recordTiming(.pathfinding_solve, pathfinding_stats.solve_ns);
@@ -668,12 +671,14 @@ pub const SimulationPipelineStats = struct {
         // Only a step that resized records its resize, so the timing averages per resize.
         if (pathfinding_stats.resize_ns != 0) {
             perf.recordTiming(.pathfinding_resize, pathfinding_stats.resize_ns);
-            perf.recordBatch(.path_resize_copy, pathfinding_stats.resize_copy_batch);
+            if (comptime runtime_perf_log.enabled) perf.recordBatch(.path_resize_copy, pathfinding_stats.perf.resize_copy_batch);
         }
 
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
-        if (comptime runtime_perf_log.enabled) perf.recordBenchBatch(.movement, movement_stats.perf.batch);
-        perf.recordBenchBatch(.chunk_derive, self.chunk_derive);
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordBenchBatch(.movement, movement_stats.perf.batch);
+            perf.recordBenchBatch(.chunk_derive, self.perf.chunk_derive);
+        }
 
         perf.recordMetric(.collision_bodies, metric(collision_stats.body_count));
         perf.recordMetric(.collision_candidate_pairs, metric(collision_stats.candidate_pair_count));
@@ -704,9 +709,9 @@ pub const SimulationPipelineStats = struct {
             perf.recordBenchBatch(.collision_static_sort, collision_stats.perf.static_sort_batch);
             perf.recordBenchBatch(.collision_trigger_emit_count, collision_stats.perf.trigger_emit_count_batch);
             perf.recordBenchBatch(.collision_trigger_emit, collision_stats.perf.trigger_emit_batch);
+            perf.recordBenchBatch(.collision_broadphase, collision_stats.perf.broadphase_batch);
+            perf.recordBenchBatch(.collision_narrowphase, collision_stats.perf.narrowphase_batch);
         }
-        perf.recordBenchBatch(.collision_broadphase, collision_stats.broadphase_batch);
-        perf.recordBenchBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
 
         perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
         perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
@@ -1339,16 +1344,17 @@ pub const SimulationPipeline = struct {
     /// this step's, empty (and not recorded) when no static changed; a seam that rebuilt the
     /// triggers records no trigger batch.
     pub fn recordStaticColliderSyncTo(self: *const SimulationPipeline, perf: runtime_perf_log.Context) void {
-        const batches = &self.static_colliders.last_batches;
+        if (comptime !runtime_perf_log.enabled) return;
+        const batches = &self.static_colliders.perf.last_batches;
         perf.recordBatch(.static_collider_plan, batches.get(.plan));
         perf.recordBenchBatch(.static_collider_touch, batches.get(.touch));
         perf.recordBenchBatch(.static_collider_group, batches.get(.group));
         perf.recordBenchBatch(.static_collider_apply, batches.get(.apply));
         perf.recordBenchBatch(.static_collider_rewrite, batches.get(.rewrite));
         perf.recordBenchBatch(.static_collider_install, batches.get(.install));
-        const trigger_batches = &self.collision.trigger_store.last_batches;
+        const trigger_batches = &self.collision.trigger_store.perf.last_batches;
         perf.recordBatch(.collision_trigger_rewrite, trigger_batches.get(.leaf));
-        perf.recordBenchBatch(.collision_trigger_query, self.collision.trigger_query_batch);
+        perf.recordBenchBatch(.collision_trigger_query, self.collision.perf.trigger_query_batch);
         perf.recordBenchBatch(.collision_trigger_insert_place, trigger_batches.get(.insert_place));
         perf.recordBenchBatch(.collision_trigger_insert_sort, trigger_batches.get(.insert_sort));
         perf.recordBenchBatch(.collision_trigger_node, trigger_batches.get(.node));
@@ -1478,7 +1484,6 @@ pub const SimulationPipeline = struct {
         pathfinding: PathfindingStats = .{},
         apply_intents: MovementIntentStats = .{},
         movement: MovementStats = .{},
-        chunk_derive: BatchStats = .{},
         collision: CollisionStats = .{},
         collision_response: CollisionResponseStats = .{},
         destructible: DestructibleProcessStats = .{},
@@ -1514,7 +1519,6 @@ pub const SimulationPipeline = struct {
                 .pathfinding = self.pathfinding,
                 .apply_intents = self.apply_intents,
                 .movement = self.movement,
-                .chunk_derive = self.chunk_derive,
                 .collision = self.collision,
                 .collision_response = self.collision_response,
                 .stimuli_live_dropped = self.stimuli_live_dropped,
@@ -1847,12 +1851,13 @@ pub const SimulationPipeline = struct {
     fn stageChunkDerive(self: *SimulationPipeline, step: *StepState) void {
         const context = step.context;
         var chunk_derive_timer = StageTimer.start();
-        step.chunk_derive = self.scope.deriveChunks(context.data, context.thread_system, .{
+        const chunk_derive = self.scope.deriveChunks(context.data, context.thread_system, .{
             .tile_size = context.world.tile_size,
             .chunk_size_tiles = context.world.chunk_size_tiles,
             .width = context.world.width,
             .height = context.world.height,
         }, .{});
+        if (comptime runtime_perf_log.enabled) step.perf.chunk_derive = chunk_derive;
         chunk_derive_timer.stop(context.perf, .pipeline_chunk_derive);
     }
 
@@ -7622,7 +7627,7 @@ test "a static committed at the seam pushes steering agents on the next step" {
     try std.testing.expect(try steeringStageLateralForTest(&pipeline, context, agent) > 0.05);
 }
 
-test "a static move plans and splices its collider's chunk lists, and a seam with no static change records neither" {
+test "a static move installs its collider's moved row at a new revision, and a seam with no static change keeps the revision" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
     var world = try minimalSyncWorld();
@@ -7645,6 +7650,7 @@ test "a static move plans and splices its collider's chunk lists, and a seam wit
     try frame.reserveStreams(pipeline.eventCapacitySum(), 4, 4, 4, 4, 4 + 16);
 
     // The box moves onto a chunk corner.
+    const revision = pipeline.static_colliders.view().revision;
     frame.beginStep();
     const moved = math.Vec2{ .x = 500, .y = 500 };
     try writeStructuralCommands(&frame, &.{.{ .set_movement_body = .{ .entity = box, .body = .{ .position = moved, .previous_position = moved, .velocity = .{}, .speed = 0 } } }});
@@ -7652,17 +7658,43 @@ test "a static move plans and splices its collider's chunk lists, and a seam wit
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
     try pipeline.syncStaticColliders(&frame, &data, &serial_threads);
-    try std.testing.expectEqual(@as(usize, 1), pipeline.static_colliders.last_batches.get(.plan).item_count);
-    try std.testing.expect(pipeline.static_colliders.last_batches.get(.rewrite).item_count > 0);
+    const view = pipeline.static_colliders.view();
+    try std.testing.expectEqual(revision + 1, view.revision);
+    try std.testing.expectEqual(@as(usize, 1), view.changes.len);
+    try std.testing.expect(view.changes[0].entity.eql(box));
+    const row = view.row_of_index[box.index];
+    try std.testing.expectApproxEqAbs(moved.x, view.row_min_x[row], 0.001);
+    try std.testing.expectApproxEqAbs(moved.y + 20, view.row_max_y[row], 0.001);
+    // The splice lists the box in the chunks of its corners, and the parked chunk no longer.
+    const corners = [_]math.Vec2{ moved, .{ .x = moved.x + 19, .y = moved.y }, .{ .x = moved.x, .y = moved.y + 19 }, .{ .x = moved.x + 19, .y = moved.y + 19 } };
+    for (corners) |corner| try std.testing.expect(chunkListsEntity(view, chunkAt(view, corner), box));
+    const parked_chunk = chunkAt(view, parked);
+    for (corners) |corner| {
+        if (chunkAt(view, corner) == parked_chunk) break;
+    } else try std.testing.expect(!chunkListsEntity(view, parked_chunk, box));
 
-    // A seam with no static change resets the batches.
+    // A seam with no static change installs nothing.
     frame.beginStep();
     try pipeline.reserveStaticColliders(&frame, &data);
     _ = try frame.applyStructuralCommands(&data);
     pipeline.captureStaticColliderChanges(&frame);
     try pipeline.syncStaticColliders(&frame, &data, &serial_threads);
-    try std.testing.expectEqual(@as(usize, 0), pipeline.static_colliders.last_batches.get(.plan).item_count);
-    try std.testing.expectEqual(@as(usize, 0), pipeline.static_colliders.last_batches.get(.rewrite).item_count);
+    try std.testing.expectEqual(revision + 1, pipeline.static_colliders.view().revision);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.static_colliders.view().changes.len);
+}
+
+// The level-0 collider chunk holding world point `point`.
+fn chunkAt(view: ColliderView, point: math.Vec2) u32 {
+    const geometry = view.geometry.?;
+    return geometry.grid.chunkOf(@intFromFloat(point.x / geometry.cell_size), @intFromFloat(point.y / geometry.cell_size));
+}
+
+// Whether level-0 collider chunk `chunk` lists `entity`.
+fn chunkListsEntity(view: ColliderView, chunk: u32, entity: EntityId) bool {
+    for (view.chunkRows(0, chunk).entity) |listed| {
+        if (listed == entity.index) return true;
+    }
+    return false;
 }
 
 test "a step after a growing trigger sync at the collider seam allocates nothing" {

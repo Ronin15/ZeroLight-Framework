@@ -874,13 +874,12 @@ pub const Connectivity = struct {
     endpoint_links_seen: usize = 0,
     // The staging's release window over marks batches.
     staging_window: types.StagingWindow(StagingGroup) = .{},
-    // Batch shape of the most recent batch's flood, its rounds folded into one.
-    last_flood_batch: BatchStats = .{},
-    // The most recent batch's seed and gather stage shapes, kept only with
-    // `runtime_perf_log.enabled`.
+    // The most recent batch's flood (its rounds folded into one), seed, and gather stage
+    // shapes, kept only with `runtime_perf_log.enabled`.
     perf: Perf = .{},
 
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        last_flood_batch: BatchStats = .{},
         last_seed_batch: BatchStats = .{},
         last_gather_batch: BatchStats = .{},
     } else struct {};
@@ -1637,7 +1636,7 @@ pub const Connectivity = struct {
         self.layout(views, &counters);
         self.settle(views);
         self.openSets(views);
-        self.last_flood_batch = .{};
+        if (comptime runtime_perf_log.enabled) self.perf.last_flood_batch = .{};
         stats.addMain(.conn_layout_ns, section.lap());
         if (counters.families != 0) self.runFlood(views, threads, &counters, stats);
         section = StageTimer.begin();
@@ -2150,8 +2149,9 @@ pub const Connectivity = struct {
                 if (comptime runtime_perf_log.enabled) counters.perf.splits += 1;
             }
         }
-        self.last_flood_batch = dispatch.finish(self.sets.len);
+        const flood_batch = dispatch.finish(self.sets.len);
         if (comptime runtime_perf_log.enabled) {
+            self.perf.last_flood_batch = flood_batch;
             counters.perf.rounds = round;
             counters.perf.round_items_min = dispatch.round_items_min;
             counters.perf.round_items_max = dispatch.round_items_max;
@@ -2770,8 +2770,7 @@ test "enclosing a room splits off exactly the room, and reopening merges it back
             try fixture.expectMatchesRebuild(&system);
 
             try fixture.setChunk(&system, 0, edge, edge / 2, fixture.grass);
-            const opened = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-            try std.testing.expectEqual(@as(usize, 0), opened.conn_flood_batch.item_count);
+            _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
             try std.testing.expect(reach(&system.graph, 0, inside, 0, outside) == .reaches);
             try std.testing.expectEqual(roots, connectivityRootCount(&system.graph.connectivity));
             try fixture.expectMatchesRebuild(&system);
@@ -2796,8 +2795,7 @@ test "cutting a ring floods and splits nothing" {
         defer system.deinit();
         const roots = connectivityRootCount(&system.graph.connectivity);
         try fixture.setChunk(&system, 0, 0, span / 2, fixture.tree);
-        const cut = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-        try std.testing.expect(cut.conn_flood_batch.item_count != 0);
+        _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
         try std.testing.expectEqual(roots, connectivityRootCount(&system.graph.connectivity));
         try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(1, @as(usize, span - 1) * test_chunk + 1)) == .reaches);
         try fixture.expectMatchesRebuild(&system);
@@ -2839,8 +2837,7 @@ test "an opening dig floods nothing and moves no node outside its chunk to anoth
     try snapshotComps(&system.graph, &.{gap_chunk}, &before);
     const roots = connectivityRootCount(&system.graph.connectivity);
     try fixture.setChunk(&system, 0, 2, 3, fixture.grass);
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-    try std.testing.expectEqual(@as(usize, 0), stats.conn_flood_batch.item_count);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(roots - 1, connectivityRootCount(&system.graph.connectivity));
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 20)) == .reaches);
     try snapshotComps(&system.graph, &.{gap_chunk}, &after);
@@ -2870,8 +2867,7 @@ test "a dense change across four levels, its reopening, and an explosion opening
     for (0..4) |level| {
         for (0..24) |y| for (6..20) |x| try fixture.setCell(&system, @intCast(level), @intCast(x), @intCast(y), fixture.grass);
     }
-    const opened = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-    try std.testing.expectEqual(@as(usize, 0), opened.conn_flood_batch.item_count);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -2955,8 +2951,6 @@ test "replacing a level that held the only link between two halves of another sp
     _ = try fixture.world.addDenseLayer(1, 0, .obstacle, fixture.tree);
     const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
     try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
-    // The level build's flood reaches the stats.
-    try std.testing.expect(stats.conn_flood_batch.item_count != 0);
     try std.testing.expect(reach(&system.graph, 0, fixture.cell(1, 1), 0, fixture.cell(20, 21)) != .reaches);
     try std.testing.expectEqual(@as(usize, 0), system.graph.levelGraph(1).?.nodeCount());
     try fixture.expectMatchesRebuild(&system);
@@ -3200,17 +3194,13 @@ test "threaded connectivity stages equal the inline ones column for column acros
             // The world build runs the stages threaded over every chunk of each level.
             try threaded.rebuildStaticNavGridWithWorld(&run.data, &run.world, &threads);
             try expectSameColumns(&inline_system.graph, &threaded.graph);
-            var flooded_on_workers = false;
             for ([_]TileId{ run.tree, run.grass, run.tree }) |tile| {
                 try writeParityStep(&run, &.{ &inline_system, &threaded }, tile);
                 _ = try inline_system.applyBufferedNavUpdates(no_colliders, &run.world, &serial_threads);
-                const stats = try threaded.applyBufferedNavUpdates(no_colliders, &run.world, &threads);
-                if (stats.conn_flood_batch.item_count != 0 and !stats.conn_flood_batch.ran_inline) flooded_on_workers = true;
+                _ = try threaded.applyBufferedNavUpdates(no_colliders, &run.world, &threads);
                 try expectSameColumns(&inline_system.graph, &threaded.graph);
                 try run.expectMatchesRebuild(&threaded);
             }
-            // The two rooms' searches fill two ranges only at one search per range.
-            if (items_per_range == 1) try std.testing.expect(flooded_on_workers);
         }
     }
 }
@@ -3236,28 +3226,6 @@ test "an enclosing batch reserved with the real allocator commits on a multi-wor
     system.graph.allocator = original;
     system.nav_marks.clearRetainingCapacity();
     try std.testing.expect(batch.changed);
-    try std.testing.expect(!stats.conn_flood_batch.ran_inline);
-    try fixture.expectMatchesRebuild(&system);
-}
-
-test "the post-commit nav reaction runs the connectivity flood on workers" {
-    var fixture = try TestWorld.init(10, 1);
-    defer fixture.deinit();
-    try twoRooms(&fixture);
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
-    defer threads.deinit();
-    var capacity = test_support.abstractCapacity();
-    capacity.worker_participant_count = threads.participantSlotCount();
-    var system = try fixture.build(capacity);
-    defer system.deinit();
-    system.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-    try toggleRooms(&fixture, &system, fixture.tree);
-    frame.beginStep();
-    const stats = try system.reactToPostCommitNavEvents(&frame, no_colliders, &fixture.world, &threads);
-    try std.testing.expect(stats.conn_flood_batch.item_count != 0);
-    try std.testing.expect(!stats.conn_flood_batch.ran_inline and stats.conn_flood_batch.worker_thread_ranges != 0);
     try fixture.expectMatchesRebuild(&system);
 }
 
@@ -3358,7 +3326,7 @@ fn enclosePockets(fixture: *TestWorld, systems: []const *PathfindingSystem, gaps
     }
 }
 
-test "enclosing eight pockets of one component in one batch floods on workers and equals the inline run" {
+test "enclosing eight pockets of one component in one batch splits them on a multi-worker ThreadSystem as the inline run does" {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 4, .items_per_range = 1 });
@@ -3382,10 +3350,8 @@ test "enclosing eight pockets of one component in one batch floods on workers an
         const roots = connectivityRootCount(&threaded.graph.connectivity);
         try enclosePockets(&fixture, &.{ &inline_system, &threaded }, gaps[0..count]);
         _ = try inline_system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-        const stats = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+        _ = try threaded.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
         try std.testing.expectEqual(roots + count, connectivityRootCount(&threaded.graph.connectivity));
-        try std.testing.expect(!stats.conn_flood_batch.ran_inline);
-        try std.testing.expect(stats.conn_flood_batch.worker_thread_ranges != 0);
         try expectSameColumns(&inline_system.graph, &threaded.graph);
         try fixture.expectMatchesRebuild(&threaded);
     }

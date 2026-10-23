@@ -83,7 +83,8 @@ pub fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest, g
         .group_counts = self.intake_group_counts.items,
         .tallies = self.intake_tallies.items,
     };
-    stats.intake_batch = runShaped(dispatch, shape, item_count, intake_range_alignment_items, &job, intakeJob);
+    const intake_batch = runShaped(dispatch, shape, item_count, intake_range_alignment_items, &job, intakeJob);
+    if (comptime runtime_perf_log.enabled) stats.perf.intake_batch = intake_batch;
     mergeIntake(self, shape.items_per_range, gates, &stats);
     if (comptime runtime_perf_log.enabled) stats.perf.pending_requests = self.pending.len;
     return stats;
@@ -612,17 +613,11 @@ test "threaded request intake equals serial intake across range sizes and worker
             var threaded = try intakeScenarioSystem(&data, requester, threads.participantSlotCount());
             defer threaded.deinit();
             _ = try threaded.resolveGoals(PathRequest, table_requests, &threads, .{ .adaptive = false, .items_per_range = items_per_range });
-            const stats = try threaded.update(&stream, intake_test_agents, &threads, .{
+            _ = try threaded.update(&stream, intake_test_agents, &threads, .{
                 .adaptive = false,
                 .items_per_range = items_per_range,
                 .max_solve_admissions_per_step = 0,
             });
-            // Several ranges run on workers; one range runs inline on the main thread.
-            if (items_per_range < intake_test_agents and threads.workerThreadCount() > 0) {
-                try std.testing.expect(!stats.intake_batch.ran_inline);
-            } else {
-                try std.testing.expect(stats.intake_batch.ran_inline);
-            }
             try expectRequestStateEqual(&serial, &threaded);
         }
     }
@@ -738,13 +733,11 @@ test "request intake after reserve allocates nothing on a multi-worker ThreadSys
         system.allocator = original;
         system.graph.allocator = original;
     }
-    const stats = try system.update(&stream, intake_test_agents, &threads, .{
+    _ = try system.update(&stream, intake_test_agents, &threads, .{
         .adaptive = false,
         .items_per_range = 8,
         .max_solve_admissions_per_step = 0,
     });
-    try std.testing.expect(!stats.intake_batch.ran_inline);
-    try std.testing.expect(stats.intake_batch.range_count > 1);
     // Requests were accepted: pending grew past the scenario's prefilled entries.
     try std.testing.expect(system.pending.len > intake_prefilled_count + 1);
 }

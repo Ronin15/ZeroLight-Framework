@@ -7,6 +7,8 @@
 //! update (its terrain record untimed), so only the touched chunks and their neighbours patch.
 //! The mean is the two halves' average. Digs go one per chunk over the world's 256 chunks,
 //! several per chunk past that. Passes when linear in digs up to 256 and in dirty cells past it.
+//! Each update's remask batch covers exactly its dirty chunks, and an untimed update with no
+//! marks after the measured toggles remasks nothing.
 //!
 //! The static-obstacle groups time one static collision body moved one step on a 256² world
 //! through the production commit seam (`SimulationPipeline.commitStructuralAndReact`, the
@@ -207,7 +209,8 @@ fn writeFootprint(fixture: *Fixture, tile: TileId) !void {
 
 // Times one incremental nav update over the fixture's footprint. The terrain record of the
 // footprint's writes (serial, so it trains no tuner) is untimed setup, as production records
-// edits before the patch. Fails unless the update applied and remasked the footprint's chunks.
+// edits before the patch. Fails unless the update applied and remasked the footprint's chunks,
+// its remask batch over exactly those chunks.
 fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: *ThreadSystem) !u64 {
     try fixture.system.reserveTerrainNavRecord(fixture.events.items.len);
     fixture.system.recordTerrainNavEvents(fixture.events.items, &fixture.world, null);
@@ -216,6 +219,7 @@ fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: *ThreadSystem) !u
     const elapsed = suite.elapsedNs(t0, suite.nowNs(io));
     if (stats.incremental_rebuilds != 1) return error.NavUpdateNotApplied;
     if (stats.dirty_chunks != fixture.expected_dirty_chunks) return error.NavUpdateNotApplied;
+    if (stats.perf.remask_batch.item_count != stats.dirty_chunks) return error.NavUpdateRemaskMissedChunks;
     fixture.last_stats = stats;
     return elapsed;
 }
@@ -258,11 +262,15 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         const elapsed = try runToggle(&fixture, io, thread_ptr);
         accumulator.record(elapsed / 2, inlineBatch(edited_cells, 1));
     }
-    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ fixture.open_stats.perf.plan_batch, fixture.open_stats.remask_batch, fixture.open_stats.perf.patch_batch });
+    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ fixture.open_stats.perf.plan_batch, fixture.open_stats.perf.remask_batch, fixture.open_stats.perf.patch_batch });
+    // Untimed: an update with no marks applies and remasks nothing, so it reports no stale
+    // remask from the toggles.
+    const idle = try fixture.system.applyBufferedNavUpdates(&fixture.colliders, &fixture.world, thread_ptr);
+    if (idle.incremental_rebuilds != 0 or idle.perf.remask_batch.item_count != 0) return error.NavIdleUpdateRemasked;
     var stats = accumulator.finish();
     // The stages the opening update ran (the reported tuners' set), so a threaded row the
     // tuner kept inline reads inline.
-    stats.batch = suite.batchSummaryFromBatch(fixture.open_stats.remask_batch);
+    stats.batch = suite.batchSummaryFromBatch(fixture.open_stats.perf.remask_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.open_stats.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(fixture.open_stats.perf.patch_batch);
     if (case.adaptive) {
@@ -440,15 +448,15 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
         const result = try fixture.moveAndReact(io, thread_ptr);
         chunks_patched = result.stats.chunks_patched;
         last_stats = result.stats;
-        accumulator.record(result.ns, result.stats.remask_batch);
+        accumulator.record(result.ns, result.stats.perf.remask_batch);
     }
-    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ last_stats.perf.plan_batch, last_stats.remask_batch, last_stats.perf.patch_batch, nav.perf.last_mark_batch });
+    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ last_stats.perf.plan_batch, last_stats.perf.remask_batch, last_stats.perf.patch_batch, nav.perf.last_mark_batch });
     var stats = accumulator.finish();
     stats.output_count = chunks_patched;
     stats.candidate_pairs = fixture.body_count;
     // One move per iteration.
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
+    stats.batch = suite.batchSummaryFromBatch(last_stats.perf.remask_batch);
     stats.nav_mark_batch = suite.batchSummaryFromBatch(nav.perf.last_mark_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
@@ -744,17 +752,17 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         sync_total += result.sync_ns;
         nav_total += result.nav_ns;
         main_total += result.ns -| result.off_main_ns;
-        accumulator.record(result.ns, result.stats.remask_batch);
+        accumulator.record(result.ns, result.stats.perf.remask_batch);
     }
-    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ last_stats.perf.plan_batch, last_stats.remask_batch, last_stats.perf.patch_batch });
+    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ last_stats.perf.plan_batch, last_stats.perf.remask_batch, last_stats.perf.patch_batch });
     var stats = accumulator.finish();
     stats.output_count = chunks_patched;
     stats.candidate_pairs = static_colliders_test_support.liveRowCount(fixture.colliders().*);
     stats.items_per_second = suite.itemsPerSecond(change_count, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(last_stats.remask_batch);
+    stats.batch = suite.batchSummaryFromBatch(last_stats.perf.remask_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
-    stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders().last_batches.get(.rewrite));
+    stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders().perf.last_batches.get(.rewrite));
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         // Plan: the commit; write: the collider sync and record; nav: the reaction.

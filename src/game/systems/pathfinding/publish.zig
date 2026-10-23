@@ -1457,12 +1457,6 @@ const solveIndividualGoals = test_support.solveIndividualGoals;
 const solveRegistryRoutes = test_support.solveRegistryRoutes;
 const cachedStep = test_support.cachedStep;
 
-// Work units of a registry flush that adds `adds` registrations and applies no op: one per
-// pair and one per add.
-fn flushUnits(adds: usize) usize {
-    return flush_pair_count + adds;
-}
-
 // The last update published routes `[first, first + count)` of a registry world `side` tiles
 // a side.
 fn expectRoutesSolved(system: *const PathfindingSystem, side: u16, first: usize, count: usize) !void {
@@ -1920,7 +1914,7 @@ test "an update after a registry flush that ran out of memory past its publish f
     try std.testing.expect(behind != 0);
 }
 
-test "threaded publish equals serial across range sizes and worker counts (cache bytes and per-shard lists), and publish_copy and registry_flush run on workers" {
+test "threaded publish equals serial across range sizes and worker counts (cache bytes and per-shard lists)" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1947,12 +1941,9 @@ test "threaded publish equals serial across range sizes and worker counts (cache
         for ([_]usize{ 1, 3, 8 }) |items_per_range| {
             var threaded = try registrySystemWith(&data, &fixture.world, 64, .{ .stored_path_cells = 8, .participants = threads.participantSlotCount() });
             defer threaded.deinit();
-            const stats = try threaded.update(&stream, 64, &threads, .{ .adaptive = false, .items_per_range = items_per_range });
+            _ = try threaded.update(&stream, 64, &threads, .{ .adaptive = false, .items_per_range = items_per_range });
             try expectSameCache(&serial, &threaded);
             try expectSameRegistry(&serial, &threaded);
-            if (items_per_range == 1) {
-                try std.testing.expect(!stats.registry_flush_batch.ran_inline and stats.registry_flush_batch.range_count > 1);
-            }
         }
     }
 }
@@ -1987,40 +1978,24 @@ test "publish after its reserve allocates nothing on a multi-worker ThreadSystem
     setSystemAllocators(&system, failing.allocator());
     const stats = system.update(&stream, 64, &threads, fixed_threads_config);
     setSystemAllocators(&system, std.testing.allocator);
-    const published = try stats;
+    _ = try stats;
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try expectRoutesSolved(&system, 24, 0, 48);
-    // At least one unit per shard and per registration added: each published path adds at
-    // least one, and its expired result's retire adds its own.
-    const units = published.registry_flush_batch.item_count;
-    try std.testing.expect(units >= flushUnits(48));
-    try std.testing.expectEqual(units, published.registry_flush_batch.range_count);
     try expectRegistryMatchesCache(&system);
 }
 
-const ShrinkFlushes = struct {
-    serial: BatchStats = .{},
-    threaded: BatchStats = .{},
-};
-
 // Two registry systems over one world, filled alike, then shrunk by sustained low load:
-// one serial, one on `threads` under `config`. Returns each shrink step's flush batch.
-fn shrinkThroughUpdates(serial: *PathfindingSystem, threaded: *PathfindingSystem, threads: *ThreadSystem, config: PathfindingConfig) !ShrinkFlushes {
+// one serial, one on `threads` under `config`.
+fn shrinkThroughUpdates(serial: *PathfindingSystem, threaded: *PathfindingSystem, threads: *ThreadSystem, config: PathfindingConfig) !void {
     var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer empty.deinit();
-    var flushes = ShrinkFlushes{};
     for (0..serial.capacity.capacity_shrink_window) |_| {
-        const serial_capacity = serial.completed.logicalCapacity();
-        const serial_stats = try updatePathfindingInline(serial, &empty, 1, .{});
-        if (serial.completed.logicalCapacity() < serial_capacity) flushes.serial = serial_stats.registry_flush_batch;
-        const capacity = threaded.completed.logicalCapacity();
-        const stats = try threaded.update(&empty, 1, threads, config);
-        if (threaded.completed.logicalCapacity() < capacity) flushes.threaded = stats.registry_flush_batch;
+        _ = try updatePathfindingInline(serial, &empty, 1, .{});
+        _ = try threaded.update(&empty, 1, threads, config);
     }
-    return flushes;
 }
 
-test "a shrink's registry flush runs on workers at about one pair per range under the adaptive control, renames included, and equals the serial flush" {
+test "a shrink's registry flush under the adaptive control leaves the flush tuner untouched, renames included, and equals the serial flush" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -2036,20 +2011,12 @@ test "a shrink's registry flush runs on workers at about one pair per range unde
     defer threaded.deinit();
     // The shrink's fixed-shape flush leaves the flush tuner untouched.
     const tuner_before = threaded.tuners.registry_flush;
-    const flushes = try shrinkThroughUpdates(&serial, &threaded, &threads, .{});
-    const flush = flushes.threaded;
+    try shrinkThroughUpdates(&serial, &threaded, &threads, .{});
     const tuner_after = threaded.tuners.registry_flush;
     try std.testing.expectEqual(tuner_before.sample_count, tuner_after.sample_count);
     try std.testing.expectEqual(tuner_before.phase, tuner_after.phase);
     try std.testing.expectEqual(tuner_before.current_profile, tuner_after.current_profile);
     try std.testing.expectEqual(@as(usize, 32), threaded.completed.logicalCapacity());
-    try std.testing.expect(!flush.ran_inline and flush.active_worker_threads != 0 and flush.worker_thread_ranges != 0);
-    // The fixed shape is ceil(units / pairs) units per range; at a pair count's square of
-    // units or more that is exactly one range per pair.
-    try std.testing.expectEqual(flushes.serial.item_count, flush.item_count);
-    try std.testing.expect(flush.item_count >= flush_pair_count * flush_pair_count);
-    try std.testing.expectEqual(@divCeil(flush.item_count, flush_pair_count), flush.items_per_range);
-    try std.testing.expectEqual(flush_pair_count, flush.range_count);
     try expectSameCache(&serial, &threaded);
     try expectSameRegistry(&serial, &threaded);
     try expectRegistryMatchesCache(&threaded);
@@ -2095,7 +2062,7 @@ test "a shrink step whose claims retire victims among the renamed results flushe
     try expectRegistryMatchesCache(&threaded);
 }
 
-test "a shrink's registry flush keeps a configured range size and equals the serial flush" {
+test "a shrink's registry flush at a configured range size equals the serial flush" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -2110,14 +2077,8 @@ test "a shrink's registry flush keeps a configured range size and equals the ser
     var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
     defer threaded.deinit();
     const units_per_range = 4;
-    const flushes = try shrinkThroughUpdates(&serial, &threaded, &threads, .{ .items_per_range = units_per_range });
-    const flush = flushes.threaded;
+    try shrinkThroughUpdates(&serial, &threaded, &threads, .{ .items_per_range = units_per_range });
     try std.testing.expectEqual(@as(usize, 32), threaded.completed.logicalCapacity());
-    try std.testing.expect(!flush.ran_inline);
-    try std.testing.expectEqual(flushes.serial.item_count, flush.item_count);
-    try std.testing.expect(flush.item_count > flush_pair_count * units_per_range);
-    try std.testing.expectEqual(units_per_range, flush.items_per_range);
-    try std.testing.expectEqual(@divCeil(flush.item_count, units_per_range), flush.range_count);
     try expectSameCache(&serial, &threaded);
     try expectSameRegistry(&serial, &threaded);
     try expectRegistryMatchesCache(&threaded);

@@ -5,13 +5,17 @@
 //! Pathfinding connectivity bench groups: component splits and the one-way closure.
 //! A config whose nav storage exceeds the bench's nav-size limit fails with its
 //! figure (`nav_size.checkNavSize`), and every config checks each part of the nav's
-//! bytes against its charge (`nav_size.checkNavBytes`).
+//! bytes against its charge (`nav_size.checkNavBytes`). Every toggle reaction's one-way
+//! closure rows run on workers in a fixed threaded case when a round spans more than one
+//! range (`suite.checkRoundsDispatched`).
 
 const std = @import("std");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const offMainNs = @import("../../app/thread_system.zig").offMainNs;
 const DataSystem = @import("../../game/data_system.zig").DataSystem;
+const StaticColliderSystem = @import("../../game/systems/static_colliders.zig").StaticColliderSystem;
+const PathfindingSystem = @import("../../game/systems/pathfinding.zig").PathfindingSystem;
 const PathRequest = @import("../../game/simulation.zig").PathRequest;
 const PathfindingCapacity = @import("../../game/systems/pathfinding.zig").PathfindingCapacity;
 const NavUpdateStats = @import("../../game/systems/pathfinding/types.zig").NavUpdateStats;
@@ -36,6 +40,7 @@ const pocketDigCell = @import("nav_fixtures.zig").pocketDigCell;
 const ChunkCoord = @import("nav_fixtures.zig").ChunkCoord;
 const chunkCells = @import("nav_fixtures.zig").chunkCells;
 const toggleSizeConfig = @import("nav_fixtures.zig").toggleSizeConfig;
+const toggle_batch = @import("nav_fixtures.zig").toggle_batch;
 
 // One walkable level (`SplitCode`) holding, at its origin corner, solid chunks around one
 // walkable gap chunk. Variant 0: a room of edge² chunks walled off by a one-chunk band whose
@@ -269,7 +274,7 @@ fn checkOnewayWithinBounds(fixture: *const ReactFixture, stats: NavUpdateStats, 
 fn checkOnewayUntouched(stats: NavUpdateStats) !void {
     const perf = stats.perf;
     if (perf.conn_closure_candidates_batch.item_count == 0) return error.ConnectivityOnewayNoCandidateScan;
-    for ([_]BatchStats{ perf.conn_closure_resolve_batch, perf.conn_closure_mask_batch, perf.conn_closure_plan_batch, stats.conn_closure_rows_batch, perf.conn_closure_land_batch }) |batch| {
+    for ([_]BatchStats{ perf.conn_closure_resolve_batch, perf.conn_closure_mask_batch, perf.conn_closure_plan_batch, stats.perf.conn_closure_rows_batch, perf.conn_closure_land_batch }) |batch| {
         if (batch.item_count != 0) return error.ConnectivityOnewayFarDigRanClosure;
     }
     if (perf.closure_words_written != 0 or perf.closure_landed_words != 0) return error.ConnectivityOnewayFarDigWroteBlock;
@@ -303,15 +308,15 @@ fn runToggle(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, cell
     const stats = change.stats;
     const perf = stats.perf;
     const change_stages = [toggle_stage_count]BatchStats{
-        perf.plan_batch,                    stats.remask_batch,              perf.patch_batch,
-        perf.conn_seed_batch,               perf.conn_gather_batch,          stats.conn_flood_batch,
-        perf.conn_closure_candidates_batch, perf.conn_closure_resolve_batch, perf.conn_closure_mask_batch,
-        perf.conn_closure_plan_batch,       stats.conn_closure_rows_batch,   perf.conn_closure_land_batch,
+        perf.plan_batch,                    stats.perf.remask_batch,            perf.patch_batch,
+        perf.conn_seed_batch,               perf.conn_gather_batch,             stats.perf.conn_flood_batch,
+        perf.conn_closure_candidates_batch, perf.conn_closure_resolve_batch,    perf.conn_closure_mask_batch,
+        perf.conn_closure_plan_batch,       stats.perf.conn_closure_rows_batch, perf.conn_closure_land_batch,
     };
     // Every chunk-partitioned stage but the round-folded flood and rows runs on workers in a
     // fixed threaded case.
     try suite.checkStagesDispatched(case, thread_system, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{
-        perf.plan_batch,              stats.remask_batch,                 perf.patch_batch,                perf.conn_seed_batch,
+        perf.plan_batch,              stats.perf.remask_batch,            perf.patch_batch,                perf.conn_seed_batch,
         perf.conn_gather_batch,       perf.conn_closure_candidates_batch, perf.conn_closure_resolve_batch, perf.conn_closure_mask_batch,
         perf.conn_closure_plan_batch, perf.conn_closure_land_batch,
     });
@@ -321,8 +326,10 @@ fn runToggle(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, cell
     if (checks.exact_flood) |nodes| {
         if (perf.conn_flood_nodes != nodes) return error.ConnectivitySplitFloodPastBound;
     }
-    if (checks.more_searches_than_rounds and stats.conn_flood_batch.item_count <= perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
-    if (checks.flood_dispatch) try suite.checkStageDispatched(case, thread_system, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), stats.conn_flood_batch);
+    if (checks.more_searches_than_rounds and stats.perf.conn_flood_batch.item_count <= perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
+    if (checks.flood_dispatch) try suite.checkStageDispatched(case, thread_system, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), stats.perf.conn_flood_batch);
+    // The closure rows' widest round past one fixed range ran on workers.
+    try suite.checkRoundsDispatched(case, thread_system, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), stats.perf.conn_closure_rows_batch, perf.closure_rows_round_items_max);
     const revert = revert: {
         fixtures.swapNavTuners(&fixture.system, revert_tuners);
         defer fixtures.swapNavTuners(&fixture.system, revert_tuners);
@@ -384,7 +391,7 @@ const ToggleReport = struct {
         self.nav_main.endSample();
         self.shapes.add(sample.change_stages);
         self.last_change = change;
-        self.closure_rows_off_main_ns += offMainNs(change.conn_closure_rows_batch);
+        self.closure_rows_off_main_ns += offMainNs(change.perf.conn_closure_rows_batch);
         self.revert_flood_nodes = revert.perf.conn_flood_nodes;
         self.closure_shrinks += change.perf.closure_shrinks + revert.perf.closure_shrinks;
         self.closure_block_allocs += change.perf.closure_block_allocs + revert.perf.closure_block_allocs;
@@ -448,7 +455,7 @@ fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCas
     for (0..options.iterations) |_| {
         if (ballast) |chain| try chain.retire(io, fixture, thread_system);
         const sample = try runToggle(io, case, fixture, cells, thread_system, checks, &revert_tuners);
-        accumulator.record(sample.elapsedNs(), sample.change.stats.remask_batch);
+        accumulator.record(sample.elapsedNs(), sample.change.stats.perf.remask_batch);
         report.add(sample);
         if (ballast) |chain| chain.addSample(sample);
     }
@@ -705,11 +712,43 @@ fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: s
 
     const flood_bound = config.floodBound(fixture.system.graph.levelGraph(0).?.border_stride);
     var stats = try runToggleSamples(io, options, case, item_count, &fixture, gap, thread_ptr, .{ .flood_bound = flood_bound }, null);
-    if (config.variant == .room) try checkFarFillAddsNothing(allocator, io, &fixture, config, gap, stats.nav_conn.?.flood_nodes, thread_ptr);
+    if (config.variant == .room) {
+        try checkFarFillAddsNothing(allocator, io, &fixture, config, gap, stats.nav_conn.?.flood_nodes, thread_ptr);
+        try checkLevelBuildFloodFolds(allocator, io, thread_ptr);
+    }
     try nav_size.checkNavBytes(connectivity_split_group.name, item_count, size_config, &fixture.system);
     stats.output_count = gap.len;
     stats.candidate_pairs = config.structureChunks();
     return stats;
+}
+
+// Untimed: a level build whose rebuild removes the only links between two halves of another
+// level floods that level, and the build's flood folds into the reaction's
+// `conn_flood_batch` (the perf log's `nav_connect`). A 32-tile two-level world: a wall
+// column splits level 0, two stairs join its halves through level 1, then a dense
+// obstacle layer over level 1 (a content change with no cell events) rebuilds that level.
+fn checkLevelBuildFloodFolds(allocator: std.mem.Allocator, io: std.Io, thread_system: *ThreadSystem) !void {
+    const side: u16 = 32;
+    var open = try buildOpenWorld(allocator, io, side, 2);
+    defer open.world.deinit();
+    var wall: [side]CellCoord = undefined;
+    for (&wall, 0..) |*cell, y| cell.* = .{ .x = side / 2, .y = @intCast(y) };
+    try writeLevelZeroCells(&open, &wall, open.blocking);
+    for ([_]CellCoord{ .{ .x = 2, .y = 2 }, .{ .x = side - 4, .y = side - 4 } }) |cell| {
+        try open.world.addLevelLink(.{ .kind = .stair, .level_a = 0, .cell_a = cell, .level_b = 1, .cell_b = cell, .traversal_cost = 1, .bidirectional = true });
+    }
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    var colliders = StaticColliderSystem.init(allocator);
+    defer colliders.deinit();
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    try system.reserve(nav_size.navSizeCapacity(toggleSizeConfig(side, 2, 2, fixtures.participantCount(thread_system), toggle_batch)));
+    try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_system);
+    _ = try open.world.addDenseLayer(1, 0, .obstacle, open.blocking);
+    const stats = try system.applyBufferedNavUpdates(&colliders, &open.world, thread_system);
+    if (stats.levels_built != 1) return error.ConnectivityLevelBuildMissing;
+    if (stats.perf.conn_flood_batch.item_count == 0) return error.ConnectivityLevelBuildFloodNotFolded;
 }
 
 // The flat-in-side proofs compare a larger level with this one. It is the smallest side the
@@ -1197,9 +1236,9 @@ fn runPocketsProof(ctx: *const ProofCtx, config: SplitConfig) !suite.RunStats {
     const inline_stats = try untimedSeal(ctx.io, &proof.fixture, proof.gaps, &inline_threads);
     const case_stats = try untimedSeal(ctx.io, &proof.fixture, proof.gaps, ctx.threads);
     if (inline_stats.perf.conn_flood_nodes == 0 or case_stats.perf.conn_flood_nodes != inline_stats.perf.conn_flood_nodes) return error.ConnectivitySplitPocketsNotEqual;
-    if (inline_stats.conn_flood_batch.item_count <= inline_stats.perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
-    if (case_stats.conn_flood_batch.item_count <= case_stats.perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
-    try suite.checkStageDispatched(ctx.case, ctx.threads, ctx.case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), case_stats.conn_flood_batch);
+    if (inline_stats.perf.conn_flood_batch.item_count <= inline_stats.perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
+    if (case_stats.perf.conn_flood_batch.item_count <= case_stats.perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
+    try suite.checkStageDispatched(ctx.case, ctx.threads, ctx.case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), case_stats.perf.conn_flood_batch);
     return timeProof(ctx, &proof, .{
         .exact_flood = inline_stats.perf.conn_flood_nodes,
         .more_searches_than_rounds = true,
@@ -1496,7 +1535,7 @@ const OnewayBallast = struct {
         self.samples += 1;
         self.close_ns += sample.change.elapsed_ns;
         self.reserve_ns += change.perf.main.reserve_ns;
-        inline for (.{ change.perf.conn_closure_candidates_batch, change.perf.conn_closure_resolve_batch, change.perf.conn_closure_mask_batch, change.perf.conn_closure_plan_batch, change.conn_closure_rows_batch }) |batch| {
+        inline for (.{ change.perf.conn_closure_candidates_batch, change.perf.conn_closure_resolve_batch, change.perf.conn_closure_mask_batch, change.perf.conn_closure_plan_batch, change.perf.conn_closure_rows_batch }) |batch| {
             self.closure_stages_ns += batch.batch_duration_ns;
         }
         self.land_ns += change.perf.conn_closure_land_batch.batch_duration_ns;

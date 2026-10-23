@@ -24,6 +24,7 @@ const StaticColliderSystem = @import("../../game/systems/static_colliders.zig").
 const default_max_solves_per_frame = @import("../../game/systems/pathfinding.zig").default_max_solves_per_frame;
 const pathfinding_range_alignment_items = @import("../../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const intake_range_alignment_items = @import("../../game/systems/pathfinding/types.zig").intake_range_alignment_items;
+const flush_pair_count = @import("../../game/systems/pathfinding/publish.zig").flush_pair_count;
 const NavUpdateStats = @import("../../game/systems/pathfinding/types.zig").NavUpdateStats;
 const default_cache_ttl_steps = @import("../../game/systems/pathfinding/types.zig").default_cache_ttl_steps;
 const goal_scan_range_alignment_items = @import("../../game/systems/pathfinding/goal_table.zig").scan_range_alignment_items;
@@ -85,13 +86,20 @@ pub fn drainPending(system: *PathfindingSystem, thread_system: *ThreadSystem, ag
 }
 
 /// One pathfinding update under `case`; a fixed threaded case runs every update stage of
-/// more than one range on workers.
+/// more than one range on workers. A registry flush that added registrations ran at least
+/// one unit per pair and per add, on at most one worker per pair but one, and a fixed
+/// threaded case flushes one range per configured range of units.
 pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
     const config = coldStepConfig(case, solve_budget, fallback_budget);
     const stats = try system.update(requests, agent_count, thread_system, config);
     try suite.checkStagesDispatched(case, thread_system, config.items_per_range, &updateBatches(stats));
     // A shrink's registry rename pass, at its fixed shape.
     try suite.checkStageDispatched(case, thread_system, config.items_per_range, stats.perf.registry_rename_batch);
+    const flush = stats.perf.registry_flush_batch;
+    const adds = stats.perf.registrations_added;
+    if (adds != 0 and flush.item_count < flush_pair_count + adds) return error.RegistryFlushMissedUnits;
+    if (flush.active_worker_threads > flush_pair_count - 1) return error.RegistryFlushPastPairWorkers;
+    try suite.checkFixedRangeCount(case, thread_system, config.items_per_range, flush);
     return stats;
 }
 
@@ -112,7 +120,7 @@ pub fn setPathStageTuners(system: *PathfindingSystem, case: suite.BenchmarkCase)
 
 // An update's stage batches, in `StageReport` order.
 fn updateBatches(stats: PathfindingStats) [update_stage_count]BatchStats {
-    return .{ stats.intake_batch, stats.perf.group_field_batch, stats.perf.group_field_begin_batch, stats.solve_batch, stats.perf.publish_copy_batch, stats.registry_flush_batch, stats.resize_copy_batch };
+    return .{ stats.perf.intake_batch, stats.perf.group_field_batch, stats.perf.group_field_begin_batch, stats.perf.solve_batch, stats.perf.publish_copy_batch, stats.perf.registry_flush_batch, stats.perf.resize_copy_batch };
 }
 
 const update_stage_count = 7;
@@ -155,9 +163,9 @@ pub const StageReport = struct {
         self.samples += 1;
         self.timed_ns += elapsed_ns;
         self.main_ns += elapsed_ns -| offMainStageNs(stats) -| offMainNs(stats.perf.registry_flush_count_batch) -| offMainNs(stats.perf.registry_rename_batch);
-        self.accept_main_ns += stats.accept_ns -| offMainNs(stats.intake_batch);
+        self.accept_main_ns += stats.accept_ns -| offMainNs(stats.perf.intake_batch);
         self.group_main_ns += stats.group_service_ns -| (offMainNs(stats.perf.group_field_batch) + offMainNs(stats.perf.group_field_begin_batch));
-        self.solve_main_ns += stats.solve_ns -| offMainNs(stats.solve_batch);
+        self.solve_main_ns += stats.solve_ns -| offMainNs(stats.perf.solve_batch);
         self.publish_ns += stats.publish_ns -| offMainNs(stats.perf.publish_copy_batch);
         self.count.add(.{stats.perf.registry_flush_count_batch});
         self.registrations_added += stats.perf.registrations_added;
@@ -436,7 +444,7 @@ pub const EvictReport = struct {
     evicted: usize = 0,
 
     pub fn add(self: *EvictReport, reaction: Reaction) void {
-        self.stages.add(reaction, .{ reaction.stats.perf.evict_count_batch, reaction.stats.evict_batch, reaction.stats.perf.evict_flush_batch });
+        self.stages.add(reaction, .{ reaction.stats.perf.evict_count_batch, reaction.stats.perf.evict_batch, reaction.stats.perf.evict_flush_batch });
         self.count.add(.{reaction.stats.perf.registry_flush_count_batch});
         self.visited = reaction.stats.perf.evict_entries_visited;
         self.evicted = reaction.stats.perf.evicted_results;

@@ -14,8 +14,10 @@
 //! against the grid's bound: the entries of one strip in the columns a body's width reaches,
 //! flat in column height, row width, and level count. `collision` and `collision-sparse`:
 //! time linear in bodies; asserts check the analytic contact count (the 512-wide grid's
-//! neighbour pairs; one pair per group of 20 sparse bodies). `collision` also checks the
-//! pair-bound flag counts, untimed, on systems apart from the measured one: reserved to a
+//! neighbour pairs; one pair per group of 20 sparse bodies). Every measured step checks the
+//! sweep's work: the broadphase over every entry, the narrowphase over every candidate
+//! pair, and in a fixed threaded case one broadphase range per aligned range of entries.
+//! `collision` also checks the pair-bound flag counts, untimed, on systems apart from the measured one: reserved to a
 //! quarter of the grid's bodies, every step on the case's dispatch path is flagged and
 //! counted once; and a broadphase slot that outgrows its reserve inside the total bound
 //! (a fixed four-range cluster on two workers) flags and counts its replayed step once and
@@ -77,7 +79,9 @@
 //!   a removal and an insert touch per change, `install` one item per region chunk); each
 //!   stage dispatched in the fixed-partition cases, and in the adaptive threaded cases each
 //!   stage's selection through its own sync tuner; and no row or payload growth in any
-//!   measured sync (warmup runs both directions).
+//!   measured sync (warmup runs both directions). Last, untimed, where the moves are every
+//!   static of the region, one commit destroys them: every region chunk empties, and the
+//!   sync's fill runs one unit per emptied chunk.
 //! - `collision-static-dense-spike`: the dense-change fixture, serial and tuned cases only,
 //!   also at 16, 64, and 256 changes: below 256 the changes thin over the 2 x 2-chunk region,
 //!   each chunk moving the same first share of its statics.
@@ -134,7 +138,10 @@
 //!   trigger reaching half a tile into its neighbours' cells, so each overlaps its right and
 //!   lower solids and its diagonal triggers; the home pair count is checked against those
 //!   overlaps, the away count against a cold rebuild at the first away revision. Pass shape:
-//!   main per changed static flat in the change count.
+//!   main per changed static flat in the change count. Last, untimed: a collision system one
+//!   revision behind the seam, stepped at the case's controls, patches one dense change; its
+//!   query covers exactly the changes, each store patch stage runs, the fixed threaded cases
+//!   dispatch them all, and the patch leaves the rebuild's stage records.
 //! - `collision-static-trigger-wide`: one trigger one chunk row tall and the world wide over
 //!   the item count of solids, in eight rows on the two-tile pitch, the world as wide as the
 //!   largest count's columns and the solids on a column stride of the largest count over the
@@ -560,7 +567,7 @@ fn checkSlotReplayFlag(allocator: std.mem.Allocator, io: std.Io) !void {
     const config: CollisionConfig = .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false };
     const replayed = try system.update(&data, &contacts, &threads, config);
     if (replayed.candidate_pair_count != 120 + 64 or replayed.candidate_pair_count > system.reserved_pair_bound) return error.CollisionReplayFixtureMismatch;
-    if (replayed.broadphase_batch.range_count != 4 or replayed.broadphase_batch.ran_inline) return error.CollisionReplayFixtureMismatch;
+    if (replayed.perf.broadphase_batch.range_count != 4 or replayed.perf.broadphase_batch.ran_inline) return error.CollisionReplayFixtureMismatch;
     if (!replayed.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 1) return error.CollisionSlotReplayNotFlagged;
     const settled = try system.update(&data, &contacts, &threads, config);
     if (settled.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 1) return error.CollisionGrownSlotFlagged;
@@ -1082,13 +1089,13 @@ fn measureRebuild(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
         rewrite_tuner = tuners.get(.rewrite);
         if (static_colliders_test_support.liveRowCount(colliders) != static_count) return error.WrongStaticCount;
         var batches: [rebuild_stages.len]BatchStats = undefined;
-        for (&batches, rebuild_stages) |*batch, stage| batch.* = colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
+        for (&batches, rebuild_stages) |*batch, stage| batch.* = colliders.perf.last_batches.get(static_colliders_test_support.colliderStage(stage));
         try suite.checkRebuildWork(batches, data.slots.items.len, static_count, chunk_count);
         try suite.checkStagesDispatched(case, &threads, stage_range, &batches);
         for (batches, rebuild_stages) |batch, stage| try checkTunerSelected(case, &threads, tuners.getPtrConst(stage), batch);
         for (batches) |batch| try suite.checkRebuildOnWorkers(case, &threads, batch);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        accumulator.record(elapsed_ns, colliders.last_batches.get(.rewrite));
+        accumulator.record(elapsed_ns, colliders.perf.last_batches.get(.rewrite));
         main_total += elapsed_ns -| static_colliders_test_support.lastOffMainNs(colliders);
         stage_shapes.add(batches);
         for (&stage_ns, batches) |*total, batch| total.* += batch.batch_duration_ns;
@@ -1313,7 +1320,7 @@ const DenseChangeFixture = struct {
         for (self.moves) |*move| move.advance();
         const colliders = self.seam.collidersConst();
         var batches: [sync_stages.len]BatchStats = undefined;
-        for (&batches, sync_stages) |*batch, stage| batch.* = colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
+        for (&batches, sync_stages) |*batch, stage| batch.* = colliders.perf.last_batches.get(static_colliders_test_support.colliderStage(stage));
         return .{
             .ns = self.seam.pipeline().perf.seam_collider_sync_ns,
             .batches = batches,
@@ -1341,6 +1348,25 @@ const DenseChangeFixture = struct {
         if (apply.item_count != self.moves.len) return error.DenseChangeApplyMissedChanges;
         if (group_batch.item_count != 2 * self.moves.len) return error.DenseChangeGroupMissedTouches;
         if (install.item_count != self.region_side * self.region_side) return error.DenseChangeInstallMissedChunks;
+    }
+
+    // Untimed, last: one commit destroying every moved static. When the moves are every
+    // static of the region's chunks, each region chunk empties (one-tile statics hold no
+    // coarse cell), and the sync's fill runs one unit per emptied chunk, never its records
+    // plus one.
+    fn checkEmptyingSyncWork(self: *DenseChangeFixture, thread_system: *ThreadSystem) !void {
+        const region_chunks = self.region_side * self.region_side;
+        if (self.moves.len != region_chunks * dense_change_per_chunk) return;
+        for (self.moves, self.commands) |move, *command| command.* = .{ .destroy_entity = move.entity };
+        _ = try self.seam.commit(&self.data, self.commands, thread_system);
+        const colliders = self.seam.collidersConst();
+        if (colliders.changesThisStep().len != self.moves.len) return error.DenseChangeNotSynced;
+        const view = colliders.view();
+        const chunks_x = colliders.geometry.?.grid.chunks_x;
+        for (0..self.region_side) |chunk_y| for (0..self.region_side) |chunk_x| {
+            if (view.chunkHasRows(0, @intCast(chunk_y * chunks_x + chunk_x))) return error.DenseChangeRegionNotEmptied;
+        };
+        if (colliders.perf.last_batches.get(.rewrite).item_count != region_chunks) return error.DenseChangeEmptyFillNotPerItem;
     }
 
     // One change per moved static, each leaving its chunk for another in the region, and
@@ -1470,6 +1496,7 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.seam.colliders().tuners.getPtr(.rewrite)), settled);
     printStageDetails(&stats, &sync_stages, &stage_shapes, &stage_ns);
     stats.details.print("row_grows={} payload_grows={}\n", .{ grows[0] - warm_grows[0], grows[1] - warm_grows[1] });
+    try fixture.checkEmptyingSyncWork(&threads);
     return stats;
 }
 
@@ -1508,7 +1535,50 @@ fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, opt
     var samples = TriggerPatchSamples.init(change_count);
     for (0..options.iterations) |_| samples.record(try denseTriggerPatch(&fixture, &threads, pairs));
     try fixture.seam.checkStoredPairsInBound(&fixture.data, &threads, case);
-    return samples.finish(&threads, change_count, system.trigger_store.pair_count);
+    const stats = samples.finish(&threads, change_count, system.trigger_store.pair_count);
+    try checkFixedPatchStages(allocator, &fixture, &threads, case);
+    return stats;
+}
+
+// Untimed: one dense change's trigger patch at the case's fixed controls, on a collision
+// system one revision behind the seam that its collision step patches. The patch query runs
+// over the change's statics, and the store's patch stages over at least one item each, all
+// dispatched in a fixed threaded case; the patch leaves the rebuild's records. Then two
+// changes skip a revision, so the next step rebuilds: its query covers every row, and it
+// clears the patch's records.
+fn checkFixedPatchStages(allocator: std.mem.Allocator, fixture: *DenseChangeFixture, threads: *ThreadSystem, case: suite.BenchmarkCase) !void {
+    var fixed = CollisionSystem.init(allocator);
+    defer fixed.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(allocator);
+    defer contacts.deinit();
+    const stage_range = case.stageItemsPerRange(collision_range_alignment_items);
+    // The first step rebuilds the store at the seam's revision.
+    _ = try fixed.update(&fixture.data, &contacts, threads, fixedStepConfig(fixture, case));
+    const rebuild_batches = fixed.trigger_store.perf.last_rebuild_batches;
+    _ = try fixture.changeAndSync(threads);
+    _ = try fixed.update(&fixture.data, &contacts, threads, fixedStepConfig(fixture, case));
+    if (fixed.perf.trigger_query_batch.item_count != fixture.moves.len) return error.TriggerPatchMissedQuery;
+    const batches = fixed.trigger_store.perf.last_batches;
+    const patch_stages = [_]BatchStats{ batches.get(.insert_place), batches.get(.insert_sort), batches.get(.leaf), batches.get(.node) };
+    for (patch_stages) |batch| if (batch.item_count == 0) return error.TriggerPatchStageSkipped;
+    try suite.checkStagesDispatched(case, threads, stage_range, &([1]BatchStats{fixed.perf.trigger_query_batch} ++ patch_stages));
+    if (!std.meta.eql(rebuild_batches, fixed.trigger_store.perf.last_rebuild_batches)) return error.TriggerPatchReplacedRebuildRecord;
+    for (0..2) |_| _ = try fixture.changeAndSync(threads);
+    _ = try fixed.update(&fixture.data, &contacts, threads, fixedStepConfig(fixture, case));
+    if (fixed.perf.trigger_rebuild_query_batch.item_count != fixture.seam.collidersConst().view().row_entity.len) return error.TriggerRebuildQueryMissedRows;
+    if (fixed.perf.trigger_query_batch.item_count != 0) return error.TriggerRebuildKeptPatchRecord;
+    for (fixed.trigger_store.perf.last_batches.values) |batch| if (batch.item_count != 0) return error.TriggerRebuildKeptPatchRecord;
+}
+
+// A collision step's config at the case's controls over `fixture`'s world strips and colliders.
+fn fixedStepConfig(fixture: *const DenseChangeFixture, case: suite.BenchmarkCase) CollisionConfig {
+    return .{
+        .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
+        .max_worker_threads = case.maxWorkerThreads(),
+        .adaptive = case.adaptive,
+        .strips = CollisionStrips.ofWorld(&fixture.seam.world),
+        .static_colliders = fixture.seam.collidersConst().view(),
+    };
 }
 
 // One dense commit through the production commit seam (`changeAndSync` checks every move
@@ -1591,7 +1661,7 @@ const StaticSeam = struct {
     fn triggerPatch(self: *const StaticSeam) !TriggerPatch {
         const pipe = &self.seam.pipeline;
         if (pipe.collision.trigger_store.seen_revision != pipe.static_colliders.view().revision) return error.TriggerSyncMissedRevision;
-        return .{ .ns = pipe.perf.seam_trigger_sync_ns, .query_items = pipe.collision.trigger_query_batch.item_count };
+        return .{ .ns = pipe.perf.seam_trigger_sync_ns, .query_items = pipe.collision.perf.trigger_query_batch.item_count };
     }
 
     // Two untimed collision steps on the pipeline after its trigger seams, at the world's
@@ -1741,18 +1811,19 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const perf = last_collision_stats.perf;
         // Every flip moves the allow epoch, so every measured step refreshes the stored pairs.
         if (inputs.toggle) |toggle| if (perf.trigger_refresh_batch.item_count != toggle.stored_pairs) return error.CollisionTriggerRefreshMissed;
-        try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ perf.fill_batch, perf.sort_batch, last_collision_stats.broadphase_batch, last_collision_stats.narrowphase_batch, perf.static_pairs_batch, perf.static_rect_batch, perf.static_place_batch, perf.static_sort_batch, perf.trigger_refresh_batch, perf.trigger_emit_count_batch, perf.trigger_emit_batch });
+        try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ perf.fill_batch, perf.sort_batch, perf.broadphase_batch, perf.narrowphase_batch, perf.static_pairs_batch, perf.static_rect_batch, perf.static_place_batch, perf.static_sort_batch, perf.trigger_refresh_batch, perf.trigger_emit_count_batch, perf.trigger_emit_batch });
+        try checkSweepWork(case, thread_ptr, stage_range, last_collision_stats);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        accumulator.record(elapsed_ns, last_collision_stats.broadphase_batch);
+        accumulator.record(elapsed_ns, last_collision_stats.perf.broadphase_batch);
         const seam_off_main_ns = if (inputs.mover) |static_mover| static_mover.seamOffMainNs() else 0;
         const off_main_ns = offMainNs(perf.fill_batch) + offMainNs(perf.sort_batch) +
-            offMainNs(last_collision_stats.broadphase_batch) + offMainNs(last_collision_stats.narrowphase_batch) +
+            offMainNs(last_collision_stats.perf.broadphase_batch) + offMainNs(last_collision_stats.perf.narrowphase_batch) +
             offMainNs(perf.static_pairs_batch) + offMainNs(perf.static_rect_batch) +
             offMainNs(perf.static_place_batch) + offMainNs(perf.static_sort_batch) + offMainNs(perf.trigger_refresh_batch) +
             offMainNs(perf.trigger_emit_count_batch) + offMainNs(perf.trigger_emit_batch);
         main_total += elapsed_ns -| off_main_ns -| seam_off_main_ns;
         static_stages.add(.{ perf.static_pairs_batch, perf.static_rect_batch, perf.static_sort_batch, perf.trigger_refresh_batch });
-        if (inputs.mover) |static_mover| splice_stages.add(.{static_mover.seam.collidersConst().last_batches.get(.rewrite)});
+        if (inputs.mover) |static_mover| splice_stages.add(.{static_mover.seam.collidersConst().perf.last_batches.get(.rewrite)});
     }
 
     if (system.perf.entry_bound_overflows != warm_overflows[0] or system.perf.pair_bound_overflows != warm_overflows[1]) return error.CollisionWarmStepOverflowed;
@@ -1780,7 +1851,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     stats.sample_count = item_count;
     stats.candidate_pairs = last_collision_stats.candidate_pair_count;
     stats.output_count = last_collision_stats.contact_count;
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_collision_stats.narrowphase_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_collision_stats.perf.narrowphase_batch);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.broadphase_tuner), broadphase_settled_before_measurement);
         stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.narrowphase_tuner), narrowphase_settled_before_measurement);
@@ -1826,6 +1897,15 @@ fn stageTunersSettled(system: *const CollisionSystem) bool {
         (system.static_sort_tuner.sample_count == 0 or system.static_sort_tuner.phase == .settled) and
         (system.trigger_store.tuners.getPtrConst(.refresh).sample_count == 0 or system.trigger_store.tuners.getPtrConst(.refresh).phase == .settled) and
         (system.emit_tuner.sample_count == 0 or system.emit_tuner.phase == .settled);
+}
+
+// Fails when a step's sweep batches miss their work: the broadphase covers every sweep
+// entry, the narrowphase every candidate pair, and a fixed threaded case's broadphase spans
+// one range per aligned `stage_range` of entries.
+fn checkSweepWork(case: suite.BenchmarkCase, thread_system: ?*const ThreadSystem, stage_range: ?usize, stats: CollisionStats) !void {
+    if (stats.perf.broadphase_batch.item_count != stats.entry_count) return error.CollisionBroadphaseMissedEntries;
+    if (stats.perf.narrowphase_batch.item_count != stats.candidate_pair_count) return error.CollisionNarrowphaseMissedPairs;
+    try suite.checkFixedRangeCount(case, thread_system, stage_range, stats.perf.broadphase_batch);
 }
 
 fn runOnce(

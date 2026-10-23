@@ -884,12 +884,11 @@ pub const StaticColliderSystem = struct {
     query_top_class: u6 = 0,
     revision: u64 = 0,
     // `sync`'s stage tuners and `rebuild`'s (each samples once per rebuild, carried across
-    // rebuilds), the shared range controls (production runs adaptive; benches pin a fixed
-    // partition), and each stage's last batch shape.
+    // rebuilds), and the shared range controls (production runs adaptive; benches pin a
+    // fixed partition).
     tuners: std.EnumArray(SyncStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(.{})),
     rebuild_tuners: std.EnumArray(RebuildStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(rebuild_tuner_config)),
     splice_controls: StageControls = .{},
-    last_batches: std.EnumArray(ColliderStage, BatchStats) = .initFill(.{}),
     perf: Perf = .{},
     // Column views refreshed whenever the row pool grows.
     row_entity: []EntityId = &.{},
@@ -909,11 +908,18 @@ pub const StaticColliderSystem = struct {
 
     /// Kept only with `runtime_perf_log.enabled`, across rebuilds: row-pool growths, and
     /// payload growths (a level's directory opened, a block pool grown, a payload slab
-    /// allocated, or one of sync's stage scratch lists grown).
+    /// allocated, or one of sync's stage scratch lists grown); and each stage's last batch
+    /// shape (every `sync` resets them).
     pub const Perf = if (runtime_perf_log.enabled) struct {
         row_grows: u64 = 0,
         payload_grows: u64 = 0,
+        last_batches: std.EnumArray(ColliderStage, BatchStats) = .initFill(.{}),
     } else struct {};
+
+    // Stores `batch` as `stage`'s last batch (`runtime_perf_log.enabled` only).
+    fn recordBatch(self: *StaticColliderSystem, stage: ColliderStage, batch: BatchStats) void {
+        if (comptime runtime_perf_log.enabled) self.perf.last_batches.set(stage, batch);
+    }
 
     pub fn init(allocator: std.mem.Allocator) StaticColliderSystem {
         return .{ .allocator = allocator };
@@ -1156,7 +1162,7 @@ pub const StaticColliderSystem = struct {
             .tallies = self.select_tallies.items,
             .items_per_range = shape.items_per_range,
         };
-        self.last_batches.set(.select, runShaped(dispatch, shape, slot_count, select_range_alignment_items, &job, selectJob));
+        self.recordBatch(.select, runShaped(dispatch, shape, slot_count, select_range_alignment_items, &job, selectJob));
         compactRowWindows(PlanInput, SelectTally, &self.plan_inputs, self.select_tallies.items, shape.items_per_range);
     }
 
@@ -1196,7 +1202,7 @@ pub const StaticColliderSystem = struct {
         self.plan_item_count = static_count;
         self.plan_items_per_range = shape.items_per_range;
         var job = PlanJob{ .colliders = self, .inputs = PlanColumns.of(&self.plan_inputs), .outputs = self.rowLaneOutputs() };
-        self.last_batches.set(.plan, runShaped(dispatch, shape, static_count, plan_range_alignment_items, &job, planJob));
+        self.recordBatch(.plan, runShaped(dispatch, shape, static_count, plan_range_alignment_items, &job, planJob));
     }
 
     // Each plan range's touch bases in each tier, and the rows per query class, in range
@@ -1276,7 +1282,7 @@ pub const StaticColliderSystem = struct {
             setSlotCount(BandOffsets, offsets, shape.range_count);
         }
         var job = TouchJob{ .colliders = self, .range_count = shape.range_count, .source = source };
-        self.last_batches.set(.touch, runShaped(dispatch, shape, self.plan_item_count, touch_range_alignment_items, &job, touchJob));
+        self.recordBatch(.touch, runShaped(dispatch, shape, self.plan_item_count, touch_range_alignment_items, &job, touchJob));
     }
 
     // Each tier's band starts over every touch range's band offsets (O(ranges * bands)), each
@@ -1343,7 +1349,7 @@ pub const StaticColliderSystem = struct {
         setSlotCount(GroupTally, &self.group_tallies, tier_count * band_count);
         GroupTable.advance(self.group_slots.items, &self.group_generation);
         var job = GroupJob{ .colliders = self, .range_count = shape.range_count };
-        self.last_batches.set(.group, runShaped(dispatch, shape, touch_total, group_range_alignment_items, &job, groupJob));
+        self.recordBatch(.group, runShaped(dispatch, shape, touch_total, group_range_alignment_items, &job, groupJob));
     }
 
     // The group's merge and the growth seam before the fill: each tier's item and unit
@@ -1432,7 +1438,7 @@ pub const StaticColliderSystem = struct {
         const item_count = self.item_bands.itemCount();
         const shape = StageShape.select(dispatch, item_count, install_range_alignment_items);
         var job = InstallJob{ .colliders = self, .range_count = shape.range_count };
-        self.last_batches.set(.install, runShaped(dispatch, shape, item_count, install_range_alignment_items, &job, installJob));
+        self.recordBatch(.install, runShaped(dispatch, shape, item_count, install_range_alignment_items, &job, installJob));
     }
 
     // The plan lanes over plan items `[start, end)`, from the packed inputs: each static's
@@ -1990,7 +1996,7 @@ pub const StaticColliderSystem = struct {
     /// stays. The change list resets on every call.
     pub fn sync(self: *StaticColliderSystem, data: *const DataSystem, thread_system: *ThreadSystem) error{OutOfMemory}!void {
         self.changes.clearRetainingCapacity();
-        self.last_batches = .initFill(.{});
+        if (comptime runtime_perf_log.enabled) self.perf.last_batches = .initFill(.{});
         if (self.pending_dirty.items.len == 0) return;
         const threads = ColliderThreads{ .thread_system = thread_system, .config = self.splice_controls };
         try self.prepareSync(data, threads);
@@ -2104,7 +2110,7 @@ pub const StaticColliderSystem = struct {
             .inputs = PlanColumns.of(&self.plan_inputs),
             .outputs = LaneOutputs.ofSyncRows(&self.sync_rows),
         };
-        self.last_batches.set(.plan, runShaped(dispatch, shape, pending, sync_plan_range_alignment_items, &job, syncPlanJob));
+        self.recordBatch(.plan, runShaped(dispatch, shape, pending, sync_plan_range_alignment_items, &job, syncPlanJob));
     }
 
     // Packs pending indices `[start, end)`: each one's static through its captured id, or
@@ -2260,7 +2266,7 @@ pub const StaticColliderSystem = struct {
         const pending = self.plan_item_count;
         const shape = StageShape.select(dispatch, pending, apply_range_alignment_items);
         var job = ApplyJob{ .colliders = self, .inputs = PlanColumns.of(&self.plan_inputs), .outputs = LaneOutputs.ofSyncRows(&self.sync_rows), .range_count = shape.range_count };
-        self.last_batches.set(.apply, runShaped(dispatch, shape, pending, apply_range_alignment_items, &job, applyJob));
+        self.recordBatch(.apply, runShaped(dispatch, shape, pending, apply_range_alignment_items, &job, applyJob));
     }
 
     // Pending indices `[start, end)`: each one's new row written at its row (its old row, or
@@ -2312,7 +2318,7 @@ pub const StaticColliderSystem = struct {
         var job = RewriteJob{ .colliders = self, .entries = entries, .range_count = 0 };
         const shape = StageShape.select(dispatch, units, splice_range_alignment_items);
         job.range_count = shape.range_count;
-        self.last_batches.set(.rewrite, runShaped(dispatch, shape, units, splice_range_alignment_items, &job, rewriteJob));
+        self.recordBatch(.rewrite, runShaped(dispatch, shape, units, splice_range_alignment_items, &job, rewriteJob));
     }
 
     // Reserves `claims` ordinal block claims in `dir`. A grown block pool counts as one
@@ -4293,7 +4299,6 @@ fn expectSyncOutOfMemorySafe(thread_system: *ThreadSystem) !void {
         fixture.colliders.allocator = std.testing.allocator;
         if (result) |_| {
             try std.testing.expect(!failing.has_induced_failure);
-            if (thread_system.workerThreadCount() != 0) try std.testing.expect(!fixture.colliders.last_batches.get(.rewrite).ran_inline);
             // The swept sync grew the block pool.
             try std.testing.expect(fixture.colliders.chunks.blocks.items.len > blocks_before);
             var after = try fixture.rebuilt();
@@ -4427,7 +4432,6 @@ test "a dense mixed collider sync lists every chunk in entity order, threaded eq
     try commitForTestWith(&threaded.frame, &threaded.data, &threaded.colliders, commands.items, &threads);
     var live: std.ArrayList(EntityId) = .empty;
     defer live.deinit(std.testing.allocator);
-    var threaded_ranges: usize = 0;
     for (0..10) |_| {
         live.clearRetainingCapacity();
         for (serial.data.movementBodySliceConst().entities) |entity| try live.append(std.testing.allocator, entity);
@@ -4442,14 +4446,10 @@ test "a dense mixed collider sync lists every chunk in entity order, threaded eq
         var threaded_rebuilt = try serial.rebuiltOn(&threads, 8);
         defer threaded_rebuilt.deinit();
         try expectIdenticalLayout(&rebuilt, &threaded_rebuilt, 3);
-        try std.testing.expect(!threaded_rebuilt.last_batches.get(.rewrite).ran_inline and threaded_rebuilt.last_batches.get(.rewrite).range_count > 1);
-        const batch = threaded.colliders.last_batches.get(.rewrite);
-        if (!batch.ran_inline and batch.range_count > 1) threaded_ranges += 1;
     }
-    try std.testing.expect(threaded_ranges != 0);
 }
 
-test "a splice worker cap of zero keeps the chunk splice inline on a multi-worker ThreadSystem and lists the same chunks" {
+test "a splice worker cap of zero on a multi-worker ThreadSystem lists the same chunks as no cap" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var uncapped = try SeamFixture.init();
@@ -4468,7 +4468,6 @@ test "a splice worker cap of zero keeps the chunk splice inline on a multi-worke
     try commitForTestWith(&capped.frame, &capped.data, &capped.colliders, commands.items, &threads);
     var live: std.ArrayList(EntityId) = .empty;
     defer live.deinit(std.testing.allocator);
-    var threaded_ranges: usize = 0;
     for (0..10) |_| {
         live.clearRetainingCapacity();
         for (uncapped.data.movementBodySliceConst().entities) |entity| try live.append(std.testing.allocator, entity);
@@ -4476,13 +4475,7 @@ test "a splice worker cap of zero keeps the chunk splice inline on a multi-worke
         try commitForTestWith(&uncapped.frame, &uncapped.data, &uncapped.colliders, commands.items, &threads);
         try commitForTestWith(&capped.frame, &capped.data, &capped.colliders, commands.items, &threads);
         try expectIdenticalLayout(&uncapped.colliders, &capped.colliders, 3);
-        const capped_batch = capped.colliders.last_batches.get(.rewrite);
-        const batch = uncapped.colliders.last_batches.get(.rewrite);
-        try std.testing.expectEqual(batch.item_count, capped_batch.item_count);
-        try std.testing.expect(capped_batch.ran_inline and capped_batch.active_worker_threads == 0);
-        if (!batch.ran_inline and batch.worker_thread_ranges != 0) threaded_ranges += 1;
     }
-    try std.testing.expect(threaded_ranges != 0);
 }
 
 // Every growth counter's once-only log flag is set.
@@ -4525,7 +4518,6 @@ test "a move inside its footprint chunks rewrites those spans and no other chunk
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{.{ .set_movement_body = .{ .entity = entity, .body = .{ .position = position, .previous_position = position } } }});
     const change = fixture.colliders.changesThisStep()[0];
     try std.testing.expect(!std.meta.eql(change.old.?.cells, change.new.?.cells));
-    try std.testing.expect(fixture.colliders.last_batches.get(.rewrite).item_count > 0);
     try std.testing.expectEqual(live_before, listEntryCount(&fixture.colliders));
     try std.testing.expect(chunkPayloadOf(&fixture.colliders, 0, 15 * 16 + 15) == null);
     try std.testing.expectEqual(change.new.?, placementOfIndex(&fixture.colliders, entity.index).?);
@@ -4550,26 +4542,29 @@ test "a destroy-heavy sync grows no rows" {
     try std.testing.expectEqual(capacity, fixture.colliders.rows.capacity);
 }
 
-test "a sync that empties every block dispatches one fill unit per emptied item" {
+test "a sync that empties every block leaves every chunk and coarse slot empty" {
     var fixture = try SeamFixture.init();
     defer fixture.deinit();
     var creates: [32]StructuralCommand = undefined;
     for (&creates, 0..) |*command, at| command.* = .{ .create_entity = staticTemplate(.{ .x = @floatFromInt(at * 60), .y = 100 }, .{ .x = 8, .y = 8 }) };
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &creates);
-    // Each installed chunk and coarse block becomes one emptied item, holding at least one
-    // record, so the old count of its records plus one would exceed this.
     try std.testing.expectEqual(@as(usize, 1), fixture.colliders.chunks.levelCount());
-    var installed: usize = 0;
-    for (0..fixture.colliders.chunks.slotCount(0)) |chunk| installed += @intFromBool(fixture.colliders.chunks.slot(0, chunk) != empty_block);
-    for (&fixture.colliders.coarse) |*dir| {
-        for (0..dir.slotCount(0)) |cell| installed += @intFromBool(dir.slot(0, cell) != empty_block);
-    }
-    try std.testing.expect(installed > 0);
+    try std.testing.expect(installedBlockCount(&fixture.colliders) > 0);
     var destroys: [32]StructuralCommand = undefined;
     for (fixture.colliders.changesThisStep(), &destroys) |change, *command| command.* = .{ .destroy_entity = change.entity };
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &destroys);
-    try std.testing.expectEqual(installed, fixture.colliders.last_batches.get(.rewrite).item_count);
+    try std.testing.expectEqual(@as(usize, 0), installedBlockCount(&fixture.colliders));
     try expectAnchors(&fixture.colliders);
+}
+
+// Installed chunk and coarse blocks of level 0.
+fn installedBlockCount(colliders: *const StaticColliderSystem) usize {
+    var installed: usize = 0;
+    for (0..colliders.chunks.slotCount(0)) |chunk| installed += @intFromBool(colliders.chunks.slot(0, chunk) != empty_block);
+    for (&colliders.coarse) |*dir| {
+        for (0..dir.slotCount(0)) |cell| installed += @intFromBool(dir.slot(0, cell) != empty_block);
+    }
+    return installed;
 }
 
 test "a block pool that grows before its free list's reserve fails counts as payload growth" {
@@ -4585,7 +4580,7 @@ test "a block pool that grows before its free list's reserve fails counts as pay
     try std.testing.expect(colliders.payload_growth_logged);
 }
 
-test "a warmed dense sync allocates nothing inline and running every stage on a multi-worker ThreadSystem (FailingAllocator)" {
+test "a warmed dense sync allocates nothing, inline and on a multi-worker ThreadSystem (FailingAllocator)" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
@@ -4633,11 +4628,6 @@ fn expectWarmDenseSyncAllocatesNothing(threads: *ThreadSystem) !void {
         defer fixture.colliders.allocator = std.testing.allocator;
         try fixture.colliders.sync(&fixture.data, threads);
         try std.testing.expect(!failing.has_induced_failure);
-        for (std.meta.tags(SyncStage)) |stage| {
-            const batch = fixture.colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
-            try std.testing.expect(batch.item_count != 0);
-            if (threads.workerThreadCount() != 0) try std.testing.expect(!batch.ran_inline and batch.range_count > 1);
-        }
     }
     try std.testing.expectEqual(@as(usize, 48), static_colliders_test_support.liveRowCount(fixture.colliders));
     try std.testing.expect(fixture.colliders.chunks.blocks.items.len != 0);
@@ -5080,7 +5070,6 @@ test "a move across a tile inside its chunk rewrites that chunk's query bit" {
     try std.testing.expect(block != empty_block);
     const bits_before = fixture.colliders.chunks.payload(block).anchors;
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(entity, .{ .x = 72, .y = 40 })});
-    try std.testing.expect(fixture.colliders.last_batches.get(.rewrite).item_count > 0);
     // The chunk keeps its block; the anchor bit moved one cell over.
     try std.testing.expectEqual(block, fixture.colliders.chunks.slot(0, 0));
     const bits_after = fixture.colliders.chunks.payload(block).anchors;
@@ -5092,7 +5081,6 @@ test "a move across a tile inside its chunk rewrites that chunk's query bit" {
     const cells_before = fixture.colliders.view().chunkRows(0, 0);
     const nav_before = cells_before.min_x[0];
     try commitForTest(&fixture.frame, &fixture.data, &fixture.colliders, &.{moveCommand(entity, .{ .x = 73, .y = 41 })});
-    try std.testing.expect(fixture.colliders.last_batches.get(.rewrite).item_count > 0);
     try std.testing.expectEqual(nav_before, fixture.colliders.view().chunkRows(0, 0).min_x[0]);
     var rebuilt_again = try fixture.rebuilt();
     defer rebuilt_again.deinit();
@@ -5477,7 +5465,6 @@ test "a chunk rewrite matches across range sizes and worker counts" {
         threaded.colliders.splice_controls = .{ .adaptive = false, .items_per_range = items_per_range };
         try commitForTestWith(&threaded.frame, &threaded.data, &threaded.colliders, commands.items, &threads);
         try expectIdenticalLayout(&baseline.colliders, &threaded.colliders, 1);
-        if (items_per_range < 64) try std.testing.expect(!threaded.colliders.last_batches.get(.rewrite).ran_inline);
     }
 }
 
@@ -5508,7 +5495,6 @@ fn expectWarmMoveInsideChunkAllocatesNothing(thread_system: *ThreadSystem) !void
         try fixture.colliders.sync(&fixture.data, thread_system);
         try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     }
-    if (thread_system.workerThreadCount() != 0) try std.testing.expect(!fixture.colliders.last_batches.get(.rewrite).ran_inline);
     try std.testing.expectEqual(@as(usize, 1), fixture.colliders.changesThisStep().len);
     try std.testing.expectEqual(block, fixture.colliders.chunks.slot(0, 0));
     try std.testing.expectEqual(columns, fixture.colliders.chunks.payloadConst(block).nav_entity.ptr);
@@ -5618,7 +5604,6 @@ fn expectRebuildOutOfMemorySafe(thread_system: *ThreadSystem) !void {
         colliders.allocator = std.testing.allocator;
         if (result) |_| {
             try std.testing.expect(!failing.has_induced_failure);
-            if (thread_system.workerThreadCount() != 0) try std.testing.expect(!colliders.last_batches.get(.rewrite).ran_inline);
             try expectSameRows(&colliders, &expected, 1);
             break;
         } else |err| {
@@ -5651,7 +5636,6 @@ test "rebuild runs out of memory at every allocation and leaves the structure un
         const result = colliders.rebuild(&fixture.data, test_geometry, null);
         colliders.allocator = std.testing.allocator;
         if (result) |_| {
-            try std.testing.expect(colliders.last_batches.get(.rewrite).ran_inline);
             try expectSameRows(&colliders, &fixture.colliders, 1);
             break;
         } else |err| {
@@ -5707,29 +5691,27 @@ test "a rebuild samples each stage's own rebuild tuner once, threads a fresh sys
     for (1..3) |rebuilds| {
         try colliders.rebuild(&fixture.data, test_geometry, &threads);
         for (std.meta.tags(RebuildStage)) |stage| {
-            const batch = colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
-            try std.testing.expect(batch.item_count != 0);
-            // The stage selected through its own tuner, at its items and alignment, and
-            // recorded one sample per rebuild into it.
+            // The stage selected through its own tuner and recorded one sample per rebuild
+            // into it.
             const tuner = colliders.rebuild_tuners.getPtrConst(stage);
             const request = tuner.last_request orelse return error.RebuildStageSkippedItsTuner;
-            try std.testing.expectEqual(batch.item_count, request.item_count);
-            try std.testing.expectEqual(batch.range_alignment_items, request.range_alignment_items);
+            try std.testing.expect(request.item_count != 0);
+            const sampled = tuner.sampled_profile orelse return error.RebuildStageSkippedItsTuner;
             if (rebuilds == 1) {
                 // A fresh tuner's first selection is the full pool: every stage with more
-                // than one aligned range runs on workers.
-                if (rangeCount(batch.item_count, batch.range_alignment_items) > 1) {
-                    try std.testing.expect(!batch.ran_inline and batch.active_worker_threads > 0);
+                // than one aligned range samples a threaded profile.
+                if (rangeCount(request.item_count, request.range_alignment_items) > 1) {
+                    try std.testing.expect(sampled.worker_threads > 0);
                     first_threaded_stages += 1;
                 }
-                first_ran_inline.set(stage, batch.ran_inline);
+                first_ran_inline.set(stage, sampled.worker_threads == 0);
                 try std.testing.expectEqual(@as(usize, 1), tuner.sample_count);
                 continue;
             }
             // The tuner carried over: the second rebuild learns inline, never the fresh
             // full-pool selection. A threaded first sample is a different profile, so the
             // inline sample restarts the window; an inline first sample extends it.
-            try std.testing.expect(batch.ran_inline);
+            try std.testing.expectEqual(@as(usize, 0), sampled.worker_threads);
             const expected: usize = if (first_ran_inline.get(stage)) 2 else 1;
             try std.testing.expectEqual(expected, tuner.sample_count);
         }
@@ -5747,7 +5729,6 @@ test "a rebuild samples each stage's own rebuild tuner once, threads a fresh sys
     try colliders.rebuild(&empty, test_geometry, &threads);
     try std.testing.expectEqual(@as(usize, 0), static_colliders_test_support.liveRowCount(colliders));
     for (std.meta.tags(RebuildStage)) |stage| {
-        try std.testing.expectEqual(@as(usize, 0), colliders.last_batches.get(static_colliders_test_support.colliderStage(stage)).item_count);
         try std.testing.expectEqual(before.get(stage).sample_count, colliders.rebuild_tuners.get(stage).sample_count);
         try std.testing.expectEqual(before.get(stage).last_request.?.item_count, colliders.rebuild_tuners.get(stage).last_request.?.item_count);
     }
@@ -5876,11 +5857,6 @@ test "a rebuild lays out the same rows, block ids, slot ids, and bytes on worker
             defer rebuilt.deinit();
             try expectIdenticalLayout(&inline_rebuilt, &rebuilt, 3);
             try expectSameRowColumns(&inline_rebuilt, &rebuilt);
-            if (workers == 0) continue;
-            for (std.meta.tags(ColliderStage)) |stage| {
-                const batch = rebuilt.last_batches.get(stage);
-                if (batch.item_count > batch.items_per_range) try std.testing.expect(!batch.ran_inline);
-            }
         }
     }
 }
@@ -6150,17 +6126,6 @@ const SyncPartitions = struct {
     fn commit(self: *SyncPartitions, commands: []const StructuralCommand) !void {
         for (&self.fixtures, &self.threads) |*fixture, *threads| try commitForTestWith(&fixture.frame, &fixture.data, &fixture.colliders, commands, threads);
     }
-
-    // Every partition's sync stage that spanned more than one range ran on workers.
-    fn expectStagesThreaded(self: *const SyncPartitions) !void {
-        for (sync_partitions, &self.fixtures) |partition, *fixture| {
-            if (partition.workers == 0) continue;
-            for (std.meta.tags(SyncStage)) |stage| {
-                const batch = fixture.colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
-                if (batch.item_count > batch.items_per_range) try std.testing.expect(!batch.ran_inline);
-            }
-        }
-    }
 };
 
 test "a sync lays out the same rows, block ids, and slot ids on workers as inline across range sizes and worker counts, and equals a rebuild" {
@@ -6176,21 +6141,15 @@ test "a sync lays out the same rows, block ids, and slot ids on workers as inlin
     try partitions.commit(commands.items);
     var live: std.ArrayList(EntityId) = .empty;
     defer live.deinit(std.testing.allocator);
-    var threaded_stages: std.EnumSet(SyncStage) = .empty;
     for (0..8) |_| {
         live.clearRetainingCapacity();
         for (reference.data.movementBodySliceConst().entities) |entity| try live.append(std.testing.allocator, entity);
         try denseMixedCommands(random, &reference.data, live.items, &commands);
         try partitions.commit(commands.items);
-        try partitions.expectStagesThreaded();
         for (partitions.fixtures[1..]) |*fixture| {
             try expectIdenticalLayout(&reference.colliders, &fixture.colliders, 3);
             try expectSameRowColumns(&reference.colliders, &fixture.colliders);
             try std.testing.expectEqualSlices(u32, reference.colliders.row_free.items, fixture.colliders.row_free.items);
-        }
-        for (std.meta.tags(SyncStage)) |stage| {
-            const batch = partitions.fixtures[2].colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
-            if (!batch.ran_inline and batch.range_count > 1) threaded_stages.insert(stage);
         }
         // The incremental structure equals a rebuild of the same statics.
         var rebuilt = try reference.rebuilt();
@@ -6199,8 +6158,6 @@ test "a sync lays out the same rows, block ids, and slot ids on workers as inlin
         try expectSameQueries(&reference.colliders, &rebuilt, 3);
         try expectAnchors(&reference.colliders);
     }
-    // Every stage ran across ranges on workers at least once.
-    try std.testing.expectEqual(std.meta.tags(SyncStage).len, threaded_stages.count());
 }
 
 test "a sync's adds take free rows newest first, then new rows, in pending order, and its releases follow, for any partition" {

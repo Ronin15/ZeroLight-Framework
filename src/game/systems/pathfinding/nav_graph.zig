@@ -705,11 +705,11 @@ fn patchJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 }
 
 // Folds one batch's connectivity counters and stage shapes into `stats`: level builds and the
-// marks batch sum. Only the perf log's flood batch folds without `runtime_perf_log.enabled`.
+// marks batch sum. Nothing folds without `runtime_perf_log.enabled`.
 fn addConnectivityStats(stats: *NavUpdateStats, conn: *const Connectivity, counters: ConnectivityCounters) void {
-    accumulateBatch(&stats.conn_flood_batch, conn.last_flood_batch);
-    addClosureStats(stats, conn, counters.closure);
     if (comptime !runtime_perf_log.enabled) return;
+    accumulateBatch(&stats.perf.conn_flood_batch, conn.perf.last_flood_batch);
+    addClosureStats(stats, conn, counters.closure);
     stats.perf.conn_groups += counters.perf.groups;
     stats.perf.conn_families += counters.families;
     stats.perf.conn_rounds += counters.perf.rounds;
@@ -727,11 +727,11 @@ fn addConnectivityStats(stats: *NavUpdateStats, conn: *const Connectivity, count
 }
 
 // Folds one batch's closure counters and commit-side stage shapes into `stats`; the
-// candidates and the landing fold where they run. Only the perf log's rows batch folds
-// without `runtime_perf_log.enabled`.
+// candidates and the landing fold where they run. Nothing folds without
+// `runtime_perf_log.enabled`.
 fn addClosureStats(stats: *NavUpdateStats, conn: *const Connectivity, counters: ClosureCounters) void {
-    if (counters.links != 0) accumulateBatch(&stats.conn_closure_rows_batch, conn.closure.last_rows_batch);
     if (comptime !runtime_perf_log.enabled) return;
+    if (counters.links != 0) accumulateBatch(&stats.perf.conn_closure_rows_batch, conn.closure.perf.last_rows_batch);
     stats.perf.closure_touched += counters.perf.touched;
     stats.perf.closure_links += counters.links;
     stats.perf.closure_terms_new += counters.perf.terms_new;
@@ -1729,7 +1729,7 @@ pub const NavGraph = struct {
         stats.addMain(.commit_ns, section.lap());
         const batch = runStage(threads, keys.len, 1, &job, &job.range_count, remaskJob);
         stats.addStageTime(batch);
-        accumulateBatch(&stats.remask_batch, batch);
+        if (comptime runtime_perf_log.enabled) accumulateBatch(&stats.perf.remask_batch, batch);
         section = StageTimer.begin();
         for (keys, self.remask_slots.items, self.remask_deltas.items) |key, slot, delta| {
             const level_grid = levels.grid(keyLevel(key));
@@ -2168,8 +2168,7 @@ test "threaded initial nav build matches a serial build across levels" {
     defer threaded.deinit();
     try threaded.reserve(cap);
     threaded.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
-    const build_stats = try threaded.graph.rebuild(no_colliders.view(), .{ .world = &world }, .{ .thread_system = &threads, .tuners = &threaded.tuners.nav, .controls = threaded.nav_controls });
-    try std.testing.expect(!build_stats.remask_batch.ran_inline);
+    _ = try threaded.graph.rebuild(no_colliders.view(), .{ .world = &world }, .{ .thread_system = &threads, .tuners = &threaded.tuners.nav, .controls = threaded.nav_controls });
 
     var serial = PathfindingSystem.init(std.testing.allocator);
     defer serial.deinit();
@@ -2569,10 +2568,7 @@ test "an incremental nav update on a forced-parallel schedule matches a serial f
         _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
         try test_support.recordTileEdits(&system, &world, &.{.{ .level = 0, .x = cell.x, .y = cell.y }});
     }
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
-
-    // The remask must have actually threaded, not fallen back to the inline slot-0 path.
-    try std.testing.expect(!stats.remask_batch.ran_inline);
+    _ = try system.applyBufferedNavUpdates(no_colliders, &world, &threads);
 
     var rebuilt = PathfindingSystem.init(std.testing.allocator);
     defer rebuilt.deinit();
@@ -2939,8 +2935,7 @@ test "incremental nav update threaded chunk patch matches a serial full rebuild 
         _ = (try nav.world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
         try test_support.recordTileEdits(&nav.system, &nav.world, &.{.{ .level = 0, .x = cell.x, .y = cell.y }});
     }
-    const stats = try nav.system.applyBufferedNavUpdates(&nav.colliders, &nav.world, &threads);
-    try std.testing.expect(!stats.remask_batch.ran_inline);
+    _ = try nav.system.applyBufferedNavUpdates(&nav.colliders, &nav.world, &threads);
 
     var rebuilt = try nav.rebuilt();
     defer rebuilt.deinit();
@@ -3032,8 +3027,6 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
         }
         const warm_stats = try system.applyBufferedNavUpdates(&colliders, &world, &threads);
         try std.testing.expectEqual(@as(usize, 1), warm_stats.incremental_rebuilds);
-        // The warmup itself must have threaded, so the proof below runs the same dispatch.
-        try std.testing.expect(!warm_stats.remask_batch.ran_inline);
     }
 
     const original = system.allocator;
@@ -3046,8 +3039,6 @@ test "remask and patch after reserve allocate nothing on a multi-worker ThreadSy
     }
     const stats = try system.applyBufferedNavUpdates(&colliders, &world, &threads);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    // The remask threaded under the failing allocator, and the update allocated nothing.
-    try std.testing.expect(!stats.remask_batch.ran_inline);
 
     system.graph.allocator = original;
     system.allocator = original;
@@ -4459,27 +4450,4 @@ test "the key plan equals the plan by definition for multi-chunk marks at level 
         if (thread_system != null) try std.testing.expect(system.graph.plan_tallies.items.len > 1);
         for (std.meta.tags(PlanStream), &expected) |stream, *keys| try std.testing.expectEqualSlices(u64, keys.items, system.graph.keyList(stream).items);
     }
-}
-
-test "a step's remask batch folds the chunks of its level build and its marks batch" {
-    var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer serial_threads.deinit();
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    var meta = try loadTestWorldMeta(std.testing.allocator);
-    defer meta.deinit();
-    var fixture = try twoLevelWorld(&meta);
-    defer fixture.world.deinit();
-    var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
-    defer system.deinit();
-    // One step: a level appended and one cell dug on level 0.
-    _ = try fixture.world.addLevel(-32);
-    const changed = (try fixture.world.setDenseTile(fixture.obstacle[0], 5, 5, fixture.tree)) orelse return error.TestExpectedEqual;
-    try test_support.recordTileChange(&system, &fixture.world, changed);
-    const stats = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &serial_threads);
-    const chunks = system.graph.chunkCount();
-    try std.testing.expectEqual(@as(usize, 1), stats.levels_built);
-    // The dug cell (5, 5) lies in one chunk: the marks batch remasked it with the build's.
-    try std.testing.expectEqual(@as(usize, 1), stats.dirty_chunks);
-    try std.testing.expectEqual(chunks + stats.dirty_chunks, stats.remask_batch.item_count);
 }

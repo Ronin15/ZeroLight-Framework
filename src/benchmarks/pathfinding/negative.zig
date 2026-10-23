@@ -279,7 +279,7 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     for (0..coldIterations(options)) |_| {
         const step = try runPocketUpdate(io, case, &fixture, thread_ptr);
         last_stats = step.stats;
-        accumulator.record(step.elapsed_ns, last_stats.intake_batch);
+        accumulator.record(step.elapsed_ns, last_stats.perf.intake_batch);
         stage_report.add(step.elapsed_ns, last_stats);
     }
 
@@ -304,7 +304,7 @@ const NegativeDigReport = struct {
         self.samples += 1;
         self.react_ns += reaction.elapsed_ns;
         self.update_ns += step.elapsed_ns;
-        self.remask.add(.{reaction.stats.remask_batch});
+        self.remask.add(.{reaction.stats.perf.remask_batch});
     }
 
     fn write(self: NegativeDigReport, details: *suite.DetailLines) void {
@@ -371,7 +371,7 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     var reaction_report = EvictReport{};
     for (0..coldIterations(options)) |_| {
         const timed = try dig.step(io, case, &fixture, thread_ptr);
-        accumulator.record(timed.reaction.elapsed_ns + timed.update.elapsed_ns, timed.update.stats.intake_batch);
+        accumulator.record(timed.reaction.elapsed_ns + timed.update.elapsed_ns, timed.update.stats.perf.intake_batch);
         stage_report.add(timed.update.elapsed_ns, timed.update.stats);
         reaction_report.add(timed.reaction);
         report.add(timed.reaction, timed.update);
@@ -745,7 +745,7 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
         resolve_report.add(burst.resolve);
         // The update's stages and main share; the resolve's worker time prints on its own.
         stage_report.add(burst.elapsed_ns -| (offMainNs(burst.resolve.perf.scan_batch) + offMainNs(burst.resolve.perf.project_batch)), burst.stats);
-        accumulator.record(burst.elapsed_ns, burst.stats.intake_batch);
+        accumulator.record(burst.elapsed_ns, burst.stats.perf.intake_batch);
         last = burst;
     }
 

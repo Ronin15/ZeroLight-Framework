@@ -2662,8 +2662,7 @@ test "the threaded gather writes every row the serial gather does, skipping bodi
     for ([_]usize{ ai_gather_range_alignment_items, 2 * ai_gather_range_alignment_items }) |items_per_range| {
         var threaded_ai = AiSystem.init(std.testing.allocator);
         defer threaded_ai.deinit();
-        const batch = try threaded_ai.gatherAiData(inputs, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 3, .adaptive = false });
-        try std.testing.expect(!batch.ran_inline);
+        _ = try threaded_ai.gatherAiData(inputs, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 3, .adaptive = false });
         try std.testing.expectEqual(serial_ai.rows.len, threaded_ai.rows.len);
         for (0..serial_ai.rows.len) |row| try std.testing.expectEqualDeep(serial_ai.rows.get(row), threaded_ai.rows.get(row));
     }

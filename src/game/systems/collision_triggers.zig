@@ -504,14 +504,19 @@ const RefreshSums = struct {
 /// main and dispatch their own stages; readers (`cursorAt`, `locateKey`, `storedPiece`,
 /// `seek`) may run on workers while no patch, rebuild or refresh runs.
 pub const TriggerStore = struct {
-    /// Growth counts, kept only with `runtime_perf_log.enabled`: pool slabs the pages and
+    /// Kept only with `runtime_perf_log.enabled`. Growth counts: pool slabs the pages and
     /// nodes grew by, level table growths, refresh range slot growths, and patch plan
-    /// scratch lists a patch grew (each list once per patch, on error too).
+    /// scratch lists a patch grew (each list once per patch, on error too). Each patch or
+    /// step stage's last batch shape (`last_batches`; reset by every patch and rebuild, so
+    /// after a rebuild the patch stages hold none) and each rebuild stage's
+    /// (`last_rebuild_batches`; reset by every rebuild).
     pub const Perf = if (runtime_perf_log.enabled) struct {
         page_grows: u64 = 0,
         level_grows: u64 = 0,
         slot_grows: u64 = 0,
         scratch_grows: u64 = 0,
+        last_batches: std.EnumArray(TriggerStage, BatchStats) = .initFill(.{}),
+        last_rebuild_batches: std.EnumArray(TriggerRebuildStage, BatchStats) = .initFill(.{}),
     } else struct {};
 
     allocator: std.mem.Allocator,
@@ -535,11 +540,6 @@ pub const TriggerStore = struct {
     ready: bool = false,
     tuners: std.EnumArray(TriggerStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(.{})),
     rebuild_tuners: std.EnumArray(TriggerRebuildStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(rebuild_tuner_config)),
-    /// Each patch or step stage's last batch shape; reset by every patch and rebuild, so
-    /// after a rebuild the patch stages hold none.
-    last_batches: std.EnumArray(TriggerStage, BatchStats) = .initFill(.{}),
-    /// Each rebuild stage's last batch shape; reset by every rebuild.
-    last_rebuild_batches: std.EnumArray(TriggerRebuildStage, BatchStats) = .initFill(.{}),
     perf: Perf = .{},
     page_growth_logged: bool = false,
     level_growth_logged: bool = false,
@@ -737,29 +737,33 @@ pub const TriggerStore = struct {
     /// on error the store is unchanged and `seen_revision` is kept.
     pub fn patch(self: *TriggerStore, threads: StoreThreads, edits: []const EditSource, revision: u64) error{OutOfMemory}!void {
         errdefer self.discardPlan();
-        self.last_batches = .initFill(.{});
+        if (comptime runtime_perf_log.enabled) self.perf.last_batches = .initFill(.{});
         const before = self.planScratchCapacities();
         defer self.countScratchGrowth(changedCapacities(&before, &self.planScratchCapacities()));
         try self.bucket(edits);
         try self.collectInsertSegments(edits);
         const sorted = try self.sortInserts(threads.stage(self.tuners.getPtr(.insert_place)), threads.stage(self.tuners.getPtr(.insert_sort)));
-        self.last_batches.set(.insert_place, sorted.place);
-        self.last_batches.set(.insert_sort, sorted.sort);
+        if (comptime runtime_perf_log.enabled) {
+            self.perf.last_batches.set(.insert_place, sorted.place);
+            self.perf.last_batches.set(.insert_sort, sorted.sort);
+        }
         try self.orderLevels();
         try self.orderTouchedPages();
         try self.planHeights();
         try self.reservePlan();
         const written = self.writeOutputs(threads.stage(self.tuners.getPtr(.leaf)), threads.stage(self.tuners.getPtr(.node)));
-        self.last_batches.set(.leaf, written.leaf);
-        self.last_batches.set(.node, written.node);
+        if (comptime runtime_perf_log.enabled) {
+            self.perf.last_batches.set(.leaf, written.leaf);
+            self.perf.last_batches.set(.node, written.node);
+        }
         self.install(.patch);
         self.seen_revision = revision;
     }
 
     /// Replaces every stored pair with `inserts` (each query range's inserts, in range
     /// order; rows and emit bits current at `allow_epoch`) and records `revision`. Each stage
-    /// dispatches under its own rebuild tuner and records into `last_rebuild_batches`. On
-    /// error the store is empty and not ready.
+    /// dispatches under its own rebuild tuner and records into `Perf.last_rebuild_batches`.
+    /// On error the store is empty and not ready.
     pub fn rebuild(self: *TriggerStore, threads: StoreThreads, inserts: []const EditSource, revision: u64, allow_epoch: u64) error{OutOfMemory}!void {
         errdefer {
             self.discardPlan();
@@ -767,8 +771,10 @@ pub const TriggerStore = struct {
         }
         self.discardPlan();
         self.ready = false;
-        self.last_batches = .initFill(.{});
-        self.last_rebuild_batches = .initFill(.{});
+        if (comptime runtime_perf_log.enabled) {
+            self.perf.last_batches = .initFill(.{});
+            self.perf.last_rebuild_batches = .initFill(.{});
+        }
         self.pool.resetClass(leaf_class);
         self.pool.resetClass(node_class);
         self.levels.clearRetainingCapacity();
@@ -778,14 +784,18 @@ pub const TriggerStore = struct {
         self.allowed_count = 0;
         try self.collectInsertSegments(inserts);
         const sorted = try self.sortInserts(threads.stage(self.rebuild_tuners.getPtr(.insert_place)), threads.stage(self.rebuild_tuners.getPtr(.insert_sort)));
-        self.last_rebuild_batches.set(.insert_place, sorted.place);
-        self.last_rebuild_batches.set(.insert_sort, sorted.sort);
+        if (comptime runtime_perf_log.enabled) {
+            self.perf.last_rebuild_batches.set(.insert_place, sorted.place);
+            self.perf.last_rebuild_batches.set(.insert_sort, sorted.sort);
+        }
         try self.touchRebuildLevels();
         try self.planHeights();
         try self.reservePlan();
         const written = self.writeOutputs(threads.stage(self.rebuild_tuners.getPtr(.leaf)), threads.stage(self.rebuild_tuners.getPtr(.node)));
-        self.last_rebuild_batches.set(.leaf, written.leaf);
-        self.last_rebuild_batches.set(.node, written.node);
+        if (comptime runtime_perf_log.enabled) {
+            self.perf.last_rebuild_batches.set(.leaf, written.leaf);
+            self.perf.last_rebuild_batches.set(.node, written.node);
+        }
         self.install(.rebuild);
         self.seen_revision = revision;
         self.refreshed_epoch = allow_epoch;
@@ -1436,10 +1446,15 @@ pub const TriggerStore = struct {
 
     // ---- Write (workers) and install (main) ----------------------------------------------
 
-    const WriteBatches = struct {
+    // The leaf and node stages' batches, kept only with `runtime_perf_log.enabled`.
+    const WriteBatches = if (runtime_perf_log.enabled) struct {
         leaf: BatchStats = .{},
         node: BatchStats = .{},
-    };
+    } else struct {};
+
+    fn writeBatches(leaf_batch: BatchStats, node_batch: BatchStats) WriteBatches {
+        return if (comptime runtime_perf_log.enabled) .{ .leaf = leaf_batch, .node = node_batch } else .{};
+    }
 
     // The leaf stage, then one node dispatch per height under one node tuner sample.
     fn writeOutputs(self: *TriggerStore, leaf_dispatch: Dispatch, node_dispatch: Dispatch) WriteBatches {
@@ -1452,9 +1467,9 @@ pub const TriggerStore = struct {
             .outputs = self.level_outputs[0].items,
             .range_count = leaf_shape.range_count,
         };
-        var batches = WriteBatches{ .leaf = runShaped(leaf_stage, leaf_shape, pages, rewrite_range_alignment_items, &leaf_job, leafJob) };
+        const leaf_batch = runShaped(leaf_stage, leaf_shape, pages, rewrite_range_alignment_items, &leaf_job, leafJob);
         const nodes = self.nodeOutputs();
-        if (nodes == 0) return batches;
+        if (nodes == 0) return writeBatches(leaf_batch, .{});
         var rounds = RoundDispatch.begin(node_dispatch, nodes);
         for (1..self.height_count) |height| {
             const plan = self.heights[height];
@@ -1468,8 +1483,7 @@ pub const TriggerStore = struct {
             };
             rounds.run(plan.outputs, &node_job, &node_job.range_count, nodeJob);
         }
-        batches.node = rounds.finish(nodes);
-        return batches;
+        return writeBatches(leaf_batch, rounds.finish(nodes));
     }
 
     const InstallMode = enum { patch, rebuild };
@@ -1547,7 +1561,8 @@ pub const TriggerStore = struct {
             .sums = self.refresh_sums.items,
             .items_per_range = shape.items_per_range,
         };
-        self.last_batches.set(.refresh, runShaped(dispatch, shape, self.pair_count, refresh_range_alignment_items, &job, refreshJob));
+        const batch = runShaped(dispatch, shape, self.pair_count, refresh_range_alignment_items, &job, refreshJob);
+        if (comptime runtime_perf_log.enabled) self.perf.last_batches.set(.refresh, batch);
         var valid: u32 = 0;
         var allowed: u32 = 0;
         for (self.refresh_sums.items) |slot| {
@@ -2702,28 +2717,6 @@ test "collision trigger store warm patches allocate nothing on a 2-worker pool" 
     }
     try expectTreeValid(&store);
     try expectStoredKeys(&store, &keys);
-    // The leaf stage ran on workers in more than one range.
-    try testing.expect(!store.last_batches.get(.leaf).ran_inline and store.last_batches.get(.leaf).range_count > 1);
-}
-
-test "collision trigger store rebuild records only its own stage batches, and a patch only the patch's" {
-    var systems: TestSystems = undefined;
-    try systems.init();
-    defer systems.deinit();
-    var pair = TestPair.init(&systems);
-    defer pair.deinit();
-    var keys: [200]u256 = undefined;
-    try pair.patch(testRunKeys(&keys, 0, 0), &.{}, &.{});
-    const store = &pair.threaded;
-    try testing.expectEqual(@as(usize, 200), store.last_batches.get(.insert_place).item_count);
-    try pair.rebuild(testRunKeys(&keys, 1, 0));
-    for (std.enums.values(TriggerStage)) |stage| try testing.expectEqual(@as(usize, 0), store.last_batches.get(stage).item_count);
-    try testing.expectEqual(@as(usize, 200), store.last_rebuild_batches.get(.insert_sort).item_count);
-    try testing.expectEqual(@as(usize, 4), store.last_rebuild_batches.get(.leaf).item_count);
-    // A patch leaves the rebuild's record.
-    try pair.patch(&.{}, keys[0..10], &.{});
-    try testing.expectEqual(@as(usize, 1), store.last_batches.get(.leaf).item_count);
-    try testing.expectEqual(@as(usize, 4), store.last_rebuild_batches.get(.leaf).item_count);
 }
 
 // Stored pairs naming `entities` in a chain, every row hint stale (row 0).
@@ -2804,7 +2797,6 @@ test "collision trigger store refresh re-resolves rows and emit bits over severa
     try testing.expectEqual(@as(usize, 0), failing.allocations);
     try expectRefreshed(&serial, &data);
     try expectRefreshed(&threaded, &data);
-    try testing.expect(threaded.last_batches.get(.refresh).range_count > 1);
     try testing.expectEqual(serial.valid_count, threaded.valid_count);
     try testing.expectEqual(serial.allowed_count, threaded.allowed_count);
     // A current epoch does not refresh; an allow crossing moves it.

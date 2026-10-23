@@ -69,7 +69,9 @@
 //!   - `chunk-scale-nav-level-add`: one level added with a solid floor band, then nav updated.
 //!     The replace case (`LevelAddCode`) first adds a walkable level and updates nav untimed,
 //!     then times a blocking band on it and the update. Depth grows by one per iteration,
-//!     warmup included, so A/B runs use the same `--warmup` and `--iterations`.
+//!     warmup included, so A/B runs use the same `--warmup` and `--iterations`. Each
+//!     reaction builds one level, its remask batch over that level's chunks and the step's
+//!     dirty chunks.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -1418,7 +1420,7 @@ const NavFixture = struct {
 
     // Records the last reaction's flood items against the set that ran it.
     fn noteFlood(self: *NavFixture, reverting: bool) void {
-        const items = self.last_stats.conn_flood_batch.item_count;
+        const items = self.last_stats.perf.conn_flood_batch.item_count;
         if (reverting) self.revert_flood_items = items else self.forward_flood_items = items;
     }
 
@@ -1580,7 +1582,7 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     var timed_main = suite.NavMainSummary{};
     for (0..options.iterations) |_| {
         const elapsed_ns = try runNavIteration(io, &nav, &driver, workload);
-        accumulator.record(elapsed_ns, nav.last_stats.remask_batch);
+        accumulator.record(elapsed_ns, nav.last_stats.perf.remask_batch);
         timed_stats = nav.last_stats;
         timed_main = nav.lastNavMain();
         try resetNavWorkload(allocator, &nav, &driver, &refill, workload);
@@ -1591,7 +1593,7 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.items_per_second = suite.itemsPerSecond(dig_cell_count, stats.mean_ns);
     stats.nav_conn = suite.navConnSummary(timed_stats, fixtures.floodTunerWorkersOf(tuners, case));
     stats.nav_main = timed_main;
-    stats.batch = suite.batchSummaryFromBatch(timed_stats.remask_batch);
+    stats.batch = suite.batchSummaryFromBatch(timed_stats.perf.remask_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(timed_stats.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(timed_stats.perf.patch_batch);
     if (case.adaptive) {
@@ -1907,8 +1909,8 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
             if (forward.perf.conn_splits != config.pockets()) return error.NavEnclosePocketsNotSplit;
         }
         const elapsed_ns = timing.elapsed_ns;
-        accumulator.record(elapsed_ns, forward.remask_batch);
-        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ forward.perf.plan_batch, forward.remask_batch, forward.perf.patch_batch, forward_mark });
+        accumulator.record(elapsed_ns, forward.perf.remask_batch);
+        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ forward.perf.plan_batch, forward.perf.remask_batch, forward.perf.patch_batch, forward_mark });
         plan_total += timing.terrain.plan_ns;
         write_total += timing.terrain.write_ns;
         nav_total += timing.nav_ns;
@@ -1922,7 +1924,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
     stats.nav_conn = suite.navConnSummary(forward, fixtures.floodTunerWorkers(&nav.pipeline.pathfinding, case));
     stats.nav_main = nav_main;
-    stats.batch = suite.batchSummaryFromBatch(forward.remask_batch);
+    stats.batch = suite.batchSummaryFromBatch(forward.perf.remask_batch);
     stats.nav_mark_batch = suite.batchSummaryFromBatch(forward_mark);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(forward.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(forward.perf.patch_batch);
@@ -1983,7 +1985,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     for (0..options.warmup_iterations) |_| _ = try levelAddIteration(io, &nav, &frame, replace);
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
-        accumulator.record(try levelAddIteration(io, &nav, &frame, replace), nav.last_stats.remask_batch);
+        accumulator.record(try levelAddIteration(io, &nav, &frame, replace), nav.last_stats.perf.remask_batch);
     }
     try nav_size.checkNavBytes(nav_level_add_group.name, item_count, size_config, &nav.pipeline.pathfinding);
     var stats = accumulator.finish();
@@ -2024,12 +2026,14 @@ fn levelAddIteration(io: std.Io, nav: *NavFixture, frame: *SimulationFrame, repl
 }
 
 // The nav reaction to a step whose only nav change is a level added or a level's content
-// revision; fails unless it built exactly one level.
+// revision; fails unless it built exactly one level, its remask batch folding every chunk of
+// that level with the step's marks batch.
 fn reactToLevelChange(nav: *NavFixture, frame: *SimulationFrame) !void {
     frame.beginStep();
     const start_ns = suite.nowNs(nav.io);
     const stats = try nav.pipeline.pathfinding.reactToPostCommitNavEvents(frame, &nav.pipeline.static_colliders, &nav.base.world, nav.threads);
     nav.last_reaction_ns = suite.elapsedNs(start_ns, suite.nowNs(nav.io));
     if (stats.levels_built != 1) return error.NavLevelNotBuilt;
+    if (stats.perf.remask_batch.item_count != nav.pipeline.pathfinding.graph.chunkCount() + stats.dirty_chunks) return error.NavLevelRemaskMissedChunks;
     nav.last_stats = stats;
 }

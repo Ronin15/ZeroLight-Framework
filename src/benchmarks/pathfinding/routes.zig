@@ -1619,7 +1619,7 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
         const start_ns = suite.nowNs(io);
         last_stats = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        accumulator.record(elapsed_ns, last_stats.solve_batch);
+        accumulator.record(elapsed_ns, last_stats.perf.solve_batch);
         stage_report.add(elapsed_ns, last_stats);
         abstract_nodes = lastAbstractNodesUsed(system);
     }

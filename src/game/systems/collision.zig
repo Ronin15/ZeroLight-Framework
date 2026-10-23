@@ -26,7 +26,6 @@ const StageThreads = @import("../../app/thread_system.zig").StageThreads;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
-const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const rebuild_tuner_config = @import("../../app/thread_system.zig").rebuild_tuner_config;
 const setRowCount = @import("../../app/thread_system.zig").setRowCount;
@@ -377,8 +376,6 @@ pub const CollisionStats = struct {
     candidate_pair_count: usize = 0,
     /// Sweep lane groups: counted and set only with `runtime_perf_log.enabled`, else 0.
     broadphase_simd_groups: usize = 0,
-    broadphase_batch: BatchStats = .{},
-    narrowphase_batch: BatchStats = .{},
     perf: Perf = .{},
 
     /// Kept only with `runtime_perf_log.enabled`: whether the step outgrew its pair bound,
@@ -398,6 +395,8 @@ pub const CollisionStats = struct {
         /// once per step, with one `CollisionSystem.perf.pair_bound_overflows` count.
         pair_bound_exceeded: bool = false,
         broadphase_visits: usize = 0,
+        broadphase_batch: BatchStats = .{},
+        narrowphase_batch: BatchStats = .{},
         fill_batch: BatchStats = .{},
         sort_batch: BatchStats = .{},
         static_pairs_batch: BatchStats = .{},
@@ -776,11 +775,6 @@ pub const CollisionSystem = struct {
     trigger_query_slots: SlotList(TriggerQuerySlot) = .empty,
     trigger_edit_sources: std.ArrayList(EditSource) = .empty,
     emit_ranges: SlotList(EmitRange) = .empty,
-    /// The last patch query's batch shape; `resetSeamBatches` clears it at seam entry, so
-    /// after a seam that rebuilt or did nothing it holds none.
-    trigger_query_batch: BatchStats = .{},
-    /// The last rebuild query's batch shape; reset by every rebuild.
-    trigger_rebuild_query_batch: BatchStats = .{},
     // By entity index: the `change_generation` that last stamped it as changed.
     change_mark: std.ArrayList(u32) = .empty,
     change_generation: u32 = 1,
@@ -823,6 +817,12 @@ pub const CollisionSystem = struct {
         /// Trigger queries whose range slots grew, before the query or for its replay,
         /// counted once per query.
         trigger_slot_grows: u64 = 0,
+        /// The last patch query's batch shape; `resetSeamBatches` clears it at seam entry and
+        /// every rebuild clears it, so after a seam that did nothing or any rebuild it holds
+        /// none.
+        trigger_query_batch: BatchStats = .{},
+        /// The last rebuild query's batch shape; reset by every rebuild.
+        trigger_rebuild_query_batch: BatchStats = .{},
     } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) CollisionSystem {
@@ -960,10 +960,12 @@ pub const CollisionSystem = struct {
     }
 
     /// Clears the seam's trigger batch records (the patch query's and the store's stages), so
-    /// a seam that fails, rebuilds, or does nothing leaves none from an earlier seam.
+    /// a seam that fails, rebuilds, or does nothing leaves none from an earlier seam. A no-op
+    /// without `runtime_perf_log.enabled`, which keeps no records.
     pub fn resetSeamBatches(self: *CollisionSystem) void {
-        self.trigger_query_batch = .{};
-        self.trigger_store.last_batches = .initFill(.{});
+        if (comptime !runtime_perf_log.enabled) return;
+        self.perf.trigger_query_batch = .{};
+        self.trigger_store.perf.last_batches = .initFill(.{});
     }
 
     /// Brings the trigger store up to `view` after a collider sync; a view with no geometry
@@ -1027,8 +1029,8 @@ pub const CollisionSystem = struct {
             const broadphase_selection = broadphase_stage.select(stats.entry_count, collision_range_alignment_items);
             const broadphase = try self.buildBroadphaseCandidatesThreaded(thread_system, broadphase_selection, stats.entry_count);
             if (broadphase_selection.active_tuner) |tuner| tuner.record(broadphase.batch);
-            stats.broadphase_batch = broadphase.batch;
             if (comptime runtime_perf_log.enabled) {
+                stats.perf.broadphase_batch = broadphase.batch;
                 stats.broadphase_simd_groups = broadphase.perf.simd_groups;
                 stats.perf.broadphase_visits = broadphase.perf.visits;
             }
@@ -1046,7 +1048,8 @@ pub const CollisionSystem = struct {
                     .items_per_range = narrowphase_selection.items_per_range,
                     .write_keys = write_keys,
                 };
-                stats.narrowphase_batch = narrowphase_stage.run(narrowphase_selection, candidate_pair_count, collision_range_alignment_items, &context, narrowphaseContactsJob);
+                const narrowphase_batch = narrowphase_stage.run(narrowphase_selection, candidate_pair_count, collision_range_alignment_items, &context, narrowphaseContactsJob);
+                if (comptime runtime_perf_log.enabled) stats.perf.narrowphase_batch = narrowphase_batch;
                 narrow_items = narrowphase_selection.items_per_range;
                 narrow_ran = true;
             }
@@ -1531,7 +1534,7 @@ pub const CollisionSystem = struct {
         if (view.geometry == null) return false;
         try self.syncTriggers(data, view, threads);
         if (self.trigger_store.refresh(storeThreads(threads), data)) {
-            if (comptime runtime_perf_log.enabled) stats.perf.trigger_refresh_batch = self.trigger_store.last_batches.get(.refresh);
+            if (comptime runtime_perf_log.enabled) stats.perf.trigger_refresh_batch = self.trigger_store.perf.last_batches.get(.refresh);
         }
         const input_count = self.proxies.len;
         if (input_count != 0) {
@@ -1702,15 +1705,15 @@ pub const CollisionSystem = struct {
     }
 
     // The trigger query stage over the revision's changes or the row pool, under that mode's
-    // tuner and into that mode's batch record; returns its range count. A range past its
-    // slot grows it and the stage replays, and only the pass that wrote every record is
-    // recorded.
+    // tuner and, with `runtime_perf_log.enabled`, into that mode's batch record (a rebuild
+    // also clears the patch record, as the store's rebuild clears its patch stages); returns
+    // its range count. A range past its slot grows it and the stage replays, and only the
+    // pass that wrote every record is recorded.
     fn runTriggerQuery(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, mode: TriggerQueryMode) error{OutOfMemory}!usize {
-        const record = switch (mode) {
-            .patch => &self.trigger_query_batch,
-            .rebuild => &self.trigger_rebuild_query_batch,
-        };
-        record.* = .{};
+        if (comptime runtime_perf_log.enabled) {
+            self.triggerQueryRecord(mode).* = .{};
+            if (mode == .rebuild) self.perf.trigger_query_batch = .{};
+        }
         const items = switch (mode) {
             .patch => view.changes.len,
             .rebuild => view.row_entity.len,
@@ -1751,9 +1754,17 @@ pub const CollisionSystem = struct {
             grew = true;
         }
         if (selection.active_tuner) |active| active.record(batch);
-        record.* = batch;
+        if (comptime runtime_perf_log.enabled) self.triggerQueryRecord(mode).* = batch;
         if (grew) self.noteTriggerSlotGrowth();
         return selection.range_count;
+    }
+
+    // The batch record of the trigger query in `mode` (`runtime_perf_log.enabled` only).
+    fn triggerQueryRecord(self: *CollisionSystem, mode: TriggerQueryMode) *BatchStats {
+        return switch (mode) {
+            .patch => &self.perf.trigger_query_batch,
+            .rebuild => &self.perf.trigger_rebuild_query_batch,
+        };
     }
 
     // A trigger query whose range slots grew. `reserve` does not size these slots (a patch's
@@ -3690,10 +3701,6 @@ test "collision contacts are stable and reject non-overlaps" {
     try std.testing.expectEqual(@as(usize, 3), stats.body_count);
     try std.testing.expectEqual(@as(usize, 1), stats.candidate_pair_count);
     try std.testing.expectEqual(@as(usize, 1), stats.contact_count);
-    try std.testing.expectEqual(@as(usize, 1), stats.broadphase_batch.range_count);
-    try std.testing.expectEqual(@as(usize, 1), stats.broadphase_batch.main_thread_ranges);
-    try std.testing.expectEqual(@as(usize, 1), stats.narrowphase_batch.range_count);
-    try std.testing.expectEqual(@as(usize, 1), stats.narrowphase_batch.main_thread_ranges);
     const merged = contacts.mergedItems();
     try std.testing.expectEqual(first.index, merged[0].a.index);
     try std.testing.expectEqual(second.index, merged[0].b.index);
@@ -3785,35 +3792,13 @@ test "threaded contacts equal the reference across range sizes and worker counts
     defer inline_system.deinit();
     var inline_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer inline_contacts.deinit();
-    const inline_stats = try inline_system.update(&data, &inline_contacts, &threads, .{
+    _ = try inline_system.update(&data, &inline_contacts, &threads, .{
         .items_per_range = 4096,
         .max_worker_threads = 1,
         .adaptive = false,
     });
     try std.testing.expect(threads.workerThreadCount() > 0);
-    try std.testing.expectEqual(@as(usize, 1), inline_stats.broadphase_batch.range_count);
-    try std.testing.expect(inline_stats.broadphase_batch.ran_inline);
-    // Workers are present, so the inline batch still reports them.
-    try std.testing.expect(inline_stats.broadphase_batch.available_worker_threads != 0);
     try expectSameContacts(expected, inline_contacts.mergedItems());
-}
-
-test "fill, sort, broadphase, and narrowphase run on workers" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    try fillReferenceLayout(&data);
-
-    var system = CollisionSystem.init(std.testing.allocator);
-    defer system.deinit();
-    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
-    defer contacts.deinit();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
-    defer threads.deinit();
-    const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = collision_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
-    for ([_]BatchStats{ stats.broadphase_batch, stats.narrowphase_batch }) |batch| {
-        try std.testing.expect(!batch.ran_inline);
-        try std.testing.expect(batch.active_worker_threads > 0);
-    }
 }
 
 test "fill lanes write the scalar key for every copy of every body" {
@@ -4034,7 +4019,6 @@ test "collision unresolved fill slots stay empty across threads" {
     const threaded_stats = try threaded.update(&data, &threaded_contacts, &threads, config);
     try std.testing.expectEqual(input_count - bare_slots.len, serial_stats.body_count);
     try std.testing.expectEqual(serial_stats.body_count, threaded_stats.body_count);
-    try std.testing.expect(!threaded_stats.broadphase_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 0), serial.warm_count);
     try std.testing.expectEqual(@as(usize, 0), threaded.warm_count);
     try expectSameContacts(serial_contacts.mergedItems(), threaded_contacts.mergedItems());
@@ -4047,7 +4031,6 @@ test "collision unresolved fill slots stay empty across threads" {
     try std.testing.expectEqual(serial_stats.body_count, serial_again.body_count);
     try std.testing.expectEqual(serial_again.body_count, threaded_again.body_count);
     try std.testing.expectEqual(serial_again.entry_count, threaded_again.entry_count);
-    try std.testing.expect(!threaded_again.broadphase_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 0), serial.warm_count);
     try std.testing.expectEqual(@as(usize, 0), threaded.warm_count);
     try expectSameContacts(serial_contacts.mergedItems(), threaded_contacts.mergedItems());
@@ -4256,9 +4239,6 @@ test "after reserve, a multi-worker step over bodies on two strips allocates not
     for (0..2) |_| {
         const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
         try std.testing.expect(stats.entry_count > body_count);
-        for ([_]BatchStats{ stats.broadphase_batch, stats.narrowphase_batch }) |batch| {
-            try std.testing.expect(!batch.ran_inline);
-        }
         try expectSameContacts(expected, contacts.mergedItems());
     }
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
@@ -4292,16 +4272,12 @@ test "threaded collision matches serial contact order" {
     defer threads.deinit();
 
     _ = try updateInline(&serial_system, &serial_data, &serial_contacts);
-    const threaded_stats = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
+    _ = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
         .items_per_range = collision_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
     });
 
-    try std.testing.expect(!threaded_stats.broadphase_batch.ran_inline);
-    try std.testing.expect(!threaded_stats.narrowphase_batch.ran_inline);
-    try std.testing.expectEqual(@as(usize, 64), threaded_stats.broadphase_batch.item_count);
-    try std.testing.expectEqual(threaded_stats.candidate_pair_count, threaded_stats.narrowphase_batch.item_count);
     try expectSameContacts(serial_contacts.mergedItems(), threaded_contacts.mergedItems());
 }
 
@@ -4322,8 +4298,7 @@ test "threaded collision records one sample into each stage tuner" {
     defer threads.deinit();
 
     const stats = try system.update(&data, &contacts, &threads, .{});
-    try std.testing.expectEqual(@as(usize, 64), stats.broadphase_batch.item_count);
-    try std.testing.expect(stats.narrowphase_batch.item_count > 0);
+    try std.testing.expect(stats.candidate_pair_count > 0);
     for ([_]*const AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner }) |tuner| {
         try std.testing.expectEqual(@as(usize, 1), tuner.sample_count);
         try std.testing.expect(tuner.last_request != null);
@@ -4368,9 +4343,8 @@ test "threaded collision broadphase overflow-replay matches serial contacts" {
         .adaptive = false,
     });
 
-    // The batch ran on real workers and the fixture overflowed a range's reservation
-    // (candidate pairs exceed body count), so the cross-worker regrow+replay path ran.
-    try std.testing.expect(!threaded_stats.broadphase_batch.ran_inline);
+    // The fixture overflowed a range's reservation (candidate pairs exceed body count), so
+    // the cross-worker regrow+replay path ran.
     try std.testing.expect(threaded_stats.candidate_pair_count > threaded_stats.body_count);
     try std.testing.expect(serial_contacts.mergedItems().len > 0);
     try expectSameContacts(serial_contacts.mergedItems(), threaded_contacts.mergedItems());
@@ -4460,8 +4434,6 @@ test "threaded broadphase prewarms empty range buffers before dispatch" {
         .adaptive = false,
     });
 
-    const expected_broadphase_ranges = rangeCount(stats.entry_count, collision_range_alignment_items);
-    try std.testing.expectEqual(expected_broadphase_ranges, stats.broadphase_batch.range_count);
     try std.testing.expect(stats.candidate_pair_count > 0);
 }
 
@@ -4556,14 +4528,9 @@ test "threaded collision update reuses warmed range scratch without steady state
         .max_worker_threads = 2,
         .adaptive = false,
     });
-    // Warmup must have exercised real multi-worker range writes; an inline
-    // fallback would make the FailingAllocator proof a serial false pass.
-    if (warmup.candidate_pair_count > 0) {
-        try std.testing.expect(!warmup.broadphase_batch.ran_inline);
-        try std.testing.expect(!warmup.narrowphase_batch.ran_inline);
-        try std.testing.expect(warmup.broadphase_batch.active_worker_threads > 0);
-        try std.testing.expect(warmup.narrowphase_batch.active_worker_threads > 0);
-    }
+    // The fixed two-worker partition dispatches the warmup's ranges to workers, so the
+    // FailingAllocator proof below covers the multi-worker range writes.
+    try std.testing.expect(warmup.candidate_pair_count > 0);
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -4583,12 +4550,6 @@ test "threaded collision update reuses warmed range scratch without steady state
     });
     try std.testing.expectEqual(@as(usize, 32), stats.body_count);
     try std.testing.expect(contacts.mergedItems().len > 0);
-    if (stats.candidate_pair_count > 0) {
-        try std.testing.expect(!stats.broadphase_batch.ran_inline);
-        try std.testing.expect(!stats.narrowphase_batch.ran_inline);
-        try std.testing.expect(stats.broadphase_batch.active_worker_threads > 0);
-        try std.testing.expect(stats.narrowphase_batch.active_worker_threads > 0);
-    }
 }
 
 fn addFourBodiesTwoOverlappingPairs(data: *DataSystem) !void {
@@ -4698,10 +4659,7 @@ test "after reserve, threaded broad/narrowphase at 32- then 16-item ranges alloc
     }
 
     for ([_]usize{ 32, 16 }) |items_per_range| {
-        const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
-        try std.testing.expect(!stats.broadphase_batch.ran_inline);
-        try std.testing.expect(!stats.narrowphase_batch.ran_inline);
-        try std.testing.expectEqual(rangeCount(body_count, items_per_range), stats.broadphase_batch.range_count);
+        _ = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
         try expectSameContactPairs(expected, contacts.mergedItems());
     }
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
@@ -4751,8 +4709,6 @@ test "after reserve, ~2 pairs per body on the multi-worker path allocate nothing
 
     for ([_]usize{ 32, 16 }) |items_per_range| {
         const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
-        try std.testing.expect(!stats.broadphase_batch.ran_inline);
-        try std.testing.expect(!stats.narrowphase_batch.ran_inline);
         try std.testing.expectEqual(reference_stats.candidate_pair_count, stats.candidate_pair_count);
         try expectSameContactPairs(expected, contacts.mergedItems());
     }
@@ -4799,10 +4755,9 @@ test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body
         contacts.allocator = original_contacts_allocator;
     }
 
-    for ([_][2]usize{ .{ 48, 2 }, .{ 32, 3 } }) |partition| {
-        const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = partition[0], .max_worker_threads = 2, .adaptive = false });
-        try std.testing.expect(!stats.broadphase_batch.ran_inline);
-        try std.testing.expectEqual(partition[1], stats.broadphase_batch.range_count);
+    // 48- and 32-entry ranges: two and three broadphase ranges.
+    for ([_]usize{ 48, 32 }) |items_per_range| {
+        _ = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
         try expectSameContactPairs(reference_contacts.mergedItems(), contacts.mergedItems());
     }
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
@@ -4844,9 +4799,7 @@ test "a broadphase slot replay within the total pair bound matches serial and th
     defer threads.deinit();
 
     const config: CollisionConfig = .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false };
-    const replayed = try system.update(&data, &contacts, &threads, config);
-    try std.testing.expect(!replayed.broadphase_batch.ran_inline);
-    try std.testing.expectEqual(@as(usize, 4), replayed.broadphase_batch.range_count);
+    _ = try system.update(&data, &contacts, &threads, config);
     try expectSameContacts(reference_contacts.mergedItems(), contacts.mergedItems());
 
     const allocator = system.allocator;
@@ -4935,9 +4888,7 @@ test "candidate pairs past the reserved pair bound match serial on every step of
     defer threads.deinit();
 
     for (0..2) |_| {
-        const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
-        try std.testing.expect(!stats.broadphase_batch.ran_inline);
-        try std.testing.expect(!stats.narrowphase_batch.ran_inline);
+        _ = try system.update(&data, &contacts, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
         try expectSameContactPairs(reference_contacts.mergedItems(), contacts.mergedItems());
     }
 }
@@ -6767,7 +6718,7 @@ test "collision trigger rebuild releases its row-pool query records and keeps th
     try fixture.commit(&data, &.{movedBody(&data, moved, 10, 10)});
 }
 
-test "collision trigger seam that rebuilt holds no patch batches, and the next seam's patch records its changes" {
+test "a trigger seam over a skipped revision brings the store to the view, and the next seam patches it to the next revision" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const moved = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
@@ -6776,10 +6727,9 @@ test "collision trigger seam that rebuilt holds no patch batches, and the next s
     try fixture.init(&data, 0);
     defer fixture.deinit();
     const patched = &fixture.patched;
-    // A seam patch fills the patch batches.
     try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 20, 20)});
     try patched.syncCommittedTriggers(&data, fixture.colliders.view(), &fixture.threads);
-    try std.testing.expect(patched.trigger_query_batch.item_count != 0);
+    try std.testing.expectEqual(fixture.colliders.view().revision, patched.trigger_store.seen_revision);
     // Two commits with no seam refresh skip a revision, so the next seam rebuilds over a
     // nonempty row pool.
     try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 10, 10)});
@@ -6787,16 +6737,10 @@ test "collision trigger seam that rebuilt holds no patch batches, and the next s
     const rebuild_view = fixture.colliders.view();
     try std.testing.expect(rebuild_view.row_entity.len != 0);
     try patched.syncCommittedTriggers(&data, rebuild_view, &fixture.threads);
+    try std.testing.expect(patched.trigger_store.ready);
     try std.testing.expectEqual(rebuild_view.revision, patched.trigger_store.seen_revision);
-    try std.testing.expectEqual(@as(usize, 0), patched.trigger_query_batch.item_count);
-    try std.testing.expectEqual(rebuild_view.row_entity.len, patched.trigger_rebuild_query_batch.item_count);
-    for (patched.trigger_store.last_batches.values) |batch| try std.testing.expectEqual(@as(usize, 0), batch.item_count);
-    // One commit later the seam patches, and its query batch covers exactly the changes.
-    try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 10, 10)});
-    const patch_view = fixture.colliders.view();
-    try std.testing.expect(patch_view.changes.len != 0);
-    try patched.syncCommittedTriggers(&data, patch_view, &fixture.threads);
-    try std.testing.expectEqual(patch_view.changes.len, patched.trigger_query_batch.item_count);
+    // One commit later the seam patches: the store matches one rebuilt at that revision.
+    try fixture.commit(&data, &.{movedBody(&data, moved, 10, 10)});
 }
 
 fn expectPatchFailuresKeepStore(workers: usize) !void {

@@ -1179,8 +1179,8 @@ fn publishSolved(system: *PathfindingSystem, key: PathQueryKey, step: u32, stats
     publish.claimPublish(system, stats);
     system.step_counter = step_counter;
     if (system.publish_records.items[0] == null) return error.TestUnexpectedResult;
-    const batch = publish.publishCopy(system, Dispatch.init(&threads, &tuner, .{ .adaptive = false }));
-    try std.testing.expect(batch.ran_inline and system.publish_ranges == 1);
+    _ = publish.publishCopy(system, Dispatch.init(&threads, &tuner, .{ .adaptive = false }));
+    try std.testing.expectEqual(@as(usize, 1), system.publish_ranges);
 }
 
 /// Solves `goals` from cellWorld(1, 2) in one serial step with the default budgets.

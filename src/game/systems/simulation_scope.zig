@@ -62,12 +62,20 @@ pub const ScopeConfig = struct {
     adaptive: bool = true,
 };
 
+/// The batch of a scope gather or compaction, kept only with `runtime_perf_log.enabled`
+/// (bench output).
+const ScopeBatchPerf = if (runtime_perf_log.enabled) struct { batch: BatchStats = .{} } else struct {};
+
+fn scopeBatchPerf(batch: BatchStats) ScopeBatchPerf {
+    return if (comptime runtime_perf_log.enabled) .{ .batch = batch } else .{};
+}
+
 /// Threaded gather result for the movement/collision passes: `indices` is null on
 /// the full-active fast path (downstream uses the full SoA range), otherwise the
-/// merged dense-index list. `batch` feeds the perf log / bench.
+/// merged dense-index list.
 pub const ScopeGatherResult = struct {
     indices: ?[]const u32,
-    batch: BatchStats = .{},
+    perf: ScopeBatchPerf = .{},
 };
 
 /// Threaded gather result for the AI halo: the unstaggered cognition set (spatial index +
@@ -75,14 +83,14 @@ pub const ScopeGatherResult = struct {
 /// full-active. The think set comes from `compactCognition` over the index built from it.
 pub const AiPopulationGatherResult = struct {
     halo: []const u32,
-    batch: BatchStats = .{},
+    perf: ScopeBatchPerf = .{},
 };
 
 /// The step's think set (`SimulationScopeSystem.compactCognition`), valid until the next
 /// compaction.
 pub const CognitionResult = struct {
     cognition: []const u32,
-    batch: BatchStats = .{},
+    perf: ScopeBatchPerf = .{},
 };
 
 pub const SimulationScopeSystem = struct {
@@ -267,7 +275,7 @@ pub const SimulationScopeSystem = struct {
             .selected_profile = selection.profile,
         });
         const merged = compactIndexWindows(&self.collision_indices, self.range_tallies.items, selection.items_per_range);
-        return .{ .indices = if (merged.any_excluded) self.collision_indices.items else null, .batch = batch };
+        return .{ .indices = if (merged.any_excluded) self.collision_indices.items else null, .perf = scopeBatchPerf(batch) };
     }
 
     // ---- AI halo gather and think set (threaded compactions) -----------------
@@ -316,7 +324,7 @@ pub const SimulationScopeSystem = struct {
         });
         const merged = compactIndexWindows(&self.ai_halo_indices, self.range_tallies.items, selection.items_per_range);
         if (comptime runtime_perf_log.enabled) self.perf.chunk_filtered_entities = merged.perf.chunk_filtered;
-        return .{ .halo = self.ai_halo_indices.items, .batch = batch };
+        return .{ .halo = self.ai_halo_indices.items, .perf = scopeBatchPerf(batch) };
     }
 
     /// The step's think set: every row the index holds (`population_row`, dense AI indices)
@@ -356,7 +364,7 @@ pub const SimulationScopeSystem = struct {
         });
         const merged = compactIndexWindows(&self.ai_cognition_indices, self.range_tallies.items, selection.items_per_range);
         if (comptime runtime_perf_log.enabled) self.perf.stagger_skips = merged.perf.stagger_skips;
-        return .{ .cognition = self.ai_cognition_indices.items, .batch = batch };
+        return .{ .cognition = self.ai_cognition_indices.items, .perf = scopeBatchPerf(batch) };
     }
 
     fn cognitionContext(self: *SimulationScopeSystem, index: *const SpatialIndexView, stagger_step: u8, apply_stagger: bool, items_per_range: usize) CognitionContext {
@@ -1165,16 +1173,14 @@ test "threaded deriveChunks matches serial across the range block and tail" {
     var serial_sys = SimulationScopeSystem.init(allocator);
     defer serial_sys.deinit();
 
-    const stats = threaded_sys.deriveChunks(&threaded_data, &threads, grid, .{
+    _ = threaded_sys.deriveChunks(&threaded_data, &threads, grid, .{
         .items_per_range = scope_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
     });
-    try std.testing.expect(!stats.ran_inline); // real workers partitioned the range
     var inline_threads = try inlineThreads();
     defer inline_threads.deinit();
-    const inline_stats = serial_sys.deriveChunks(&serial_data, &inline_threads, grid, .{});
-    try std.testing.expect(inline_stats.ran_inline);
+    _ = serial_sys.deriveChunks(&serial_data, &inline_threads, grid, .{});
 
     const ts = threaded_data.scopeColumnsSliceConst();
     const ss = serial_data.scopeColumnsSliceConst();
@@ -1477,7 +1483,6 @@ test "threaded ai gather and think set match serial" {
     const region = try ActiveRegion.init(.{ .x = 0, .y = 0 }, .{ .x = 5, .y = 5 });
     const serial = try gatherAiInline(&serial_sys, &data, region);
     const threaded = try threaded_sys.gatherAiPopulations(&data, region, &threads, fixed);
-    try std.testing.expect(!threaded.batch.ran_inline);
     try std.testing.expectEqualSlices(u32, serial.halo, threaded.halo);
 
     var index = try testHaloIndex(&data, serial.halo);
@@ -1519,8 +1524,7 @@ test "threaded tier policy matches serial" {
     defer threaded_sys.deinit();
     var threaded_stream = RangeOutputStream(StructuralCommand).init(allocator);
     defer threaded_stream.deinit();
-    const batch = try threaded_sys.queueTierChanges(&data, visible, &threaded_stream, &threads, .{ .items_per_range = scope_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
-    try std.testing.expect(!batch.ran_inline);
+    _ = try threaded_sys.queueTierChanges(&data, visible, &threaded_stream, &threads, .{ .items_per_range = scope_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
 
     const serial = serial_stream.mergedItems();
     const threaded = threaded_stream.mergedItems();
@@ -1749,8 +1753,6 @@ test "after reserve, threaded gathers and tier policy at 32- then 16-item ranges
     for ([_]usize{ 32, 16 }) |items_per_range| {
         const config = ScopeConfig{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false };
         const collision = try sys.gatherCollisionBoundsIndices(&data, &threads, config);
-        try std.testing.expect(!collision.batch.ran_inline);
-        try std.testing.expectEqual(@divCeil(population, items_per_range), collision.batch.range_count);
         try std.testing.expectEqualSlices(u32, col_serial, collision.indices.?);
 
         const ai_result = try sys.gatherAiPopulations(&data, ai_region, &threads, config);
@@ -1941,7 +1943,6 @@ test "the think set is the halo's phase set in the index's cell-major order, ser
             for (1..5) |workers| {
                 for ([_]usize{ 16, 48, 256 }) |items_per_range| {
                     const threaded = try threaded_sys.compactCognition(&view, stagger_step, apply_stagger, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = workers, .adaptive = false });
-                    try std.testing.expect(!threaded.batch.ran_inline);
                     try std.testing.expectEqualSlices(u32, expected.items, threaded.cognition);
                 }
             }
@@ -1978,8 +1979,6 @@ test "a one-chunk crowd's think set splits across ranges and workers, equal to t
             for (1..5) |workers| {
                 for ([_]usize{ 16, 48, 256 }) |items_per_range| {
                     const threaded = try threaded_sys.compactCognition(&view, stagger_step, apply_stagger, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = workers, .adaptive = false });
-                    try std.testing.expect(!threaded.batch.ran_inline);
-                    try std.testing.expectEqual(@divCeil(halo.len, items_per_range), threaded.batch.range_count);
                     try std.testing.expectEqualSlices(u32, expected.items, threaded.cognition);
                 }
             }
@@ -2036,8 +2035,6 @@ test "after reserve, the threaded think set at 32- then 16-item ranges allocates
     }
     for ([_]usize{ 32, 16 }) |items_per_range| {
         const threaded = try sys.compactCognition(&view, 1, true, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
-        try std.testing.expect(!threaded.batch.ran_inline);
-        try std.testing.expectEqual(@divCeil(population, items_per_range), threaded.batch.range_count);
         try std.testing.expectEqualSlices(u32, serial.cognition, threaded.cognition);
     }
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);

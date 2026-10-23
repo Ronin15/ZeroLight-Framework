@@ -10,6 +10,7 @@
 const std = @import("std");
 const pdqSort = @import("../../core/sort.zig").pdq;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
@@ -87,12 +88,12 @@ fn startsBefore(range_start: usize, band_start: u32) bool {
     return band_start < range_start;
 }
 
-/// The batches of one banded sort's place and sort stages; empty for a stage that did not
-/// run.
-pub const SortBatches = struct {
+/// The batches of one banded sort's place and sort stages, kept only with
+/// `runtime_perf_log.enabled` (zero-sized otherwise); empty for a stage that did not run.
+pub const SortBatches = if (runtime_perf_log.enabled) struct {
     place: BatchStats = .{},
     sort: BatchStats = .{},
-};
+} else struct {};
 
 // Each band's start in the sorted order: band b's elements over every fill range precede
 // band b + 1's. O(ranges × bands).
@@ -259,8 +260,7 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
                 .items_per_range = place.items_per_range,
                 .offsets = offsets.items,
             };
-            var batches = SortBatches{};
-            batches.place = runShaped(place_dispatch, place, total, range_alignment_items, &place_job, placeJob);
+            const place_batch = runShaped(place_dispatch, place, total, range_alignment_items, &place_job, placeJob);
             const sort = StageShape.select(sort_dispatch, total, range_alignment_items);
             var sort_job = SortJob{
                 .source = .{ .staging = staging.items, .band_offsets = offsets.items, .window_stride = place.items_per_range },
@@ -268,8 +268,8 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
                 .starts = sumBandOffsets(offsets.items),
                 .range_count = sort.range_count,
             };
-            batches.sort = runShaped(sort_dispatch, sort, total, range_alignment_items, &sort_job, sortJob);
-            return batches;
+            const sort_batch = runShaped(sort_dispatch, sort, total, range_alignment_items, &sort_job, sortJob);
+            return if (comptime runtime_perf_log.enabled) .{ .place = place_batch, .sort = sort_batch } else .{};
         }
 
         // One fill range of a banded sort: places its elements of the concatenation of
@@ -565,9 +565,9 @@ test "sample slots cover every slot when they fit and stay below the slot count 
 }
 
 // Sorts `segments` through both stages on `thread_system` at fixed 8-item ranges.
-fn sortTestSegments(thread_system: *ThreadSystem, allocator: std.mem.Allocator, tuners: *[2]AdaptiveWorkTuner, segments: []const []const TestElement, segment_starts: []const usize, staging: *std.ArrayList(TestElement), offsets: *SlotList(BandOffsets), dest: []TestElement) !SortBatches {
+fn sortTestSegments(thread_system: *ThreadSystem, allocator: std.mem.Allocator, tuners: *[2]AdaptiveWorkTuner, segments: []const []const TestElement, segment_starts: []const usize, staging: *std.ArrayList(TestElement), offsets: *SlotList(BandOffsets), dest: []TestElement) !void {
     const controls = StageControls{ .items_per_range = 8, .max_worker_threads = thread_system.workerThreadCount(), .adaptive = false };
-    return TestSort.sortSegments(allocator, Dispatch.init(thread_system, &tuners[0], controls), Dispatch.init(thread_system, &tuners[1], controls), segments, segment_starts, 8, staging, offsets, dest);
+    _ = try TestSort.sortSegments(allocator, Dispatch.init(thread_system, &tuners[0], controls), Dispatch.init(thread_system, &tuners[1], controls), segments, segment_starts, 8, staging, offsets, dest);
 }
 
 test "segments sorted through the place and sort stages match a sort of their concatenation, inline and on 2 workers, and allocate nothing warm" {
@@ -594,20 +594,22 @@ test "segments sorted through the place and sort stages match a sort of their co
         var offsets: SlotList(BandOffsets) = .empty;
         defer offsets.deinit(testing.allocator);
         var dest: [150]TestElement = undefined;
-        const batches = try sortTestSegments(&thread_system, testing.allocator, &tuners, &segments, &segment_starts, &staging, &offsets, &dest);
+        try sortTestSegments(&thread_system, testing.allocator, &tuners, &segments, &segment_starts, &staging, &offsets, &dest);
         try testing.expectEqualSlices(TestElement, &expected, &dest);
-        // On workers, both stages split into several ranges.
-        if (workers != 0) try testing.expect(batches.place.range_count > 1 and batches.sort.range_count > 1);
         // Warm: the same sort grows nothing.
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
         dest = undefined;
-        _ = try sortTestSegments(&thread_system, failing.allocator(), &tuners, &segments, &segment_starts, &staging, &offsets, &dest);
+        try sortTestSegments(&thread_system, failing.allocator(), &tuners, &segments, &segment_starts, &staging, &offsets, &dest);
         try testing.expectEqual(@as(usize, 0), failing.allocations);
         try testing.expectEqualSlices(TestElement, &expected, &dest);
-        // One element runs no stage; none leaves `dest` empty.
+        // One element runs no stage, so the staging and band offsets keep the last sort's;
+        // none leaves `dest` empty.
+        const staged = staging.items.len;
+        const ranges = offsets.items.len;
         var one: [1]TestElement = undefined;
-        const lone = try sortTestSegments(&thread_system, failing.allocator(), &tuners, &.{ elements[0..0], elements[5..6] }, &.{ 0, 0 }, &staging, &offsets, &one);
+        try sortTestSegments(&thread_system, failing.allocator(), &tuners, &.{ elements[0..0], elements[5..6] }, &.{ 0, 0 }, &staging, &offsets, &one);
         try testing.expectEqual(elements[5], one[0]);
-        try testing.expectEqual(@as(usize, 0), lone.place.item_count + lone.sort.item_count);
+        try testing.expectEqual(staged, staging.items.len);
+        try testing.expectEqual(ranges, offsets.items.len);
     }
 }

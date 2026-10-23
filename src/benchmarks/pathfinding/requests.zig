@@ -412,7 +412,7 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         expireCachedResults(system);
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
-        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solve_batch);
+        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.perf.solve_batch);
         if (last_stats.perf.group_field_begin_batch.item_count != 0 or last_stats.perf.group_fields_built != 0) return error.SharedGoalBeganField;
     }
     if (last_stats.perf.solve_admissions != 1) return error.SharedGoalNotOneSolve;
@@ -477,7 +477,7 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.perf.solve_batch);
         stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
     }
     // Every route exists and starts open.
@@ -552,7 +552,7 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
             const start_ns = suite.nowNs(io);
             last_stats = try runColdOnce(system, &empty, thread_ptr, case, item_count, item_count, item_count);
             const end_ns = suite.nowNs(io);
-            accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solve_batch);
+            accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.perf.solve_batch);
             stage_report.add(suite.elapsedNs(start_ns, end_ns), last_stats);
             if (system.pending.len >= before) return error.DrainStalled;
         }
@@ -750,7 +750,7 @@ fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: sui
         try promoteDetour(system, &fixture.requests, thread_ptr, case);
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &empty, thread_ptr, case, 1, 1, 1);
-        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.solve_batch);
+        accumulator.record(suite.elapsedNs(start_ns, suite.nowNs(io)), last_stats.perf.solve_batch);
     }
     // The fixed tier-1 budget solves the detour; a second exhaustion would drop it.
     if (last_stats.perf.available_results != 1 or last_stats.perf.escalated_solves != 1) return error.EscalatedDetourUnsolved;
@@ -886,7 +886,7 @@ fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: su
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        accumulator.record(elapsed_ns, last_stats.solve_batch);
+        accumulator.record(elapsed_ns, last_stats.perf.solve_batch);
         stage_report.add(elapsed_ns, last_stats);
         // A ready field answers every member: no build, no per-agent solve.
         if (last_stats.perf.group_fields_built != 0 or last_stats.perf.group_field_samples != item_count) return error.GroupFieldNotSampled;
@@ -948,7 +948,7 @@ fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, _: su
             const stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
             const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
             if (!measured) continue;
-            accumulator.record(elapsed_ns, stats.solve_batch);
+            accumulator.record(elapsed_ns, stats.perf.solve_batch);
             stage_report.add(elapsed_ns, stats);
             totals.add(stats);
         }
@@ -1010,7 +1010,7 @@ fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io: std
         const stats = try runColdOnce(system, &fixture.stream, thread_ptr, case, item_count, item_count, item_count);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         if (!measured) continue;
-        accumulator.record(elapsed_ns, stats.solve_batch);
+        accumulator.record(elapsed_ns, stats.perf.solve_batch);
         totals.add(stats);
     }
     // The field still serves part of the run; escalated solves follow the hysteresis-reduced
