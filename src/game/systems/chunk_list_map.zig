@@ -211,6 +211,14 @@ pub const OrdinalClaims = struct {
         std.debug.assert(self.free.items.len + releases <= self.free.capacity);
         self.free.items.len += releases;
     }
+
+    /// Releases every id at once: the next claim takes id 0. Keeps `id_limit` and the free
+    /// list's capacity, so the storage the owner covered still covers its ids. O(1). Only
+    /// for an owner that keeps no id past it.
+    pub fn reset(self: *OrdinalClaims) void {
+        self.free.clearRetainingCapacity();
+        self.next_id = 0;
+    }
 };
 
 /// A payload's place in a `PayloadSlabs` pool: its size class and its id in that class.
@@ -232,7 +240,7 @@ pub const PayloadSlot = struct {
 /// format width, not a cap.
 pub const max_payload_classes: usize = 132;
 /// Slot and slab alignment of `PayloadSlabs`: every class size is a multiple of it.
-const payload_slot_alignment: usize = 16;
+pub const payload_slot_alignment: usize = 16;
 // Bytes of a class's first slab (at least one slot); slab `j` holds `base << j` slots.
 const payload_first_slab_bytes: usize = 4096;
 
@@ -335,6 +343,13 @@ pub const PayloadSlabs = struct {
 
     pub fn commitReleases(self: *PayloadSlabs, class: u8, releases: usize) void {
         self.classes[class].claims.commitReleases(releases);
+    }
+
+    /// Releases every slot of `class` at once and keeps its slabs, so its next claims take
+    /// ids from zero inside the storage it already holds. O(1). Only for an owner that keeps
+    /// no slot of the class past it.
+    pub fn resetClass(self: *PayloadSlabs, class: u8) void {
+        self.classes[class].claims.reset();
     }
 
     /// The bytes of `slot`, `classBytes(slot.class)` long. O(1): slab
@@ -906,6 +921,39 @@ test "a reserved slab class claims and releases without allocating (FailingAlloc
     try std.testing.expectEqual(@as(u32, 24), slabs.claimedId(class, 0));
     slabs.commitClaims(class, 25);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "a payload class reset hands out ids from zero and keeps its slabs" {
+    const allocator = std.testing.allocator;
+    var slabs: PayloadSlabs = .{};
+    defer slabs.deinit(allocator);
+    const class: u8 = 0;
+    const other: u8 = 2;
+    try slabs.reserve(allocator, class, 100);
+    try slabs.reserve(allocator, other, 3);
+    slabs.commitClaims(class, 100);
+    slabs.commitClaims(other, 3);
+    for (0..10) |position| slabs.releaseAt(.{ .class = class, .id = @intCast(position * 7) }, position);
+    slabs.commitReleases(class, 10);
+    const held = slabs.slab_count;
+    const limit = slabs.classes[class].claims.id_limit;
+
+    slabs.resetClass(class);
+    try std.testing.expectEqual(held, slabs.slab_count);
+    try std.testing.expectEqual(limit, slabs.classes[class].claims.id_limit);
+    try std.testing.expectEqual(@as(usize, 0), slabs.classes[class].claims.free.items.len);
+    // The same claims fit the kept slabs: no allocation, ids from zero up.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    try slabs.reserve(failing.allocator(), class, 100);
+    for (0..100) |ordinal| try std.testing.expectEqual(@as(u32, @intCast(ordinal)), slabs.claimedId(class, ordinal));
+    slabs.commitClaims(class, 100);
+    // Every id releases into the kept free list without allocating.
+    for (0..100) |position| slabs.releaseAt(.{ .class = class, .id = @intCast(position) }, position);
+    slabs.commitReleases(class, 100);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(held, slabs.slab_count);
+    // The other class keeps its claims.
+    try std.testing.expectEqual(@as(u32, 3), slabs.classes[other].claims.next_id);
 }
 
 test "a directory's ordinal claims extend the block pool once and releases return blocks to it" {

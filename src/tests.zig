@@ -74,6 +74,7 @@ comptime {
     _ = @import("game/systems/banded_sort.zig");
     _ = @import("game/systems/chunk_list_map.zig");
     _ = @import("game/systems/collision.zig");
+    _ = @import("game/systems/collision_triggers.zig");
     _ = @import("game/systems/collision_response.zig");
     _ = @import("game/systems/movement.zig");
     _ = @import("game/systems/pathfinding.zig");

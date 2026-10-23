@@ -10,6 +10,8 @@
 const std = @import("std");
 const pdqSort = @import("../../core/sort.zig").pdq;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
+const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 
 /// Partition width of a banded sort, not a capacity: the sorted result is the same for any
@@ -79,6 +81,27 @@ fn startsBefore(range_start: usize, band_start: u32) bool {
     return band_start < range_start;
 }
 
+/// Each band's start in the sorted order: band b's elements over every fill range precede
+/// band b + 1's. O(ranges × bands).
+pub fn sumBandOffsets(offsets: []const PaddedSlot(BandOffsets)) [band_count + 1]u32 {
+    var starts: [band_count + 1]u32 = @splat(0);
+    for (offsets) |slot| {
+        for (&starts, slot.value.offsets) |*start, offset| start.* += offset;
+    }
+    return starts;
+}
+
+/// The segment of a concatenation holding `position`: the last whose start is at or
+/// before it. `segment_starts` is nondecreasing, one start per segment.
+fn segmentAt(segment_starts: []const usize, position: usize) usize {
+    std.debug.assert(segment_starts.len != 0 and segment_starts[0] <= position);
+    return std.sort.partitionPoint(usize, segment_starts, position, startAtOrBefore) - 1;
+}
+
+fn startAtOrBefore(position: usize, segment_start: usize) bool {
+    return segment_start <= position;
+}
+
 /// The banded sort over `Element`s keyed by `keyOf`, an unsigned integer.
 pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
     const Key = @typeInfo(@TypeOf(keyOf)).@"fn".return_type.?;
@@ -112,20 +135,122 @@ pub fn BandedSort(comptime Element: type, comptime keyOf: anytype) type {
         }
 
         /// Places `elements` into `window` by band of `splitters`, in input order within a
-        /// band, and returns the band offsets. Scalar: a counting scatter, the band search
-        /// run twice per element rather than stored (a six-step binary search).
+        /// band, and returns the band offsets.
         pub fn placeByBand(splitters: *const Splitters, elements: []const Element, window: []Element) BandOffsets {
-            std.debug.assert(window.len >= elements.len);
+            return placeSegmentsByBand(splitters, &.{elements}, &.{0}, 0, elements.len, window);
+        }
+
+        /// Places elements `[start, end)` of the concatenation of `segments` into `window`
+        /// by band of `splitters`, in concatenation order within a band, and returns the
+        /// band offsets. `segment_starts[s]` is the element count before segment s. Scalar:
+        /// a counting scatter, the band search run twice per element rather than stored (a
+        /// six-step binary search).
+        pub fn placeSegmentsByBand(splitters: *const Splitters, segments: []const []const Element, segment_starts: []const usize, start: usize, end: usize, window: []Element) BandOffsets {
+            std.debug.assert(segments.len == segment_starts.len);
+            std.debug.assert(start <= end and window.len >= end - start);
             var offsets: [band_count + 1]u32 = @splat(0);
-            for (elements) |element| offsets[bandOfKey(splitters, keyOf(element)) + 1] += 1;
+            if (start == end) return .{ .offsets = offsets };
+            const first = segmentAt(segment_starts, start);
+            var pieces = SegmentPieces{ .segments = segments, .segment_starts = segment_starts, .segment = first, .position = start, .end = end };
+            while (pieces.next()) |piece| {
+                for (piece) |element| offsets[bandOfKey(splitters, keyOf(element)) + 1] += 1;
+            }
             for (1..band_count + 1) |band| offsets[band] += offsets[band - 1];
             var cursor = offsets;
-            for (elements) |element| {
-                const band = bandOfKey(splitters, keyOf(element));
-                window[cursor[band]] = element;
-                cursor[band] += 1;
+            pieces = .{ .segments = segments, .segment_starts = segment_starts, .segment = first, .position = start, .end = end };
+            while (pieces.next()) |piece| {
+                for (piece) |element| {
+                    const band = bandOfKey(splitters, keyOf(element));
+                    window[cursor[band]] = element;
+                    cursor[band] += 1;
+                }
             }
             return .{ .offsets = offsets };
+        }
+
+        // The concatenation's elements `[position, end)`, one segment's share per `next`.
+        const SegmentPieces = struct {
+            segments: []const []const Element,
+            segment_starts: []const usize,
+            segment: usize,
+            position: usize,
+            end: usize,
+
+            fn next(self: *SegmentPieces) ?[]const Element {
+                while (self.position < self.end) {
+                    std.debug.assert(self.segment < self.segments.len);
+                    const segment = self.segments[self.segment];
+                    const base = self.segment_starts[self.segment];
+                    const piece_end = @min(self.end, base + segment.len);
+                    self.segment += 1;
+                    if (piece_end <= self.position) continue;
+                    const piece = segment[self.position - base .. piece_end - base];
+                    self.position = piece_end;
+                    return piece;
+                }
+                return null;
+            }
+        };
+
+        /// Band splitters sampled from the concatenation of `segments` (`total` elements;
+        /// `segment_starts` as in `placeSegmentsByBand`).
+        pub fn segmentSplitters(segments: []const []const Element, segment_starts: []const usize, total: usize) Splitters {
+            var samples: [splitter_sample_count]Key = undefined;
+            const count = sampleCount(total);
+            for (samples[0..count], 0..) |*sample, index| {
+                const position = sampleSlot(index, total);
+                const segment = segmentAt(segment_starts, position);
+                sample.* = keyOf(segments[segment][position - segment_starts[segment]]);
+            }
+            return splittersFromSamples(samples[0..count]);
+        }
+
+        /// One fill range of a banded sort: places its elements of the concatenation of
+        /// `segments` into its `staging` window by band and writes its band offsets.
+        pub const PlaceJob = struct {
+            splitters: Splitters,
+            segments: []const []const Element,
+            segment_starts: []const usize,
+            staging: []Element,
+            items_per_range: usize,
+            offsets: []PaddedSlot(BandOffsets),
+        };
+
+        pub fn placeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+            const job: *PlaceJob = @ptrCast(@alignCast(context));
+            std.debug.assert(range.index < job.offsets.len);
+            std.debug.assert(range.start == range.index * job.items_per_range);
+            std.debug.assert(range.end <= job.staging.len);
+            job.offsets[range.index].value = placeSegmentsByBand(&job.splitters, job.segments, job.segment_starts, range.start, range.end, job.staging[range.start..range.end]);
+        }
+
+        /// One sort range of a banded sort: gathers each band it owns from `source` into
+        /// `dest` at the band's start and sorts it by key. Keys are distinct, so the order is
+        /// the same for any partition.
+        pub const SortJob = struct {
+            source: WindowSource,
+            dest: []Element,
+            starts: [band_count + 1]u32,
+            range_count: usize,
+        };
+
+        pub fn sortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+            const job: *SortJob = @ptrCast(@alignCast(context));
+            const total = job.starts[band_count];
+            std.debug.assert(range.index < job.range_count);
+            std.debug.assert(range.end <= total and total <= job.dest.len);
+            var owned = OwnedBands.init(&job.starts, range.start, range.end);
+            while (owned.next()) |band| {
+                const start = job.starts[band];
+                const end = job.starts[band + 1];
+                const gathered = gatherBand(job.dest[start..end], band, .{job.source});
+                std.debug.assert(gathered == end - start);
+                pdqSort(Element, job.dest[start..end], {}, elementKeyLess);
+            }
+        }
+
+        fn elementKeyLess(_: void, lhs: Element, rhs: Element) bool {
+            return keyOf(lhs) < keyOf(rhs);
         }
 
         /// Fill ranges' band-placed windows: range r's window starts at
@@ -215,6 +340,42 @@ test "band placement equals a stable sort by band, with each band's offsets" {
             }
         }
     }
+}
+
+test "placing several segments by band matches placing their concatenation" {
+    var prng = std.Random.DefaultPrng.init(0x73_65_67);
+    const random = prng.random();
+    const splitters = testSplitters(random, 300, 5);
+    var elements: [120]TestElement = undefined;
+    for (&elements, 0..) |*element, index| element.* = .{ .key = random.uintLessThan(u64, 300), .tag = @intCast(index) };
+    // Segment lengths 0, 17, 0, 40, 1, 62: empty segments at the front and inside.
+    const lengths = [_]usize{ 0, 17, 0, 40, 1, 62 };
+    var segments: [lengths.len][]const TestElement = undefined;
+    var segment_starts: [lengths.len]usize = undefined;
+    var at: usize = 0;
+    for (lengths, 0..) |len, index| {
+        segments[index] = elements[at..][0..len];
+        segment_starts[index] = at;
+        at += len;
+    }
+    // Every window of the concatenation, including ones that start or end inside a segment
+    // or on a segment boundary, places like the same elements as one slice.
+    for ([_][2]usize{ .{ 0, 120 }, .{ 0, 0 }, .{ 5, 17 }, .{ 17, 57 }, .{ 16, 58 }, .{ 57, 58 }, .{ 30, 120 }, .{ 119, 120 } }) |window_bounds| {
+        const start = window_bounds[0];
+        const end = window_bounds[1];
+        var expected: [120]TestElement = undefined;
+        var actual: [120]TestElement = undefined;
+        const want = TestSort.placeByBand(&splitters, elements[start..end], expected[0 .. end - start]);
+        const got = TestSort.placeSegmentsByBand(&splitters, &segments, &segment_starts, start, end, actual[0 .. end - start]);
+        try testing.expectEqual(want.offsets, got.offsets);
+        try testing.expectEqualSlices(TestElement, expected[0 .. end - start], actual[0 .. end - start]);
+    }
+    // Splitters sampled from the segments are the ones sampled from the concatenation.
+    var keys: [120]u64 = undefined;
+    for (&keys, elements) |*key, element| key.* = element.key;
+    var samples: [splitter_sample_count]u64 = undefined;
+    for (0..sampleCount(120)) |sample| samples[sample] = keys[sampleSlot(sample, 120)];
+    try testing.expectEqual(TestSort.splittersFromSamples(samples[0..sampleCount(120)]), TestSort.segmentSplitters(&segments, &segment_starts, 120));
 }
 
 test "every nonempty band has exactly one owner for any range split" {

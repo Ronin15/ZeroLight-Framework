@@ -1792,29 +1792,32 @@ pub const CollisionSystem = struct {
         self.sort_staging.items.len = count;
         try self.sort_offsets.ensureTotalCapacity(self.allocator, place.range_count);
         while (self.sort_offsets.items.len < place.range_count) self.sort_offsets.appendAssumeCapacity(.{});
-        var place_job = PairPlaceJob{
-            .pairs = self.static_pairs.items,
+        const segments = [_][]const KeyedContact{self.static_pairs.items};
+        const segment_starts = [_]usize{0};
+        var place_job = PairSort.PlaceJob{
+            .splitters = PairSort.segmentSplitters(&segments, &segment_starts, count),
+            .segments = &segments,
+            .segment_starts = &segment_starts,
             .staging = self.sort_staging.items,
-            .splitters = pairSplitters(self.static_pairs.items),
             .items_per_range = place.items_per_range,
             .offsets = self.sort_offsets.items,
         };
-        _ = threads.thread_system.parallelForWithOptions(count, &place_job, pairPlaceJob, .{
+        _ = threads.thread_system.parallelForWithOptions(count, &place_job, PairSort.placeJob, .{
             .max_worker_threads = place.worker_threads,
             .range_alignment_items = collision_range_alignment_items,
             .selected_profile = place.profile,
         });
-        const starts = pairBandStarts(self.sort_offsets.items[0..place.range_count]);
+        const starts = banded_sort.sumBandOffsets(self.sort_offsets.items[0..place.range_count]);
         try self.ordered.ensureTotalCapacity(self.allocator, count);
         self.ordered.items.len = count;
         const sort_selection = stage.select(count, collision_range_alignment_items);
-        var sort_job = PairSortJob{
+        var sort_job = PairSort.SortJob{
             .source = .{ .staging = self.sort_staging.items, .band_offsets = self.sort_offsets.items[0..place.range_count], .window_stride = place.items_per_range },
             .dest = self.ordered.items,
             .starts = starts,
             .range_count = sort_selection.range_count,
         };
-        const batch = stage.run(sort_selection, count, collision_range_alignment_items, &sort_job, pairSortJob);
+        const batch = stage.run(sort_selection, count, collision_range_alignment_items, &sort_job, PairSort.sortJob);
         if (comptime runtime_perf_log.enabled) stats.perf.static_sort_batch = batch;
         self.static_pairs.clearRetainingCapacity();
         try self.static_pairs.ensureTotalCapacity(self.allocator, count);
@@ -2383,67 +2386,6 @@ fn storedPair(kept: []const KeyedContact, contact: CollisionContact) bool {
         if (pair.contact.a.eql(contact.a) and pair.contact.b.eql(contact.b)) return true;
     }
     return false;
-}
-
-fn keyedLess(_: void, a: KeyedContact, b: KeyedContact) bool {
-    return a.key < b.key;
-}
-
-const PairPlaceJob = struct {
-    pairs: []const KeyedContact,
-    staging: []KeyedContact,
-    splitters: PairSort.Splitters,
-    items_per_range: usize,
-    offsets: []PaddedSlot(BandOffsets),
-};
-
-fn pairPlaceJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *PairPlaceJob = @ptrCast(@alignCast(context));
-    std.debug.assert(range.index < job.offsets.len);
-    std.debug.assert(range.start == range.index * job.items_per_range);
-    std.debug.assert(range.end <= job.pairs.len and range.end <= job.staging.len);
-    const elements = job.pairs[range.start..range.end];
-    job.offsets[range.index].value = PairSort.placeByBand(&job.splitters, elements, job.staging[range.start..range.end]);
-}
-
-const PairSortJob = struct {
-    source: PairSort.WindowSource,
-    dest: []KeyedContact,
-    starts: [band_count + 1]u32,
-    range_count: usize,
-};
-
-fn pairSortJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *PairSortJob = @ptrCast(@alignCast(context));
-    const total = job.starts[band_count];
-    std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.end <= total and total <= job.dest.len);
-    var owned = OwnedBands.init(&job.starts, range.start, range.end);
-    while (owned.next()) |band| {
-        const start = job.starts[band];
-        const end = job.starts[band + 1];
-        const gathered = PairSort.gatherBand(job.dest[start..end], band, .{job.source});
-        std.debug.assert(gathered == end - start);
-        pdqSort(KeyedContact, job.dest[start..end], {}, keyedLess);
-    }
-}
-
-fn pairSplitters(pairs: []const KeyedContact) PairSort.Splitters {
-    var samples: [banded_sort.splitter_sample_count]u256 = undefined;
-    var valid: usize = 0;
-    for (0..banded_sort.sampleCount(pairs.len)) |sample| {
-        samples[valid] = pairs[banded_sort.sampleSlot(sample, pairs.len)].key;
-        valid += 1;
-    }
-    return PairSort.splittersFromSamples(samples[0..valid]);
-}
-
-fn pairBandStarts(offsets: []const PaddedSlot(BandOffsets)) [band_count + 1]u32 {
-    var starts: [band_count + 1]u32 = @splat(0);
-    for (offsets) |slot| {
-        for (&starts, slot.value.offsets) |*start, offset| start.* += offset;
-    }
-    return starts;
 }
 
 const PackTriggerAllowJob = struct {
