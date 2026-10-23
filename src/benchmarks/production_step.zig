@@ -21,13 +21,21 @@
 //!
 //! Each sample binds a fresh runtime perf log and bench-only batch sink: `main` is the step's
 //! wall time minus the off-main time of the logged and bench-only batches that ran on
-//! workers (an upper bound: batches neither carries count as main), and `untimed` is the wall time no top-level stage timer holds. `tiers=`
-//! splits the rows by scope tier (cognition/locomotion/kinematic/dormant), `thinking=` counts
-//! the rows the AI stage ran, `separation_per_thinking=` the AI separation candidate checks
-//! and neighbor samples per thinking row, and `top_main=` names the three top-level stages
-//! with the most main time. `--details` adds each top-level stage's `wall=`,
-//! `off_main=`, and `main=` with its batches' `threaded=` steps over the measured steps, the
-//! nested stage timers, and the census counters as means per step.
+//! workers (an upper bound: batches neither carries count as main), and `untimed` is the wall
+//! time no top-level stage timer holds, the log's and the sink's bench-only timers both.
+//! `tiers=` splits the rows by scope tier (cognition/locomotion/kinematic/dormant),
+//! `thinking=` counts the rows the AI stage ran, `separation_per_thinking=` the AI separation
+//! candidate checks and neighbor samples per thinking row, and `top_main=` names the three
+//! top-level stages with the most main time. `--details` adds each top-level stage's
+//! `wall=`, `off_main=`, and `main=` with each of its batches' `(ran=r/n threaded=k/r)`: the
+//! r of n measured steps it ran on, and the k of those every call ran on workers; the nested
+//! stage timers; and the census counters as means per step. It also prints, as each case
+//! ends, every batch that ran under its stage timer (`calls/step=`, `items/call=` mean and
+//! fewest-most, `ns/call=` mean, `ran=`, `threaded=`), and every tuner, by field path, whose
+//! probe windows, demotions, restores, or shift skips changed over the measured steps.
+//!
+//! Every case runs the same pre-measure steps (the warmup plus the adaptive settle limit), so
+//! the serial and tuned cases measure the same simulated state.
 //!
 //! Pass shape: step and main time linear in population for `spread` and `crowd`; in level
 //! side and in level count at a fixed population, every row advances at its tier and the cost
@@ -49,6 +57,7 @@ const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const StateTransitions = @import("../app/state.zig").StateTransitions;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const TimeLoop = @import("../app/time_loop.zig").TimeLoop;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -65,6 +74,7 @@ const placeSpawnedMover = @import("../game/game_demo_state.zig").placeSpawnedMov
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const data_test_support = @import("../game/data_system/test_support.zig");
+const forEachTunerIn = @import("../game/simulation_pipeline_test_support.zig").forEachTunerIn;
 const pinTunersIn = @import("../game/simulation_pipeline_test_support.zig").pinTunersIn;
 const keep_stagger_phase = @import("../game/simulation_scope.zig").keep_stagger_phase;
 const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
@@ -77,6 +87,7 @@ const suite = @import("suite.zig");
 
 const BatchStage = runtime_perf_log.BatchStage;
 const BenchBatchStage = runtime_perf_log.BenchBatchStage;
+const BenchTiming = runtime_perf_log.BenchTiming;
 const Metric = runtime_perf_log.Metric;
 const Timing = runtime_perf_log.Timing;
 
@@ -148,16 +159,24 @@ const StageBatches = struct {
 // Each top-level stage timer's batches, for the per-stage main-thread split.
 fn stageBatches(stage: Timing) StageBatches {
     return switch (stage) {
-        .pipeline_spatial_index => .{ .logged = &.{.spatial_index_build} },
-        .pipeline_perception => .{ .bench = &.{.perception} },
-        .pipeline_ai => .{ .bench = &.{ .ai_separation, .ai_intent } },
-        .pipeline_steering => .{ .bench = &.{.steering} },
-        .pipeline_pathfinding => .{ .logged = &.{ .path_intake, .path_registry_flush, .path_resize_copy }, .bench = &.{.path_solve} },
+        .pipeline_spatial_index => .{ .logged = &.{.spatial_index_build}, .bench = &.{ .spatial_index_bucket, .spatial_index_link } },
+        .pipeline_perception => .{ .bench = &.{ .perception_gather, .perception } },
+        .pipeline_ai_memory => .{ .bench = &.{ .ai_memory_gather, .ai_memory_order, .ai_memory_visible, .ai_memory_decay } },
+        .pipeline_ai_affect => .{ .bench = &.{.affect} },
+        .pipeline_ai => .{ .bench = &.{ .ai_gather, .ai_separation, .ai_intent } },
+        .pipeline_path_goals => .{ .bench = &.{ .path_goal_scan, .path_goal_project } },
+        .pipeline_steering => .{ .bench = &.{ .steering_agents, .steering_select_resolve, .steering_select_claim, .steering_directions, .steering_grid_bucket, .steering_grid_sort, .steering } },
+        .pipeline_pathfinding => .{
+            .logged = &.{ .path_intake, .path_registry_flush, .path_resize_copy },
+            .bench = &.{ .path_registry_flush_count, .path_registry_rename, .path_group_field_advance, .path_group_field_begin, .path_solve, .path_publish_copy },
+        },
+        .pipeline_apply_intents => .{ .bench = &.{.apply_intents} },
         .pipeline_movement => .{ .bench = &.{.movement} },
         .pipeline_collision => .{
             .logged = &.{.collision_trigger_refresh},
             .bench = &.{ .collision_fill, .collision_sort, .collision_broadphase, .collision_narrowphase, .collision_static_pairs, .collision_static_rect, .collision_static_place, .collision_static_sort, .collision_trigger_emit_count, .collision_trigger_emit },
         },
+        .pipeline_collision_response => .{ .bench = &.{ .collision_response_gather, .collision_response_place, .collision_response_apply } },
         .pipeline_chunk_derive => .{ .bench = &.{.chunk_derive} },
         .gameplay_particles => .{ .bench = &.{.particles} },
         .gameplay_structural => .{
@@ -165,6 +184,18 @@ fn stageBatches(stage: Timing) StageBatches {
             .bench = &.{ .static_collider_touch, .static_collider_group, .static_collider_apply, .static_collider_rewrite, .static_collider_install, .collision_trigger_query, .collision_trigger_insert_place, .collision_trigger_insert_sort, .collision_trigger_node },
         },
         else => .{},
+    };
+}
+
+// Each bench-only stage timer's batches; every bench-only timer is a top-level stage.
+fn benchStageBatches(stage: BenchTiming) StageBatches {
+    return switch (stage) {
+        .pipeline_scope_gather => .{ .bench = &.{.scope_ai_gather} },
+        .pipeline_cognition_order => .{ .bench = &.{.scope_cognition} },
+        .pipeline_collision_scope => .{ .bench = &.{.scope_collision_gather} },
+        .pipeline_plane_traversal => .{ .bench = &.{.plane_entry} },
+        .pipeline_tier_policy => .{ .bench = &.{.scope_tier_policy} },
+        .pipeline_action_react => .{},
     };
 }
 
@@ -178,12 +209,22 @@ comptime {
                 if (owned == batch) owners += 1;
             }
         }
+        for (std.meta.tags(BenchTiming)) |stage| {
+            for (benchStageBatches(stage).logged) |owned| {
+                if (owned == batch) owners += 1;
+            }
+        }
         if (owners != 1) @compileError("batch stage " ++ @tagName(batch) ++ " needs exactly one stage timer");
     }
     for (std.meta.tags(BenchBatchStage)) |batch| {
         var owners: usize = 0;
         for (std.meta.tags(Timing)) |stage| {
             for (stageBatches(stage).bench) |owned| {
+                if (owned == batch) owners += 1;
+            }
+        }
+        for (std.meta.tags(BenchTiming)) |stage| {
+            for (benchStageBatches(stage).bench) |owned| {
                 if (owned == batch) owners += 1;
             }
         }
@@ -564,6 +605,26 @@ const StepRunner = struct {
     }
 };
 
+// One batch stage's calls over the measured steps: how many, the items they carried (the
+// fewest and most in one call), and their summed duration.
+const BatchShape = struct {
+    calls: u64 = 0,
+    items: u64 = 0,
+    min_items: u64 = 0,
+    max_items: u64 = 0,
+    duration_ns: u128 = 0,
+
+    // `batch`: one step's aggregate of the stage.
+    fn add(self: *BatchShape, batch: anytype) void {
+        if (batch.calls == 0) return;
+        self.min_items = if (self.calls == 0) batch.min_items else @min(self.min_items, batch.min_items);
+        self.max_items = @max(self.max_items, batch.max_items);
+        self.calls += batch.calls;
+        self.items += batch.items;
+        self.duration_ns += batch.total_duration_ns;
+    }
+};
+
 // Sums of the measured steps' perf-log reads.
 const Census = struct {
     steps: usize = 0,
@@ -576,6 +637,9 @@ const Census = struct {
     bench_batch_off_main_ns: std.enums.EnumArray(BenchBatchStage, u128) = .initFill(0),
     bench_batch_threaded_steps: std.enums.EnumArray(BenchBatchStage, usize) = .initFill(0),
     bench_batch_recorded_steps: std.enums.EnumArray(BenchBatchStage, usize) = .initFill(0),
+    batch_shapes: std.enums.EnumArray(BatchStage, BatchShape) = .initFill(.{}),
+    bench_batch_shapes: std.enums.EnumArray(BenchBatchStage, BatchShape) = .initFill(.{}),
+    bench_stage_wall_ns: std.enums.EnumArray(BenchTiming, u128) = .initFill(0),
     metrics: std.enums.EnumArray(Metric, u128) = .initFill(0),
 
     // One stage's step: whether it ran, and its off-main time when every call ran on workers.
@@ -596,15 +660,22 @@ const Census = struct {
             self.stage_wall_ns.getPtr(stage).* += wall_ns;
             if (isTopLevelStage(stage)) timed_ns += wall_ns;
         }
+        for (std.meta.tags(BenchTiming)) |stage| {
+            const wall_ns = step_batches.timings[@backingInt(stage)].total_ns;
+            self.bench_stage_wall_ns.getPtr(stage).* += wall_ns;
+            timed_ns += wall_ns;
+        }
         var off_main_ns: u64 = 0;
         // A step counts off main only when every call of the stage ran on workers.
         for (std.meta.tags(BatchStage)) |stage| {
             const batch = log.batches[@backingInt(stage)];
             off_main_ns += addBatch(batch.calls, batch.threaded_calls, batch.total_duration_ns, self.batch_recorded_steps.getPtr(stage), self.batch_threaded_steps.getPtr(stage), self.batch_off_main_ns.getPtr(stage));
+            self.batch_shapes.getPtr(stage).add(batch);
         }
         for (std.meta.tags(BenchBatchStage)) |stage| {
             const batch = step_batches.batches[@backingInt(stage)];
             off_main_ns += addBatch(batch.calls, batch.threaded_calls, batch.total_duration_ns, self.bench_batch_recorded_steps.getPtr(stage), self.bench_batch_threaded_steps.getPtr(stage), self.bench_batch_off_main_ns.getPtr(stage));
+            self.bench_batch_shapes.getPtr(stage).add(batch);
         }
         for (std.meta.tags(Metric)) |metric| self.metrics.getPtr(metric).* += log.metrics[@backingInt(metric)];
         self.main_ns += step_ns -| off_main_ns;
@@ -618,6 +689,7 @@ const Census = struct {
         summary.main_ns = @intCast(self.main_ns / steps);
         summary.untimed_ns = @intCast(self.untimed_ns / steps);
         for (std.meta.tags(Timing)) |stage| summary.stage_wall_ns.set(stage, @intCast(self.stage_wall_ns.get(stage) / steps));
+        for (std.meta.tags(BenchTiming)) |stage| summary.bench_stage_wall_ns.set(stage, @intCast(self.bench_stage_wall_ns.get(stage) / steps));
         for (std.meta.tags(BatchStage)) |stage| {
             summary.batch_off_main_ns.set(stage, @intCast(self.batch_off_main_ns.get(stage) / steps));
             summary.batch_threaded_steps.set(stage, self.batch_threaded_steps.get(stage));
@@ -631,6 +703,133 @@ const Census = struct {
         for (std.meta.tags(Metric)) |metric| summary.metrics.set(metric, @intCast(self.metrics.get(metric) / steps));
         return summary;
     }
+
+    // Every batch that ran, under its top-level stage: calls per measured step, items per
+    // call (mean, fewest-most), mean duration per call, the measured steps it ran on, and of
+    // those the steps every call ran on workers.
+    fn printBatchShapes(self: *const Census) void {
+        std.debug.print("  batches over {} measured steps:\n", .{self.steps});
+        for (std.meta.tags(Timing)) |stage| self.printStageBatchShapes(@tagName(stage), stageBatches(stage));
+        for (std.meta.tags(BenchTiming)) |stage| self.printStageBatchShapes(@tagName(stage), benchStageBatches(stage));
+    }
+
+    fn printStageBatchShapes(self: *const Census, stage: []const u8, batches: StageBatches) void {
+        for (batches.logged) |batch| self.printBatchShape(stage, @tagName(batch), self.batch_shapes.get(batch), self.batch_recorded_steps.get(batch), self.batch_threaded_steps.get(batch));
+        for (batches.bench) |batch| self.printBatchShape(stage, @tagName(batch), self.bench_batch_shapes.get(batch), self.bench_batch_recorded_steps.get(batch), self.bench_batch_threaded_steps.get(batch));
+    }
+
+    fn printBatchShape(self: *const Census, stage: []const u8, name: []const u8, shape: BatchShape, recorded_steps: usize, threaded_steps: usize) void {
+        if (shape.calls == 0) return;
+        std.debug.print("    {s} {s} calls/step={d:.2} items/call={} ({}-{}) ns/call={f} ran={}/{} threaded={}/{}\n", .{
+            stage,
+            name,
+            @as(f64, @floatFromInt(shape.calls)) / @as(f64, @floatFromInt(self.steps)),
+            shape.items / shape.calls,
+            shape.min_items,
+            shape.max_items,
+            suite.formatDuration(@intCast(shape.duration_ns / shape.calls)),
+            recorded_steps,
+            self.steps,
+            threaded_steps,
+            recorded_steps,
+        });
+    }
+};
+
+// A tuner's diagnostic counts (`AdaptiveWorkTuner`): its probe windows, settled demotions,
+// restores, and records skipped on an unsustained item-count shift.
+const TunerCounts = struct {
+    probes: u64 = 0,
+    demotes: u64 = 0,
+    restores: u64 = 0,
+    shift_skips: u64 = 0,
+
+    fn of(tuner: *const AdaptiveWorkTuner) TunerCounts {
+        return .{ .probes = tuner.probe_window_count, .demotes = tuner.demotion_count, .restores = tuner.restore_count, .shift_skips = tuner.shift_skip_count };
+    }
+
+    fn since(self: TunerCounts, before: TunerCounts) TunerCounts {
+        return .{ .probes = self.probes - before.probes, .demotes = self.demotes - before.demotes, .restores = self.restores - before.restores, .shift_skips = self.shift_skips - before.shift_skips };
+    }
+
+    fn any(self: TunerCounts) bool {
+        return self.probes != 0 or self.demotes != 0 or self.restores != 0 or self.shift_skips != 0;
+    }
+};
+
+// Every `GameDemoState` tuner's counts by field path, taken before the measured steps; the
+// counts after them print as deltas. The walk after the measured steps must visit the
+// snapshot's paths in the same order, or the case fails: a tuner that appeared or went away
+// (a set or cleared optional) has no delta.
+const TunerCensus = struct {
+    const Entry = struct { path: []const u8, counts: TunerCounts };
+
+    entries: std.ArrayList(Entry) = .empty,
+
+    fn init(allocator: std.mem.Allocator, state: *GameDemoState) !TunerCensus {
+        var counter = CountVisitor{};
+        forEachTunerIn(GameDemoState, state, "state", &counter);
+        var census = TunerCensus{};
+        try census.entries.ensureTotalCapacity(allocator, counter.count);
+        var snapshot = SnapshotVisitor{ .entries = &census.entries };
+        forEachTunerIn(GameDemoState, state, "state", &snapshot);
+        return census;
+    }
+
+    fn deinit(self: *TunerCensus, allocator: std.mem.Allocator) void {
+        self.entries.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn printDeltas(self: *const TunerCensus, state: *GameDemoState) !void {
+        std.debug.print("  tuners changed over the measured steps (of {}):\n", .{self.entries.items.len});
+        var deltas = DeltaVisitor{ .entries = self.entries.items };
+        forEachTunerIn(GameDemoState, state, "state", &deltas);
+        if (deltas.mismatched or deltas.cursor != self.entries.items.len) {
+            std.debug.print("production-step: the tuners after the measured steps are not the snapshot's ({} of {} matched)\n", .{ deltas.cursor, self.entries.items.len });
+            return error.TunerSetChanged;
+        }
+        if (deltas.changed == 0) std.debug.print("    none\n", .{});
+    }
+
+    const CountVisitor = struct {
+        count: usize = 0,
+
+        pub fn visit(self: *CountVisitor, comptime _: []const u8, _: *AdaptiveWorkTuner) void {
+            self.count += 1;
+        }
+    };
+
+    const SnapshotVisitor = struct {
+        entries: *std.ArrayList(Entry),
+
+        pub fn visit(self: *SnapshotVisitor, comptime path: []const u8, tuner: *AdaptiveWorkTuner) void {
+            self.entries.appendAssumeCapacity(.{ .path = path, .counts = .of(tuner) });
+        }
+    };
+
+    // Matches each visited tuner to the snapshot entry at its position; the first mismatch
+    // stops the deltas.
+    const DeltaVisitor = struct {
+        entries: []const Entry,
+        cursor: usize = 0,
+        changed: usize = 0,
+        mismatched: bool = false,
+
+        pub fn visit(self: *DeltaVisitor, comptime path: []const u8, tuner: *AdaptiveWorkTuner) void {
+            if (self.mismatched) return;
+            if (self.cursor == self.entries.len or !std.mem.eql(u8, self.entries[self.cursor].path, path)) {
+                self.mismatched = true;
+                return;
+            }
+            const before = self.entries[self.cursor].counts;
+            self.cursor += 1;
+            const delta = TunerCounts.of(tuner).since(before);
+            if (!delta.any()) return;
+            self.changed += 1;
+            std.debug.print("    {s} probes={} demotes={} restores={} shift_skips={}\n", .{ path, delta.probes, delta.demotes, delta.restores, delta.shift_skips });
+        }
+    };
 };
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -688,12 +887,15 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         .threads = &threads,
     };
 
-    // The tuned case settles its stage tuners first; the serial case's stages run inline.
-    const settle_steps = if (case.adaptive) suite.adaptiveSettleIterationLimit(options) else 0;
+    // Every case runs the tuned case's pre-measure steps, so each measures the same simulated
+    // state (paths requested and solved, positions); the serial case's stages run inline.
+    const settle_steps = suite.adaptiveSettleIterationLimit(options);
     const warmup_steps = options.warmup_iterations + settle_steps;
     for (0..warmup_steps) |_| _ = try step.run();
     var accumulator = suite.StatsAccumulator.init(item_count);
     var census = Census{};
+    var tuner_census: ?TunerCensus = if (options.details) try TunerCensus.init(allocator, state) else null;
+    defer if (tuner_census) |*census_of_tuners| census_of_tuners.deinit(allocator);
     // Each measured step's queries read the index its build files from the positions the step
     // before it left.
     var span_record: ?CellSpanRecord = if (fields.shape == .stacked)
@@ -706,6 +908,11 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         accumulator.record(step_ns, .{});
         census.add(&step.perf_log, &step.step_batches, step_ns);
         if (span_record) |*record| if (iteration + 1 < options.iterations) record.widen(&state.data);
+    }
+    if (options.details) {
+        std.debug.print("  census production-step {} {s}:\n", .{ item_count, case.name });
+        census.printBatchShapes();
+        try tuner_census.?.printDeltas(state);
     }
     var stats = accumulator.finish();
     stats.items_per_second = suite.itemsPerSecond(population, stats.mean_ns);
@@ -744,35 +951,71 @@ fn checkPinnedStage(details: *suite.DetailLines, name: []const u8, batch: anytyp
     return error.PinnedStageRanInline;
 }
 
-const timing_count = std.meta.tags(Timing).len;
+// A top-level stage timer: one the perf log records, or a bench-only one the census's sink
+// receives.
+const Stage = union(enum) {
+    logged: Timing,
+    bench: BenchTiming,
 
-// The top-level stages that ran, most main-thread time first.
-fn stagesByMain(summary: *const suite.ProductionStepSummary, out: *[timing_count]Timing) []Timing {
+    fn name(self: Stage) []const u8 {
+        return switch (self) {
+            inline else => |stage| @tagName(stage),
+        };
+    }
+
+    fn batches(self: Stage) StageBatches {
+        return switch (self) {
+            .logged => |stage| stageBatches(stage),
+            .bench => |stage| benchStageBatches(stage),
+        };
+    }
+
+    fn wallNs(self: Stage, summary: *const suite.ProductionStepSummary) u64 {
+        return switch (self) {
+            .logged => |stage| summary.stage_wall_ns.get(stage),
+            .bench => |stage| summary.bench_stage_wall_ns.get(stage),
+        };
+    }
+};
+
+const stage_count = std.meta.tags(Timing).len + std.meta.tags(BenchTiming).len;
+
+// The top-level stages that ran, both channels, most main-thread time first.
+fn stagesByMain(summary: *const suite.ProductionStepSummary, out: *[stage_count]Stage) []Stage {
     var count: usize = 0;
     for (std.meta.tags(Timing)) |stage| {
         if (!isTopLevelStage(stage) or summary.stage_wall_ns.get(stage) == 0) continue;
-        out[count] = stage;
+        out[count] = .{ .logged = stage };
         count += 1;
     }
-    std.mem.sort(Timing, out[0..count], summary, moreMainFirst);
+    for (std.meta.tags(BenchTiming)) |stage| {
+        if (summary.bench_stage_wall_ns.get(stage) == 0) continue;
+        out[count] = .{ .bench = stage };
+        count += 1;
+    }
+    std.mem.sort(Stage, out[0..count], summary, moreMainFirst);
     return out[0..count];
 }
 
-fn moreMainFirst(summary: *const suite.ProductionStepSummary, lhs: Timing, rhs: Timing) bool {
+fn moreMainFirst(summary: *const suite.ProductionStepSummary, lhs: Stage, rhs: Stage) bool {
     return stageMainNs(summary, lhs) > stageMainNs(summary, rhs);
 }
 
-fn stageOffMainNs(summary: *const suite.ProductionStepSummary, stage: Timing) u64 {
-    const batches = stageBatches(stage);
+fn stageOffMainNs(summary: *const suite.ProductionStepSummary, stage: Stage) u64 {
+    const batches = stage.batches();
     var off_main_ns: u64 = 0;
     for (batches.logged) |batch| off_main_ns += summary.batch_off_main_ns.get(batch);
     for (batches.bench) |batch| off_main_ns += summary.bench_batch_off_main_ns.get(batch);
     return off_main_ns;
 }
 
-fn stageMainNs(summary: *const suite.ProductionStepSummary, stage: Timing) u64 {
-    return summary.stage_wall_ns.get(stage) -| stageOffMainNs(summary, stage);
+fn stageMainNs(summary: *const suite.ProductionStepSummary, stage: Stage) u64 {
+    return stage.wallNs(summary) -| stageOffMainNs(summary, stage);
 }
+
+// A stage line's batch: the measured steps it ran on, and of those the steps every call ran
+// on workers.
+const batch_steps_format = " {s}(ran={}/{} threaded={}/{})";
 
 fn writeStepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("rows={}", .{stats.output_count});
@@ -793,30 +1036,31 @@ fn writeStepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.
         @as(f64, @floatFromInt(summary.metrics.get(.ai_separation_neighbor_samples))) / thinking,
     });
     if (summary.separation_check_bound) |bound| try writer.print(" check_bound={} drift={}", .{ bound, summary.max_cell_drift });
-    var stage_buffer: [timing_count]Timing = undefined;
+    var stage_buffer: [stage_count]Stage = undefined;
     const stages = stagesByMain(summary, &stage_buffer);
     try writer.writeAll(" top_main=");
     for (stages[0..@min(stages.len, 3)], 0..) |stage, index| {
         if (index != 0) try writer.writeByte(',');
-        try writer.print("{s}:{f}", .{ @tagName(stage)[std.mem.indexOfScalar(u8, @tagName(stage), '_').? + 1 ..], suite.formatDuration(stageMainNs(summary, stage)) });
+        const name = stage.name();
+        try writer.print("{s}:{f}", .{ name[std.mem.indexOfScalar(u8, name, '_').? + 1 ..], suite.formatDuration(stageMainNs(summary, stage)) });
     }
     if (view == .summary) return;
 
     for (stages) |stage| {
         try writer.print("\n    stage {s} wall={f} off_main={f} main={f}", .{
-            @tagName(stage),
-            suite.formatDuration(summary.stage_wall_ns.get(stage)),
+            stage.name(),
+            suite.formatDuration(stage.wallNs(summary)),
             suite.formatDuration(stageOffMainNs(summary, stage)),
             suite.formatDuration(stageMainNs(summary, stage)),
         });
-        const batches = stageBatches(stage);
+        const batches = stage.batches();
         for (batches.logged) |batch| {
-            if (summary.batch_recorded_steps.get(batch) == 0) continue;
-            try writer.print(" {s}:threaded={}/{}", .{ @tagName(batch), summary.batch_threaded_steps.get(batch), summary.measured_steps });
+            const recorded = summary.batch_recorded_steps.get(batch);
+            if (recorded != 0) try writer.print(batch_steps_format, .{ @tagName(batch), recorded, summary.measured_steps, summary.batch_threaded_steps.get(batch), recorded });
         }
         for (batches.bench) |batch| {
-            if (summary.bench_batch_recorded_steps.get(batch) == 0) continue;
-            try writer.print(" {s}:threaded={}/{}", .{ @tagName(batch), summary.bench_batch_threaded_steps.get(batch), summary.measured_steps });
+            const recorded = summary.bench_batch_recorded_steps.get(batch);
+            if (recorded != 0) try writer.print(batch_steps_format, .{ @tagName(batch), recorded, summary.measured_steps, summary.bench_batch_threaded_steps.get(batch), recorded });
         }
     }
     try writer.writeAll("\n    nested");

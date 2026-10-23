@@ -244,6 +244,10 @@ pub const AdaptiveWorkTuner = struct {
     // them) and never read by policy.
     probe_window_count: DiagnosticCount = zero_diagnostic_count,
     demotion_count: DiagnosticCount = zero_diagnostic_count,
+    // Settled demotions undone by their judging window, and batches outside the reset
+    // band whose record was skipped (an unsustained item-count shift).
+    restore_count: DiagnosticCount = zero_diagnostic_count,
+    shift_skip_count: DiagnosticCount = zero_diagnostic_count,
 
     pub fn init(config: AdaptiveWorkTunerConfig) AdaptiveWorkTuner {
         const normalized = normalizeWorkTunerConfig(config);
@@ -279,6 +283,7 @@ pub const AdaptiveWorkTuner = struct {
                 self.shifted_batch_count = 0;
             } else {
                 self.skip_next_record = true;
+                if (comptime diagnostics_enabled) self.shift_skip_count += 1;
             }
         } else {
             self.shifted_batch_count = 0;
@@ -772,6 +777,7 @@ pub const AdaptiveWorkTuner = struct {
     // judged inline sample, so a later commit must still beat a measurement.
     fn restoreThreadedProfile(self: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile, inline_mean_ns: u64) void {
         std.debug.assert(self.phase == .settled and profile.worker_threads > 0);
+        if (comptime diagnostics_enabled) self.restore_count += 1;
         self.has_threaded_profile = true;
         self.best_profile = profile;
         self.current_profile = profile;
@@ -4711,6 +4717,8 @@ const TunerSnapshot = struct {
     skip_next_record: bool,
     probe_window_count: DiagnosticCount,
     demotion_count: DiagnosticCount,
+    restore_count: DiagnosticCount,
+    shift_skip_count: DiagnosticCount,
 
     fn of(tuner: *const AdaptiveWorkTuner) TunerSnapshot {
         return .{
@@ -4731,6 +4739,8 @@ const TunerSnapshot = struct {
             .skip_next_record = tuner.skip_next_record,
             .probe_window_count = tuner.probe_window_count,
             .demotion_count = tuner.demotion_count,
+            .restore_count = tuner.restore_count,
+            .shift_skip_count = tuner.shift_skip_count,
         };
     }
 };

@@ -245,13 +245,56 @@ pub const BatchStage = enum {
 /// Stages whose batch timing is bench output only. A bench that sets a `StepBatches` sink on
 /// its `Context` (`step_batches`) receives them; the log never records them.
 pub const BenchBatchStage = enum {
+    // The spatial index build's bucket and link stages around its logged sort.
+    spatial_index_bucket,
+    spatial_index_link,
+    // Perception's observer gather and its sense pass.
+    perception_gather,
     perception,
+    // Memory's think-row translate, member order, visibility, and decay stages.
+    ai_memory_gather,
+    ai_memory_order,
+    ai_memory_visible,
+    ai_memory_decay,
+    affect,
+    // AI's think-row gather, separation, and intent passes.
+    ai_gather,
     ai_separation,
     ai_intent,
+    // The goal resolve's intent scan and blocked-goal projection.
+    path_goal_scan,
+    path_goal_project,
+    // Steering's prepare stages before the avoidance pass (`steering`).
+    steering_agents,
+    steering_select_resolve,
+    steering_select_claim,
+    steering_directions,
+    steering_grid_bucket,
+    steering_grid_sort,
     steering,
+    // The pathfinding update's registry flush count, a shrink's owner rename, the group-field
+    // advance and begin passes, and the publish copy, beside its logged intake and flush.
+    path_registry_flush_count,
+    path_registry_rename,
+    path_group_field_advance,
+    path_group_field_begin,
     path_solve,
+    path_publish_copy,
+    apply_intents,
     movement,
     chunk_derive,
+    // The per-step scope passes: the AI halo gather, the think-set compaction, the collision
+    // gather, and the tier policy.
+    scope_ai_gather,
+    scope_cognition,
+    scope_collision_gather,
+    scope_tier_policy,
+    // Plane traversal's entry gather.
+    plane_entry,
+    // Collision response's contact gather, place, and apply.
+    collision_response_gather,
+    collision_response_place,
+    collision_response_apply,
     // The collision detect fill and sort, inline or on workers. An untimed batch with no
     // workers is not a sample.
     collision_fill,
@@ -285,6 +328,18 @@ pub const BenchBatchStage = enum {
     static_collider_install,
 };
 
+/// Top-level stage timers that are bench output only: the scope gathers, the think-set
+/// order, plane traversal, tier policy, and the action-intent consumer. A bench that sets a
+/// `StepBatches` sink on its `Context` receives them; the log never records them.
+pub const BenchTiming = enum {
+    pipeline_scope_gather,
+    pipeline_cognition_order,
+    pipeline_collision_scope,
+    pipeline_plane_traversal,
+    pipeline_tier_policy,
+    pipeline_action_react,
+};
+
 pub const FrameSample = struct {
     frame_delta_ns: u64 = 0,
     fixed_updates: u32 = 0,
@@ -297,17 +352,23 @@ const metric_count = @typeInfo(Metric).@"enum".field_names.len;
 const timing_count = @typeInfo(Timing).@"enum".field_names.len;
 const batch_stage_count = @typeInfo(BatchStage).@"enum".field_names.len;
 const bench_batch_stage_count = @typeInfo(BenchBatchStage).@"enum".field_names.len;
+const bench_timing_count = @typeInfo(BenchTiming).@"enum".field_names.len;
 
 pub const RuntimePerfLog = if (enabled) EnabledRuntimePerfLog else DisabledRuntimePerfLog;
 
-/// A bench's sink for the step's bench-only batches, aggregated like the log's and indexed
-/// by `BenchBatchStage`.
+/// A bench's sink for the step's bench-only batches and stage timers, aggregated like the
+/// log's and indexed by `BenchBatchStage` and `BenchTiming`.
 pub const StepBatches = if (enabled) struct {
     batches: [bench_batch_stage_count]BatchAggregate = @splat(.{}),
+    timings: [bench_timing_count]TimingAggregate = @splat(.{}),
 
     fn record(self: *StepBatches, stage: BenchBatchStage, stats: BatchStats) void {
         if (isEmptyBatch(stats)) return;
         self.batches[@backingInt(stage)].record(stats);
+    }
+
+    fn recordTiming(self: *StepBatches, timing: BenchTiming, duration_ns: u64) void {
+        self.timings[@backingInt(timing)].record(duration_ns);
     }
 } else struct {};
 
@@ -344,6 +405,11 @@ pub const Context = if (enabled) struct {
     pub fn recordBenchBatch(self: Context, stage: BenchBatchStage, stats: BatchStats) void {
         if (self.step_batches) |sink| sink.record(stage, stats);
     }
+
+    /// Reaches only a bound `StepBatches` sink; the log never records it.
+    pub fn recordBenchTiming(self: Context, timing: BenchTiming, duration_ns: u64) void {
+        if (self.step_batches) |sink| sink.recordTiming(timing, duration_ns);
+    }
 } else struct {
     pub fn bind(_: *RuntimePerfLog) Context {
         return .{};
@@ -354,6 +420,7 @@ pub const Context = if (enabled) struct {
     pub fn recordTiming(_: Context, _: Timing, _: u64) void {}
     pub fn recordBatch(_: Context, _: BatchStage, _: BatchStats) void {}
     pub fn recordBenchBatch(_: Context, _: BenchBatchStage, _: BatchStats) void {}
+    pub fn recordBenchTiming(_: Context, _: BenchTiming, _: u64) void {}
 };
 
 comptime {
@@ -361,6 +428,7 @@ comptime {
         std.debug.assert(@sizeOf(RuntimePerfLog) == 0);
         std.debug.assert(@sizeOf(Context) == 0);
         std.debug.assert(@sizeOf(StepBatches) == 0);
+        std.debug.assert(@sizeOf(BenchStageTimer) == 0);
     }
 }
 
@@ -396,6 +464,28 @@ pub const StageTimer = if (enabled) struct {
         return 0;
     }
     pub fn stop(_: StageTimer, _: Context, _: Timing) void {}
+};
+
+// A `BenchTiming` stage's wall-clock timer: it reads the clock only when `perf` has a bench
+// sink bound, so a game build pays one null check per stage. Zero-sized when perf logging is
+// disabled.
+pub const BenchStageTimer = if (enabled) struct {
+    start_ns: ?u64,
+
+    pub fn start(perf: Context) BenchStageTimer {
+        return .{ .start_ns = if (perf.step_batches != null) sdl.SDL_GetTicksNS() else null };
+    }
+
+    pub fn stop(self: BenchStageTimer, perf: Context, timing: BenchTiming) void {
+        const start_ns = self.start_ns orelse return;
+        const now = sdl.SDL_GetTicksNS();
+        perf.recordBenchTiming(timing, if (now > start_ns) now - start_ns else 0);
+    }
+} else struct {
+    pub fn start(_: Context) BenchStageTimer {
+        return .{};
+    }
+    pub fn stop(_: BenchStageTimer, _: Context, _: BenchTiming) void {}
 };
 
 const DisabledRuntimePerfLog = struct {
@@ -880,6 +970,9 @@ const TimingAggregate = struct {
 const BatchAggregate = struct {
     calls: u64 = 0,
     items: u64 = 0,
+    // The fewest and most items one call carried; zero before the first call.
+    min_items: u64 = 0,
+    max_items: u64 = 0,
     ranges: u64 = 0,
     inline_calls: u64 = 0,
     threaded_calls: u64 = 0,
@@ -897,6 +990,8 @@ const BatchAggregate = struct {
     max_active_worker_threads: usize = 0,
 
     fn record(self: *BatchAggregate, stats: BatchStats) void {
+        self.min_items = if (self.calls == 0) stats.item_count else @min(self.min_items, stats.item_count);
+        self.max_items = @max(self.max_items, stats.item_count);
         self.calls += 1;
         self.items += stats.item_count;
         self.ranges += stats.range_count;
@@ -1011,4 +1106,32 @@ test "a bench-only batch reaches a bound step sink and never the log" {
     try std.testing.expectEqual(@as(u64, 1), sink.batches[@backingInt(BenchBatchStage.movement)].threaded_calls);
     try std.testing.expectEqual(@as(u64, 0), sink.batches[@backingInt(BenchBatchStage.steering)].calls);
     for (log_under_test.batches) |batch| try std.testing.expectEqual(@as(u64, 0), batch.calls);
+}
+
+test "a batch aggregate keeps the fewest and most items one call carried" {
+    var log_under_test = EnabledRuntimePerfLog.init(0);
+    try std.testing.expectEqual(@as(u64, 0), log_under_test.batchValue(.nav_remask).min_items);
+    for ([_]usize{ 48, 16, 96 }) |items| log_under_test.recordBatch(.nav_remask, .{ .item_count = items, .range_count = 1, .batch_duration_ns = 100 });
+    const batch = log_under_test.batchValue(.nav_remask);
+    try std.testing.expectEqual(@as(u64, 3), batch.calls);
+    try std.testing.expectEqual(@as(u64, 16), batch.min_items);
+    try std.testing.expectEqual(@as(u64, 96), batch.max_items);
+}
+
+test "a bench-only stage timing reaches a bound step sink and never the log" {
+    if (comptime !enabled) {
+        try std.testing.expectEqual(@as(usize, 0), @sizeOf(BenchStageTimer));
+        return;
+    }
+    var log_under_test = EnabledRuntimePerfLog.init(0);
+    var sink = StepBatches{};
+    Context.bind(&log_under_test).recordBenchTiming(.pipeline_tier_policy, 40);
+    const bound = Context{ .logger = &log_under_test, .step_batches = &sink };
+    bound.recordBenchTiming(.pipeline_tier_policy, 40);
+    try std.testing.expectEqual(@as(u64, 1), sink.timings[@backingInt(BenchTiming.pipeline_tier_policy)].count);
+    try std.testing.expectEqual(@as(u64, 40), sink.timings[@backingInt(BenchTiming.pipeline_tier_policy)].total_ns);
+    for (log_under_test.timings) |timing| try std.testing.expectEqual(@as(u64, 0), timing.count);
+    // Unbound, the timer reads no clock and records nothing.
+    const unbound_timer = BenchStageTimer.start(Context.bind(&log_under_test));
+    try std.testing.expect(unbound_timer.start_ns == null);
 }

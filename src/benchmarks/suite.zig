@@ -21,6 +21,7 @@ const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const PerfBatchStage = @import("../app/runtime_perf_log.zig").BatchStage;
 const PerfBenchBatchStage = @import("../app/runtime_perf_log.zig").BenchBatchStage;
 const PerfMetric = @import("../app/runtime_perf_log.zig").Metric;
+const PerfBenchTiming = @import("../app/runtime_perf_log.zig").BenchTiming;
 const PerfTiming = @import("../app/runtime_perf_log.zig").Timing;
 const NavMainPhases = @import("../game/systems/pathfinding/types.zig").NavMainPhases;
 const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
@@ -551,6 +552,8 @@ pub const ProductionStepSummary = struct {
     main_ns: u64 = 0,
     untimed_ns: u64 = 0,
     stage_wall_ns: std.enums.EnumArray(PerfTiming, u64) = .initFill(0),
+    // The bench-only top-level stage timers' wall times the step hands the census's sink.
+    bench_stage_wall_ns: std.enums.EnumArray(PerfBenchTiming, u64) = .initFill(0),
     batch_off_main_ns: std.enums.EnumArray(PerfBatchStage, u64) = .initFill(0),
     batch_threaded_steps: std.enums.EnumArray(PerfBatchStage, usize) = .initFill(0),
     batch_recorded_steps: std.enums.EnumArray(PerfBatchStage, usize) = .initFill(0),

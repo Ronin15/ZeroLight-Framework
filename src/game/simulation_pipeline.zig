@@ -558,10 +558,16 @@ pub const SimulationPipelineStats = struct {
 
     /// Kept only with `runtime_perf_log.enabled`: this step's plane-traversal scratch and
     /// plane-entry window growths past their reservations (the reservation short of the
-    /// live population; zero in steady state), and the chunk derive's batch.
+    /// live population; zero in steady state), and the batches of the stages the pipeline
+    /// runs itself: the scope passes, the plane-entry gather, and the chunk derive.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         dig_plane_scratch_grows: usize = 0,
         plane_entry_window_grows: usize = 0,
+        scope_ai_gather: BatchStats = .{},
+        scope_cognition: BatchStats = .{},
+        scope_collision_gather: BatchStats = .{},
+        scope_tier_policy: BatchStats = .{},
+        plane_entry: BatchStats = .{},
         chunk_derive: BatchStats = .{},
     } else struct {};
 
@@ -575,6 +581,10 @@ pub const SimulationPipelineStats = struct {
         const movement_stats = self.movement;
         const collision_stats = self.collision;
         const collision_response_stats = self.collision_response;
+        const ai_memory_stats = self.ai_memory;
+        const affect_stats = self.affect;
+        const path_goals_stats = self.path_goals;
+        const apply_intents_stats = self.apply_intents;
 
         perf.recordMetric(.scope_total_entities, metric(scope_stats.total_entities));
         perf.recordMetric(.scope_dormant_entities, metric(scope_stats.dormant_entities));
@@ -591,8 +601,20 @@ pub const SimulationPipelineStats = struct {
             perf.recordMetric(.scope_chunk_filtered_entities, metric(scope_stats.perf.chunk_filtered_entities));
         }
 
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordBenchBatch(.scope_ai_gather, self.perf.scope_ai_gather);
+            perf.recordBenchBatch(.scope_cognition, self.perf.scope_cognition);
+            perf.recordBenchBatch(.scope_collision_gather, self.perf.scope_collision_gather);
+            perf.recordBenchBatch(.scope_tier_policy, self.perf.scope_tier_policy);
+            perf.recordBenchBatch(.plane_entry, self.perf.plane_entry);
+        }
+
         // The sort is the build's cost driver; the bucket and link stages stay bench-only.
-        if (comptime runtime_perf_log.enabled) perf.recordBatch(.spatial_index_build, spatial_index_stats.perf.sort_batch);
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordBatch(.spatial_index_build, spatial_index_stats.perf.sort_batch);
+            perf.recordBenchBatch(.spatial_index_bucket, spatial_index_stats.perf.bucket_batch);
+            perf.recordBenchBatch(.spatial_index_link, spatial_index_stats.perf.link_batch);
+        }
 
         if (comptime runtime_perf_log.enabled) {
             perf.recordMetric(.perception_observers, metric(perception_stats.perf.observer_count));
@@ -601,15 +623,24 @@ pub const SimulationPipelineStats = struct {
             perf.recordMetric(.perception_los_blocked, metric(perception_stats.perf.los_blocked));
             perf.recordMetric(.perception_nearest_threat_found, metric(perception_stats.perf.nearest_threat_found_count));
             perf.recordMetric(.perception_candidate_checks, metric(perception_stats.perf.candidate_checks));
+            perf.recordBenchBatch(.perception_gather, perception_stats.perf.gather_batch);
             perf.recordBenchBatch(.perception, perception_stats.perf.batch);
+            perf.recordBenchBatch(.ai_memory_gather, ai_memory_stats.perf.gather_batch);
+            perf.recordBenchBatch(.ai_memory_order, ai_memory_stats.perf.order_batch);
+            perf.recordBenchBatch(.ai_memory_visible, ai_memory_stats.perf.visible_batch);
+            perf.recordBenchBatch(.ai_memory_decay, ai_memory_stats.perf.batch);
+            perf.recordBenchBatch(.affect, affect_stats.perf.batch);
         }
 
         if (comptime runtime_perf_log.enabled) {
             perf.recordMetric(.ai_entities, metric(ai_stats.perf.entity_count));
             perf.recordMetric(.ai_separation_candidate_checks, metric(ai_stats.perf.separation_candidate_checks));
             perf.recordMetric(.ai_separation_neighbor_samples, metric(ai_stats.perf.separation_neighbor_samples));
+            perf.recordBenchBatch(.ai_gather, ai_stats.perf.gather_batch);
             perf.recordBenchBatch(.ai_separation, ai_stats.perf.separation_batch);
             perf.recordBenchBatch(.ai_intent, ai_stats.perf.intent_batch);
+            perf.recordBenchBatch(.path_goal_scan, path_goals_stats.perf.scan_batch);
+            perf.recordBenchBatch(.path_goal_project, path_goals_stats.perf.project_batch);
         }
 
         perf.recordMetric(.steering_navigation_intents, metric(steering_stats.navigation_intent_count));
@@ -627,6 +658,12 @@ pub const SimulationPipelineStats = struct {
             perf.recordMetric(.steering_obstacle_samples, metric(steering_stats.perf.obstacle_samples));
             perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.perf.agent_candidate_checks));
             perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.perf.obstacle_candidate_checks));
+            perf.recordBenchBatch(.steering_agents, steering_stats.perf.agents_batch);
+            perf.recordBenchBatch(.steering_select_resolve, steering_stats.perf.select_resolve_batch);
+            perf.recordBenchBatch(.steering_select_claim, steering_stats.perf.select_claim_batch);
+            perf.recordBenchBatch(.steering_directions, steering_stats.perf.directions_batch);
+            perf.recordBenchBatch(.steering_grid_bucket, steering_stats.perf.grid_bucket_batch);
+            perf.recordBenchBatch(.steering_grid_sort, steering_stats.perf.grid_sort_batch);
             perf.recordBenchBatch(.steering, steering_stats.perf.batch);
         }
         perf.recordTiming(.steering_select, steering_stats.select_ns);
@@ -663,6 +700,11 @@ pub const SimulationPipelineStats = struct {
             perf.recordBenchBatch(.path_solve, pathfinding_stats.perf.solve_batch);
             perf.recordBatch(.path_intake, pathfinding_stats.perf.intake_batch);
             perf.recordBatch(.path_registry_flush, pathfinding_stats.perf.registry_flush_batch);
+            perf.recordBenchBatch(.path_registry_flush_count, pathfinding_stats.perf.registry_flush_count_batch);
+            perf.recordBenchBatch(.path_registry_rename, pathfinding_stats.perf.registry_rename_batch);
+            perf.recordBenchBatch(.path_group_field_advance, pathfinding_stats.perf.group_field_batch);
+            perf.recordBenchBatch(.path_group_field_begin, pathfinding_stats.perf.group_field_begin_batch);
+            perf.recordBenchBatch(.path_publish_copy, pathfinding_stats.perf.publish_copy_batch);
         }
         perf.recordTiming(.pathfinding_accept, pathfinding_stats.accept_ns);
         perf.recordTiming(.pathfinding_group_service, pathfinding_stats.group_service_ns);
@@ -676,6 +718,7 @@ pub const SimulationPipelineStats = struct {
 
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
         if (comptime runtime_perf_log.enabled) {
+            perf.recordBenchBatch(.apply_intents, apply_intents_stats.perf.batch);
             perf.recordBenchBatch(.movement, movement_stats.perf.batch);
             perf.recordBenchBatch(.chunk_derive, self.perf.chunk_derive);
         }
@@ -716,6 +759,11 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
         perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
         perf.recordMetric(.collision_response_triggers, metric(collision_response_stats.trigger_count));
+        if (comptime runtime_perf_log.enabled) {
+            perf.recordBenchBatch(.collision_response_gather, collision_response_stats.perf.gather_batch);
+            perf.recordBenchBatch(.collision_response_place, collision_response_stats.perf.place_batch);
+            perf.recordBenchBatch(.collision_response_apply, collision_response_stats.perf.apply_batch);
+        }
 
         perf.recordMetric(.stimuli_live_dropped, metric(self.stimuli_live_dropped));
         perf.recordMetric(.stimuli_deferred_dropped, metric(self.stimuli_deferred_dropped));
@@ -1613,10 +1661,14 @@ pub const SimulationPipeline = struct {
     /// keep running off-screen.
     fn stageScopeAdvanceAndAiGather(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
+        const scope_gather_timer = BenchStageTimer.start(context.perf);
         self.scope.advanceStep();
         step.cognition_region = context.world.cognitionRegionForWorldRect(context.sim_view, sim_view_overscan_chunks, cognition_halo_chunks);
         step.stagger_step = self.scope.staggerStep();
-        step.ai_halo_indices = (try self.scope.gatherAiPopulations(context.data, step.cognition_region, context.thread_system, .{})).halo;
+        const gathered = try self.scope.gatherAiPopulations(context.data, step.cognition_region, context.thread_system, .{});
+        step.ai_halo_indices = gathered.halo;
+        if (comptime runtime_perf_log.enabled) step.perf.scope_ai_gather = gathered.perf.batch;
+        scope_gather_timer.stop(context.perf, .pipeline_scope_gather);
     }
 
     /// Shared neighbor index: built once from the unstaggered halo, at the
@@ -1639,9 +1691,12 @@ pub const SimulationPipeline = struct {
     /// cognition region), in the index's cell-major order.
     fn stageAiCognitionOrder(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
+        const cognition_order_timer = BenchStageTimer.start(context.perf);
         const index = self.spatial_index.view();
         const result = try self.scope.compactCognition(&index, step.stagger_step, step.cognition_region != null, context.thread_system, .{});
         step.ai_cognition_indices = result.cognition;
+        if (comptime runtime_perf_log.enabled) step.perf.scope_cognition = result.perf.batch;
+        cognition_order_timer.stop(context.perf, .pipeline_cognition_order);
     }
 
     /// Perception: hostile candidates within vision/FOV/line-of-sight
@@ -1797,7 +1852,11 @@ pub const SimulationPipeline = struct {
     /// colliding. Null indices mean full-active.
     fn stageCollisionScopeGather(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
-        step.collision_scope_indices = (try self.scope.gatherCollisionBoundsIndices(context.data, context.thread_system, .{})).indices;
+        const collision_scope_timer = BenchStageTimer.start(context.perf);
+        const gathered = try self.scope.gatherCollisionBoundsIndices(context.data, context.thread_system, .{});
+        step.collision_scope_indices = gathered.indices;
+        if (comptime runtime_perf_log.enabled) step.perf.scope_collision_gather = gathered.perf.batch;
+        collision_scope_timer.stop(context.perf, .pipeline_collision_scope);
     }
 
     fn stageCollisionDetect(self: *SimulationPipeline, step: *StepState) !void {
@@ -1836,13 +1895,16 @@ pub const SimulationPipeline = struct {
     /// standing over a hole (`runPlaneTraversal`).
     fn stagePlaneTraversal(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
+        const plane_traversal_timer = BenchStageTimer.start(context.perf);
         const scratch_grows_before = if (comptime runtime_perf_log.enabled) self.dig.perf.plane_scratch_grows else 0;
         const window_grows_before = if (comptime runtime_perf_log.enabled) self.plane_entry.perf.window_grows else 0;
         try runPlaneTraversal(&self.plane_entry, &self.dig, &self.pathfinding, context.world, context.data, context.player, context.frame, context.thread_system);
         if (comptime runtime_perf_log.enabled) {
             step.perf.plane_entry_window_grows = @intCast(self.plane_entry.perf.window_grows - window_grows_before);
             step.perf.dig_plane_scratch_grows = @intCast(self.dig.perf.plane_scratch_grows - scratch_grows_before);
+            step.perf.plane_entry = self.plane_entry.perf.last_batch;
         }
+        plane_traversal_timer.stop(context.perf, .pipeline_plane_traversal);
     }
 
     /// Recompute each body's chunk from its settled position. Consumers are tier
@@ -1864,12 +1926,14 @@ pub const SimulationPipeline = struct {
     /// First domain consumer of action intents carried from input capture.
     fn stageActionReact(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
+        const action_react_timer = BenchStageTimer.start(context.perf);
         step.destructible = try self.destructible.process(
             context.frame,
             context.data,
             context.world,
             context.particles,
         );
+        action_react_timer.stop(context.perf, .pipeline_action_react);
     }
 
     /// Assign cognition/locomotion/kinematic/dormant by cube distance from the
@@ -1877,7 +1941,10 @@ pub const SimulationPipeline = struct {
     /// player's, so off-level entities demote. Queues nothing when no tier changed.
     fn stageTierPolicy(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
-        _ = try self.scope.queueTierChanges(context.data, simViewRegion(context), &context.frame.structural_commands, context.thread_system, .{});
+        const tier_policy_timer = BenchStageTimer.start(context.perf);
+        const tier_policy = try self.scope.queueTierChanges(context.data, simViewRegion(context), &context.frame.structural_commands, context.thread_system, .{});
+        if (comptime runtime_perf_log.enabled) step.perf.scope_tier_policy = tier_policy;
+        tier_policy_timer.stop(context.perf, .pipeline_tier_policy);
     }
 
     fn buildScopeStats(
@@ -1905,6 +1972,7 @@ pub const SimulationPipeline = struct {
     }
 };
 
+const BenchStageTimer = @import("../app/runtime_perf_log.zig").BenchStageTimer;
 const StageTimer = @import("../app/runtime_perf_log.zig").StageTimer;
 
 const data_test_support = @import("data_system/test_support.zig");

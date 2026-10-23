@@ -3,9 +3,10 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Shared private fixtures: tuner pins for the pipeline's tests and the benches' dispatch
-//! checks, and the steering-after-commit scene the pipeline's seam tests and the demo's
-//! nav-OOM test drive, and the one-agent pipeline fixture both files' seam and event-budget
-//! tests build. Test-only: no production path imports it.
+//! checks, the named tuner walk the benches' census reads, the steering-after-commit scene
+//! the pipeline's seam tests and the demo's nav-OOM test drive, and the one-agent pipeline
+//! fixture both files' seam and event-budget tests build. Test-only: no production path
+//! imports it.
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -32,18 +33,36 @@ pub fn pinPipelineThreadedProfiles(pipeline: *SimulationPipeline, profile: Adapt
 /// array element, or a set optional, at any depth. A single pointer is not owned, so it is
 /// not walked.
 pub fn pinTunersIn(comptime T: type, value: *T, profile: AdaptiveWorkProfile) void {
-    if (T == AdaptiveWorkTuner) return pinThreadedProfile(value, profile);
+    var pin = PinVisitor{ .profile = profile };
+    forEachTunerIn(T, value, "", &pin);
+}
+
+const PinVisitor = struct {
+    profile: AdaptiveWorkProfile,
+
+    pub fn visit(self: *PinVisitor, comptime _: []const u8, tuner: *AdaptiveWorkTuner) void {
+        pinThreadedProfile(tuner, self.profile);
+    }
+};
+
+/// Calls `visitor.visit(comptime path, tuner)` on every `AdaptiveWorkTuner` `value` holds by
+/// value, in field order, as `pinTunersIn` pins them. `path` is `root_path` plus each field
+/// name (`.name`) and array element (`[i]`) to the tuner, so it names one tuner.
+pub fn forEachTunerIn(comptime T: type, value: *T, comptime root_path: []const u8, visitor: anytype) void {
+    if (T == AdaptiveWorkTuner) return visitor.visit(root_path, value);
     switch (@typeInfo(T)) {
         .@"struct" => |info| inline for (info.field_names, info.field_types) |name, Field| {
-            if (comptime holdsTuner(Field)) pinTunersIn(Field, &@field(value, name), profile);
+            if (comptime holdsTuner(Field)) forEachTunerIn(Field, &@field(value, name), root_path ++ "." ++ name, visitor);
         },
-        .array => |info| for (value) |*element| pinTunersIn(info.child, element, profile),
-        .optional => |info| if (value.*) |*payload| pinTunersIn(info.child, payload, profile),
+        .array => |info| inline for (0..info.len) |index| {
+            forEachTunerIn(info.child, &value[index], root_path ++ std.fmt.comptimePrint("[{d}]", .{index}), visitor);
+        },
+        .optional => |info| if (value.*) |*payload| forEachTunerIn(info.child, payload, root_path, visitor),
         else => {},
     }
 }
 
-// Whether a `T` holds an `AdaptiveWorkTuner` where `pinTunersIn` walks. A tuner the walk
+// Whether a `T` holds an `AdaptiveWorkTuner` where `forEachTunerIn` walks. A tuner the walk
 // cannot reach fails the build: in a union (which variant is live), behind a slice or
 // many-item pointer (owned heap rows), or in an error-union payload.
 fn holdsTuner(comptime T: type) bool {
@@ -56,13 +75,13 @@ fn holdsTuner(comptime T: type) bool {
         .array => |info| holdsTuner(info.child),
         .optional => |info| holdsTuner(info.child),
         .@"union" => |info| for (info.field_types) |Field| {
-            if (holdsTuner(Field)) @compileError("pinTunersIn cannot walk a tuner in union " ++ @typeName(T));
+            if (holdsTuner(Field)) @compileError("forEachTunerIn cannot walk a tuner in union " ++ @typeName(T));
         } else false,
         .pointer => |info| switch (info.size) {
             .one => false,
-            .slice, .many, .c => if (holdsTuner(info.child)) @compileError("pinTunersIn cannot walk a tuner behind " ++ @typeName(T)) else false,
+            .slice, .many, .c => if (holdsTuner(info.child)) @compileError("forEachTunerIn cannot walk a tuner behind " ++ @typeName(T)) else false,
         },
-        .error_union => |info| if (holdsTuner(info.payload)) @compileError("pinTunersIn cannot walk a tuner in error union " ++ @typeName(T)) else false,
+        .error_union => |info| if (holdsTuner(info.payload)) @compileError("forEachTunerIn cannot walk a tuner in error union " ++ @typeName(T)) else false,
         else => false,
     };
 }
