@@ -1079,10 +1079,11 @@ pub fn RangeOutputStream(comptime T: type) type {
             return running_total;
         }
 
-        // Extends the values to `running_total` slots in reserved capacity.
+        // Extends the values to `running_total` slots in reserved capacity, in O(1): range
+        // writers fill every slot.
         fn extendValues(self: *Self, running_total: usize) void {
-            while (self.values.items.len < running_total) {
-                self.values.appendAssumeCapacity(undefined);
+            if (self.values.items.len < running_total) {
+                _ = self.values.addManyAsSliceAssumeCapacity(running_total - self.values.items.len);
             }
             self.merged_len = running_total;
         }
