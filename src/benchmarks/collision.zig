@@ -101,9 +101,38 @@
 //! the analytic contact count; every measured step packs every stored pair, on workers in a
 //! fixed threaded case; one step with no allow crossing packs nothing; and the cold step,
 //! whose wide dynamic outgrows its static query slot's reserved hit rows while the broadphase
-//! stays inside the pair bound, is flagged and counted once.
+//! stays inside the pair bound, is flagged and counted once. Its dormant variant (item code
+//! `1_000_000 + pairs`) makes every eighth trigger dormant (trigger B of each cell 4m + 3), so a
+//! quarter of the stored pairs are kept but filtered from the contacts; same pass shape and
+//! asserts, the contact count less the dormant pairs and the wide dynamic's dormant hits.
 //!
-//! Every group prints `candidate_pairs=` and `contacts=`, the shape groups `per_body=`
+//! The trigger patch groups time only the trigger refresh after a commit seam
+//! (`fixtures.CommitSeam`, then `CollisionSystem.refreshCommittedTriggers`), on the case's
+//! thread system, in a world fixed at the largest size's. They assert fixture invariants
+//! only, not their pass shapes: the cold store's pair count, that each sync changes exactly
+//! the moved statics, that the patch requeried (not a rebuild: the rows it requeries), and
+//! the stored pair count after every patch. The patch has no tuner and takes no range
+//! control, so they run `serial-direct` and the fixed worker-count cases only, no adaptive
+//! case. Each prints `per_change=`, and with `--details` the main share in `serial-direct`
+//! only (no worker exists, so the whole refresh is main; a threaded requery's batch is not
+//! exposed) and, under each row, the requery rows and the stored pairs.
+//! - `collision-static-trigger-change`: the `collision-static-triggers` fixture's stored pairs
+//!   in the corner of the largest count's grid, plus one solid alternating between cell 0's
+//!   and cell 1's triggers (drops two pairs, adds two; requeries the solid and its two
+//!   triggers). Pass shape: patch time and main per change flat in stored pairs.
+//! - `collision-static-trigger-dense-change`: the `collision-static-dense-change` world and
+//!   moves, with every other static (a checkerboard, the last row and column solid) a
+//!   trigger reaching half a tile into its neighbours' cells, so each overlaps its right and
+//!   lower solids and its diagonal triggers; the home pair count is checked against those
+//!   overlaps, the away count against a cold rebuild at the first away revision. Pass shape:
+//!   main per changed static flat in the change count.
+//! - `collision-static-trigger-wide`: one trigger one chunk row tall and the world wide over
+//!   the item count of solids, in eight rows on the two-tile pitch, the world as wide as the
+//!   largest count's columns and the solids on a column stride of the largest count over the
+//!   item count; the middle solid alternates with its free diagonal tile each step (requeries
+//!   it and the trigger). Pass shape: flat in the solids under the trigger.
+//!
+//! Every collision-step group prints `candidate_pairs=` and `contacts=`, the shape groups `per_body=`
 //! (mean time per body), the static groups `per_dynamic=` (`collision-static-triggers`
 //! `per_pair=`, per stored pair); `--details` adds each stage's
 //! shape and batch time, `fill=`, `sort=`, `broad=` (the row's batch, its mean time; the
@@ -253,11 +282,43 @@ pub const static_dense_spike_group = suite.BenchmarkGroup{
 
 pub const static_triggers_group = suite.BenchmarkGroup{
     .name = "collision-static-triggers",
-    .item_label = "stored trigger pairs",
-    .item_counts = &trigger_pair_counts,
+    .item_label = TriggerCode.label,
+    .item_counts = &static_triggers_item_counts,
     .runCase = runStaticTriggersCase,
     .write_workload = writeTriggerWorkload,
 };
+
+pub const static_trigger_change_group = suite.BenchmarkGroup{
+    .name = "collision-static-trigger-change",
+    .item_label = "stored trigger pairs",
+    .item_counts = &trigger_pair_counts,
+    .runCase = runStaticTriggerChangeCase,
+    .write_workload = writeTriggerPatchWorkload,
+    .cases = &trigger_patch_cases,
+};
+
+pub const static_trigger_dense_change_group = suite.BenchmarkGroup{
+    .name = "collision-static-trigger-dense-change",
+    .item_label = "statics changed in one commit",
+    .item_counts = &dense_change_counts,
+    .runCase = runStaticTriggerDenseChangeCase,
+    .write_workload = writeTriggerPatchWorkload,
+    .cases = &trigger_patch_cases,
+};
+
+pub const static_trigger_wide_group = suite.BenchmarkGroup{
+    .name = "collision-static-trigger-wide",
+    .item_label = "statics under the wide trigger",
+    .item_counts = &trigger_wide_counts,
+    .runCase = runStaticTriggerWideCase,
+    .write_workload = writeTriggerPatchWorkload,
+    .cases = &trigger_patch_cases,
+};
+
+// The trigger patch groups' cases: the requery has no tuner and takes no range control, so
+// only the worker count reaches it, and the range and adaptive cases would repeat
+// `thread-fixed-auto`.
+const trigger_patch_cases = suite.casesNamed(&.{ "serial-direct", "thread-fixed-1", "thread-fixed-2", "thread-fixed-auto" });
 
 const FixtureMode = enum {
     dense,
@@ -597,6 +658,7 @@ fn runStaticCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Option
     var colliders = StaticColliderSystem.init(allocator);
     defer colliders.deinit();
     if (!move_static) {
+        // The fixture's two-tile pitch grid side fits u32.
         const cells: u32 = @intCast(2 * fixture.side);
         try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles), null);
     }
@@ -618,6 +680,17 @@ fn runStaticCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Option
 // ----------------------------------------------------------------------------
 
 const trigger_pair_counts = [_]usize{ 1_024, 4_096, 16_384 };
+// `collision-static-triggers`' configs: the stored pair count, and whether every eighth
+// trigger is dormant. The all-allowed configs' codes are their pair counts.
+const TriggerCode = suite.ItemCode(struct { every_eighth_trigger_dormant: bool, stored_trigger_pairs: u32 }, &.{6});
+const static_triggers_item_counts = blk: {
+    var codes: [2 * trigger_pair_counts.len]usize = undefined;
+    for (trigger_pair_counts, 0..) |pairs, index| {
+        codes[index] = TriggerCode.of(.{ .every_eighth_trigger_dormant = false, .stored_trigger_pairs = pairs });
+        codes[trigger_pair_counts.len + index] = TriggerCode.of(.{ .every_eighth_trigger_dormant = true, .stored_trigger_pairs = pairs });
+    }
+    break :blk codes;
+};
 const trigger_dynamic_count: usize = 512;
 // Trigger B sits half a tile down and right of trigger A in its pitch cell: one stored pair
 // per cell, clear of the next cell (B ends at 48 of the 64-unit pitch).
@@ -626,6 +699,10 @@ const trigger_pair_offset: f32 = tile_size / 2;
 const trigger_free_slot_offset: f32 = tile_size + trigger_pair_offset + 2;
 // The wide dynamic covers a square of this many pitch cells a side, both triggers of each.
 const trigger_wide_cells: usize = 10;
+// In the dormant variant, every eighth trigger in creation order is dormant: trigger B of
+// each cell 4m + 3, so its cell's stored pair is kept and filtered from the contacts.
+const trigger_dormant_cell_stride: usize = 4;
+const trigger_dormant_cell: usize = 3;
 
 // One trigger whose tier crosses the allow bit each step, so every step moves the collision
 // allow epoch and repacks the stored pairs' allow column.
@@ -645,42 +722,60 @@ const TriggerFixture = struct {
     data: DataSystem,
     side: usize,
     toggle: AllowToggle,
+    // Dormant triggers: every one's stored pair, and those under the wide dynamic.
+    dormant_pairs: usize = 0,
+    dormant_wide: usize = 0,
 
-    // The kinematic trigger's pair, the toggled trigger's pair while it is excluded, every
-    // slot-0 dynamic on its cell's trigger A, and the wide dynamic on both triggers of its
-    // cells.
+    // The kinematic trigger's pair, the toggled trigger's pair while it is excluded, and the
+    // dormant triggers' pairs are filtered; every slot-0 dynamic is on its cell's trigger A,
+    // and the wide dynamic on both triggers of its cells less the dormant ones.
     fn contacts(self: *const TriggerFixture) usize {
-        const pairs = self.toggle.stored_pairs - 1 - @intFromBool(self.toggle.excluded);
-        return pairs + trigger_dynamic_count / 2 + 2 * trigger_wide_cells * trigger_wide_cells;
+        const pairs = self.toggle.stored_pairs - 1 - @intFromBool(self.toggle.excluded) - self.dormant_pairs;
+        return pairs + trigger_dynamic_count / 2 + 2 * trigger_wide_cells * trigger_wide_cells - self.dormant_wide;
     }
 };
 
-fn addTrigger(data: *DataSystem, position: math.Vec2) !EntityId {
-    const entity = try fixtures.addBody(data, position, .{ .x = static_size, .y = static_size }, .static);
+fn addTrigger(data: *DataSystem, position: math.Vec2, size: math.Vec2) !EntityId {
+    const entity = try fixtures.addBody(data, position, size, .static);
     try data.setCollisionResponse(entity, .{ .mobility = .static, .mode = .trigger });
     return entity;
 }
 
+fn triggerCellDormant(cell: usize, dormant_eighth: bool) bool {
+    return dormant_eighth and cell % trigger_dormant_cell_stride == trigger_dormant_cell;
+}
+
 // `pair_count` cells row-major on the pitch grid, two overlapping triggers each. Cell 0's
-// trigger B is kinematic, so exclusion stays on; cell 1's is the toggle. The dynamics fill
-// the first cells, dynamic k in slot k % 2 of cell k / 2, and one wide dynamic covers the
-// grid's last `trigger_wide_cells` square.
-fn createTriggerFixture(allocator: std.mem.Allocator, pair_count: usize) !TriggerFixture {
+// trigger B is kinematic, so exclusion stays on; cell 1's is the toggle; with
+// `dormant_eighth`, trigger B of each cell 4m + 3 is dormant. The dynamics fill the first
+// cells, dynamic k in slot k % 2 of cell k / 2, and one wide dynamic covers the grid's last
+// `trigger_wide_cells` square.
+fn createTriggerFixture(allocator: std.mem.Allocator, pair_count: usize, dormant_eighth: bool) !TriggerFixture {
     const side = std.math.sqrt(pair_count);
     if (side * side != pair_count) return error.TriggerPairCountNotSquare;
     if (trigger_dynamic_count / 2 + trigger_wide_cells * side > pair_count) return error.TriggerGridTooSmall;
+    comptime std.debug.assert(!triggerCellDormant(0, true) and !triggerCellDormant(1, true));
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
+    const trigger_size = math.Vec2{ .x = static_size, .y = static_size };
     var toggled = EntityId.invalid;
+    var dormant_pairs: usize = 0;
+    var dormant_wide: usize = 0;
     for (0..side) |cell_y| for (0..side) |cell_x| {
         const origin = pitchCellOrigin(cell_x, cell_y);
-        _ = try addTrigger(&data, origin);
-        const b = try addTrigger(&data, .{ .x = origin.x + trigger_pair_offset, .y = origin.y + trigger_pair_offset });
+        _ = try addTrigger(&data, origin, trigger_size);
+        const b = try addTrigger(&data, .{ .x = origin.x + trigger_pair_offset, .y = origin.y + trigger_pair_offset }, trigger_size);
         const cell = cell_y * side + cell_x;
         if (cell == 0) try data.setSimulationTier(b, .kinematic);
         if (cell == 1) toggled = b;
+        if (triggerCellDormant(cell, dormant_eighth)) {
+            try data.setSimulationTier(b, .dormant);
+            dormant_pairs += 1;
+            if (cell_x >= side - trigger_wide_cells and cell_y >= side - trigger_wide_cells) dormant_wide += 1;
+        }
     };
+    if (dormant_eighth and dormant_pairs != pair_count / trigger_dormant_cell_stride) return error.TriggerDormantCountMismatch;
     for (0..trigger_dynamic_count) |index| {
         const cell = index / 2;
         const origin = pitchCellOrigin(cell % side, cell / side);
@@ -690,27 +785,226 @@ fn createTriggerFixture(allocator: std.mem.Allocator, pair_count: usize) !Trigge
     const corner = pitchCellOrigin(side - trigger_wide_cells, side - trigger_wide_cells);
     const wide = @as(f32, @floatFromInt(trigger_wide_cells)) * static_pitch - 2;
     _ = try fixtures.addBody(&data, .{ .x = corner.x + 1, .y = corner.y + 1 }, .{ .x = wide, .y = wide }, .dynamic);
-    return .{ .data = data, .side = side, .toggle = .{ .entity = toggled, .stored_pairs = pair_count } };
+    return .{
+        .data = data,
+        .side = side,
+        .toggle = .{ .entity = toggled, .stored_pairs = pair_count },
+        .dormant_pairs = dormant_pairs,
+        .dormant_wide = dormant_wide,
+    };
 }
 
-fn runStaticTriggersCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, pair_count: usize) !suite.RunStats {
+fn runStaticTriggersCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var fixture = try createTriggerFixture(allocator, pair_count);
+    const config = try TriggerCode.decode(item_count);
+    const pair_count: usize = config.stored_trigger_pairs;
+    var fixture = try createTriggerFixture(allocator, pair_count, config.every_eighth_trigger_dormant);
     defer fixture.data.deinit();
     var colliders = StaticColliderSystem.init(allocator);
     defer colliders.deinit();
+    // The fixture's two-tile pitch grid side fits u32.
     const cells: u32 = @intCast(2 * fixture.side);
     try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles), null);
     if (static_colliders_test_support.liveRowCount(colliders) != 2 * pair_count) return error.WrongStaticCount;
 
-    const stats = try measureCase(allocator, io, options, case, pair_count, &fixture.data, .{
+    var stats = try measureCase(allocator, io, options, case, pair_count, &fixture.data, .{
         .colliders = &colliders,
         .toggle = &fixture.toggle,
         .reserved_cold_growth = true,
         .swept_bodies = trigger_dynamic_count + 1,
     });
     if (stats.iterations > 0 and stats.output_count != fixture.contacts()) return error.CollisionContactCountMismatch;
+    // The header names the config; throughput and `per_pair=` stay per stored pair.
+    stats.item_count = item_count;
     return stats;
+}
+
+// ----------------------------------------------------------------------------
+// Static trigger patches: statics moved through the commit seam, then the stored trigger
+// pairs brought up to the synced colliders through the seam entry
+// (`CollisionSystem.refreshCommittedTriggers`), timed alone.
+// ----------------------------------------------------------------------------
+
+// A solid's offset in its pitch cell: it overlaps both of the cell's triggers.
+const trigger_change_solid_offset: f32 = tile_size / 4;
+// The change group's fixed world: the largest count's pitch grid, every count's grid in its
+// corner.
+const trigger_change_geometry = blk: {
+    const side = std.math.sqrt(trigger_pair_counts[trigger_pair_counts.len - 1]);
+    // The largest count's two-tile pitch grid side fits u32.
+    const cells: u32 = @intCast(2 * side);
+    break :blk ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles);
+};
+const trigger_wide_counts = [_]usize{ 256, 1_024, 4_096 };
+// Static rows under the wide trigger: one chunk row of tiles on the two-tile pitch.
+const trigger_wide_rows: usize = default_chunk_size_tiles / 2;
+// The wide group's fixed world width: the largest count's columns on the two-tile pitch.
+const trigger_wide_max_columns: usize = trigger_wide_counts[trigger_wide_counts.len - 1] / trigger_wide_rows;
+const trigger_wide_tiles_x: usize = 2 * trigger_wide_max_columns;
+const trigger_wide_geometry = blk: {
+    // The largest count's world width and one chunk row fit u32.
+    const cells_x: u32 = @intCast(trigger_wide_tiles_x);
+    const cells_y: u32 = @intCast(default_chunk_size_tiles);
+    break :blk ColliderGeometry.init(tile_size, cells_x, cells_y, default_chunk_size_tiles);
+};
+
+// One timed trigger refresh: its time and the rows the patch requeried.
+const TriggerPatch = struct {
+    ns: u64,
+    rows: usize,
+};
+
+// Brings `system`'s stored trigger pairs up to `colliders`' synced revision, timed. A
+// rebuild requeries every row, so callers check the rows for the warm patch.
+fn refreshTriggersTimed(system: *CollisionSystem, data: *const DataSystem, colliders: *const StaticColliderSystem, threads: *ThreadSystem, io: std.Io) !TriggerPatch {
+    const view = colliders.view();
+    const start_ns = suite.nowNs(io);
+    try system.refreshCommittedTriggers(data, view, threads);
+    const end_ns = suite.nowNs(io);
+    if (system.seen_revision != view.revision) return error.TriggerRefreshMissedRevision;
+    return .{ .ns = suite.elapsedNs(start_ns, end_ns), .rows = system.trigger_rows.items.len };
+}
+
+// The timed refreshes of one case. The requery reports no batch, so main time is known
+// only on a thread system with no workers, where the whole refresh runs on main.
+const TriggerPatchSamples = struct {
+    accumulator: suite.StatsAccumulator,
+    last_rows: ?usize = null,
+
+    fn init(item_count: usize) TriggerPatchSamples {
+        return .{ .accumulator = suite.StatsAccumulator.init(item_count) };
+    }
+
+    fn record(self: *TriggerPatchSamples, patch: TriggerPatch) void {
+        self.accumulator.record(patch.ns, .{});
+        self.last_rows = patch.rows;
+    }
+
+    // `changes` is the statics changed per patch (`per_change=`), `stored_pairs` the last
+    // patch's.
+    fn finish(self: *const TriggerPatchSamples, threads: *const ThreadSystem, changes: usize, stored_pairs: usize) suite.RunStats {
+        var stats = self.accumulator.finish();
+        stats.batch_carried = false;
+        stats.sample_count = changes;
+        if (threads.workerThreadCount() == 0 and stats.iterations > 0) stats.main_ns = stats.mean_ns;
+        if (self.last_rows) |rows| stats.details.print("requery_rows={} stored_pairs={}\n", .{ rows, stored_pairs });
+        return stats;
+    }
+};
+
+// What one moved static's patch must show: the colliders' rows, the stored pairs after
+// every patch (the cold rebuild's too), and the rows the patch requeries.
+const TriggerPatchShape = struct {
+    static_count: usize,
+    stored_pairs: usize,
+    requery_rows: usize,
+};
+
+fn runStaticTriggerChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, pair_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var fixture = try createTriggerFixture(allocator, pair_count, false);
+    defer fixture.data.deinit();
+    // One solid alternating between cell 0's and cell 1's triggers: each move drops two
+    // stored pairs and adds two.
+    const home = pitchCellOrigin(0, 0);
+    const away = pitchCellOrigin(1, 0);
+    const offset = trigger_change_solid_offset;
+    const solid = try fixtures.addBody(&fixture.data, .{ .x = home.x + offset, .y = home.y + offset }, .{ .x = static_size, .y = static_size }, .static);
+    var move = fixtures.StaticMove{ .entity = solid, .positions = .{ .{ .x = home.x + offset, .y = home.y + offset }, .{ .x = away.x + offset, .y = away.y + offset } } };
+    var stats = try measureTriggerPatches(allocator, io, options, case, &fixture.data, trigger_change_geometry, &move, .{
+        .static_count = 2 * pair_count + 1,
+        .stored_pairs = pair_count + 2,
+        // The solid and the two triggers at its new tile.
+        .requery_rows = 3,
+    });
+    stats.item_count = pair_count;
+    return stats;
+}
+
+fn runStaticTriggerWideCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, static_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    if (static_count % trigger_wide_rows != 0) return error.TriggerWideCountNotPerRow;
+    const columns = static_count / trigger_wide_rows;
+    if (columns == 0 or trigger_wide_max_columns % columns != 0) return error.TriggerWideCountNotStride;
+    // Fewer solids spread over the fixed world on a wider column stride.
+    const column_stride = trigger_wide_max_columns / columns;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    // The trigger covers the whole world: one chunk row tall, every static under it.
+    _ = try addTrigger(&data, .{ .x = 0, .y = 0 }, .{
+        .x = @as(f32, @floatFromInt(trigger_wide_tiles_x)) * tile_size,
+        .y = @as(f32, @floatFromInt(default_chunk_size_tiles)) * tile_size,
+    });
+    var move: ?fixtures.StaticMove = null;
+    for (0..trigger_wide_rows) |cell_y| for (0..columns) |column| {
+        const cell_x = column * column_stride;
+        const home = pitchCellOrigin(cell_x, cell_y);
+        const entity = try fixtures.addBody(&data, home, .{ .x = static_size, .y = static_size }, .static);
+        // The middle static alternates with the free tile diagonal to it, still under the
+        // trigger.
+        if (column == columns / 2 and cell_y == trigger_wide_rows / 2) move = .{ .entity = entity, .positions = .{ home, .{ .x = home.x + tile_size, .y = home.y + tile_size } } };
+    };
+    var moved = move orelse return error.TriggerWideMissingMove;
+    var stats = try measureTriggerPatches(allocator, io, options, case, &data, trigger_wide_geometry, &moved, .{
+        .static_count = static_count + 1,
+        .stored_pairs = static_count,
+        // The moved static and the trigger.
+        .requery_rows = 2,
+    });
+    stats.item_count = static_count;
+    return stats;
+}
+
+// Builds the colliders and the cold trigger store, then moves `move`'s static through the
+// commit seam each step and times the trigger refresh after its sync.
+fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *DataSystem, geometry: ColliderGeometry, move: *fixtures.StaticMove, shape: TriggerPatchShape) !suite.RunStats {
+    var frame = SimulationFrame.init(allocator);
+    defer frame.deinit();
+    // One command and its one component event per step.
+    try frame.reserveStreams(1, 1, 0, 0, 0, 1);
+    var colliders = StaticColliderSystem.init(allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(data, geometry, null);
+    if (static_colliders_test_support.liveRowCount(colliders) != shape.static_count) return error.WrongStaticCount;
+    fixtures.setSpliceTuners(&colliders, case);
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    var system = CollisionSystem.init(allocator);
+    defer system.deinit();
+    // The cold store: a rebuild over every row.
+    try system.refreshCommittedTriggers(data, colliders.view(), &threads);
+    if (system.trigger_pairs.items.len != shape.stored_pairs) return error.TriggerPairCountMismatch;
+
+    const seam = fixtures.CommitSeam{ .colliders = &colliders, .structural_headroom = fixtures.StaticMove.structural_headroom };
+    // The requery is untuned, so nothing settles; two steps run both directions.
+    var warm = suite.Warmup.init(options, case, 2);
+    while (warm.next(true)) _ = try patchMovedStatic(&system, &colliders, &frame, data, move, seam, &threads, io, shape);
+    var samples = TriggerPatchSamples.init(shape.stored_pairs);
+    for (0..options.iterations) |_| samples.record(try patchMovedStatic(&system, &colliders, &frame, data, move, seam, &threads, io, shape));
+    return samples.finish(&threads, 1, shape.stored_pairs);
+}
+
+// One move through the commit seam, then the timed refresh: the sync changes only the
+// moved static, and the warm patch requeries the shape's rows and keeps its pair count.
+fn patchMovedStatic(system: *CollisionSystem, colliders: *StaticColliderSystem, frame: *SimulationFrame, data: *DataSystem, move: *fixtures.StaticMove, seam: fixtures.CommitSeam, threads: *ThreadSystem, io: std.Io, shape: TriggerPatchShape) !TriggerPatch {
+    frame.beginStep();
+    const commit = try seam.commit(frame, data, &.{move.command()}, threads);
+    if (commit.structural.components_set != 1) return error.StaticMoveNotApplied;
+    const changes = colliders.changesThisStep();
+    if (changes.len != 1 or !changes[0].entity.eql(move.entity)) return error.StaticChangeNotSynced;
+    move.advance();
+    const patch = try refreshTriggersTimed(system, data, colliders, threads, io);
+    if (patch.rows != shape.requery_rows) return error.TriggerPatchMissedRequery;
+    if (system.trigger_pairs.items.len != shape.stored_pairs) return error.TriggerPairCountMismatch;
+    return patch;
+}
+
+fn writeTriggerPatchWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
+    // `sample_count` holds the statics changed per patch.
+    const changes = @max(stats.sample_count, 1);
+    try writer.print("per_change={f}", .{suite.formatDuration(stats.mean_ns / changes)});
+    if (view == .summary) return;
+    try suite.writeMainShare(writer, stats, changes);
 }
 
 // ----------------------------------------------------------------------------
@@ -723,6 +1017,7 @@ fn runStaticRebuildCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var fixture = try createStaticHeavyFixture(allocator, static_count, .clustered);
     defer fixture.data.deinit();
+    // The fixture's two-tile pitch grid side fits u32.
     const cells: u32 = @intCast(2 * fixture.side);
     const geometry = ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles);
     // Pitch cells per chunk side: the occupied chunks.
@@ -750,6 +1045,7 @@ fn runStaticRebuildSparseCase(allocator: std.mem.Allocator, io: std.Io, options:
         const position = math.Vec2{ .x = @as(f32, @floatFromInt(tile_x)) * tile_size, .y = @as(f32, @floatFromInt(tile_y)) * tile_size };
         _ = try fixtures.addBody(&data, position, .{ .x = static_size, .y = static_size }, .static);
     };
+    // The sparse world's tile side fits u32.
     const cells: u32 = @intCast(sparse_world_chunks_side * default_chunk_size_tiles);
     const geometry = ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles);
     return measureRebuild(allocator, io, options, case, &data, geometry, static_count, static_count);
@@ -894,6 +1190,50 @@ comptime {
     std.debug.assert(dense_change_ahead_tiles % 2 == 1 and dense_change_back_tiles % 2 == 1);
 }
 
+// The dense-change world's statics: all solid, or every other one (a checkerboard) a trigger.
+const DenseStatics = enum { solid, checkered_triggers };
+// A checkered trigger covers its pitch cell and half a tile past it, so it overlaps the
+// solids right of and below it and the triggers diagonal to it; a moved static lands in the
+// reach of the triggers around its free tile.
+const dense_trigger_size: f32 = static_pitch + static_size / 2;
+
+// Checkered triggers sit on even cells; the last row and column stay solid, so no trigger
+// reaches past the world.
+fn denseCellTrigger(statics: DenseStatics, cell_x: usize, cell_y: usize) bool {
+    if (statics != .checkered_triggers) return false;
+    return (cell_x + cell_y) % 2 == 0 and cell_x + 1 < dense_change_side and cell_y + 1 < dense_change_side;
+}
+
+fn denseHomeRect(statics: DenseStatics, cell_x: usize, cell_y: usize) math.Aabb {
+    const origin = pitchCellOrigin(cell_x, cell_y);
+    const size: f32 = if (denseCellTrigger(statics, cell_x, cell_y)) dense_trigger_size else static_size;
+    return .{ .min_x = origin.x, .min_y = origin.y, .max_x = origin.x + size, .max_y = origin.y + size };
+}
+
+// The stored trigger pairs with every static home: each pair of neighbouring cells, one
+// a trigger, whose rects overlap. Footprints reach only the next cell, so the right, down,
+// and both diagonal neighbours visit each such pair once.
+fn denseHomeTriggerPairs(statics: DenseStatics) usize {
+    const neighbours = [_][2]isize{ .{ 1, 0 }, .{ 0, 1 }, .{ 1, 1 }, .{ 1, -1 } };
+    var pairs: usize = 0;
+    for (0..dense_change_side) |cell_y| for (0..dense_change_side) |cell_x| {
+        const rect = denseHomeRect(statics, cell_x, cell_y);
+        const trigger = denseCellTrigger(statics, cell_x, cell_y);
+        for (neighbours) |step| {
+            const x = @as(isize, @intCast(cell_x)) + step[0];
+            const y = @as(isize, @intCast(cell_y)) + step[1];
+            if (x < 0 or y < 0 or x >= dense_change_side or y >= dense_change_side) continue;
+            // In range by the check above.
+            const other_x: usize = @intCast(x);
+            const other_y: usize = @intCast(y);
+            if (!trigger and !denseCellTrigger(statics, other_x, other_y)) continue;
+            const other = denseHomeRect(statics, other_x, other_y);
+            if (rect.min_x < other.max_x and other.min_x < rect.max_x and rect.min_y < other.max_y and other.min_y < rect.max_y) pairs += 1;
+        }
+    };
+    return pairs;
+}
+
 const DenseChangeFixture = struct {
     data: DataSystem,
     frame: SimulationFrame,
@@ -913,7 +1253,7 @@ const DenseChangeFixture = struct {
     // Every static of a square region of `change_count / dense_change_per_chunk` chunks
     // changes; the region has an even side, so each chunk's pair-swap partner is in it. A
     // smaller count changes the first `change_count / 4` statics of each 2 x 2-region chunk.
-    fn init(allocator: std.mem.Allocator, change_count: usize, case: suite.BenchmarkCase) !DenseChangeFixture {
+    fn init(allocator: std.mem.Allocator, change_count: usize, case: suite.BenchmarkCase, statics: DenseStatics) !DenseChangeFixture {
         const region_chunks = @max(change_count / dense_change_per_chunk, 4);
         const moves_per_chunk = change_count / region_chunks;
         if (moves_per_chunk == 0 or moves_per_chunk > dense_change_per_chunk or moves_per_chunk * region_chunks != change_count) return error.DenseChangeNotPerChunk;
@@ -935,7 +1275,10 @@ const DenseChangeFixture = struct {
         var single: fixtures.StaticMove = undefined;
         for (0..dense_change_side) |cell_y| for (0..dense_change_side) |cell_x| {
             const home = pitchCellOrigin(cell_x, cell_y);
-            const entity = try fixtures.addBody(&data, home, .{ .x = static_size, .y = static_size }, .static);
+            const entity = if (denseCellTrigger(statics, cell_x, cell_y))
+                try addTrigger(&data, home, .{ .x = dense_trigger_size, .y = dense_trigger_size })
+            else
+                try fixtures.addBody(&data, home, .{ .x = static_size, .y = static_size }, .static);
             const away = math.Vec2{
                 .x = home.x + awayOffset(cell_x),
                 .y = home.y + awayOffset(cell_y),
@@ -953,6 +1296,7 @@ const DenseChangeFixture = struct {
         errdefer frame.deinit();
         var colliders = StaticColliderSystem.init(allocator);
         errdefer colliders.deinit();
+        // The dense world's two-tile pitch grid side fits u32.
         const cells: u32 = @intCast(2 * dense_change_side);
         try colliders.rebuild(&data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles), null);
         if (static_colliders_test_support.liveRowCount(colliders) != dense_change_side * dense_change_side) return error.WrongStaticCount;
@@ -1096,7 +1440,7 @@ fn runStaticDenseSpikeCase(allocator: std.mem.Allocator, io: std.Io, options: su
 
 fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize, load: DenseLoad) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var fixture = try DenseChangeFixture.init(allocator, change_count, case);
+    var fixture = try DenseChangeFixture.init(allocator, change_count, case, .solid);
     defer fixture.deinit();
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
@@ -1159,6 +1503,58 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     printStageDetails(&stats, &sync_stages, &stage_shapes, &stage_ns);
     stats.details.print("row_grows={} payload_grows={}\n", .{ grows[0] - warm_grows[0], grows[1] - warm_grows[1] });
     return stats;
+}
+
+// The dense-change world with checkered triggers: each step's dense commit through the
+// commit seam, then the timed trigger refresh.
+fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var fixture = try DenseChangeFixture.init(allocator, change_count, case, .checkered_triggers);
+    defer fixture.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    var system = CollisionSystem.init(allocator);
+    defer system.deinit();
+    // The cold store: a rebuild over every row, every static home.
+    try system.refreshCommittedTriggers(&fixture.data, fixture.colliders.view(), &threads);
+    const home_pairs = denseHomeTriggerPairs(.checkered_triggers);
+    if (system.trigger_pairs.items.len != home_pairs) return error.TriggerPairCountMismatch;
+    // Untimed, once: the region moved away, then a cold rebuild at that revision is the away
+    // count every away patch keeps.
+    _ = try fixture.changeAndSync(io, &threads);
+    const away_pairs = blk: {
+        var cold = CollisionSystem.init(allocator);
+        defer cold.deinit();
+        try cold.refreshCommittedTriggers(&fixture.data, fixture.colliders.view(), &threads);
+        break :blk cold.trigger_pairs.items.len;
+    };
+    // Stored pairs with the region home and away.
+    const pairs = [2]usize{ home_pairs, away_pairs };
+    _ = try denseTriggerRefresh(&fixture, &system, &threads, io, pairs);
+
+    // The requery is untuned, so nothing settles; two steps run both directions.
+    var warm = suite.Warmup.init(options, case, 2);
+    while (warm.next(true)) _ = try denseTriggerPatch(&fixture, &system, &threads, io, pairs);
+    var samples = TriggerPatchSamples.init(change_count);
+    for (0..options.iterations) |_| samples.record(try denseTriggerPatch(&fixture, &system, &threads, io, pairs));
+    return samples.finish(&threads, change_count, system.trigger_pairs.items.len);
+}
+
+// One dense commit and its sync (`changeAndSync` checks every move synced), then the timed
+// refresh.
+fn denseTriggerPatch(fixture: *DenseChangeFixture, system: *CollisionSystem, threads: *ThreadSystem, io: std.Io, pairs: [2]usize) !TriggerPatch {
+    _ = try fixture.changeAndSync(io, threads);
+    return denseTriggerRefresh(fixture, system, threads, io, pairs);
+}
+
+// The timed refresh after a dense sync: the warm patch requeries at least every changed
+// static and fewer than all rows, and keeps the stored pair count of the region's side.
+fn denseTriggerRefresh(fixture: *DenseChangeFixture, system: *CollisionSystem, threads: *ThreadSystem, io: std.Io, pairs: [2]usize) !TriggerPatch {
+    const patch = try refreshTriggersTimed(system, &fixture.data, &fixture.colliders, threads, io);
+    if (patch.rows < fixture.moves.len or patch.rows >= dense_change_side * dense_change_side) return error.TriggerPatchMissedRequery;
+    // `changeAndSync` advanced every move, so the first move's side is the region's.
+    if (system.trigger_pairs.items.len != pairs[@intFromBool(fixture.moves[0].at_second)]) return error.TriggerPairCountMismatch;
+    return patch;
 }
 
 fn writeDenseChangeWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
