@@ -71,10 +71,10 @@ orchestrates, verifies every agent claim against live code, and reports.
 - Terse reports and docs, never by dropping findings. A perf report gives
   both sides' times for each case, each with its entity count, both sides
   built at the same CPU. Make engineering calls
-  without asking, on best practice, scale, performance, and efficiency, never
-  on what today's code happens to produce or by doing less work, and report
-  them. A call may depart from a rule only where the rule's letter would cost
-  best practice, scale, or performance, never to ease work; it is reported
+  without asking, on uniformity, scalability, best practice, efficiency, and
+  speed, never on what today's code happens to produce or by doing less work,
+  and report them. A call may depart from a rule only where the rule's letter
+  would cost one of those criteria, never to ease work; it is reported
   with its reasoning as a decision made, and a departure that would recur
   becomes a proposed rule edit. Only scope added or dropped, product/gameplay
   behavior, rule edits, a major redesign, a `ThreadSystem`/tuner redesign, and
