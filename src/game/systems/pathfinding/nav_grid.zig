@@ -886,7 +886,8 @@ test "a remasked chunk equals world bits OR static coverage, labels and chunkLab
         for (0..world.height) |y| for (0..world.width) |x| {
             var expected = world.levelBlocksMovement(0, @intCast(x), @intCast(y));
             for (data.movementBodySliceConst().entities) |entity| {
-                const rect = data.staticObstacleWorldRect(entity).?;
+                const bounds = data.collisionBoundsConst(entity).?;
+                const rect = math.aabbFromOffsetSize(data.movementBodyConst(entity).?.position, bounds.offset, bounds.size);
                 const span = grid.cellSpanForWorldRect(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
                 if (x >= span.min_x and x <= span.max_x and y >= span.min_y and y <= span.max_y) expected = true;
             }

@@ -695,10 +695,11 @@ pub const SimulationPipelineStats = struct {
             if (static_rect.available_worker_threads != 0 or static_rect.batch_duration_ns != 0) {
                 perf.recordBenchBatch(.collision_static_rect, static_rect);
             }
-            const trigger_allow = collision_stats.perf.trigger_allow_batch;
-            if (trigger_allow.available_worker_threads != 0 or trigger_allow.batch_duration_ns != 0) {
-                perf.recordBenchBatch(.collision_trigger_allow, trigger_allow);
-            }
+            perf.recordBatch(.collision_trigger_refresh, collision_stats.perf.trigger_refresh_batch);
+            perf.recordBenchBatch(.collision_static_place, collision_stats.perf.static_place_batch);
+            perf.recordBenchBatch(.collision_static_sort, collision_stats.perf.static_sort_batch);
+            perf.recordBenchBatch(.collision_trigger_emit_count, collision_stats.perf.trigger_emit_count_batch);
+            perf.recordBenchBatch(.collision_trigger_emit, collision_stats.perf.trigger_emit_batch);
         }
         perf.recordBenchBatch(.collision_broadphase, collision_stats.broadphase_batch);
         perf.recordBenchBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
@@ -1152,8 +1153,9 @@ pub const SimulationPipeline = struct {
 
     /// Applies the captured static changes, records them for nav, then refreshes collision's
     /// triggers to this revision so the next step's patch does not allocate. The chunk
-    /// rewrite and the trigger requery thread under `thread_system`. A warm patch's main
-    /// work is O(1) per dirty static and per stored trigger pair. A sync error leaves the
+    /// rewrite, the trigger query, and the store's page rewrite thread under
+    /// `thread_system`. A warm patch's main work is O(1) per edit record and touched page,
+    /// flat in stored pairs. A sync error leaves the
     /// rows unchanged and keeps the changes. A refresh error leaves the synced rows and
     /// nav marks in place; the next sync retries the refresh.
     pub fn syncStaticColliders(self: *SimulationPipeline, data: *const DataSystem, thread_system: *ThreadSystem) !void {
@@ -1175,6 +1177,12 @@ pub const SimulationPipeline = struct {
         perf.recordBenchBatch(.static_collider_apply, batches.get(.apply));
         perf.recordBenchBatch(.static_collider_rewrite, batches.get(.rewrite));
         perf.recordBenchBatch(.static_collider_install, batches.get(.install));
+        const trigger_batches = &self.collision.trigger_store.last_batches;
+        perf.recordBatch(.collision_trigger_rewrite, trigger_batches.get(.leaf));
+        perf.recordBenchBatch(.collision_trigger_query, self.collision.trigger_query_batch);
+        perf.recordBenchBatch(.collision_trigger_insert_place, trigger_batches.get(.insert_place));
+        perf.recordBenchBatch(.collision_trigger_insert_sort, trigger_batches.get(.insert_sort));
+        perf.recordBenchBatch(.collision_trigger_node, trigger_batches.get(.node));
     }
 
     /// Orchestrates the post-commit nav reaction by delegating to the nav-owning

@@ -826,10 +826,6 @@ fn metric(value: usize) u64 {
     return @intCast(value);
 }
 
-/// World-space AABB of a static navigation obstacle's collision body, resolved from its
-/// movement body position plus collision bounds offset/size (`math.aabbFromOffsetSize`).
-pub const ObstacleWorldRect = math.Aabb;
-
 /// The store columns `DataSystem.staticObstacleAt` reads, sliced once per pass by
 /// `DataSystem.staticObstacleColumns`. Valid until the stores change.
 pub const StaticObstacleColumns = struct {
@@ -844,7 +840,8 @@ pub const StaticObstacleColumns = struct {
 };
 
 /// A static navigation obstacle: its id, its world level (`world_level`, else 0), and the
-/// inputs of its `ObstacleWorldRect` (position, bounds offset, bounds size).
+/// inputs of its world rect, `math.aabbFromOffsetSize` of position, bounds offset and
+/// bounds size.
 pub const StaticObstacle = struct {
     entity: EntityId,
     level: u16,

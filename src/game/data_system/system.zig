@@ -10,7 +10,6 @@
 //! own per-domain modules, mirroring pathfinding's system.zig + solve.zig split.
 
 const std = @import("std");
-const math = @import("../../core/math.zig");
 const types = @import("types.zig");
 const EntityId = types.EntityId;
 const Component = types.Component;
@@ -364,15 +363,6 @@ pub const DataSystem = struct {
         return response.mobility == .static;
     }
 
-    /// World-space AABB of `id`'s collision body (movement body position plus collision
-    /// bounds offset/size, `math.aabbFromOffsetSize`), or null when either component is
-    /// absent. The static-collider rows hold this rect for each static navigation obstacle.
-    pub fn staticObstacleWorldRect(self: *const DataSystem, id: EntityId) ?types.ObstacleWorldRect {
-        const body = self.movementBodyConst(id) orelse return null;
-        const bounds = self.collisionBoundsConst(id) orelse return null;
-        return math.aabbFromOffsetSize(body.position, bounds.offset, bounds.size);
-    }
-
     /// The columns `staticObstacleAt` reads, sliced once. O(1).
     pub fn staticObstacleColumns(self: *const DataSystem) types.StaticObstacleColumns {
         const movement = self.movementBodySliceConst();
@@ -393,8 +383,9 @@ pub const DataSystem = struct {
     /// the slot's live id:
     /// a live slot with a movement body, collision bounds, and a static collision response,
     /// read through `columns` (`staticObstacleColumns`); null otherwise. Its rect is
-    /// `staticObstacleWorldRect`'s, and its level `worldLevelConst`'s or 0. One slot read and
-    /// one row read per store, no slice built; safe on workers while the stores are unchanged.
+    /// `math.aabbFromOffsetSize` of its position, offset and size, and its level
+    /// `worldLevelConst`'s or 0. One slot read and one row read per store, no slice built;
+    /// safe on workers while the stores are unchanged.
     pub fn staticObstacleAt(self: *const DataSystem, index: usize, columns: types.StaticObstacleColumns) ?types.StaticObstacle {
         const slot = &self.slots.items[index];
         if (!slot.alive) return null;
@@ -1711,8 +1702,6 @@ test "a static obstacle resolves only for a live slot with body, bounds, and a s
         const found = data.staticObstacleAt(entity.index, columns).?;
         try std.testing.expect(found.entity.eql(entity));
         try std.testing.expectEqual(data.worldLevelConst(entity) orelse 0, found.level);
-        const rect = math.aabbFromOffsetSize(.{ .x = found.x, .y = found.y }, .{ .x = found.offset_x, .y = found.offset_y }, .{ .x = found.size_x, .y = found.size_y });
-        try std.testing.expectEqual(data.staticObstacleWorldRect(entity).?, rect);
         try std.testing.expect(data.isStaticNavigationObstacle(entity));
         try std.testing.expectEqual(found, data.staticObstacle(entity, columns).?);
     }

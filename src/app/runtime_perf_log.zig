@@ -227,6 +227,12 @@ pub const BatchStage = enum {
     // A static add, move, or destroy, one or many in a step: the commit seam's collider sync
     // plan (the changed statics' reads, lanes, and decisions), the sync's largest stage.
     static_collider_plan,
+    // A static add, move, or destroy next to stored triggers: the seam trigger patch's page
+    // rewrite.
+    collision_trigger_rewrite,
+    // A movement-row removal or allow crossing with stored triggers: the step's
+    // stored-trigger refresh.
+    collision_trigger_refresh,
     // Dig, build, and dense terrain change: the nav reaction's chunk remask, its
     // connectivity flood (rounds summed, the removal-shaped share), its one-way closure rows
     // (round 0 and its rounds summed), and the path-cache eviction halo walk.
@@ -256,8 +262,19 @@ pub const BenchBatchStage = enum {
     collision_static_pairs,
     // Debug stored-rect compare, when that batch ran.
     collision_static_rect,
-    // Stored-trigger allow pack, on a step that packs a stale column.
-    collision_trigger_allow,
+    // The dynamic x static pairs' banded place and sort, when the step has any.
+    collision_static_place,
+    collision_static_sort,
+    // The stored-trigger emission: its count pass, on a step that filters a stored pair,
+    // and its merge into the contact stream.
+    collision_trigger_emit_count,
+    collision_trigger_emit,
+    // The commit seam's stored-trigger stages before and after the patch plan: the query
+    // over the changes, the insert place and sort, and the node rewrite.
+    collision_trigger_query,
+    collision_trigger_insert_place,
+    collision_trigger_insert_sort,
+    collision_trigger_node,
     particles,
     // The commit seam's collider sync stages after its plan: row claims and touch emission,
     // the grouped touches, the row writes, the chunk-list splice, and the directory install.

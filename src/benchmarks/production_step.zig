@@ -154,12 +154,15 @@ fn stageBatches(stage: Timing) StageBatches {
         .pipeline_steering => .{ .bench = &.{.steering} },
         .pipeline_pathfinding => .{ .logged = &.{ .path_intake, .path_registry_flush, .path_resize_copy }, .bench = &.{.path_solve} },
         .pipeline_movement => .{ .bench = &.{.movement} },
-        .pipeline_collision => .{ .bench = &.{ .collision_fill, .collision_sort, .collision_broadphase, .collision_narrowphase, .collision_static_pairs, .collision_static_rect, .collision_trigger_allow } },
+        .pipeline_collision => .{
+            .logged = &.{.collision_trigger_refresh},
+            .bench = &.{ .collision_fill, .collision_sort, .collision_broadphase, .collision_narrowphase, .collision_static_pairs, .collision_static_rect, .collision_static_place, .collision_static_sort, .collision_trigger_emit_count, .collision_trigger_emit },
+        },
         .pipeline_chunk_derive => .{ .bench = &.{.chunk_derive} },
         .gameplay_particles => .{ .bench = &.{.particles} },
         .gameplay_structural => .{
-            .logged = &.{ .static_collider_plan, .nav_remask, .nav_connect, .nav_closure, .nav_evict },
-            .bench = &.{ .static_collider_touch, .static_collider_group, .static_collider_apply, .static_collider_rewrite, .static_collider_install },
+            .logged = &.{ .static_collider_plan, .collision_trigger_rewrite, .nav_remask, .nav_connect, .nav_closure, .nav_evict },
+            .bench = &.{ .static_collider_touch, .static_collider_group, .static_collider_apply, .static_collider_rewrite, .static_collider_install, .collision_trigger_query, .collision_trigger_insert_place, .collision_trigger_insert_sort, .collision_trigger_node },
         },
         else => .{},
     };

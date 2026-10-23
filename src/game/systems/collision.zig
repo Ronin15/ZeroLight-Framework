@@ -55,6 +55,15 @@ const ColliderView = @import("static_colliders.zig").ColliderView;
 const ColliderChange = @import("static_colliders.zig").ColliderChange;
 const SpanIds = @import("static_colliders.zig").SpanIds;
 const idleSpanIds = @import("static_colliders.zig").idleSpanIds;
+const OldPlacement = @import("static_colliders.zig").OldPlacement;
+const collision_triggers = @import("collision_triggers.zig");
+const TriggerStore = collision_triggers.TriggerStore;
+const StoreThreads = collision_triggers.StoreThreads;
+const EditSource = collision_triggers.EditSource;
+const InsertEdit = collision_triggers.InsertEdit;
+const TreePath = collision_triggers.TreePath;
+const DropPiece = collision_triggers.DropPiece;
+const no_entry = @import("chunk_list_map.zig").no_entry;
 
 pub const collision_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -71,7 +80,11 @@ const entries_per_body: usize = 2;
 /// Strips per level: a u16 strip index. A level's pixel height over the strip height stays
 /// within it (`CollisionStrips.ofWorld` asserts it); positions past the last strip clamp
 /// into it.
-const strip_count: u32 = 1 << 16;
+const strip_bits = 16;
+const strip_count: u32 = 1 << strip_bits;
+/// Where a contact key's (level, strip) run starts: below the store's level bits, so the
+/// level is the key's top 16 bits for both.
+const contact_run_shift = collision_triggers.key_level_shift - strip_bits;
 
 const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;
 
@@ -212,7 +225,7 @@ fn packKey(run: u32, ordered_min_x: u32, ordered_min_y: u32, entity_index: u32) 
 
 // A (level, strip) run's id: the key's top word.
 fn runOf(level: u16, strip: u32) u32 {
-    return (@as(u32, level) << 16) | strip;
+    return (@as(u32, level) << strip_bits) | strip;
 }
 
 fn keyRun(key: u128) u32 {
@@ -371,14 +384,16 @@ pub const CollisionStats = struct {
     /// Kept only with `runtime_perf_log.enabled`: whether the step outgrew its pair bound,
     /// the entries the sweep tested against an earlier entry of its run inside that entry's
     /// x span, and the batches of the stages the step ran. A stage that did not run leaves
-    /// its batch zero: the Debug stored-rect compare in every other mode, the trigger allow
-    /// pack on a step with a fresh column.
+    /// its batch zero: the Debug stored-rect compare in every other mode, the stored-trigger
+    /// refresh on a step whose allow epoch did not move, the emission count pass on a step
+    /// that emits every stored pair.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         /// This reserved step outgrew the pair bound, so a main-thread grow path ran: the
         /// candidate pairs exceeded `CollisionSystem.reserved_pair_bound`, a broadphase
         /// range held more than `broadphase_pairs_per_item` pairs per entry its slot was
-        /// reserved for (the slot grew and the broadphase replayed), or a static query
-        /// range outgrew its pair or hit rows (the slot grew and the query replayed). Set
+        /// reserved for (the slot grew and the broadphase replayed), a static query range
+        /// outgrew its pair or hit rows (the slot grew and the query replayed), or the
+        /// stored and dynamic contacts exceeded the bound (the contact stream grew). Set
         /// once per step, with one `CollisionSystem.perf.pair_bound_overflows` count.
         pair_bound_exceeded: bool = false,
         broadphase_visits: usize = 0,
@@ -386,8 +401,11 @@ pub const CollisionStats = struct {
         sort_batch: BatchStats = .{},
         static_pairs_batch: BatchStats = .{},
         static_rect_batch: BatchStats = .{},
+        static_place_batch: BatchStats = .{},
         static_sort_batch: BatchStats = .{},
-        trigger_allow_batch: BatchStats = .{},
+        trigger_refresh_batch: BatchStats = .{},
+        trigger_emit_count_batch: BatchStats = .{},
+        trigger_emit_batch: BatchStats = .{},
     } else struct {};
 };
 
@@ -447,9 +465,6 @@ const KeyedContact = struct {
 /// in range order.
 const ContactStagingList = std.array_list.Aligned(CollisionContact, .fromByteUnits(thread_shared_record_alignment));
 const NarrowphaseKeyList = std.array_list.Aligned(u256, .fromByteUnits(thread_shared_record_alignment));
-// One word per stored trigger pair. u32 so a range of `collision_range_alignment_items`
-// is one cache line and two ranges never share one.
-const TriggerAllowList = std.array_list.Aligned(u32, .fromByteUnits(thread_shared_record_alignment));
 
 /// One narrowphase range's contact count, written once by the range's job.
 const ContactCountTally = struct {
@@ -464,7 +479,8 @@ comptime {
     // One narrowphase range starts on a cache line when the previous one does.
     std.debug.assert(collision_range_alignment_items * @sizeOf(CollisionContact) % thread_shared_record_alignment == 0);
     std.debug.assert(collision_range_alignment_items * @sizeOf(u256) % thread_shared_record_alignment == 0);
-    std.debug.assert(collision_range_alignment_items * @sizeOf(u32) % thread_shared_record_alignment == 0);
+    std.debug.assert(@sizeOf(PaddedSlot(TriggerQuerySlot)) % thread_shared_record_alignment == 0);
+    std.debug.assert(@sizeOf(PaddedSlot(EmitRange)) % thread_shared_record_alignment == 0);
 }
 
 const ContactCountTallyList = std.array_list.Aligned(ContactCountTally, .fromByteUnits(thread_shared_record_alignment));
@@ -589,10 +605,89 @@ const StaticSlotGrowth = struct {
 /// counted grow path.
 const reserved_query_hits: usize = broadphase_pairs_per_item * collision_range_alignment_items;
 
-const TriggerHead = struct {
-    entity_index: u32,
-    start: u32,
-    count: u32,
+/// Stored-trigger edit records reserved per trigger query item: a reserve heuristic, never
+/// a gate. A range past it grows its slot and replays.
+const trigger_records_per_item: usize = broadphase_pairs_per_item;
+
+// A trigger query's items: the revision's changes (a patch), or every row-pool id (a
+// rebuild).
+const TriggerQueryMode = enum { patch, rebuild };
+
+// One trigger query range's edits in item order, and one query's hits and kernel contacts.
+// Grow-only for the system's life, so each slot keeps its lists' capacity.
+const TriggerQuerySlot = struct {
+    hits: std.MultiArrayList(HitRow) = .{},
+    contacts: std.ArrayList(KeyedContact) = .empty,
+    inserts: std.ArrayList(InsertEdit) = .empty,
+    // Patch only: `inserts[i]`'s located path.
+    insert_paths: std.ArrayList(TreePath) = .empty,
+    drops: std.ArrayList(DropPiece) = .empty,
+    // The records the range's items owe, held or not.
+    insert_need: usize = 0,
+    drop_need: usize = 0,
+    // The largest single query's hit count past `hits.len`; 0 when every query fit.
+    hits_required: usize = 0,
+    // Set at the first record or query that did not fit: from there the range only counts
+    // its needs, so one grow sizes it for the replay.
+    overflowed: bool = false,
+
+    fn clear(self: *TriggerQuerySlot) void {
+        self.contacts.clearRetainingCapacity();
+        self.inserts.clearRetainingCapacity();
+        self.insert_paths.clearRetainingCapacity();
+        self.drops.clearRetainingCapacity();
+        self.insert_need = 0;
+        self.drop_need = 0;
+        self.hits_required = 0;
+        self.overflowed = false;
+    }
+
+    fn deinit(self: *TriggerQuerySlot, allocator: std.mem.Allocator) void {
+        self.hits.deinit(allocator);
+        self.contacts.deinit(allocator);
+        self.inserts.deinit(allocator);
+        self.insert_paths.deinit(allocator);
+        self.drops.deinit(allocator);
+    }
+
+    // `path` is null in a rebuild, which locates nothing.
+    fn pushInsert(self: *TriggerQuerySlot, edit: InsertEdit, path: ?TreePath) void {
+        self.insert_need += 1;
+        if (self.overflowed) return;
+        const fits = self.inserts.items.len < self.inserts.capacity and
+            (path == null or self.insert_paths.items.len < self.insert_paths.capacity);
+        if (!fits) {
+            self.overflowed = true;
+            return;
+        }
+        self.inserts.appendAssumeCapacity(edit);
+        if (path) |located| self.insert_paths.appendAssumeCapacity(located);
+    }
+
+    fn pushDrop(self: *TriggerQuerySlot, piece: DropPiece) void {
+        self.drop_need += 1;
+        if (self.overflowed) return;
+        if (self.drops.items.len == self.drops.capacity) {
+            self.overflowed = true;
+            return;
+        }
+        self.drops.appendAssumeCapacity(piece);
+    }
+
+    fn noteHits(self: *TriggerQuerySlot, full: usize) void {
+        self.hits_required = @max(self.hits_required, full);
+        self.overflowed = true;
+    }
+};
+
+// One emission range's split of the merged order: its stored pairs, its dynamic-side
+// contacts, and the contacts it writes. Written once by its range's count job.
+const EmitRange = struct {
+    stored_start: u32 = 0,
+    stored_end: u32 = 0,
+    dynamic_start: usize = 0,
+    dynamic_end: usize = 0,
+    out: usize = 0,
 };
 
 const no_static_row: u32 = std.math.maxInt(u32);
@@ -649,8 +744,13 @@ pub const CollisionSystem = struct {
     // Debug stored-rect compare. A query replay must not teach it, and it must not teach
     // `static_pair_tuner`. ReleaseFast never selects it, so `sample_count` stays 0.
     static_rect_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    trigger_allow_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    static_place_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     static_sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    trigger_query_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // A collider rebuild is a one-off, so a fresh tuner's first rebuild query takes the full
+    // pool instead of running inline on main.
+    trigger_query_rebuild_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{ .first_selection = .full_pool }),
+    emit_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     strips: CollisionStrips = .default,
     static_pair_slots: SlotList(StaticPairBuffer) = .empty,
     static_pairs: std.ArrayList(KeyedContact) = .empty,
@@ -665,17 +765,19 @@ pub const CollisionSystem = struct {
     ordered: std.ArrayList(KeyedContact) = .empty,
     sort_staging: std.ArrayList(KeyedContact) = .empty,
     sort_offsets: SlotList(BandOffsets) = .empty,
-    triggers: std.ArrayList(TriggerHead) = .empty,
-    trigger_pairs: std.ArrayList(KeyedContact) = .empty,
-    // Parallel to `trigger_pairs`: 1 when both entities' current movement rows allow collision, else 0.
-    // `len == trigger_pairs.len` only after the pack that stored `trigger_allow_epoch`.
-    trigger_allow: TriggerAllowList = .empty,
-    trigger_allow_epoch: u64 = 0,
-    trigger_rows: std.ArrayList(u32) = .empty,
+    /// The static-static pairs with a trigger side, in contact-key order.
+    trigger_store: TriggerStore,
+    // The strips the stored keys were built with.
+    trigger_strips: CollisionStrips = .default,
+    // Per trigger query range; grow-only, never reset through `setSlotCount`.
+    trigger_query_slots: SlotList(TriggerQuerySlot) = .empty,
+    trigger_edit_sources: std.ArrayList(EditSource) = .empty,
+    emit_ranges: SlotList(EmitRange) = .empty,
+    /// The last seam trigger query's batch shape; reset by every `refreshCommittedTriggers`.
+    trigger_query_batch: BatchStats = .{},
+    // By entity index: the `change_generation` that last stamped it as changed.
     change_mark: std.ArrayList(u32) = .empty,
     change_generation: u32 = 1,
-    seen_revision: u64 = 0,
-    triggers_ready: bool = false,
     /// The pair bound `reserve` declared (`broadphasePairBound(body_capacity)`, grow-only);
     /// 0 until `reserve` runs. Telemetry compares against this logical limit, never a
     /// list's `.capacity`, which `ensureTotalCapacity` rounds past it.
@@ -686,6 +788,7 @@ pub const CollisionSystem = struct {
     pair_bound_warned: bool = false,
     static_slot_warned: bool = false,
     entry_bound_warned: bool = false,
+    contact_bound_warned: bool = false,
     perf: Perf = .{},
 
     /// Telemetry, kept only with `runtime_perf_log.enabled`. Every grow path it counts runs on
@@ -698,7 +801,8 @@ pub const CollisionSystem = struct {
         /// staging, the contact stream and the response reserves (all sized to that bound
         /// under the pipeline) grew, or a range's pairs outgrew its broadphase slot, so the
         /// slot grew and the broadphase replayed, or a static query range outgrew its slot,
-        /// so the slot grew and the query replayed.
+        /// so the slot grew and the query replayed, or the stored and dynamic contacts
+        /// exceeded the bound, so the contact stream and its emission ranges grew.
         pair_bound_overflows: u64 = 0,
         /// Reserved steps whose entries exceeded `reserved_entry_bound` (the keys and entries
         /// grew the first time) or whose fill spilled past a range's spill slot (the slot
@@ -707,15 +811,16 @@ pub const CollisionSystem = struct {
     } else struct {};
 
     pub fn init(allocator: std.mem.Allocator) CollisionSystem {
-        return .{ .allocator = allocator };
+        return .{ .allocator = allocator, .trigger_store = .init(allocator) };
     }
 
     pub fn deinit(self: *CollisionSystem) void {
         self.change_mark.deinit(self.allocator);
-        self.trigger_rows.deinit(self.allocator);
-        self.trigger_allow.deinit(self.allocator);
-        self.trigger_pairs.deinit(self.allocator);
-        self.triggers.deinit(self.allocator);
+        self.emit_ranges.deinit(self.allocator);
+        self.trigger_edit_sources.deinit(self.allocator);
+        for (self.trigger_query_slots.items) |*slot| slot.value.deinit(self.allocator);
+        self.trigger_query_slots.deinit(self.allocator);
+        self.trigger_store.deinit();
         self.sort_offsets.deinit(self.allocator);
         self.sort_staging.deinit(self.allocator);
         self.ordered.deinit(self.allocator);
@@ -762,9 +867,9 @@ pub const CollisionSystem = struct {
     /// the merged candidates, the narrowphase staging (at most one contact per candidate
     /// pair, one window per range), and its tallies hold the pair bound over the body
     /// capacity (`broadphasePairBound`). Static query slots hold the same per-range pair
-    /// bound, and one query's hit rows (`reserved_query_hits`, at most the slot's pairs). A
-    /// denser or taller scene, in total or inside one range, takes the counted grow paths
-    /// (`Perf`).
+    /// bound, and one query's hit rows (`reserved_query_hits`, at most the slot's pairs).
+    /// The stored-trigger emission's range records cover the pair bound's ranges. A denser
+    /// or taller scene, in total or inside one range, takes the counted grow paths (`Perf`).
     pub fn reserve(self: *CollisionSystem, body_capacity: usize) !void {
         if (body_capacity == 0) return;
         // The u32 slots, sources, and pair indices are exhausted only past maxInt(u32)
@@ -809,27 +914,36 @@ pub const CollisionSystem = struct {
         try self.static_pairs.ensureTotalCapacity(self.allocator, pair_capacity);
         try self.ordered.ensureTotalCapacity(self.allocator, pair_capacity);
         try self.sort_staging.ensureTotalCapacity(self.allocator, pair_capacity);
-        try self.sort_offsets.ensureTotalCapacity(self.allocator, static_ranges);
+        // The static place runs over up to the pair bound's items.
+        const pair_ranges = maxRangeCount(pair_capacity, collision_range_alignment_items);
+        try self.sort_offsets.ensureTotalCapacity(self.allocator, pair_ranges);
+        try self.emit_ranges.ensureTotalCapacity(self.allocator, pair_ranges);
         self.reserved_pair_bound = @max(self.reserved_pair_bound, pair_capacity);
         self.reserved_entry_bound = @max(self.reserved_entry_bound, entry_capacity);
     }
 
     /// Reserves a contact stream to the pair bound for `body_capacity` bodies: its
-    /// values to `estimateContactCapacity` and its ranges to the narrowphase's range
-    /// bound over those pairs (`update` streams one range per narrowphase range, at most
-    /// `maxRangeCount(pairs, collision_range_alignment_items)`; a no-worker step uses
-    /// one). Grow-only.
+    /// values to `estimateContactCapacity` and its ranges to the emission's range bound
+    /// over those pairs (`update` streams one range per emission range, at most
+    /// `maxRangeCount(pairs, collision_range_alignment_items)`). Grow-only.
     pub fn reserveContactStream(contacts: *RangeOutputStream(CollisionContact), body_capacity: usize) !void {
         const contact_capacity = estimateContactCapacity(body_capacity);
         try contacts.reserve(maxRangeCount(contact_capacity, collision_range_alignment_items), contact_capacity);
     }
 
-    /// Brings the trigger store up to `view` after a collider sync. A contiguous revision
-    /// with changes patches; anything else rebuilds. Growth is the patch's, on this thread.
-    /// The requery uses `thread_system` and runs inline below its gate. Strips are the last
-    /// collision step's, the engine tile until one has run. The next `update` with this
-    /// revision does not run the patch. An error leaves the stored revision unchanged.
+    /// Brings the trigger store up to `view` after a collider sync; a view with no geometry
+    /// is skipped. A contiguous revision with changes patches: a query over the changes
+    /// builds exact drops and located inserts, and the store rewrites only the pages they
+    /// touch. Anything else rebuilds from the row pool. Growth is this call's, on this
+    /// thread; the query and the store's stages use `thread_system` and run inline below
+    /// their gates. Strips are the last collision step's, the engine tile until one has run.
+    /// The next `update` with this revision does not patch. An error leaves the stored
+    /// pairs and revision unchanged.
     pub fn refreshCommittedTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, thread_system: *ThreadSystem) !void {
+        // Reset first: the seam's batches are recorded every step, refresh or not.
+        self.trigger_query_batch = .{};
+        self.trigger_store.last_batches = .initFill(.{});
+        if (view.geometry == null) return;
         try self.refreshTriggers(data, view, .{
             .thread_system = thread_system,
             .config = .{ .strips = self.strips, .static_colliders = view },
@@ -837,9 +951,10 @@ pub const CollisionSystem = struct {
     }
 
     /// One collision step over the bounds rows (or `config.scope_dense_indices`): the fill,
-    /// sort, broadphase, and narrowphase, each on workers under its own tuner or inline as
-    /// it selects. With no worker the same functions run inline. Allocates only past
-    /// `reserve`'s bounds, on the calling thread between dispatches.
+    /// sort, broadphase, and narrowphase, the static query, the stored-trigger refresh, and
+    /// the key-ordered emission of stored and dynamic contacts, each on workers under its
+    /// own tuner or inline as it selects. With no worker the same functions run inline.
+    /// Allocates only past `reserve`'s bounds, on the calling thread between dispatches.
     pub fn update(
         self: *CollisionSystem,
         data: *const DataSystem,
@@ -858,10 +973,15 @@ pub const CollisionSystem = struct {
         var stats = CollisionStats{};
         const sweep = try self.buildBanded(data, config.scope_dense_indices, config.strips, threads, &stats);
         // The query reads proxies only, so it runs before the narrowphase and the
-        // narrowphase writes order keys only when a static pair will be merged.
-        const moved = try self.gatherStaticPairs(data, view, threads, &stats);
+        // narrowphase writes order keys only when a static or stored pair will be merged.
+        const exclude = data.tierCount(.dormant) + data.tierCount(.kinematic) != 0;
+        const moved = try self.gatherStaticPairs(data, view, threads, exclude, &stats);
         if (moved) return error.StaticMovedOutsideCommit;
-        const write_keys = self.static_pairs.items.len != 0;
+        const store = &self.trigger_store;
+        const stored_emitted: u32 = if (view.geometry == null or store.pair_count == 0) 0 else if (exclude) store.allowed_count else store.valid_count;
+        // A step that emits no stored pair merges none.
+        const stored: u32 = if (stored_emitted == 0) 0 else store.pair_count;
+        const write_keys = self.static_pairs.items.len != 0 or stored_emitted != 0;
         var narrow_items: usize = 0;
         var narrow_ran = false;
         if (sweep) {
@@ -903,7 +1023,8 @@ pub const CollisionSystem = struct {
             return stats;
         }
         try self.sortStaticPairs(threads, &stats);
-        stats.contact_count = try self.mergeWithStatics(contacts, narrow_ran, narrow_items);
+        const dynamic = try self.mergeOrdered(narrow_ran, narrow_items);
+        stats.contact_count = try self.emitContacts(contacts, dynamic, stored, stored_emitted, exclude, threads, &stats);
         return stats;
     }
 
@@ -1364,13 +1485,16 @@ pub const CollisionSystem = struct {
         return growth;
     }
 
-    // Trigger patch, then one query over the filled dynamics. `static_pairs` is the
-    // static-involving contacts. Returns the Debug out-of-band flag.
-    fn gatherStaticPairs(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, stats: *CollisionStats) !bool {
+    // The trigger store brought to `view` (the seam's retry) and refreshed to the allow
+    // epoch, then one query over the filled dynamics. `static_pairs` is the dynamic x static
+    // contacts. Returns the Debug out-of-band flag.
+    fn gatherStaticPairs(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, exclude_tiers: bool, stats: *CollisionStats) !bool {
         self.static_pairs.clearRetainingCapacity();
         if (view.geometry == null) return false;
         try self.refreshTriggers(data, view, threads);
-        const exclude_tiers = data.tierCount(.dormant) + data.tierCount(.kinematic) != 0;
+        if (self.trigger_store.refresh(storeThreads(threads), data)) {
+            if (comptime runtime_perf_log.enabled) stats.perf.trigger_refresh_batch = self.trigger_store.last_batches.get(.refresh);
+        }
         const input_count = self.proxies.len;
         if (input_count != 0) {
             const stage = threads.stage(&self.static_pair_tuner);
@@ -1419,8 +1543,6 @@ pub const CollisionSystem = struct {
                 if (try self.dispatchRectCompare(data, view, threads, stats)) return true;
             }
         }
-        try self.packTriggerAllow(data, threads, exclude_tiers, stats);
-        try self.appendTriggerContacts(exclude_tiers);
         return false;
     }
 
@@ -1500,65 +1622,79 @@ pub const CollisionSystem = struct {
         while (self.rect_moved.items.len < range_count) self.rect_moved.appendAssumeCapacity(.{});
     }
 
+    // Brings the trigger store up to `view`: nothing at its revision, a patch for the next
+    // revision with changes at the same strips, else a rebuild. Allocates only before the
+    // store's first stored mutation, so an error leaves it at its revision for the retry.
     fn refreshTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
-        if (view.revision == self.seen_revision) return;
-        const warm = self.triggers_ready and view.revision == self.seen_revision +% 1 and view.changes.len != 0;
-        if (warm) try self.patchTriggers(data, view, threads) else try self.rebuildTriggers(data, view, threads);
-        self.seen_revision = view.revision;
-        self.triggers_ready = true;
-    }
-
-    fn rebuildTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
-        self.trigger_allow.items.len = 0;
-        self.trigger_pairs.clearRetainingCapacity();
-        self.triggers.clearRetainingCapacity();
-        self.trigger_rows.clearRetainingCapacity();
-        try self.trigger_rows.ensureTotalCapacity(self.allocator, view.row_of_index.len);
-        for (view.row_of_index) |row| {
-            if (row == no_static_row) continue;
-            self.trigger_rows.appendAssumeCapacity(row);
+        const store = &self.trigger_store;
+        const same = store.ready and self.trigger_strips.height == self.strips.height;
+        if (same and view.revision == store.seen_revision) return;
+        if (same and view.revision == store.seen_revision +% 1 and view.changes.len != 0) {
+            try self.markChanges(view.changes);
+            const range_count = try self.runTriggerQuery(data, view, threads, .patch);
+            try store.patch(storeThreads(threads), self.triggerEditSources(range_count, .patch), view.revision);
+            return;
         }
-        try self.dispatchTriggerRows(data, view, threads);
-        try self.groupTriggerHeads();
+        const range_count = try self.runTriggerQuery(data, view, threads, .rebuild);
+        try store.rebuild(storeThreads(threads), self.triggerEditSources(range_count, .rebuild), view.revision, data.collision_allow_epoch);
+        self.trigger_strips = self.strips;
+        self.releaseRebuildQuerySlots();
     }
 
-    fn patchTriggers(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
-        self.trigger_allow.items.len = 0;
-        try self.markChanges(view.changes);
-        self.dropChangedPairs();
-        const kept = self.trigger_pairs.items.len;
-        self.trigger_rows.clearRetainingCapacity();
-        try self.collectRequeryRows(data, view);
-        try self.dispatchTriggerRows(data, view, threads);
-        try self.attachTriggerPairs(kept);
+    // A rebuild is a cold one-off over the row pool: frees what its query reserved past the
+    // patch query's, so the slots follow changes, not rows. A patch reserves `insert_paths`
+    // with `inserts` in every range it runs, so the slots patches used are the prefix
+    // holding paths; the rest are the rebuild's alone. Cannot fail: a shrink that cannot
+    // move keeps its capacity.
+    fn releaseRebuildQuerySlots(self: *CollisionSystem) void {
+        const slots = self.trigger_query_slots.items;
+        var patch_slots: usize = 0;
+        while (patch_slots < slots.len and slots[patch_slots].value.insert_paths.capacity != 0) patch_slots += 1;
+        for (slots[0..patch_slots]) |*padded| {
+            const slot = &padded.value;
+            if (slot.inserts.capacity > slot.insert_paths.capacity) slot.inserts.clearAndFree(self.allocator);
+        }
+        for (slots[patch_slots..]) |*padded| padded.value.deinit(self.allocator);
+        self.trigger_query_slots.shrinkAndFree(self.allocator, patch_slots);
+        const sources = &self.trigger_edit_sources;
+        sources.shrinkAndFree(self.allocator, @min(patch_slots, sources.items.len));
+        sources.clearRetainingCapacity();
     }
 
-    fn dispatchTriggerRows(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads) !void {
-        const items = self.trigger_rows.items.len;
-        if (items == 0) return;
-        // A null tuner: this rebuild must not call `selectProfile` on `static_pair_tuner`.
-        // The shape is the config's fixed profile.
-        const selection = threads.thread_system.selectBatchProfile(null, .{
-            .item_count = items,
-            .items_per_range = threads.config.items_per_range,
-            .max_worker_threads = threads.config.max_worker_threads,
-            .range_alignment_items = collision_range_alignment_items,
-            .adaptive = threads.config.adaptive,
-        });
-        try self.prepareStaticPairSlots(selection.range_count);
-        const slots = self.static_pair_slots.items[0..selection.range_count];
-        var job = TriggerJob{
+    // The trigger query stage over the revision's changes or the row pool, under that mode's
+    // tuner; returns its range count. A range past its slot grows it and the stage replays,
+    // and only the pass that wrote every record is recorded.
+    fn runTriggerQuery(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, mode: TriggerQueryMode) !usize {
+        self.trigger_query_batch = .{};
+        const items = switch (mode) {
+            .patch => view.changes.len,
+            .rebuild => view.row_entity.len,
+        };
+        if (items == 0) return 0;
+        const tuner = switch (mode) {
+            .patch => &self.trigger_query_tuner,
+            .rebuild => &self.trigger_query_rebuild_tuner,
+        };
+        const selection = threads.stage(tuner).select(items, collision_range_alignment_items);
+        var grew = try self.prepareTriggerQuerySlots(selection, items, mode);
+        const slots = self.trigger_query_slots.items[0..selection.range_count];
+        var job = TriggerQueryJob{
             .data = data,
             .view = view,
+            .store = &self.trigger_store,
             .strips = self.strips,
-            .rows = self.trigger_rows.items,
+            .mode = mode,
+            .change_mark = self.change_mark.items,
+            .change_generation = self.change_generation,
             .slots = slots,
             .items_per_range = selection.items_per_range,
             .range_count = selection.range_count,
+            .item_count = items,
         };
+        var batch = BatchStats{};
         while (true) {
             for (slots) |*slot| slot.value.clear();
-            _ = threads.thread_system.parallelForWithOptions(items, &job, triggerJob, .{
+            batch = threads.thread_system.parallelForWithOptions(items, &job, triggerQueryJob, .{
                 .items_per_range = threads.config.items_per_range,
                 .max_worker_threads = threads.config.max_worker_threads,
                 .range_alignment_items = collision_range_alignment_items,
@@ -1566,80 +1702,81 @@ pub const CollisionSystem = struct {
                 .adaptive_tuner = null,
                 .selected_profile = selection.profile,
             });
-            if (!(try self.growStaticPairSlots(selection.range_count)).grew()) break;
+            if (!try self.growTriggerQuerySlots(selection.range_count, mode)) break;
+            grew = true;
         }
-        for (slots) |*slot| {
-            try self.trigger_pairs.ensureTotalCapacity(self.allocator, self.trigger_pairs.items.len + slot.value.pairs.items.len);
-            self.trigger_pairs.appendSliceAssumeCapacity(slot.value.pairs.items);
-        }
+        if (selection.active_tuner) |active| active.record(batch);
+        self.trigger_query_batch = batch;
+        if (grew) self.trigger_store.countSlotGrowth();
+        return selection.range_count;
     }
 
-    fn collectRequeryRows(self: *CollisionSystem, data: *const DataSystem, view: ColliderView) !void {
-        self.change_generation +%= 1;
-        if (self.change_generation == 0) {
-            @memset(self.change_mark.items, 0);
-            self.change_generation = 1;
+    // Reserves every range's slot at the selection: `trigger_records_per_item` edit records
+    // per item it covers and one query's hit rows. Grow-only; returns whether any list grew.
+    fn prepareTriggerQuerySlots(self: *CollisionSystem, selection: BatchSelection, items: usize, mode: TriggerQueryMode) !bool {
+        const range_count = selection.range_count;
+        var grew = false;
+        if (self.trigger_query_slots.capacity < range_count) {
+            try self.trigger_query_slots.ensureTotalCapacity(self.allocator, range_count);
+            grew = true;
         }
-        for (view.changes) |change| {
-            if (!data.isStaticNavigationObstacle(change.entity)) continue;
-            const index = change.entity.index;
-            if (index >= view.row_of_index.len) continue;
-            const row = view.row_of_index[index];
-            if (row == no_static_row) continue;
-            try self.pushRequeryRow(row, index);
-            const rect = data.staticObstacleWorldRect(change.entity) orelse continue;
-            const level = data.worldLevelConst(change.entity) orelse 0;
-            var entity_buf: [8]u32 = undefined;
-            var min_x: [8]f32 = undefined;
-            var min_y: [8]f32 = undefined;
-            var max_x: [8]f32 = undefined;
-            var max_y: [8]f32 = undefined;
-            const hits = view.collectOverlaps(level, rect, &entity_buf, &min_x, &min_y, &max_x, &max_y, idleSpanIds());
-            if (hits > entity_buf.len) {
-                try self.noteRequeryOverflow(data, view, level, rect, hits);
-                continue;
+        while (self.trigger_query_slots.items.len < range_count) self.trigger_query_slots.appendAssumeCapacity(.{});
+        for (self.trigger_query_slots.items[0..range_count], 0..) |*padded, range_index| {
+            const slot = &padded.value;
+            const records = trigger_records_per_item * rangeLenForIndex(items, selection.items_per_range, range_index);
+            grew = try reserveRecords(InsertEdit, &slot.inserts, self.allocator, records) or grew;
+            if (mode == .patch) {
+                grew = try reserveRecords(TreePath, &slot.insert_paths, self.allocator, records) or grew;
+                grew = try reserveRecords(DropPiece, &slot.drops, self.allocator, records) or grew;
             }
-            try self.noteRequeryHits(data, view, entity_buf[0..hits]);
+            if (slot.hits.len < reserved_query_hits) {
+                try ensureHitRows(&slot.hits, self.allocator, reserved_query_hits);
+                grew = true;
+            }
+            grew = try reserveRecords(KeyedContact, &slot.contacts, self.allocator, slot.hits.len) or grew;
         }
-    }
-
-    fn noteRequeryOverflow(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, level: u16, rect: math.Aabb, hits: usize) !void {
-        const entities = try self.allocator.alloc(u32, hits);
-        defer self.allocator.free(entities);
-        const min_x = try self.allocator.alloc(f32, hits);
-        defer self.allocator.free(min_x);
-        const min_y = try self.allocator.alloc(f32, hits);
-        defer self.allocator.free(min_y);
-        const max_x = try self.allocator.alloc(f32, hits);
-        defer self.allocator.free(max_x);
-        const max_y = try self.allocator.alloc(f32, hits);
-        defer self.allocator.free(max_y);
-        const full = view.collectOverlaps(level, rect, entities, min_x, min_y, max_x, max_y, idleSpanIds());
-        try self.noteRequeryHits(data, view, entities[0..full]);
-    }
-
-    fn noteRequeryHits(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, entities: []const u32) !void {
-        for (entities) |entity_index| {
-            if (entity_index >= view.row_of_index.len) continue;
-            const row = view.row_of_index[entity_index];
-            if (row == no_static_row or row >= view.row_entity.len) continue;
-            const other = view.row_entity[row];
-            const response = data.collisionResponseConst(other) orelse continue;
-            if (response.mode != .trigger) continue;
-            try self.pushRequeryRow(row, other.index);
+        if (self.trigger_edit_sources.capacity < range_count) {
+            try self.trigger_edit_sources.ensureTotalCapacity(self.allocator, range_count);
+            grew = true;
         }
+        return grew;
     }
 
-    fn pushRequeryRow(self: *CollisionSystem, row: u32, entity_index: u32) !void {
-        if (entity_index >= self.change_mark.items.len) {
-            try self.change_mark.ensureTotalCapacity(self.allocator, entity_index + 1);
-            self.change_mark.appendNTimesAssumeCapacity(0, entity_index + 1 - self.change_mark.items.len);
+    // Grows each slot the last pass outgrew, before its replay: hit rows geometrically past
+    // its largest query (its contacts with them), and each record list past its need.
+    fn growTriggerQuerySlots(self: *CollisionSystem, range_count: usize, mode: TriggerQueryMode) !bool {
+        var grew = false;
+        for (self.trigger_query_slots.items[0..range_count]) |*padded| {
+            const slot = &padded.value;
+            if (slot.hits_required > slot.hits.len) {
+                try ensureHitRows(&slot.hits, self.allocator, std.MultiArrayList(HitRow).growCapacity(slot.hits_required));
+                try slot.contacts.ensureTotalCapacity(self.allocator, slot.hits.len);
+                grew = true;
+            }
+            grew = try reserveRecords(InsertEdit, &slot.inserts, self.allocator, slot.insert_need) or grew;
+            if (mode == .patch) grew = try reserveRecords(TreePath, &slot.insert_paths, self.allocator, slot.insert_need) or grew;
+            grew = try reserveRecords(DropPiece, &slot.drops, self.allocator, slot.drop_need) or grew;
         }
-        if (self.change_mark.items[entity_index] == self.change_generation) return;
-        self.change_mark.items[entity_index] = self.change_generation;
-        try self.trigger_rows.append(self.allocator, row);
+        return grew;
     }
 
+    // One edit source per query range, in range order, within reserved capacity.
+    fn triggerEditSources(self: *CollisionSystem, range_count: usize, mode: TriggerQueryMode) []const EditSource {
+        self.trigger_edit_sources.clearRetainingCapacity();
+        for (self.trigger_query_slots.items[0..range_count]) |*padded| {
+            const slot = &padded.value;
+            std.debug.assert(!slot.overflowed);
+            self.trigger_edit_sources.appendAssumeCapacity(.{
+                .inserts = slot.inserts.items,
+                .insert_paths = if (mode == .patch) slot.insert_paths.items else &.{},
+                .drops = slot.drops.items,
+            });
+        }
+        return self.trigger_edit_sources.items;
+    }
+
+    // Stamps every changed entity index with a fresh generation, growing the column to the
+    // highest changed index. O(changes).
     fn markChanges(self: *CollisionSystem, changes: []const ColliderChange) !void {
         self.change_generation +%= 1;
         if (self.change_generation == 0) {
@@ -1655,139 +1792,12 @@ pub const CollisionSystem = struct {
         for (changes) |change| self.change_mark.items[change.entity.index] = self.change_generation;
     }
 
-    fn dropChangedPairs(self: *CollisionSystem) void {
-        var write: usize = 0;
-        for (self.trigger_pairs.items) |pair| {
-            if (self.entityChanged(pair.contact.a) or self.entityChanged(pair.contact.b)) continue;
-            self.trigger_pairs.items[write] = pair;
-            write += 1;
-        }
-        self.trigger_pairs.items.len = write;
-    }
-
-    fn entityChanged(self: *const CollisionSystem, id: EntityId) bool {
-        const index = id.index;
-        return index < self.change_mark.items.len and self.change_mark.items[index] == self.change_generation;
-    }
-
-    // Cold roster: every stored pair is new, so one sort groups them by head.
-    fn groupTriggerHeads(self: *CollisionSystem) !void {
-        std.mem.sort(KeyedContact, self.trigger_pairs.items, {}, keyedHeadLess);
-        try self.rebuildTriggerHeads(self.trigger_pairs.items);
-    }
-
-    // The kept prefix is already grouped. Sort only the pairs the requery appended
-    // and merge them onto those heads. A pair already stored on its head is not copied.
-    fn attachTriggerPairs(self: *CollisionSystem, kept: usize) !void {
-        const total = self.trigger_pairs.items.len;
-        if (kept == 0) {
-            try self.groupTriggerHeads();
-            return;
-        }
-        if (kept == total) {
-            try self.rebuildTriggerHeads(self.trigger_pairs.items);
-            return;
-        }
-        std.mem.sort(KeyedContact, self.trigger_pairs.items[kept..], {}, keyedHeadLess);
-        try self.rebuildTriggerHeads(self.trigger_pairs.items[0..kept]);
-        try self.ordered.ensureTotalCapacity(self.allocator, total);
-        self.ordered.clearRetainingCapacity();
-        var head_index: usize = 0;
-        var fresh_index: usize = 0;
-        const fresh = self.trigger_pairs.items[kept..];
-        while (head_index < self.triggers.items.len or fresh_index < fresh.len) {
-            const head_entity: ?u32 = if (head_index < self.triggers.items.len) self.triggers.items[head_index].entity_index else null;
-            const fresh_entity: ?u32 = if (fresh_index < fresh.len) fresh[fresh_index].contact.a.index else null;
-            if (head_entity != null and (fresh_entity == null or head_entity.? <= fresh_entity.?)) {
-                const head = self.triggers.items[head_index];
-                const start: usize = head.start;
-                const end = start + head.count;
-                self.ordered.appendSliceAssumeCapacity(self.trigger_pairs.items[start..end]);
-                head_index += 1;
-                if (fresh_entity != null and fresh_entity.? == head.entity_index) {
-                    fresh_index = self.appendFreshHead(fresh, fresh_index, self.trigger_pairs.items[start..end]);
-                }
-            } else {
-                fresh_index = self.appendFreshHead(fresh, fresh_index, &.{});
-            }
-        }
-        self.trigger_pairs.items.len = self.ordered.items.len;
-        @memcpy(self.trigger_pairs.items, self.ordered.items);
-        try self.rebuildTriggerHeads(self.trigger_pairs.items);
-    }
-
-    fn appendFreshHead(self: *CollisionSystem, fresh: []const KeyedContact, start: usize, kept: []const KeyedContact) usize {
-        var index = start;
-        if (index >= fresh.len) return index;
-        const entity = fresh[index].contact.a.index;
-        while (index < fresh.len and fresh[index].contact.a.index == entity) : (index += 1) {
-            if (storedPair(kept, fresh[index].contact)) continue;
-            self.ordered.appendAssumeCapacity(fresh[index]);
-        }
-        return index;
-    }
-
-    fn rebuildTriggerHeads(self: *CollisionSystem, pairs: []const KeyedContact) !void {
-        self.triggers.clearRetainingCapacity();
-        try self.triggers.ensureTotalCapacity(self.allocator, pairs.len);
-        var index: usize = 0;
-        while (index < pairs.len) {
-            const head = pairs[index].contact.a.index;
-            const start = index;
-            while (index < pairs.len and pairs[index].contact.a.index == head) index += 1;
-            self.triggers.appendAssumeCapacity(.{
-                .entity_index = head,
-                .start = @intCast(start),
-                .count = @intCast(index - start),
-            });
-        }
-    }
-
-    // One reserve, then every stored pair, or only the pairs whose allow word is 1.
-    // The pack wrote that column; this does not read tiers.
-    fn appendTriggerContacts(self: *CollisionSystem, exclude: bool) !void {
-        const pairs = self.trigger_pairs.items;
-        if (pairs.len == 0) return;
-        try self.static_pairs.ensureTotalCapacity(self.allocator, self.static_pairs.items.len + pairs.len);
-        if (!exclude) {
-            self.static_pairs.appendSliceAssumeCapacity(pairs);
-            return;
-        }
-        const allow = self.trigger_allow.items;
-        std.debug.assert(allow.len == pairs.len);
-        for (pairs, allow) |pair, word| {
-            std.debug.assert(word == 0 or word == 1);
-            if (word == 1) self.static_pairs.appendAssumeCapacity(pair);
-        }
-    }
-
-    // Packs one u32 per stored pair when exclusion is on and the column is stale.
-    // Below the tuner gate the same job runs inline. A fresh column, exclusion off,
-    // or an empty list does not dispatch.
-    fn packTriggerAllow(self: *CollisionSystem, data: *const DataSystem, threads: Threads, exclude: bool, stats: *CollisionStats) !void {
-        const pair_count = self.trigger_pairs.items.len;
-        if (!exclude or pair_count == 0 or (self.trigger_allow.items.len == pair_count and self.trigger_allow_epoch == data.collision_allow_epoch)) return;
-        try self.trigger_allow.ensureTotalCapacity(self.allocator, pair_count);
-        self.trigger_allow.items.len = pair_count;
-        const stage = threads.stage(&self.trigger_allow_tuner);
-        const selection = stage.select(pair_count, collision_range_alignment_items);
-        var job = PackTriggerAllowJob{
-            .data = data,
-            .pairs = self.trigger_pairs.items,
-            .allow = self.trigger_allow.items,
-            .items_per_range = selection.items_per_range,
-            .range_count = selection.range_count,
-        };
-        const batch = stage.run(selection, pair_count, collision_range_alignment_items, &job, packTriggerAllowJob);
-        if (comptime runtime_perf_log.enabled) stats.perf.trigger_allow_batch = batch;
-        self.trigger_allow_epoch = data.collision_allow_epoch;
-    }
-
+    // The static place, then the sort back into `static_pairs`, each under its own tuner.
     fn sortStaticPairs(self: *CollisionSystem, threads: Threads, stats: *CollisionStats) !void {
         const count = self.static_pairs.items.len;
         if (count == 0) return;
-        const stage = threads.stage(&self.static_sort_tuner);
-        const place = stage.select(count, collision_range_alignment_items);
+        const place_stage = threads.stage(&self.static_place_tuner);
+        const place = place_stage.select(count, collision_range_alignment_items);
         try self.sort_staging.ensureTotalCapacity(self.allocator, count);
         self.sort_staging.items.len = count;
         try self.sort_offsets.ensureTotalCapacity(self.allocator, place.range_count);
@@ -1802,46 +1812,31 @@ pub const CollisionSystem = struct {
             .items_per_range = place.items_per_range,
             .offsets = self.sort_offsets.items,
         };
-        _ = threads.thread_system.parallelForWithOptions(count, &place_job, PairSort.placeJob, .{
-            .max_worker_threads = place.worker_threads,
-            .range_alignment_items = collision_range_alignment_items,
-            .selected_profile = place.profile,
-        });
-        const starts = banded_sort.sumBandOffsets(self.sort_offsets.items[0..place.range_count]);
-        try self.ordered.ensureTotalCapacity(self.allocator, count);
-        self.ordered.items.len = count;
-        const sort_selection = stage.select(count, collision_range_alignment_items);
+        const place_batch = place_stage.run(place, count, collision_range_alignment_items, &place_job, PairSort.placeJob);
+        if (comptime runtime_perf_log.enabled) stats.perf.static_place_batch = place_batch;
+        const sort_stage = threads.stage(&self.static_sort_tuner);
+        const sort = sort_stage.select(count, collision_range_alignment_items);
+        // The place copied every pair into the staging windows, so the sort writes them back.
         var sort_job = PairSort.SortJob{
             .source = .{ .staging = self.sort_staging.items, .band_offsets = self.sort_offsets.items[0..place.range_count], .window_stride = place.items_per_range },
-            .dest = self.ordered.items,
-            .starts = starts,
-            .range_count = sort_selection.range_count,
+            .dest = self.static_pairs.items,
+            .starts = banded_sort.sumBandOffsets(self.sort_offsets.items[0..place.range_count]),
+            .range_count = sort.range_count,
         };
-        const batch = stage.run(sort_selection, count, collision_range_alignment_items, &sort_job, PairSort.sortJob);
+        const batch = sort_stage.run(sort, count, collision_range_alignment_items, &sort_job, PairSort.sortJob);
         if (comptime runtime_perf_log.enabled) stats.perf.static_sort_batch = batch;
-        self.static_pairs.clearRetainingCapacity();
-        try self.static_pairs.ensureTotalCapacity(self.allocator, count);
-        self.static_pairs.appendSliceAssumeCapacity(self.ordered.items[0..count]);
     }
 
-    fn mergeWithStatics(self: *CollisionSystem, contacts: *RangeOutputStream(CollisionContact), narrow_ran: bool, items_per_range: usize) !usize {
+    // The dynamic side of the emission in key order: the sorted static pairs alone, or the
+    // narrowphase windows merged with them in `ordered`.
+    fn mergeOrdered(self: *CollisionSystem, narrow_ran: bool, items_per_range: usize) ![]const KeyedContact {
+        const dynamic_count = if (narrow_ran) try self.compactDynamicKeys(items_per_range) else 0;
+        if (dynamic_count == 0) return self.static_pairs.items;
         const static_count = self.static_pairs.items.len;
-        var dynamic_count: usize = 0;
-        if (narrow_ran) dynamic_count = try self.compactDynamicKeys(items_per_range);
-        const total = dynamic_count + static_count;
-        try self.ordered.ensureTotalCapacity(self.allocator, total);
-        self.ordered.items.len = total;
-        if (static_count != 0) {
-            try self.sort_staging.ensureTotalCapacity(self.allocator, static_count);
-            self.sort_staging.items.len = static_count;
-            @memcpy(self.sort_staging.items, self.static_pairs.items);
-            if (dynamic_count == 0) {
-                @memcpy(self.ordered.items, self.sort_staging.items);
-            } else {
-                mergeIntoSorted(KeyedContact, keyedGreater, self.ordered.items, dynamic_count, self.sort_staging.items);
-            }
-        }
-        return self.writeOrderedContacts(contacts, self.ordered.items[0..total]);
+        std.debug.assert(self.ordered.capacity >= dynamic_count + static_count);
+        self.ordered.items.len = dynamic_count + static_count;
+        mergeIntoSorted(KeyedContact, keyedGreater, self.ordered.items, dynamic_count, self.static_pairs.items);
+        return self.ordered.items;
     }
 
     // Copies the narrowphase windows, keys included, to the front of `ordered`.
@@ -1865,22 +1860,408 @@ pub const CollisionSystem = struct {
         return count;
     }
 
-    fn writeOrderedContacts(self: *CollisionSystem, contacts: *RangeOutputStream(CollisionContact), items: []const KeyedContact) !usize {
-        _ = self;
-        if (items.len == 0) {
+    // Merges the first `stored` stored pairs with `dynamic` by key straight into the contact
+    // stream's range windows, on workers. Each range finds its split by merge path; a count
+    // pass at the write's selection sizes the windows when some stored pair is filtered.
+    // Main work is O(ranges). Returns the contacts written.
+    fn emitContacts(
+        self: *CollisionSystem,
+        contacts: *RangeOutputStream(CollisionContact),
+        dynamic: []const KeyedContact,
+        stored: u32,
+        stored_emitted: u32,
+        exclude: bool,
+        threads: Threads,
+        stats: *CollisionStats,
+    ) !usize {
+        const items = stored + dynamic.len;
+        if (items == 0) {
             contacts.clearRetainingCapacity();
             return 0;
         }
-        try contacts.prepareRangeCounts(1);
-        contacts.addCount(0, items.len);
+        // Covers both grows below: the values are at most `items`, and the ranges at most
+        // `maxRangeCount(items, collision_range_alignment_items)`.
+        if (self.reserved_pair_bound != 0 and items > self.reserved_pair_bound) self.noteContactBoundOverflow(stats, items);
+        const dispatch = threads.stage(&self.emit_tuner);
+        const selection = dispatch.select(items, collision_range_alignment_items);
+        const range_count = selection.range_count;
+        try self.emit_ranges.ensureTotalCapacity(self.allocator, range_count);
+        setSlotCount(EmitRange, &self.emit_ranges, range_count);
+        const counted = stored_emitted < stored;
+        var job = EmitJob{
+            .store = &self.trigger_store,
+            .dynamic = dynamic,
+            .stored = stored,
+            .exclude = exclude,
+            .counted = counted,
+            .ranges = self.emit_ranges.items,
+            .contacts = contacts,
+            .items_per_range = selection.items_per_range,
+            .range_count = range_count,
+            .item_count = items,
+        };
+        if (counted) {
+            // Rides the write's selection unrecorded: its O(pages + ranges x page) is small
+            // next to the write it sizes.
+            const count_batch = threads.thread_system.parallelForWithOptions(items, &job, emitCountJob, .{
+                .items_per_range = threads.config.items_per_range,
+                .max_worker_threads = threads.config.max_worker_threads,
+                .range_alignment_items = collision_range_alignment_items,
+                .adaptive = threads.config.adaptive,
+                .adaptive_tuner = null,
+                .selected_profile = selection.profile,
+            });
+            if (comptime runtime_perf_log.enabled) stats.perf.trigger_emit_count_batch = count_batch;
+        }
+        try contacts.prepareRangeCounts(range_count);
+        for (self.emit_ranges.items, 0..) |slot, range_index| {
+            contacts.addCount(range_index, if (counted) slot.value.out else rangeLenForIndex(items, selection.items_per_range, range_index));
+        }
         try contacts.prefix();
-        var writer = contacts.rangeWriter(0);
-        for (items) |item| writer.write(item.contact);
-        writer.finish();
+        const batch = dispatch.run(selection, items, collision_range_alignment_items, &job, emitWriteJob);
+        if (comptime runtime_perf_log.enabled) stats.perf.trigger_emit_batch = batch;
         contacts.finishWrite();
-        return items.len;
+        return stored_emitted + dynamic.len;
+    }
+
+    // A step whose stored and dynamic contacts outgrew the reserved pair bound: the contact
+    // stream and the emission ranges grow on main.
+    fn noteContactBoundOverflow(self: *CollisionSystem, stats: *CollisionStats, items: usize) void {
+        @branchHint(.cold);
+        self.markPairBoundExceeded(stats);
+        if (self.contact_bound_warned) return;
+        self.contact_bound_warned = true;
+        if (comptime logging.enabled(.warn)) logging.game.warn(
+            "collision: {d} stored trigger and dynamic contacts outgrew the reserved pair bound {d}; the contact stream grew in-stage",
+            .{ items, self.reserved_pair_bound },
+        );
     }
 };
+
+// The store's stage controls: the collision config's.
+fn storeThreads(threads: Threads) StoreThreads {
+    return .{ .thread_system = threads.thread_system, .config = .{
+        .items_per_range = threads.config.items_per_range,
+        .max_worker_threads = threads.config.max_worker_threads,
+        .adaptive = threads.config.adaptive,
+    } };
+}
+
+// Grows `list` to hold `count` records; true when it allocated.
+fn reserveRecords(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, count: usize) !bool {
+    if (list.capacity >= count) return false;
+    try list.ensureTotalCapacity(allocator, count);
+    return true;
+}
+
+// ---- Stored-trigger query (workers) -----------------------------------------------------
+
+const TriggerQueryJob = struct {
+    data: *const DataSystem,
+    view: ColliderView,
+    // Read only: no patch runs during the query.
+    store: *const TriggerStore,
+    strips: CollisionStrips,
+    mode: TriggerQueryMode,
+    change_mark: []const u32,
+    change_generation: u32,
+    slots: []PaddedSlot(TriggerQuerySlot),
+    items_per_range: usize,
+    range_count: usize,
+    item_count: usize,
+
+    fn changed(self: *const TriggerQueryJob, entity_index: u32) bool {
+        return entity_index < self.change_mark.len and self.change_mark[entity_index] == self.change_generation;
+    }
+};
+
+// A patch item drops its change's old pairs and queries its new row; a rebuild item queries
+// its row when it is live and a trigger.
+fn triggerQueryJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *TriggerQueryJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.range_count and range.index < job.slots.len);
+    std.debug.assert(range.start == range.index * job.items_per_range);
+    std.debug.assert(range.start <= range.end and range.end <= job.item_count);
+    const slot = &job.slots[range.index].value;
+    const view = job.view;
+    for (range.start..range.end) |item| switch (job.mode) {
+        .patch => {
+            const change = view.changes[item];
+            const entity_index = change.entity.index;
+            if (change.old) |old| queryOldTriggerPairs(job, slot, old, entity_index);
+            if (change.new) |placement| {
+                std.debug.assert(entity_index < view.row_of_index.len and view.row_of_index[entity_index] != no_static_row);
+                queryNewTriggerPairs(job, slot, view.row_of_index[entity_index], placement.level);
+            }
+        },
+        .rebuild => {
+            // Rebuild items are row-pool ids, u32 by `ColliderView.row_of_index`.
+            const row: u32 = @intCast(item);
+            const entity = view.row_entity[row];
+            if (entity.index >= view.row_of_index.len or view.row_of_index[entity.index] != row) continue;
+            queryNewTriggerPairs(job, slot, row, job.data.worldLevelConst(entity) orelse 0);
+        },
+    };
+}
+
+// Inserts the stored pairs row `row` on `level` owns: each positive overlap with a partner
+// that has a movement row, where either side is a trigger, unless the partner also queries
+// and is the pair's a. Rows and emit bits are current now.
+// SIMD verdict: the overlap and contact math is the `writeStaticHitContacts` lane kernel;
+// the hit pack and the pair rule are scalar (pair-stream point lookups), and each kept
+// pair drains into a tree descent, which is irreducible.
+fn queryNewTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, row: u32, level: u16) void {
+    const data = job.data;
+    const view = job.view;
+    const entity = view.row_entity[row];
+    const response = data.collisionResponseConst(entity) orelse return;
+    const own_trigger = response.mode == .trigger;
+    if (job.mode == .rebuild and !own_trigger) return;
+    const own_move = data.movementBodyDenseIndex(entity) orelse return;
+    const box = math.Aabb{ .min_x = view.row_min_x[row], .min_y = view.row_min_y[row], .max_x = view.row_max_x[row], .max_y = view.row_max_y[row] };
+    const hits = HitColumns.of(slot.hits.slice());
+    const full = view.collectOverlaps(level, box, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, idleSpanIds());
+    if (full > slot.hits.len) {
+        slot.noteHits(full);
+        return;
+    }
+    const bodies = data.movement_bodies.sliceConst();
+    const scope = data.movement_bodies.scopeSliceConst();
+    packStaticHits(view, data, hits, full, entity, bodies, scope, false);
+    slot.contacts.clearRetainingCapacity();
+    std.debug.assert(slot.contacts.capacity >= full);
+    // Movement rows are u32 throughout collision.
+    writeStaticHitContacts(&slot.contacts, hits, full, entity, @intCast(own_move), box, bodies.velocity_x[own_move], bodies.velocity_y[own_move], level, job.strips);
+    for (slot.contacts.items) |keyed| {
+        const contact = keyed.contact;
+        const partner_is_a = !contact.a.eql(entity);
+        const partner = if (partner_is_a) contact.a else contact.b;
+        const partner_response = data.collisionResponseConst(partner) orelse continue;
+        const partner_trigger = partner_response.mode == .trigger;
+        if (!own_trigger and !partner_trigger) continue;
+        const partner_queries = switch (job.mode) {
+            .patch => job.changed(partner.index),
+            .rebuild => partner_trigger,
+        };
+        if (partner_queries and partner_is_a) continue;
+        const allow = scope.tier[contact.a_movement_index].allowsCollision() and scope.tier[contact.b_movement_index].allowsCollision();
+        const emit = collision_triggers.emit_valid | if (allow) collision_triggers.emit_allowed else 0;
+        switch (job.mode) {
+            .patch => {
+                const located = job.store.locateKey(keyed.key);
+                slot.pushInsert(.{ .key = keyed.key, .contact = contact, .leaf_start = located.leaf_start, .emit = emit }, located.path);
+            },
+            .rebuild => slot.pushInsert(.{ .key = keyed.key, .contact = contact, .leaf_start = 0, .emit = emit }, null),
+        }
+    }
+}
+
+// Drops every stored pair entity index `entity_index` held at its old row: its a-pairs as
+// one key range per occupied strip its old box reaches, and its b-pairs by exact key
+// against each unchanged partner its old box can reach. A changed partner drops their pair
+// from its own a-range.
+// SIMD verdict: scalar. Tree descents and page searches per strip and per hit.
+fn queryOldTriggerPairs(job: *const TriggerQueryJob, slot: *TriggerQuerySlot, old: OldPlacement, entity_index: u32) void {
+    const store = job.store;
+    if (store.pair_count == 0) return;
+    const view = job.view;
+    const geometry = view.geometry.?;
+    const old_run = bodyRunKey(old.min_x, old.min_y, entity_index);
+    // The old box reached at most one cell past its last cell's far edge, which absorbs the
+    // f32 rounding of that edge; from a level's last cell a row may reach past the grid.
+    const reach = math.Aabb{
+        .min_x = old.min_x,
+        .min_y = old.min_y,
+        .max_x = edgePastCell(old.cells.max_x, geometry.grid.width, geometry.cell_size),
+        .max_y = edgePastCell(old.cells.max_y, geometry.grid.height, geometry.cell_size),
+    };
+    const level_start = store.levelStart(old.level);
+    var strip = stripOf(job.strips, old.min_y);
+    const last_strip = stripOf(job.strips, reach.max_y);
+    while (strip <= last_strip) : (strip += 1) {
+        const bounds = keyRangeOfARun(old.level, strip, old_run);
+        var cursor = store.seek(bounds[0]);
+        if (!cursor.valid()) break;
+        var keys = cursor.pageKeys();
+        const first_key = keys[cursor.offset];
+        if (collision_triggers.keyLevel(first_key) != old.level) break;
+        // Jump to the next occupied strip, so the walk costs occupied strips, not the reach.
+        const first_strip = keyStrip(first_key);
+        if (first_strip > strip) {
+            if (first_strip > last_strip) break;
+            strip = first_strip - 1;
+            continue;
+        }
+        while (true) {
+            const offset = cursor.offset;
+            var end = offset;
+            while (end < cursor.page_len and keys[end] <= bounds[1]) end += 1;
+            if (end > offset) slot.pushDrop(.{ .path = cursor.path, .leaf_start = cursor.page_start - level_start, .lo = @intCast(offset), .hi = @intCast(end) });
+            if (end == offset or end < cursor.page_len) break;
+            cursor.nextPage();
+            if (!cursor.valid()) break;
+            keys = cursor.pageKeys();
+        }
+    }
+    const hits = HitColumns.of(slot.hits.slice());
+    const full = view.collectOverlaps(old.level, reach, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, idleSpanIds());
+    if (full > slot.hits.len) {
+        slot.noteHits(full);
+        return;
+    }
+    for (0..full) |hit| {
+        const partner = hits.entity[hit];
+        if (partner == entity_index or job.changed(partner)) continue;
+        const partner_run = bodyRunKey(hits.min_x[hit], hits.min_y[hit], partner);
+        if (partner_run >= old_run) continue;
+        const key = contactOrderKey(old.level, stripOf(job.strips, @max(hits.min_y[hit], old.min_y)), partner_run, old_run);
+        const located = store.locateKey(key);
+        if (located.path.leaf == no_entry) continue;
+        const keys = store.pageKeys(located.path.leaf)[0..located.page_len];
+        const at = std.sort.lowerBound(u256, keys, key, orderKey);
+        if (at < keys.len and keys[at] == key) slot.pushDrop(.{ .path = located.path, .leaf_start = located.leaf_start, .lo = @intCast(at), .hi = @intCast(at + 1) });
+    }
+}
+
+// The world edge one cell past cell `cell`'s far edge, or +inf from the axis's last cell.
+fn edgePastCell(cell: u32, cells: u32, cell_size: f32) f32 {
+    if (cell + 1 >= cells) return std.math.inf(f32);
+    return @as(f32, @floatFromInt(cell + 2)) * cell_size;
+}
+
+fn stripOf(strips: CollisionStrips, y: f32) u32 {
+    return math.worldPosToCell(y, strips.height, strip_count);
+}
+
+fn orderKey(key: u256, item: u256) std.math.Order {
+    return std.math.order(key, item);
+}
+
+// ---- Stored-trigger emission (workers) --------------------------------------------------
+
+const EmitJob = struct {
+    // Read only: the emission runs after every refresh and patch.
+    store: *const TriggerStore,
+    dynamic: []const KeyedContact,
+    stored: u32,
+    exclude: bool,
+    counted: bool,
+    ranges: []PaddedSlot(EmitRange),
+    contacts: *RangeOutputStream(CollisionContact),
+    items_per_range: usize,
+    range_count: usize,
+    item_count: usize,
+
+    fn assertRange(self: *const EmitJob, range: ParallelRange) void {
+        std.debug.assert(range.index < self.range_count and range.index < self.ranges.len);
+        std.debug.assert(range.start == range.index * self.items_per_range);
+        std.debug.assert(range.start <= range.end and range.end <= self.item_count);
+    }
+
+    // The stored pairs among the first `position` merged positions: a binary search on the
+    // merge path, comparing stored pair i with dynamic contact `position - i - 1`. Keys are
+    // distinct across the streams (static-static against dynamic-involving pairs).
+    // Hand-rolled: `std.sort.partitionPoint` needs a slice, and one side is a tree select.
+    fn split(self: *const EmitJob, position: usize) u32 {
+        var lo: usize = position -| self.dynamic.len;
+        var hi: usize = @min(position, self.stored);
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const cursor = self.store.cursorAt(@intCast(mid));
+            if (cursor.page().keys[cursor.offset] < self.dynamic[position - mid - 1].key) lo = mid + 1 else hi = mid;
+        }
+        return @intCast(lo);
+    }
+
+    fn rangeSplit(self: *const EmitJob, range: ParallelRange) EmitRange {
+        const stored_start = self.split(range.start);
+        const stored_end = self.split(range.end);
+        return .{ .stored_start = stored_start, .stored_end = stored_end, .dynamic_start = range.start - stored_start, .dynamic_end = range.end - stored_end };
+    }
+};
+
+fn emitsStored(emit: u8, exclude: bool) bool {
+    const both = collision_triggers.emit_valid | collision_triggers.emit_allowed;
+    return if (exclude) emit == both else emit & collision_triggers.emit_valid != 0;
+}
+
+// Sizes each range's window: its dynamic contacts plus its stored pairs that pass the
+// filter, whole pages from their header sums.
+// SIMD verdict: scalar. One header load per whole page and at most two partial pages of u8
+// emit bytes; `simd.zig` has no u8 lanes.
+fn emitCountJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *EmitJob = @ptrCast(@alignCast(context));
+    job.assertRange(range);
+    var bounds = job.rangeSplit(range);
+    var stored: usize = 0;
+    var at = bounds.stored_start;
+    if (at < bounds.stored_end) {
+        var cursor = job.store.cursorAt(at);
+        while (true) {
+            const page = cursor.page();
+            const take: u32 = @min(cursor.page_len - cursor.offset, bounds.stored_end - at);
+            if (cursor.offset == 0 and take == cursor.page_len) {
+                stored += if (job.exclude) page.header.allowed else page.header.valid;
+            } else {
+                for (page.emit[cursor.offset..][0..take]) |emit| stored += @intFromBool(emitsStored(emit, job.exclude));
+            }
+            at += take;
+            if (at == bounds.stored_end) break;
+            cursor.nextPage();
+        }
+    }
+    bounds.out = stored + (bounds.dynamic_end - bounds.dynamic_start);
+    job.ranges[range.index].value = bounds;
+}
+
+// Merges the range's stored pairs and dynamic contacts by key into its window, the stored
+// ones that pass the filter transposed from the page columns.
+// SIMD verdict: scalar. A compare-driven merge with a byte filter, and a SoA-to-AoS
+// transpose with usize widening.
+fn emitWriteJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *EmitJob = @ptrCast(@alignCast(context));
+    job.assertRange(range);
+    const bounds = if (job.counted) job.ranges[range.index].value else job.rangeSplit(range);
+    var writer = job.contacts.rangeWriter(range.index);
+    var stored = bounds.stored_start;
+    var dynamic = bounds.dynamic_start;
+    var cursor: collision_triggers.Cursor = undefined;
+    // The cursor's page view, built once per page: building it per pair is two pool slot
+    // resolves and a column-pointer set per merged item.
+    var page: collision_triggers.Page = undefined;
+    if (stored < bounds.stored_end) {
+        cursor = job.store.cursorAt(stored);
+        page = cursor.page();
+    }
+    while (stored < bounds.stored_end or dynamic < bounds.dynamic_end) {
+        const take_stored = stored < bounds.stored_end and
+            (dynamic == bounds.dynamic_end or page.keys[cursor.offset] < job.dynamic[dynamic].key);
+        if (!take_stored) {
+            writer.write(job.dynamic[dynamic].contact);
+            dynamic += 1;
+            continue;
+        }
+        const slot = cursor.offset;
+        if (emitsStored(page.emit[slot], job.exclude)) writer.write(.{
+            .a = page.a[slot],
+            .b = page.b[slot],
+            .a_movement_index = page.a_row[slot],
+            .b_movement_index = page.b_row[slot],
+            .normal_x = page.normal_x[slot],
+            .normal_y = page.normal_y[slot],
+            .penetration = page.penetration[slot],
+            .pre_response_max_speed_sq = page.max_speed_sq[slot],
+            .pre_response_relative_speed_sq = page.rel_speed_sq[slot],
+        });
+        stored += 1;
+        if (stored < bounds.stored_end) {
+            cursor.next();
+            // `next` leaves offset 0 only when it stepped onto a new page.
+            if (cursor.offset == 0) page = cursor.page();
+        }
+    }
+    writer.finish();
+}
 
 // ---- Static pairs --------------------------------------------------------------------
 
@@ -2299,74 +2680,6 @@ fn rectsMismatch(
     return false;
 }
 
-const TriggerJob = struct {
-    data: *const DataSystem,
-    view: ColliderView,
-    strips: CollisionStrips,
-    rows: []const u32,
-    slots: []PaddedSlot(StaticPairBuffer),
-    items_per_range: usize,
-    range_count: usize,
-};
-
-fn triggerJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *TriggerJob = @ptrCast(@alignCast(context));
-    std.debug.assert(range.index < job.range_count and range.index < job.slots.len);
-    std.debug.assert(range.start == range.index * job.items_per_range);
-    std.debug.assert(range.end <= job.rows.len);
-    const slot = &job.slots[range.index].value;
-    for (range.start..range.end) |item| writeTriggerRow(job, slot, job.rows[item]);
-}
-
-fn writeTriggerRow(job: *const TriggerJob, slot: *StaticPairBuffer, row: u32) void {
-    const view = job.view;
-    if (row >= view.row_entity.len) return;
-    const entity = view.row_entity[row];
-    const response = job.data.collisionResponseConst(entity) orelse return;
-    if (response.mode != .trigger) return;
-    const rect = job.data.staticObstacleWorldRect(entity) orelse return;
-    const level = job.data.worldLevelConst(entity) orelse 0;
-    const self_body = job.data.movementBodyConst(entity) orelse return;
-    const self_move = job.data.movementBodyDenseIndex(entity) orelse return;
-    const hits = HitColumns.of(slot.hits.slice());
-    const full = job.view.collectOverlaps(level, rect, hits.entity, hits.min_x, hits.min_y, hits.max_x, hits.max_y, idleSpanIds());
-    if (!slot.admit(full)) return;
-    const self_box = rect;
-    for (0..full) |hit| {
-        const entity_index = hits.entity[hit];
-        if (entity_index >= view.row_of_index.len) continue;
-        const other_row = view.row_of_index[entity_index];
-        if (other_row == no_static_row or other_row >= view.row_entity.len) continue;
-        const other = view.row_entity[other_row];
-        if (other.eql(entity)) continue;
-        const other_response = job.data.collisionResponseConst(other) orelse continue;
-        const other_box = math.Aabb{
-            .min_x = hits.min_x[hit],
-            .min_y = hits.min_y[hit],
-            .max_x = hits.max_x[hit],
-            .max_y = hits.max_y[hit],
-        };
-        if (!positiveOverlap(self_box, other_box)) continue;
-        const key_self = bodyRunKey(self_box.min_x, self_box.min_y, entity.index);
-        const key_other = bodyRunKey(other_box.min_x, other_box.min_y, other.index);
-        if (other_response.mode == .trigger and key_other < key_self) continue;
-        const other_body = job.data.movementBodyConst(other) orelse continue;
-        const other_move = job.data.movementBodyDenseIndex(other) orelse continue;
-        const strip = math.worldPosToCell(@max(self_box.min_y, other_box.min_y), job.strips.height, strip_count);
-        const self_move_u: u32 = @intCast(self_move);
-        const other_move_u: u32 = @intCast(other_move);
-        const contact = if (key_self <= key_other)
-            contactForAabbs(entity, other, self_move_u, other_move_u, self_box, other_box, self_body.velocity.x, self_body.velocity.y, other_body.velocity.x, other_body.velocity.y)
-        else
-            contactForAabbs(other, entity, other_move_u, self_move_u, other_box, self_box, other_body.velocity.x, other_body.velocity.y, self_body.velocity.x, self_body.velocity.y);
-        const key = if (key_self <= key_other)
-            contactOrderKey(level, strip, key_self, key_other)
-        else
-            contactOrderKey(level, strip, key_other, key_self);
-        slot.pairs.appendAssumeCapacity(.{ .key = key, .contact = contact });
-    }
-}
-
 const PairSort = banded_sort.BandedSort(KeyedContact, keyedKeyOf);
 
 fn keyedKeyOf(item: KeyedContact) u256 {
@@ -2375,46 +2688,6 @@ fn keyedKeyOf(item: KeyedContact) u256 {
 
 fn keyedGreater(a: KeyedContact, b: KeyedContact) bool {
     return a.key > b.key;
-}
-
-fn keyedHeadLess(_: void, a: KeyedContact, b: KeyedContact) bool {
-    return a.contact.a.index < b.contact.a.index;
-}
-
-fn storedPair(kept: []const KeyedContact, contact: CollisionContact) bool {
-    for (kept) |pair| {
-        if (pair.contact.a.eql(contact.a) and pair.contact.b.eql(contact.b)) return true;
-    }
-    return false;
-}
-
-const PackTriggerAllowJob = struct {
-    data: *const DataSystem,
-    pairs: []const KeyedContact,
-    allow: []u32,
-    items_per_range: usize,
-    range_count: usize,
-};
-
-// Scalar: each pair is two indexed row checks, two tier loads, and one store. The movement
-// columns are not in pair order. A stored pair keeps the rows of the step that made it, and a
-// later swap-remove can move an entity off its row or put another entity on it, so each side
-// resolves through its hint (`movementBodyDenseIndexHinted`). A side with no movement body
-// allows nothing.
-fn packTriggerAllowJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *PackTriggerAllowJob = @ptrCast(@alignCast(context));
-    std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.start == range.index * job.items_per_range);
-    std.debug.assert(range.end <= job.pairs.len and range.end <= job.allow.len);
-    const tier = job.data.scopeColumnsSliceConst().tier;
-    const entities = job.data.movement_bodies.sliceConst().entities;
-    std.debug.assert(entities.len == tier.len);
-    for (job.pairs[range.start..range.end], job.allow[range.start..range.end]) |pair, *word| {
-        const a_row = job.data.movementBodyDenseIndexHinted(entities, pair.contact.a, pair.contact.a_movement_index);
-        const b_row = job.data.movementBodyDenseIndexHinted(entities, pair.contact.b, pair.contact.b_movement_index);
-        const allow = if (a_row != null and b_row != null) tier[a_row.?].allowsCollision() and tier[b_row.?].allowsCollision() else false;
-        word.* = @intFromBool(allow);
-    }
 }
 
 // The reference run key: ordered min_x, ordered min_y, entity. Level and the contact
@@ -2429,7 +2702,25 @@ fn reducedRunKey(key: u128) u96 {
 
 fn contactOrderKey(level: u16, strip: u32, key_a: u128, key_b: u128) u256 {
     // High word is the contact run. Each tail is the 96-bit reference run key, a then b.
-    return (@as(u256, runOf(level, strip)) << 224) | (@as(u256, reducedRunKey(key_a)) << 96) | reducedRunKey(key_b);
+    return (@as(u256, runOf(level, strip)) << contact_run_shift) | (@as(u256, reducedRunKey(key_a)) << 96) | reducedRunKey(key_b);
+}
+
+comptime {
+    // One key layout: the store reads the level from the key collision builds.
+    std.debug.assert(contact_run_shift >= 2 * 96);
+    const top = std.math.maxInt(u128);
+    std.debug.assert(collision_triggers.keyLevel(contactOrderKey(std.math.maxInt(u16), strip_count - 1, top, top)) == std.math.maxInt(u16));
+    std.debug.assert(collision_triggers.keyLevel(contactOrderKey(0, strip_count - 1, top, top)) == 0);
+}
+
+// The strip of contact key `key`.
+fn keyStrip(key: u256) u32 {
+    return @as(u16, @truncate(key >> contact_run_shift));
+}
+
+// The keys of every pair on `strip` of `level` whose a has run key `a_run`, inclusive.
+fn keyRangeOfARun(level: u16, strip: u32, a_run: u128) [2]u256 {
+    return .{ contactOrderKey(level, strip, a_run, 0), contactOrderKey(level, strip, a_run, std.math.maxInt(u128)) };
 }
 
 fn contactKeyFromProxies(strips: CollisionStrips, proxies: ConstProxyColumns, a: usize, b: usize) u256 {
@@ -3063,13 +3354,6 @@ fn contactForCandidate(proxies: ConstProxyColumns, a: usize, b: usize) ?Collisio
         proxies.velocity_x[b],
         proxies.velocity_y[b],
     );
-}
-
-// Both axes overlap by a positive amount. A shared edge is not a contact.
-fn positiveOverlap(a: math.Aabb, b: math.Aabb) bool {
-    const overlap_x = @min(a.max_x - b.min_x, b.max_x - a.min_x);
-    const overlap_y = @min(a.max_y - b.min_y, b.max_y - a.min_y);
-    return overlap_x > 0 and overlap_y > 0;
 }
 
 fn contactForAabbs(
@@ -5101,7 +5385,7 @@ fn expectKinematicDynamicDropsStaticContacts(workers: usize) !void {
     // Exclusion on: the parked body's own tier, packed at the fill, drops its contact only.
     try data.setSimulationTier(parked, .kinematic);
     _ = try updateView(&system, &data, &contacts, colliders.view(), workers, null);
-    const kept = try contactsNotNaming(both, parked);
+    const kept = try contactsNotNamingAny(both, &.{parked});
     defer std.testing.allocator.free(kept);
     try std.testing.expectEqual(@as(usize, 1), kept.len);
     try std.testing.expect(kept[0].a.eql(wall) or kept[0].b.eql(wall));
@@ -5118,11 +5402,12 @@ test "a kinematic dynamic body drops its static contacts while exclusion is on" 
     try expectKinematicDynamicDropsStaticContacts(2);
 }
 
-fn contactsNotNaming(contacts: []const CollisionContact, id: EntityId) ![]CollisionContact {
+// The contacts naming none of `ids`.
+fn contactsNotNamingAny(contacts: []const CollisionContact, ids: []const EntityId) ![]CollisionContact {
     var kept: std.ArrayList(CollisionContact) = .empty;
     errdefer kept.deinit(std.testing.allocator);
-    for (contacts) |contact| {
-        if (contact.a.eql(id) or contact.b.eql(id)) continue;
+    outer: for (contacts) |contact| {
+        for (ids) |id| if (contact.a.eql(id) or contact.b.eql(id)) continue :outer;
         try kept.append(std.testing.allocator, contact);
     }
     return try kept.toOwnedSlice(std.testing.allocator);
@@ -5149,7 +5434,6 @@ fn expectStoredTriggerAllowFollowsTier(workers: usize) !void {
     const open = try updateView(&system, &data, &contacts, view, workers, null);
     try std.testing.expect(open.contact_count > 0);
     try std.testing.expectEqual(@as(u64, 0), data.collision_allow_epoch);
-    try std.testing.expectEqual(@as(usize, 0), system.trigger_allow.items.len);
     var first: std.ArrayList(CollisionContact) = .empty;
     defer first.deinit(std.testing.allocator);
     try first.appendSlice(std.testing.allocator, contacts.mergedItems());
@@ -5157,7 +5441,7 @@ fn expectStoredTriggerAllowFollowsTier(workers: usize) !void {
     try data.setSimulationTier(right, .kinematic);
     _ = try updateView(&system, &data, &contacts, view, workers, null);
     try std.testing.expectEqual(@as(u64, 1), data.collision_allow_epoch);
-    const dropped = try contactsNotNaming(first.items, right);
+    const dropped = try contactsNotNamingAny(first.items, &.{right});
     defer std.testing.allocator.free(dropped);
     try expectSameContacts(dropped, contacts.mergedItems());
 
@@ -5208,8 +5492,9 @@ fn expectStoredTriggerAllowFollowsMovedRow(workers: usize) !void {
     try std.testing.expectEqual(@as(usize, 1), trigger_pair.len);
     try expectSameContacts(trigger_pair, contacts.mergedItems());
 
-    // Removing the dynamic walker swaps right onto row 0; no static changed, so the stored
-    // pair keeps right's row 2. A kinematic body then takes row 2 and turns exclusion on.
+    // Removing the dynamic walker swaps right onto row 0; no static changed, so the store
+    // holds right's row 2 until the removal's allow epoch refreshes it. A kinematic body
+    // then takes row 2 and turns exclusion on.
     try std.testing.expect(data.destroyEntity(walker));
     const parked = try addObstacle(&data, .{ .x = 2000, .y = 2000, .w = 8, .h = 8 }, .dynamic, .solid);
     try data.setSimulationTier(parked, .kinematic);
@@ -5218,10 +5503,12 @@ fn expectStoredTriggerAllowFollowsMovedRow(workers: usize) !void {
     try std.testing.expectEqual(view.revision, colliders.view().revision);
 
     // Both triggers still allow collision, so their pair stays; row 2's tier is not theirs.
-    // Pairs only: the stored contact keeps right's old row as its hint, which consumers
-    // re-resolve once it no longer names the entity.
+    // The contact carries right's current row.
     _ = try updateView(&system, &data, &contacts, view, workers, null);
-    try expectSameContactPairs(trigger_pair, contacts.mergedItems());
+    const moved_pair = try filteredReference(&data, .default);
+    defer std.testing.allocator.free(moved_pair);
+    try std.testing.expectEqual(@as(usize, 1), moved_pair.len);
+    try expectSameContacts(moved_pair, contacts.mergedItems());
 
     // Right's own tier, on its new row, drops the pair.
     try data.setSimulationTier(right, .dormant);
@@ -5265,17 +5552,20 @@ fn expectStoredTriggerAllowPastColumnEnd(workers: usize) !void {
     try std.testing.expectEqual(@as(usize, 3), data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(view.revision, colliders.view().revision);
     _ = try updateView(&system, &data, &contacts, view, workers, null);
-    try expectSameContactPairs(trigger_pair, contacts.mergedItems());
+    const moved_pair = try filteredReference(&data, .default);
+    defer std.testing.allocator.free(moved_pair);
+    try std.testing.expectEqual(@as(usize, 1), moved_pair.len);
+    try expectSameContacts(moved_pair, contacts.mergedItems());
 }
 
-test "collision stored trigger allow reads the tier of a trigger a swapRemove moved" {
+test "collision stored trigger contacts carry their entities' current movement rows after a swapRemove" {
     try expectStoredTriggerAllowFollowsMovedRow(0);
     try expectStoredTriggerAllowFollowsMovedRow(2);
     try expectStoredTriggerAllowPastColumnEnd(0);
     try expectStoredTriggerAllowPastColumnEnd(2);
 }
 
-test "collision stored trigger allow packed over several ranges matches serial and allocates nothing warm" {
+test "collision stored trigger refresh and emission over several ranges match serial and allocate nothing after the rebuild" {
     const span = 2 * collision_range_alignment_items;
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -5310,28 +5600,25 @@ test "collision stored trigger allow packed over several ranges matches serial a
     defer contacts.deinit();
     _ = try updateView(&system, &data, &contacts, view, 2, collision_range_alignment_items);
     try expectSameContacts(serial_contacts.mergedItems(), contacts.mergedItems());
-    // More stored pairs than one aligned range, so the pack splits across ranges.
-    try std.testing.expect(system.trigger_pairs.items.len > collision_range_alignment_items);
-    try std.testing.expectEqual(system.trigger_pairs.items.len, system.trigger_allow.items.len);
-    var saw_zero = false;
-    var saw_one = false;
-    for (system.trigger_pairs.items, system.trigger_allow.items) |pair, word| {
-        const names_kinematic = pair.contact.a.eql(smalls[0]) or pair.contact.b.eql(smalls[0]);
-        try std.testing.expectEqual(names_kinematic, word == 0);
-        if (word == 0) saw_zero = true else saw_one = true;
-    }
-    try std.testing.expect(saw_zero);
-    try std.testing.expect(saw_one);
+    // More stored pairs than one aligned range, so the refresh and emission split across
+    // ranges.
+    try std.testing.expect(system.trigger_store.pair_count > collision_range_alignment_items);
+    const all = try filteredReference(&data, .default);
+    defer std.testing.allocator.free(all);
+    const kept = try contactsNotNamingAny(all, &.{smalls[0]});
+    defer std.testing.allocator.free(kept);
+    try std.testing.expect(kept.len < all.len);
+    try expectSameContacts(kept, contacts.mergedItems());
 
-    const allocator = system.allocator;
+    // The first allow cross after the cold rebuild moves the epoch and keeps exclusion on:
+    // the rebuild reserved the refresh's range slots, so this step allocates nothing.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    system.allocator = failing.allocator();
-    defer system.allocator = allocator;
-    // Another allow cross keeps exclusion on, so this step packs the same pair count.
+    setTestAllocator(&system, failing.allocator());
+    defer setTestAllocator(&system, std.testing.allocator);
     try data.setSimulationTier(smalls[1], .kinematic);
     _ = try updateView(&system, &data, &contacts, view, 2, collision_range_alignment_items);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
-    system.allocator = allocator;
+    setTestAllocator(&system, std.testing.allocator);
     _ = try updateView(&serial, &data, &serial_contacts, view, 0, collision_range_alignment_items);
     try expectSameContacts(serial_contacts.mergedItems(), contacts.mergedItems());
     for (contacts.mergedItems()) |contact| {
@@ -5776,13 +6063,12 @@ test "a reserved warm static step allocates nothing" {
     defer contacts.deinit();
     try CollisionSystem.reserveContactStream(&contacts, 8);
     _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
-    try std.testing.expect(system.triggers_ready);
+    try std.testing.expect(system.trigger_store.ready);
     try std.testing.expect(contacts.mergedItems().len > 0);
 
-    const allocator = system.allocator;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    system.allocator = failing.allocator();
-    defer system.allocator = allocator;
+    setTestAllocator(&system, failing.allocator());
+    defer setTestAllocator(&system, std.testing.allocator);
     _ = try updateView(&system, &data, &contacts, colliders.view(), 0, null);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 
@@ -5811,10 +6097,9 @@ test "a reserved warm static step allocates nothing" {
     try CollisionSystem.reserveContactStream(&worker_contacts, worker_bodies);
     _ = try updateView(&worker_system, &worker_data, &worker_contacts, worker_colliders.view(), 2, collision_range_alignment_items);
 
-    const worker_allocator = worker_system.allocator;
     var worker_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    worker_system.allocator = worker_failing.allocator();
-    defer worker_system.allocator = worker_allocator;
+    setTestAllocator(&worker_system, worker_failing.allocator());
+    defer setTestAllocator(&worker_system, std.testing.allocator);
     _ = try updateView(&worker_system, &worker_data, &worker_contacts, worker_colliders.view(), 2, collision_range_alignment_items);
     try std.testing.expectEqual(@as(usize, 0), worker_failing.allocations);
 }
@@ -5826,27 +6111,69 @@ fn movedBody(data: *const DataSystem, entity: EntityId, x: f32, y: f32) Structur
     return .{ .set_movement_body = .{ .entity = entity, .body = body } };
 }
 
-fn keyedPairLess(_: void, a: KeyedContact, b: KeyedContact) bool {
-    return a.key < b.key;
+// Points `system` and its trigger store at `allocator`.
+fn setTestAllocator(system: *CollisionSystem, allocator: std.mem.Allocator) void {
+    system.allocator = allocator;
+    system.trigger_store.allocator = allocator;
 }
 
-// The same stored trigger pairs in any storage order: equal keys, entities, and fields.
-fn expectSameTriggerPairs(expected: []const KeyedContact, actual: []const KeyedContact) !void {
-    try std.testing.expectEqual(expected.len, actual.len);
-    const want = try std.testing.allocator.dupe(KeyedContact, expected);
-    defer std.testing.allocator.free(want);
-    const got = try std.testing.allocator.dupe(KeyedContact, actual);
-    defer std.testing.allocator.free(got);
-    std.mem.sort(KeyedContact, want, {}, keyedPairLess);
-    std.mem.sort(KeyedContact, got, {}, keyedPairLess);
-    for (want, got) |w, g| try std.testing.expectEqual(w.key, g.key);
-    const want_contacts = try std.testing.allocator.alloc(CollisionContact, want.len);
-    defer std.testing.allocator.free(want_contacts);
-    const got_contacts = try std.testing.allocator.alloc(CollisionContact, got.len);
-    defer std.testing.allocator.free(got_contacts);
-    for (want, want_contacts) |pair, *contact| contact.* = pair.contact;
-    for (got, got_contacts) |pair, *contact| contact.* = pair.contact;
+// Every stored pair in walk order, rows widened as emitted, and its emit byte.
+const StoredPairs = struct {
+    pairs: []KeyedContact,
+    emit: []u8,
+};
+
+// Walks the store from its first pair with the production cursor; keys strictly increase.
+fn storedPairs(system: *const CollisionSystem, arena: std.mem.Allocator) !StoredPairs {
+    const store = &system.trigger_store;
+    const walked = StoredPairs{
+        .pairs = try arena.alloc(KeyedContact, store.pair_count),
+        .emit = try arena.alloc(u8, store.pair_count),
+    };
+    if (store.pair_count == 0) return walked;
+    var cursor = store.cursorAt(0);
+    for (walked.pairs, walked.emit, 0..) |*pair, *emit, index| {
+        try std.testing.expect(cursor.valid());
+        const page = cursor.page();
+        const slot = cursor.offset;
+        pair.* = .{ .key = page.keys[slot], .contact = .{
+            .a = page.a[slot],
+            .b = page.b[slot],
+            .a_movement_index = page.a_row[slot],
+            .b_movement_index = page.b_row[slot],
+            .normal_x = page.normal_x[slot],
+            .normal_y = page.normal_y[slot],
+            .penetration = page.penetration[slot],
+            .pre_response_max_speed_sq = page.max_speed_sq[slot],
+            .pre_response_relative_speed_sq = page.rel_speed_sq[slot],
+        } };
+        emit.* = page.emit[slot];
+        if (index != 0) try std.testing.expect(walked.pairs[index - 1].key < pair.key);
+        cursor.next();
+    }
+    try std.testing.expect(!cursor.valid());
+    return walked;
+}
+
+// The same stored pairs in the same order: keys, contacts, emit bytes, and store sums.
+fn expectSameTriggerPairs(expected: *const CollisionSystem, actual: *const CollisionSystem) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const want = try storedPairs(expected, arena);
+    const got = try storedPairs(actual, arena);
+    try std.testing.expectEqual(want.pairs.len, got.pairs.len);
+    const want_contacts = try arena.alloc(CollisionContact, want.pairs.len);
+    const got_contacts = try arena.alloc(CollisionContact, got.pairs.len);
+    for (want.pairs, got.pairs, want_contacts, got_contacts) |w, g, *want_contact, *got_contact| {
+        try std.testing.expectEqual(w.key, g.key);
+        want_contact.* = w.contact;
+        got_contact.* = g.contact;
+    }
     try expectSameContacts(want_contacts, got_contacts);
+    try std.testing.expectEqualSlices(u8, want.emit, got.emit);
+    try std.testing.expectEqual(expected.trigger_store.valid_count, actual.trigger_store.valid_count);
+    try std.testing.expectEqual(expected.trigger_store.allowed_count, actual.trigger_store.allowed_count);
 }
 
 fn updateOn(system: *CollisionSystem, data: *const DataSystem, contacts: *RangeOutputStream(CollisionContact), view: ColliderView, threads: *ThreadSystem, workers: usize) !void {
@@ -5875,8 +6202,9 @@ fn expectPatchMatchesRebuild(
     const view = colliders.view();
     try std.testing.expectEqual(revision + 1, view.revision);
     try std.testing.expect(view.changes.len != 0);
-    try std.testing.expect(patched.triggers_ready and patched.seen_revision == revision);
+    try std.testing.expect(patched.trigger_store.ready and patched.trigger_store.seen_revision == revision);
     try patched.refreshCommittedTriggers(data, view, threads);
+    try std.testing.expectEqual(view.revision, patched.trigger_store.seen_revision);
     try updateOn(patched, data, patched_contacts, view, threads, workers);
 
     var rebuilt = CollisionSystem.init(std.testing.allocator);
@@ -5884,7 +6212,7 @@ fn expectPatchMatchesRebuild(
     var rebuilt_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer rebuilt_contacts.deinit();
     try updateOn(&rebuilt, data, &rebuilt_contacts, view, threads, workers);
-    try expectSameTriggerPairs(rebuilt.trigger_pairs.items, patched.trigger_pairs.items);
+    try expectSameTriggerPairs(&rebuilt, patched);
     try expectSameContacts(rebuilt_contacts.mergedItems(), patched_contacts.mergedItems());
     const expected = try filteredReference(data, .default);
     defer std.testing.allocator.free(expected);
@@ -5892,8 +6220,10 @@ fn expectPatchMatchesRebuild(
 }
 
 // A stored pair names `entity`, and `other` when set.
-fn storesPairNaming(pairs: []const KeyedContact, entity: EntityId, other: ?EntityId) bool {
-    for (pairs) |pair| {
+fn storesPairNaming(system: *const CollisionSystem, entity: EntityId, other: ?EntityId) !bool {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    for ((try storedPairs(system, arena_state.allocator())).pairs) |pair| {
         const a = pair.contact.a;
         const b = pair.contact.b;
         if (!a.eql(entity) and !b.eql(entity)) continue;
@@ -5924,8 +6254,8 @@ fn expectTriggerPatchesMatchRebuild(workers: usize) !void {
     const late = try addObstacle(&data, .{ .x = 1800, .y = 1800, .w = 40, .h = 40 }, .dynamic, .trigger);
     _ = try addObstacle(&data, .{ .x = 40, .y = 40, .w = 8, .h = 8 }, .dynamic, .solid);
     _ = try addObstacle(&data, .{ .x = 290, .y = 30, .w = 8, .h = 8 }, .dynamic, .solid);
-    // Last movement row and kinematic: exclusion is on, so the allow column packs, and a
-    // destroyed static's row swap moves only this body.
+    // Last movement row and kinematic: exclusion is on, so emission filters on the allow
+    // bit, and a destroyed static's row swap moves only this body.
     const parked = try addObstacle(&data, .{ .x = 1900, .y = 100, .w = 8, .h = 8 }, .dynamic, .solid);
     try data.setSimulationTier(parked, .kinematic);
 
@@ -5939,7 +6269,7 @@ fn expectTriggerPatchesMatchRebuild(workers: usize) !void {
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
     try updateOn(&patched, &data, &contacts, colliders.view(), &threads, workers);
-    try std.testing.expect(patched.trigger_pairs.items.len > collision_range_alignment_items);
+    try std.testing.expect(patched.trigger_store.pair_count > collision_range_alignment_items);
 
     // Multi-chunk: a trigger crosses onto the trigger pair, a solid onto the lone trigger.
     try expectPatchMatchesRebuild(&data, &colliders, &threads, workers, &patched, &contacts, &.{
@@ -5959,8 +6289,8 @@ fn expectTriggerPatchesMatchRebuild(workers: usize) !void {
     });
     // Live partners destroyed: the solid on the lone trigger since the first commit, and a
     // chain trigger whose pairs sit on both of its neighbours.
-    try std.testing.expect(storesPairNaming(patched.trigger_pairs.items, solid_c, trigger_d));
-    try std.testing.expect(storesPairNaming(patched.trigger_pairs.items, chain_link, null));
+    try std.testing.expect(try storesPairNaming(&patched, solid_c, trigger_d));
+    try std.testing.expect(try storesPairNaming(&patched, chain_link, null));
     try expectPatchMatchesRebuild(&data, &colliders, &threads, workers, &patched, &contacts, &.{
         .{ .destroy_entity = solid_c },
         .{ .destroy_entity = chain_link },
@@ -5974,6 +6304,448 @@ fn expectTriggerPatchesMatchRebuild(workers: usize) !void {
 test "incremental trigger patches match a full trigger rebuild" {
     try expectTriggerPatchesMatchRebuild(0);
     try expectTriggerPatchesMatchRebuild(2);
+}
+
+// A patched system's cold store over `data`'s statics, stepped at fixed 16-item ranges on
+// `workers` workers; `commit` checks each seam patch against a rebuild. Initialized in place:
+// the thread system stays where it started.
+const TriggerPatchFixture = struct {
+    colliders: StaticColliderSystem,
+    threads: ThreadSystem,
+    patched: CollisionSystem,
+    contacts: RangeOutputStream(CollisionContact),
+    workers: usize,
+
+    fn init(self: *TriggerPatchFixture, data: *const DataSystem, workers: usize) !void {
+        self.workers = workers;
+        self.colliders = StaticColliderSystem.init(std.testing.allocator);
+        errdefer self.colliders.deinit();
+        try self.colliders.rebuild(data, testGeometry(), null);
+        self.threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = workers });
+        errdefer self.threads.deinit();
+        self.patched = CollisionSystem.init(std.testing.allocator);
+        errdefer self.patched.deinit();
+        self.contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+        errdefer self.contacts.deinit();
+        try updateOn(&self.patched, data, &self.contacts, self.colliders.view(), &self.threads, workers);
+    }
+
+    fn deinit(self: *TriggerPatchFixture) void {
+        self.contacts.deinit();
+        self.patched.deinit();
+        self.threads.deinit();
+        self.colliders.deinit();
+    }
+
+    fn commit(self: *TriggerPatchFixture, data: *DataSystem, commands: []const StructuralCommand) !void {
+        try expectPatchMatchesRebuild(data, &self.colliders, &self.threads, self.workers, &self.patched, &self.contacts, commands);
+    }
+};
+
+fn expectTwoLevelPatch(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const ground_trigger = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 30, .y = 30, .w = 40, .h = 40 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 300, .y = 300, .w = 40, .h = 40 }, .static, .solid);
+    const deep_trigger = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40, .level = 1 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 30, .y = 30, .w = 40, .h = 40, .level = 1 }, .static, .trigger);
+    const deep_solid = try addObstacle(&data, .{ .x = 500, .y = 500, .w = 40, .h = 40, .level = 1 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 520, .y = 520, .w = 40, .h = 40, .level = 2 }, .static, .trigger);
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, workers);
+    defer fixture.deinit();
+    // Both stored levels change in one commit, and a solid joins a third level's trigger.
+    try fixture.commit(&data, &.{
+        movedBody(&data, ground_trigger, 290, 290),
+        movedBody(&data, deep_trigger, 900, 900),
+        .{ .set_world_level = .{ .entity = deep_solid, .level = 2 } },
+    });
+    // A trigger crosses levels onto a level the store has never held.
+    try fixture.commit(&data, &.{.{ .set_world_level = .{ .entity = ground_trigger, .level = 3 } }});
+    try fixture.commit(&data, &.{.{ .set_world_level = .{ .entity = ground_trigger, .level = 0 } }});
+}
+
+test "collision trigger patch with triggers on two levels changed in one commit matches a rebuild" {
+    try expectTwoLevelPatch(0);
+    try expectTwoLevelPatch(2);
+}
+
+fn expectWideTriggerPatch(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // The trigger is at min_x 0, so it is the a of every pair, all in one strip: one a-run
+    // longer than a page, so dropping it walks across a page boundary.
+    const partners = 70;
+    const wide = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 1800, .h = 40 }, .static, .trigger);
+    for (0..partners) |index| {
+        _ = try addObstacle(&data, .{ .x = @as(f32, @floatFromInt(index)) * 25 + 4, .y = 8, .w = 16, .h = 16 }, .static, .solid);
+    }
+    // Bystander pairs keyed after the run, in a later strip. A rebuild splits the 80 pairs
+    // into two pages of 40, so they sit on the run's last page at offsets the first page's
+    // run keys also fill: a walk that reads the first page's keys there drops them.
+    const bystanders = 10;
+    _ = try addObstacle(&data, .{ .x = 0, .y = 1500, .w = 300, .h = 40 }, .static, .trigger);
+    for (0..bystanders) |index| {
+        _ = try addObstacle(&data, .{ .x = @as(f32, @floatFromInt(index)) * 25 + 4, .y = 1508, .w = 16, .h = 16 }, .static, .solid);
+    }
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, workers);
+    defer fixture.deinit();
+    try std.testing.expectEqual(partners + bystanders, fixture.patched.trigger_store.pair_count);
+    comptime std.debug.assert(partners > collision_triggers.page_capacity);
+    // The far end shrinks off its last solids with the min corner kept, then grows back.
+    try fixture.commit(&data, &.{.{ .set_collision_bounds = .{ .entity = wide, .bounds = .{ .size = .{ .x = 1300, .y = 40 } } } }});
+    try fixture.commit(&data, &.{.{ .set_collision_bounds = .{ .entity = wide, .bounds = .{ .size = .{ .x = 1800, .y = 40 } } } }});
+    // A shift moves every pair's key.
+    try fixture.commit(&data, &.{movedBody(&data, wide, 30, 2)});
+}
+
+test "collision trigger patch of a wide trigger changed at its far end matches a rebuild" {
+    try expectWideTriggerPatch(0);
+    try expectWideTriggerPatch(2);
+}
+
+fn expectGridEdgePatch(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // The test grid is 2048 units a side. At its last cell, past both far edges.
+    const edge_trigger = try addObstacle(&data, .{ .x = 2030, .y = 2030, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 2040, .y = 2050, .w = 30, .h = 30 }, .static, .solid);
+    // Left of it, so the pair's a: the trigger's old b-pair is dropped by exact key.
+    _ = try addObstacle(&data, .{ .x = 2020, .y = 2040, .w = 20, .h = 20 }, .static, .solid);
+    // Wholly below the level.
+    const below = try addObstacle(&data, .{ .x = 600, .y = 2100, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 620, .y = 2120, .w = 40, .h = 40 }, .static, .trigger);
+    // A trigger over 60 strips with partners on only two of them.
+    const tall = try addObstacle(&data, .{ .x = 300, .y = 0, .w = 20, .h = 1900 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 310, .y = 100, .w = 20, .h = 20 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 310, .y = 1800, .w = 20, .h = 20 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 295, .y = 1000, .w = 10, .h = 10 }, .static, .solid);
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, workers);
+    defer fixture.deinit();
+    try fixture.commit(&data, &.{movedBody(&data, edge_trigger, 2034, 2034)});
+    try fixture.commit(&data, &.{movedBody(&data, below, 610, 2110)});
+    try fixture.commit(&data, &.{movedBody(&data, tall, 302, 2)});
+    try fixture.commit(&data, &.{
+        movedBody(&data, edge_trigger, 2030, 2030),
+        movedBody(&data, below, 600, 2100),
+        movedBody(&data, tall, 300, 0),
+    });
+}
+
+test "collision trigger patch at the grid's last cell and below the level matches a rebuild" {
+    try expectGridEdgePatch(0);
+    try expectGridEdgePatch(2);
+}
+
+fn expectTurnedTriggerPatch(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const turned = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 30, .y = 30, .w = 40, .h = 40 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 20, .y = 40, .w = 40, .h = 40 }, .static, .trigger);
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, workers);
+    defer fixture.deinit();
+    // Only the mode changes: the solid-solid neighbour gains a pair, and back.
+    try fixture.commit(&data, &.{.{ .set_collision_response = .{ .entity = turned, .response = .{ .mobility = .static, .mode = .trigger, .restitution = 0 } } }});
+    try fixture.commit(&data, &.{.{ .set_collision_response = .{ .entity = turned, .response = .{ .mobility = .static, .mode = .solid, .restitution = 0 } } }});
+}
+
+test "collision trigger patch of a solid turned trigger with no move matches a rebuild" {
+    try expectTurnedTriggerPatch(0);
+    try expectTurnedTriggerPatch(2);
+}
+
+fn expectIndexReusePatch(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const doomed = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 30, .y = 30, .w = 40, .h = 40 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 400, .y = 400, .w = 40, .h = 40 }, .static, .solid);
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, workers);
+    defer fixture.deinit();
+    const reborn = math.Vec2{ .x = 410, .y = 410 };
+    try fixture.commit(&data, &.{
+        .{ .destroy_entity = doomed },
+        .{ .create_entity = .{
+            .movement_body = .{ .position = reborn, .previous_position = reborn },
+            .collision_bounds = .{ .size = .{ .x = 40, .y = 40 } },
+            .collision_response = .{ .mobility = .static, .mode = .trigger, .restitution = 0 },
+        } },
+    });
+    // The create took the destroyed index: one change for it.
+    try std.testing.expectEqual(@as(usize, 1), fixture.colliders.view().changes.len);
+    try std.testing.expectEqual(doomed.index, fixture.colliders.view().changes[0].entity.index);
+}
+
+test "collision trigger patch of a destroy and an index reuse in one commit matches a rebuild" {
+    try expectIndexReusePatch(0);
+    try expectIndexReusePatch(2);
+}
+
+fn expectOverlappingChangedTriggersPatch(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const first = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
+    const second = try addObstacle(&data, .{ .x = 30, .y = 30, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 300, .y = 300, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 320, .y = 290, .w = 40, .h = 40 }, .static, .solid);
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, workers);
+    defer fixture.deinit();
+    // Both changed triggers keep their pair and meet the lone trigger and the solid.
+    try fixture.commit(&data, &.{ movedBody(&data, first, 290, 300), movedBody(&data, second, 310, 310) });
+    try fixture.commit(&data, &.{ movedBody(&data, second, 30, 30), movedBody(&data, first, 10, 10) });
+}
+
+test "collision trigger patch of two overlapping changed triggers matches a rebuild" {
+    try expectOverlappingChangedTriggersPatch(0);
+    try expectOverlappingChangedTriggersPatch(2);
+}
+
+// A chain of 81 overlapping triggers (80 stored pairs) and 24 dynamics on every third one:
+// 104 merged positions in one strip, so 112-, 64- and 16-item ranges give one, two and
+// seven ranges. With `dormant`, every third trigger from the second is dormant, so two in
+// three stored pairs are filtered, some at range edges.
+fn expectEmissionAcrossRanges(dormant: bool) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var chain: [81]EntityId = undefined;
+    for (&chain, 0..) |*link, index| {
+        link.* = try addObstacle(&data, .{ .x = @as(f32, @floatFromInt(index)) * 12, .y = 0, .w = 16, .h = 16 }, .static, .trigger);
+    }
+    for (0..24) |index| {
+        _ = try addObstacle(&data, .{ .x = @as(f32, @floatFromInt(index)) * 36 + 4, .y = 4, .w = 4, .h = 8, .velocity_x = 1 }, .dynamic, .solid);
+    }
+    var excluded: std.ArrayList(EntityId) = .empty;
+    defer excluded.deinit(std.testing.allocator);
+    if (dormant) {
+        var index: usize = 1;
+        while (index < chain.len) : (index += 3) {
+            try data.setSimulationTier(chain[index], .dormant);
+            try excluded.append(std.testing.allocator, chain[index]);
+        }
+    }
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry(), null);
+    const all = try filteredReference(&data, .default);
+    defer std.testing.allocator.free(all);
+    try std.testing.expectEqual(@as(usize, 104), all.len);
+    const expected = try contactsNotNamingAny(all, excluded.items);
+    defer std.testing.allocator.free(expected);
+    for ([_]usize{ 112, 64, 16 }) |items_per_range| {
+        for ([_]usize{ 0, 2 }) |workers| {
+            var system = CollisionSystem.init(std.testing.allocator);
+            defer system.deinit();
+            var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+            defer contacts.deinit();
+            const stats = try updateView(&system, &data, &contacts, colliders.view(), workers, items_per_range);
+            try std.testing.expectEqual(expected.len, stats.contact_count);
+            try expectSameContacts(expected, contacts.mergedItems());
+        }
+    }
+}
+
+test "collision trigger emission matches the reference at one, two and seven ranges, with disallowed pairs at range edges" {
+    try expectEmissionAcrossRanges(false);
+    try expectEmissionAcrossRanges(true);
+}
+
+// Two levels, each a chain of 70 overlapping triggers (69 stored pairs: a full page and a
+// partial one) and 20 dynamics, every third trigger from the second dormant. Level 1's
+// stored pairs and dynamic contacts follow level 0's in key order, so 16-item ranges split,
+// count, and page across the level end.
+fn expectEmissionAcrossLevels(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var excluded: std.ArrayList(EntityId) = .empty;
+    defer excluded.deinit(std.testing.allocator);
+    for ([_]u16{ 0, 1 }) |level| {
+        for (0..70) |index| {
+            const link = try addObstacle(&data, .{ .x = @as(f32, @floatFromInt(index)) * 12, .y = 0, .w = 16, .h = 16, .level = level }, .static, .trigger);
+            if (index % 3 != 1) continue;
+            try data.setSimulationTier(link, .dormant);
+            try excluded.append(std.testing.allocator, link);
+        }
+        for (0..20) |index| {
+            _ = try addObstacle(&data, .{ .x = @as(f32, @floatFromInt(index)) * 40 + 4, .y = 4, .w = 4, .h = 8, .level = level, .velocity_x = 1 }, .dynamic, .solid);
+        }
+    }
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry(), null);
+    const all = try filteredReference(&data, .default);
+    defer std.testing.allocator.free(all);
+    const expected = try contactsNotNamingAny(all, excluded.items);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expect(expected.len < all.len);
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    const stats = try updateView(&system, &data, &contacts, colliders.view(), workers, 16);
+    try std.testing.expectEqual(@as(u32, 2 * 69), system.trigger_store.pair_count);
+    try std.testing.expectEqual(expected.len, stats.contact_count);
+    try expectSameContacts(expected, contacts.mergedItems());
+}
+
+test "collision trigger emission across a level end with dynamics on both levels matches the reference" {
+    try expectEmissionAcrossLevels(0);
+    try expectEmissionAcrossLevels(2);
+}
+
+test "collision trigger warm patch allocates nothing on a 2-worker pool" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..4) |index| {
+        const x = @as(f32, @floatFromInt(index)) * 128;
+        _ = try addObstacle(&data, .{ .x = x, .y = 0, .w = 40, .h = 40 }, .static, .trigger);
+        _ = try addObstacle(&data, .{ .x = x + 20, .y = 20, .w = 40, .h = 40 }, .static, .trigger);
+    }
+    const solid = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 16, .h = 16 }, .static, .solid);
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, 2);
+    defer fixture.deinit();
+    try fixture.commit(&data, &.{movedBody(&data, solid, 138, 10)});
+    try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, solid, 10, 10)});
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    setTestAllocator(&fixture.patched, failing.allocator());
+    defer setTestAllocator(&fixture.patched, std.testing.allocator);
+    try fixture.patched.refreshCommittedTriggers(&data, fixture.colliders.view(), &fixture.threads);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(fixture.colliders.view().revision, fixture.patched.trigger_store.seen_revision);
+}
+
+test "collision trigger rebuild releases its row-pool query records and keeps the patch query's" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const moved = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 30, .y = 30, .w = 40, .h = 40 }, .static, .trigger);
+    // More rows than one range, so the rebuild query runs over several.
+    for (0..3 * collision_range_alignment_items) |index| {
+        _ = try addObstacle(&data, .{ .x = 200 + @as(f32, @floatFromInt(index)) * 20, .y = 600, .w = 8, .h = 8 }, .static, .solid);
+    }
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, 2);
+    defer fixture.deinit();
+    // No patch has run: the cold rebuild keeps no query slot.
+    try std.testing.expectEqual(@as(usize, 0), fixture.patched.trigger_query_slots.items.len);
+    try fixture.commit(&data, &.{movedBody(&data, moved, 20, 20)});
+    const patch_slots = fixture.patched.trigger_query_slots.items.len;
+    try std.testing.expect(patch_slots != 0);
+    // Two commits with no seam refresh skip a revision, so the next refresh rebuilds.
+    try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 10, 10)});
+    try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 20, 20)});
+    try fixture.patched.refreshCommittedTriggers(&data, fixture.colliders.view(), &fixture.threads);
+    try std.testing.expectEqual(fixture.colliders.view().revision, fixture.patched.trigger_store.seen_revision);
+    try std.testing.expectEqual(patch_slots, fixture.patched.trigger_query_slots.items.len);
+    for (fixture.patched.trigger_query_slots.items) |padded| {
+        try std.testing.expect(padded.value.inserts.capacity <= padded.value.insert_paths.capacity);
+    }
+    // The next patch re-reserves its records and still matches a rebuild.
+    try fixture.commit(&data, &.{movedBody(&data, moved, 10, 10)});
+}
+
+fn expectPatchFailuresKeepStore(workers: usize) !void {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const trigger = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 30, .y = 30, .w = 40, .h = 40 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 300, .y = 300, .w = 40, .h = 40 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 320, .y = 320, .w = 40, .h = 40 }, .static, .solid);
+    var fixture: TriggerPatchFixture = undefined;
+    try fixture.init(&data, workers);
+    defer fixture.deinit();
+    const revision = fixture.patched.trigger_store.seen_revision;
+    try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, trigger, 290, 290)});
+    const view = fixture.colliders.view();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const before = try storedPairs(&fixture.patched, arena);
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        setTestAllocator(&fixture.patched, failing.allocator());
+        const result = fixture.patched.refreshCommittedTriggers(&data, view, &fixture.threads);
+        setTestAllocator(&fixture.patched, std.testing.allocator);
+        if (result) |_| break else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(revision, fixture.patched.trigger_store.seen_revision);
+        const after = try storedPairs(&fixture.patched, arena);
+        try std.testing.expectEqual(before.pairs.len, after.pairs.len);
+        for (before.pairs, after.pairs) |kept, now| {
+            try std.testing.expectEqual(kept.key, now.key);
+            try std.testing.expect(kept.contact.a.eql(now.contact.a) and kept.contact.b.eql(now.contact.b));
+        }
+        try std.testing.expectEqualSlices(u8, before.emit, after.emit);
+    }
+    // The sweep reached the patch's allocations, then the retry patched.
+    try std.testing.expect(fail_index > 0);
+    try std.testing.expectEqual(view.revision, fixture.patched.trigger_store.seen_revision);
+    try updateOn(&fixture.patched, &data, &fixture.contacts, view, &fixture.threads, workers);
+    var rebuilt = CollisionSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    var rebuilt_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer rebuilt_contacts.deinit();
+    try updateOn(&rebuilt, &data, &rebuilt_contacts, view, &fixture.threads, workers);
+    try expectSameTriggerPairs(&rebuilt, &fixture.patched);
+    try expectSameContacts(rebuilt_contacts.mergedItems(), fixture.contacts.mergedItems());
+}
+
+test "collision trigger patch under every allocation failure leaves the stored pairs unchanged, and the retry matches a rebuild" {
+    try expectPatchFailuresKeepStore(0);
+    try expectPatchFailuresKeepStore(2);
+}
+
+test "collision trigger store rebuilds when the strip height changes" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // Pairs whose larger min_y lies in different strips at 32 and 16 units.
+    _ = try addObstacle(&data, .{ .x = 0, .y = 0, .w = 40, .h = 60 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 20, .y = 20, .w = 40, .h = 40 }, .static, .solid);
+    _ = try addObstacle(&data, .{ .x = 10, .y = 40, .w = 20, .h = 20 }, .static, .trigger);
+    _ = try addObstacle(&data, .{ .x = 4, .y = 50, .w = 8, .h = 8 }, .dynamic, .solid);
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry(), null);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    for ([_]CollisionStrips{ .default, .ofTileSize(16), .default }) |strips| {
+        _ = try system.update(&data, &contacts, &threads, .{ .static_colliders = colliders.view(), .strips = strips });
+        const expected = try filteredReference(&data, strips);
+        defer std.testing.allocator.free(expected);
+        try expectSameContacts(expected, contacts.mergedItems());
+    }
+}
+
+test "collision trigger a-run key range holds exactly its a-run's keys" {
+    const run = bodyRunKey(100, 40, 7);
+    const below = bodyRunKey(100, 40, 6);
+    const above = bodyRunKey(100.5, 40, 0);
+    const range = keyRangeOfARun(3, 5, run);
+    for ([_]u128{ 0, bodyRunKey(-50, 0, 0), run, above, std.math.maxInt(u128) }) |b| {
+        const key = contactOrderKey(3, 5, run, b);
+        try std.testing.expect(range[0] <= key and key <= range[1]);
+    }
+    for ([_]u256{
+        contactOrderKey(3, 5, below, std.math.maxInt(u128)),
+        contactOrderKey(3, 5, above, 0),
+        contactOrderKey(3, 4, run, std.math.maxInt(u128)),
+        contactOrderKey(3, 6, run, 0),
+        contactOrderKey(2, strip_count - 1, run, std.math.maxInt(u128)),
+        contactOrderKey(4, 0, run, 0),
+    }) |key| try std.testing.expect(key < range[0] or key > range[1]);
+    try std.testing.expectEqual(@as(u32, 5), keyStrip(range[0]));
+    try std.testing.expectEqual(@as(u16, 3), collision_triggers.keyLevel(range[1]));
 }
 
 // The Debug rect reserve's own bytes on a system reserved for as many bodies, so the
