@@ -154,9 +154,8 @@ const JumpProfile = struct {
     profile: AdaptiveWorkProfile,
 };
 
-// Cost-model terms. The defaults floor the learned participant and range overheads in
-// the prediction and sit below the measured warm dispatch costs, so learned values
-// above them decide; `min_participant_overhead_ns` floors each learned sample.
+// The defaults floor the learned participant and range overheads in the prediction;
+// `min_participant_overhead_ns` floors each learned participant sample.
 const default_participant_overhead_ns: f64 = 1_000;
 const min_participant_overhead_ns: f64 = 100;
 const default_range_overhead_ns: f64 = 1_000;
@@ -214,9 +213,12 @@ pub const AdaptiveWorkTuner = struct {
     // counts and keep the fastest, converging on the measured optimum instead of the
     // sqrt guess. `climb_direction` is the step (-1 fewer, +1 more) tried next;
     // `climb_reversed` marks that the other direction was already tried since the
-    // last improvement, so the next loss settles on the best.
+    // last improvement, so the next loss settles on the best or probes the model's
+    // prediction.
     climb_direction: i8 = -1,
     climb_reversed: bool = false,
+    // The window in flight is a model probe; set only while probing.
+    model_probe_active: bool = false,
     // The threaded policy a settled demotion dropped, held until the first full
     // inline settled window judges it. Set only while settled and not threaded,
     // always with workers; cleared on entering probing or learning.
@@ -360,9 +362,12 @@ pub const AdaptiveWorkTuner = struct {
 
     // A probe only becomes policy after it beats the baseline by the commit
     // threshold. On a win the worker hill-climb continues in the same direction from
-    // the new best; on a loss it tries the opposite direction once, then settles on
-    // the best — converging on the measured-optimal worker count.
+    // the new best; on a loss it tries the opposite direction once, then probes the
+    // model's prediction once per commit or settles. A losing model probe settles.
     fn finishProfileWindow(self: *AdaptiveWorkTuner, sample_mean_ns: u64) void {
+        std.debug.assert(!self.model_probe_active or self.phase == .probing);
+        const model_probe = self.model_probe_active;
+        self.model_probe_active = false;
         const request = self.last_request orelse {
             self.settle();
             return;
@@ -384,7 +389,7 @@ pub const AdaptiveWorkTuner = struct {
             if (self.nextClimbCandidate(request)) |next| {
                 self.candidate_profile = next;
             } else {
-                self.settle();
+                self.settleOrProbeModel(request);
             }
             return;
         }
@@ -393,6 +398,10 @@ pub const AdaptiveWorkTuner = struct {
         if (!self.has_threaded_profile) {
             // First-ever threaded probe lost: stay inline and cool down before retry.
             self.inline_probe_cooldown_windows = self.config.retune_after_settled_windows;
+            self.settle();
+            return;
+        }
+        if (model_probe) {
             self.settle();
             return;
         }
@@ -406,6 +415,23 @@ pub const AdaptiveWorkTuner = struct {
                 self.candidate_profile = next;
                 return;
             }
+        }
+        self.settleOrProbeModel(request);
+    }
+
+    // Settles on the threaded best, unless the model's prediction threads and differs
+    // from the best and from the candidate that just lost: that becomes the candidate.
+    // A one-worker prediction climbs up.
+    fn settleOrProbeModel(self: *AdaptiveWorkTuner, request: AdaptiveWorkRequest) void {
+        std.debug.assert(!self.model_probe_active);
+        std.debug.assert(self.has_threaded_profile and self.best_profile.worker_threads > 0);
+        const predicted = self.normalizedProfile(self.predictProfile(request), request);
+        const just_lost = if (self.candidate_profile) |candidate| profilesEqual(predicted, candidate) else false;
+        if (predicted.worker_threads > 0 and !profilesEqual(predicted, self.best_profile) and !just_lost) {
+            if (predicted.worker_threads == 1) self.climb_direction = 1;
+            self.model_probe_active = true;
+            self.candidate_profile = predicted;
+            return;
         }
         self.settle();
     }
@@ -488,15 +514,20 @@ pub const AdaptiveWorkTuner = struct {
         };
         const normalized_baseline = self.normalizedProfile(baseline_profile, request);
         // The first probe after a sustained shift re-bases on the threaded incumbent
-        // at the new count: the old count's best is not comparable. Every other
-        // probe keeps its measured best.
+        // at the new count: the old count's best is not comparable.
         std.debug.assert(!self.retune_at_new_count or self.phase == .settled);
         const from_incumbent = self.retune_at_new_count and self.has_threaded_profile and normalized_baseline.worker_threads > 0;
+        // A periodic retune from the settled best re-bases its best mean on this window.
+        const from_settled_best = !self.retune_at_new_count and self.phase == .settled and
+            self.has_threaded_profile and profilesEqual(normalized_baseline, self.best_profile);
         self.retune_at_new_count = false;
         self.retune_climb = from_incumbent;
         if (from_incumbent) {
             self.current_profile = normalized_baseline;
             self.best_profile = normalized_baseline;
+            self.best_mean_batch_duration_ns = baseline_mean_ns;
+        } else if (from_settled_best) {
+            self.current_profile = normalized_baseline;
             self.best_mean_batch_duration_ns = baseline_mean_ns;
         } else if (normalized_baseline.worker_threads > 0) {
             self.current_profile = normalized_baseline;
@@ -507,6 +538,7 @@ pub const AdaptiveWorkTuner = struct {
         // first (the sqrt guess tends to over-shoot medium workloads).
         self.climb_direction = -1;
         self.climb_reversed = false;
+        self.model_probe_active = false;
 
         const predicted = self.predictProfile(request);
         if (predicted.worker_threads == 0) {
@@ -664,13 +696,22 @@ pub const AdaptiveWorkTuner = struct {
 
     fn settle(self: *AdaptiveWorkTuner) void {
         self.phase = .settled;
+        self.model_probe_active = false;
         self.retune_at_new_count = false;
         self.retune_climb = false;
         self.current_profile = self.best_profile;
         self.candidate_profile = null;
         self.failed_profile_count = 0;
         self.settled_window_count = 0;
-        self.settled_overhead = self.measuredOverhead();
+        self.settled_overhead = self.lowerOverhead(self.measuredOverhead());
+    }
+
+    // The measured overhead, or the held one when it covers the same profile and is lower.
+    fn lowerOverhead(self: *const AdaptiveWorkTuner, measured: ?ProfileOverhead) ?ProfileOverhead {
+        const current = measured orelse return null;
+        const held = self.settled_overhead orelse return current;
+        if (profilesEqual(held.profile, current.profile) and held.overhead_ns < current.overhead_ns) return held;
+        return current;
     }
 
     // The settled threaded profile's best mean minus the inline model's work split
@@ -712,6 +753,7 @@ pub const AdaptiveWorkTuner = struct {
         self.bound_rule_suppressed = false;
         self.retune_at_new_count = false;
         self.retune_climb = false;
+        self.model_probe_active = false;
         self.phase = .settled;
         self.has_threaded_profile = false;
         self.settled_overhead = null;
@@ -776,6 +818,7 @@ pub const AdaptiveWorkTuner = struct {
         self.inline_probe_cooldown_windows = 0;
         self.climb_direction = -1;
         self.climb_reversed = false;
+        self.model_probe_active = false;
         self.resetSamples();
     }
 
@@ -3218,8 +3261,7 @@ test "adaptive work tuner climbs up from a winning one-worker first probe" {
     });
     const request = tunerTestRequest(8192, 10, 16, 64);
 
-    // A steep learned participant overhead puts the first probe, predicted when the
-    // inline window closes, at one worker.
+    // Puts the first prediction at one worker.
     tuner.model_participant_overhead_ns = 25_000;
     const inline_profile = tuner.selectProfile(request);
     tuner.record(tunerTestBatchWithProfile(8192, inline_profile, 100_000));
@@ -3270,8 +3312,7 @@ test "adaptive work tuner reverses upward from a wider best after a one-worker r
     try std.testing.expect(tuner.phase == .settled);
     try std.testing.expectEqual(@as(usize, 3), tuner.best_profile.worker_threads);
 
-    // A steep learned participant overhead, still above 18 us after the settled windows'
-    // samples, so the retune predicts one worker.
+    // The retune predicts one worker.
     tuner.model_participant_overhead_ns = 40_000;
     // Settled windows until the retune probe starts.
     guard = 0;
@@ -3286,6 +3327,109 @@ test "adaptive work tuner reverses upward from a wider best after a one-worker r
     tuner.record(tunerTestBatchWithProfile(8192, selected, timing.duration(selected.worker_threads)));
     const next = tuner.selectProfile(request);
     try std.testing.expectEqual(@as(usize, 4), next.worker_threads);
+}
+
+fn modelProbeTestTuner() AdaptiveWorkTuner {
+    return AdaptiveWorkTuner.init(.{
+        .initial_range_items = 16,
+        .smallest_range_items = 16,
+        .largest_range_items = 4096,
+        .sample_window = 1,
+        .threaded_batch_ns = 1000,
+        .improvement_threshold_percent = 1,
+        .threaded_commit_threshold_percent = 5,
+    });
+}
+
+// A reversed climb on threaded `best` whose last candidate is `neighbour`.
+fn lastClimbStepTuner(request: AdaptiveWorkRequest, best: AdaptiveWorkProfile, neighbour: AdaptiveWorkProfile) AdaptiveWorkTuner {
+    var tuner = modelProbeTestTuner();
+    tuner.phase = .probing;
+    tuner.has_threaded_profile = true;
+    tuner.learned_item_count = request.item_count;
+    tuner.best_profile = best;
+    tuner.current_profile = best;
+    tuner.candidate_profile = neighbour;
+    tuner.best_mean_batch_duration_ns = 100_000;
+    tuner.baseline_mean_batch_duration_ns = 100_000;
+    tuner.climb_direction = -1;
+    tuner.climb_reversed = true;
+    tuner.model_work_ns_per_item = 1_000_000.0 / @as(f64, @floatFromInt(request.item_count));
+    return tuner;
+}
+
+const model_probe_best = AdaptiveWorkProfile{ .worker_threads = 4, .items_per_range = 512 };
+const model_probe_neighbour = AdaptiveWorkProfile{ .worker_threads = 3, .items_per_range = 512 };
+
+// Records a losing candidate window; returns the model probe that follows.
+fn loseLastClimbStep(tuner: *AdaptiveWorkTuner, request: AdaptiveWorkRequest) !AdaptiveWorkProfile {
+    tuner.record(tunerTestBatchWithProfile(request.item_count, tuner.selectProfile(request), 150_000));
+    try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.phase);
+    const model_probe = tuner.selectProfile(request);
+    try std.testing.expectEqual(tuner.normalizedProfile(tuner.predictProfile(request), request), model_probe);
+    try std.testing.expect(model_probe.worker_threads > model_probe_best.worker_threads + 1);
+    return model_probe;
+}
+
+test "adaptive work tuner probes the model's prediction at the climb's settle point and climbs on from its win" {
+    const request = tunerTestRequest(8192, 20, 16, 64);
+    var tuner = lastClimbStepTuner(request, model_probe_best, model_probe_neighbour);
+    const model_probe = try loseLastClimbStep(&tuner, request);
+    tuner.record(tunerTestBatchWithProfile(8192, model_probe, 80_000));
+    try std.testing.expectEqual(model_probe, tuner.best_profile);
+    try std.testing.expectEqual(@as(u64, 80_000), tuner.best_mean_batch_duration_ns);
+    try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.phase);
+    try std.testing.expect(!tuner.climb_reversed);
+    try std.testing.expectEqual(model_probe.worker_threads - 1, tuner.selectProfile(request).worker_threads);
+}
+
+test "adaptive work tuner a losing model probe settles on the best without reversing" {
+    const request = tunerTestRequest(8192, 20, 16, 64);
+    var tuner = lastClimbStepTuner(request, model_probe_best, model_probe_neighbour);
+    const model_probe = try loseLastClimbStep(&tuner, request);
+    tuner.climb_reversed = false;
+    tuner.record(tunerTestBatchWithProfile(8192, model_probe, 150_000));
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, tuner.phase);
+    try std.testing.expectEqual(model_probe_best, tuner.best_profile);
+    try std.testing.expectEqual(model_probe_best, tuner.selectProfile(request));
+}
+
+test "adaptive work tuner settles with no model probe when the prediction is the best" {
+    const request = tunerTestRequest(8192, 2, 16, 64);
+    var tuner = lastClimbStepTuner(request, model_probe_best, model_probe_neighbour);
+    tuner.model_imbalance_work_ns = 1;
+    const best = tuner.normalizedProfile(tuner.predictProfile(request), request);
+    try std.testing.expectEqual(@as(usize, 2), best.worker_threads);
+    tuner.best_profile = best;
+    tuner.current_profile = best;
+    tuner.candidate_profile = .{ .worker_threads = 1, .items_per_range = best.items_per_range };
+    tuner.record(tunerTestBatchWithProfile(8192, tuner.selectProfile(request), 150_000));
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, tuner.phase);
+    try std.testing.expectEqual(best, tuner.best_profile);
+    try std.testing.expectEqual(best, tuner.normalizedProfile(tuner.predictProfile(request), request));
+}
+
+test "adaptive work tuner settles on the best when the model predicts inline" {
+    const request = tunerTestRequest(8192, 20, 16, 64);
+    var tuner = lastClimbStepTuner(request, model_probe_best, model_probe_neighbour);
+    tuner.model_work_ns_per_item = 0.1;
+    tuner.record(tunerTestBatchWithProfile(8192, tuner.selectProfile(request), 150_000));
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, tuner.phase);
+    try std.testing.expectEqual(model_probe_best, tuner.best_profile);
+    try std.testing.expectEqual(model_probe_best, tuner.selectProfile(request));
+}
+
+test "adaptive work tuner a winning one-worker model probe climbs up" {
+    const request = tunerTestRequest(8192, 20, 16, 64);
+    var tuner = lastClimbStepTuner(request, model_probe_best, model_probe_neighbour);
+    tuner.model_participant_overhead_ns = 400_000;
+    tuner.record(tunerTestBatchWithProfile(8192, tuner.selectProfile(request), 150_000));
+    const model_probe = tuner.selectProfile(request);
+    try std.testing.expectEqual(@as(usize, 1), model_probe.worker_threads);
+    tuner.record(tunerTestBatchWithProfile(8192, model_probe, 80_000));
+    try std.testing.expectEqual(model_probe, tuner.best_profile);
+    try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.phase);
+    try std.testing.expectEqual(@as(usize, 2), tuner.selectProfile(request).worker_threads);
 }
 
 test "adaptive work tuner computes more workers for larger measured work" {
@@ -3520,34 +3664,9 @@ test "adaptive work tuner a shift retune keeps its incumbent against a candidate
     try std.testing.expectEqual(@as(u64, 400_000 * 94 / 100), commits.best_mean_batch_duration_ns);
 }
 
-// Settles an 8192-item stage below its sqrt guess (fewer workers are cheaper), then
-// records settled windows at `settled_ns` until the periodic retune probes; returns
-// the incumbent's measured cost.
-fn periodicRetuneFromLowWorkerIncumbent(tuner: *AdaptiveWorkTuner, request: AdaptiveWorkRequest, settled_percent: u64) !u64 {
-    tuner.record(tunerTestBatchWithProfile(8192, tuner.selectProfile(request), 1_000_000));
-    var guard: usize = 0;
-    while (tuner.phase != .settled and guard < 256) : (guard += 1) {
-        const selected = tuner.selectProfile(request);
-        const duration: u64 = if (selected.worker_threads == 0) 1_000_000 else 40_000 + @as(u64, selected.worker_threads) * 5_000;
-        tuner.record(tunerTestBatchWithProfile(8192, selected, duration));
-    }
-    try std.testing.expect(tuner.phase == .settled);
-    const incumbent = tuner.selectProfile(request);
-    try std.testing.expect(incumbent.worker_threads > 0);
-    const incumbent_ns = 40_000 + @as(u64, incumbent.worker_threads) * 5_000;
-    try std.testing.expectEqual(incumbent_ns, tuner.best_mean_batch_duration_ns);
-    var retune_guard: usize = 0;
-    while (tuner.phase == .settled and retune_guard < 8) : (retune_guard += 1) {
-        tuner.record(tunerTestBatchWithProfile(8192, tuner.selectProfile(request), incumbent_ns * settled_percent / 100));
-    }
-    try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.phase);
-    try std.testing.expect(!profilesEqual(tuner.selectProfile(request), incumbent));
-    return incumbent_ns;
-}
-
-test "adaptive work tuner a periodic retune keeps its measured best and the small-improvement margin" {
-    const request = tunerTestRequest(8192, 10, 16, 64);
-    const config = AdaptiveWorkTunerConfig{
+// A tuner settled on a threaded incumbent, one window before its periodic retune.
+fn settledBeforePeriodicRetune(request: AdaptiveWorkRequest) AdaptiveWorkTuner {
+    var tuner = AdaptiveWorkTuner.init(.{
         .initial_range_items = 16,
         .smallest_range_items = 16,
         .largest_range_items = 4096,
@@ -3556,23 +3675,70 @@ test "adaptive work tuner a periodic retune keeps its measured best and the smal
         .retune_after_settled_windows = 2,
         .improvement_threshold_percent = 1,
         .threaded_commit_threshold_percent = 5,
-    };
+    });
+    const incumbent = AdaptiveWorkProfile{ .worker_threads = 2, .items_per_range = 512 };
+    tuner.phase = .settled;
+    tuner.has_threaded_profile = true;
+    tuner.learned_item_count = request.item_count;
+    tuner.best_profile = incumbent;
+    tuner.current_profile = incumbent;
+    tuner.best_mean_batch_duration_ns = 100_000;
+    tuner.settled_window_count = 1;
+    tuner.model_work_ns_per_item = 1_000_000.0 / @as(f64, @floatFromInt(request.item_count));
+    return tuner;
+}
 
-    // Slow settled windows leave the best at the measured minimum: a candidate faster
-    // than those windows but slower than that best is not committed.
-    var stable = AdaptiveWorkTuner.init(config);
-    const stable_ns = try periodicRetuneFromLowWorkerIncumbent(&stable, request, 120);
-    try std.testing.expectEqual(stable_ns, stable.best_mean_batch_duration_ns);
-    stable.record(tunerTestBatchWithProfile(8192, stable.selectProfile(request), stable_ns * 110 / 100));
-    try std.testing.expectEqual(stable_ns, stable.best_mean_batch_duration_ns);
+// Records the incumbent's retune window at `window_ns`.
+fn startPeriodicRetune(tuner: *AdaptiveWorkTuner, request: AdaptiveWorkRequest, window_ns: u64) !void {
+    const incumbent = tuner.best_profile;
+    tuner.record(tunerTestBatchWithProfile(request.item_count, tuner.selectProfile(request), window_ns));
+    try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.phase);
+    try std.testing.expectEqual(incumbent, tuner.best_profile);
+    try std.testing.expect(!profilesEqual(tuner.selectProfile(request), incumbent));
+}
 
-    // A 2% win clears the 1% improvement margin.
-    var small_win = AdaptiveWorkTuner.init(config);
-    const small_win_ns = try periodicRetuneFromLowWorkerIncumbent(&small_win, request, 100);
+test "adaptive work tuner a periodic retune compares with the incumbent's latest window under the small-improvement margin" {
+    const request = tunerTestRequest(8192, 10, 16, 64);
+
+    var drifted = settledBeforePeriodicRetune(request);
+    try startPeriodicRetune(&drifted, request, 120_000);
+    try std.testing.expectEqual(@as(u64, 120_000), drifted.best_mean_batch_duration_ns);
+    const drifted_candidate = drifted.selectProfile(request);
+    drifted.record(tunerTestBatchWithProfile(8192, drifted_candidate, 110_000));
+    try std.testing.expectEqual(drifted_candidate, drifted.best_profile);
+    try std.testing.expectEqual(@as(u64, 110_000), drifted.best_mean_batch_duration_ns);
+
+    var within = settledBeforePeriodicRetune(request);
+    const within_incumbent = within.best_profile;
+    try startPeriodicRetune(&within, request, 120_000);
+    within.record(tunerTestBatchWithProfile(8192, within.selectProfile(request), 119_400));
+    try std.testing.expectEqual(within_incumbent, within.best_profile);
+    try std.testing.expectEqual(@as(u64, 120_000), within.best_mean_batch_duration_ns);
+
+    var small_win = settledBeforePeriodicRetune(request);
+    try startPeriodicRetune(&small_win, request, 100_000);
     const candidate = small_win.selectProfile(request);
-    small_win.record(tunerTestBatchWithProfile(8192, candidate, small_win_ns * 98 / 100));
+    small_win.record(tunerTestBatchWithProfile(8192, candidate, 98_000));
     try std.testing.expectEqual(candidate, small_win.best_profile);
-    try std.testing.expectEqual(small_win_ns * 98 / 100, small_win.best_mean_batch_duration_ns);
+    try std.testing.expectEqual(@as(u64, 98_000), small_win.best_mean_batch_duration_ns);
+}
+
+test "adaptive work tuner a periodic retune that settles back on its incumbent keeps its lowest overhead" {
+    const request = tunerTestRequest(8192, 2, 16, 64);
+    var tuner = settledBeforePeriodicRetune(request);
+    const incumbent = tuner.best_profile;
+    tuner.config.threaded_batch_ns = 150_000;
+    tuner.model_work_ns_per_item = 250_000.0 / 8192.0;
+    tuner.model_imbalance_work_ns = 1;
+    _ = tuner.selectProfile(request);
+    tuner.settled_overhead = tuner.measuredOverhead();
+    try startPeriodicRetune(&tuner, request, 160_000);
+    tuner.record(tunerTestBatchWithProfile(8192, tuner.selectProfile(request), 200_000));
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, tuner.phase);
+    try std.testing.expectEqual(incumbent, tuner.best_profile);
+    tuner.record(tunerTestBatchWithProfile(8192, tuner.selectProfile(request), 100_000));
+    try std.testing.expect(tuner.has_threaded_profile);
+    try std.testing.expectEqual(incumbent, tuner.selectProfile(request));
 }
 
 test "adaptive work tuner an initial climb still commits a small win" {
@@ -3899,7 +4065,6 @@ test "adaptive work tuner without a per-item model selects a count jump as befor
 
 test "adaptive work tuner two jumps to the same count get the same shape" {
     var tuner = try inlineSettledTestTuner();
-    // Enough workers that the per-item model's move changes the predicted count.
     const jump_request = tunerTestRequest(1024, 64, 16, 64);
     const first = tuner.selectProfile(jump_request);
     tuner.record(tunerTestBatchWithProfile(1024, first, 1_000_000));
@@ -3912,7 +4077,6 @@ test "adaptive work tuner two jumps to the same count get the same shape" {
 
 test "adaptive work tuner a jump keeps its held shape across a shifted window median" {
     var tuner = try inlineSettledTestTuner();
-    // Enough workers that the per-item model's move changes the predicted count.
     const jump_request = tunerTestRequest(1024, 64, 16, 64);
     const first = tuner.selectProfile(jump_request);
     tuner.record(tunerTestBatchWithProfile(1024, first, 1_000_000));
@@ -4769,7 +4933,6 @@ test "a nested run of an owner's tuned selection keeps its aligned range set" {
         .largest_range_items = 256,
         .sample_window = 1,
         .threaded_batch_ns = 1000,
-        // Four ranges per participant: a 96-item range, off the 64-item default.
         .max_ranges_per_participant = 4,
     });
     // One slow inline sample moves the tuner to probing a threaded candidate.
