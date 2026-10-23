@@ -6,8 +6,8 @@
 //! (translate think rows to memory rows, order the member rows ascending, decay, visibility)
 //! plus the main thread's mark, compact, unmark, and event refresh. Every
 //! `ai_memory_event_stride`th AI row (the think rows in `ai-memory-sparse`) gets a synthetic
-//! perceived event each iteration, so the refreshes scale with the think set without the
-//! injection dominating the window.
+//! perceived event each iteration, committed with the step's start before the timed window,
+//! so the refreshes scale with the think set and the window holds only the memory step.
 //! - `ai-memory`: every agent's memory, the think set in store order. Pass shape: time linear
 //!   in agents; the tuned case within spread of the best control; main's time per processed
 //!   row flat across sizes.
@@ -167,6 +167,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(tunersSettled(&system))) {
+        try prepareStep(&fixture, run);
         _ = try runOnce(&system, &fixture, run, &threads, case);
     }
     const settled_before_measurement = if (case.adaptive) tunersSettled(&system) else false;
@@ -175,6 +176,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var last_stats = AiMemoryStats{};
     var main_total: u128 = 0;
     for (0..options.iterations) |_| {
+        try prepareStep(&fixture, run);
         const start_ns = suite.nowNs(io);
         last_stats = try runOnce(&system, &fixture, run, &threads, case);
         const end_ns = suite.nowNs(io);
@@ -214,11 +216,15 @@ const Run = struct {
     touched_words: usize,
 };
 
-fn runOnce(system: *AiMemorySystem, fixture: *Fixture, run: Run, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !AiMemoryStats {
+// A new step with this iteration's synthetic perceived events, outside the timed window.
+fn prepareStep(fixture: *Fixture, run: Run) !void {
     fixture.frame.beginStep();
-    const ai_slice = fixture.data.aiAgentSliceConst();
-    try injectPerceivedEvents(&fixture.frame, ai_slice, run.event_rows, fixture.target);
+    try injectPerceivedEvents(&fixture.frame, fixture.data.aiAgentSliceConst(), run.event_rows, fixture.target);
+}
 
+// One memory step over the step `prepareStep` set up.
+fn runOnce(system: *AiMemorySystem, fixture: *Fixture, run: Run, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !AiMemoryStats {
+    const ai_slice = fixture.data.aiAgentSliceConst();
     return try system.update(ai_slice, &fixture.data, &fixture.frame, thread_system, .{
         .items_per_range = case.stageItemsPerRange(ai_memory_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),

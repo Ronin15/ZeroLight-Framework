@@ -62,6 +62,7 @@ const chunkCells = @import("nav_fixtures.zig").chunkCells;
 pub const evict_group = suite.BenchmarkGroup{
     .name = "pathfinding-evict",
     .item_label = EvictCode.label,
+    .describe_item = EvictCode.describe,
     .item_counts = &evict_item_counts,
     .runCase = runEvictCase,
     .write_workload = writeEvictWorkload,

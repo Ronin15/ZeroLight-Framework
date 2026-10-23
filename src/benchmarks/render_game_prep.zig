@@ -13,8 +13,9 @@
 //! Prints `vertices=`, `sprites=`, `skipped=`, `merged_groups=`, `sparse=` (sparse tiles
 //! submitted), `dynamic_records=`, `static_groups=`, `merged_tilemap_groups=`, and the phases.
 //! Pass shape: one merged `.tilemap` group at every count and play level, so draw groups never
-//! grow with dense window depth. Asserts check that group count and that the collect returns
-//! every entity and active particle.
+//! grow with dense window depth. Asserts check that group count, that the collect returns
+//! every entity and active particle, and that a fixed threaded case dispatches the vertex
+//! emit to workers.
 //!
 //! `render-game-prep-offview` times `collectDynamicRecords` alone under the production
 //! camera window: a fixed set of rows inside it and a growing count of rows outside it on
@@ -213,6 +214,7 @@ fn runCaseWithConfig(
             allocator,
         );
         accumulator.record(measured.timed_ns, measured.stats.perf.batch);
+        try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(sprite_prep_range_alignment_items), measured.stats.perf.batch);
         phase_accumulator.record(measured.phases);
         last_prep = measured.stats;
         last_sparse_submitted = measured.sparse_submitted;

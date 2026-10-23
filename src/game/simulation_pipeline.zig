@@ -84,6 +84,7 @@ const stimulus_deferred_capacity = @import("simulation.zig").stimulus_deferred_c
 const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const stimulus_max_impacts_per_step = @import("simulation.zig").stimulus_max_impacts_per_step;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
+const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const SimulationScope = @import("simulation_scope.zig").SimulationScope;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const cognition_halo_chunks = @import("simulation_scope.zig").cognition_halo_chunks;
@@ -744,6 +745,14 @@ pub const PopulationSyncStats = struct {
     }
 };
 
+/// What one `SimulationPipeline.commitStructuralAndReact` did: the structural commit, the
+/// population growth seam, and the post-commit nav reaction.
+pub const CommitSeamResult = struct {
+    structural: StructuralCommitStats,
+    population_sync: PopulationSyncStats,
+    nav_update: NavUpdateStats,
+};
+
 /// Fixed-step simulation owner for one gameplay state instance.
 /// This owns reusable systems and concrete stage order; it is not a global
 /// scheduler, registry, or callback-driven dependency graph.
@@ -811,6 +820,19 @@ pub const SimulationPipeline = struct {
     interact_held_last: bool = false,
     /// Soft-drops from `tryAppendActionIntent` this step (reset each `update`).
     action_intents_dropped_step: usize = 0,
+    perf: Perf = .{},
+
+    /// Kept only with `runtime_perf_log.enabled`: the last commit seam's stage wall times,
+    /// bench output (`threading.md` § Verification). Each is zero when its stage did not run
+    /// that seam (an earlier failure, or the nav reaction after a failed collider sync).
+    pub const Perf = if (runtime_perf_log.enabled) struct {
+        /// `StaticColliderSystem.sync`, its stages included.
+        seam_collider_sync_ns: u64 = 0,
+        /// `CollisionSystem.syncCommittedTriggers`: the stored-trigger patch or rebuild.
+        seam_trigger_sync_ns: u64 = 0,
+        /// `reactToPostCommitNavEvents`.
+        seam_nav_reaction_ns: u64 = 0,
+    } else struct {};
 
     /// Initializes owned systems, reserves their cold capacities, and builds
     /// the current static navigation grid from the state-owned `DataSystem`.
@@ -915,12 +937,27 @@ pub const SimulationPipeline = struct {
         };
     }
 
+    /// Reserves `frame` for the tracked capacities: every population-sized stream the
+    /// pipeline's stages write (navigation and movement intents, structural commands,
+    /// path requests), each to the most ranges its writers dispatch at
+    /// `movement_body_capacity`, then `reserve` at that population (the event limit, the
+    /// cognition scratch, and the contact streams). Grow-only. The production entry: state
+    /// init calls it once after `init`, and the population seam after each growth.
+    pub fn reserveFrame(self: *SimulationPipeline, frame: *SimulationFrame) !void {
+        const body = self.movement_body_capacity;
+        try frame.navigation_intents.reserve(self.navigationIntentRangeCount(), body);
+        try frame.intents.reserve(self.steeringStreamRangeCount(), body);
+        try frame.structural_commands.reserve(self.structuralCommandRangeCount(), body + self.structuralCommandHeadroom());
+        try frame.reservePathRequests(self.steeringStreamRangeCount(), body);
+        try self.reserve(frame, body);
+    }
+
     /// Tops up frame events to the sum of producer budgets (`eventCapacitySum`),
     /// reserves cognition gather scratch for `pop`, and reserves the contact-dependent
     /// streams to the collision pair bound over the tracked `movement_body_capacity`
-    /// (`reserveContactStreams`). Does not lower an existing higher event limit. The
-    /// production entry: state init calls it after `reserveStreams`.
-    pub fn reserve(self: *SimulationPipeline, frame: *SimulationFrame, pop: usize) !void {
+    /// (`reserveContactStreams`). Does not lower an existing higher event limit.
+    /// `reserveFrame` runs it at the tracked population.
+    fn reserve(self: *SimulationPipeline, frame: *SimulationFrame, pop: usize) !void {
         try self.ai.reserve(pop);
         try self.perception.reserve(pop);
         try self.ai_memory.reserve(pop);
@@ -992,7 +1029,7 @@ pub const SimulationPipeline = struct {
     /// The most ranges steering's avoidance pass appends to `frame.intents` and to
     /// `frame.path_requests` in one step at the tracked population (one of each per pass
     /// range): the range count to reserve both streams to.
-    pub fn steeringStreamRangeCount(self: *const SimulationPipeline) usize {
+    fn steeringStreamRangeCount(self: *const SimulationPipeline) usize {
         return maxRangeCount(self.movement_body_capacity, steering_range_alignment_items);
     }
 
@@ -1024,7 +1061,7 @@ pub const SimulationPipeline = struct {
     /// The budget for this step's structural commit: the whole `.structural_commit`
     /// share (the pipeline's destructible share plus the caller's
     /// `structural_headroom`), plus `extra_required_events` preflighted for after it.
-    pub fn structuralCommitBudget(self: *const SimulationPipeline, extra_required_events: usize) StructuralCommitBudget {
+    fn structuralCommitBudget(self: *const SimulationPipeline, extra_required_events: usize) StructuralCommitBudget {
         return .{
             .extra_required_events = extra_required_events,
             .structural_event_share = maxEventsPerStep(.structural_commit, self.eventBudgets()),
@@ -1034,7 +1071,7 @@ pub const SimulationPipeline = struct {
     /// Structural-command stream room beyond one `set_simulation_tier` per body: the
     /// whole `.structural_commit` event share. Every non-tier command emits at least one
     /// event, so the event share bounds the command count.
-    pub fn structuralCommandHeadroom(self: *const SimulationPipeline) usize {
+    fn structuralCommandHeadroom(self: *const SimulationPipeline) usize {
         return maxEventsPerStep(.structural_commit, self.eventBudgets());
     }
 
@@ -1116,15 +1153,9 @@ pub const SimulationPipeline = struct {
         self.affect_max_events_per_step = affect_share;
 
         if (body_grew or shares_grew) {
-            // Each stream's range count is the most ranges its writers dispatch at `body`.
-            try frame.navigation_intents.reserve(self.navigationIntentRangeCount(), body);
-            try frame.intents.reserve(self.steeringStreamRangeCount(), body);
-            try frame.structural_commands.reserve(self.structuralCommandRangeCount(), body + self.structuralCommandHeadroom());
-            try frame.reservePathRequests(self.steeringStreamRangeCount(), body);
-            // Raises the event limit, re-runs the cognition reserves and the contact
-            // streams + response reserves to the grown pair bound (and every other
-            // reserve attached to `reserve`).
-            try self.reserve(frame, body);
+            // The streams at `body`, the raised event limit, the cognition reserves, and the
+            // contact streams + response reserves to the grown pair bound.
+            try self.reserveFrame(frame);
         }
 
         try growPathfindingForAgents(&self.pathfinding, rows.steering_agents);
@@ -1180,7 +1211,7 @@ pub const SimulationPipeline = struct {
     /// capture after the commit allocates nothing, and nav's static marks to every change
     /// the next collider sync can record (the pending changes plus one per command). An
     /// error commits nothing.
-    pub fn reserveStaticColliders(self: *SimulationPipeline, frame: *const SimulationFrame, data: *const DataSystem) !void {
+    fn reserveStaticColliders(self: *SimulationPipeline, frame: *const SimulationFrame, data: *const DataSystem) !void {
         const command_count = frame.structural_commands.mergedItems().len;
         try self.static_colliders.reserveForCommit(data, command_count);
         try self.pathfinding.reserveStaticColliderMarks(self.static_colliders.pendingChangeCount() + command_count);
@@ -1189,7 +1220,7 @@ pub const SimulationPipeline = struct {
     /// Right after the structural commit: records the step's static changes into the
     /// colliders' persistent dirty list. Allocation-free; never fails, so a later seam
     /// failure cannot lose them.
-    pub fn captureStaticColliderChanges(self: *SimulationPipeline, frame: *const SimulationFrame) void {
+    fn captureStaticColliderChanges(self: *SimulationPipeline, frame: *const SimulationFrame) void {
         self.static_colliders.capture(frame);
     }
 
@@ -1203,14 +1234,67 @@ pub const SimulationPipeline = struct {
     /// its growth geometric. A collider sync error leaves the rows unchanged and keeps the
     /// changes. A trigger sync or bound growth error leaves the synced rows and nav marks in
     /// place; the next update or seam retries the sync, and the next seam the growth.
-    pub fn syncStaticColliders(self: *SimulationPipeline, frame: *SimulationFrame, data: *const DataSystem, thread_system: *ThreadSystem) !void {
+    fn syncStaticColliders(self: *SimulationPipeline, frame: *SimulationFrame, data: *const DataSystem, thread_system: *ThreadSystem) !void {
         self.collision.resetSeamBatches();
+        var collider_timer = StageTimer.start();
         try self.static_colliders.sync(data, thread_system);
+        if (comptime runtime_perf_log.enabled) self.perf.seam_collider_sync_ns = collider_timer.lap();
         self.pathfinding.recordStaticColliderChanges(self.static_colliders.changesThisStep());
         const view = self.static_colliders.view();
         try self.collision.reserveDebugRects(view.row_of_index.len);
+        var trigger_timer = StageTimer.start();
         try self.collision.syncCommittedTriggers(data, view, thread_system);
+        if (comptime runtime_perf_log.enabled) self.perf.seam_trigger_sync_ns = trigger_timer.lap();
         try self.topUpTriggerContactBound(frame);
+    }
+
+    /// The structural-commit seam, in order: the static-collider and static nav-mark
+    /// reserve, the budgeted commit, the collider capture of the step's static changes, the
+    /// population growth seam, the collider sync with its nav record and the stored-trigger
+    /// contact bound growth (run even when the growth seam failed, so the step's static
+    /// changes land and reach nav), then the post-commit reactions. The nav apply runs only
+    /// after a successful growth seam and collider sync, keeping every recorded mark for the
+    /// next step otherwise (a failed trigger bound growth counts as a failed sync and retries
+    /// next seam); the steering reaction (allocation-free flag setting) always runs, and the
+    /// first growth, collider, or nav error is returned only after it. Steering reads the
+    /// synced collider rows, so a growth or nav failure still leaves it on the committed
+    /// statics; a failed collider sync keeps steering on the pre-commit rows and keeps its
+    /// changes for the next step's sync, which converges. Commits `frame`'s structural
+    /// commands in its current step; the step's changes stay in the frame.
+    pub fn commitStructuralAndReact(
+        self: *SimulationPipeline,
+        frame: *SimulationFrame,
+        data: *DataSystem,
+        world: *const WorldSystem,
+        thread_system: *ThreadSystem,
+    ) !CommitSeamResult {
+        if (comptime runtime_perf_log.enabled) self.perf = .{};
+        // The post-commit nav reaction appends at most one nav_region_invalidated event,
+        // driven by structural commands applied this frame, marks a terrain writer recorded
+        // (a dig's world_tile_changed), or nav work the world left pending (a level, link, or
+        // content revision). Reserve the slot for every source so the append never trips a
+        // tight capacity_limit.
+        const extra_event_count: usize = if (self.navReactionMayEmit(data, frame, world)) maxEventsPerStep(.nav_reaction, .{}) else 0;
+        try self.reserveStaticColliders(frame, data);
+        const structural = try frame.applyStructuralCommandsBudgeted(data, self.structuralCommitBudget(extra_event_count));
+        self.captureStaticColliderChanges(frame);
+        // Population growth seam: the post-commit reactions and the next step see grown
+        // capacities. O(1) when the committed rows fit the tracked capacities.
+        const population_sync = self.syncPopulationCapacity(frame, data);
+        const collider_sync = self.syncStaticColliders(frame, data, thread_system);
+        const nav_update = if (population_sync) |_|
+            (if (collider_sync) |_| nav: {
+                var nav_timer = StageTimer.start();
+                const stats = self.reactToPostCommitNavEvents(frame, world, thread_system);
+                if (comptime runtime_perf_log.enabled) self.perf.seam_nav_reaction_ns = nav_timer.lap();
+                break :nav stats;
+            } else |err| err)
+        else |err|
+            err;
+        self.reactToPostCommitSteeringEvents(frame);
+        const population = try population_sync;
+        try collider_sync;
+        return .{ .structural = structural, .population_sync = population, .nav_update = try nav_update };
     }
 
     /// Records the commit seam's stage batches: the collider sync's plan and the trigger
@@ -1237,7 +1321,7 @@ pub const SimulationPipeline = struct {
     /// Orchestrates the post-commit nav reaction by delegating to the nav-owning
     /// `PathfindingSystem`, which applies every recorded nav change and emits the
     /// invalidation event. Runs after `syncStaticColliders` succeeded this step.
-    pub fn reactToPostCommitNavEvents(
+    fn reactToPostCommitNavEvents(
         self: *SimulationPipeline,
         frame: *SimulationFrame,
         world: *const WorldSystem,
@@ -1250,7 +1334,7 @@ pub const SimulationPipeline = struct {
     /// step's entity changes. Steering reads the synced collider rows directly, so no
     /// static change reaches it here. Disjoint state, so it runs even when the nav
     /// reaction fails.
-    pub fn reactToPostCommitSteeringEvents(
+    fn reactToPostCommitSteeringEvents(
         self: *SimulationPipeline,
         frame: *const SimulationFrame,
     ) void {
@@ -1261,7 +1345,7 @@ pub const SimulationPipeline = struct {
     /// structural command may change nav, a failed collider sync left static changes for
     /// this step's sync, or nav has recorded marks, levels, links, or a content revision
     /// still to apply. Used for the pre-commit event capacity preflight.
-    pub fn navReactionMayEmit(self: *const SimulationPipeline, data: *const DataSystem, frame: *const SimulationFrame, world: *const WorldSystem) bool {
+    fn navReactionMayEmit(self: *const SimulationPipeline, data: *const DataSystem, frame: *const SimulationFrame, world: *const WorldSystem) bool {
         return self.static_colliders.hasPendingChanges() or self.pathfinding.navReactionMayEmit(data, frame, world);
     }
 
@@ -2739,6 +2823,12 @@ const RangeOutputStream = @import("simulation.zig").RangeOutputStream;
 const contactsNaming = @import("systems/collision_response_test_support.zig").contactsNaming;
 const pinPipelineThreadedProfiles = @import("simulation_pipeline_test_support.zig").pinPipelineThreadedProfiles;
 const pinThreadedProfile = @import("simulation_pipeline_test_support.zig").pinThreadedProfile;
+const lateralSteeringOnce = @import("simulation_pipeline_test_support.zig").lateralSteeringOnce;
+const addSteeringAgentAndParkedBox = @import("simulation_pipeline_test_support.zig").addSteeringAgentAndParkedBox;
+const writeBoxMove = @import("simulation_pipeline_test_support.zig").writeBoxMove;
+const expectSteeringSeesOwnPosition = @import("simulation_pipeline_test_support.zig").expectSteeringSeesOwnPosition;
+const addBystanderBody = @import("simulation_pipeline_test_support.zig").addBystanderBody;
+const OneAgentPipelineFixture = @import("simulation_pipeline_test_support.zig").OneAgentPipelineFixture;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
 const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
@@ -3164,26 +3254,12 @@ fn markAllAlwaysActive(data: *DataSystem) !void {
     }
 }
 
-/// Mirrors `GameDemoState.applyStructuralCommandsAndPostCommitEvents`: the collider and
-/// static mark reserve, the commit with the nav-reaction slot reserved, the collider
-/// capture, the population seam, the collider sync and its nav record, then the post-commit
-/// reactions (nav apply only after a successful population seam and collider sync; steering
-/// always), returning the first error.
-fn commitAndSyncLikeDemo(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {
+// The production commit seam (`commitStructuralAndReact`) on an inline thread system,
+// returning its population seam stats.
+fn commitSeamInline(pipeline: *SimulationPipeline, frame: *SimulationFrame, data: *DataSystem, world: *const WorldSystem) !PopulationSyncStats {
     var serial_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer serial_threads.deinit();
-    const extra_event_count: usize = if (pipeline.navReactionMayEmit(data, frame, world)) maxEventsPerStep(.nav_reaction, .{}) else 0;
-    try pipeline.reserveStaticColliders(frame, data);
-    _ = try frame.applyStructuralCommandsBudgeted(data, pipeline.structuralCommitBudget(extra_event_count));
-    pipeline.captureStaticColliderChanges(frame);
-    const sync = pipeline.syncPopulationCapacity(frame, data);
-    const colliders = pipeline.syncStaticColliders(frame, data, &serial_threads);
-    const nav_update = if (sync) |_| (if (colliders) |_| pipeline.reactToPostCommitNavEvents(frame, world, &serial_threads) else |err| err) else |err| err;
-    pipeline.reactToPostCommitSteeringEvents(frame);
-    const sync_stats = try sync;
-    try colliders;
-    _ = try nav_update;
-    return sync_stats;
+    return (try pipeline.commitStructuralAndReact(frame, data, world, &serial_threads)).population_sync;
 }
 
 fn writeStructuralCommands(frame: *SimulationFrame, commands: []const StructuralCommand) !void {
@@ -3349,13 +3425,13 @@ fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: AdaptiveW
     };
     frame.beginStep();
     _ = try pipeline.update(context);
-    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    _ = try commitSeamInline(&pipeline, &frame, &data, &world);
 
     var commands: [pathing_crowd_count]StructuralCommand = undefined;
     for (&commands, 0..) |*command, column| command.* = pathingCrowdTemplate(column);
     frame.beginStep();
     try writeStructuralCommands(&frame, &commands);
-    const sync = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    const sync = try commitSeamInline(&pipeline, &frame, &data, &world);
     try std.testing.expect(sync.grew);
     try markAllAlwaysActive(&data);
 
@@ -3394,7 +3470,7 @@ fn runPathingCrowdGrowthScenario(first_items_per_range: usize, second: AdaptiveW
     try counters.expectOnlyOwnersAllocated(&.{"pathfinding"});
     try std.testing.expectEqual(seam_before, seam_state.of(&pipeline.pathfinding));
     try std.testing.expect(seam_state.registry(&pipeline.pathfinding) > registry_before);
-    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    _ = try commitSeamInline(&pipeline, &frame, &data, &world);
 
     // The crowd's markers are the world's only markers.
     try std.testing.expectEqual(@as(usize, markers.len), world.interest_markers.count());
@@ -3777,7 +3853,7 @@ fn responderTemplate(index: usize, mobility: CollisionResponseMobility) Structur
 }
 
 /// World-backed nav over the minimal three-level world: a player at (5,3) facing right, so a
-/// dig hits (6,3), stepped through `update` and the demo seam. On level 0 a dig is a hole
+/// dig hits (6,3), stepped through `update` and the commit seam. On level 0 a dig is a hole
 /// (walkable either way); `underground` puts the player on level 1's solid dirt, where a dig
 /// mines a walkable tunnel and so changes nav.
 const NavSeamFixture = struct {
@@ -3861,7 +3937,7 @@ const NavSeamFixture = struct {
     }
 
     fn seam(self: *NavSeamFixture) !void {
-        _ = try commitAndSyncLikeDemo(&self.pipeline, &self.frame, &self.data, &self.world);
+        _ = try commitSeamInline(&self.pipeline, &self.frame, &self.data, &self.world);
     }
 
     fn navBlocked(self: *const NavSeamFixture, level: u16, x: i32, y: i32) bool {
@@ -3950,7 +4026,7 @@ fn commitStructuralBurst(create_count: usize, saturate_other_producers: bool) !S
     const events_before = frame.events.mergedItems().len;
     const bodies_before = data.movementBodySliceConst().entities.len;
 
-    _ = commitAndSyncLikeDemo(&pipeline, &frame, &data, &world) catch |err| {
+    _ = commitSeamInline(&pipeline, &frame, &data, &world) catch |err| {
         try std.testing.expectEqual(error.EventCapacityExceeded, err);
         // Rejected before mutation: no rows, no events.
         try std.testing.expectEqual(bodies_before, data.movementBodySliceConst().entities.len);
@@ -4470,7 +4546,7 @@ test "perception share grows at the seam so newly created observers never trunca
     }
     frame.beginStep();
     try writeStructuralCommands(&frame, &commands);
-    const sync = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    const sync = try commitSeamInline(&pipeline, &frame, &data, &world);
     try std.testing.expect(sync.grew);
     try std.testing.expectEqual(@as(usize, 7), data.populationRowCounts().ai_perceptions);
     try std.testing.expectEqual(perception_events_per_observer_max * grownPopulationCapacity(7), pipeline.perception_max_events_per_step);
@@ -6383,7 +6459,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     // Warm step at the initial population.
     frame.beginStep();
     _ = try pipeline.update(context);
-    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    _ = try commitSeamInline(&pipeline, &frame, &data, &world);
 
     // Growth: 19 NPCs (7 commit events each) + 2 NPCs that also carry AiPerception and
     // AiAffect (9 each) + 12 steering-only agents parked on rows 6-7 (4 events each) =
@@ -6403,7 +6479,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     const init_affect_share = pipeline.affect_max_events_per_step;
     frame.beginStep();
     try writeStructuralCommands(&frame, &commands);
-    const sync = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    const sync = try commitSeamInline(&pipeline, &frame, &data, &world);
     try std.testing.expect(sync.grew);
     // 3 -> 5 perception/affect rows: the seam's share-growth arm ran too.
     try std.testing.expectEqual(@as(usize, 5), data.ai_perceptions.len());
@@ -6582,18 +6658,18 @@ test "after population growth the seam's stream range counts are the binding res
     };
     frame.beginStep();
     _ = try pipeline.update(context);
-    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    _ = try commitSeamInline(&pipeline, &frame, &data, &world);
 
     var commands: [32]StructuralCommand = undefined;
     for (commands[0..25], 0..) |*command, index| command.* = sealedPursuerTemplate(index);
     frame.beginStep();
     try writeStructuralCommands(&frame, commands[0..25]);
-    try std.testing.expect((try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    try std.testing.expect((try commitSeamInline(&pipeline, &frame, &data, &world)).grew);
     try std.testing.expectEqual(@as(usize, 64), pipeline.movement_body_capacity);
     for (&commands, 25..) |*command, index| command.* = sealedPursuerTemplate(index);
     frame.beginStep();
     try writeStructuralCommands(&frame, &commands);
-    try std.testing.expect(!(try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    try std.testing.expect(!(try commitSeamInline(&pipeline, &frame, &data, &world)).grew);
     try std.testing.expectEqual(@as(usize, 64), data.movementBodySliceConst().entities.len);
     try markAllAlwaysActive(&data);
     // The crate alone is tier-policed, and its tier is wrong: the policy changes it, so
@@ -6904,7 +6980,7 @@ test "a collider sync that runs out of memory keeps its change and the next step
     try pipeline.reserveStaticColliders(&frame, &data);
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     pipeline.static_colliders.allocator = failing.allocator();
-    const failed = commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    const failed = commitSeamInline(&pipeline, &frame, &data, &world);
     pipeline.static_colliders.allocator = std.testing.allocator;
     try std.testing.expectError(error.OutOfMemory, failed);
     try std.testing.expect(!pipeline.pathfinding.graph.grid(0).?.isBlockedCell(.{ .x = 0, .y = 0 }));
@@ -6913,10 +6989,201 @@ test "a collider sync that runs out of memory keeps its change and the next step
     // seam reserves its event, and the retried sync blocks the cell.
     frame.beginStep();
     try std.testing.expect(pipeline.navReactionMayEmit(&data, &frame, &world));
-    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    _ = try commitSeamInline(&pipeline, &frame, &data, &world);
     try std.testing.expectEqual(@as(usize, 1), frame.events.stats.nav_region_invalidated);
     try std.testing.expect(pipeline.pathfinding.graph.grid(0).?.isBlockedCell(.{ .x = 0, .y = 0 }));
     try std.testing.expect(!pipeline.navReactionMayEmit(&data, &frame, &world));
+}
+
+// The level of entity `index`'s static-collider row, or null when it has none (a row id of
+// maxInt(u32)).
+fn colliderRowLevelForTest(colliders: *const StaticColliderSystem, index: u32) ?u16 {
+    if (index >= colliders.row_of_index.items.len) return null;
+    const row = colliders.row_of_index.items[index];
+    if (row == std.math.maxInt(u32)) return null;
+    return colliders.row_level[row];
+}
+
+/// One create per step: the seam-capacity tests' structural headroom.
+const seam_test_structural_headroom: usize = structuralEventHeadroom(1, 0);
+
+test "a population growth seam that runs out of memory still runs the steering reaction and returns the error" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
+    var fixture: OneAgentPipelineFixture = undefined;
+    try fixture.init(seam_test_structural_headroom);
+    defer fixture.deinit();
+    const frame = &fixture.frame;
+    const bystander = try addBystanderBody(&fixture.data, 0);
+    const scene = try addSteeringAgentAndParkedBox(&fixture.data, 0);
+
+    // Four bodies fit the 4-body reserve. A steering step caches the agent's movement row.
+    frame.beginStep();
+    _ = try fixture.pipeline.commitStructuralAndReact(frame, &fixture.data, &fixture.world, &inline_threads);
+    try std.testing.expectEqual(@as(usize, 4), fixture.pipeline.movement_body_capacity);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnce(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal), 0.001);
+    try std.testing.expect(fixture.pipeline.steering.steering_movement_index_valid);
+
+    // The commit moves the box beside the agent and destroys the bystander, swap-removing
+    // the agent into the bystander's row; two creates then push the population past the
+    // reserve, the first refilling the agent's old row. The growth seam's first reserve
+    // fails.
+    const far = math.Vec2{ .x = 640, .y = 640 };
+    const create: StructuralCommand = .{ .create_entity = .{
+        .movement_body = .{ .position = far, .previous_position = far, .velocity = .{}, .speed = 0 },
+    } };
+    frame.beginStep();
+    try writeBoxMove(frame, scene.box, scene.beside, &.{ .{ .destroy_entity = bystander }, create, create });
+    const agent_row = fixture.data.movementBodyDenseIndex(scene.agent).?;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const scope_allocator = fixture.pipeline.scope.allocator;
+    fixture.pipeline.scope.allocator = failing.allocator();
+    const result = fixture.pipeline.commitStructuralAndReact(frame, &fixture.data, &fixture.world, &inline_threads);
+    fixture.pipeline.scope.allocator = scope_allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expectEqual(@as(usize, 5), fixture.data.movementBodySliceConst().entities.len);
+    try std.testing.expect(fixture.data.movementBodyDenseIndex(scene.agent).? != agent_row);
+    try std.testing.expect(!fixture.pipeline.steering.steering_movement_index_valid);
+
+    // The synced collider rows push the agent away from the moved box (+y), and the agent
+    // snapshot reads its own renumbered row, not the create now in its old one.
+    try std.testing.expect(try lateralSteeringOnce(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal) > 0.05);
+    try expectSteeringSeesOwnPosition(&fixture.pipeline, &fixture.data, scene.agent);
+}
+
+test "a population-seam OOM still records the step's static changes" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
+    var fixture: OneAgentPipelineFixture = undefined;
+    try fixture.init(seam_test_structural_headroom);
+    defer fixture.deinit();
+    const frame = &fixture.frame;
+    const scene = try addSteeringAgentAndParkedBox(&fixture.data, 0);
+    frame.beginStep();
+    _ = try fixture.pipeline.commitStructuralAndReact(frame, &fixture.data, &fixture.world, &inline_threads);
+    // The box was added outside a commit, so the colliders have not seen it yet.
+    try std.testing.expect(colliderRowLevelForTest(&fixture.pipeline.static_colliders, scene.box.index) == null);
+
+    // The commit moves the box while two creates push the population past its reserve;
+    // the growth seam's first reserve fails.
+    const far = math.Vec2{ .x = 640, .y = 640 };
+    const create: StructuralCommand = .{ .create_entity = .{
+        .movement_body = .{ .position = far, .previous_position = far, .velocity = .{}, .speed = 0 },
+    } };
+    frame.beginStep();
+    try writeBoxMove(frame, scene.box, scene.beside, &.{ create, create });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const scope_allocator = fixture.pipeline.scope.allocator;
+    fixture.pipeline.scope.allocator = failing.allocator();
+    const result = fixture.pipeline.commitStructuralAndReact(frame, &fixture.data, &fixture.world, &inline_threads);
+    fixture.pipeline.scope.allocator = scope_allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    // The collider sync ran anyway: the moved box has its row.
+    const row_level = colliderRowLevelForTest(&fixture.pipeline.static_colliders, scene.box.index) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 0), row_level);
+    try std.testing.expectEqual(@as(usize, 1), fixture.pipeline.static_colliders.changesThisStep().len);
+
+    // The next step, with no command, applies the recorded change: nav equals a fresh
+    // build of the statics, the box's cells blocked.
+    frame.beginStep();
+    _ = try fixture.pipeline.commitStructuralAndReact(frame, &fixture.data, &fixture.world, &inline_threads);
+    const live = fixture.pipeline.pathfinding.graph.grid(0).?;
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(fixture.pipeline.pathfinding.capacity);
+    try rebuilt.rebuildStaticNavGrid(&fixture.data, 64, 64, fixture.pipeline.pathfinding.graph.cell_size);
+    const fresh = rebuilt.graph.grid(0).?;
+    var blocked: usize = 0;
+    for (0..live.geometry.height) |y| for (0..live.geometry.width) |x| {
+        const cell: GridCell = .{ .x = @intCast(x), .y = @intCast(y) };
+        try std.testing.expectEqual(fresh.isBlockedCell(cell), live.isBlockedCell(cell));
+        if (live.isBlockedCell(cell)) blocked += 1;
+    };
+    try std.testing.expect(blocked != 0);
+}
+
+test "a collider sync that runs out of memory leaves steering on the pre-commit rows and the next seam converges" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
+    var fixture: OneAgentPipelineFixture = undefined;
+    try fixture.init(seam_test_structural_headroom);
+    defer fixture.deinit();
+    const frame = &fixture.frame;
+    const scene = try addSteeringAgentAndParkedBox(&fixture.data, 0);
+    const colliders = &fixture.pipeline.static_colliders;
+
+    // The box was added outside a commit: a commit re-placing it where it is gives it its
+    // row, parked far from the agent.
+    const parked = fixture.data.movementBodyConst(scene.box).?.position;
+    frame.beginStep();
+    try writeBoxMove(frame, scene.box, parked, &.{});
+    _ = try fixture.pipeline.commitStructuralAndReact(frame, &fixture.data, &fixture.world, &inline_threads);
+    try std.testing.expect(colliderRowLevelForTest(colliders, scene.box.index) != null);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnce(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal), 0.001);
+
+    // The commit moves the box beside the agent. The sync's plan scratch is released
+    // first, so the sync must grow it, and every collider allocation fails: the sync after
+    // the commit fails.
+    colliders.sync_plan.clearAndFree(colliders.allocator);
+    frame.beginStep();
+    try writeBoxMove(frame, scene.box, scene.beside, &.{});
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const allocator = colliders.allocator;
+    colliders.allocator = failing.allocator();
+    const result = fixture.pipeline.commitStructuralAndReact(frame, &fixture.data, &fixture.world, &inline_threads);
+    colliders.allocator = allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+    // The commit applied; the sync kept the change for the next seam.
+    try std.testing.expectEqual(scene.beside, fixture.data.movementBodyConst(scene.box).?.position);
+    try std.testing.expect(colliders.hasPendingChanges());
+
+    // Steering reads the pre-commit rows: the box is still parked.
+    try std.testing.expectApproxEqAbs(@as(f32, 0), try lateralSteeringOnce(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal), 0.001);
+
+    // The next seam, with no command, syncs the kept change: steering pushes away from the
+    // box (+y).
+    frame.beginStep();
+    _ = try fixture.pipeline.commitStructuralAndReact(frame, &fixture.data, &fixture.world, &inline_threads);
+    try std.testing.expect(!colliders.hasPendingChanges());
+    try std.testing.expect(try lateralSteeringOnce(&fixture.pipeline, frame, &fixture.data, scene.agent, scene.goal) > 0.05);
+}
+
+test "a commit seam whose creates pass the reserve grows the pipeline capacity and its event bound" {
+    var inline_threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer inline_threads.deinit();
+    var fixture: OneAgentPipelineFixture = undefined;
+    try fixture.init(seam_test_structural_headroom);
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 4), fixture.pipeline.movement_body_capacity);
+
+    // Five creates (movement, bounds, response: 4 commit events each, 20 <= 79) push
+    // the population to 6, past the 4-body initial reserve.
+    var commands: [5]StructuralCommand = undefined;
+    for (&commands, 0..) |*command, index| {
+        const x: f32 = @as(f32, @floatFromInt(index)) * 64;
+        command.* = .{ .create_entity = .{
+            .movement_body = .{ .position = .{ .x = x, .y = 180 }, .previous_position = .{ .x = x, .y = 180 }, .velocity = .{}, .speed = 0 },
+            .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
+            .collision_response = .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
+        } };
+    }
+    fixture.frame.beginStep();
+    try writeStructuralCommands(&fixture.frame, &commands);
+    const grown = try fixture.pipeline.commitStructuralAndReact(&fixture.frame, &fixture.data, &fixture.world, &inline_threads);
+    try std.testing.expectEqual(@as(usize, 5), grown.structural.created);
+
+    // 6 bodies -> 6 + 3 + 16 = 25, hot-store aligned to 32. The bound follows:
+    // dig 2 + perception 2 + affect 4 + plane (32 + 1) + action_react 64 +
+    // structural 79 (fixed) + nav 1 = 185.
+    try std.testing.expect(grown.population_sync.grew);
+    try std.testing.expectEqual(@as(usize, 32), fixture.pipeline.movement_body_capacity);
+    try std.testing.expectEqual(@as(usize, 185), fixture.pipeline.eventCapacitySum());
+    try std.testing.expectEqual(@as(?usize, 185), fixture.frame.events.capacity_limit);
+
+    fixture.frame.beginStep();
+    const unchanged = try fixture.pipeline.commitStructuralAndReact(&fixture.frame, &fixture.data, &fixture.world, &inline_threads);
+    try std.testing.expect(!unchanged.population_sync.grew);
 }
 
 test "a nav-mark reserve OOM before a dig leaves world and nav intact and the retry applies it" {
@@ -7207,7 +7474,7 @@ test "statics committed at the seam leave the next step allocation-free" {
     commands[12] = responderTemplate(12, .static);
     frame.beginStep();
     try writeStructuralCommands(&frame, commands[0..13]);
-    try std.testing.expect((try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    try std.testing.expect((try commitSeamInline(&pipeline, &frame, &data, &world)).grew);
     frame.beginStep();
     _ = try pipeline.update(context);
 
@@ -7215,7 +7482,7 @@ test "statics committed at the seam leave the next step allocation-free" {
     for (&commands, 0..) |*command, index| command.* = responderTemplate(13 + index, .static);
     frame.beginStep();
     try writeStructuralCommands(&frame, &commands);
-    try std.testing.expect(!(try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    try std.testing.expect(!(try commitSeamInline(&pipeline, &frame, &data, &world)).grew);
     try std.testing.expectEqual(@as(usize, 21), static_colliders_test_support.liveRowCount(pipeline.static_colliders));
 
     // The next step reads the synced rows and allocates nothing on any owner.
@@ -7405,7 +7672,7 @@ test "a step after a growing trigger sync at the collider seam allocates nothing
     // Warm step and seam at the initial population.
     frame.beginStep();
     _ = try pipeline.update(context);
-    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    _ = try commitSeamInline(&pipeline, &frame, &data, &world);
 
     const spot = math.Vec2{ .x = 600, .y = 300 };
     var creates: [trigger_count]StructuralCommand = undefined;
@@ -7417,7 +7684,7 @@ test "a step after a growing trigger sync at the collider seam allocates nothing
     } };
     frame.beginStep();
     try writeStructuralCommands(&frame, &creates);
-    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    _ = try commitSeamInline(&pipeline, &frame, &data, &world);
     try std.testing.expectEqual(@as(usize, 0), pipeline.collision.trigger_store.pair_count);
 
     // Warm step and seam at the final population and shape.
@@ -7425,7 +7692,7 @@ test "a step after a growing trigger sync at the collider seam allocates nothing
     pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
     frame.beginStep();
     _ = try pipeline.update(context);
-    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    _ = try commitSeamInline(&pipeline, &frame, &data, &world);
 
     var mode_changes: [trigger_count]StructuralCommand = undefined;
     var changed: usize = 0;
@@ -7437,7 +7704,7 @@ test "a step after a growing trigger sync at the collider seam allocates nothing
     try std.testing.expectEqual(trigger_count, changed);
     frame.beginStep();
     try writeStructuralCommands(&frame, &mode_changes);
-    _ = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    _ = try commitSeamInline(&pipeline, &frame, &data, &world);
     const pair_count: usize = pipeline.collision.trigger_store.pair_count;
     try std.testing.expectEqual(@as(usize, trigger_count * (trigger_count - 1) / 2), pair_count);
     try std.testing.expect(pair_count > pipeline.collision.reserved_pair_bound);

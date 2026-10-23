@@ -4,9 +4,12 @@
 
 //! `world-gate`: one `world_gate.apply` (the bounds clamp and the solid-tile gate of a
 //! settled movement step) over AI bodies on an underground level whose floor alternates
-//! walkable and solid tiles, plus the player on the surface. Pass shape: linear in bodies,
-//! dispatched across workers with a SIMD tile test; the gate has a serial main-thread path
-//! only, so `serial-direct` is its one case. Asserts check only the fixture's body count.
+//! walkable and solid tiles, plus the player on the surface. Each body starts and steps
+//! inside one tile, a checkerboard of bodies on walkable and on solid tiles whatever the grid
+//! pitch, so every size gates the same half and per-body work is the same at every size. Pass
+//! shape: linear in bodies. The gate is scalar and serial on the main thread today, so
+//! `serial-direct` is its one case. Asserts check the fixture's body count and that the
+//! timed applies gate exactly the solid-start half (each held at its previous position).
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -39,6 +42,8 @@ const Fixture = struct {
     world: WorldSystem,
     data: DataSystem,
     player: Player,
+    // Bodies whose start tile is solid: the gate holds exactly these.
+    solid_starts: usize,
 
     fn deinit(self: *Fixture) void {
         self.data.deinit();
@@ -72,13 +77,27 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, bodies: usize) !Fixtur
     errdefer data.deinit();
     const player = try Player.spawn(&data);
 
-    const level_px = world.worldWidthPixels();
+    const tile = world.tile_size;
+    // A body and its step stay inside its start tile on both axes.
+    std.debug.assert(body_size + step_offset.x < tile and body_size + step_offset.y < tile);
     const grid_side = suite.ceilSqrt(bodies);
-    const pitch = level_px / @as(f32, @floatFromInt(grid_side));
+    if (grid_side > gate_level_side) return error.WorldGateGridPastLevel;
+    const pitch_tiles = gate_level_side / grid_side;
+    var solid_starts: usize = 0;
     for (0..bodies) |index| {
+        const column = index % grid_side;
+        const row = index / grid_side;
+        // Checkerboard of bodies: odd ones start on a solid tile, even ones on a walkable one.
+        const solid = (column + row) % 2 == 1;
+        var tile_x = column * pitch_tiles;
+        const tile_y = row * pitch_tiles;
+        // The floor is walkable where the tile parity is even; a body whose pitch tile has the
+        // other parity shifts one tile along x, back from the level's last column.
+        if (((tile_x + tile_y) % 2 == 1) != solid) tile_x = if (tile_x + 1 < gate_level_side) tile_x + 1 else tile_x - 1;
+        solid_starts += @intFromBool(solid);
         const previous = math.Vec2{
-            .x = @as(f32, @floatFromInt(index % grid_side)) * pitch,
-            .y = @as(f32, @floatFromInt(index / grid_side)) * pitch,
+            .x = @as(f32, @floatFromInt(tile_x)) * tile,
+            .y = @as(f32, @floatFromInt(tile_y)) * tile,
         };
         const position = math.Vec2{ .x = previous.x + step_offset.x, .y = previous.y + step_offset.y };
         const entity = try data.createEntity();
@@ -97,7 +116,18 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, bodies: usize) !Fixtur
         });
     }
     std.debug.assert(data.aiAgentSliceConst().entities.len == bodies);
-    return .{ .world = world, .data = data, .player = player };
+    return .{ .world = world, .data = data, .player = player, .solid_starts = solid_starts };
+}
+
+// The AI bodies the gate holds at their previous position on both axes.
+fn heldBodies(data: *const DataSystem) usize {
+    const movement = data.movementBodySliceConst();
+    var held: usize = 0;
+    for (data.aiAgentSliceConst().entities) |entity| {
+        const row = data.movementBodyDenseIndex(entity).?;
+        held += @intFromBool(movement.position_x[row] == movement.previous_x[row] and movement.position_y[row] == movement.previous_y[row]);
+    }
+    return held;
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -116,11 +146,13 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), .{});
     }
+    if (options.iterations > 0 and heldBodies(&fixture.data) != fixture.solid_starts) return error.WorldGateWrongGatedBodies;
     var stats = accumulator.finish();
     stats.output_count = fixture.data.aiAgentSliceConst().entities.len;
+    stats.sample_count = fixture.solid_starts;
     return stats;
 }
 
 fn writeGateWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
-    try writer.print("bodies={} level={}", .{ stats.output_count, gate_level });
+    try writer.print("bodies={} gated={} level={}", .{ stats.output_count, stats.sample_count, gate_level });
 }

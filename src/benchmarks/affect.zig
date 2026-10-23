@@ -6,7 +6,9 @@
 //! curiosity, aggression, fatigue). Every `affect_signal_stride`th agent also carries
 //! `AiPerception` and `AiMemory` with a visible hostile and low familiarity in its hot
 //! columns, set at fixture creation; nothing is injected per step. Both groups print
-//! `processed=` (rows appraised) and `threshold_crossings=`.
+//! `processed=` (rows appraised) and `threshold_crossings=`; `--details` adds `main=` with
+//! `main_per_item=` (per processed row), flat across sizes. Asserts also check a fixed
+//! threaded case dispatches the appraisal to workers.
 //! - `ai-affect`: every agent, the think set in store order. Pass shape: time linear in
 //!   agents; asserts check every agent is appraised each step.
 //! - `ai-affect-shuffled`: the same step over a stride shuffle of every agent as the think
@@ -15,6 +17,7 @@
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const AffectStats = @import("../game/systems/affect.zig").AffectStats;
 const AffectSystem = @import("../game/systems/affect.zig").AffectSystem;
@@ -103,22 +106,28 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(system.compute_tuner.phase == .settled)) {
+        fixture.events.clearRetainingCapacity();
         _ = try runOnce(&system, &fixture, think_set, &threads, case);
     }
     const settled_before_measurement = if (case.adaptive) (system.compute_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = AffectStats{};
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
+        fixture.events.clearRetainingCapacity();
         const start_ns = suite.nowNs(io);
         last_stats = try runOnce(&system, &fixture, think_set, &threads, case);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.perf.batch);
+        const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
+        accumulator.record(elapsed_ns, last_stats.perf.batch);
         try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(affect_range_alignment_items), last_stats.perf.batch);
+        main_total += elapsed_ns -| offMainNs(last_stats.perf.batch);
     }
 
     std.debug.assert(options.iterations == 0 or system.rows.len == item_count);
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.candidate_pairs = system.rows.len;
     stats.output_count = fixture.events.stats.affect_threshold_crossed;
     if (case.adaptive) {
@@ -127,8 +136,8 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     return stats;
 }
 
+// One affect step; the caller clears the events first, outside any timed window.
 fn runOnce(system: *AffectSystem, fixture: *Fixture, think_set: ?[]const u32, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !AffectStats {
-    fixture.events.clearRetainingCapacity();
     const ai_slice = fixture.data.aiAgentSliceConst();
 
     return try system.update(ai_slice, &fixture.data, &fixture.events, thread_system, .{
@@ -139,6 +148,9 @@ fn runOnce(system: *AffectSystem, fixture: *Fixture, think_set: ?[]const u32, th
     });
 }
 
-fn writeAffectWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+// `main` is the time outside the appraisal's worker dispatch, also per processed row.
+fn writeAffectWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("processed={} threshold_crossings={}", .{ stats.candidate_pairs, stats.output_count });
+    if (view == .summary) return;
+    try suite.writeMainShare(writer, stats, stats.candidate_pairs);
 }

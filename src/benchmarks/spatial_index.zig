@@ -10,8 +10,9 @@
 //! - `spatial_index-shape`: the build in a `shape_world_chunks`² world with every body in one
 //!   chunk (`dense_chunk`), one per chunk (`sparse_chunks`), or `shape_deep_bodies` over its
 //!   levels (`deep_levels`). Pass shape: linear in H, the tuned case on the production tuner;
-//!   `deep_levels` flat in levels, its storage linear in levels. Asserts
-//!   check every body indexed and the directories' bytes whole against
+//!   `deep_levels` flat in levels, its storage linear in levels. Asserts check every body
+//!   indexed, `thread-fixed-auto` dispatching each stage to workers, and the directories'
+//!   bytes whole against
 //!   `chunk_slot_bytes` x chunks x levels.
 //!   Both build groups print `entities=`, `--details` adding `main=` and the `sort=` and
 //!   `link=` stage shapes; `spatial_index-shape` also prints `directory_bytes=`, the level
@@ -64,15 +65,20 @@ pub const group = suite.BenchmarkGroup{
 pub const shape_group = suite.BenchmarkGroup{
     .name = "spatial_index-shape",
     .item_label = ShapeCode.label,
+    .describe_item = ShapeCode.describe,
     .item_counts = &shape_item_counts,
     .runCase = runShapeCase,
     .write_workload = writeShapeWorkload,
-    .cases = &suite.serial_and_tuned_cases,
+    // The fixed control proves the shapes dispatch; the tuned case is the production tuner.
+    .cases = &shape_cases,
 };
+
+const shape_cases = suite.casesNamed(&.{ "serial-direct", "thread-fixed-auto", "thread-adaptive-tuned-range" });
 
 pub const query_group = suite.BenchmarkGroup{
     .name = "spatial_index-query",
     .item_label = QueryCode.label,
+    .describe_item = QueryCode.describe,
     .item_counts = &query_item_counts,
     .runCase = runQueryCase,
     .write_workload = writeQueryWorkload,

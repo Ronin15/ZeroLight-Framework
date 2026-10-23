@@ -40,7 +40,8 @@ reviewer diligence:
    exemptions are the owner's `OWNER_KEPT_API` entries.
 10. No `error.SkipZigTest` under `src/` (tests, benches, and smoke included).
 11. A `test` block, and a file-scope helper only tests reach, does not
-    reference `runtime_perf_log`, `perf_counters`, or `.perf`. `src/benchmarks/`
+    reference `runtime_perf_log`, `perf_counters`, or `.perf` (any member access;
+    an empty reset `.perf = .{}` reads nothing and is allowed). `src/benchmarks/`
     and `*test_support.zig` may: benches read counters, and support files serve
     benches. Production code outside `test` blocks may too. `build.zig`'s
     `perf_counters` option is not a hit.
@@ -658,8 +659,28 @@ def lint_test_only_api(files: list[Path]) -> list[tuple[str, int, str, str]]:
     return issues
 
 
-# Rule 11. `.perf` is a member access, not the `perf_counters` identifier (`_` is a word char).
-PERF_REF = re.compile(r"\bruntime_perf_log\b|\bperf_counters\b|(?<![\w])\.perf\b")
+# Rule 11. `.perf` is any member access (`stats.perf.x`, `.perf.x`), never the `perf_counters`
+# identifier or a `.perf_*` field (`_` is a word char). Resetting it to empty (`.perf = .{}`,
+# dropping the counters from a compare) reads nothing and is not a hit.
+PERF_REF = re.compile(r"\bruntime_perf_log\b|\bperf_counters\b|\.perf\b(?!\s*=\s*\.\{\s*\})")
+# Rule 11's self-check: each line and whether it is a hit.
+PERF_REF_CASES = (
+    ("try expect(stats.perf.batch.ran_inline);", True),
+    ("_ = .perf.batch;", True),
+    ("const x = self.perf;", True),
+    ("if (comptime runtime_perf_log.enabled) {}", True),
+    ("behavior.perf = .{};", False),
+    ("const y = stats.perf_total;", False),
+    ("const z = performance.perf_counters_off;", False),
+)
+
+
+def check_perf_ref() -> None:
+    """Fails the lint when rule 11's pattern misreads one of its self-check cases."""
+    for line, hit in PERF_REF_CASES:
+        if bool(PERF_REF.search(line)) != hit:
+            print(f"idiom-lint: rule 11 self-check failed on `{line}` (expected {'a hit' if hit else 'no hit'})", file=sys.stderr)
+            raise SystemExit(1)
 
 # Rule 12. Layers and the dev-tool roots no layer may import.
 LAYERS = ("game", "app", "render", "assets", "core", "platform")
@@ -840,6 +861,7 @@ def main() -> None:
         print(f"idiom-lint: source directory not found: {SRC_DIR}", file=sys.stderr)
         raise SystemExit(1)
 
+    check_perf_ref()
     files = sorted(SRC_DIR.rglob("*.zig")) + [BUILD_FILE]
     issues: list[tuple[str, int, str, str]] = []
     for path in files:

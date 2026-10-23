@@ -138,6 +138,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     thread_dispatch.group,
     world_gate.group,
     world_create.group,
+    world_create.statics_group,
     production_step.group,
 };
 

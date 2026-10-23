@@ -14,6 +14,29 @@
 //! at most linear in level area times levels, memory following what exists, and zero bytes
 //! after destroy. Asserts check the zero after destroy and, once per case at the smallest
 //! config, that the phases build the world `initProcedural` builds.
+//!
+//! `world-create-statics`: a world's pipeline created over its statics and its first commit
+//! seam, through the production entries (`SimulationPipeline.init` with nav over the world on
+//! the case's threads, `SimulationPipeline.reserveFrame`, then `commitStructuralAndReact`
+//! with no commands), on a fixed one-level 256² walkable world. Item count: statics, two per
+//! pitch cell of a square on the world's corner (a solid and a trigger half a tile past it,
+//! one stored trigger pair per cell). Timed: `init` and `first_seam`; the world and data
+//! build untimed. Today the stored-trigger store first builds in the first seam's trigger
+//! sync (a rebuild over every row, which also grows the stored trigger contact bound).
+//! Cases: serial, tuned, and `thread-fixed-auto`, which pins the first seam's trigger rebuild
+//! stages (the rebuild query and the store's four) to the case's fixed range on every worker
+//! between `init` and the seam, and fails when one of them ran inline over more than one
+//! range. The init's collider rebuild and nav build run on fresh tuners no control reaches.
+//! `main=` is the create's time less the off-main time of the collider rebuild and the
+//! trigger rebuild stages; the nav build's worker time is not split out yet, so it counts
+//! as main. A measuring landing: pass shape, for the fix that builds the store at create, is
+//! create plus first seam linear in statics with main per static flat, the first seam's
+//! trigger sync O(1) (no rebuild), and the first collision step after it emitting every
+//! stored pair with no pair-bound overflow. Asserts check fixture invariants only: the
+//! collider rows, and one stored pair per cell after the first seam. Prints `statics=`,
+//! `stored_pairs=`, `init=`, `first_seam=`, `per_static=`, and `main=` with
+//! `main_per_item=`; `--details` adds the first seam's `trigger_sync=` time and its rebuild query's shape
+//! (`trigger_rebuild_query=` workers/ranges, the last measured create's).
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -21,6 +44,14 @@ const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilese
 const manifest = @import("../assets/manifest.zig");
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
+const EntityId = @import("../game/data_system.zig").EntityId;
+const math = @import("../core/math.zig");
+const static_colliders_test_support = @import("../game/systems/static_colliders_test_support.zig");
+const pinThreadedProfile = @import("../game/simulation_pipeline_test_support.zig").pinThreadedProfile;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
+const BatchStats = @import("../app/thread_system.zig").BatchStats;
+const AdaptiveWorkProfile = @import("../app/thread_system.zig").AdaptiveWorkProfile;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const SimulationPipeline = @import("../game/simulation_pipeline.zig").SimulationPipeline;
 const WorldBuildConfig = @import("../game/world/system.zig").WorldBuildConfig;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
@@ -30,6 +61,7 @@ const suite = @import("suite.zig");
 pub const group = suite.BenchmarkGroup{
     .name = "world-create",
     .item_label = ScaleCode.label,
+    .describe_item = ScaleCode.describe,
     .item_counts = &item_counts,
     .runCase = runCase,
     .write_workload = writeCreateWorkload,
@@ -237,4 +269,181 @@ fn writeCreateWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.W
         summary.nav_bytes / 1024,
         summary.destroyed_bytes,
     });
+}
+
+pub const statics_group = suite.BenchmarkGroup{
+    .name = "world-create-statics",
+    .item_label = "statics (a solid and a trigger per cell)",
+    .item_counts = &statics_counts,
+    .runCase = runStaticsCase,
+    .write_workload = writeStaticsWorkload,
+    // The init's stages run their own fresh tuners; the fixed case pins the first seam's
+    // trigger rebuild.
+    .cases = &statics_cases,
+};
+
+const statics_cases = suite.casesNamed(&.{ "serial-direct", "thread-fixed-auto", "thread-adaptive-tuned-range" });
+const statics_counts = [_]usize{ 2_048, 8_192, 32_768 };
+// The fixed world: one level, the largest count's pitch grid a side.
+const statics_world_tiles: u16 = 256;
+// A cell's two statics sit on a two-tile pitch: the solid at the cell origin, the trigger half
+// a tile down and right, overlapping only its own cell's solid.
+const statics_pitch_tiles: usize = 2;
+
+const StaticsFixture = struct {
+    data: DataSystem,
+    world: WorldSystem,
+    cells: usize,
+
+    fn deinit(self: *StaticsFixture) void {
+        self.world.deinit();
+        self.data.deinit();
+        self.* = undefined;
+    }
+};
+
+fn addStatic(data: *DataSystem, position: math.Vec2, size: f32, trigger: bool) !EntityId {
+    const entity = try fixtures.addBody(data, position, .{ .x = size, .y = size }, .static);
+    if (trigger) try data.setCollisionResponse(entity, .{ .mobility = .static, .mode = .trigger });
+    return entity;
+}
+
+fn createStaticsFixture(allocator: std.mem.Allocator, io: std.Io, statics: usize) !StaticsFixture {
+    const cells = statics / 2;
+    const side = std.math.sqrt(cells);
+    if (side * side * 2 != statics) return error.WorldCreateStaticsNotSquare;
+    if (side * statics_pitch_tiles > statics_world_tiles) return error.WorldCreateStaticsPastWorld;
+    var meta = try fixtures.loadTilesetMeta(allocator, io);
+    defer meta.deinit();
+    var world = try fixtures.buildBandedWorld(allocator, &meta, statics_world_tiles, 1, "grass", "grass");
+    errdefer world.deinit();
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    const tile = world.tile_size;
+    const pitch = tile * @as(f32, @floatFromInt(statics_pitch_tiles));
+    for (0..side) |cell_y| for (0..side) |cell_x| {
+        const origin = math.Vec2{ .x = @as(f32, @floatFromInt(cell_x)) * pitch, .y = @as(f32, @floatFromInt(cell_y)) * pitch };
+        _ = try addStatic(&data, origin, tile, false);
+        _ = try addStatic(&data, .{ .x = origin.x + tile / 2, .y = origin.y + tile / 2 }, tile, true);
+    };
+    return .{ .data = data, .world = world, .cells = cells };
+}
+
+const StaticsSample = struct {
+    init_ns: u64,
+    seam_ns: u64,
+    trigger_sync_ns: u64,
+    // The collider rebuild's and the trigger rebuild stages' worker dispatch time.
+    off_main_ns: u64,
+    // The first seam's trigger rebuild query.
+    query_batch: BatchStats,
+};
+
+// The first seam's trigger rebuild stages: the rebuild query, then the store's.
+const trigger_rebuild_stage_count = 5;
+
+fn triggerRebuildBatches(pipeline: *const SimulationPipeline) [trigger_rebuild_stage_count]BatchStats {
+    const store_batches = pipeline.collision.trigger_store.last_rebuild_batches.values;
+    return [1]BatchStats{pipeline.collision.trigger_rebuild_query_batch} ++ store_batches;
+}
+
+// The fixed case's control: every trigger rebuild stage tuner replaced by one pinned to the
+// case's range on every worker, so the first seam's rebuild dispatches at that shape. The
+// replacement has no full-pool first selection, which would override the pin. Other cases
+// keep production's fresh rebuild tuners.
+fn pinTriggerRebuild(pipeline: *SimulationPipeline, case: suite.BenchmarkCase, threads: *const ThreadSystem) void {
+    const items_per_range = case.stageItemsPerRange(1) orelse return;
+    if (threads.workerThreadCount() == 0) return;
+    const profile: AdaptiveWorkProfile = .{ .worker_threads = threads.workerThreadCount(), .items_per_range = items_per_range };
+    pinFixed(&pipeline.collision.trigger_query_rebuild_tuner, profile);
+    for (&pipeline.collision.trigger_store.rebuild_tuners.values) |*tuner| pinFixed(tuner, profile);
+}
+
+fn pinFixed(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void {
+    tuner.* = AdaptiveWorkTuner.init(.{});
+    pinThreadedProfile(tuner, profile);
+}
+
+// One create and first seam on `threads`, timed, then the teardown, untimed. Checks the
+// fixture invariants, and on the fixed case that the trigger rebuild ran on workers.
+fn createWithStatics(allocator: std.mem.Allocator, io: std.Io, fixture: *StaticsFixture, statics: usize, case: suite.BenchmarkCase, threads: *ThreadSystem) !StaticsSample {
+    const start_ns = suite.nowNs(io);
+    var seam = try fixtures.PipelineSeam.init(allocator, &fixture.data, &fixture.world, .{
+        .structural_headroom = 0,
+        .pathfinding = .{ .worker_participant_count = threads.participantSlotCount() },
+        .nav_build_thread_system = threads,
+    });
+    defer seam.deinit();
+    const init_end_ns = suite.nowNs(io);
+    const pipeline = &seam.pipeline;
+    // The init's collider rebuild; the seam's sync replaces these records.
+    const rebuild_off_main_ns = static_colliders_test_support.lastOffMainNs(pipeline.static_colliders);
+    pinTriggerRebuild(pipeline, case, threads);
+    const seam_start_ns = suite.nowNs(io);
+    seam.frame.beginStep();
+    _ = try seam.commit(&fixture.data, &fixture.world, &.{}, threads);
+    const seam_end_ns = suite.nowNs(io);
+    if (static_colliders_test_support.liveRowCount(pipeline.static_colliders) != statics) return error.WrongStaticCount;
+    if (pipeline.collision.trigger_store.pair_count != fixture.cells) return error.TriggerPairCountMismatch;
+    const trigger_batches = triggerRebuildBatches(pipeline);
+    try suite.checkStagesDispatched(case, threads, case.stageItemsPerRange(1), &trigger_batches);
+    var off_main_ns = rebuild_off_main_ns;
+    for (trigger_batches) |batch| off_main_ns += offMainNs(batch);
+    return .{
+        .init_ns = suite.elapsedNs(start_ns, init_end_ns),
+        .seam_ns = suite.elapsedNs(seam_start_ns, seam_end_ns),
+        .trigger_sync_ns = pipeline.perf.seam_trigger_sync_ns,
+        .off_main_ns = off_main_ns,
+        .query_batch = trigger_batches[0],
+    };
+}
+
+fn runStaticsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, statics: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    var fixture = try createStaticsFixture(allocator, io, statics);
+    defer fixture.deinit();
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    for (0..options.warmup_iterations) |_| _ = try createWithStatics(allocator, io, &fixture, statics, case, &threads);
+    var accumulator = suite.StatsAccumulator.init(statics);
+    var totals: [4]u128 = @splat(0);
+    var query_batch: BatchStats = .{};
+    for (0..options.iterations) |_| {
+        const sample = try createWithStatics(allocator, io, &fixture, statics, case, &threads);
+        query_batch = sample.query_batch;
+        const ns = sample.init_ns + sample.seam_ns;
+        totals[0] += sample.init_ns;
+        totals[1] += sample.seam_ns;
+        totals[2] += sample.trigger_sync_ns;
+        totals[3] += ns -| sample.off_main_ns;
+        accumulator.record(ns, .{});
+    }
+    var stats = accumulator.finish();
+    stats.batch_carried = false;
+    stats.sample_count = statics;
+    stats.output_count = fixture.cells;
+    if (stats.iterations > 0) {
+        stats.deferred_count = @intCast(totals[0] / stats.iterations);
+        stats.fallback_deferred_count = @intCast(totals[1] / stats.iterations);
+        stats.main_ns = @intCast(totals[3] / stats.iterations);
+        stats.details.print("trigger_sync={f} trigger_rebuild_query={}w/{}r\n", .{
+            suite.formatDuration(@intCast(totals[2] / stats.iterations)),
+            if (query_batch.ran_inline) 0 else query_batch.active_worker_threads,
+            query_batch.range_count,
+        });
+    }
+    return stats;
+}
+
+// `sample_count` holds the statics, `output_count` the stored pairs, `deferred_count` the
+// mean `init` time and `fallback_deferred_count` the mean first seam time.
+fn writeStaticsWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+    try writer.print("statics={} stored_pairs={} init={f} first_seam={f} per_static={f}", .{
+        stats.sample_count,
+        stats.output_count,
+        suite.formatDuration(stats.deferred_count),
+        suite.formatDuration(stats.fallback_deferred_count),
+        suite.formatDuration(stats.mean_ns / @max(stats.sample_count, 1)),
+    });
+    try suite.writeMainShare(writer, stats, stats.sample_count);
 }

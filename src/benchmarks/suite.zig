@@ -48,6 +48,9 @@ pub const BenchmarkGroup = struct {
     /// What one item count names: the unit counted, or an item code's layout
     /// (`ItemCode(...).label`).
     item_label: []const u8,
+    /// A coded group's decoder (`ItemCode(...).describe`): the report header prints the run
+    /// code's fields after its label. Null for a group whose item count is a plain count.
+    describe_item: ?ItemDescriber = null,
     /// The item counts (or item codes) the group runs; `--items` runs one instead.
     item_counts: []const usize,
     runCase: *const fn (std.mem.Allocator, std.Io, Options, BenchmarkCase, usize) anyerror!RunStats,
@@ -76,6 +79,9 @@ pub const FixedRangeShape = struct {
 pub const WorkloadView = enum { summary, details };
 
 pub const WorkloadWriter = *const fn (*std.Io.Writer, RunStats, WorkloadView) std.Io.Writer.Error!void;
+
+/// Writes an item code's decoded fields (`ItemCode(...).describe`).
+pub const ItemDescriber = *const fn (*std.Io.Writer, usize) std.Io.Writer.Error!void;
 
 /// A group with no workload counters.
 pub fn writeNoWorkload(_: *std.Io.Writer, _: RunStats, _: WorkloadView) std.Io.Writer.Error!void {}
@@ -1023,7 +1029,8 @@ fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options:
         return;
     }
 
-    std.debug.print("\n{s}  {} {s}\n\n", .{ group.name, baseline.stats.item_count, group.item_label });
+    var item_buffer: [256]u8 = undefined;
+    std.debug.print("\n{s}  {} {s}{s}\n\n", .{ group.name, baseline.stats.item_count, group.item_label, formatItemInto(&item_buffer, group, baseline.stats.item_count) });
     const best = bestMeasured(results) orelse baseline;
     const fixed_auto = measured(findResult(results, "thread-fixed-auto"));
     const adaptive = measured(findResult(results, "thread-adaptive-tuned-range")) orelse measured(findResult(results, "thread-adaptive-fixed-range"));
@@ -1121,6 +1128,15 @@ fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
 fn printDetailLines(text: []const u8) void {
     var lines = std.mem.tokenizeScalar(u8, text, '\n');
     while (lines.next()) |line| std.debug.print("    {s}\n", .{line});
+}
+
+// A coded `group`'s decoded fields for `item_count`, after a `: `; empty for a plain count.
+fn formatItemInto(buffer: []u8, group: BenchmarkGroup, item_count: usize) []const u8 {
+    const describe = group.describe_item orelse return "";
+    var writer: std.Io.Writer = .fixed(buffer);
+    writer.writeAll(": ") catch return "";
+    describe(&writer, item_count) catch return ": item fields";
+    return writer.buffered();
 }
 
 // `group`'s workload text for `stats`; empty when it writes none.
@@ -1744,6 +1760,20 @@ pub fn ItemCode(comptime Fields: type, comptime digits: []const usize) type {
             }
             return fields;
         }
+
+        /// Writes `code`'s fields as `name=value` (an enum by its tag) for the report
+        /// header, or `undecodable` when `decode` fails.
+        pub fn describe(writer: *std.Io.Writer, code: usize) std.Io.Writer.Error!void {
+            const fields = decode(code) catch return writer.writeAll("undecodable");
+            inline for (names, 0..) |name, index| {
+                if (index != 0) try writer.writeByte(' ');
+                const value = @field(fields, name);
+                switch (@typeInfo(@TypeOf(value))) {
+                    .@"enum" => try writer.print("{s}={s}", .{ name, @tagName(value) }),
+                    else => try writer.print("{s}={}", .{ name, value }),
+                }
+            }
+        }
     };
 }
 
@@ -2092,6 +2122,26 @@ test "an item code packs its fields in decimal, round-trips them, and names its 
     const Plain = ItemCode(struct { level_side: u16, levels: u16 }, &.{3});
     try std.testing.expectEqualStrings("(level side * 1000 + levels)", Plain.label);
     try std.testing.expectEqual(@as(usize, 256_008), Plain.of(.{ .level_side = 256, .levels = 8 }));
+}
+
+test "a coded group's header names the run code's fields, and a code no config decodes from says so" {
+    const group = BenchmarkGroup{
+        .name = "test",
+        .item_label = TestCode.label,
+        .describe_item = TestCode.describe,
+        .item_counts = &test_item_counts,
+        .runCase = testRunCase,
+        .write_workload = writeNoWorkload,
+    };
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(": variant=packed_pads edge_chunks=8 level_side=1024 levels=1", formatItemInto(&buffer, group, 10_081_024_001));
+    try std.testing.expectEqualStrings(": undecodable", formatItemInto(&buffer, group, 20_081_024_001));
+    const Flag = ItemCode(struct { dormant: bool, pairs: u32 }, &.{6});
+    var flag_writer: std.Io.Writer = .fixed(&buffer);
+    try Flag.describe(&flag_writer, 1_000_064);
+    try std.testing.expectEqualStrings("dormant=true pairs=64", flag_writer.buffered());
+    const plain = BenchmarkGroup{ .name = "plain", .item_label = "items", .item_counts = &test_item_counts, .runCase = testRunCase, .write_workload = writeNoWorkload };
+    try std.testing.expectEqualStrings("", formatItemInto(&buffer, plain, 64));
 }
 
 test "an item code rejects a field past its digits, its type, or its enum's tags" {

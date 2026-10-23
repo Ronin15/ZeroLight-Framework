@@ -26,9 +26,11 @@
 //!   the range; `levels` stacks one hostile per level below at half the range and puts the
 //!   same-level hostile past the stack. Pass shape: every observer finds its hostile, nothing
 //!   is sensed across levels, and checks per observer stay flat in allies and levels. Asserts
-//!   check a threat found per observer, one FOV survivor each, and at most
-//!   `crowd_max_checks_per_observer` checks. Prints `threat_found=` (found over observers),
-//!   `sensed=`, `block_fills=`, and `checks_per_observer=`.
+//!   check a threat found per observer, one FOV survivor each, at most
+//!   `crowd_max_checks_per_observer` checks, and a fixed threaded case dispatching the gather
+//!   and compute to workers. Prints `threat_found=` (found over observers), `sensed=`,
+//!   `block_fills=`, and `checks_per_observer=`; `--details` adds `main=` with
+//!   `main_per_item=` (per observer).
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -88,6 +90,7 @@ pub const cell_ordered_group = suite.BenchmarkGroup{
 pub const crowd_group = suite.BenchmarkGroup{
     .name = "perception-crowd",
     .item_label = CrowdCode.label,
+    .describe_item = CrowdCode.describe,
     .item_counts = &crowd_item_counts,
     .runCase = runCrowdCase,
     .write_workload = writeCrowdWorkload,
@@ -400,6 +403,7 @@ fn runCaseImpl(
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next((system.gather_tuner.phase == .settled) and (system.compute_tuner.phase == .settled))) {
+        events.clearRetainingCapacity();
         _ = try runOnce(&system, &fixture, spatial_view, think_set, &events, &threads, case);
     }
     const settled_before_measurement = if (case.adaptive) (system.compute_tuner.phase == .settled) else false;
@@ -409,6 +413,7 @@ fn runCaseImpl(
     var last_stats = PerceptionStats{};
     var main_total: u128 = 0;
     for (0..options.iterations) |_| {
+        events.clearRetainingCapacity();
         const start_ns = suite.nowNs(io);
         last_stats = try runOnce(&system, &fixture, spatial_view, think_set, &events, &threads, case);
         const end_ns = suite.nowNs(io);
@@ -458,7 +463,6 @@ fn runOnce(
     thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) !PerceptionStats {
-    events.clearRetainingCapacity();
     const ai_slice = fixture.data.aiAgentSliceConst();
     const movement_slice = fixture.data.movementBodySliceConst();
 
@@ -585,17 +589,23 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next((system.gather_tuner.phase == .settled) and (system.compute_tuner.phase == .settled))) {
+        events.clearRetainingCapacity();
         _ = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
     }
     const settled_before_measurement = if (case.adaptive) (system.compute_tuner.phase == .settled) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PerceptionStats{};
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
+        events.clearRetainingCapacity();
         const start_ns = suite.nowNs(io);
         last_stats = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.perf.batch);
+        const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
+        accumulator.record(elapsed_ns, last_stats.perf.batch);
+        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(perception_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.perf.batch });
+        main_total += elapsed_ns -| (offMainNs(last_stats.perf.gather_batch) + offMainNs(last_stats.perf.batch));
     }
     std.debug.assert(last_stats.perf.observer_count == crowd_observers);
     std.debug.assert(last_stats.perf.nearest_threat_found_count == crowd_observers);
@@ -603,6 +613,7 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     std.debug.assert(last_stats.perf.candidate_checks <= crowd_observers * crowd_max_checks_per_observer);
 
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.items_per_second = suite.itemsPerSecond(last_stats.perf.observer_count, stats.mean_ns);
     stats.deferred_count = last_stats.perf.observer_count;
     stats.output_count = last_stats.perf.nearest_threat_found_count;
@@ -624,7 +635,6 @@ fn runCrowdOnce(
     thread_system: *ThreadSystem,
     case: suite.BenchmarkCase,
 ) !PerceptionStats {
-    events.clearRetainingCapacity();
     const ai_slice = fixture.data.aiAgentSliceConst();
     const movement_slice = fixture.data.movementBodySliceConst();
     return try system.update(ai_slice, movement_slice, spatial_view, &fixture.world, &fixture.data, events, thread_system, .{
@@ -637,8 +647,9 @@ fn runCrowdOnce(
 
 // `deferred_count` holds the observers, `output_count` those that found a threat,
 // `sample_count` the sensed candidates, `candidate_pairs` the index candidate checks, and
-// `neighbor_block_fills` the block fills.
-fn writeCrowdWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+// `neighbor_block_fills` the block fills; `main` is the time outside the gather's and
+// compute's worker dispatches, also per observer.
+fn writeCrowdWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     const observers = @max(stats.deferred_count, 1);
     try writer.print("threat_found={}/{} sensed={} block_fills={} checks_per_observer={d:.2}", .{
         stats.output_count,
@@ -647,4 +658,6 @@ fn writeCrowdWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.Wo
         stats.neighbor_block_fills,
         @as(f64, @floatFromInt(stats.candidate_pairs)) / @as(f64, @floatFromInt(observers)),
     });
+    if (view == .summary) return;
+    try suite.writeMainShare(writer, stats, observers);
 }

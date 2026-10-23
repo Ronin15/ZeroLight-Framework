@@ -8,7 +8,8 @@
 //!   every agent in one chunk (one index record), whose ranges split the chunk. Pass shape: linear in the H indexed
 //!   rows in both layouts. The tuned case follows the production tuner and stays inline while
 //!   its batch is under the gate; the main thread's share (the window merges) is flat per row.
-//!   Asserts check one record for `dense_chunk`, every case's think set equal
+//!   Asserts check a fixed threaded case dispatches the pass to workers, one record for
+//!   `dense_chunk`, every case's think set equal
 //!   to the serial pass's, and every indexed row counted once, thinking or skipped. Item
 //!   code `layout * 10^6 + agents` (layout 0 `spread`, 1 `dense_chunk`). Prints `indexed=`
 //!   (H) and `thinking=`; `--details` adds `main=` with `main_per_item=` (per indexed row).
@@ -64,6 +65,7 @@ fn cognitionHaloRegion() ActiveRegion {
 pub const cognition_group = suite.BenchmarkGroup{
     .name = "scope-cognition",
     .item_label = CognitionCode.label,
+    .describe_item = CognitionCode.describe,
     .item_counts = &cognition_item_counts,
     .runCase = runCognitionCase,
     .write_workload = writeCognitionWorkload,
@@ -185,6 +187,7 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         const result = try runCognitionOnce(&scope, &view, thread_ptr, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
+        try suite.checkStageDispatched(case, thread_ptr, case.stageItemsPerRange(scope_range_alignment_items), result.batch);
         accumulator.record(elapsed_ns, result.batch);
         main_total += elapsed_ns -| offMainNs(result.batch);
         std.debug.assert(std.mem.eql(u32, serial_think, result.cognition));

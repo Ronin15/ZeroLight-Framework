@@ -27,8 +27,7 @@
 //! and neighbor samples per thinking row, and `top_main=` names the three top-level stages
 //! with the most main time. `--details` adds each top-level stage's `wall=`,
 //! `off_main=`, and `main=` with its batches' `threaded=` steps over the measured steps, the
-//! nested stage timers, and the census counters as means per step. ReleaseFast compiles the
-//! log out, so only the step total prints there.
+//! nested stage timers, and the census counters as means per step.
 //!
 //! Pass shape: step and main time linear in population for `spread` and `crowd`; in level
 //! side and in level count at a fixed population, every row advances at its tier and the cost
@@ -84,6 +83,7 @@ const Timing = runtime_perf_log.Timing;
 pub const group = suite.BenchmarkGroup{
     .name = "production-step",
     .item_label = StepCode.label,
+    .describe_item = StepCode.describe,
     .item_counts = &item_counts,
     .runCase = runCase,
     .write_workload = writeStepWorkload,
@@ -644,10 +644,11 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var tileset = try fixtures.loadTilesetMeta(allocator, io);
     defer tileset.deinit();
     const dig_config = try DigConfig.fromMeta(&tileset);
-    var world = try fixtures.buildBandedWorld(allocator, &tileset, fields.level_side, fields.levels, "grass", "grass");
-    const world_px = world.worldWidthPixels();
+    // The state first: nothing fallible sits between the world build and `initWithWorld`.
     const state = try allocator.create(GameDemoState);
     defer allocator.destroy(state);
+    var world = try fixtures.buildBandedWorld(allocator, &tileset, fields.level_side, fields.levels, "grass", "grass");
+    const world_px = world.worldWidthPixels();
     // `initWithWorld` owns `world` from here, on failure too.
     state.* = try GameDemoState.initWithWorld(
         allocator,

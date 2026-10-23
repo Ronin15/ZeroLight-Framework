@@ -63,8 +63,9 @@
 //!     `reactToPostCommitNavEvents`. Linear in region chunks, flat in level size and depth.
 //!   - `chunk-scale-nav-enclose`: one batched edit fills the one-chunk doorways walling
 //!     pockets off one open surface component and the next carves them back. Variant 0: P
-//!     pockets of 4x4 chunks (linear in P); variant 1: one pocket of edge E chunks (linear in
-//!     its area); variant 2: a one-chunk tunnel of L chunks closed at its mouth (linear in L).
+//!     pockets of 4x4 chunks on a 2048² level (linear in P); variant 1: one pocket of edge E
+//!     chunks (linear in its area) and variant 2: a one-chunk tunnel of L chunks closed at its
+//!     mouth (linear in L), each on a 1024² level.
 //!   - `chunk-scale-nav-level-add`: one level added with a solid floor band, then nav updated.
 //!     The replace case (`LevelAddCode`) first adds a walkable level and updates nav untimed,
 //!     then times a blocking band on it and the update. Depth grows by one per iteration,
@@ -231,6 +232,7 @@ const dig_window_chunks: u16 = 8;
 pub const dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-dig",
     .item_label = ScaleCode.label,
+    .describe_item = ScaleCode.describe,
     .item_counts = &scale_item_counts,
     .runCase = runDigCase,
     .write_workload = writeCellsWorkload,
@@ -240,6 +242,7 @@ pub const dig_group = suite.BenchmarkGroup{
 pub const ramp_group = suite.BenchmarkGroup{
     .name = "chunk-scale-ramp",
     .item_label = ScaleCode.label,
+    .describe_item = ScaleCode.describe,
     .item_counts = &scale_item_counts,
     .runCase = runRampCase,
     .write_workload = writeCellsWorkload,
@@ -249,6 +252,7 @@ pub const ramp_group = suite.BenchmarkGroup{
 pub const cave_in_group = suite.BenchmarkGroup{
     .name = "chunk-scale-cave-in",
     .item_label = RegionCode.label,
+    .describe_item = RegionCode.describe,
     .item_counts = &region_item_counts,
     .runCase = runCaveInCase,
     .write_workload = writeBatchWorkload,
@@ -258,6 +262,7 @@ pub const cave_in_group = suite.BenchmarkGroup{
 pub const explosion_fill_group = suite.BenchmarkGroup{
     .name = "chunk-scale-explosion-fill",
     .item_label = RegionCode.label,
+    .describe_item = RegionCode.describe,
     .item_counts = &explosion_item_counts,
     .runCase = runExplosionFillCase,
     .write_workload = writeBatchWorkload,
@@ -267,6 +272,7 @@ pub const explosion_fill_group = suite.BenchmarkGroup{
 pub const gpu_sync_dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-gpu-sync-dig",
     .item_label = GpuSyncDigCode.label,
+    .describe_item = GpuSyncDigCode.describe,
     .item_counts = &gpu_sync_dig_item_counts,
     .runCase = runGpuSyncDigCase,
     .write_workload = writeUploadsWorkload,
@@ -276,6 +282,7 @@ pub const gpu_sync_dig_group = suite.BenchmarkGroup{
 pub const gpu_sync_level_enter_group = suite.BenchmarkGroup{
     .name = "chunk-scale-gpu-sync-level-enter",
     .item_label = WindowCode.label,
+    .describe_item = WindowCode.describe,
     .item_counts = &level_enter_item_counts,
     .runCase = runGpuSyncLevelEnterCase,
     .write_workload = writeUploadsWorkload,
@@ -285,6 +292,7 @@ pub const gpu_sync_level_enter_group = suite.BenchmarkGroup{
 pub const gpu_sync_pan_group = suite.BenchmarkGroup{
     .name = "chunk-scale-gpu-sync-pan",
     .item_label = WindowCode.label,
+    .describe_item = WindowCode.describe,
     .item_counts = &pan_item_counts,
     .runCase = runGpuSyncPanCase,
     .write_workload = writeUploadsWorkload,
@@ -294,6 +302,7 @@ pub const gpu_sync_pan_group = suite.BenchmarkGroup{
 pub const nav_dig_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-dig",
     .item_label = ScaleCode.label,
+    .describe_item = ScaleCode.describe,
     .item_counts = &scale_item_counts,
     .runCase = runNavDigCase,
     .write_workload = writeNavCellsWorkload,
@@ -302,6 +311,7 @@ pub const nav_dig_group = suite.BenchmarkGroup{
 pub const nav_ramp_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-ramp",
     .item_label = ScaleCode.label,
+    .describe_item = ScaleCode.describe,
     .item_counts = &scale_item_counts,
     .runCase = runNavRampCase,
     .write_workload = writeNavCellsWorkload,
@@ -310,6 +320,7 @@ pub const nav_ramp_group = suite.BenchmarkGroup{
 pub const nav_cave_in_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-cave-in",
     .item_label = RegionCode.label,
+    .describe_item = RegionCode.describe,
     .item_counts = &region_item_counts,
     .runCase = runNavCaveInCase,
     .write_workload = writeNavBatchWorkload,
@@ -318,6 +329,7 @@ pub const nav_cave_in_group = suite.BenchmarkGroup{
 pub const nav_explosion_fill_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-explosion-fill",
     .item_label = RegionCode.label,
+    .describe_item = RegionCode.describe,
     .item_counts = &region_item_counts,
     .runCase = runNavExplosionFillCase,
     .write_workload = writeNavBatchWorkload,
@@ -326,6 +338,7 @@ pub const nav_explosion_fill_group = suite.BenchmarkGroup{
 pub const nav_enclose_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-enclose",
     .item_label = EncloseCode.label,
+    .describe_item = EncloseCode.describe,
     .item_counts = &enclose_item_counts,
     .runCase = runNavEncloseCase,
     .write_workload = writeNavBatchWorkload,
@@ -334,6 +347,7 @@ pub const nav_enclose_group = suite.BenchmarkGroup{
 pub const nav_level_add_group = suite.BenchmarkGroup{
     .name = "chunk-scale-nav-level-add",
     .item_label = LevelAddCode.label,
+    .describe_item = LevelAddCode.describe,
     .item_counts = &level_add_item_counts,
     .runCase = runNavLevelAddCase,
     .write_workload = writeLevelAddWorkload,
@@ -402,8 +416,9 @@ const level_add_item_counts = blk: {
 const enclose_pocket_edge: u16 = 4;
 const enclose_tunnel_row: u16 = 8;
 const enclose_item_counts = [_]usize{
-    EncloseCode.of(.{ .variant = .pockets, .count = 16, .level_side = 1024, .levels = 1 }),
-    EncloseCode.of(.{ .variant = .pockets, .count = 64, .level_side = 1024, .levels = 1 }),
+    // Every pocket count on one level side, so only the pockets vary.
+    EncloseCode.of(.{ .variant = .pockets, .count = 16, .level_side = 2048, .levels = 1 }),
+    EncloseCode.of(.{ .variant = .pockets, .count = 64, .level_side = 2048, .levels = 1 }),
     EncloseCode.of(.{ .variant = .pockets, .count = 196, .level_side = 2048, .levels = 1 }),
     EncloseCode.of(.{ .variant = .pocket_edge, .count = 8, .level_side = 1024, .levels = 1 }),
     EncloseCode.of(.{ .variant = .pocket_edge, .count = 16, .level_side = 1024, .levels = 1 }),

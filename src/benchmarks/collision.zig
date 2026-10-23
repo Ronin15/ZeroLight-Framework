@@ -29,8 +29,10 @@
 //! - `collision-static-heavy`: the dynamics spread uniformly over the world. Pass shape:
 //!   time per dynamic flat in statics.
 //! - `collision-static-index-change`: the clustered fixture; each step moves one static
-//!   through the commit seam (`fixtures.CommitSeam`: reserve, budgeted commit, collider
-//!   capture, and sync) and then runs one collision step. Pass shape: flat in statics.
+//!   through the production commit seam (`SimulationPipeline.commitStructuralAndReact` on a
+//!   pipeline built over the fixture, nav over a one-level walkable world of the statics'
+//!   tiles) and then runs one collision step on the pipeline's collision system. Pass shape:
+//!   flat in statics.
 //! Asserts check fixture invariants only: the analytic contact count (one per overlapping
 //! dynamic) in every static group; sweep `body_count` and `entry_count` follow the dynamic
 //! bodies (one strip each on this fixture), not the statics; in `collision-static-index-change`
@@ -61,9 +63,11 @@
 //!   a static in an even chunk column (row) moves ahead one chunk and one tile, one in an odd
 //!   column (row) back one chunk less one tile, so every destination is a free tile, no two
 //!   coincide, every region chunk gets its own count of inserts in both directions, and the
-//!   next step moves each back. One sample times the collider sync
-//!   (`StaticColliderSystem.sync`, capture to synced), every stage on the case's thread
-//!   system under its own sync tuner; the tuned case settles all six first. Pass shape:
+//!   next step moves each back, each step through the production commit seam on a pipeline
+//!   over the world (nav over a one-level walkable world of its tiles). One sample is the
+//!   seam's collider sync time (`SimulationPipeline.Perf.seam_collider_sync_ns`: `StaticColliderSystem.sync`
+//!   alone), every stage on the case's thread system under its own sync tuner; the tuned
+//!   case settles all six first. Pass shape:
 //!   main per changed static flat in the change count, the chunks outside the region a
 //!   control: a term in the world's chunk count shows as a per-change intercept falling with
 //!   the change count. A move is a remove and an insert across chunks, a superset of an
@@ -106,12 +110,16 @@
 //! quarter of the stored pairs are kept but filtered from the contacts; same pass shape and
 //! asserts, the contact count less the dormant pairs and the wide dynamic's dormant hits.
 //!
-//! The trigger patch groups time only the trigger sync after a commit seam
-//! (`fixtures.CommitSeam`, then `CollisionSystem.syncCommittedTriggers`), on the case's
-//! thread system, in a world fixed at the largest size's. They assert fixture invariants
-//! only, not their pass shapes: the cold store's pair count, that each sync changes exactly
-//! the moved statics, that the patch queried only the changes (not a rebuild over the row
-//! pool), and the stored pair count after every patch. They run `serial-direct` and the
+//! The trigger patch groups run each change through the production commit seam on a pipeline
+//! over the fixture (nav over a one-level walkable world fixed at the largest size's), on the
+//! case's thread system; one sample is the seam's trigger sync time
+//! (`SimulationPipeline.Perf.seam_trigger_sync_ns`: `CollisionSystem.syncCommittedTriggers`). The first seam
+//! builds the cold store. They assert fixture invariants only, not their pass shapes: the
+//! cold store's pair count, that each sync changes exactly the moved statics, that the patch
+//! queried only the changes (not a rebuild over the row pool), the stored pair count after
+//! every patch, and that after the cold seam and after the last measured seam (each growing
+//! the stored-trigger contact bound as needed) a second collision step counts no pair-bound
+//! overflow (the first may count a one-off slot growth). They run `serial-direct` and the
 //! fixed worker-count cases only, no adaptive case. Each prints `per_change=`, and with
 //! `--details` the main share in `serial-direct` only (no worker exists, so the whole
 //! sync is main) and, under each row, the query items and the stored pairs.
@@ -167,7 +175,6 @@ const collision_range_alignment_items = @import("../game/systems/collision.zig")
 const EntityId = @import("../game/data_system.zig").EntityId;
 const CollisionContact = @import("../game/simulation.zig").CollisionContact;
 const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
-const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const structuralEventHeadroom = @import("../game/simulation.zig").structuralEventHeadroom;
 const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const ColliderGeometry = @import("../game/systems/static_colliders.zig").ColliderGeometry;
@@ -177,6 +184,9 @@ const RebuildStage = @import("../game/systems/static_colliders.zig").RebuildStag
 const SyncStage = @import("../game/systems/static_colliders.zig").SyncStage;
 const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
+const WorldSystem = @import("../game/world/system.zig").WorldSystem;
+const SimulationPipeline = @import("../game/simulation_pipeline.zig").SimulationPipeline;
+const CommitSeamResult = @import("../game/simulation_pipeline.zig").CommitSeamResult;
 const tile_size = @import("../assets/world_tileset_meta.zig").required_tile_size;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
@@ -201,6 +211,7 @@ pub const sparse_group = suite.BenchmarkGroup{
 pub const tall_group = suite.BenchmarkGroup{
     .name = "collision-tall",
     .item_label = ShapeCode.label,
+    .describe_item = ShapeCode.describe,
     .item_counts = &tall_item_counts,
     .runCase = runShapeCase,
     .write_workload = writeCollisionWorkload,
@@ -209,6 +220,7 @@ pub const tall_group = suite.BenchmarkGroup{
 pub const stacked_group = suite.BenchmarkGroup{
     .name = "collision-stacked",
     .item_label = ShapeCode.label,
+    .describe_item = ShapeCode.describe,
     .item_counts = &stacked_item_counts,
     .runCase = runShapeCase,
     .write_workload = writeCollisionWorkload,
@@ -217,6 +229,7 @@ pub const stacked_group = suite.BenchmarkGroup{
 pub const thin_group = suite.BenchmarkGroup{
     .name = "collision-thin",
     .item_label = ShapeCode.label,
+    .describe_item = ShapeCode.describe,
     .item_counts = &thin_item_counts,
     .runCase = runShapeCase,
     .write_workload = writeCollisionWorkload,
@@ -282,6 +295,7 @@ pub const static_dense_spike_group = suite.BenchmarkGroup{
 pub const static_triggers_group = suite.BenchmarkGroup{
     .name = "collision-static-triggers",
     .item_label = TriggerCode.label,
+    .describe_item = TriggerCode.describe,
     .item_counts = &static_triggers_item_counts,
     .runCase = runStaticTriggersCase,
     .write_workload = writeTriggerWorkload,
@@ -650,7 +664,7 @@ fn runStaticCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Option
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var fixture = try createStaticHeavyFixture(allocator, static_count, placement);
     defer fixture.data.deinit();
-    var mover: ?StaticMover = if (move_static) try StaticMover.init(allocator, &fixture, case) else null;
+    var mover: ?StaticMover = if (move_static) try StaticMover.init(allocator, io, &fixture, case) else null;
     defer if (mover) |*static_mover| static_mover.deinit();
     var colliders = StaticColliderSystem.init(allocator);
     defer colliders.deinit();
@@ -817,50 +831,28 @@ fn runStaticTriggersCase(allocator: std.mem.Allocator, io: std.Io, options: suit
 }
 
 // ----------------------------------------------------------------------------
-// Static trigger patches: statics moved through the commit seam, then the stored trigger
-// pairs brought up to the synced colliders through the seam entry
-// (`CollisionSystem.syncCommittedTriggers`), timed alone.
+// Static trigger patches: statics moved through the production commit seam, which brings the
+// stored trigger pairs up to the synced colliders (`CollisionSystem.syncCommittedTriggers`);
+// the seam's trigger sync time (`SimulationPipeline.Perf.seam_trigger_sync_ns`) is the sample.
 // ----------------------------------------------------------------------------
 
 // A solid's offset in its pitch cell: it overlaps both of the cell's triggers.
 const trigger_change_solid_offset: f32 = tile_size / 4;
-// The change group's fixed world: the largest count's pitch grid, every count's grid in its
-// corner.
-const trigger_change_geometry = blk: {
-    const side = std.math.sqrt(trigger_pair_counts[trigger_pair_counts.len - 1]);
-    // The largest count's two-tile pitch grid side fits u32.
-    const cells: u32 = @intCast(2 * side);
-    break :blk ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles);
-};
+// The change group's fixed world in tiles a side: the largest count's pitch grid, every
+// count's grid in its corner.
+const trigger_change_cells: u32 = 2 * std.math.sqrt(trigger_pair_counts[trigger_pair_counts.len - 1]);
 const trigger_wide_counts = [_]usize{ 256, 1_024, 4_096 };
 // Static rows under the wide trigger: one chunk row of tiles on the two-tile pitch.
 const trigger_wide_rows: usize = default_chunk_size_tiles / 2;
 // The wide group's fixed world width: the largest count's columns on the two-tile pitch.
 const trigger_wide_max_columns: usize = trigger_wide_counts[trigger_wide_counts.len - 1] / trigger_wide_rows;
 const trigger_wide_tiles_x: usize = 2 * trigger_wide_max_columns;
-const trigger_wide_geometry = blk: {
-    // The largest count's world width and one chunk row fit u32.
-    const cells_x: u32 = @intCast(trigger_wide_tiles_x);
-    const cells_y: u32 = @intCast(default_chunk_size_tiles);
-    break :blk ColliderGeometry.init(tile_size, cells_x, cells_y, default_chunk_size_tiles);
-};
 
 // One timed trigger sync: its time and the items its patch query ran over.
 const TriggerPatch = struct {
     ns: u64,
     query_items: usize,
 };
-
-// Brings `system`'s stored trigger pairs up to `colliders`' synced revision, timed. A seam
-// that rebuilt records no patch query, so callers check the items for the warm patch.
-fn syncTriggersTimed(system: *CollisionSystem, data: *const DataSystem, colliders: *const StaticColliderSystem, threads: *ThreadSystem, io: std.Io) !TriggerPatch {
-    const view = colliders.view();
-    const start_ns = suite.nowNs(io);
-    try system.syncCommittedTriggers(data, view, threads);
-    const end_ns = suite.nowNs(io);
-    if (system.trigger_store.seen_revision != view.revision) return error.TriggerSyncMissedRevision;
-    return .{ .ns = suite.elapsedNs(start_ns, end_ns), .query_items = system.trigger_query_batch.item_count };
-}
 
 // The timed syncs of one case. Main time is known only on a thread system with no
 // workers, where the whole sync runs on main.
@@ -908,7 +900,7 @@ fn runStaticTriggerChangeCase(allocator: std.mem.Allocator, io: std.Io, options:
     const offset = trigger_change_solid_offset;
     const solid = try fixtures.addBody(&fixture.data, .{ .x = home.x + offset, .y = home.y + offset }, .{ .x = static_size, .y = static_size }, .static);
     var move = fixtures.StaticMove{ .entity = solid, .positions = .{ .{ .x = home.x + offset, .y = home.y + offset }, .{ .x = away.x + offset, .y = away.y + offset } } };
-    var stats = try measureTriggerPatches(allocator, io, options, case, &fixture.data, trigger_change_geometry, &move, .{
+    var stats = try measureTriggerPatches(allocator, io, options, case, &fixture.data, .{ trigger_change_cells, trigger_change_cells }, &move, .{
         .static_count = 2 * pair_count + 1,
         .stored_pairs = pair_count + 2,
         // The moved solid's change.
@@ -942,7 +934,8 @@ fn runStaticTriggerWideCase(allocator: std.mem.Allocator, io: std.Io, options: s
         if (column == columns / 2 and cell_y == trigger_wide_rows / 2) move = .{ .entity = entity, .positions = .{ home, .{ .x = home.x + tile_size, .y = home.y + tile_size } } };
     };
     var moved = move orelse return error.TriggerWideMissingMove;
-    var stats = try measureTriggerPatches(allocator, io, options, case, &data, trigger_wide_geometry, &moved, .{
+    // The largest count's world width and one chunk row fit u32.
+    var stats = try measureTriggerPatches(allocator, io, options, case, &data, .{ @intCast(trigger_wide_tiles_x), default_chunk_size_tiles }, &moved, .{
         .static_count = static_count + 1,
         .stored_pairs = static_count,
         // The moved static's change.
@@ -952,47 +945,44 @@ fn runStaticTriggerWideCase(allocator: std.mem.Allocator, io: std.Io, options: s
     return stats;
 }
 
-// Builds the colliders and the cold trigger store, then moves `move`'s static through the
-// commit seam each step and times the trigger sync after the collider sync.
-fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *DataSystem, geometry: ColliderGeometry, move: *fixtures.StaticMove, shape: TriggerPatchShape) !suite.RunStats {
-    var frame = SimulationFrame.init(allocator);
-    defer frame.deinit();
-    // One command and its one component event per step.
-    try frame.reserveStreams(1, 1, 0, 0, 0, 1);
-    var colliders = StaticColliderSystem.init(allocator);
-    defer colliders.deinit();
-    try colliders.rebuild(data, geometry, null);
-    if (static_colliders_test_support.liveRowCount(colliders) != shape.static_count) return error.WrongStaticCount;
-    fixtures.setSpliceTuners(&colliders, case);
+// Builds the pipeline over a `cells` world, whose first seam builds the cold trigger store
+// (a rebuild over every row, growing the stored-trigger contact bound), then moves `move`'s
+// static through the production commit seam each step; the sample is each seam's trigger
+// sync. After the cold seam and after the last measured seam, one collision step emits the
+// stored pairs with no pair-bound overflow.
+fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *DataSystem, cells: [2]u32, move: *fixtures.StaticMove, shape: TriggerPatchShape) !suite.RunStats {
+    var seam = try StaticSeam.init(allocator, io, data, cells[0], cells[1], fixtures.StaticMove.structural_headroom, case);
+    defer seam.deinit();
+    if (static_colliders_test_support.liveRowCount(seam.colliders().*) != shape.static_count) return error.WrongStaticCount;
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
-    var system = CollisionSystem.init(allocator);
-    defer system.deinit();
-    // The cold store: a rebuild over every row.
-    try system.syncCommittedTriggers(data, colliders.view(), &threads);
+    // The cold store: the first seam rebuilds over every row.
+    _ = try seam.commit(data, &.{}, &threads);
+    const system = &seam.pipeline().collision;
     if (system.trigger_store.pair_count != shape.stored_pairs) return error.TriggerPairCountMismatch;
+    try seam.checkStoredPairsInBound(data, &threads, case);
 
-    const seam = fixtures.CommitSeam{ .colliders = &colliders, .structural_headroom = fixtures.StaticMove.structural_headroom };
     // Fixed worker-count cases only, so nothing settles; two steps run both directions.
     var warm = suite.Warmup.init(options, case, 2);
-    while (warm.next(true)) _ = try patchMovedStatic(&system, &colliders, &frame, data, move, seam, &threads, io, shape);
+    while (warm.next(true)) _ = try patchMovedStatic(&seam, data, move, &threads, shape);
     var samples = TriggerPatchSamples.init(shape.stored_pairs);
-    for (0..options.iterations) |_| samples.record(try patchMovedStatic(&system, &colliders, &frame, data, move, seam, &threads, io, shape));
+    for (0..options.iterations) |_| samples.record(try patchMovedStatic(&seam, data, move, &threads, shape));
+    try seam.checkStoredPairsInBound(data, &threads, case);
     return samples.finish(&threads, 1, shape.stored_pairs);
 }
 
-// One move through the commit seam, then the timed trigger sync: the sync changes only the
-// moved static, and the warm patch queries the shape's items and keeps its pair count.
-fn patchMovedStatic(system: *CollisionSystem, colliders: *StaticColliderSystem, frame: *SimulationFrame, data: *DataSystem, move: *fixtures.StaticMove, seam: fixtures.CommitSeam, threads: *ThreadSystem, io: std.Io, shape: TriggerPatchShape) !TriggerPatch {
-    frame.beginStep();
-    const commit = try seam.commit(frame, data, &.{move.command()}, threads);
+// One move through the production commit seam, whose trigger sync is the sample: the sync
+// changes only the moved static, and the warm patch queries the shape's items and keeps its
+// pair count.
+fn patchMovedStatic(seam: *StaticSeam, data: *DataSystem, move: *fixtures.StaticMove, threads: *ThreadSystem, shape: TriggerPatchShape) !TriggerPatch {
+    const commit = try seam.commit(data, &.{move.command()}, threads);
     if (commit.structural.components_set != 1) return error.StaticMoveNotApplied;
-    const changes = colliders.changesThisStep();
+    const changes = seam.colliders().changesThisStep();
     if (changes.len != 1 or !changes[0].entity.eql(move.entity)) return error.StaticChangeNotSynced;
     move.advance();
-    const patch = try syncTriggersTimed(system, data, colliders, threads, io);
+    const patch = try seam.triggerPatch();
     if (patch.query_items != shape.query_items) return error.TriggerPatchMissedQuery;
-    if (system.trigger_store.pair_count != shape.stored_pairs) return error.TriggerPairCountMismatch;
+    if (seam.pipeline().collision.trigger_store.pair_count != shape.stored_pairs) return error.TriggerPairCountMismatch;
     return patch;
 }
 
@@ -1233,8 +1223,8 @@ fn denseHomeTriggerPairs(statics: DenseStatics) usize {
 
 const DenseChangeFixture = struct {
     data: DataSystem,
-    frame: SimulationFrame,
-    colliders: StaticColliderSystem,
+    // The production commit seam every change commits through.
+    seam: StaticSeam,
     // The changed statics, each moved between its home tile and its away tile every step.
     moves: []fixtures.StaticMove,
     // The world's last static, outside the region, moved alone by `changeOneAndSync`.
@@ -1244,13 +1234,12 @@ const DenseChangeFixture = struct {
     region_side: usize,
     // One bit per world chunk, set where a step's changes touch it (fixture check scratch).
     touched: std.DynamicBitSetUnmanaged,
-    structural_headroom: usize,
     allocator: std.mem.Allocator,
 
     // Every static of a square region of `change_count / dense_change_per_chunk` chunks
     // changes; the region has an even side, so each chunk's pair-swap partner is in it. A
     // smaller count changes the first `change_count / 4` statics of each 2 x 2-region chunk.
-    fn init(allocator: std.mem.Allocator, change_count: usize, case: suite.BenchmarkCase, statics: DenseStatics) !DenseChangeFixture {
+    fn init(allocator: std.mem.Allocator, io: std.Io, change_count: usize, case: suite.BenchmarkCase, statics: DenseStatics) !DenseChangeFixture {
         const region_chunks = @max(change_count / dense_change_per_chunk, 4);
         const moves_per_chunk = change_count / region_chunks;
         if (moves_per_chunk == 0 or moves_per_chunk > dense_change_per_chunk or moves_per_chunk * region_chunks != change_count) return error.DenseChangeNotPerChunk;
@@ -1289,32 +1278,25 @@ const DenseChangeFixture = struct {
         };
         std.debug.assert(moved == change_count);
 
-        var frame = SimulationFrame.init(allocator);
-        errdefer frame.deinit();
-        var colliders = StaticColliderSystem.init(allocator);
-        errdefer colliders.deinit();
         // The dense world's two-tile pitch grid side fits u32.
         const cells: u32 = @intCast(2 * dense_change_side);
-        try colliders.rebuild(&data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles), null);
-        if (static_colliders_test_support.liveRowCount(colliders) != dense_change_side * dense_change_side) return error.WrongStaticCount;
-        fixtures.setSpliceTuners(&colliders, case);
+        var seam = try StaticSeam.init(allocator, io, &data, cells, cells, structuralEventHeadroom(0, change_count), case);
+        errdefer seam.deinit();
+        if (static_colliders_test_support.liveRowCount(seam.colliders().*) != dense_change_side * dense_change_side) return error.WrongStaticCount;
         return .{
             .data = data,
-            .frame = frame,
-            .colliders = colliders,
+            .seam = seam,
             .moves = moves,
             .single = single,
             .commands = commands,
             .region_side = region_side,
             .touched = touched,
-            .structural_headroom = structuralEventHeadroom(0, change_count),
             .allocator = allocator,
         };
     }
 
     fn deinit(self: *DenseChangeFixture) void {
-        self.colliders.deinit();
-        self.frame.deinit();
+        self.seam.deinit();
         self.touched.deinit(self.allocator);
         self.allocator.free(self.commands);
         self.allocator.free(self.moves);
@@ -1330,35 +1312,32 @@ const DenseChangeFixture = struct {
         return if (odd_chunk) -tiles * tile_size else tiles * tile_size;
     }
 
-    // Every move as one commit through the commit seam; returns the collider sync's time
-    // (capture to synced) and its stages' batches.
-    fn changeAndSync(self: *DenseChangeFixture, io: std.Io, thread_system: *ThreadSystem) !DenseSync {
-        self.frame.beginStep();
+    // Every move as one commit through the production commit seam; returns the seam's
+    // collider sync time (`SimulationPipeline.Perf.seam_collider_sync_ns`, `StaticColliderSystem.sync` alone) and
+    // its stages' batches.
+    fn changeAndSync(self: *DenseChangeFixture, thread_system: *ThreadSystem) !DenseSync {
         for (self.moves, self.commands) |*move, *command| command.* = move.command();
-        var clock = fixtures.CommitSeam.PhaseClock{ .io = io };
-        const seam = fixtures.CommitSeam{ .colliders = &self.colliders, .structural_headroom = self.structural_headroom, .clock = &clock };
-        const commit = try seam.commit(&self.frame, &self.data, self.commands, thread_system);
+        const commit = try self.seam.commit(&self.data, self.commands, thread_system);
         if (commit.structural.components_set != self.moves.len) return error.DenseChangeNotApplied;
         try self.checkChanges();
         for (self.moves) |*move| move.advance();
+        const colliders = self.seam.collidersConst();
         var batches: [sync_stages.len]BatchStats = undefined;
-        for (&batches, sync_stages) |*batch, stage| batch.* = self.colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
+        for (&batches, sync_stages) |*batch, stage| batch.* = colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
         return .{
-            .ns = suite.elapsedNs(clock.captured_ns, clock.synced_ns),
+            .ns = self.seam.pipeline().perf.seam_collider_sync_ns,
             .batches = batches,
-            .off_main_ns = static_colliders_test_support.lastOffMainNs(self.colliders),
+            .off_main_ns = static_colliders_test_support.lastOffMainNs(colliders.*),
         };
     }
 
-    // The single static moved as one commit through the commit seam and synced: an
-    // in-band sync for tuners that learned on single-static syncs. Untimed.
+    // The single static moved as one commit through the production commit seam and synced:
+    // an in-band sync for tuners that learned on single-static syncs. Untimed.
     fn changeOneAndSync(self: *DenseChangeFixture, thread_system: *ThreadSystem) !void {
-        self.frame.beginStep();
         const commands = [1]StructuralCommand{self.single.command()};
-        const seam = fixtures.CommitSeam{ .colliders = &self.colliders, .structural_headroom = fixtures.StaticMove.structural_headroom };
-        const commit = try seam.commit(&self.frame, &self.data, &commands, thread_system);
+        const commit = try self.seam.commit(&self.data, &commands, thread_system);
         if (commit.structural.components_set != 1) return error.DenseSpikeSingleNotApplied;
-        if (self.colliders.changesThisStep().len != 1) return error.DenseSpikeSingleNotSynced;
+        if (self.seam.colliders().changesThisStep().len != 1) return error.DenseSpikeSingleNotSynced;
         self.single.advance();
     }
 
@@ -1377,9 +1356,10 @@ const DenseChangeFixture = struct {
     // One change per moved static, each leaving its chunk for another in the region, and
     // the changes together touching exactly the region's chunks.
     fn checkChanges(self: *DenseChangeFixture) !void {
-        const changes = self.colliders.changesThisStep();
+        const colliders = self.seam.colliders();
+        const changes = colliders.changesThisStep();
         if (changes.len != self.moves.len) return error.DenseChangeNotSynced;
-        const chunk_tiles = self.colliders.geometry.?.grid.chunk_tiles;
+        const chunk_tiles = colliders.geometry.?.grid.chunk_tiles;
         self.touched.unsetAll();
         for (changes) |change| {
             const old_cells = (change.old orelse return error.DenseChangeUnplaced).cells;
@@ -1397,7 +1377,8 @@ const DenseChangeFixture = struct {
 
     // The colliders' row-pool and payload growths so far.
     fn grows(self: *const DenseChangeFixture) [2]u64 {
-        return .{ self.colliders.perf.row_grows, self.colliders.perf.payload_grows };
+        const colliders = self.seam.collidersConst();
+        return .{ colliders.perf.row_grows, colliders.perf.payload_grows };
     }
 };
 
@@ -1437,7 +1418,7 @@ fn runStaticDenseSpikeCase(allocator: std.mem.Allocator, io: std.Io, options: su
 
 fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize, load: DenseLoad) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var fixture = try DenseChangeFixture.init(allocator, change_count, case, .solid);
+    var fixture = try DenseChangeFixture.init(allocator, io, change_count, case, .solid);
     defer fixture.deinit();
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
@@ -1446,18 +1427,18 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     // sync, so one untimed dense round trip takes that growth out of the timed syncs, and
     // fresh tuners then settle on single-static syncs only.
     if (load == .spike) {
-        for (0..2) |_| _ = try fixture.changeAndSync(io, &threads);
-        fixtures.setSpliceTuners(&fixture.colliders, case);
+        for (0..2) |_| _ = try fixture.changeAndSync(&threads);
+        fixtures.setSpliceTuners(fixture.seam.colliders(), case);
     }
     // Sync's tuners train in play, so the tuned case settles all six first: on dense syncs,
     // or for a spike on single-static syncs. At least two steps, so the dense statics (or
     // the single one) have been at both their tiles.
     var warm = suite.Warmup.init(options, case, 2);
-    while (warm.next(syncTunersSettled(&fixture.colliders))) switch (load) {
-        .sustained => _ = try fixture.changeAndSync(io, &threads),
+    while (warm.next(syncTunersSettled(fixture.seam.collidersConst()))) switch (load) {
+        .sustained => _ = try fixture.changeAndSync(&threads),
         .spike => try fixture.changeOneAndSync(&threads),
     };
-    const settled = case.adaptive and syncTunersSettled(&fixture.colliders);
+    const settled = case.adaptive and syncTunersSettled(fixture.seam.collidersConst());
     // A spike is measured only from settled tuners.
     if (load == .spike and case.adaptive and !settled) return error.DenseSpikeTunersNotSettled;
     // The settled tuners' spike shape sizes the per-range scratch (the touch windows), so one
@@ -1465,7 +1446,7 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     // these spikes set each tuner's held jump shape, which the timed spikes reuse.
     if (load == .spike) for (0..2) |_| {
         try fixture.changeOneAndSync(&threads);
-        _ = try fixture.changeAndSync(io, &threads);
+        _ = try fixture.changeAndSync(&threads);
     };
 
     var accumulator = suite.StatsAccumulator.init(change_count);
@@ -1478,12 +1459,12 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
         if (load == .spike) {
             try fixture.changeOneAndSync(&threads);
             // Every timed spike runs on tuners settled at the single-static count.
-            if (case.adaptive and !syncTunersSettled(&fixture.colliders)) return error.DenseSpikeTunersNotSettled;
+            if (case.adaptive and !syncTunersSettled(fixture.seam.collidersConst())) return error.DenseSpikeTunersNotSettled;
         }
-        const sync = try fixture.changeAndSync(io, &threads);
+        const sync = try fixture.changeAndSync(&threads);
         try fixture.checkSyncWork(sync.batches);
         try suite.checkStagesDispatched(case, &threads, stage_range, &sync.batches);
-        for (sync.batches, sync_stages) |batch, stage| try checkTunerSelected(case, &threads, fixture.colliders.tuners.getPtrConst(stage), batch);
+        for (sync.batches, sync_stages) |batch, stage| try checkTunerSelected(case, &threads, fixture.seam.collidersConst().tuners.getPtrConst(stage), batch);
         accumulator.record(sync.ns, sync.batches[comptime std.mem.indexOfScalar(SyncStage, &sync_stages, .rewrite).?]);
         main_total += sync.ns -| sync.off_main_ns;
         stage_shapes.add(sync.batches);
@@ -1496,7 +1477,7 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.sample_count = change_count;
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.colliders.tuners.getPtr(.rewrite)), settled);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.seam.colliders().tuners.getPtr(.rewrite)), settled);
     printStageDetails(&stats, &sync_stages, &stage_shapes, &stage_ns);
     stats.details.print("row_grows={} payload_grows={}\n", .{ grows[0] - warm_grows[0], grows[1] - warm_grows[1] });
     return stats;
@@ -1506,51 +1487,53 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
 // commit seam, then the timed trigger sync.
 fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var fixture = try DenseChangeFixture.init(allocator, change_count, case, .checkered_triggers);
+    var fixture = try DenseChangeFixture.init(allocator, io, change_count, case, .checkered_triggers);
     defer fixture.deinit();
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
-    var system = CollisionSystem.init(allocator);
-    defer system.deinit();
-    // The cold store: a rebuild over every row, every static home.
-    try system.syncCommittedTriggers(&fixture.data, fixture.colliders.view(), &threads);
+    // The cold store: the first seam rebuilds over every row, every static home, and grows
+    // the stored-trigger contact bound.
+    _ = try fixture.seam.commit(&fixture.data, &.{}, &threads);
+    const system = &fixture.seam.pipeline().collision;
     const home_pairs = denseHomeTriggerPairs(.checkered_triggers);
     if (system.trigger_store.pair_count != home_pairs) return error.TriggerPairCountMismatch;
-    // Untimed, once: the region moved away, then a cold rebuild at that revision is the away
-    // count every away patch keeps.
-    _ = try fixture.changeAndSync(io, &threads);
+    try fixture.seam.checkStoredPairsInBound(&fixture.data, &threads, case);
+    // Untimed, once: the region moved away (its seam patches the store), then a cold rebuild
+    // at that revision on a separate system is the away count every away patch keeps.
+    _ = try fixture.changeAndSync(&threads);
     const away_pairs = blk: {
         var cold = CollisionSystem.init(allocator);
         defer cold.deinit();
-        try cold.syncCommittedTriggers(&fixture.data, fixture.colliders.view(), &threads);
+        try cold.syncCommittedTriggers(&fixture.data, fixture.seam.collidersConst().view(), &threads);
         break :blk cold.trigger_store.pair_count;
     };
     // Stored pairs with the region home and away.
     const pairs = [2]usize{ home_pairs, away_pairs };
-    _ = try denseTriggerSync(&fixture, &system, &threads, io, pairs);
+    _ = try denseTriggerSync(&fixture, pairs);
 
     // Fixed worker-count cases only, so nothing settles; two steps run both directions.
     var warm = suite.Warmup.init(options, case, 2);
-    while (warm.next(true)) _ = try denseTriggerPatch(&fixture, &system, &threads, io, pairs);
+    while (warm.next(true)) _ = try denseTriggerPatch(&fixture, &threads, pairs);
     var samples = TriggerPatchSamples.init(change_count);
-    for (0..options.iterations) |_| samples.record(try denseTriggerPatch(&fixture, &system, &threads, io, pairs));
+    for (0..options.iterations) |_| samples.record(try denseTriggerPatch(&fixture, &threads, pairs));
+    try fixture.seam.checkStoredPairsInBound(&fixture.data, &threads, case);
     return samples.finish(&threads, change_count, system.trigger_store.pair_count);
 }
 
-// One dense commit and its collider sync (`changeAndSync` checks every move synced), then
-// the timed trigger sync.
-fn denseTriggerPatch(fixture: *DenseChangeFixture, system: *CollisionSystem, threads: *ThreadSystem, io: std.Io, pairs: [2]usize) !TriggerPatch {
-    _ = try fixture.changeAndSync(io, threads);
-    return denseTriggerSync(fixture, system, threads, io, pairs);
+// One dense commit through the production commit seam (`changeAndSync` checks every move
+// synced), whose trigger sync is the sample.
+fn denseTriggerPatch(fixture: *DenseChangeFixture, threads: *ThreadSystem, pairs: [2]usize) !TriggerPatch {
+    _ = try fixture.changeAndSync(threads);
+    return denseTriggerSync(fixture, pairs);
 }
 
-// The timed trigger sync after a dense collider sync: the warm patch queries exactly the changed statics,
-// and keeps the stored pair count of the region's side.
-fn denseTriggerSync(fixture: *DenseChangeFixture, system: *CollisionSystem, threads: *ThreadSystem, io: std.Io, pairs: [2]usize) !TriggerPatch {
-    const patch = try syncTriggersTimed(system, &fixture.data, &fixture.colliders, threads, io);
+// The seam's trigger sync after a dense collider sync: the warm patch queries exactly the
+// changed statics, and keeps the stored pair count of the region's side.
+fn denseTriggerSync(fixture: *DenseChangeFixture, pairs: [2]usize) !TriggerPatch {
+    const patch = try fixture.seam.triggerPatch();
     if (patch.query_items != fixture.moves.len) return error.TriggerPatchMissedQuery;
     // `changeAndSync` advanced every move, so the first move's side is the region's.
-    if (system.trigger_store.pair_count != pairs[@intFromBool(fixture.moves[0].at_second)]) return error.TriggerPairCountMismatch;
+    if (fixture.seam.pipeline().collision.trigger_store.pair_count != pairs[@intFromBool(fixture.moves[0].at_second)]) return error.TriggerPairCountMismatch;
     return patch;
 }
 
@@ -1563,74 +1546,147 @@ fn writeDenseChangeWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view:
     try suite.writeMainShare(writer, stats, changes);
 }
 
-// One static moved through the commit seam each step, alternating between its pitch cell's
-// static tile and a free tile one chunk and one tile back on both axes, so every move leaves
-// one chunk for another; it overlaps nothing at either.
-const StaticMover = struct {
-    frame: SimulationFrame,
-    colliders: StaticColliderSystem,
-    move: fixtures.StaticMove,
+// A static fixture's production commit seam: a `SimulationPipeline` over the fixture's data
+// with nav over a one-level walkable world of the statics' tile grid, its colliders built at
+// the pipeline's init and its sync and nav stages on the case's controls.
+const StaticSeam = struct {
+    world: WorldSystem,
+    seam: fixtures.PipelineSeam,
 
-    fn init(allocator: std.mem.Allocator, fixture: *const StaticHeavyFixture, case: suite.BenchmarkCase) !StaticMover {
-        var frame = SimulationFrame.init(allocator);
-        errdefer frame.deinit();
-        // One command and its one component event per step.
-        try frame.reserveStreams(1, 1, 0, 0, 0, 1);
-        var colliders = StaticColliderSystem.init(allocator);
-        errdefer colliders.deinit();
+    fn init(allocator: std.mem.Allocator, io: std.Io, data: *const DataSystem, cells_x: u32, cells_y: u32, structural_headroom: usize, case: suite.BenchmarkCase) !StaticSeam {
+        var tileset = try fixtures.loadTilesetMeta(allocator, io);
+        defer tileset.deinit();
+        // The bench grids' tile counts fit a level side.
+        var world = try fixtures.buildBandedWorldSized(allocator, &tileset, @intCast(cells_x), @intCast(cells_y), 1, "grass", "grass");
+        errdefer world.deinit();
+        if (world.tile_size != tile_size or world.chunk_size_tiles != default_chunk_size_tiles) return error.StaticSeamWorldGridMismatch;
+        var seam = try fixtures.PipelineSeam.init(allocator, data, &world, .{ .structural_headroom = structural_headroom });
+        errdefer seam.deinit();
+        seam.setCaseTuners(case);
+        return .{ .world = world, .seam = seam };
+    }
+
+    fn deinit(self: *StaticSeam) void {
+        self.seam.deinit();
+        self.world.deinit();
+        self.* = undefined;
+    }
+
+    fn pipeline(self: *StaticSeam) *SimulationPipeline {
+        return &self.seam.pipeline;
+    }
+
+    fn colliders(self: *StaticSeam) *StaticColliderSystem {
+        return &self.seam.pipeline.static_colliders;
+    }
+
+    fn collidersConst(self: *const StaticSeam) *const StaticColliderSystem {
+        return &self.seam.pipeline.static_colliders;
+    }
+
+    // One step's commit of `commands` through the production seam, in a new frame step.
+    fn commit(self: *StaticSeam, data: *DataSystem, commands: []const StructuralCommand, thread_system: *ThreadSystem) !CommitSeamResult {
+        self.seam.frame.beginStep();
+        return self.seam.commit(data, &self.world, commands, thread_system);
+    }
+
+    // The last seam's trigger sync: its time and its patch query's items. A seam that rebuilt
+    // records no patch query, so callers check the items for the warm patch.
+    fn triggerPatch(self: *const StaticSeam) !TriggerPatch {
+        const pipe = &self.seam.pipeline;
+        if (pipe.collision.trigger_store.seen_revision != pipe.static_colliders.view().revision) return error.TriggerSyncMissedRevision;
+        return .{ .ns = pipe.perf.seam_trigger_sync_ns, .query_items = pipe.collision.trigger_query_batch.item_count };
+    }
+
+    // Two untimed collision steps on the pipeline after its trigger seams, at the case's
+    // fixed controls. The first may count a one-off slot growth (a wide dynamic's static
+    // query slot); the second counts no pair-bound overflow. Every step checks its stored and
+    // dynamic contacts against the contact bound the seams declared, so the seams' bound
+    // growth covers the stored pairs.
+    fn checkStoredPairsInBound(self: *StaticSeam, data: *const DataSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !void {
+        const pipe = &self.seam.pipeline;
+        const config: CollisionConfig = .{
+            .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
+            .max_worker_threads = case.maxWorkerThreads(),
+            .adaptive = case.adaptive,
+            .static_colliders = pipe.static_colliders.view(),
+        };
+        _ = try pipe.collision.update(data, &self.seam.frame.contacts, thread_system, config);
+        const before = pipe.collision.perf.pair_bound_overflows;
+        _ = try pipe.collision.update(data, &self.seam.frame.contacts, thread_system, config);
+        if (pipe.collision.perf.pair_bound_overflows != before) return error.TriggerSeamPairBoundOverflowed;
+    }
+};
+
+// One static moved through the production commit seam each step, alternating between its
+// pitch cell's static tile and a free tile one chunk and one tile back on both axes, so every
+// move leaves one chunk for another; it overlaps nothing at either.
+const StaticMover = struct {
+    seam: StaticSeam,
+    move: fixtures.StaticMove,
+    // The last seam's nav reaction stages' worker time.
+    nav_off_main_ns: u64 = 0,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, fixture: *const StaticHeavyFixture, case: suite.BenchmarkCase) !StaticMover {
         // The statics' tiles: two tiles per pitch cell a side.
         const cells: u32 = @intCast(2 * fixture.side);
-        try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles), null);
-        if (static_colliders_test_support.liveRowCount(colliders) != fixture.side * fixture.side) return error.WrongStaticCount;
-        fixtures.setSpliceTuners(&colliders, case);
+        var seam = try StaticSeam.init(allocator, io, &fixture.data, cells, cells, fixtures.StaticMove.structural_headroom, case);
+        errdefer seam.deinit();
+        if (static_colliders_test_support.liveRowCount(seam.colliders().*) != fixture.side * fixture.side) return error.WrongStaticCount;
         const home = pitchCellOrigin(fixture.side - 1, fixture.side - 1);
         // Statics sit on even tiles, so an odd tile offset lands on a free tile.
         const away_tiles = default_chunk_size_tiles + 1;
         comptime std.debug.assert(away_tiles % 2 == 1);
         const away = @as(f32, @floatFromInt(away_tiles)) * tile_size;
         return .{
-            .frame = frame,
-            .colliders = colliders,
+            .seam = seam,
             .move = .{ .entity = fixture.last_static, .positions = .{ home, .{ .x = home.x - away, .y = home.y - away } } },
         };
     }
 
     fn deinit(self: *StaticMover) void {
-        self.colliders.deinit();
-        self.frame.deinit();
+        self.seam.deinit();
         self.* = undefined;
     }
 
-    // The move's set_movement_body through the commit seam (its splice stages on
-    // `thread_system` when set).
+    // The pipeline's collision system, which the measured steps run, as production's step
+    // after its seam does.
+    fn collision(self: *StaticMover) *CollisionSystem {
+        return &self.seam.seam.pipeline.collision;
+    }
+
+    // The move's set_movement_body through the production commit seam on `thread_system`.
     fn moveAndSync(self: *StaticMover, data: *DataSystem, thread_system: *ThreadSystem) !void {
-        self.frame.beginStep();
-        const seam = fixtures.CommitSeam{ .colliders = &self.colliders, .structural_headroom = fixtures.StaticMove.structural_headroom };
-        const commit = try seam.commit(&self.frame, data, &.{self.move.command()}, thread_system);
+        const commit = try self.seam.commit(data, &.{self.move.command()}, thread_system);
         if (commit.structural.components_set != 1) return error.StaticMoveNotApplied;
-        const changes = self.colliders.changesThisStep();
+        self.nav_off_main_ns = commit.nav_update.perf.off_main_stage_ns;
+        const colliders = self.seam.colliders();
+        const changes = colliders.changesThisStep();
         if (changes.len != 1) return error.StaticChangeNotSynced;
-        const chunk_tiles = self.colliders.geometry.?.grid.chunk_tiles;
+        const chunk_tiles = colliders.geometry.?.grid.chunk_tiles;
         const old_cells = (changes[0].old orelse return error.StaticMoverUnplaced).cells;
         const new_cells = (changes[0].new orelse return error.StaticMoverUnplaced).cells;
         if (old_cells.min_x / chunk_tiles == new_cells.min_x / chunk_tiles or old_cells.min_y / chunk_tiles == new_cells.min_y / chunk_tiles) return error.StaticMoverStayedInChunk;
         self.move.advance();
     }
 
-    fn spliceOffMainNs(self: *const StaticMover) u64 {
-        return static_colliders_test_support.lastOffMainNs(self.colliders);
+    // The last seam's collider sync and nav reaction worker time.
+    fn seamOffMainNs(self: *const StaticMover) u64 {
+        return static_colliders_test_support.lastOffMainNs(self.seam.collidersConst().*) + self.nav_off_main_ns;
     }
 
     // The colliders' row-pool and payload growths so far.
     fn grows(self: *const StaticMover) [2]u64 {
-        return .{ self.colliders.perf.row_grows, self.colliders.perf.payload_grows };
+        const colliders = self.seam.collidersConst();
+        return .{ colliders.perf.row_grows, colliders.perf.payload_grows };
     }
 };
 
 // What a measured step runs besides the collision update, and the fixture invariants the
 // measurement checks.
 const StepInputs = struct {
-    // A static moved through the commit seam before each update.
+    // A static moved through the production commit seam before each update, whose
+    // pipeline's collision system runs the update.
     mover: ?*StaticMover = null,
     // A collider structure built once; its view feeds every update.
     colliders: ?*StaticColliderSystem = null,
@@ -1648,9 +1704,11 @@ const StepInputs = struct {
 // Warms up, settles the stage tuners, and times one step per iteration: the inputs' static
 // move or tier flip, then the collision update over `data`.
 fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, data: *DataSystem, inputs: StepInputs) !suite.RunStats {
-    var system = CollisionSystem.init(allocator);
-    defer system.deinit();
-    useCaseTuners(&system, case);
+    var own_system = CollisionSystem.init(allocator);
+    defer own_system.deinit();
+    // A mover's steps run on its pipeline's collision system, which its seams synced.
+    const system = if (inputs.mover) |static_mover| static_mover.collision() else &own_system;
+    useCaseTuners(system, case);
     var contacts = RangeOutputStream(CollisionContact).init(allocator);
     defer contacts.deinit();
 
@@ -1660,15 +1718,15 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     if (inputs.reserved_cold_growth) {
         try system.reserve(data.movementBodySliceConst().entities.len);
-        const cold = try runOnce(&system, data, inputs, &contacts, thread_ptr, case);
+        const cold = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
         // A broadphase inside its bound cannot flag the step, so the flag is the static
         // slot's growth, kept through the later broadphase.
         if (cold.candidate_pair_count > system.reserved_pair_bound) return error.CollisionColdBroadphaseOutgrewBound;
         if (!cold.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 1) return error.CollisionColdSlotGrowthNotFlagged;
     }
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(stageTunersSettled(&system))) {
-        _ = try runOnce(&system, data, inputs, &contacts, thread_ptr, case);
+    while (warm.next(stageTunersSettled(system))) {
+        _ = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
     }
     const fill_settled_before_measurement = case.adaptive and (system.fill_tuner.phase == .settled);
     const sort_settled_before_measurement = case.adaptive and (system.sort_tuner.phase == .settled);
@@ -1689,7 +1747,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     const stage_range = case.stageItemsPerRange(collision_range_alignment_items);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        last_collision_stats = try runOnce(&system, data, inputs, &contacts, thread_ptr, case);
+        last_collision_stats = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
         const end_ns = suite.nowNs(io);
         if (inputs.swept_bodies) |bodies| std.debug.assert(last_collision_stats.body_count == bodies);
         if (inputs.one_strip_per_body) std.debug.assert(last_collision_stats.entry_count == last_collision_stats.body_count);
@@ -1699,15 +1757,15 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ perf.fill_batch, perf.sort_batch, last_collision_stats.broadphase_batch, last_collision_stats.narrowphase_batch, perf.static_pairs_batch, perf.static_rect_batch, perf.static_place_batch, perf.static_sort_batch, perf.trigger_refresh_batch, perf.trigger_emit_count_batch, perf.trigger_emit_batch });
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_collision_stats.broadphase_batch);
-        const mover_off_main_ns = if (inputs.mover) |static_mover| static_mover.spliceOffMainNs() else 0;
+        const seam_off_main_ns = if (inputs.mover) |static_mover| static_mover.seamOffMainNs() else 0;
         const off_main_ns = offMainNs(perf.fill_batch) + offMainNs(perf.sort_batch) +
             offMainNs(last_collision_stats.broadphase_batch) + offMainNs(last_collision_stats.narrowphase_batch) +
             offMainNs(perf.static_pairs_batch) + offMainNs(perf.static_rect_batch) +
             offMainNs(perf.static_place_batch) + offMainNs(perf.static_sort_batch) + offMainNs(perf.trigger_refresh_batch) +
             offMainNs(perf.trigger_emit_count_batch) + offMainNs(perf.trigger_emit_batch);
-        main_total += elapsed_ns -| off_main_ns -| mover_off_main_ns;
+        main_total += elapsed_ns -| off_main_ns -| seam_off_main_ns;
         static_stages.add(.{ perf.static_pairs_batch, perf.static_rect_batch, perf.static_sort_batch, perf.trigger_refresh_batch });
-        if (inputs.mover) |static_mover| splice_stages.add(.{static_mover.colliders.last_batches.get(.rewrite)});
+        if (inputs.mover) |static_mover| splice_stages.add(.{static_mover.seam.collidersConst().last_batches.get(.rewrite)});
     }
 
     if (system.perf.entry_bound_overflows != warm_overflows[0] or system.perf.pair_bound_overflows != warm_overflows[1]) return error.CollisionWarmStepOverflowed;
@@ -1745,7 +1803,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         // A step with no allow crossing keeps the stored rows and emit bits: no refresh runs.
         var quiet_inputs = inputs;
         quiet_inputs.toggle = null;
-        const quiet = try runOnce(&system, data, quiet_inputs, &contacts, thread_ptr, case);
+        const quiet = try runOnce(system, data, quiet_inputs, &contacts, thread_ptr, case);
         if (quiet.perf.trigger_refresh_batch.item_count != 0) return error.CollisionTriggerRefreshedQuietStep;
         if (quiet.contact_count != last_collision_stats.contact_count) return error.CollisionQuietStepChangedContacts;
     }
@@ -1794,7 +1852,7 @@ fn runOnce(
     if (inputs.mover) |static_mover| try static_mover.moveAndSync(data, thread_system);
     if (inputs.toggle) |toggle| try toggle.flip(data);
     const view: ColliderView = if (inputs.mover) |static_mover|
-        static_mover.colliders.view()
+        static_mover.seam.collidersConst().view()
     else if (inputs.colliders) |static_colliders|
         static_colliders.view()
     else
