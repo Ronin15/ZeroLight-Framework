@@ -872,7 +872,7 @@ fn writeRebuildWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: sui
 
 const dense_change_counts = [_]usize{ 1_024, 4_096, 16_384 };
 // The spike also runs small changes (a room's worth), which thin over the 2 x 2-chunk region.
-const dense_spike_counts = [_]usize{ 16, 64, 256 } ++ dense_change_counts;
+const dense_spike_counts = [_]usize{ 16, 64, 128, 256 } ++ dense_change_counts;
 // The fixed world: the static grid's side in pitch cells (65,536 statics on 1,024 chunks of
 // 64 each), whatever the change count.
 const dense_change_side: usize = 256;

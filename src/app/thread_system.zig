@@ -147,12 +147,10 @@ pub const AdaptiveWorkPhase = enum {
     settled,
 };
 
-// An unsustained jump's predicted profile, the counts it was predicted between, and the
-// window median it was predicted from.
+// An unsustained jump's predicted profile and the counts it was predicted between.
 const JumpProfile = struct {
     learned_item_count: usize,
     item_count: usize,
-    baseline_mean_batch_duration_ns: u64,
     profile: AdaptiveWorkProfile,
 };
 
@@ -238,8 +236,8 @@ pub const AdaptiveWorkTuner = struct {
     // the best mean by the threaded commit margin, not the small-improvement one.
     retune_climb: bool = false,
     // The shape the last unsustained jump up predicted, reused while its learned and
-    // requested counts repeat and the window median has not shifted, so the same jump
-    // dispatches alike under model jitter and re-predicts when per-item cost drifts.
+    // requested counts repeat, so the same jump dispatches alike under model jitter. A
+    // sustained shift changes the learned count and so re-predicts it.
     jump_profile: ?JumpProfile = null,
     // Diagnostics only: cumulative over the tuner's life (no reset path clears
     // them) and never read by policy.
@@ -291,15 +289,12 @@ pub const AdaptiveWorkTuner = struct {
         // it teaches nothing. A tuner with a threaded profile re-normalizes that profile.
         if (self.skip_next_record and self.shifted_up and !self.has_threaded_profile and self.model_work_ns_per_item > 0) {
             const repeated = if (self.jump_profile) |jump|
-                jump.learned_item_count == self.learned_item_count and
-                    jump.item_count == normalized_request.item_count and
-                    !itemCountShifted(jump.baseline_mean_batch_duration_ns, self.baseline_mean_batch_duration_ns, self.config.item_count_reset_percent)
+                jump.learned_item_count == self.learned_item_count and jump.item_count == normalized_request.item_count
             else
                 false;
             if (!repeated) self.jump_profile = .{
                 .learned_item_count = self.learned_item_count,
                 .item_count = normalized_request.item_count,
-                .baseline_mean_batch_duration_ns = self.baseline_mean_batch_duration_ns,
                 .profile = self.predictProfile(normalized_request),
             };
             return self.normalizedProfile(self.jump_profile.?.profile, normalized_request);
@@ -3897,7 +3892,7 @@ test "adaptive work tuner without a per-item model selects a count jump as befor
     try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(tunerTestRequest(4096, 4, 16, 64)).worker_threads);
 }
 
-test "adaptive work tuner two jumps to the same count under an unchanged window median get the same shape" {
+test "adaptive work tuner two jumps to the same count get the same shape" {
     var tuner = try inlineSettledTestTuner();
     const jump_request = tunerTestRequest(1024, 4, 16, 64);
     const first = tuner.selectProfile(jump_request);
@@ -3909,7 +3904,7 @@ test "adaptive work tuner two jumps to the same count under an unchanged window 
     try std.testing.expectEqual(first, tuner.selectProfile(jump_request));
 }
 
-test "adaptive work tuner a jump after the window median shifts re-predicts its shape" {
+test "adaptive work tuner a jump keeps its held shape across a shifted window median" {
     var tuner = try inlineSettledTestTuner();
     const jump_request = tunerTestRequest(1024, 4, 16, 64);
     const first = tuner.selectProfile(jump_request);
@@ -3922,9 +3917,8 @@ test "adaptive work tuner a jump after the window median shifts re-predicts its 
     }
     try std.testing.expect(itemCountShifted(median_before, tuner.baseline_mean_batch_duration_ns, tuner.config.item_count_reset_percent));
     try std.testing.expect(!tuner.has_threaded_profile);
-    const predicted = tuner.predictProfile(tuner.normalizeRequest(jump_request));
-    try std.testing.expect(!profilesEqual(first, predicted));
-    try std.testing.expectEqual(predicted, tuner.selectProfile(jump_request));
+    try std.testing.expect(!profilesEqual(first, tuner.predictProfile(tuner.normalizeRequest(jump_request))));
+    try std.testing.expectEqual(first, tuner.selectProfile(jump_request));
 }
 
 test "adaptive work tuner a threaded-settled tuner selects a count jump as before" {
