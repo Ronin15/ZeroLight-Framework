@@ -127,6 +127,16 @@ pub const AdaptiveWorkTunerConfig = struct {
     retune_after_settled_windows: usize = 120,
     min_ranges_per_participant: usize = 1,
     max_ranges_per_participant: usize = 16,
+    /// A fresh tuner's first selection; every later selection and record is unchanged.
+    first_selection: AdaptiveFirstSelection = .learn_inline,
+};
+
+/// `learn_inline` runs a fresh tuner's first batch inline to measure its baseline;
+/// `full_pool` dispatches it on every allowed worker, shaped by the cost model, for a
+/// stage whose first batch is a one-off too large for main (a world-create build).
+pub const AdaptiveFirstSelection = enum {
+    learn_inline,
+    full_pool,
 };
 
 pub const max_sample_window = 16;
@@ -135,6 +145,15 @@ pub const AdaptiveWorkPhase = enum {
     learning,
     probing,
     settled,
+};
+
+// An unsustained jump's predicted profile, the counts it was predicted between, and the
+// window median it was predicted from.
+const JumpProfile = struct {
+    learned_item_count: usize,
+    item_count: usize,
+    baseline_mean_batch_duration_ns: u64,
+    profile: AdaptiveWorkProfile,
 };
 
 // Cost-model terms. `default_participant_overhead_ns` is a permanent floor under the
@@ -218,6 +237,10 @@ pub const AdaptiveWorkTuner = struct {
     // Set while the climb opened by that re-based probe runs: candidates must beat
     // the best mean by the threaded commit margin, not the small-improvement one.
     retune_climb: bool = false,
+    // The shape the last unsustained jump up predicted, reused while its learned and
+    // requested counts repeat and the window median has not shifted, so the same jump
+    // dispatches alike under model jitter and re-predicts when per-item cost drifts.
+    jump_profile: ?JumpProfile = null,
     // Diagnostics only: cumulative over the tuner's life (no reset path clears
     // them) and never read by policy.
     probe_window_count: DiagnosticCount = zero_diagnostic_count,
@@ -243,6 +266,7 @@ pub const AdaptiveWorkTuner = struct {
         self.last_request = normalized_request;
         self.last_range_alignment_items = normalized_request.range_alignment_items;
         self.skip_next_record = false;
+        const fresh_full_pool = self.learned_item_count == 0 and self.config.first_selection == .full_pool;
         if (self.learned_item_count == 0) {
             self.learned_item_count = normalized_request.item_count;
         } else if (itemCountShifted(self.learned_item_count, normalized_request.item_count, self.config.item_count_reset_percent)) {
@@ -259,6 +283,26 @@ pub const AdaptiveWorkTuner = struct {
             }
         } else {
             self.shifted_batch_count = 0;
+        }
+
+        if (fresh_full_pool) return self.profileForParticipants(normalized_request, normalized_request.max_worker_threads + 1);
+        // An unsustained jump up on a tuner without a threaded profile runs at the shape the
+        // per-item model predicts for the new count, not inline; its record is skipped, so
+        // it teaches nothing. A tuner with a threaded profile re-normalizes that profile.
+        if (self.skip_next_record and self.shifted_up and !self.has_threaded_profile and self.model_work_ns_per_item > 0) {
+            const repeated = if (self.jump_profile) |jump|
+                jump.learned_item_count == self.learned_item_count and
+                    jump.item_count == normalized_request.item_count and
+                    !itemCountShifted(jump.baseline_mean_batch_duration_ns, self.baseline_mean_batch_duration_ns, self.config.item_count_reset_percent)
+            else
+                false;
+            if (!repeated) self.jump_profile = .{
+                .learned_item_count = self.learned_item_count,
+                .item_count = normalized_request.item_count,
+                .baseline_mean_batch_duration_ns = self.baseline_mean_batch_duration_ns,
+                .profile = self.predictProfile(normalized_request),
+            };
+            return self.normalizedProfile(self.jump_profile.?.profile, normalized_request);
         }
 
         const selected = switch (self.phase) {
@@ -3806,6 +3850,95 @@ test "adaptive work tuner keeps threading when one batch in a window is near-zer
         if (step >= 120 and workers == 0) inline_steps_after_warmup += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), inline_steps_after_warmup);
+}
+
+test "adaptive work tuner a full-pool first selection dispatches workers and a default one runs inline" {
+    const request = tunerTestRequest(4096, 4, 16, 64);
+    var opted = AdaptiveWorkTuner.init(.{ .first_selection = .full_pool });
+    const first = opted.selectProfile(request);
+    try std.testing.expectEqual(@as(usize, 4), shapeBatch(4096, first, 4, 16, true).worker_threads);
+    // Every later selection is today's: learning measures inline.
+    opted.record(tunerTestBatchWithProfile(4096, first, 400_000));
+    try std.testing.expectEqual(@as(usize, 0), opted.selectProfile(request).worker_threads);
+
+    var default = AdaptiveWorkTuner.init(.{});
+    try std.testing.expectEqual(@as(usize, 0), shapeBatch(4096, default.selectProfile(request), 4, 16, true).worker_threads);
+}
+
+// A tuner settled inline at 16 items of 1 us each: its per-item model is learned.
+fn inlineSettledTestTuner() !AdaptiveWorkTuner {
+    var tuner = AdaptiveWorkTuner.init(.{});
+    for (0..tuner.config.sample_window) |_| {
+        const selected = tuner.selectProfile(tunerTestRequest(16, 4, 16, 64));
+        tuner.record(tunerTestBatchWithProfile(16, selected, 16_000));
+    }
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, tuner.phase);
+    try std.testing.expect(!tuner.has_threaded_profile and tuner.model_work_ns_per_item > 0);
+    return tuner;
+}
+
+test "adaptive work tuner an inline-settled tuner with a per-item model threads a count jump" {
+    var tuner = try inlineSettledTestTuner();
+    const jump = tuner.selectProfile(tunerTestRequest(4096, 4, 16, 64));
+    try std.testing.expect(shapeBatch(4096, jump, 4, 16, true).worker_threads > 0);
+    // The shift path runs as today: the jump is not sampled and the tuner stays settled inline.
+    tuner.record(tunerTestBatchWithProfile(4096, jump, 1_000_000));
+    try std.testing.expectEqual(@as(usize, 0), tuner.sample_count);
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, tuner.phase);
+    try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(tunerTestRequest(16, 4, 16, 64)).worker_threads);
+}
+
+test "adaptive work tuner without a per-item model selects a count jump as before" {
+    var tuner = AdaptiveWorkTuner.init(.{});
+    // A zero-duration batch teaches nothing, so the learned count is set but no model is.
+    const first = tuner.selectProfile(tunerTestRequest(16, 4, 16, 64));
+    tuner.record(tunerTestBatchWithProfile(16, first, 0));
+    try std.testing.expectEqual(@as(f64, 0), tuner.model_work_ns_per_item);
+    try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(tunerTestRequest(4096, 4, 16, 64)).worker_threads);
+}
+
+test "adaptive work tuner two jumps to the same count under an unchanged window median get the same shape" {
+    var tuner = try inlineSettledTestTuner();
+    const jump_request = tunerTestRequest(1024, 4, 16, 64);
+    const first = tuner.selectProfile(jump_request);
+    tuner.record(tunerTestBatchWithProfile(1024, first, 1_000_000));
+    // An in-band batch between the jumps moves the per-item model a long way.
+    const between = tuner.selectProfile(tunerTestRequest(16, 4, 16, 64));
+    tuner.record(tunerTestBatchWithProfile(16, between, 160_000));
+    try std.testing.expect(!profilesEqual(first, tuner.predictProfile(tuner.normalizeRequest(jump_request))));
+    try std.testing.expectEqual(first, tuner.selectProfile(jump_request));
+}
+
+test "adaptive work tuner a jump after the window median shifts re-predicts its shape" {
+    var tuner = try inlineSettledTestTuner();
+    const jump_request = tunerTestRequest(1024, 4, 16, 64);
+    const first = tuner.selectProfile(jump_request);
+    tuner.record(tunerTestBatchWithProfile(1024, first, 1_000_000));
+    // A whole in-band window at 2.5x the per-item cost moves the median; it stays inline.
+    const median_before = tuner.baseline_mean_batch_duration_ns;
+    for (0..tuner.config.sample_window) |_| {
+        const selected = tuner.selectProfile(tunerTestRequest(16, 4, 16, 64));
+        tuner.record(tunerTestBatchWithProfile(16, selected, 40_000));
+    }
+    try std.testing.expect(itemCountShifted(median_before, tuner.baseline_mean_batch_duration_ns, tuner.config.item_count_reset_percent));
+    try std.testing.expect(!tuner.has_threaded_profile);
+    const predicted = tuner.predictProfile(tuner.normalizeRequest(jump_request));
+    try std.testing.expect(!profilesEqual(first, predicted));
+    try std.testing.expectEqual(predicted, tuner.selectProfile(jump_request));
+}
+
+test "adaptive work tuner a threaded-settled tuner selects a count jump as before" {
+    // A window above one sample, so a single jump stays unsustained.
+    var tuner = AdaptiveWorkTuner.init(.{ .sample_window = 2 });
+    _ = try settleTunerThreadedAgainstExpensiveInline(&tuner, tunerTestRequest(1024, 4, 16, 64));
+    try std.testing.expect(tuner.model_work_ns_per_item > 0);
+    const jump_request = tuner.normalizeRequest(tunerTestRequest(1536, 4, 16, 64));
+    const jump = tuner.selectProfile(jump_request);
+    try std.testing.expect(tuner.skip_next_record and tuner.shifted_up);
+    // The settled threaded profile, re-normalized to the jump's count; no prediction.
+    try std.testing.expectEqual(tuner.normalizedProfile(tuner.current_profile, jump_request), jump);
+    try std.testing.expect(!profilesEqual(jump, tuner.normalizedProfile(tuner.predictProfile(jump_request), jump_request)));
+    try std.testing.expect(tuner.jump_profile == null);
 }
 
 test "participant slots include main thread and worker threads" {

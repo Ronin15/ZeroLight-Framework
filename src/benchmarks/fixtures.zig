@@ -179,14 +179,15 @@ pub const StaticMove = struct {
     }
 };
 
-/// Gives each of the static colliders' sync and rebuild stages a fresh tuner, and every stage
-/// the range controls for `case`.
+/// Gives each of the static colliders' sync and rebuild stages a fresh tuner (a tuned case's
+/// rebuild tuners in production's rebuild config), and every stage the range controls for
+/// `case`.
 pub fn setSpliceTuners(colliders: *StaticColliderSystem, case: suite.BenchmarkCase) void {
     for (std.enums.values(SyncStage)) |stage| {
         colliders.tuners.set(stage, suite.adaptiveTunerForCase(case, sync_range_alignment.get(stage)) orelse AdaptiveWorkTuner.init(.{}));
     }
     for (std.enums.values(RebuildStage)) |stage| {
-        colliders.rebuild_tuners.set(stage, suite.adaptiveTunerForCase(case, rebuild_range_alignment.get(stage)) orelse AdaptiveWorkTuner.init(.{}));
+        colliders.rebuild_tuners.set(stage, suite.adaptiveTunerForCase(case, rebuild_range_alignment.get(stage)) orelse AdaptiveWorkTuner.init(StaticColliderSystem.rebuild_tuner_config));
     }
     colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
 }

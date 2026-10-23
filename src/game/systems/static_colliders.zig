@@ -23,6 +23,7 @@ const logging = @import("../../core/logging.zig");
 const pdq = @import("../../core/sort.zig").pdq;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
@@ -31,6 +32,7 @@ const StageControls = @import("../../app/thread_system.zig").StageControls;
 const StageThreads = @import("../../app/thread_system.zig").StageThreads;
 const runShaped = @import("../../app/thread_system.zig").runShaped;
 const stageShape = @import("../../app/thread_system.zig").stageShape;
+const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const StageShape = @import("../../app/thread_system.zig").StageShape;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
@@ -797,6 +799,10 @@ fn orderGroupBit(bit: u16, group: QueryGroup) std.math.Order {
 }
 
 pub const StaticColliderSystem = struct {
+    /// A rebuild stage's tuner config: a world-create rebuild is a one-off, so a fresh
+    /// tuner's first rebuild dispatches on the full pool instead of inline on main.
+    pub const rebuild_tuner_config = AdaptiveWorkTunerConfig{ .first_selection = .full_pool };
+
     allocator: std.mem.Allocator,
     geometry: ?ColliderGeometry = null,
     rows: std.MultiArrayList(Row) = .{},
@@ -882,7 +888,7 @@ pub const StaticColliderSystem = struct {
     // rebuilds), the shared range controls (production runs adaptive; benches pin a fixed
     // partition), and each stage's last batch shape.
     tuners: std.EnumArray(SyncStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(.{})),
-    rebuild_tuners: std.EnumArray(RebuildStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(.{})),
+    rebuild_tuners: std.EnumArray(RebuildStage, AdaptiveWorkTuner) = .initFill(AdaptiveWorkTuner.init(rebuild_tuner_config)),
     splice_controls: StageControls = .{},
     last_batches: std.EnumArray(ColliderStage, BatchStats) = .initFill(.{}),
     perf: Perf = .{},
@@ -5638,7 +5644,7 @@ fn syncThreadsFor(colliders: *const StaticColliderSystem, thread_system: *Thread
     return .{ .thread_system = thread_system, .config = colliders.splice_controls };
 }
 
-test "a rebuild samples each stage's own rebuild tuner once, carries them to the next rebuild, and samples no sync tuner" {
+test "a rebuild samples each stage's own rebuild tuner once, threads a fresh system's first rebuild, carries them to the next, and samples no sync tuner" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
     defer threads.deinit();
     var prng = std.Random.DefaultPrng.init(0x51f1);
@@ -5652,19 +5658,38 @@ test "a rebuild samples each stage's own rebuild tuner once, carries them to the
     // Production's controls and untrained tuners, as world create builds the system.
     var colliders = StaticColliderSystem.init(std.testing.allocator);
     defer colliders.deinit();
+    var first_ran_inline: std.EnumArray(RebuildStage, bool) = .initFill(true);
+    var first_threaded_stages: usize = 0;
     for (1..3) |rebuilds| {
         try colliders.rebuild(&fixture.data, test_geometry, &threads);
         for (std.meta.tags(RebuildStage)) |stage| {
             const batch = colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
             try std.testing.expect(batch.item_count != 0);
             // The stage selected through its own tuner, at its items and alignment, and
-            // recorded one sample per rebuild into it, the earlier rebuild's carried over.
+            // recorded one sample per rebuild into it.
             const tuner = colliders.rebuild_tuners.getPtrConst(stage);
             const request = tuner.last_request orelse return error.RebuildStageSkippedItsTuner;
             try std.testing.expectEqual(batch.item_count, request.item_count);
             try std.testing.expectEqual(batch.range_alignment_items, request.range_alignment_items);
-            try std.testing.expectEqual(rebuilds, tuner.sample_count);
+            if (rebuilds == 1) {
+                // A fresh tuner's first selection is the full pool: every stage with more
+                // than one aligned range runs on workers.
+                if (rangeCount(batch.item_count, batch.range_alignment_items) > 1) {
+                    try std.testing.expect(!batch.ran_inline and batch.active_worker_threads > 0);
+                    first_threaded_stages += 1;
+                }
+                first_ran_inline.set(stage, batch.ran_inline);
+                try std.testing.expectEqual(@as(usize, 1), tuner.sample_count);
+                continue;
+            }
+            // The tuner carried over: the second rebuild learns inline, never the fresh
+            // full-pool selection. A threaded first sample is a different profile, so the
+            // inline sample restarts the window; an inline first sample extends it.
+            try std.testing.expect(batch.ran_inline);
+            const expected: usize = if (first_ran_inline.get(stage)) 2 else 1;
+            try std.testing.expectEqual(expected, tuner.sample_count);
         }
+        try std.testing.expect(first_threaded_stages > 0);
         for (std.meta.tags(SyncStage)) |stage| {
             try std.testing.expectEqual(@as(usize, 0), colliders.tuners.get(stage).sample_count);
             try std.testing.expect(colliders.tuners.get(stage).last_request == null);

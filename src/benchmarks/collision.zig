@@ -44,8 +44,9 @@
 //!   on workers in the tuned case. Asserts: the row count; each stage's work (`select`
 //!   every entity slot, `plan` and `touch` every static, `group` one touch per static, a fill
 //!   of at least two units per static, and `install` one item per occupied chunk); each
-//!   stage dispatched in the fixed-partition cases; and in the adaptive threaded cases each
-//!   stage's selection through its own rebuild tuner.
+//!   stage dispatched in the fixed-partition cases; in the adaptive threaded cases each
+//!   stage's selection through its own rebuild tuner; and in the tuned case with workers
+//!   every stage with more than one aligned block on workers.
 //! - `collision-static-rebuild-sparse`: the same rebuild on a fixed world of 256 x 256
 //!   chunks, one one-tile static at the middle tile of each occupied chunk and no other body;
 //!   the item count of chunks is occupied on an even stride (every fourth, second, or each
@@ -73,17 +74,22 @@
 //!   stage dispatched in the fixed-partition cases, and in the adaptive threaded cases each
 //!   stage's selection through its own sync tuner; and no row or payload growth in any
 //!   measured sync (warmup runs both directions).
-//! - `collision-static-dense-spike`: the dense-change fixture, serial and tuned cases only.
+//! - `collision-static-dense-spike`: the dense-change fixture, serial and tuned cases only,
+//!   also at 16, 64, and 256 changes: below 256 the changes thin over the 2 x 2-chunk region,
+//!   each chunk moving the same first share of its statics.
 //!   One untimed dense round trip grows the region chunks first; then fresh sync tuners
 //!   settle on single-static syncs (one static outside the region moved through the commit
-//!   seam, a quiet world's in-band load); each measured step runs one in-band single-static
-//!   sync, untimed, then, with the tuners still settled, times one dense sync of the change
-//!   count, an explosion after a quiet spell. Pass shape: main per changed static flat in
-//!   the change count, and every stage with more than one aligned block on workers in the
-//!   tuned case.
+//!   seam, a quiet world's in-band load), and one untimed spike each way grows the per-range
+//!   scratch to the settled tuners' spike shape; each measured step runs one in-band
+//!   single-static sync, untimed, then, with the tuners still settled, times one dense sync of
+//!   the change count, an explosion after a quiet spell. Pass shape: main per changed static
+//!   flat in the change count; in the tuned case each stage's shape the same across the timed
+//!   spikes (the held jump shape, shown in the stage details) and the main share reported.
+//!   The tuned shapes are learned from timing, so no worker count is asserted.
 //!   Asserts are fixture invariants only: each single sync commits and syncs its one change,
-//!   and leaves the tuned case's tuners settled; each dense sync's work as `collision-static-dense-change`, each stage's selection
-//!   through its own sync tuner, and no row or payload growth in any measured sync.
+//!   and leaves the tuned case's tuners settled; each dense sync's work as
+//!   `collision-static-dense-change`, each stage's selection through its own sync tuner, and
+//!   no row or payload growth (sync scratch included) in any measured sync after the warmup.
 //!
 //! `collision-static-triggers` holds the item count of stored trigger pairs: two overlapping
 //! one-tile triggers per pitch cell, 512 dynamics on the first cells (half on a trigger), and
@@ -122,6 +128,7 @@ const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
+const rangeCount = @import("../app/thread_system.zig").rangeCount;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const CollisionStats = @import("../game/systems/collision.zig").CollisionStats;
@@ -238,7 +245,7 @@ pub const static_dense_change_group = suite.BenchmarkGroup{
 pub const static_dense_spike_group = suite.BenchmarkGroup{
     .name = "collision-static-dense-spike",
     .item_label = "statics changed in the spike",
-    .item_counts = &dense_change_counts,
+    .item_counts = &dense_spike_counts,
     .runCase = runStaticDenseSpikeCase,
     .write_workload = writeDenseChangeWorkload,
     .cases = &suite.serial_and_tuned_cases,
@@ -787,6 +794,7 @@ fn measureRebuild(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
         try checkRebuildWork(batches, data.slots.items.len, static_count, chunk_count);
         try suite.checkStagesDispatched(case, &threads, stage_range, &batches);
         for (batches, rebuild_stages) |batch, stage| try checkTunerSelected(case, &threads, tuners.getPtrConst(stage), batch);
+        for (batches) |batch| try checkRebuildOnWorkers(case, &threads, batch);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, colliders.last_batches.get(.rewrite));
         main_total += elapsed_ns -| static_colliders_test_support.lastOffMainNs(colliders);
@@ -833,6 +841,13 @@ fn checkTunerSelected(case: suite.BenchmarkCase, threads: *const ThreadSystem, t
     if (request.item_count != batch.item_count) return error.ColliderStageSkippedItsTuner;
 }
 
+// The tuned case's rebuild stage with more than one aligned range runs on workers: a fresh
+// rebuild tuner's first selection is the full pool (`StaticColliderSystem.rebuild_tuner_config`).
+fn checkRebuildOnWorkers(case: suite.BenchmarkCase, threads: *const ThreadSystem, batch: BatchStats) error{RebuildStageRanInline}!void {
+    if (case.adaptive_range_mode != .tuned or threads.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
+    if (rangeCount(batch.item_count, batch.range_alignment_items) > 1 and batch.ran_inline) return error.RebuildStageRanInline;
+}
+
 // An empty collider system with the case's stage controls and fresh tuners, as a new
 // world's is.
 fn freshRebuildSystem(allocator: std.mem.Allocator, case: suite.BenchmarkCase) StaticColliderSystem {
@@ -856,6 +871,8 @@ fn writeRebuildWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: sui
 // ----------------------------------------------------------------------------
 
 const dense_change_counts = [_]usize{ 1_024, 4_096, 16_384 };
+// The spike also runs small changes (a room's worth), which thin over the 2 x 2-chunk region.
+const dense_spike_counts = [_]usize{ 16, 64, 256 } ++ dense_change_counts;
 // The fixed world: the static grid's side in pitch cells (65,536 statics on 1,024 chunks of
 // 64 each), whatever the change count.
 const dense_change_side: usize = 256;
@@ -863,7 +880,8 @@ const dense_change_side: usize = 256;
 const dense_change_chunk_cells: usize = default_chunk_size_tiles / 2;
 const dense_change_chunks_side: usize = dense_change_side / dense_change_chunk_cells;
 // Every static of a region chunk changes: the region grows with the change count at this
-// fixed density.
+// fixed density. Below the smallest paired region's statics, that region's chunks each change
+// the same share of theirs.
 const dense_change_per_chunk: usize = dense_change_chunk_cells * dense_change_chunk_cells;
 // A move's offset in tiles on each axis, by its chunk's parity there: an even chunk's
 // statics move ahead into the next chunk, an odd chunk's back into the previous one. From
@@ -893,10 +911,12 @@ const DenseChangeFixture = struct {
     allocator: std.mem.Allocator,
 
     // Every static of a square region of `change_count / dense_change_per_chunk` chunks
-    // changes; the region has an even side, so each chunk's pair-swap partner is in it.
+    // changes; the region has an even side, so each chunk's pair-swap partner is in it. A
+    // smaller count changes the first `change_count / 4` statics of each 2 x 2-region chunk.
     fn init(allocator: std.mem.Allocator, change_count: usize, case: suite.BenchmarkCase) !DenseChangeFixture {
-        if (change_count % dense_change_per_chunk != 0) return error.DenseChangeNotPerChunk;
-        const region_chunks = change_count / dense_change_per_chunk;
+        const region_chunks = @max(change_count / dense_change_per_chunk, 4);
+        const moves_per_chunk = change_count / region_chunks;
+        if (moves_per_chunk == 0 or moves_per_chunk > dense_change_per_chunk or moves_per_chunk * region_chunks != change_count) return error.DenseChangeNotPerChunk;
         const region_side = std.math.sqrt(region_chunks);
         if (region_side * region_side != region_chunks) return error.DenseChangeRegionNotSquare;
         if (region_side % 2 != 0 or region_side > dense_change_chunks_side) return error.DenseChangeRegionNotPaired;
@@ -922,6 +942,8 @@ const DenseChangeFixture = struct {
             };
             if (cell_x == dense_change_side - 1 and cell_y == dense_change_side - 1) single = .{ .entity = entity, .positions = .{ home, away } };
             if (cell_x / dense_change_chunk_cells >= region_side or cell_y / dense_change_chunk_cells >= region_side) continue;
+            const chunk_cell = (cell_y % dense_change_chunk_cells) * dense_change_chunk_cells + cell_x % dense_change_chunk_cells;
+            if (chunk_cell >= moves_per_chunk) continue;
             moves[moved] = .{ .entity = entity, .positions = .{ home, away } };
             moved += 1;
         };
@@ -1097,6 +1119,13 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     const settled = case.adaptive and syncTunersSettled(&fixture.colliders);
     // A spike is measured only from settled tuners.
     if (load == .spike and case.adaptive and !settled) return error.DenseSpikeTunersNotSettled;
+    // The settled tuners' spike shape sizes the per-range scratch (the touch windows), so one
+    // untimed spike each way grows it to the timed shape. A spike's record is skipped, but
+    // these spikes set each tuner's held jump shape, which the timed spikes reuse.
+    if (load == .spike) for (0..2) |_| {
+        try fixture.changeOneAndSync(&threads);
+        _ = try fixture.changeAndSync(io, &threads);
+    };
 
     var accumulator = suite.StatsAccumulator.init(change_count);
     var main_total: u128 = 0;
