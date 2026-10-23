@@ -51,6 +51,10 @@ DEFAULT_CASES = ("serial-direct", "thread-adaptive-tuned-range")
 NOISE_PCT = 10.0
 # A regression check needs medians and spread over reps, not long runs per config.
 DEFAULT_TIMING = ("--warmup", "1", "--iterations", "3")
+TUNED_CASE = "thread-adaptive-tuned-range"
+# A rep's tuned case matches its controls when within this much of that rep's fastest one.
+CONTROL_MATCH_PCT = 5.0
+ATTENTION = re.compile(r"^summary: .*?(attention: .*)$", re.M)
 
 
 def host_target() -> tuple[str, str]:
@@ -186,6 +190,33 @@ def fmt_us(v: float) -> str:
     return f"{v:.1f} us"
 
 
+def tuned_vs_controls(by_rep: dict[tuple[str, str, str], dict[int, dict[str, tuple[float, str]]]], names: list[str]) -> list[str]:
+    """Per (group, item, side): in how many reps the tuned case matched that rep's fastest
+    other case (`tests-benchmarks.md`: every other case is a control), and its worst rep."""
+    out: list[str] = []
+    for group, item, side in sorted(by_rep, key=lambda k: (k[0], k[1], names.index(k[2]))):
+        reps = by_rep[(group, item, side)]
+        judged = []
+        for rep in sorted(reps):
+            cases_us = reps[rep]
+            if TUNED_CASE not in cases_us or len(cases_us) < 2:
+                continue
+            tuned_us, tuned_cell = cases_us[TUNED_CASE]
+            best_case, (best_us, best_cell) = min(((k, v) for k, v in cases_us.items() if k != TUNED_CASE), key=lambda kv: kv[1][0])
+            judged.append((tuned_us / best_us if best_us else 1.0, tuned_us, tuned_cell, best_case, best_us, best_cell))
+        if not judged:
+            continue
+        if not out:
+            out += ["", f"# tuned vs fastest control per rep (match: within {CONTROL_MATCH_PCT:.0f}%)"]
+        matched = sum(1 for j in judged if j[0] <= 1 + CONTROL_MATCH_PCT / 100)
+        ratio, tuned_us, tuned_cell, best_case, best_us, best_cell = max(judged)
+        out.append(
+            f"{group:30} {item:>12} {side:<18} matched {matched}/{len(judged)}"
+            f"  worst: tuned {fmt_us(tuned_us)} @{tuned_cell} vs {best_case} {fmt_us(best_us)} @{best_cell} ({(ratio - 1) * 100:+.0f}%)"
+        )
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Targeted A/B bench (Debug by default): base ref vs working tree, one run per side or medians over reps.",
@@ -289,13 +320,20 @@ def main() -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"created": time.time(), "cpu": args.cpu, "args": bench_args, "texts": runs}))
     workers: dict[tuple[str, str, str, str], str] = {}
+    # (group, item, side) -> rep index -> case -> (us, worker_threads cell): the tuned
+    # case is judged per rep against the controls of the same rep.
+    by_rep: dict[tuple[str, str, str], dict[int, dict[str, tuple[float, str]]]] = {}
+    attention: dict[str, list[str]] = {}
     for (t, c, s), runs in {**texts, **fresh}.items():
-        for text in runs:
+        for rep_index, text in enumerate(runs):
             side_workers: dict[tuple[str, str, str], str] = {}
             for (group, item, case_name), us in parse(text, cases[c], side_workers).items():
                 samples.setdefault((group, item, case_name, sides[s][0]), []).append(us)
+                cell = side_workers.get((group, item, case_name), "-")
+                by_rep.setdefault((group, item, sides[s][0]), {}).setdefault(rep_index, {})[case_name] = (us, cell)
             for key, cell in side_workers.items():
                 workers[key + (sides[s][0],)] = cell
+            attention.setdefault(sides[s][0], []).extend(ATTENTION.findall(text))
 
     keys = sorted({k[:3] for k in samples})
     names = [n for n, _, _ in sides]
@@ -337,6 +375,10 @@ def main() -> int:
             # Workers used/available: 0/N means the tuner kept the stage inline (serial is production).
             row += "  workers " + " ".join(f"{n}={workers.get(key + (n,), '-')}" for n in names)
         lines.append(row)
+    lines += tuned_vs_controls(by_rep, names)
+    for n in names:
+        if attention.get(n):
+            lines.append(f"# {n}: {len(attention[n])} harness attention line(s); first: {attention[n][0]}")
     summary = "\n".join(lines) + "\n"
     (out_dir / "summary.txt").write_text(summary)
     print(summary)
