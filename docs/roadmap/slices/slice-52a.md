@@ -136,7 +136,7 @@ Linux and macOS; no shader compilers are needed for a normal build.
 - [ ] Docs: DW sections CPU Baseline (with the A/B table and minimum spec), SDL
       Versions And Sources, Shader Artifacts, Toolchain Pins And Upgrades;
       `docs/setup.md`; `docs/rendering-assets-shaders.md` Shader Build;
-      `README.md` requirements; `AGENTS.md` commands.
+      `README.md` requirements; `CLAUDE.md` commands.
 - [ ] Rule additions when this lands: release CPU baseline and toolchain
       upgrade policy (`.claude/rules/build-validation.md`).
 

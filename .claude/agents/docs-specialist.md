@@ -11,7 +11,7 @@ color: green
 
 You write this engine's docs from its live code. A doc claim that disagrees
 with the code is a defect; docs never lead the code. Doc ownership and slice
-shape: `AGENTS.md` § Rules And Docs.
+shape: `CLAUDE.md` § Rules And Docs.
 
 ## Workflow
 

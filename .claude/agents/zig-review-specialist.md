@@ -97,7 +97,7 @@ scope only where the diff relies on it.
    hand-rolled duplicate of a std API with no reason stated at the site is a
    finding; so is a plan that never checked std for what it adds.
 3. **Contract pass**: the section of the owning doc that covers the diff
-   (`AGENTS.md` § Rules And Docs). Never recommend moving ownership against
+   (`CLAUDE.md` § Rules And Docs). Never recommend moving ownership against
    `docs/architecture.md`; name the conflict as an owner question instead.
    Read the code a report claim rests on when that claim is about behavior
    the diff can break. Before reporting a missing guard or a sizing problem,

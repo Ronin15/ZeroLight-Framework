@@ -1,4 +1,4 @@
-# AGENTS.md
+# ZeroLight Framework
 
 ## Project Snapshot
 
@@ -11,7 +11,8 @@ multi-world colony simulator (target and the demo's role:
 
 - **Rules** live only in `.claude/rules/`, one topic per file
   (`engine-design.md`). `engine-design.md` loads every session; each other
-  rule loads with the files its `paths:` frontmatter names.
+  rule loads when a file its `paths:` frontmatter names is Read, so Read a
+  file you only grepped before relying on its rules.
 - Docs, briefs, plans, and reports cite rule files by name and never restate
   them; a plan cites the rule each decision meets, a review the rule each
   standards finding breaks.

@@ -83,16 +83,16 @@ files it links. Do not load the whole roadmap.
    other slice files unless linked.
 3. **Design plan right before implementation.** `zig-design-specialist`
    writes the plan for each slice or landing whose design is open, against
-   the live code (`AGENTS.md` § Agent Pipeline). The plan goes to the
+   the live code (`CLAUDE.md` § Agent Pipeline). The plan goes to the
    implementer, not into the slice.
 4. **Implement only that slice's scope** in the owning `src/` modules.
-5. **Review before commit** (`AGENTS.md` § Agent Pipeline); fixes fold into
+5. **Review before commit** (`CLAUDE.md` § Agent Pipeline); fixes fold into
    the commit.
 6. **Pass every Acceptance check.** Items marked "(added by Slice N)" are
    part of this slice's scope.
 7. **Docs commit, once the slice's programming is done:** check off Checklist
    items, update durable docs (`architecture.md`, rendering/sim docs) and
-   Tables T1–T6 from the landings' commit notes (`AGENTS.md` § Agent
+   Tables T1–T6 from the landings' commit notes (`CLAUDE.md` § Agent
    Pipeline), and bring every open slice the landed code affects up to
    date: its Current foundation and `file:line` refs, items the landing
    closed or made obsolete, and the interfaces or orders it builds on.

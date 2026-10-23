@@ -47,7 +47,7 @@ than working from a compaction summary.
    `tests-benchmarks.md` § Test and production code. Tests are fast logic
    tests; a stability, convergence, work-bound, or perf proof goes in its
    bench group (`tests-benchmarks.md` § Tests). Edit no docs: put the
-   doc changes as notes in the report (`AGENTS.md` § Agent Pipeline).
+   doc changes as notes in the report (`CLAUDE.md` § Agent Pipeline).
 5. Validate per `build-validation.md`. While iterating, run `zig build check`
    and, when test bodies changed, `zig build test-compile` with no
    `-Dtest-filter`. A filter compiles only the tests it matches, and a filter
