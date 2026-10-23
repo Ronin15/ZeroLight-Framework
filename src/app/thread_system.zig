@@ -154,13 +154,12 @@ const JumpProfile = struct {
     profile: AdaptiveWorkProfile,
 };
 
-// Cost-model terms. `default_participant_overhead_ns` is a permanent floor under the
-// learned participant overhead in the worker-count prediction, not only a seed; the
-// range overhead floors the range-size model the same way. Sub-microsecond values
-// over-predicted worker counts for ~100µs work versus real wake/join overhead.
-const default_participant_overhead_ns: f64 = 25_000;
-const min_participant_overhead_ns: f64 = 5_000;
-const default_range_overhead_ns: f64 = 5_000;
+// Cost-model terms. The defaults floor the learned participant and range overheads in
+// the prediction and sit below the measured warm dispatch costs, so learned values
+// above them decide; `min_participant_overhead_ns` floors each learned sample.
+const default_participant_overhead_ns: f64 = 1_000;
+const min_participant_overhead_ns: f64 = 100;
+const default_range_overhead_ns: f64 = 1_000;
 
 /// Cumulative tuner diagnostic count: `u64` where perf instrumentation is
 /// compiled in, zero-sized (and never written) in ReleaseFast/ReleaseSmall.
@@ -3219,6 +3218,9 @@ test "adaptive work tuner climbs up from a winning one-worker first probe" {
     });
     const request = tunerTestRequest(8192, 10, 16, 64);
 
+    // A steep learned participant overhead puts the first probe, predicted when the
+    // inline window closes, at one worker.
+    tuner.model_participant_overhead_ns = 25_000;
     const inline_profile = tuner.selectProfile(request);
     tuner.record(tunerTestBatchWithProfile(8192, inline_profile, 100_000));
     const first = tuner.selectProfile(request);
@@ -3268,6 +3270,9 @@ test "adaptive work tuner reverses upward from a wider best after a one-worker r
     try std.testing.expect(tuner.phase == .settled);
     try std.testing.expectEqual(@as(usize, 3), tuner.best_profile.worker_threads);
 
+    // A steep learned participant overhead, still above 18 us after the settled windows'
+    // samples, so the retune predicts one worker.
+    tuner.model_participant_overhead_ns = 40_000;
     // Settled windows until the retune probe starts.
     guard = 0;
     while (tuner.phase == .settled and guard < 64) : (guard += 1) {
@@ -3894,7 +3899,8 @@ test "adaptive work tuner without a per-item model selects a count jump as befor
 
 test "adaptive work tuner two jumps to the same count get the same shape" {
     var tuner = try inlineSettledTestTuner();
-    const jump_request = tunerTestRequest(1024, 4, 16, 64);
+    // Enough workers that the per-item model's move changes the predicted count.
+    const jump_request = tunerTestRequest(1024, 64, 16, 64);
     const first = tuner.selectProfile(jump_request);
     tuner.record(tunerTestBatchWithProfile(1024, first, 1_000_000));
     // An in-band batch between the jumps moves the per-item model a long way.
@@ -3906,7 +3912,8 @@ test "adaptive work tuner two jumps to the same count get the same shape" {
 
 test "adaptive work tuner a jump keeps its held shape across a shifted window median" {
     var tuner = try inlineSettledTestTuner();
-    const jump_request = tunerTestRequest(1024, 4, 16, 64);
+    // Enough workers that the per-item model's move changes the predicted count.
+    const jump_request = tunerTestRequest(1024, 64, 16, 64);
     const first = tuner.selectProfile(jump_request);
     tuner.record(tunerTestBatchWithProfile(1024, first, 1_000_000));
     // A whole in-band window at 2.5x the per-item cost moves the median; it stays inline.
@@ -4762,6 +4769,8 @@ test "a nested run of an owner's tuned selection keeps its aligned range set" {
         .largest_range_items = 256,
         .sample_window = 1,
         .threaded_batch_ns = 1000,
+        // Four ranges per participant: a 96-item range, off the 64-item default.
+        .max_ranges_per_participant = 4,
     });
     // One slow inline sample moves the tuner to probing a threaded candidate.
     tuner.record(tunerTestBatchWithProfile(1024, tuner.selectProfile(tunerTestRequest(1024, 2, 16, 64)), 200_000));
