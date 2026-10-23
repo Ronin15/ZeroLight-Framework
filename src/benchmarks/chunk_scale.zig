@@ -1503,7 +1503,7 @@ fn navFixtureOver(allocator: std.mem.Allocator, io: std.Io, fixture: Fixture, ca
     const pipeline = try SimulationPipeline.init(allocator, &data, base.world.worldWidthPixels(), base.world.worldHeightPixels(), .{
         .pathfinding = capacity,
         .navigation_world = &base.world,
-        .nav_build_thread_system = thread_system,
+        .build_thread_system = thread_system,
         .dig = base.dig,
     });
     return .{ .base = base, .pipeline = pipeline, .io = io, .threads = thread_system };

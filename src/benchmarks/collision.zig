@@ -113,14 +113,16 @@
 //! The trigger patch groups run each change through the production commit seam on a pipeline
 //! over the fixture (nav over a one-level walkable world fixed at the largest size's), on the
 //! case's thread system; one sample is the seam's trigger sync time
-//! (`SimulationPipeline.Perf.seam_trigger_sync_ns`: `CollisionSystem.syncCommittedTriggers`). The first seam
-//! builds the cold store. They assert fixture invariants only, not their pass shapes: the
-//! cold store's pair count, that each sync changes exactly the moved statics, that the patch
-//! queried only the changes (not a rebuild over the row pool), the stored pair count after
-//! every patch, and that after the cold seam and after the last measured seam (each growing
-//! the stored-trigger contact bound as needed) a second collision step counts no pair-bound
-//! overflow (the first may count a one-off slot growth). They run `serial-direct` and the
-//! fixed worker-count cases only, no adaptive case. Each prints `per_change=`, and with
+//! (`SimulationPipeline.Perf.seam_trigger_sync_ns`:
+//! `CollisionSystem.syncCommittedTriggers`). The pipeline's init builds the cold store;
+//! `reserveFrame` tops up the bound. They assert fixture invariants only, not their pass
+//! shapes: the cold store's pair count, that each sync changes exactly the moved statics,
+//! that the patch queried only the changes (not a rebuild over the row pool), the stored
+//! pair count after every patch, and that after the first, untimed seam and after the last
+//! measured seam (each growing the stored-trigger contact bound as needed) a second
+//! collision step at the world's strips counts no pair-bound overflow (the first may count
+//! a one-off slot growth). They run `serial-direct` and the fixed worker-count cases only,
+//! no adaptive case. Each prints `per_change=`, and with
 //! `--details` the main share in `serial-direct` only (no worker exists, so the whole
 //! sync is main) and, under each row, the query items and the stored pairs.
 //! - `collision-static-trigger-change`: the `collision-static-triggers` fixture's stored pairs
@@ -164,7 +166,6 @@ const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
-const rangeCount = @import("../app/thread_system.zig").rangeCount;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const CollisionStats = @import("../game/systems/collision.zig").CollisionStats;
@@ -473,7 +474,9 @@ fn runShapeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const shape = try gridShapeFor(item_count);
     var data = try createGridFixture(allocator, shape);
     defer data.deinit();
-    var stats = try measureCase(allocator, io, options, case, shape.bodies(), &data, .{});
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    var stats = try measureCase(allocator, io, options, case, shape.bodies(), &data, &threads, .{});
     std.debug.assert(stats.output_count == shape.contacts());
     const stages = stats.collision_stages.?;
     if (stages.entries > shape.bodies() * denseStripsPerBodyBound()) return error.CollisionEntriesPastStripBound;
@@ -489,7 +492,9 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var data = try createFixtureWithMode(allocator, item_count, mode);
     defer data.deinit();
     if (mode == .dense) try checkPairBoundFlags(allocator, io, case, &data);
-    const stats = try measureCase(allocator, io, options, case, item_count, &data, .{});
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    const stats = try measureCase(allocator, io, options, case, item_count, &data, &threads, .{});
     if (stats.iterations > 0 and stats.output_count != fixtureContacts(item_count, mode)) return error.CollisionContactCountMismatch;
     // A dense strip's rows overlap in x past one lane group, so the sweep runs its lanes.
     if (mode == .dense and stats.iterations > 0 and stats.collision_stages.?.simd_groups == 0) return error.CollisionSweepRanNoLanes;
@@ -664,7 +669,9 @@ fn runStaticCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Option
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var fixture = try createStaticHeavyFixture(allocator, static_count, placement);
     defer fixture.data.deinit();
-    var mover: ?StaticMover = if (move_static) try StaticMover.init(allocator, io, &fixture, case) else null;
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    var mover: ?StaticMover = if (move_static) try StaticMover.init(allocator, io, &fixture, case, &threads) else null;
     defer if (mover) |*static_mover| static_mover.deinit();
     var colliders = StaticColliderSystem.init(allocator);
     defer colliders.deinit();
@@ -674,7 +681,7 @@ fn runStaticCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Option
         try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles), null);
     }
 
-    var stats = try measureCase(allocator, io, options, case, static_dynamic_count, &fixture.data, .{
+    var stats = try measureCase(allocator, io, options, case, static_dynamic_count, &fixture.data, &threads, .{
         .mover = if (mover) |*static_mover| static_mover else null,
         .colliders = if (move_static) null else &colliders,
         .swept_bodies = static_dynamic_count,
@@ -818,7 +825,9 @@ fn runStaticTriggersCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     try colliders.rebuild(&fixture.data, ColliderGeometry.init(tile_size, cells, cells, default_chunk_size_tiles), null);
     if (static_colliders_test_support.liveRowCount(colliders) != 2 * pair_count) return error.WrongStaticCount;
 
-    var stats = try measureCase(allocator, io, options, case, pair_count, &fixture.data, .{
+    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
+    defer threads.deinit();
+    var stats = try measureCase(allocator, io, options, case, pair_count, &fixture.data, &threads, .{
         .colliders = &colliders,
         .toggle = &fixture.toggle,
         .reserved_cold_growth = true,
@@ -945,18 +954,18 @@ fn runStaticTriggerWideCase(allocator: std.mem.Allocator, io: std.Io, options: s
     return stats;
 }
 
-// Builds the pipeline over a `cells` world, whose first seam builds the cold trigger store
-// (a rebuild over every row, growing the stored-trigger contact bound), then moves `move`'s
-// static through the production commit seam each step; the sample is each seam's trigger
-// sync. After the cold seam and after the last measured seam, one collision step emits the
-// stored pairs with no pair-bound overflow.
+// Builds the pipeline over a `cells` world, whose init builds the cold trigger store (a
+// rebuild over every row; `reserveFrame` tops up the stored-trigger contact bound), then
+// moves `move`'s static through the production commit seam each step; the sample is each
+// seam's trigger sync. After the first seam and after the last measured seam, one collision
+// step emits the stored pairs with no pair-bound overflow.
 fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *DataSystem, cells: [2]u32, move: *fixtures.StaticMove, shape: TriggerPatchShape) !suite.RunStats {
-    var seam = try StaticSeam.init(allocator, io, data, cells[0], cells[1], fixtures.StaticMove.structural_headroom, case);
-    defer seam.deinit();
-    if (static_colliders_test_support.liveRowCount(seam.colliders().*) != shape.static_count) return error.WrongStaticCount;
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
-    // The cold store: the first seam rebuilds over every row.
+    var seam = try StaticSeam.init(allocator, io, data, cells[0], cells[1], fixtures.StaticMove.structural_headroom, case, &threads);
+    defer seam.deinit();
+    if (static_colliders_test_support.liveRowCount(seam.colliders().*) != shape.static_count) return error.WrongStaticCount;
+    // Untimed: the first seam, with the cold store built at init.
     _ = try seam.commit(data, &.{}, &threads);
     const system = &seam.pipeline().collision;
     if (system.trigger_store.pair_count != shape.stored_pairs) return error.TriggerPairCountMismatch;
@@ -1074,10 +1083,10 @@ fn measureRebuild(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
         if (static_colliders_test_support.liveRowCount(colliders) != static_count) return error.WrongStaticCount;
         var batches: [rebuild_stages.len]BatchStats = undefined;
         for (&batches, rebuild_stages) |*batch, stage| batch.* = colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
-        try checkRebuildWork(batches, data.slots.items.len, static_count, chunk_count);
+        try suite.checkRebuildWork(batches, data.slots.items.len, static_count, chunk_count);
         try suite.checkStagesDispatched(case, &threads, stage_range, &batches);
         for (batches, rebuild_stages) |batch, stage| try checkTunerSelected(case, &threads, tuners.getPtrConst(stage), batch);
-        for (batches) |batch| try checkRebuildOnWorkers(case, &threads, batch);
+        for (batches) |batch| try suite.checkRebuildOnWorkers(case, &threads, batch);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, colliders.last_batches.get(.rewrite));
         main_total += elapsed_ns -| static_colliders_test_support.lastOffMainNs(colliders);
@@ -1104,31 +1113,12 @@ fn printStageDetails(stats: *suite.RunStats, stages: anytype, shapes: anytype, s
     stats.details.print("\n", .{});
 }
 
-// The rebuild's pass-shape counts on this fixture: every entity slot selected, every static
-// planned and touched, one footprint chunk and no coarse cell per one-tile static, at least
-// one fill unit per span and per query record, and one installed block per occupied chunk.
-fn checkRebuildWork(batches: [rebuild_stages.len]BatchStats, slot_count: usize, static_count: usize, chunk_count: usize) !void {
-    const select, const plan, const touch, const group_batch, const rewrite, const install = batches;
-    if (select.item_count != slot_count) return error.RebuildSelectMissedSlots;
-    if (plan.item_count != static_count or touch.item_count != static_count) return error.RebuildPlanMissedStatics;
-    if (group_batch.item_count != static_count) return error.RebuildGroupMissedTouches;
-    if (rewrite.item_count < 2 * static_count) return error.RebuildFillMissedStatics;
-    if (install.item_count != chunk_count) return error.RebuildInstallMissedChunks;
-}
-
 // An adaptive case's rebuild or sync stage, whenever the case allows a worker, selects its
 // shape through its own tuner at the stage's items.
 fn checkTunerSelected(case: suite.BenchmarkCase, threads: *const ThreadSystem, tuner: *const AdaptiveWorkTuner, batch: BatchStats) error{ColliderStageSkippedItsTuner}!void {
     if (!case.adaptive or batch.item_count == 0 or threads.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
     const request = tuner.last_request orelse return error.ColliderStageSkippedItsTuner;
     if (request.item_count != batch.item_count) return error.ColliderStageSkippedItsTuner;
-}
-
-// The tuned case's rebuild stage with more than one aligned range runs on workers: a fresh
-// rebuild tuner's first selection is the full pool (`rebuild_tuner_config`).
-fn checkRebuildOnWorkers(case: suite.BenchmarkCase, threads: *const ThreadSystem, batch: BatchStats) error{RebuildStageRanInline}!void {
-    if (case.adaptive_range_mode != .tuned or threads.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
-    if (rangeCount(batch.item_count, batch.range_alignment_items) > 1 and batch.ran_inline) return error.RebuildStageRanInline;
 }
 
 // An empty collider system with the case's stage controls and fresh tuners, as a new
@@ -1239,7 +1229,7 @@ const DenseChangeFixture = struct {
     // Every static of a square region of `change_count / dense_change_per_chunk` chunks
     // changes; the region has an even side, so each chunk's pair-swap partner is in it. A
     // smaller count changes the first `change_count / 4` statics of each 2 x 2-region chunk.
-    fn init(allocator: std.mem.Allocator, io: std.Io, change_count: usize, case: suite.BenchmarkCase, statics: DenseStatics) !DenseChangeFixture {
+    fn init(allocator: std.mem.Allocator, io: std.Io, change_count: usize, case: suite.BenchmarkCase, statics: DenseStatics, threads: *ThreadSystem) !DenseChangeFixture {
         const region_chunks = @max(change_count / dense_change_per_chunk, 4);
         const moves_per_chunk = change_count / region_chunks;
         if (moves_per_chunk == 0 or moves_per_chunk > dense_change_per_chunk or moves_per_chunk * region_chunks != change_count) return error.DenseChangeNotPerChunk;
@@ -1280,7 +1270,7 @@ const DenseChangeFixture = struct {
 
         // The dense world's two-tile pitch grid side fits u32.
         const cells: u32 = @intCast(2 * dense_change_side);
-        var seam = try StaticSeam.init(allocator, io, &data, cells, cells, structuralEventHeadroom(0, change_count), case);
+        var seam = try StaticSeam.init(allocator, io, &data, cells, cells, structuralEventHeadroom(0, change_count), case, threads);
         errdefer seam.deinit();
         if (static_colliders_test_support.liveRowCount(seam.colliders().*) != dense_change_side * dense_change_side) return error.WrongStaticCount;
         return .{
@@ -1418,10 +1408,10 @@ fn runStaticDenseSpikeCase(allocator: std.mem.Allocator, io: std.Io, options: su
 
 fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize, load: DenseLoad) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var fixture = try DenseChangeFixture.init(allocator, io, change_count, case, .solid);
-    defer fixture.deinit();
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
+    var fixture = try DenseChangeFixture.init(allocator, io, change_count, case, .solid, &threads);
+    defer fixture.deinit();
 
     // The first dense sync grows the region chunks' payloads. A spike's warmup has no dense
     // sync, so one untimed dense round trip takes that growth out of the timed syncs, and
@@ -1487,12 +1477,12 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
 // commit seam, then the timed trigger sync.
 fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    var fixture = try DenseChangeFixture.init(allocator, io, change_count, case, .checkered_triggers);
-    defer fixture.deinit();
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
-    // The cold store: the first seam rebuilds over every row, every static home, and grows
-    // the stored-trigger contact bound.
+    var fixture = try DenseChangeFixture.init(allocator, io, change_count, case, .checkered_triggers, &threads);
+    defer fixture.deinit();
+    // Untimed: the first seam, with the cold store built at init over every row, every static
+    // home, and the stored-trigger contact bound topped up by `reserveFrame`.
     _ = try fixture.seam.commit(&fixture.data, &.{}, &threads);
     const system = &fixture.seam.pipeline().collision;
     const home_pairs = denseHomeTriggerPairs(.checkered_triggers);
@@ -1504,6 +1494,7 @@ fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, opt
     const away_pairs = blk: {
         var cold = CollisionSystem.init(allocator);
         defer cold.deinit();
+        cold.strips = CollisionStrips.ofWorld(&fixture.seam.world);
         try cold.syncCommittedTriggers(&fixture.data, fixture.seam.collidersConst().view(), &threads);
         break :blk cold.trigger_store.pair_count;
     };
@@ -1553,14 +1544,19 @@ const StaticSeam = struct {
     world: WorldSystem,
     seam: fixtures.PipelineSeam,
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, data: *const DataSystem, cells_x: u32, cells_y: u32, structural_headroom: usize, case: suite.BenchmarkCase) !StaticSeam {
+    // `threads` is the case's thread system, which builds the colliders, nav, and the stored
+    // trigger pairs at init and runs the case's seams after.
+    fn init(allocator: std.mem.Allocator, io: std.Io, data: *const DataSystem, cells_x: u32, cells_y: u32, structural_headroom: usize, case: suite.BenchmarkCase, threads: *ThreadSystem) !StaticSeam {
         var tileset = try fixtures.loadTilesetMeta(allocator, io);
         defer tileset.deinit();
         // The bench grids' tile counts fit a level side.
         var world = try fixtures.buildBandedWorldSized(allocator, &tileset, @intCast(cells_x), @intCast(cells_y), 1, "grass", "grass");
         errdefer world.deinit();
         if (world.tile_size != tile_size or world.chunk_size_tiles != default_chunk_size_tiles) return error.StaticSeamWorldGridMismatch;
-        var seam = try fixtures.PipelineSeam.init(allocator, data, &world, .{ .structural_headroom = structural_headroom });
+        var seam = try fixtures.PipelineSeam.init(allocator, data, &world, .{
+            .structural_headroom = structural_headroom,
+            .build_thread_system = threads,
+        });
         errdefer seam.deinit();
         seam.setCaseTuners(case);
         return .{ .world = world, .seam = seam };
@@ -1598,23 +1594,18 @@ const StaticSeam = struct {
         return .{ .ns = pipe.perf.seam_trigger_sync_ns, .query_items = pipe.collision.trigger_query_batch.item_count };
     }
 
-    // Two untimed collision steps on the pipeline after its trigger seams, at the case's
-    // fixed controls. The first may count a one-off slot growth (a wide dynamic's static
-    // query slot); the second counts no pair-bound overflow. Every step checks its stored and
-    // dynamic contacts against the contact bound the seams declared, so the seams' bound
-    // growth covers the stored pairs.
+    // Two untimed collision steps on the pipeline after its trigger seams, at the world's
+    // strips and the case's controls (`PipelineSeam.collisionStep`). The first may count a
+    // one-off slot growth (a wide dynamic's static query slot); the second counts no
+    // pair-bound overflow. Every step checks its stored and dynamic contacts against the
+    // contact bound init's reserve and the seams declared, so that bound covers the stored
+    // pairs.
     fn checkStoredPairsInBound(self: *StaticSeam, data: *const DataSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !void {
-        const pipe = &self.seam.pipeline;
-        const config: CollisionConfig = .{
-            .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
-            .max_worker_threads = case.maxWorkerThreads(),
-            .adaptive = case.adaptive,
-            .static_colliders = pipe.static_colliders.view(),
-        };
-        _ = try pipe.collision.update(data, &self.seam.frame.contacts, thread_system, config);
-        const before = pipe.collision.perf.pair_bound_overflows;
-        _ = try pipe.collision.update(data, &self.seam.frame.contacts, thread_system, config);
-        if (pipe.collision.perf.pair_bound_overflows != before) return error.TriggerSeamPairBoundOverflowed;
+        const collision = &self.seam.pipeline.collision;
+        _ = try self.seam.collisionStep(data, &self.world, thread_system, case);
+        const before = collision.perf.pair_bound_overflows;
+        _ = try self.seam.collisionStep(data, &self.world, thread_system, case);
+        if (collision.perf.pair_bound_overflows != before) return error.TriggerSeamPairBoundOverflowed;
     }
 };
 
@@ -1627,10 +1618,10 @@ const StaticMover = struct {
     // The last seam's nav reaction stages' worker time.
     nav_off_main_ns: u64 = 0,
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, fixture: *const StaticHeavyFixture, case: suite.BenchmarkCase) !StaticMover {
+    fn init(allocator: std.mem.Allocator, io: std.Io, fixture: *const StaticHeavyFixture, case: suite.BenchmarkCase, threads: *ThreadSystem) !StaticMover {
         // The statics' tiles: two tiles per pitch cell a side.
         const cells: u32 = @intCast(2 * fixture.side);
-        var seam = try StaticSeam.init(allocator, io, &fixture.data, cells, cells, fixtures.StaticMove.structural_headroom, case);
+        var seam = try StaticSeam.init(allocator, io, &fixture.data, cells, cells, fixtures.StaticMove.structural_headroom, case, threads);
         errdefer seam.deinit();
         if (static_colliders_test_support.liveRowCount(seam.colliders().*) != fixture.side * fixture.side) return error.WrongStaticCount;
         const home = pitchCellOrigin(fixture.side - 1, fixture.side - 1);
@@ -1701,9 +1692,9 @@ const StepInputs = struct {
     one_strip_per_body: bool = false,
 };
 
-// Warms up, settles the stage tuners, and times one step per iteration: the inputs' static
-// move or tier flip, then the collision update over `data`.
-fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, data: *DataSystem, inputs: StepInputs) !suite.RunStats {
+// Warms up, settles the stage tuners, and times one step per iteration on the case's
+// `thread_ptr`: the inputs' static move or tier flip, then the collision update over `data`.
+fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, data: *DataSystem, thread_ptr: *ThreadSystem, inputs: StepInputs) !suite.RunStats {
     var own_system = CollisionSystem.init(allocator);
     defer own_system.deinit();
     // A mover's steps run on its pipeline's collision system, which its seams synced.
@@ -1711,10 +1702,6 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     useCaseTuners(system, case);
     var contacts = RangeOutputStream(CollisionContact).init(allocator);
     defer contacts.deinit();
-
-    var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
-    defer threads.deinit();
-    const thread_ptr = &threads;
 
     if (inputs.reserved_cold_growth) {
         try system.reserve(data.movementBodySliceConst().entities.len);

@@ -344,7 +344,7 @@ pub const GameDemoState = struct {
         dig_config: DigConfig,
         worker_participant_count: usize,
         pathfinding_override: ?PathfindingCapacity,
-        nav_build_thread_system: ?*ThreadSystem,
+        build_thread_system: ?*ThreadSystem,
         mover_count: usize,
         asset_store: AssetStore,
     ) !GameDemoState {
@@ -420,7 +420,7 @@ pub const GameDemoState = struct {
                 .worker_participant_count = worker_participant_count,
             },
             .navigation_world = &world,
-            .nav_build_thread_system = nav_build_thread_system,
+            .build_thread_system = build_thread_system,
             .dig = dig_config,
             .structural_headroom = demo_structural_headroom,
         });

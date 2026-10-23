@@ -16,6 +16,7 @@ const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const DiagnosticCount = @import("../app/thread_system.zig").DiagnosticCount;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const rangeCount = @import("../app/thread_system.zig").rangeCount;
 const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const PerfBatchStage = @import("../app/runtime_perf_log.zig").BatchStage;
 const PerfBenchBatchStage = @import("../app/runtime_perf_log.zig").BenchBatchStage;
@@ -23,6 +24,7 @@ const PerfMetric = @import("../app/runtime_perf_log.zig").Metric;
 const PerfTiming = @import("../app/runtime_perf_log.zig").Timing;
 const NavMainPhases = @import("../game/systems/pathfinding/types.zig").NavMainPhases;
 const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
+const RebuildStage = @import("../game/systems/static_colliders.zig").RebuildStage;
 
 pub const default_items_per_range = (ThreadSystemConfig{}).items_per_range;
 /// The fixed partition of a chunk-partitioned stage: one chunk per range.
@@ -964,6 +966,27 @@ pub fn checkStageDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSy
 /// `checkStageDispatched` over each of `batches`.
 pub fn checkStagesDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, items_per_range: ?usize, batches: []const BatchStats) error{BenchStageRanInline}!void {
     for (batches) |batch| try checkStageDispatched(case, thread_system, items_per_range, batch);
+}
+
+/// Fails when the tuned case on a thread system with workers ran a rebuild stage inline over
+/// more than one aligned range: a fresh rebuild tuner's first selection is the full pool
+/// (`rebuild_tuner_config`). Other cases pass.
+pub fn checkRebuildOnWorkers(case: BenchmarkCase, threads: *const ThreadSystem, batch: BatchStats) error{RebuildStageRanInline}!void {
+    if (case.adaptive_range_mode != .tuned or threads.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
+    if (rangeCount(batch.item_count, batch.range_alignment_items) > 1 and batch.ran_inline) return error.RebuildStageRanInline;
+}
+
+/// A static collider rebuild's pass-shape counts, its batch records in `RebuildStage` order,
+/// on a fixture of one-tile statics: every entity slot selected, every static planned and
+/// touched, one footprint chunk and no coarse cell per static, at least one fill unit per
+/// span and per query record, and one installed block per occupied chunk.
+pub fn checkRebuildWork(batches: [std.enums.values(RebuildStage).len]BatchStats, slot_count: usize, static_count: usize, chunk_count: usize) !void {
+    const select, const plan, const touch, const group_batch, const rewrite, const install = batches;
+    if (select.item_count != slot_count) return error.RebuildSelectMissedSlots;
+    if (plan.item_count != static_count or touch.item_count != static_count) return error.RebuildPlanMissedStatics;
+    if (group_batch.item_count != static_count) return error.RebuildGroupMissedTouches;
+    if (rewrite.item_count < 2 * static_count) return error.RebuildFillMissedStatics;
+    if (install.item_count != chunk_count) return error.RebuildInstallMissedChunks;
 }
 
 pub fn skipIfWorkersUnavailable(case: BenchmarkCase) ?RunStats {

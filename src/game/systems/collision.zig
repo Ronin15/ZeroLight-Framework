@@ -751,6 +751,8 @@ pub const CollisionSystem = struct {
     trigger_query_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     trigger_query_rebuild_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(rebuild_tuner_config),
     emit_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    /// The last `update`'s strips, or the ones the owner set before a step ran (the world's,
+    /// for the pipeline's init build); the engine tile until either.
     strips: CollisionStrips = .default,
     static_pair_slots: SlotList(StaticPairBuffer) = .empty,
     static_pairs: std.ArrayList(KeyedContact) = .empty,
@@ -969,7 +971,7 @@ pub const CollisionSystem = struct {
     /// builds exact drops and located inserts, and the store rewrites only the pages they
     /// touch. Anything else rebuilds from the row pool. Growth is this call's, on this
     /// thread; the query and the store's stages use `thread_system` and run inline below
-    /// their gates. Strips are the last collision step's, the engine tile until one has run.
+    /// their gates. Strips are `strips`: the last collision step's, or the owner's before one.
     /// The next `update` with this revision does not patch. A patch error leaves the stored
     /// pairs and revision unchanged; a rebuild error leaves the store empty and not ready.
     /// Either way the next call, or the next `update`, retries: a rebuild after a rebuild

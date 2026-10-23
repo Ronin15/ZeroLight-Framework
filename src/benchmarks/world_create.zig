@@ -5,38 +5,45 @@
 //! `world-create`: one world created and destroyed through the production build, timed by
 //! phase: `surface` (`initProceduralFromMeta`, the threaded paint), `stack`
 //! (`addUndergroundLevelStack`), `nav` (`SimulationPipeline.init` on the world, the static
-//! colliders and the nav build), and `destroy` (`pipeline.deinit`, then the world), on the
-//! serial and tuned cases. Configs: sides 256, 1024, and 2048 at 8 levels, then 32 and 128
-//! levels at side 256 (item code `level side * 1000 + levels`). One untimed pass per config
-//! on a zero-worker thread system counts live bytes after each create phase and after
-//! destroy. Prints each phase's mean time, `live_kb` after `surface`, `stack`, and `nav`
-//! (the counted pass), and `after_destroy_bytes=`. Pass shape: each phase's time and bytes
+//! colliders, the nav build, and the stored-trigger build, empty here), and `destroy`
+//! (`pipeline.deinit`, then the world), on the serial and tuned cases. Configs: sides 256,
+//! 1024, and 2048 at 8 levels, then 32 and 128 levels at side 256 (item code
+//! `level side * 1000 + levels`). One untimed pass per config on a zero-worker thread system
+//! counts live bytes after each create phase and after destroy. Prints each phase's mean
+//! time, `live_kb` after `surface`, `stack`, and `nav` (the counted pass), and
+//! `after_destroy_bytes=`. Pass shape: each phase's time and bytes
 //! at most linear in level area times levels, memory following what exists, and zero bytes
 //! after destroy. Asserts check the zero after destroy and, once per case at the smallest
 //! config, that the phases build the world `initProcedural` builds.
 //!
 //! `world-create-statics`: a world's pipeline created over its statics and its first commit
 //! seam, through the production entries (`SimulationPipeline.init` with nav over the world on
-//! the case's threads, `SimulationPipeline.reserveFrame`, then `commitStructuralAndReact`
-//! with no commands), on a fixed one-level 256² walkable world. Item count: statics, two per
-//! pitch cell of a square on the world's corner (a solid and a trigger half a tile past it,
-//! one stored trigger pair per cell). Timed: `init` and `first_seam`; the world and data
-//! build untimed. Today the stored-trigger store first builds in the first seam's trigger
-//! sync (a rebuild over every row, which also grows the stored trigger contact bound).
-//! Cases: serial, tuned, and `thread-fixed-auto`, which pins the first seam's trigger rebuild
-//! stages (the rebuild query and the store's four) to the case's fixed range on every worker
-//! between `init` and the seam, and fails when one of them ran inline over more than one
-//! range. The init's collider rebuild and nav build run on fresh tuners no control reaches.
-//! `main=` is the create's time less the off-main time of the collider rebuild and the
-//! trigger rebuild stages; the nav build's worker time is not split out yet, so it counts
-//! as main. A measuring landing: pass shape, for the fix that builds the store at create, is
-//! create plus first seam linear in statics with main per static flat, the first seam's
-//! trigger sync O(1) (no rebuild), and the first collision step after it emitting every
-//! stored pair with no pair-bound overflow. Asserts check fixture invariants only: the
-//! collider rows, and one stored pair per cell after the first seam. Prints `statics=`,
-//! `stored_pairs=`, `init=`, `first_seam=`, `per_static=`, and `main=` with
-//! `main_per_item=`; `--details` adds the first seam's `trigger_sync=` time and its rebuild query's shape
-//! (`trigger_rebuild_query=` workers/ranges, the last measured create's).
+//! the case's threads, which builds the static colliders, nav, and the stored trigger pairs;
+//! `SimulationPipeline.reserveFrame`, which tops up the stored-trigger contact bound; then
+//! `commitStructuralAndReact` with no commands), on a fixed one-level 256² walkable world.
+//! Item count: statics, two per pitch cell of a square on the world's corner (a solid and a
+//! trigger half a tile past it, one stored trigger pair per cell). Timed: `init` and
+//! `first_seam`; the world and data build untimed. Cases: serial and tuned; the init's
+//! rebuild stages run on fresh tuners no control reaches. Per create, untimed checks: init
+//! stored every pair at the colliders' revision and the world's strips, and `reserveFrame`
+//! declared a trigger contact bound covering them; the collider rebuild selected every slot,
+//! planned, touched and grouped every static, filled every span and installed every
+//! occupied chunk; the trigger rebuild query covered every static, the insert place and sort
+//! every pair, the leaf stage their pages, the node stage at least one item, and no patch
+//! stage ran; in the tuned case with workers every rebuild stage over more than one aligned
+//! range (the collider rebuild's six, the trigger build's five) ran on workers; the first
+//! seam rebuilt nothing (its trigger rebuild records are init's, its patch query empty, its
+//! pair count kept); and a collision step after it at the world's strips emits every stored
+//! pair with no pair-bound overflow. `main=` is the create's time less the off-main time of the
+//! collider rebuild and the trigger build stages; the nav build's worker time is not split
+//! out yet, so it counts as main. Pass shape: time per static flat up to the insert sort's
+//! log factor; main per static flat (the nav build's fixed-world cost an intercept); the
+//! first seam's trigger sync O(1); every multi-range rebuild stage on workers in the tuned
+//! case; a first step with no overflow. Prints `statics=`, `stored_pairs=`, `init=`, `first_seam=`,
+//! `per_static=`, and `main=` with `main_per_item=`; `--details` adds the init's phases
+//! (`collider_rebuild=` and `trigger_build=` each with its main, `nav_build=`, and `rest=`,
+//! the init less the three), `first_seam=` with its trigger sync, and the shapes of the
+//! trigger build's and the collider rebuild's stages (the busiest over the measured creates).
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -47,12 +54,13 @@ const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const math = @import("../core/math.zig");
 const static_colliders_test_support = @import("../game/systems/static_colliders_test_support.zig");
-const pinThreadedProfile = @import("../game/simulation_pipeline_test_support.zig").pinThreadedProfile;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
-const AdaptiveWorkProfile = @import("../app/thread_system.zig").AdaptiveWorkProfile;
-const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const SimulationPipeline = @import("../game/simulation_pipeline.zig").SimulationPipeline;
+const CollisionStrips = @import("../game/systems/collision.zig").CollisionStrips;
+const TriggerStore = @import("../game/systems/collision_triggers.zig").TriggerStore;
+const trigger_page_capacity = @import("../game/systems/collision_triggers.zig").page_capacity;
+const RebuildStage = @import("../game/systems/static_colliders.zig").RebuildStage;
 const WorldBuildConfig = @import("../game/world/system.zig").WorldBuildConfig;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const fixtures = @import("fixtures.zig");
@@ -146,7 +154,7 @@ fn createAndDestroy(
     errdefer data.deinit();
     var pipeline = try SimulationPipeline.init(allocator, &data, world.worldWidthPixels(), world.worldHeightPixels(), .{
         .navigation_world = &world,
-        .nav_build_thread_system = threads,
+        .build_thread_system = threads,
     });
     const nav = markPhase(io, counter);
 
@@ -277,12 +285,10 @@ pub const statics_group = suite.BenchmarkGroup{
     .item_counts = &statics_counts,
     .runCase = runStaticsCase,
     .write_workload = writeStaticsWorkload,
-    // The init's stages run their own fresh tuners; the fixed case pins the first seam's
-    // trigger rebuild.
-    .cases = &statics_cases,
+    // The init's rebuild stages run on fresh tuners no control reaches.
+    .cases = &suite.serial_and_tuned_cases,
 };
 
-const statics_cases = suite.casesNamed(&.{ "serial-direct", "thread-fixed-auto", "thread-adaptive-tuned-range" });
 const statics_counts = [_]usize{ 2_048, 8_192, 32_768 };
 // The fixed world: one level, the largest count's pitch grid a side.
 const statics_world_tiles: u16 = 256;
@@ -294,6 +300,8 @@ const StaticsFixture = struct {
     data: DataSystem,
     world: WorldSystem,
     cells: usize,
+    // The chunks the statics occupy: the square's side in chunks, squared.
+    chunks: usize,
 
     fn deinit(self: *StaticsFixture) void {
         self.world.deinit();
@@ -326,77 +334,151 @@ fn createStaticsFixture(allocator: std.mem.Allocator, io: std.Io, statics: usize
         _ = try addStatic(&data, origin, tile, false);
         _ = try addStatic(&data, .{ .x = origin.x + tile / 2, .y = origin.y + tile / 2 }, tile, true);
     };
-    return .{ .data = data, .world = world, .cells = cells };
+    const chunk_tiles: usize = world.chunk_size_tiles;
+    const chunks_side = (side * statics_pitch_tiles + chunk_tiles - 1) / chunk_tiles;
+    return .{ .data = data, .world = world, .cells = cells, .chunks = chunks_side * chunks_side };
 }
+
+const collider_rebuild_stages = std.enums.values(RebuildStage);
+const TriggerRebuildStage = @FieldType(TriggerStore, "last_rebuild_batches").Key;
+const trigger_rebuild_stages = std.enums.values(TriggerRebuildStage);
+// The trigger build's stages: the rebuild query, then the store's.
+const trigger_stage_count = 1 + trigger_rebuild_stages.len;
 
 const StaticsSample = struct {
     init_ns: u64,
     seam_ns: u64,
+    // The first seam's `SimulationPipeline.Perf.seam_trigger_sync_ns`.
     trigger_sync_ns: u64,
-    // The collider rebuild's and the trigger rebuild stages' worker dispatch time.
-    off_main_ns: u64,
-    // The first seam's trigger rebuild query.
-    query_batch: BatchStats,
+    // The init's phases (`SimulationPipeline.Perf`'s `create_*`).
+    collider_rebuild_ns: u64,
+    nav_build_ns: u64,
+    trigger_build_ns: u64,
+    // Each phase's stages' worker dispatch time.
+    collider_off_main_ns: u64,
+    trigger_off_main_ns: u64,
+    collider_batches: [collider_rebuild_stages.len]BatchStats,
+    trigger_batches: [trigger_stage_count]BatchStats,
 };
 
-// The first seam's trigger rebuild stages: the rebuild query, then the store's.
-const trigger_rebuild_stage_count = 5;
-
-fn triggerRebuildBatches(pipeline: *const SimulationPipeline) [trigger_rebuild_stage_count]BatchStats {
+fn triggerRebuildBatches(pipeline: *const SimulationPipeline) [trigger_stage_count]BatchStats {
     const store_batches = pipeline.collision.trigger_store.last_rebuild_batches.values;
     return [1]BatchStats{pipeline.collision.trigger_rebuild_query_batch} ++ store_batches;
 }
 
-// The fixed case's control: every trigger rebuild stage tuner replaced by one pinned to the
-// case's range on every worker, so the first seam's rebuild dispatches at that shape. The
-// replacement has no full-pool first selection, which would override the pin. Other cases
-// keep production's fresh rebuild tuners.
-fn pinTriggerRebuild(pipeline: *SimulationPipeline, case: suite.BenchmarkCase, threads: *const ThreadSystem) void {
-    const items_per_range = case.stageItemsPerRange(1) orelse return;
-    if (threads.workerThreadCount() == 0) return;
-    const profile: AdaptiveWorkProfile = .{ .worker_threads = threads.workerThreadCount(), .items_per_range = items_per_range };
-    pinFixed(&pipeline.collision.trigger_query_rebuild_tuner, profile);
-    for (&pipeline.collision.trigger_store.rebuild_tuners.values) |*tuner| pinFixed(tuner, profile);
+fn colliderRebuildBatches(pipeline: *const SimulationPipeline) [collider_rebuild_stages.len]BatchStats {
+    var batches: [collider_rebuild_stages.len]BatchStats = undefined;
+    for (&batches, collider_rebuild_stages) |*batch, stage| batch.* = pipeline.static_colliders.last_batches.get(static_colliders_test_support.colliderStage(stage));
+    return batches;
 }
 
-fn pinFixed(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void {
-    tuner.* = AdaptiveWorkTuner.init(.{});
-    pinThreadedProfile(tuner, profile);
+fn sumOffMainNs(batches: []const BatchStats) u64 {
+    var total: u64 = 0;
+    for (batches) |batch| total += offMainNs(batch);
+    return total;
 }
 
-// One create and first seam on `threads`, timed, then the teardown, untimed. Checks the
-// fixture invariants, and on the fixed case that the trigger rebuild ran on workers.
+// The init's trigger build: every pair stored at the colliders' revision and the world's
+// strips, the contact bound `reserveFrame` declared covering them, the rebuild query over
+// every static, the insert place and sort over every pair, the leaf stage over their pages,
+// the node stage over at least one item, and no patch stage.
+fn checkInitTriggerBuild(pipeline: *const SimulationPipeline, world: *const WorldSystem, statics: usize, cells: usize, batches: [trigger_stage_count]BatchStats) !void {
+    const collision = &pipeline.collision;
+    const store = &collision.trigger_store;
+    if (!store.ready or store.seen_revision != pipeline.static_colliders.view().revision) return error.InitTriggerStoreNotBuilt;
+    if (collision.trigger_strips.height != CollisionStrips.ofWorld(world).height) return error.InitTriggerStripsNotWorlds;
+    if (store.pair_count != cells) return error.TriggerPairCountMismatch;
+    if (collision.reserved_trigger_bound < store.pair_count) return error.InitTriggerBoundNotToppedUp;
+    if (batches[0].item_count != statics) return error.TriggerRebuildQueryMissedStatics;
+    const store_batches = &store.last_rebuild_batches;
+    if (store_batches.get(.insert_place).item_count != cells) return error.TriggerRebuildPlaceMissedPairs;
+    if (store_batches.get(.insert_sort).item_count != cells) return error.TriggerRebuildSortMissedPairs;
+    const pages = std.math.divCeil(usize, cells, trigger_page_capacity) catch unreachable; // lint:allow catch-unreachable: the page capacity is a nonzero constant
+    if (store_batches.get(.leaf).item_count != pages) return error.TriggerRebuildLeafMissedPages;
+    if (store_batches.get(.node).item_count < 1) return error.TriggerRebuildNodeSkipped;
+    if (collision.trigger_query_batch.item_count != 0) return error.InitTriggerBuildPatched;
+    for (store.last_batches.values) |batch| if (batch.item_count != 0) return error.InitTriggerBuildPatched;
+}
+
+// One create and first seam on `threads`, timed, then a collision step and the teardown,
+// untimed, with the group's checks.
 fn createWithStatics(allocator: std.mem.Allocator, io: std.Io, fixture: *StaticsFixture, statics: usize, case: suite.BenchmarkCase, threads: *ThreadSystem) !StaticsSample {
     const start_ns = suite.nowNs(io);
     var seam = try fixtures.PipelineSeam.init(allocator, &fixture.data, &fixture.world, .{
         .structural_headroom = 0,
         .pathfinding = .{ .worker_participant_count = threads.participantSlotCount() },
-        .nav_build_thread_system = threads,
+        .build_thread_system = threads,
     });
     defer seam.deinit();
     const init_end_ns = suite.nowNs(io);
     const pipeline = &seam.pipeline;
-    // The init's collider rebuild; the seam's sync replaces these records.
-    const rebuild_off_main_ns = static_colliders_test_support.lastOffMainNs(pipeline.static_colliders);
-    pinTriggerRebuild(pipeline, case, threads);
+    // Read before the seam, which clears `perf` and replaces the collider records.
+    const perf = pipeline.perf;
+    const collider_batches = colliderRebuildBatches(pipeline);
+    const trigger_batches = triggerRebuildBatches(pipeline);
+    if (static_colliders_test_support.liveRowCount(pipeline.static_colliders) != statics) return error.WrongStaticCount;
+    try suite.checkRebuildWork(collider_batches, fixture.data.slots.items.len, statics, fixture.chunks);
+    try checkInitTriggerBuild(pipeline, &fixture.world, statics, fixture.cells, trigger_batches);
+    for (collider_batches ++ trigger_batches) |batch| try suite.checkRebuildOnWorkers(case, threads, batch);
+
     const seam_start_ns = suite.nowNs(io);
     seam.frame.beginStep();
     _ = try seam.commit(&fixture.data, &fixture.world, &.{}, threads);
     const seam_end_ns = suite.nowNs(io);
-    if (static_colliders_test_support.liveRowCount(pipeline.static_colliders) != statics) return error.WrongStaticCount;
+    // The first seam rebuilt nothing: init's records stand, and it patched nothing.
+    if (!std.meta.eql(triggerRebuildBatches(pipeline), trigger_batches)) return error.FirstSeamRebuiltTriggers;
+    if (pipeline.collision.trigger_query_batch.item_count != 0) return error.FirstSeamPatchedTriggers;
     if (pipeline.collision.trigger_store.pair_count != fixture.cells) return error.TriggerPairCountMismatch;
-    const trigger_batches = triggerRebuildBatches(pipeline);
-    try suite.checkStagesDispatched(case, threads, case.stageItemsPerRange(1), &trigger_batches);
-    var off_main_ns = rebuild_off_main_ns;
-    for (trigger_batches) |batch| off_main_ns += offMainNs(batch);
+
+    // The first collision step emits every stored pair inside the declared bound.
+    const step = try seam.collisionStep(&fixture.data, &fixture.world, threads, case);
+    if (pipeline.collision.perf.pair_bound_overflows != 0) return error.FirstStepPairBoundOverflowed;
+    if (step.contact_count != fixture.cells) return error.FirstStepMissedStoredPairs;
     return .{
         .init_ns = suite.elapsedNs(start_ns, init_end_ns),
         .seam_ns = suite.elapsedNs(seam_start_ns, seam_end_ns),
         .trigger_sync_ns = pipeline.perf.seam_trigger_sync_ns,
-        .off_main_ns = off_main_ns,
-        .query_batch = trigger_batches[0],
+        .collider_rebuild_ns = perf.create_collider_rebuild_ns,
+        .nav_build_ns = perf.create_nav_build_ns,
+        .trigger_build_ns = perf.create_trigger_build_ns,
+        .collider_off_main_ns = sumOffMainNs(&collider_batches),
+        .trigger_off_main_ns = sumOffMainNs(&trigger_batches),
+        .collider_batches = collider_batches,
+        .trigger_batches = trigger_batches,
     };
 }
+
+// Mean nanoseconds of the statics group's totals.
+const StaticsTotals = struct {
+    init: u128 = 0,
+    seam: u128 = 0,
+    trigger_sync: u128 = 0,
+    main: u128 = 0,
+    collider_rebuild: u128 = 0,
+    collider_main: u128 = 0,
+    nav_build: u128 = 0,
+    trigger_build: u128 = 0,
+    trigger_main: u128 = 0,
+    rest: u128 = 0,
+
+    fn add(self: *StaticsTotals, sample: StaticsSample) void {
+        const ns = sample.init_ns + sample.seam_ns;
+        self.init += sample.init_ns;
+        self.seam += sample.seam_ns;
+        self.trigger_sync += sample.trigger_sync_ns;
+        self.main += ns -| (sample.collider_off_main_ns + sample.trigger_off_main_ns);
+        self.collider_rebuild += sample.collider_rebuild_ns;
+        self.collider_main += sample.collider_rebuild_ns -| sample.collider_off_main_ns;
+        self.nav_build += sample.nav_build_ns;
+        self.trigger_build += sample.trigger_build_ns;
+        self.trigger_main += sample.trigger_build_ns -| sample.trigger_off_main_ns;
+        self.rest += sample.init_ns -| (sample.collider_rebuild_ns + sample.nav_build_ns + sample.trigger_build_ns);
+    }
+
+    fn mean(total: u128, iterations: usize) u64 {
+        return @intCast(total / iterations);
+    }
+};
 
 fn runStaticsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, statics: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
@@ -406,31 +488,41 @@ fn runStaticsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
     defer threads.deinit();
     for (0..options.warmup_iterations) |_| _ = try createWithStatics(allocator, io, &fixture, statics, case, &threads);
     var accumulator = suite.StatsAccumulator.init(statics);
-    var totals: [4]u128 = @splat(0);
-    var query_batch: BatchStats = .{};
+    var totals = StaticsTotals{};
+    var collider_shapes = suite.StageShapes(collider_rebuild_stages.len){};
+    var trigger_shapes = suite.StageShapes(trigger_stage_count){};
     for (0..options.iterations) |_| {
         const sample = try createWithStatics(allocator, io, &fixture, statics, case, &threads);
-        query_batch = sample.query_batch;
-        const ns = sample.init_ns + sample.seam_ns;
-        totals[0] += sample.init_ns;
-        totals[1] += sample.seam_ns;
-        totals[2] += sample.trigger_sync_ns;
-        totals[3] += ns -| sample.off_main_ns;
-        accumulator.record(ns, .{});
+        totals.add(sample);
+        collider_shapes.add(sample.collider_batches);
+        trigger_shapes.add(sample.trigger_batches);
+        accumulator.record(sample.init_ns + sample.seam_ns, .{});
     }
     var stats = accumulator.finish();
     stats.batch_carried = false;
     stats.sample_count = statics;
     stats.output_count = fixture.cells;
     if (stats.iterations > 0) {
-        stats.deferred_count = @intCast(totals[0] / stats.iterations);
-        stats.fallback_deferred_count = @intCast(totals[1] / stats.iterations);
-        stats.main_ns = @intCast(totals[3] / stats.iterations);
-        stats.details.print("trigger_sync={f} trigger_rebuild_query={}w/{}r\n", .{
-            suite.formatDuration(@intCast(totals[2] / stats.iterations)),
-            if (query_batch.ran_inline) 0 else query_batch.active_worker_threads,
-            query_batch.range_count,
+        const n = stats.iterations;
+        stats.deferred_count = StaticsTotals.mean(totals.init, n);
+        stats.fallback_deferred_count = StaticsTotals.mean(totals.seam, n);
+        stats.main_ns = StaticsTotals.mean(totals.main, n);
+        stats.details.print("collider_rebuild={f} (main {f}) nav_build={f} trigger_build={f} (main {f}) rest={f} first_seam={f} (trigger_sync {f})\n", .{
+            suite.formatDuration(StaticsTotals.mean(totals.collider_rebuild, n)),
+            suite.formatDuration(StaticsTotals.mean(totals.collider_main, n)),
+            suite.formatDuration(StaticsTotals.mean(totals.nav_build, n)),
+            suite.formatDuration(StaticsTotals.mean(totals.trigger_build, n)),
+            suite.formatDuration(StaticsTotals.mean(totals.trigger_main, n)),
+            suite.formatDuration(StaticsTotals.mean(totals.rest, n)),
+            suite.formatDuration(StaticsTotals.mean(totals.seam, n)),
+            suite.formatDuration(StaticsTotals.mean(totals.trigger_sync, n)),
         });
+        var label_buffer: [48]u8 = undefined;
+        stats.details.print("trigger_build: query={s}", .{trigger_shapes.label(0, &label_buffer)});
+        for (trigger_rebuild_stages, 1..) |stage, index| stats.details.print(" {s}={s}", .{ @tagName(stage), trigger_shapes.label(index, &label_buffer) });
+        stats.details.print("\ncollider_rebuild:", .{});
+        for (collider_rebuild_stages, 0..) |stage, index| stats.details.print(" {s}={s}", .{ @tagName(stage), collider_shapes.label(index, &label_buffer) });
+        stats.details.print("\n", .{});
     }
     return stats;
 }

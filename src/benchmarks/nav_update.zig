@@ -388,7 +388,7 @@ const StaticMoveFixture = struct {
     }
 };
 
-fn initStaticMoveFixture(allocator: std.mem.Allocator, io: std.Io, other_statics: usize, dynamic_bodies: usize, participant_count: usize) !StaticMoveFixture {
+fn initStaticMoveFixture(allocator: std.mem.Allocator, io: std.Io, other_statics: usize, dynamic_bodies: usize, threads: *ThreadSystem) !StaticMoveFixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
     const moved = fixtures.StaticMove{
@@ -404,7 +404,8 @@ fn initStaticMoveFixture(allocator: std.mem.Allocator, io: std.Io, other_statics
     errdefer world.deinit();
     const seam = try fixtures.PipelineSeam.init(allocator, &data, &world, .{
         .structural_headroom = fixtures.StaticMove.structural_headroom,
-        .pathfinding = .{ .worker_participant_count = participant_count },
+        .pathfinding = .{ .worker_participant_count = threads.participantSlotCount() },
+        .build_thread_system = threads,
     });
     return .{
         .data = data,
@@ -421,9 +422,8 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
     const thread_ptr = &threads;
-    const participant_count = fixtures.participantCount(thread_ptr);
 
-    var fixture = try initStaticMoveFixture(allocator, io, other_statics, dynamic_bodies, participant_count);
+    var fixture = try initStaticMoveFixture(allocator, io, other_statics, dynamic_bodies, thread_ptr);
     defer fixture.deinit();
     fixture.seam.setCaseTuners(case);
     const nav = fixture.nav();
@@ -651,7 +651,7 @@ const DenseLayout = struct {
     }
 };
 
-fn initStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, change_count: usize, participant_count: usize, tail: bool) !StaticDenseFixture {
+fn initStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, change_count: usize, threads: *ThreadSystem, tail: bool) !StaticDenseFixture {
     const layout = DenseLayout.init(change_count);
 
     var data = DataSystem.init(allocator);
@@ -688,7 +688,8 @@ fn initStaticDenseFixture(allocator: std.mem.Allocator, io: std.Io, change_count
     const seam = try fixtures.PipelineSeam.init(allocator, &data, &world, .{
         // Per chunk: the moves and destroys, and a create per destroy unless the tail only moves.
         .structural_headroom = structuralEventHeadroom(if (tail) 0 else layout.chunk_count * dense_changes_per_chunk / 2, layout.chunk_count * dense_changes_per_chunk),
-        .pathfinding = .{ .worker_participant_count = participant_count },
+        .pathfinding = .{ .worker_participant_count = threads.participantSlotCount() },
+        .build_thread_system = threads,
     });
     return .{
         .allocator = allocator,
@@ -716,9 +717,8 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
     const thread_ptr = &threads;
-    const participant_count = fixtures.participantCount(thread_ptr);
 
-    var fixture = try initStaticDenseFixture(allocator, io, item_count, participant_count, tail);
+    var fixture = try initStaticDenseFixture(allocator, io, item_count, thread_ptr, tail);
     defer fixture.deinit();
     fixture.seam.setCaseTuners(case);
     const nav = fixture.nav();

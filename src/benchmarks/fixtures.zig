@@ -41,6 +41,9 @@ const default_chunk_size_tiles = @import("../game/world/system.zig").default_chu
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
 const SimulationPipeline = @import("../game/simulation_pipeline.zig").SimulationPipeline;
+const CollisionStats = @import("../game/systems/collision.zig").CollisionStats;
+const CollisionStrips = @import("../game/systems/collision.zig").CollisionStrips;
+const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
 const CommitSeamResult = @import("../game/simulation_pipeline.zig").CommitSeamResult;
 const evict_range_alignment_items = @import("../game/systems/pathfinding/types.zig").evict_range_alignment_items;
 const nav_mark_range_alignment_items = @import("../game/systems/pathfinding/nav_reaction.zig").nav_mark_range_alignment_items;
@@ -77,9 +80,10 @@ pub fn addBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, mobility
 }
 
 /// A bench's production commit seam: a `SimulationPipeline` over a bench's data with nav over
-/// its world, and the frame its steps run in, reserved as a gameplay state reserves it
-/// (`SimulationPipeline.reserveFrame`). Data and world stay the caller's; pass the same ones
-/// to every call.
+/// its world, built on the build threads as a gameplay state builds it (so its stored trigger
+/// pairs build at init), and the frame its steps run in, reserved as a gameplay state
+/// reserves it (`SimulationPipeline.reserveFrame`). Data and world stay the caller's; pass
+/// the same ones to every call.
 pub const PipelineSeam = struct {
     pipeline: SimulationPipeline,
     frame: SimulationFrame,
@@ -89,14 +93,14 @@ pub const PipelineSeam = struct {
         /// (`structuralEventHeadroom` of the commands it queues a step).
         structural_headroom: usize,
         pathfinding: PathfindingCapacity = .{},
-        /// The world-create build's threads (`SimulationPipelineConfig.nav_build_thread_system`).
-        nav_build_thread_system: ?*ThreadSystem = null,
+        /// The world-create builds' threads (`SimulationPipelineConfig.build_thread_system`).
+        build_thread_system: *ThreadSystem,
     };
 
     pub fn init(allocator: std.mem.Allocator, data: *const DataSystem, world: *const WorldSystem, config: Config) !PipelineSeam {
         var pipeline = try SimulationPipeline.init(allocator, data, world.worldWidthPixels(), world.worldHeightPixels(), .{
             .navigation_world = world,
-            .nav_build_thread_system = config.nav_build_thread_system,
+            .build_thread_system = config.build_thread_system,
             .structural_headroom = config.structural_headroom,
             .pathfinding = config.pathfinding,
         });
@@ -126,6 +130,18 @@ pub const PipelineSeam = struct {
     pub fn commit(self: *PipelineSeam, data: *DataSystem, world: *const WorldSystem, commands: []const StructuralCommand, thread_system: *ThreadSystem) !CommitSeamResult {
         try writeOneRange(StructuralCommand, &self.frame.structural_commands, commands);
         return self.pipeline.commitStructuralAndReact(&self.frame, data, world, thread_system);
+    }
+
+    /// One collision step on the pipeline at production's inputs (`world`'s strips, the
+    /// colliders' view) and `case`'s controls, emitting into the frame's contacts.
+    pub fn collisionStep(self: *PipelineSeam, data: *const DataSystem, world: *const WorldSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !CollisionStats {
+        return self.pipeline.collision.update(data, &self.frame.contacts, thread_system, .{
+            .items_per_range = case.stageItemsPerRange(collision_range_alignment_items),
+            .max_worker_threads = case.maxWorkerThreads(),
+            .adaptive = case.adaptive,
+            .strips = CollisionStrips.ofWorld(world),
+            .static_colliders = self.pipeline.static_colliders.view(),
+        });
     }
 };
 

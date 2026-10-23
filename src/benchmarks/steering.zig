@@ -479,9 +479,13 @@ const SeamFixture = struct {
         var world = try fixtures.buildBandedWorldSized(allocator, &tileset, tiles_x, tiles_y, 1, "grass", "grass");
         errdefer world.deinit();
         if (world.tile_size != nav_cell_size or world.chunk_size_tiles != default_chunk_size_tiles) return error.SeamWorldGridMismatch;
+        // One participant, as the pathfinding capacity: the builds run inline.
+        var build_threads = try fixtures.initRequiredCaseThreads(allocator, io, suite.serial_cases[0]);
+        defer build_threads.deinit();
         const seam = try fixtures.PipelineSeam.init(allocator, &owned_data, &world, .{
             .structural_headroom = structural_headroom,
             .pathfinding = .{ .max_group_fields = 4, .worker_participant_count = 1 },
+            .build_thread_system = &build_threads,
         });
         return .{ .data = owned_data, .world = world, .seam = seam, .agents = owned_agents };
     }
