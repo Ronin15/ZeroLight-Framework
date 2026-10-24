@@ -13,7 +13,12 @@ The standard Zig layout; every change, plan, and review follows it.
 1. Production code holds only what production runs: no entry point,
    parameter, branch, field, stage, hook, path, or work that only tests or
    benches use, and no separate serial entry (the serial path:
-   `threading.md` § What runs where).
+   `threading.md` § What runs where). The one sanctioned seam is
+   `ThreadSystem`'s fixed-shape dispatch options (`adaptive = false`,
+   `items_per_range`, `max_worker_threads`), which tests and benches set to
+   force a shape; production code never sets them to anything but a forward
+   of its stage's controls, and `tools/lint_idioms.py` fails the build when
+   it does.
 2. Tests are `test` blocks in the owning file, named by behavior. A helper
    only that file's tests use is a private file-scope function in that file.
 3. A module's `*test_support.zig` holds only what tests in other files or
