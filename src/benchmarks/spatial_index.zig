@@ -14,8 +14,11 @@
 //!   indexed, `thread-fixed-auto` dispatching each stage to workers, and the directories'
 //!   bytes whole against
 //!   `chunk_slot_bytes` x chunks x levels.
-//!   Both build groups print `entities=`, `--details` adding `main=` and the `sort=` and
-//!   `link=` stage shapes; `spatial_index-shape` also prints `directory_bytes=`, the level
+//!   Both build groups' headline batch and tuner are the sort, the stage the pass shape
+//!   names. They print `entities=`, `--details` adding `main=` with `main_per_item=` (per
+//!   entity), the `bucket=` and `link=` stage shapes over the measured builds, and, for the
+//!   tuned case, each stage tuner's state (`tuners:`); the tuned case settles all three
+//!   before measuring. `spatial_index-shape` also prints `directory_bytes=`, the level
 //!   directories' bytes.
 //! - `spatial_index-query`: one query per body from its own position, in the index's
 //!   cell-major order, through one neighbor block. `field` is a uniform four-faction field at
@@ -30,6 +33,7 @@
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
 const simd = @import("../core/simd.zig");
@@ -164,21 +168,25 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     const thread_ptr = &threads;
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(suite.tunerSettled(&system.bucket_tuner) and suite.tunerSettled(&system.sort_tuner) and suite.tunerSettled(&system.link_tuner))) _ = try runOnce(&system, data, geometry, thread_ptr, case);
-    const bucket_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.bucket_tuner) else false;
-    const sort_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.sort_tuner) else false;
-    const bucket_tuner_start = suite.TunerStart.of(&system.bucket_tuner, bucket_settled_before_measurement);
-    const sort_tuner_start = suite.TunerStart.of(&system.sort_tuner, sort_settled_before_measurement);
+    while (warm.next(stageTunerSettle(&system).all())) _ = try runOnce(&system, data, geometry, thread_ptr, case);
+    const settle = stageTunerSettle(&system);
+    const settled = case.adaptive and settle.all();
+    const bucket_tuner_start = suite.TunerStart.of(&system.bucket_tuner, settled);
+    const sort_tuner_start = suite.TunerStart.of(&system.sort_tuner, settled);
+    const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(&system));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = SpatialIndexStats{};
     var main_total: u128 = 0;
+    var shapes = suite.StageShapes(stage_names.len){};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         last_stats = try runOnce(&system, data, geometry, thread_ptr, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        accumulator.record(elapsed_ns, last_stats.perf.bucket_batch);
+        // The headline is the sort, whose order (H log(H/B)) the pass shape names.
+        accumulator.record(elapsed_ns, last_stats.perf.sort_batch);
+        shapes.add(.{ last_stats.perf.bucket_batch, last_stats.perf.sort_batch, last_stats.perf.link_batch });
         try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(spatial_index_range_alignment_items), &.{ last_stats.perf.bucket_batch, last_stats.perf.sort_batch, last_stats.perf.link_batch });
         main_total += elapsed_ns -| (offMainNs(last_stats.perf.bucket_batch) + offMainNs(last_stats.perf.sort_batch) + offMainNs(last_stats.perf.link_batch));
     }
@@ -186,13 +194,26 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.output_count = system.view().entryCount();
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.sort_batch);
-    stats.splice_batch = suite.batchSummaryFromBatch(last_stats.perf.link_batch);
+    stats.secondary_batch = suite.batchSummaryFromShapes(&shapes, 0);
+    stats.splice_batch = suite.batchSummaryFromShapes(&shapes, 2);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(&system.bucket_tuner, bucket_tuner_start);
-        stats.secondary_work_tuning = suite.workTuningSummary(&system.sort_tuner, sort_tuner_start);
+        stats.tuner_settle = settle;
+        stats.work_tuning = suite.workTuningSummary(&system.sort_tuner, sort_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(&system.bucket_tuner, bucket_tuner_start);
+        tuner_window.printTuning(&stats.details, stage_names, stageTuners(&system));
     }
     return .{ .stats = stats, .directory_bytes = spatial_index_test_support.directoryBytes(&system) };
+}
+
+// The build's stages, each under its own tuner, in run order.
+const stage_names = [_][]const u8{ "bucket", "sort", "link" };
+
+fn stageTuners(system: *const SpatialIndexSystem) [stage_names.len]*const AdaptiveWorkTuner {
+    return .{ &system.bucket_tuner, &system.sort_tuner, &system.link_tuner };
+}
+
+fn stageTunerSettle(system: *const SpatialIndexSystem) suite.TunerSettle {
+    return suite.TunerSettle.ofNamed(&stage_names, &stageTuners(system));
 }
 
 fn runOnce(system: *SpatialIndexSystem, data: *const DataSystem, geometry: IndexGeometry, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SpatialIndexStats {
@@ -205,15 +226,15 @@ fn runOnce(system: *SpatialIndexSystem, data: *const DataSystem, geometry: Index
     });
 }
 
-// The primary batch is the bucket stage, `secondary_batch` the sort, and `splice_batch` the
-// link; `main` is the time outside the three stages' worker dispatches.
+// The primary batch is the sort stage, `secondary_batch` the bucket, and `splice_batch` the
+// link; `main` is the time outside the three stages' worker dispatches, also per entity.
 fn writeIndexWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("entities={}", .{stats.output_count});
     if (view == .summary) return;
-    if (stats.main_ns) |main_ns| try suite.writeShare(writer, "main", main_ns, stats.mean_ns);
-    const sort = stats.secondary_batch orelse return;
-    try writer.writeAll(" sort=");
-    try suite.writeStageShape(writer, sort);
+    try suite.writeMainShare(writer, stats, stats.output_count);
+    const bucket = stats.secondary_batch orelse return;
+    try writer.writeAll(" bucket=");
+    try suite.writeStageShape(writer, bucket);
     const link = stats.splice_batch orelse return;
     try writer.writeAll(" link=");
     try suite.writeStageShape(writer, link);

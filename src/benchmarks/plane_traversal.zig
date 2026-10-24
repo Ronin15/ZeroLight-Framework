@@ -20,9 +20,14 @@
 //! cell-entry gather, the dig reserve and commit over its entries with the carve batch, and
 //! the carves' nav record, on the case's threads (none for the serial case). The untimed
 //! reset applies the recorded nav marks, puts the fallers back on level 0, refills their
-//! landing cells, and begins the next frame step. `--details` reports the gather's shape and
-//! the stage's main-thread time (all but a dispatched gather, carve, or mark batch), its
-//! share, and its time per entry.
+//! landing cells, and begins the next frame step. The carves run on the world's terrain-edit
+//! tuners under the case's controls. `--details` reports the headline's shape (the gather;
+//! the carve write for the dense-falls groups, which are judged on landings), the stage's
+//! main-thread time (all but a dispatched gather, carve, or mark batch), its share, and its
+//! time per entry, then every stage's shape over the measured steps (`stages:`) and, for the
+//! tuned case, each stage tuner's state (`tuners:`). The tuned case settles the gather, carve,
+//! and nav tuners before measuring; a fixed threaded case runs each stage of more than one
+//! range on workers.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -41,6 +46,9 @@ const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const TileId = @import("../game/world/system.zig").TileId;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const maxEventsPerStep = @import("../game/simulation.zig").maxEventsPerStep;
+const BatchStats = @import("../app/thread_system.zig").BatchStats;
+const StageControls = @import("../app/thread_system.zig").StageControls;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 
@@ -182,6 +190,25 @@ const Fixture = struct {
             _ = try self.world.setDenseTile(floor1, x, y, self.dirt);
         }
         self.frame.beginStep();
+    }
+
+    // The stage's tuners in `stage_names` order.
+    fn stageTuners(self: *const Fixture) [stage_names.len]*const AdaptiveWorkTuner {
+        return .{ &self.plane_entry.tuner, &self.world.terrain_edit_plan_tuner, &self.world.terrain_edit_write_tuner, &self.nav.tuners.nav_mark };
+    }
+
+    // The last stage's batches in `stage_names` order.
+    fn stageBatches(self: *const Fixture) [stage_names.len]BatchStats {
+        return .{ self.plane_entry.perf.last_batch, self.world.perf.last_terrain_edit_plan_batch, self.world.perf.last_terrain_edit_write_batch, self.nav.perf.last_mark_batch };
+    }
+
+    // Every tuner a stage and its untimed reset run: the stage's, and the nav set the
+    // reset's update applies the marks on (`fixtures.addNavTuners`).
+    fn tunerSettle(self: *const Fixture) suite.TunerSettle {
+        var census = suite.TunerSettle{};
+        census.addNamed(stage_names[0..mark_stage], self.stageTuners()[0..mark_stage]);
+        fixtures.addNavTuners(&census, "nav.", &self.nav.tuners);
+        return census;
     }
 };
 
@@ -327,35 +354,51 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         .adaptive = case.adaptive,
     };
 
-    // A fixed threaded case with more than one range of agents dispatches the gather.
-    const expect_dispatch = !case.adaptive and threads.workerThreadCount() > 0 and item_count > plane_entry.config.items_per_range.?;
+    // The landing carves run on the world's terrain-edit tuners under the case's controls,
+    // fresh after the fixture's build, as the nav stages are.
+    const carve_controls: StageControls = .{
+        .adaptive = case.adaptive,
+        .max_worker_threads = case.maxWorkerThreads(),
+        .items_per_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1),
+    };
+    fixture.dig.carve_controls = carve_controls;
+    fixture.world.terrain_edit_plan_tuner = AdaptiveWorkTuner.init(.{});
+    fixture.world.terrain_edit_write_tuner = AdaptiveWorkTuner.init(.{});
+    const nav_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1);
+    // The falls workloads are judged on their landings: the carve write is their headline.
+    const headline_stage: usize = if (workload == .dense_falls or workload == .banded_falls) carve_write_stage else gather_stage;
 
     try fixture.resetStep(thread_ptr);
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(suite.tunerSettled(&plane_entry.tuner))) {
+    while (warm.next(fixture.tunerSettle().all())) {
         _ = try runStage(&fixture, thread_ptr);
         try fixture.resetStep(thread_ptr);
     }
-    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&plane_entry.tuner) else false;
-    const tuner_start = suite.TunerStart.of(&plane_entry.tuner, settled_before_measurement);
+    const settle = fixture.tunerSettle();
+    const headline_tuner = fixture.stageTuners()[headline_stage];
+    const tuner_start = suite.TunerStart.of(headline_tuner, case.adaptive and settle.all());
+    const tuner_window = suite.TunerWindow(stage_names.len).begin(fixture.stageTuners());
 
     // The banded group's size axis is its landing band count.
     var accumulator = suite.StatsAccumulator.init(if (workload == .banded_falls) landing_bands else item_count);
+    var shapes = suite.StageShapes(stage_names.len){};
     var main_total: u128 = 0;
     var entries: usize = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         entries = try runStage(&fixture, thread_ptr);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
-        const gather = plane_entry.perf.last_batch;
-        std.debug.assert(!expect_dispatch or (gather.range_count > 1 and !gather.ran_inline));
-        accumulator.record(elapsed_ns, gather);
+        const batches = fixture.stageBatches();
+        accumulator.record(elapsed_ns, batches[headline_stage]);
+        shapes.add(batches);
+        // A fixed threaded case runs each stage of more than one range on workers.
+        try suite.checkStageDispatched(case, thread_ptr, plane_entry.config.items_per_range, batches[gather_stage]);
+        try suite.checkStagesDispatched(case, thread_ptr, carve_controls.items_per_range, batches[carve_plan_stage .. carve_write_stage + 1]);
+        try suite.checkStageDispatched(case, thread_ptr, nav_range, batches[mark_stage]);
         // Main is everything but the stages that ran on workers: the gather, the carve
         // batch's plan and write stages, and the nav mark stage.
         var off_main: u64 = 0;
-        for ([_]@TypeOf(gather){ gather, fixture.world.perf.last_terrain_edit_plan_batch, fixture.world.perf.last_terrain_edit_write_batch, fixture.nav.perf.last_mark_batch }) |batch| {
-            if (!batch.ran_inline) off_main += batch.batch_duration_ns;
-        }
+        for (batches) |batch| off_main += offMainNs(batch);
         main_total += elapsed_ns -| off_main;
         try fixture.resetStep(thread_ptr);
     }
@@ -363,11 +406,22 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var stats = accumulator.finish();
     stats.output_count = entries;
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    shapes.print(&stats.details, "stages", stage_names);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(&plane_entry.tuner, tuner_start);
+        stats.tuner_settle = settle;
+        stats.work_tuning = suite.workTuningSummary(headline_tuner, tuner_start);
+        tuner_window.printTuning(&stats.details, stage_names, fixture.stageTuners());
     }
     return stats;
 }
+
+// The plane stage's threaded stages, in run order: the cell-entry gather, the landing carve
+// batch's plan and write, and the carves' nav mark.
+const stage_names = [_][]const u8{ "gather", "carve_plan", "carve_write", "nav_mark" };
+const gather_stage = 0;
+const carve_plan_stage = 1;
+const carve_write_stage = 2;
+const mark_stage = 3;
 
 fn writePlaneAgentsWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writePlaneWorkload(writer, stats, view, "agents");
@@ -381,7 +435,7 @@ fn writePlaneWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite
     try writer.print("{s}={} entries={}", .{ unit, stats.item_count, stats.output_count });
     if (view == .summary) return;
     const main_ns = stats.main_ns orelse 0;
-    try writer.writeAll(" gather=");
+    try writer.writeAll(" headline=");
     try suite.writeStageShape(writer, stats.batch);
     try suite.writeShare(writer, "main", main_ns, stats.mean_ns);
     try writer.print(" main_per_entry={f}", .{suite.formatDuration(if (stats.output_count == 0) 0 else main_ns / stats.output_count)});

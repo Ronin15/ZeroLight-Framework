@@ -149,8 +149,8 @@
 //! `--details` the main share (the sample less the patch stages' worker time) and, under each
 //! row, in the tuned case the patch tuners' `step_tuners: settled=k/n` (each unsettled one
 //! named), each patch stage's shape over the measured patches (`StageShapes.label`) and mean
-//! batch time, in the tuned case each patch tuner's probe windows, demotions, restores, and
-//! shift skips over them (`measured_retunes=`), then
+//! batch time, in the tuned case each patch tuner's phase, final shape, and probe windows,
+//! demotions, restores, and shift skips over them (`tuners:`), then
 //! the query items, the stored pairs, the store's patch scratch growths, and the patch slot
 //! set's prepare growths and replays.
 //! - `collision-static-trigger-change`: the `collision-static-triggers` fixture's stored pairs
@@ -181,25 +181,33 @@
 //! (mean time per body), the static groups `per_dynamic=` (`collision-static-triggers`
 //! `per_pair=`, per stored pair); `--details` adds each stage's
 //! shape and batch time, `fill=`, `sort=`, `broad=` (the row's batch, its mean time; the
-//! others the last step's), and `narrow=`, with the fill and sort tuners' state in brackets
-//! (each stage tunes on its own; the broadphase's is the row's tuning cell, the
-//! narrowphase's the `secondary_tuning:` line), then `entries=` (sweep entries), `visits_per_body=` (candidates the sweep tested,
-//! counted with the perf log only), and `main=` with `main_per_item=` per body: the time
-//! outside the stages' worker dispatches. The `--details` lines under each row give the
-//! measured steps' shapes (`StageShapes.label`: the busiest batch, then threaded over
-//! non-empty batches) of the fill, sort, broadphase, narrowphase, emission count, and
-//! emission (`steps:`), and of the static query, Debug rect compare, static sort, and
-//! stored-trigger refresh, in the tuned case the step tuners' `step_tuners: settled=k/n` and
-//! each one's probe windows, demotions, restores, and shift skips over the measured steps
-//! (`measured_retunes=`), and in `collision-static-index-change` the
-//! collider sync's splice shape and its `row_grows=` and `payload_grows=` counts. `collision-static-rebuild` and
+//! others the busiest over the measured steps), and `narrow=`, with the fill and sort tuners'
+//! state in brackets (each stage tunes on its own; the row's tuning cell is the broadphase's,
+//! the `secondary_tuning:` line the narrowphase's; `collision-static-triggers`, judged per
+//! stored pair, prints `refresh=` and `emit=` in their place: the stored-trigger refresh is
+//! its row's batch and tuner and the emission its secondary batch and tuner), then `entries=` (sweep entries), `visits_per_body=` (candidates the
+//! sweep tested, counted with the perf log only), and `main=` with `main_per_item=` per body:
+//! the time outside the stages' worker dispatches (and, in `collision-static-index-change`,
+//! outside the seam's). The `--details` lines under each row give the measured steps' shapes
+//! (`StageShapes.label`: the busiest batch, then threaded over non-empty batches) of the fill,
+//! sort, broadphase, narrowphase, emission count, and emission (`steps:`), and of the static
+//! query, Debug rect compare, static place, static sort, and stored-trigger refresh
+//! (`static:`), in the tuned case the step tuners' `step_tuners: settled=k/n` (in
+//! `collision-static-index-change` the seam's sync, trigger patch, and nav tuners too) and
+//! each step tuner's phase, final shape, and probe windows, demotions, restores, and shift
+//! skips over the measured steps (`tuners:`), and in `collision-static-index-change` the seam's
+//! collider sync and trigger patch stage shapes (`seam:`) and its `row_grows=` and
+//! `payload_grows=` counts. Each case checks once, before its warmup, that its named tuner
+//! lists' lengths plus the rebuild stages' add up to `CollisionSystem`'s tuner count (a count,
+//! not which tuners the lists name). `collision-static-rebuild` and
 //! `collision-static-rebuild-sparse` print `per_static=`, and with `--details` the rewrite
 //! stage and the main share per static (main is elapsed less every stage's worker time), and
 //! under each row every stage's shape and mean batch time; `collision-static-dense-change`
 //! prints `per_change=`, and with `--details` the rewrite stage (its tuner in the tuned case),
 //! the main share per changed static (main is elapsed less every stage's worker time), and
-//! under each row every stage's shape and mean batch time and the timed syncs' `row_grows=`
-//! and `payload_grows=` counts; `collision-static-dense-spike` prints the same.
+//! under each row every stage's shape and mean batch time, in the tuned case the sync tuners'
+//! `step_tuners: settled=k/n` and each one's state (`tuners:`), and the timed syncs'
+//! `row_grows=` and `payload_grows=` counts; `collision-static-dense-spike` prints the same.
 
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
@@ -227,6 +235,7 @@ const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const SimulationPipeline = @import("../game/simulation_pipeline.zig").SimulationPipeline;
+const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
 const CommitSeamResult = @import("../game/simulation_pipeline.zig").CommitSeamResult;
 const tile_size = @import("../assets/world_tileset_meta.zig").required_tile_size;
 const fixtures = @import("fixtures.zig");
@@ -926,9 +935,7 @@ fn triggerPatchTuners(system: *const CollisionSystem) [trigger_patch_stage_count
 
 // The patch tuners whose stages ran, and how many of them settled.
 fn patchTunerSettle(system: *const CollisionSystem) suite.TunerSettle {
-    var census = suite.TunerSettle{};
-    for (trigger_patch_stage_names, triggerPatchTuners(system)) |name, tuner| census.add(name, tuner);
-    return census;
+    return suite.TunerSettle.ofNamed(&trigger_patch_stage_names, &triggerPatchTuners(system));
 }
 
 // A fixed threaded case pins the patch tuners at its controls, so the seam's sync, which
@@ -1066,7 +1073,7 @@ const TriggerPatchSamples = struct {
             stats.details.print("{s}={s}({f}) ", .{ name, self.shapes.label(index, &buffer), suite.formatDuration(mean_ns) });
         }
         stats.details.print("\n", .{});
-        if (self.case.adaptive) self.retunes.print(&stats.details, trigger_patch_stage_names, tuners);
+        if (self.case.adaptive) self.retunes.printTuning(&stats.details, trigger_patch_stage_names, tuners);
         stats.details.print("query_items={} stored_pairs={} scratch_grows={} slot_prepare_grows={} slot_replays={}\n", .{
             self.last.query_items,
             stored_pairs,
@@ -1658,7 +1665,7 @@ const DenseChangeFixture = struct {
 };
 
 // A sync's stages in dispatch order.
-const sync_stages = [_]SyncStage{ .plan, .touch, .group, .apply, .rewrite, .install };
+const sync_stages = fixtures.sync_stages;
 
 const DenseSync = struct {
     ns: u64,
@@ -1667,11 +1674,9 @@ const DenseSync = struct {
     off_main_ns: u64,
 };
 
-fn syncTunersSettled(colliders: *const StaticColliderSystem) bool {
-    for (sync_stages) |stage| {
-        if (colliders.tuners.getPtrConst(stage).phase != .settled) return false;
-    }
-    return true;
+// The collider sync's six stage tuners, by stage name.
+fn syncTunerSettle(colliders: *const StaticColliderSystem) suite.TunerSettle {
+    return suite.TunerSettle.ofNamed(&fixtures.sync_stage_names, &fixtures.syncTuners(colliders));
 }
 
 // What the sync tuners settle on before each measured dense sync.
@@ -1709,11 +1714,12 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     // or for a spike on single-static syncs. At least two steps, so the dense statics (or
     // the single one) have been at both their tiles.
     var warm = suite.Warmup.init(options, case, 2);
-    while (warm.next(syncTunersSettled(fixture.seam.collidersConst()))) switch (load) {
+    while (warm.next(syncTunerSettle(fixture.seam.collidersConst()).all())) switch (load) {
         .sustained => _ = try fixture.changeAndSync(&threads),
         .spike => try fixture.changeOneAndSync(&threads),
     };
-    const settled = case.adaptive and syncTunersSettled(fixture.seam.collidersConst());
+    const settle = syncTunerSettle(fixture.seam.collidersConst());
+    const settled = case.adaptive and settle.all();
     // A spike is measured only from settled tuners.
     if (load == .spike and case.adaptive and !settled) return error.DenseSpikeTunersNotSettled;
     // The settled tuners' spike shape sizes the per-range scratch (the touch windows), so one
@@ -1725,6 +1731,7 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     };
 
     const rewrite_start = suite.TunerStart.of(fixture.seam.collidersConst().tuners.getPtrConst(.rewrite), settled);
+    const sync_window = suite.TunerWindow(sync_stages.len).begin(fixtures.syncTuners(fixture.seam.collidersConst()));
     var accumulator = suite.StatsAccumulator.init(change_count);
     var main_total: u128 = 0;
     var stage_shapes = suite.StageShapes(sync_stages.len){};
@@ -1735,13 +1742,13 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
         if (load == .spike) {
             try fixture.changeOneAndSync(&threads);
             // Every timed spike runs on tuners settled at the single-static count.
-            if (case.adaptive and !syncTunersSettled(fixture.seam.collidersConst())) return error.DenseSpikeTunersNotSettled;
+            if (case.adaptive and !syncTunerSettle(fixture.seam.collidersConst()).all()) return error.DenseSpikeTunersNotSettled;
         }
         const sync = try fixture.changeAndSync(&threads);
         try fixture.checkSyncWork(sync.batches);
         try suite.checkStagesDispatched(case, &threads, stage_range, &sync.batches);
         for (sync.batches, sync_stages) |batch, stage| try checkTunerSelected(case, &threads, fixture.seam.collidersConst().tuners.getPtrConst(stage), batch);
-        accumulator.record(sync.ns, sync.batches[comptime std.mem.indexOfScalar(SyncStage, &sync_stages, .rewrite).?]);
+        accumulator.record(sync.ns, sync.batches[comptime std.mem.indexOfScalar(SyncStage, sync_stages, .rewrite).?]);
         main_total += sync.ns -| sync.off_main_ns;
         stage_shapes.add(sync.batches);
         for (&stage_ns, sync.batches) |*total, batch| total.* += batch.batch_duration_ns;
@@ -1753,8 +1760,12 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.sample_count = change_count;
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(fixture.seam.collidersConst().tuners.getPtrConst(.rewrite), rewrite_start);
-    printStageDetails(&stats, &sync_stages, &stage_shapes, &stage_ns);
+    if (case.adaptive) {
+        stats.tuner_settle = settle;
+        stats.work_tuning = suite.workTuningSummary(fixture.seam.collidersConst().tuners.getPtrConst(.rewrite), rewrite_start);
+    }
+    printStageDetails(&stats, sync_stages, &stage_shapes, &stage_ns);
+    if (case.adaptive) sync_window.printTuning(&stats.details, fixtures.sync_stage_names, fixtures.syncTuners(fixture.seam.collidersConst()));
     stats.details.print("row_grows={} payload_grows={}\n", .{ grows[0] - warm_grows[0], grows[1] - warm_grows[1] });
     try fixture.checkEmptyingSyncWork(&threads);
     return stats;
@@ -1968,8 +1979,8 @@ const StaticSeam = struct {
 const StaticMover = struct {
     seam: StaticSeam,
     move: fixtures.StaticMove,
-    // The last seam's nav reaction stages' worker time.
-    nav_off_main_ns: u64 = 0,
+    // The last seam's nav reaction.
+    nav_stats: NavUpdateStats = .{},
 
     fn init(allocator: std.mem.Allocator, io: std.Io, fixture: *const StaticHeavyFixture, case: suite.BenchmarkCase, threads: *ThreadSystem) !StaticMover {
         // The statics' tiles: two tiles per pitch cell a side.
@@ -2003,7 +2014,7 @@ const StaticMover = struct {
     fn moveAndSync(self: *StaticMover, data: *DataSystem, thread_system: *ThreadSystem) !void {
         const commit = try self.seam.commit(data, &.{self.move.command()}, thread_system);
         if (commit.structural.components_set != 1) return error.StaticMoveNotApplied;
-        self.nav_off_main_ns = commit.nav_update.perf.off_main_stage_ns;
+        self.nav_stats = commit.nav_update;
         const colliders = self.seam.colliders();
         const changes = colliders.changesThisStep();
         if (changes.len != 1) return error.StaticChangeNotSynced;
@@ -2014,9 +2025,9 @@ const StaticMover = struct {
         self.move.advance();
     }
 
-    // The last seam's collider sync and nav reaction worker time.
+    // The last seam's collider sync, trigger patch, and nav reaction worker time.
     fn seamOffMainNs(self: *const StaticMover) u64 {
-        return static_colliders_test_support.lastOffMainNs(self.seam.collidersConst().*) + self.nav_off_main_ns;
+        return fixtures.seamOffMainNs(&self.seam.seam.pipeline, self.nav_stats);
     }
 
     // The colliders' row-pool and payload growths so far.
@@ -2093,18 +2104,24 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         if (system.static_slots.replays != 1 or system.static_sizing.hit_rows == 0) return error.CollisionColdSlotGrowthNotCounted;
         if (cold.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 0) return error.CollisionColdSlotGrowthFlaggedPairBound;
     }
+    try checkTunerLists(system);
     var warm = suite.Warmup.init(options, case, 0);
     // The last step's range slot shapes, which a measured step's slot growth must differ from.
     var slot_shapes: ?[slot_set_count]SlotShape = null;
-    while (warm.next(stepTunerSettle(system).all())) {
+    while (warm.next(caseTunerSettle(system, inputs).all())) {
         const warm_stats = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
         slot_shapes = slotShapes(system, warm_stats);
     }
-    const step_settle = stepTunerSettle(system);
+    const step_settle = caseTunerSettle(system, inputs);
     const fill_start = suite.TunerStart.of(&system.fill_tuner, case.adaptive and suite.tunerSettledOrUnused(&system.fill_tuner));
     const sort_start = suite.TunerStart.of(&system.sort_tuner, case.adaptive and suite.tunerSettledOrUnused(&system.sort_tuner));
-    const broadphase_start = suite.TunerStart.of(&system.broadphase_tuner, case.adaptive and suite.tunerSettledOrUnused(&system.broadphase_tuner));
-    const narrowphase_start = suite.TunerStart.of(&system.narrowphase_tuner, case.adaptive and suite.tunerSettledOrUnused(&system.narrowphase_tuner));
+    // The row's tuners: the stored-trigger refresh and emission for the refresh workload
+    // (`toggle`), the stage its pass shape names; the broadphase and narrowphase otherwise.
+    const refreshes = inputs.toggle != null;
+    const headline_tuner = if (refreshes) system.trigger_store.tuners.getPtrConst(.refresh) else &system.broadphase_tuner;
+    const secondary_tuner = if (refreshes) &system.emit_tuner else &system.narrowphase_tuner;
+    const headline_start = suite.TunerStart.of(headline_tuner, case.adaptive and suite.tunerSettledOrUnused(headline_tuner));
+    const secondary_start = suite.TunerStart.of(secondary_tuner, case.adaptive and suite.tunerSettledOrUnused(secondary_tuner));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_collision_stats = CollisionStats{};
@@ -2113,10 +2130,10 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     const warm_overflows = .{ system.perf.entry_bound_overflows, system.perf.pair_bound_overflows };
     // A warm mover's sync rewrites its two chunks in place: no row or payload growth.
     const warm_collider_grows = if (inputs.mover) |static_mover| static_mover.grows() else .{ 0, 0 };
-    // Static query, Debug rect compare, static sort, and stored-trigger refresh; the mover's
-    // splice.
-    var static_stages = suite.StageShapes(4){};
-    var splice_stages = suite.StageShapes(1){};
+    // Static query, Debug rect compare, static place, static sort, and stored-trigger
+    // refresh; the mover's seam stages.
+    var static_stages = suite.StageShapes(static_stage_names.len){};
+    var seam_stages = suite.StageShapes(fixtures.seam_stage_names.len){};
     var dynamic_stages = suite.StageShapes(dynamic_stage_names.len){};
     const retunes = suite.TunerWindow(step_tuner_names.len).begin(stepTuners(system));
     const stage_range = case.stageItemsPerRange(collision_range_alignment_items);
@@ -2140,7 +2157,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ perf.fill_batch, perf.sort_batch, perf.broadphase_batch, perf.narrowphase_batch, perf.static_pairs_batch, perf.static_rect_batch, perf.static_place_batch, perf.static_sort_batch, perf.trigger_refresh_batch, perf.trigger_emit_count_batch, perf.trigger_emit_batch });
         try checkSweepWork(case, thread_ptr, stage_range, last_collision_stats);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        accumulator.record(elapsed_ns, last_collision_stats.perf.broadphase_batch);
+        accumulator.record(elapsed_ns, if (refreshes) perf.trigger_refresh_batch else perf.broadphase_batch);
         const seam_off_main_ns = if (inputs.mover) |static_mover| static_mover.seamOffMainNs() else 0;
         const off_main_ns = offMainNs(perf.fill_batch) + offMainNs(perf.sort_batch) +
             offMainNs(last_collision_stats.perf.broadphase_batch) + offMainNs(last_collision_stats.perf.narrowphase_batch) +
@@ -2148,9 +2165,9 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
             offMainNs(perf.static_place_batch) + offMainNs(perf.static_sort_batch) + offMainNs(perf.trigger_refresh_batch) +
             offMainNs(perf.trigger_emit_count_batch) + offMainNs(perf.trigger_emit_batch);
         main_total += elapsed_ns -| off_main_ns -| seam_off_main_ns;
-        static_stages.add(.{ perf.static_pairs_batch, perf.static_rect_batch, perf.static_sort_batch, perf.trigger_refresh_batch });
+        static_stages.add(.{ perf.static_pairs_batch, perf.static_rect_batch, perf.static_place_batch, perf.static_sort_batch, perf.trigger_refresh_batch });
         dynamic_stages.add(dynamicStageBatches(perf));
-        if (inputs.mover) |static_mover| splice_stages.add(.{static_mover.seam.collidersConst().perf.last_batches.get(.rewrite)});
+        if (inputs.mover) |static_mover| seam_stages.add(fixtures.seamBatches(&static_mover.seam.seam.pipeline));
     }
 
     if (system.perf.entry_bound_overflows != warm_overflows[0] or system.perf.pair_bound_overflows != warm_overflows[1]) return error.CollisionWarmStepOverflowed;
@@ -2161,31 +2178,33 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.collision_stages = .{
-        .fill = suite.batchSummaryFromBatch(last_collision_stats.perf.fill_batch),
-        .sort = suite.batchSummaryFromBatch(last_collision_stats.perf.sort_batch),
+        .fill = suite.batchSummaryFromShapes(&dynamic_stages, 0),
+        .sort = suite.batchSummaryFromShapes(&dynamic_stages, 1),
         .fill_tuning = if (case.adaptive) suite.workTuningSummary(&system.fill_tuner, fill_start) else null,
         .sort_tuning = if (case.adaptive) suite.workTuningSummary(&system.sort_tuner, sort_start) else null,
         .entries = last_collision_stats.entry_count,
         .visits = last_collision_stats.perf.broadphase_visits,
         .simd_groups = last_collision_stats.broadphase_simd_groups,
     };
-    writeDynamicStageDetails(&stats.details, &dynamic_stages);
-    writeStaticStageDetails(&stats.details, &static_stages);
-    if (case.adaptive) retunes.print(&stats.details, step_tuner_names, stepTuners(system));
+    dynamic_stages.print(&stats.details, "steps", dynamic_stage_names);
+    static_stages.print(&stats.details, "static", static_stage_names);
+    if (case.adaptive) retunes.printTuning(&stats.details, step_tuner_names, stepTuners(system));
     try checkSlotRecords(&stats.details, system, last_collision_stats.entry_count);
     writeSlotGrowth(&stats.details, slotGrowth(system));
     if (inputs.mover) |static_mover| {
-        var splice_buffer: [48]u8 = undefined;
+        seam_stages.print(&stats.details, "seam", fixtures.seam_stage_names);
         const grows = static_mover.grows();
-        stats.details.print("splice={s} row_grows={} payload_grows={}\n", .{ splice_stages.label(0, &splice_buffer), grows[0], grows[1] });
+        stats.details.print("row_grows={} payload_grows={}\n", .{ grows[0], grows[1] });
     }
     stats.sample_count = item_count;
     stats.candidate_pairs = last_collision_stats.candidate_pair_count;
     stats.output_count = last_collision_stats.contact_count;
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_collision_stats.perf.narrowphase_batch);
+    // The secondary is the row's secondary tuner's stage: the emission (`emit`) for the
+    // refresh workload, the narrowphase (`narrow`) otherwise.
+    stats.secondary_batch = suite.batchSummaryFromShapes(&dynamic_stages, if (refreshes) 5 else 3);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(&system.broadphase_tuner, broadphase_start);
-        stats.secondary_work_tuning = suite.workTuningSummary(&system.narrowphase_tuner, narrowphase_start);
+        stats.work_tuning = suite.workTuningSummary(headline_tuner, headline_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(secondary_tuner, secondary_start);
         stats.tuner_settle = step_settle;
     }
 
@@ -2304,33 +2323,24 @@ fn harmonic(n: usize) f64 {
     return sum;
 }
 
-// The measured steps' dynamic-side stage shapes (`StageShapes.label`): each stage's busiest
-// batch and its threaded over non-empty batches, so a stage that flips inline or threaded
-// during measurement shows it.
-fn writeDynamicStageDetails(details: *suite.DetailLines, stages: *const suite.StageShapes(dynamic_stage_names.len)) void {
-    var buffers: [dynamic_stage_names.len][48]u8 = undefined;
-    details.print("steps:", .{});
-    for (dynamic_stage_names, &buffers, 0..) |name, *buffer, index| details.print(" {s}={s}", .{ name, stages.label(index, buffer) });
-    details.print("\n", .{});
-}
+// A collision step's static-side stages, in the order the measured steps add them.
+const static_stage_names = [_][]const u8{ "static_pairs", "static_rect", "static_place", "static_sort", "trigger_refresh" };
 
-// The measured steps' static query, Debug rect compare, static sort, and stored-trigger
-// refresh shapes (`StageShapes.label`).
-fn writeStaticStageDetails(details: *suite.DetailLines, stages: *const suite.StageShapes(4)) void {
-    var buffers: [4][48]u8 = undefined;
-    details.print("static_pairs={s} static_rect={s} static_sort={s} trigger_refresh={s}\n", .{
-        stages.label(0, &buffers[0]),
-        stages.label(1, &buffers[1]),
-        stages.label(2, &buffers[2]),
-        stages.label(3, &buffers[3]),
-    });
-}
-
-// The step's stage tuners whose stages ran, and how many of them settled.
-fn stepTunerSettle(system: *const CollisionSystem) suite.TunerSettle {
-    var census = suite.TunerSettle{};
-    for (step_tuner_names, stepTuners(system)) |name, tuner| census.add(name, tuner);
+// The step's stage tuners whose stages ran, and how many of them settled; with a mover, also
+// every tuner its commit seam runs (`fixtures.addSeamTuners`).
+fn caseTunerSettle(system: *const CollisionSystem, inputs: StepInputs) suite.TunerSettle {
+    var census = suite.TunerSettle.ofNamed(&step_tuner_names, &stepTuners(system));
+    if (inputs.mover) |static_mover| fixtures.addSeamTuners(&census, &static_mover.seam.seam.pipeline);
     return census;
+}
+
+// Fails when `CollisionSystem` holds a tuner the bench's named lists miss: every tuner is a
+// step stage's (`stepTuners`, the store's refresh among them), a trigger patch stage's
+// (`triggerPatchTuners`), or a rebuild stage's, which only a rebuild selects.
+fn checkTunerLists(system: *const CollisionSystem) error{CollisionTunerListStale}!void {
+    const store_rebuild_count = @FieldType(@FieldType(CollisionSystem, "trigger_store"), "rebuild_tuners").len;
+    const rebuild_count = 1 + store_rebuild_count;
+    if (suite.tunerCount(CollisionSystem, system) != step_tuner_names.len + trigger_patch_stage_count + rebuild_count) return error.CollisionTunerListStale;
 }
 
 // Fails when a step's sweep batches miss their work: the broadphase covers every sweep
@@ -2393,7 +2403,7 @@ fn writeCollisionWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: s
     // `sample_count` holds the body count.
     if (stats.sample_count != 0) try writer.print(" per_body={f}", .{suite.formatDuration(stats.mean_ns / stats.sample_count)});
     if (view == .summary) return;
-    try writeCollisionDetails(writer, stats);
+    try writeCollisionDetails(writer, stats, sweep_stage_labels);
 }
 
 fn writeTriggerWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
@@ -2401,7 +2411,8 @@ fn writeTriggerWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: sui
     // `sample_count` holds the stored pair count.
     if (stats.sample_count != 0) try writer.print(" per_pair={f}", .{suite.formatDuration(stats.mean_ns / stats.sample_count)});
     if (view == .summary) return;
-    try writeCollisionDetails(writer, stats);
+    // The row's batch is the stored-trigger refresh and its secondary the emission.
+    try writeCollisionDetails(writer, stats, .{ .batch = "refresh", .secondary = "emit" });
 }
 
 fn writeStaticWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
@@ -2409,7 +2420,7 @@ fn writeStaticWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suit
     // `sample_count` holds the dynamic count.
     if (stats.sample_count != 0) try writer.print(" per_dynamic={f}", .{suite.formatDuration(stats.mean_ns / stats.sample_count)});
     if (view == .summary) return;
-    try writeCollisionDetails(writer, stats);
+    try writeCollisionDetails(writer, stats, sweep_stage_labels);
 }
 
 // ` <label>=<shape>(<batch time>)`, then the stage tuner's state when the case has one.
@@ -2424,14 +2435,24 @@ fn writeStage(writer: *std.Io.Writer, label: []const u8, batch: suite.BatchSumma
     }
 }
 
-fn writeCollisionDetails(writer: *std.Io.Writer, stats: suite.RunStats) std.Io.Writer.Error!void {
+// The labels of a row's batch and secondary batch, the stages its tuning cell and
+// `secondary_tuning:` line tune.
+const RowStageLabels = struct {
+    batch: []const u8,
+    secondary: []const u8,
+};
+
+// A sweep row's batch is the broadphase and its secondary the narrowphase.
+const sweep_stage_labels = RowStageLabels{ .batch = "broad", .secondary = "narrow" };
+
+fn writeCollisionDetails(writer: *std.Io.Writer, stats: suite.RunStats, labels: RowStageLabels) std.Io.Writer.Error!void {
     const stages = stats.collision_stages orelse return;
     try writeStage(writer, "fill", stages.fill, stages.fill_tuning);
     try writeStage(writer, "sort", stages.sort, stages.sort_tuning);
-    // The primary batch is the broadphase, its tuner the primary tuning cell.
-    try writeStage(writer, "broad", stats.batch, null);
-    // The narrowphase's tuner prints once, on the suite's secondary tuning line.
-    if (stats.secondary_batch) |narrow| try writeStage(writer, "narrow", narrow, null);
+    // The row's batch, its tuner the primary tuning cell.
+    try writeStage(writer, labels.batch, stats.batch, null);
+    // The secondary stage's tuner prints once, on the suite's secondary tuning line.
+    if (stats.secondary_batch) |secondary| try writeStage(writer, labels.secondary, secondary, null);
     // `sample_count` holds the body (or dynamic) count.
     const bodies = @max(stats.sample_count, 1);
     try writer.print(" entries={} visits_per_body={d:.2}", .{ stages.entries, @as(f64, @floatFromInt(stages.visits)) / @as(f64, @floatFromInt(bodies)) });

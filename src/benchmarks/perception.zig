@@ -30,10 +30,14 @@
 //!   `crowd_max_checks_per_observer` checks, and a fixed threaded case dispatching the gather
 //!   and compute to workers. Prints `threat_found=` (found over observers), `sensed=`,
 //!   `block_fills=`, and `checks_per_observer=`; `--details` adds `main=` with
-//!   `main_per_item=` (per observer).
+//!   `main_per_item=` (per observer) and `gather=`.
+//! Stage shapes are over the measured steps (`[threaded/non-empty]`; the compute is the row's
+//! batch). The tuned case settles both stage tuners before measuring, and `--details` prints
+//! each one's state (`tuners:`).
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
@@ -397,12 +401,14 @@ fn runCaseImpl(
     const think_set = (try scope.compactCognition(&spatial_view, 0, false, &threads, .{ .adaptive = false })).cognition;
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(suite.tunerSettled(&system.gather_tuner) and suite.tunerSettled(&system.compute_tuner))) {
+    while (warm.next(stageTunerSettle(&system).all())) {
         events.clearRetainingCapacity();
         _ = try runOnce(&system, &fixture, spatial_view, think_set, &events, &threads, case);
     }
-    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.compute_tuner) else false;
-    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, settled_before_measurement);
+    const settle = stageTunerSettle(&system);
+    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, case.adaptive and settle.all());
+    const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(&system));
+    var shapes = suite.StageShapes(stage_names.len){};
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     // Sensed, LOS, and found counts are the same every step; transitions occur once.
@@ -415,6 +421,7 @@ fn runCaseImpl(
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_stats.perf.batch);
+        shapes.add(.{ last_stats.perf.gather_batch, last_stats.perf.batch });
         try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(perception_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.perf.batch });
         main_total += elapsed_ns -| (offMainNs(last_stats.perf.gather_batch) + offMainNs(last_stats.perf.batch));
     }
@@ -429,11 +436,28 @@ fn runCaseImpl(
     stats.fallback_deferred_count = events.stats.entity_perceived + events.stats.entity_lost;
     stats.cache_evictions = events.stats.dropped;
     stats.neighbor_block_fills = last_stats.perf.block_fills;
-    stats.splice_batch = suite.batchSummaryFromBatch(last_stats.perf.gather_batch);
-    if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(&system.compute_tuner, compute_tuner_start);
-    }
+    stats.splice_batch = suite.batchSummaryFromShapes(&shapes, 0);
+    reportTuners(&stats, &system, case, settle, tuner_window, compute_tuner_start);
     return stats;
+}
+
+// The step's stages, each under its own tuner: the observer gather, then the compute.
+const stage_names = [_][]const u8{ "gather", "compute" };
+
+fn stageTuners(system: *const PerceptionSystem) [stage_names.len]*const AdaptiveWorkTuner {
+    return .{ &system.gather_tuner, &system.compute_tuner };
+}
+
+fn stageTunerSettle(system: *const PerceptionSystem) suite.TunerSettle {
+    return suite.TunerSettle.ofNamed(&stage_names, &stageTuners(system));
+}
+
+// The tuned case's census, its compute tuner (the row's), and both stage tuners' states.
+fn reportTuners(stats: *suite.RunStats, system: *const PerceptionSystem, case: suite.BenchmarkCase, settle: suite.TunerSettle, window: suite.TunerWindow(stage_names.len), compute_start: suite.TunerStart) void {
+    if (!case.adaptive) return;
+    stats.tuner_settle = settle;
+    stats.work_tuning = suite.workTuningSummary(&system.compute_tuner, compute_start);
+    window.printTuning(&stats.details, stage_names, stageTuners(system));
 }
 
 // The runs of consecutive observer rows sharing a level, index cell, and faction: the
@@ -580,12 +604,14 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const think_set = (try scope.compactCognition(&spatial_view, 0, false, &threads, .{ .adaptive = false })).cognition;
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(suite.tunerSettled(&system.gather_tuner) and suite.tunerSettled(&system.compute_tuner))) {
+    while (warm.next(stageTunerSettle(&system).all())) {
         events.clearRetainingCapacity();
         _ = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
     }
-    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.compute_tuner) else false;
-    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, settled_before_measurement);
+    const settle = stageTunerSettle(&system);
+    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, case.adaptive and settle.all());
+    const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(&system));
+    var shapes = suite.StageShapes(stage_names.len){};
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PerceptionStats{};
@@ -597,6 +623,7 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_stats.perf.batch);
+        shapes.add(.{ last_stats.perf.gather_batch, last_stats.perf.batch });
         try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(perception_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.perf.batch });
         main_total += elapsed_ns -| (offMainNs(last_stats.perf.gather_batch) + offMainNs(last_stats.perf.batch));
     }
@@ -613,9 +640,8 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.sample_count = last_stats.perf.sensed_count;
     stats.candidate_pairs = last_stats.perf.candidate_checks;
     stats.neighbor_block_fills = last_stats.perf.block_fills;
-    if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(&system.compute_tuner, compute_tuner_start);
-    }
+    stats.splice_batch = suite.batchSummaryFromShapes(&shapes, 0);
+    reportTuners(&stats, &system, case, settle, tuner_window, compute_tuner_start);
     return stats;
 }
 
@@ -653,4 +679,8 @@ fn writeCrowdWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite
     });
     if (view == .summary) return;
     try suite.writeMainShare(writer, stats, observers);
+    if (stats.splice_batch) |gather| {
+        try writer.writeAll(" gather=");
+        try suite.writeStageShape(writer, gather);
+    }
 }

@@ -33,11 +33,12 @@ const fixtures = @import("../fixtures.zig");
 const nav_size = @import("../nav_size.zig");
 const suite = @import("../suite.zig");
 
-// A cold step re-solves up to the per-step ceiling, so the cold groups take fewer samples
-// than the suite's defaults; a smaller `--warmup`/`--iterations` still wins.
+// A cold step re-solves up to the per-step ceiling, so the cold groups take fewer warmup and
+// measured samples than the suite's defaults; a smaller `--warmup`/`--iterations` still wins.
+// The tuned case still settles at the suite's limit (`suite.adaptiveSettleIterationLimit`):
+// production's update tuners persist across steps, so a cold step is no fresh one-off.
 const cold_warmup_cap: usize = 1;
 const cold_iteration_cap: usize = 5;
-const cold_settle_cap: usize = 4;
 
 pub fn coldWarmup(options: suite.Options) usize {
     return @min(options.warmup_iterations, cold_warmup_cap);
@@ -45,8 +46,12 @@ pub fn coldWarmup(options: suite.Options) usize {
 pub fn coldIterations(options: suite.Options) usize {
     return @min(options.iterations, cold_iteration_cap);
 }
-pub fn coldSettleLimit(options: suite.Options) usize {
-    return @min(suite.adaptiveSettleIterationLimit(options), cold_settle_cap);
+
+/// Every tuner of `system`'s stage set (`fixtures.addNavTuners`): those a pathfinding step,
+/// and its nav reaction, select. One no measured step selects stays unused, so a fixture's
+/// setup runs only the measured step's shape.
+pub fn stepTunerSettle(system: *const PathfindingSystem) suite.TunerSettle {
+    return fixtures.navTunerSettle("", &system.tuners);
 }
 
 /// The update config of a cold step under `case` with the given solve and admission budgets.
@@ -90,8 +95,8 @@ pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(Path
     const config = coldStepConfig(case, solve_budget, fallback_budget);
     const stats = try system.update(requests, agent_count, thread_system, config);
     try suite.checkStagesDispatched(case, thread_system, config.items_per_range, &updateBatches(stats));
-    // A shrink's registry rename pass, at its fixed shape.
-    try suite.checkStageDispatched(case, thread_system, config.items_per_range, stats.perf.registry_rename_batch);
+    // A shrink's registry rename pass, at its fixed shape, and the flush's bound count.
+    try suite.checkStagesDispatched(case, thread_system, config.items_per_range, &.{ stats.perf.registry_rename_batch, stats.perf.registry_flush_count_batch });
     const flush = stats.perf.registry_flush_batch;
     const adds = stats.perf.registrations_added;
     if (adds != 0 and flush.item_count < flush_pair_count + adds) return error.RegistryFlushMissedUnits;
@@ -373,13 +378,15 @@ pub const ReactFixture = struct {
         const elapsed = suite.elapsedNs(start_ns, suite.nowNs(io));
         if (stats.incremental_rebuilds != 1) return error.EvictReactionUnchanged;
         if (self.system.graph.version != version_before) return error.EvictDigRebuiltNav;
-        return .{ .elapsed_ns = elapsed, .stats = stats };
+        return .{ .elapsed_ns = elapsed, .stats = stats, .mark = self.system.perf.last_mark_batch };
     }
 };
 
 pub const Reaction = struct {
     elapsed_ns: u64,
     stats: NavUpdateStats,
+    // The timed terrain record's `nav_mark` dispatch; empty for a reaction that timed no mark.
+    mark: BatchStats = .{},
 };
 
 // Three stages' shapes in the timed nav reactions and the reactions' main-thread share and

@@ -120,7 +120,8 @@ fn writeMovementWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: su
 // scattered row order. Timed: one apply of the merged intents into velocity; apply is
 // idempotent, so no reset runs between iterations. `--details` reports the applied
 // intents, the apply shape, and the main-thread time (everything but a dispatched
-// apply) and share. `movement-apply-intents-sorted` is the same stream in row order, so
+// apply), share, and time per intent; a fixed threaded case with more than one range of
+// intents dispatches the apply at one range per fixed range. `movement-apply-intents-sorted` is the same stream in row order, so
 // each range writes one contiguous row window: the scattered group's control for worker
 // ranges writing rows scattered across the velocity columns.
 pub const apply_intents_group = suite.BenchmarkGroup{
@@ -251,9 +252,6 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     defer fixture.deinit();
     var system = MovementSystem.init();
 
-    // A fixed threaded case with more than one range of intents dispatches the apply.
-    const expect_dispatch = !case.adaptive and thread_ptr.workerThreadCount() > 0 and item_count > case.fixedItemsPerRange(movement_range_alignment_items);
-
     var warm = suite.Warmup.init(options, case, 1);
     while (warm.next(suite.tunerSettled(&system.apply_intents_tuner))) {
         _ = applyIntentsOnce(&system, &fixture, thread_ptr, case);
@@ -268,7 +266,10 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
         const batch = applyIntentsOnce(&system, &fixture, thread_ptr, case);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         std.debug.assert(batch.item_count == item_count);
-        std.debug.assert(!expect_dispatch or (batch.range_count > 1 and !batch.ran_inline));
+        // A fixed threaded case with more than one range of intents dispatches the apply, one
+        // range per fixed range of intents.
+        try suite.checkStageDispatched(case, thread_ptr, case.stageItemsPerRange(movement_range_alignment_items), batch);
+        try suite.checkFixedRangeCount(case, thread_ptr, case.stageItemsPerRange(movement_range_alignment_items), batch);
         accumulator.record(elapsed_ns, batch);
         // Main is everything but an apply that ran on workers.
         main_total += if (batch.ran_inline) elapsed_ns else elapsed_ns -| batch.batch_duration_ns;
@@ -289,5 +290,5 @@ fn writeApplyWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite
     if (view == .summary) return;
     try writer.writeAll(" apply=");
     try suite.writeStageShape(writer, stats.batch);
-    try suite.writeShare(writer, "main", stats.main_ns orelse 0, stats.mean_ns);
+    try suite.writeMainShare(writer, stats, stats.output_count);
 }

@@ -5,7 +5,12 @@
 //! Pathfinding cache bench groups: scoped eviction and elastic capacity ramp and shrink.
 //! A config whose nav storage exceeds the bench's nav-size limit fails with its
 //! figure (`nav_size.checkNavSize`), and every config checks each part of the nav's
-//! bytes against its charge (`nav_size.checkNavBytes`).
+//! bytes against its charge (`nav_size.checkNavBytes`). The headline batch is the stage each
+//! group is judged on: the eviction's halo walk (`pathfinding-evict`, its tuner reported), the
+//! busiest solve of a ramp, the shrink step's resize copy. The evict and ramp groups' tuned
+//! case settles every tuner of the pathfinding set before measuring (`step_tuners:`); every
+//! measured evict reaction runs each nav stage of more than one range on workers in a fixed
+//! threaded case (`suite.checkNavReactionDispatched`).
 
 const std = @import("std");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -25,7 +30,6 @@ const default_max_solves_per_frame = @import("../../game/systems/pathfinding.zig
 const PathQueryKey = @import("../../game/systems/pathfinding/types.zig").PathQueryKey;
 const cached_results_per_agent = @import("../../game/systems/pathfinding/types.zig").cached_results_per_agent;
 const min_capacity_floor = @import("../../game/systems/pathfinding/types.zig").min_capacity_floor;
-const NavUpdateStats = @import("../../game/systems/pathfinding/types.zig").NavUpdateStats;
 const CellCoord = @import("../../game/world/system.zig").CellCoord;
 const default_chunk_size_tiles = @import("../../game/world/system.zig").default_chunk_size_tiles;
 const fixtures = @import("../fixtures.zig");
@@ -36,6 +40,7 @@ const coldWarmup = @import("nav_fixtures.zig").coldWarmup;
 const coldIterations = @import("nav_fixtures.zig").coldIterations;
 const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
 const StageReport = @import("nav_fixtures.zig").StageReport;
+const stepTunerSettle = @import("nav_fixtures.zig").stepTunerSettle;
 const OpenWorld = @import("nav_fixtures.zig").OpenWorld;
 const buildOpenWorld = @import("nav_fixtures.zig").buildOpenWorld;
 const toggle_batch = @import("nav_fixtures.zig").toggle_batch;
@@ -234,16 +239,22 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     try fixture.fillCache(case, thread_ptr);
     if (churn) |*registry_churn| try registry_churn.run(io, &fixture, case, thread_ptr);
 
-    for (0..options.warmup_iterations) |_| {
+    // A sample's blocking reaction, reopen, refill, and churn all run on the system's one
+    // tuner set, every tuner of which the tuned case settles.
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(stepTunerSettle(&fixture.system).all())) {
         _ = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_ptr);
         _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
         if (churn) |*registry_churn| try registry_churn.run(io, &fixture, case, thread_ptr);
     }
+    const settle = stepTunerSettle(&fixture.system);
+    const evict_tuner = &fixture.system.tuners.nav_evict;
+    const evict_start = suite.TunerStart.of(evict_tuner, case.adaptive and settle.all());
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = EvictReport{};
+    var reactions = suite.NavReactionShapes{};
     var evicted: usize = 0;
-    var last_stats: NavUpdateStats = .{};
     for (0..options.iterations) |_| {
         const reaction = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_ptr);
         evicted = result_count - fixture.cachedCount();
@@ -254,8 +265,10 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
             if (evict_item.perf.visited > evict_item.bound) return error.EvictVisitPastHalo;
         }
         try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ reaction.stats.perf.evict_count_batch, reaction.stats.perf.evict_batch, reaction.stats.perf.evict_flush_batch });
-        last_stats = reaction.stats;
-        accumulator.record(reaction.elapsed_ns, reaction.stats.perf.remask_batch);
+        // The headline is the eviction's halo walk, the stage the group is judged on.
+        accumulator.record(reaction.elapsed_ns, reaction.stats.perf.evict_batch);
+        try suite.checkNavReactionDispatched(case, thread_ptr, reaction.mark, reaction.stats);
+        reactions.add(reaction.mark, reaction.stats);
         report.add(reaction);
         _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
@@ -271,7 +284,11 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.candidate_pairs = result_count;
     // Registry entries the reaction's eviction visited per second.
     stats.items_per_second = suite.itemsPerSecond(report.visited, stats.mean_ns);
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
+    reactions.summarize(&stats, fixtures.floodTunerWorkers(&fixture.system, case));
+    if (case.adaptive) {
+        stats.tuner_settle = settle;
+        stats.work_tuning = suite.workTuningSummary(evict_tuner, evict_start);
+    }
     return stats;
 }
 
@@ -368,28 +385,39 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
     try nav_size.checkNavBytes(elastic_ramp_group.name, item_count, size_config, &system);
 
-    for (0..options.warmup_iterations) |_| _ = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr);
+    // A sample is one whole ramp; the tuned case settles every step tuner it runs.
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(stepTunerSettle(&system).all())) _ = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr, null);
+    const settle = stepTunerSettle(&system);
+    const solve_start = suite.TunerStart.of(&system.tuners.solve, case.adaptive and settle.all());
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last = ElasticRamp{};
+    var stage_report = StageReport{};
     for (0..options.iterations) |_| {
-        last = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr);
+        last = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr, &stage_report);
         accumulator.record(last.elapsed_ns, last.busiest_solve_batch);
     }
     // The size config charges no long block.
     if (system.long_block_growth.perf.count != 0) return error.ShortRouteTookLongBlock;
     try nav_size.checkNavBytes(elastic_ramp_group.name, item_count, size_config, &system);
     var stats = accumulator.finish();
+    stage_report.write(&stats.details);
     stats.output_count = last.solves;
     // A ramp ends with every agent's result cached once, so every solve past one per
     // agent re-solved a lost result.
     stats.candidate_pairs = last.solves - item_count;
     stats.items_per_second = suite.itemsPerSecond(last.solves, stats.mean_ns);
+    if (case.adaptive) {
+        stats.tuner_settle = settle;
+        stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
+    }
     return stats;
 }
 
 // One ramp from the reserved floor: resets the system to its reserve (untimed), then
-// steps until every agent's result is cached. Times the pathfinding updates only.
-fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSystem, capacity: PathfindingCapacity, stream: *RangeOutputStream(PathRequest), requests: []const PathRequest, thread_system: *ThreadSystem) !ElasticRamp {
+// steps until every agent's result is cached. Times the pathfinding updates only, each added
+// to `report` when given.
+fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSystem, capacity: PathfindingCapacity, stream: *RangeOutputStream(PathRequest), requests: []const PathRequest, thread_system: *ThreadSystem, report: ?*StageReport) !ElasticRamp {
     try system.reserve(capacity);
     system.clearRuntimeState();
     const agent_total = requests.len;
@@ -400,7 +428,9 @@ fn runElasticRamp(io: std.Io, case: suite.BenchmarkCase, system: *PathfindingSys
         try fixtures.writeRequests(stream, requests[0..live]);
         const start_ns = suite.nowNs(io);
         const step_stats = try runColdOnce(system, stream, thread_system, case, live, live, live);
-        ramp.elapsed_ns += suite.elapsedNs(start_ns, suite.nowNs(io));
+        const step_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        ramp.elapsed_ns += step_ns;
+        if (report) |stage_report| stage_report.add(step_ns, step_stats);
         // Every goal is reachable, so each solve caches one result.
         if (step_stats.perf.unavailable_results != 0) return error.ElasticRampUnreachableGoal;
         ramp.solves += step_stats.perf.solved_requests;
@@ -527,7 +557,8 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     var shrink_report = ShrinkReport{};
     for (0..coldIterations(options)) |_| {
         const shrink = try runElasticShrink(allocator, io, case, &system, capacity, &stream, requests, &cached, thread_ptr);
-        accumulator.record(shrink.step_ns, shrink.step_stats.perf.intake_batch);
+        // The headline is the resize copy, the stage the group is judged on.
+        accumulator.record(shrink.step_ns, shrink.step_stats.perf.resize_copy_batch);
         stage_report.add(shrink.step_ns, shrink.step_stats);
         shrink_report.add(shrink);
     }
@@ -558,7 +589,7 @@ fn runElasticShrink(
     cached: *std.ArrayList(CachedPayload),
     thread_system: *ThreadSystem,
 ) !ElasticShrink {
-    _ = try runElasticRamp(io, case, system, capacity, stream, requests, thread_system);
+    _ = try runElasticRamp(io, case, system, capacity, stream, requests, thread_system, null);
     if (system.low_load_steps != 0) return error.ElasticShrinkRampLeftLowLoad;
     const held = requests[requests.len - requests.len / elastic_shrink_divisor ..];
     try fixtures.writeRequests(stream, held);

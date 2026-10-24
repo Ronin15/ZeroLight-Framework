@@ -35,7 +35,11 @@
 //! probe windows, demotions, restores, or shift skips changed over the measured steps.
 //!
 //! Every case runs the same pre-measure steps (the warmup plus the adaptive settle limit), so
-//! the serial and tuned cases measure the same simulated state.
+//! the serial and tuned cases measure the same simulated state. The tuned case then reports
+//! whether every `GameDemoState` tuner a step runs had settled (`settled=k/n` and the
+//! unsettled paths; the rebuild tuners, which only a world create or rebuild selects, are not
+//! counted) and is not judged when one had not. The `--details` tuner deltas end with each
+//! tuner's phase and final shape.
 //!
 //! Pass shape: step and main time linear in population for `spread` and `crowd`; in level
 //! side and in level count at a fixed population, every row advances at its tier and the cost
@@ -808,10 +812,12 @@ const TunerCensus = struct {
             const delta = TunerCounts.of(tuner).since(before);
             if (!delta.any()) return;
             self.changed += 1;
-            // Four counts of at most 20 digits and their labels.
-            var line: [128]u8 = undefined;
+            // Four counts of at most 20 digits and their labels, then the tuner's state.
+            var line: [192]u8 = undefined;
             var writer: std.Io.Writer = .fixed(&line);
             delta.write(&writer) catch {};
+            writer.writeByte(' ') catch {};
+            suite.writeTunerState(&writer, tuner) catch {};
             std.debug.print("    {s} {s}\n", .{ path, writer.buffered() });
         }
     };
@@ -877,6 +883,9 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     const settle_steps = suite.adaptiveSettleIterationLimit(options);
     const warmup_steps = options.warmup_iterations + settle_steps;
     for (0..warmup_steps) |_| _ = try step.run();
+    // Whether every tuner the step runs settled in that fixed count; the rebuild tuners run
+    // only at the world's create and a nav or collider rebuild, never at a step.
+    const settle = suite.TunerSettle.ofExcept(GameDemoState, state, "state", &.{ "rebuild_tuners", "trigger_query_rebuild_tuner" });
     var accumulator = suite.StatsAccumulator.init(item_count);
     var census = Census{};
     var tuner_census: ?TunerCensus = if (options.details) try TunerCensus.init(allocator, state) else null;
@@ -908,6 +917,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         try record.expectRowsUnchanged(&state.data);
         try checkStackedSeparation(allocator, &stats.production_step.?, fields, record);
     }
+    if (case.adaptive) stats.tuner_settle = settle;
     if (threads.workerThreadCount() > 0) try checkPinnedDispatch(&step, &stats.details);
     return stats;
 }

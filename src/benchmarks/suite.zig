@@ -242,7 +242,7 @@ const same_shape_notes = blk: {
 /// A case's report lines past its workload (a group's stage or memory report), written when
 /// the case ends and printed under its row by `--details`. Text past the buffer is cut.
 pub const DetailLines = struct {
-    buffer: [2048]u8 = undefined,
+    buffer: [4096]u8 = undefined,
     len: usize = 0,
 
     pub fn print(self: *DetailLines, comptime format: []const u8, args: anytype) void {
@@ -284,9 +284,11 @@ pub const RunStats = struct {
     /// and range cells print `-` and the summary names no worker use.
     batch_carried: bool = true,
     secondary_batch: ?BatchSummary = null,
-    // Nav groups: the mark stage (null when the workload marks no events) and the key plan.
+    // Nav groups: the mark stage (null when the workload marks no events), the key plan, and
+    // the remask when the headline `batch` is another stage.
     nav_mark_batch: ?BatchSummary = null,
     nav_plan_batch: ?BatchSummary = null,
+    nav_remask_batch: ?BatchSummary = null,
     // Static-collider groups: the chunk lists' and the query lists' splice stages.
     splice_batch: ?BatchSummary = null,
     query_splice_batch: ?BatchSummary = null,
@@ -296,6 +298,9 @@ pub const RunStats = struct {
     secondary_work_tuning: ?WorkTuningSummary = null,
     /// The settle state, before measurement, of the tuners the case's step runs.
     tuner_settle: ?TunerSettle = null,
+    /// The case runs a fixed number of steps no option changes (a fixed-cycle workload), so
+    /// more warmup cannot settle its tuners.
+    fixed_length: bool = false,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
     render_game_prep_phases: ?RenderGamePrepPhaseSummary = null,
     terrain_edit_phases: ?TerrainEditPhaseSummary = null,
@@ -417,7 +422,7 @@ pub const NavMainSummary = struct {
     }
 };
 
-pub fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
+fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
     return .{
         .item_count = batch.item_count,
         .range_count = batch.range_count,
@@ -766,6 +771,21 @@ pub fn tunerSettledOrUnused(tuner: *const AdaptiveWorkTuner) bool {
     return tuner.learned_item_count == 0 or tunerSettled(tuner);
 }
 
+/// Every `AdaptiveWorkTuner` `value` holds by value (`forEachTunerIn`), used or not: a named
+/// tuner list's completeness check.
+pub fn tunerCount(comptime T: type, value: *const T) usize {
+    const Counter = struct {
+        count: usize = 0,
+        pub fn visit(self: *@This(), comptime _: []const u8, _: *AdaptiveWorkTuner) void {
+            self.count += 1;
+        }
+    };
+    var counter = Counter{};
+    // The walk takes mutable pointers; `visit` reads nothing.
+    forEachTunerIn(T, @constCast(value), "", &counter);
+    return counter.count;
+}
+
 /// The settle state of the tuners a case's step runs: `settled` of the `used` ones (a tuner
 /// that never selected a shape is unused) and the first unsettled ones' names. Built per
 /// tuner with `add`, or over every tuner a fixture holds by value with `of`.
@@ -778,10 +798,66 @@ pub const TunerSettle = struct {
     unsettled_listed: usize = 0,
 
     /// Every `AdaptiveWorkTuner` `value` holds by value (`forEachTunerIn`), named by path.
-    pub fn of(comptime T: type, value: *T) TunerSettle {
+    /// `value` is the sub-structure whose tuners the measured step runs: a tuner only a setup
+    /// or one-off step selected counts as used and can hold the census unsettled forever, so
+    /// a fixture holding such tuners passes their parent's step-run members instead.
+    pub fn of(comptime T: type, value: *const T) TunerSettle {
         var census = TunerSettle{};
-        forEachTunerIn(T, value, "", &census);
+        census.addAll(T, value, "");
         return census;
+    }
+
+    /// `of`'s walk added to this census, its paths under `root`.
+    pub fn addAll(self: *TunerSettle, comptime T: type, value: *const T, comptime root: []const u8) void {
+        // The walk takes mutable pointers; `visit` only reads the tuner.
+        forEachTunerIn(T, @constCast(value), root, self);
+    }
+
+    /// `of` over every tuner of `value` but those whose path holds a field named in
+    /// `setup_fields` (`.name`): tuners only a setup step selects, such as a world create's
+    /// rebuild stages, which would otherwise hold the census unsettled.
+    pub fn ofExcept(comptime T: type, value: *const T, comptime root: []const u8, comptime setup_fields: []const []const u8) TunerSettle {
+        var walk = ExceptVisitor(setup_fields){};
+        forEachTunerIn(T, @constCast(value), root, &walk);
+        return walk.census;
+    }
+
+    fn ExceptVisitor(comptime setup_fields: []const []const u8) type {
+        return struct {
+            census: TunerSettle = .{},
+
+            pub fn visit(self: *@This(), comptime path: []const u8, tuner: *AdaptiveWorkTuner) void {
+                const excluded = comptime for (setup_fields) |field| {
+                    if (pathHasField(path, field)) break true;
+                } else false;
+                if (!excluded) self.census.add(path, tuner);
+            }
+        };
+    }
+
+    // Whether `path` (`forEachTunerIn`'s `.field` and `[index]` segments) has a segment named
+    // `field`: any occurrence of `.field` ending at the path's end or a segment boundary.
+    fn pathHasField(comptime path: []const u8, comptime field: []const u8) bool {
+        const segment = "." ++ field;
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, path, from, segment)) |at| {
+            const end = at + segment.len;
+            if (end == path.len or path[end] == '.' or path[end] == '[') return true;
+            from = at + 1;
+        }
+        return false;
+    }
+
+    /// A census over a named tuner list: `tuners[i]` named `names[i]`.
+    pub fn ofNamed(names: []const []const u8, tuners: []const *const AdaptiveWorkTuner) TunerSettle {
+        var census = TunerSettle{};
+        census.addNamed(names, tuners);
+        return census;
+    }
+
+    /// `add` over a named tuner list: `tuners[i]` named `names[i]`.
+    pub fn addNamed(self: *TunerSettle, names: []const []const u8, tuners: []const *const AdaptiveWorkTuner) void {
+        for (names, tuners) |name, tuner| self.add(name, tuner);
     }
 
     pub fn add(self: *TunerSettle, name: []const u8, tuner: *const AdaptiveWorkTuner) void {
@@ -817,8 +893,8 @@ pub const TunerSettle = struct {
     }
 };
 
-/// Per named tuner, its counts when a case's measurement starts; `print` writes each one's
-/// counts over the measured window.
+/// Per named tuner, its counts when a case's measurement starts; `printTuning` writes each
+/// one's state and its counts over the measured window.
 pub fn TunerWindow(comptime n: usize) type {
     return struct {
         const Self = @This();
@@ -831,17 +907,32 @@ pub fn TunerWindow(comptime n: usize) type {
             return window;
         }
 
-        /// `measured_retunes=<name>:<probes>/<demotes>/<restores>/<shift skips> ...`.
-        pub fn print(self: *const Self, details: *DetailLines, names: [n][]const u8, tuners: [n]*const AdaptiveWorkTuner) void {
-            if (comptime !diagnostics_enabled) return;
-            details.print("measured_retunes=", .{});
+        /// `tuners: <name>=<phase>,<final workers/range or inline>,x=<batch multiplier>,<probes>/
+        /// <demotes>/<restores>/<shift skips> ...` (counts over the measured window), one line.
+        pub fn printTuning(self: *const Self, details: *DetailLines, names: [n][]const u8, tuners: [n]*const AdaptiveWorkTuner) void {
+            details.print("tuners:", .{});
             for (names, tuners, self.start) |name, tuner, start| {
-                const counts = TunerCounts.of(tuner).since(start);
-                details.print("{s}:{}/{}/{}/{} ", .{ name, counts.probes, counts.demotes, counts.restores, counts.shift_skips });
+                var state: [64]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(&state);
+                writeTunerState(&writer, tuner) catch {};
+                details.print(" {s}={s}", .{ name, writer.buffered() });
+                if (comptime diagnostics_enabled) {
+                    const counts = TunerCounts.of(tuner).since(start);
+                    details.print(",{}/{}/{}/{}", .{ counts.probes, counts.demotes, counts.restores, counts.shift_skips });
+                }
             }
-            details.print("(probes/demotes/restores/shift_skips)\n", .{});
+            details.print("\n", .{});
         }
+
     };
+}
+
+/// `<phase>,<final workers>/<items per range>,x=<batch multiplier>`, or `<phase>,inline` for
+/// a tuner with no threaded profile.
+pub fn writeTunerState(writer: *std.Io.Writer, tuner: *const AdaptiveWorkTuner) std.Io.Writer.Error!void {
+    try writer.print("{s},", .{@tagName(tuner.phase)});
+    if (!tuner.has_threaded_profile) return writer.writeAll("inline");
+    try writer.print("{}/{},x={d:.2}", .{ tuner.current_profile.worker_threads, tuner.current_profile.items_per_range, tuner.batch_multiplier });
 }
 
 /// A case's warmup and adaptive settle, driven by `while (warm.next(tuners_settled)) step();`:
@@ -1383,7 +1474,10 @@ fn validationAttention(fixed_auto: ?CaseResult, adaptive: ?CaseResult, threaded_
     // benchmark still exits successfully so timing noise can be reviewed.
     if (adaptive) |adaptive_result| {
         // An unsettled tuned case is never judged against the controls.
-        if (caseSettle(adaptive_result.stats) == .no) return "adaptive did not settle before measurement (settled=no): not judged, rerun with more warmup";
+        if (caseSettle(adaptive_result.stats) == .no) {
+            if (adaptive_result.stats.fixed_length) return "adaptive did not settle before measurement (settled=no): not judged, it cannot settle at its fixed length";
+            return "adaptive did not settle before measurement (settled=no): not judged, rerun with more warmup";
+        }
         if (fixed_auto) |auto| {
             if (percentDelta(adaptive_result.stats.mean_ns, auto.stats.mean_ns) > 25) {
                 return "adaptive is more than 25% slower than fixed-auto";
@@ -1536,10 +1630,15 @@ pub fn writeMainShare(writer: *std.Io.Writer, stats: RunStats, items: usize) std
     try writer.print(" main_per_item={f}", .{formatDuration(main_ns / @max(items, 1))});
 }
 
-/// A stage's batch shape: `inline`, or active workers and ranges.
+/// A stage's batch shape: `inline`, or active workers and ranges; then, for a summary over
+/// samples (`batchSummaryFromShapes`), `[threaded/non-empty]` batches.
 pub fn writeStageShape(writer: *std.Io.Writer, batch: BatchSummary) std.Io.Writer.Error!void {
-    if (batch.ran_inline or batch.active_worker_threads == 0) return writer.writeAll("inline");
-    try writer.print("{}w/{}r", .{ batch.active_worker_threads, batch.range_count });
+    if (batch.ran_inline or batch.active_worker_threads == 0) {
+        try writer.writeAll("inline");
+    } else {
+        try writer.print("{}w/{}r", .{ batch.active_worker_threads, batch.range_count });
+    }
+    if (batch.dispatched_batches != 0) try writer.print("[{}/{}]", .{ batch.threaded_batches, batch.dispatched_batches });
 }
 
 // `writeStageShape`, or `-` for a stage that covered no items.
@@ -1549,8 +1648,8 @@ fn writeRunStageShape(writer: *std.Io.Writer, batch: BatchSummary) std.Io.Writer
 }
 
 /// A nav reaction's stage shapes: `mark=` (when the workload marks events), `plan=`, then
-/// `remask=` (the primary batch) and `patch=` (the secondary batch), then the connectivity
-/// block and main-thread split when the group reports them.
+/// `remask=` (`nav_remask_batch`, else the primary batch) and `patch=` (the secondary batch),
+/// then the connectivity block and main-thread split when the group reports them.
 pub fn writeNavStages(writer: *std.Io.Writer, stats: RunStats) std.Io.Writer.Error!void {
     if (stats.nav_mark_batch) |mark| {
         try writer.writeAll("mark=");
@@ -1560,7 +1659,7 @@ pub fn writeNavStages(writer: *std.Io.Writer, stats: RunStats) std.Io.Writer.Err
     try writer.writeAll("plan=");
     try writeStageShape(writer, stats.nav_plan_batch orelse .{});
     try writer.writeAll(" remask=");
-    try writeStageShape(writer, stats.batch);
+    try writeStageShape(writer, stats.nav_remask_batch orelse stats.batch);
     try writer.writeAll(" patch=");
     try writeStageShape(writer, stats.secondary_batch orelse .{});
     try writeNavConn(writer, stats.nav_conn);
@@ -1658,20 +1757,115 @@ fn writeNavConn(writer: *std.Io.Writer, summary: ?NavConnSummary) std.Io.Writer.
     });
 }
 
-/// One nav reaction's connectivity and closure summary from its stats, with the flood
-/// tuner's workers when the case runs it adaptive (null otherwise; zero is inline).
-pub fn navConnSummary(stats: NavUpdateStats, flood_tuner_workers: ?usize) NavConnSummary {
+/// A nav reaction's stage batches over the reactions added (`StageShapes`): the mark, plan,
+/// remask, and patch, the connectivity seed, gather, and flood, and the closure candidates,
+/// resolve, mask, plan, rows, and landing; and the last reaction, for the counters.
+pub const NavReactionShapes = struct {
+    // A stage after the mark: its name, its `NavUpdateStats.perf` batch field, and for a
+    // round-folded stage its widest round's field (`checkNavReactionDispatched`).
+    const PerfStage = struct { name: []const u8, batch: []const u8, round_items_max: ?[]const u8 = null };
+    // The one stage-to-field table `add` and `checkNavReactionDispatched` read, in stage order.
+    const perf_stages = [_]PerfStage{
+        .{ .name = "plan", .batch = "plan_batch" },
+        .{ .name = "remask", .batch = "remask_batch" },
+        .{ .name = "patch", .batch = "patch_batch" },
+        .{ .name = "conn_seed", .batch = "conn_seed_batch" },
+        .{ .name = "conn_gather", .batch = "conn_gather_batch" },
+        .{ .name = "conn_flood", .batch = "conn_flood_batch", .round_items_max = "conn_round_items_max" },
+        .{ .name = "closure_candidates", .batch = "conn_closure_candidates_batch" },
+        .{ .name = "closure_resolve", .batch = "conn_closure_resolve_batch" },
+        .{ .name = "closure_mask", .batch = "conn_closure_mask_batch" },
+        .{ .name = "closure_plan", .batch = "conn_closure_plan_batch" },
+        .{ .name = "closure_rows", .batch = "conn_closure_rows_batch", .round_items_max = "closure_rows_round_items_max" },
+        .{ .name = "closure_land", .batch = "conn_closure_land_batch" },
+    };
+    comptime {
+        // Each stage reads the batch field its name names.
+        for (perf_stages) |stage| std.debug.assert(std.mem.endsWith(u8, stage.batch, stage.name ++ "_batch"));
+    }
+    pub const stage_names = blk: {
+        var names: [1 + perf_stages.len][]const u8 = undefined;
+        names[0] = "mark";
+        for (perf_stages, 1..) |stage, index| names[index] = stage.name;
+        break :blk names;
+    };
+    pub const stage_count = stage_names.len;
+    const mark_stage = 0;
+    const plan_stage = 1;
+    const remask_stage = 2;
+    const patch_stage = 3;
+    comptime {
+        std.debug.assert(std.mem.eql(u8, stage_names[plan_stage], "plan") and std.mem.eql(u8, stage_names[remask_stage], "remask") and std.mem.eql(u8, stage_names[patch_stage], "patch"));
+    }
+
+    shapes: StageShapes(stage_count) = .{},
+    last: NavUpdateStats = .{},
+
+    /// One reaction: `mark` is the mark dispatch that fed it (empty when none did).
+    pub fn add(self: *NavReactionShapes, mark: BatchStats, stats: NavUpdateStats) void {
+        // The counters `connSummary` reads outside the perf log (`chunks_patched`,
+        // `records_patched`) are kept in every build.
+        self.last = stats;
+        if (comptime !diagnostics_enabled) return;
+        var batches: [stage_count]BatchStats = undefined;
+        batches[mark_stage] = mark;
+        inline for (perf_stages, 1..) |stage, index| batches[index] = @field(stats.perf, stage.batch);
+        self.shapes.add(batches);
+    }
+
+    /// `<prefix>: <stage>=<label> ...` over every stage (`StageShapes.print`).
+    pub fn print(self: *const NavReactionShapes, details: *DetailLines, prefix: []const u8) void {
+        self.shapes.print(details, prefix, stage_names);
+    }
+
+    /// Into `stats`: the mark (when a reaction marked), plan, remask, and patch over the
+    /// reactions added, and the connectivity summary (`connSummary`).
+    pub fn summarize(self: *const NavReactionShapes, stats: *RunStats, flood_tuner_workers: ?usize) void {
+        if (self.shapes.dispatched[mark_stage] != 0) stats.nav_mark_batch = batchSummaryFromShapes(&self.shapes, mark_stage);
+        stats.nav_plan_batch = batchSummaryFromShapes(&self.shapes, plan_stage);
+        stats.nav_remask_batch = batchSummaryFromShapes(&self.shapes, remask_stage);
+        stats.secondary_batch = batchSummaryFromShapes(&self.shapes, patch_stage);
+        stats.nav_conn = self.connSummary(flood_tuner_workers);
+    }
+
+    /// The last reaction's connectivity and closure counters (`navConnCounters`), every stage
+    /// shape over the reactions added.
+    pub fn connSummary(self: *const NavReactionShapes, flood_tuner_workers: ?usize) NavConnSummary {
+        var conn = navConnCounters(self.last, flood_tuner_workers);
+        const stage_summaries = [_]*BatchSummary{ &conn.seed, &conn.gather, &conn.flood, &conn.candidates, &conn.closure_resolve, &conn.closure_mask, &conn.closure_plan, &conn.closure_rows, &conn.closure_land };
+        comptime std.debug.assert(patch_stage + 1 + stage_summaries.len == stage_count);
+        for (stage_summaries, patch_stage + 1..) |summary, stage| summary.* = batchSummaryFromShapes(&self.shapes, stage);
+        return conn;
+    }
+};
+
+/// Fails when a fixed threaded case ran a nav reaction stage inline that it dispatches: the
+/// chunk-partitioned stages and `mark` past one range (`checkStageDispatched`), the flood
+/// and closure rows when their widest round spans more than one (`checkRoundsDispatched`);
+/// every stage of `NavReactionShapes`. The nav stages share one control, from one item per
+/// range (`chunk_partition_items`).
+pub fn checkNavReactionDispatched(case: BenchmarkCase, thread_system: ?*const ThreadSystem, mark: BatchStats, stats: NavUpdateStats) error{BenchStageRanInline}!void {
+    if (comptime !diagnostics_enabled) return;
+    const range = case.stageItemsPerRangeForPartition(chunk_partition_items, 1);
+    try checkStageDispatched(case, thread_system, range, mark);
+    inline for (NavReactionShapes.perf_stages) |stage| {
+        const batch = @field(stats.perf, stage.batch);
+        if (comptime stage.round_items_max) |round_field| {
+            try checkRoundsDispatched(case, thread_system, range, batch, @field(stats.perf, round_field));
+        } else try checkStageDispatched(case, thread_system, range, batch);
+    }
+}
+
+// One nav reaction's connectivity and closure counters from its stats (no stage shapes), with
+// the flood tuner's workers when the case runs it adaptive (null otherwise; zero is inline).
+fn navConnCounters(stats: NavUpdateStats, flood_tuner_workers: ?usize) NavConnSummary {
     var summary = NavConnSummary{
-        .flood = batchSummaryFromBatch(stats.perf.conn_flood_batch),
         .flood_tuner_workers = flood_tuner_workers,
         .chunks_patched = stats.chunks_patched,
         .records_patched = stats.records_patched,
-        .closure_rows = batchSummaryFromBatch(stats.perf.conn_closure_rows_batch),
         .closure_rows_off_main_ns = if (stats.perf.conn_closure_rows_batch.ran_inline) 0 else stats.perf.conn_closure_rows_batch.batch_duration_ns,
     };
     if (comptime diagnostics_enabled) {
-        summary.seed = batchSummaryFromBatch(stats.perf.conn_seed_batch);
-        summary.gather = batchSummaryFromBatch(stats.perf.conn_gather_batch);
         summary.families = stats.perf.conn_families;
         summary.rounds = stats.perf.conn_rounds;
         summary.round_items_min = stats.perf.conn_round_items_min;
@@ -1682,11 +1876,6 @@ pub fn navConnSummary(stats: NavUpdateStats, flood_tuner_workers: ?usize) NavCon
         summary.splits = stats.perf.conn_splits;
         summary.merges = stats.perf.conn_merges;
         summary.flood_off_main_ns = stats.perf.conn_flood_off_main_ns;
-        summary.candidates = batchSummaryFromBatch(stats.perf.conn_closure_candidates_batch);
-        summary.closure_resolve = batchSummaryFromBatch(stats.perf.conn_closure_resolve_batch);
-        summary.closure_mask = batchSummaryFromBatch(stats.perf.conn_closure_mask_batch);
-        summary.closure_plan = batchSummaryFromBatch(stats.perf.conn_closure_plan_batch);
-        summary.closure_land = batchSummaryFromBatch(stats.perf.conn_closure_land_batch);
         summary.closure_touched = stats.perf.closure_touched;
         summary.closure_links = stats.perf.closure_links;
         summary.closure_terms_new = stats.perf.closure_terms_new;
@@ -1829,6 +2018,14 @@ pub fn StageShapes(comptime n: usize) type {
                 const busiest_on_workers = !busiest.ran_inline and busiest.active_worker_threads != 0;
                 if (batch.item_count > busiest.item_count or (batch.item_count == busiest.item_count and on_workers and !busiest_on_workers)) busiest.* = batch;
             }
+        }
+
+        /// `<prefix>: <name>=<label> ...`, one line over every stage.
+        pub fn print(self: *const Self, details: *DetailLines, prefix: []const u8, names: [n][]const u8) void {
+            var buffer: [48]u8 = undefined;
+            details.print("{s}:", .{prefix});
+            for (names, 0..) |name, index| details.print(" {s}={s}", .{ name, self.label(index, &buffer) });
+            details.print("\n", .{});
         }
 
         /// Stage `index`'s shape: `inline(items)` or `Ww/Rr(items)`, then threaded/non-empty
@@ -2114,7 +2311,11 @@ test "a tuner census counts used tuners only and names the unsettled" {
     try std.testing.expectEqual(@as(?Settle, .no), caseSettle(unsettled));
     const adaptive = CaseResult{ .case = default_cases[default_cases.len - 1], .stats = unsettled };
     const fixed = CaseResult{ .case = findBenchmarkCase("thread-fixed-auto").?, .stats = .{ .mean_ns = 1 } };
-    try std.testing.expect(std.mem.startsWith(u8, validationAttention(fixed, adaptive, fixed).?, "adaptive did not settle"));
+    try std.testing.expect(std.mem.endsWith(u8, validationAttention(fixed, adaptive, fixed).?, "rerun with more warmup"));
+    // A fixed-length case is never told to warm up more.
+    var fixed_length = adaptive;
+    fixed_length.stats.fixed_length = true;
+    try std.testing.expect(std.mem.endsWith(u8, validationAttention(fixed, fixed_length, fixed).?, "cannot settle at its fixed length"));
     const fresh: RunStats = .{ .work_tuning = workTuningSummary(&fixture.settled, .fresh) };
     try std.testing.expectEqual(@as(?Settle, .fresh), caseSettle(fresh));
     try std.testing.expectEqualStrings("settled=fresh", formatSettleInto(&buffer, fresh).?);
@@ -2389,6 +2590,98 @@ test "the stage-shape accumulator keeps each stage's busiest batch, preferring o
     var buffer: [48]u8 = undefined;
     try std.testing.expectEqualStrings("3w/4r(8)[1/3]", shapes.label(0, &buffer));
     try std.testing.expectEqualStrings("inline(2)[0/1]", shapes.label(1, &buffer));
+}
+
+test "a stage line names each stage's shape over the samples, and a summarized stage prints its threaded count" {
+    var shapes = StageShapes(2){};
+    shapes.add(.{ .{ .item_count = 8, .range_count = 4, .active_worker_threads = 3, .ran_inline = false }, .{ .item_count = 2, .range_count = 1, .ran_inline = true } });
+    shapes.add(.{ .{ .item_count = 8, .range_count = 1, .ran_inline = true }, .{} });
+    var details = DetailLines{};
+    shapes.print(&details, "stages", .{ "plan", "write" });
+    try std.testing.expectEqualStrings("stages: plan=3w/4r(8)[1/2] write=inline(2)[0/1]\n", details.text());
+
+    var buffer: [48]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeStageShape(&writer, batchSummaryFromShapes(&shapes, 0));
+    try std.testing.expectEqualStrings("3w/4r[1/2]", writer.buffered());
+    // A summary of no samples (a shape set by hand) prints no count.
+    writer = .fixed(&buffer);
+    try writeStageShape(&writer, .{ .item_count = 2, .ran_inline = true });
+    try std.testing.expectEqualStrings("inline", writer.buffered());
+}
+
+test "a nav reaction's stage shapes land on their named summaries and stage line" {
+    // Each stage's batch carries its stage index plus one as its item count.
+    var batches: [NavReactionShapes.stage_count]BatchStats = undefined;
+    for (&batches, 1..) |*batch, count| batch.* = .{ .item_count = count, .range_count = 1 };
+    var shapes = NavReactionShapes{};
+    shapes.shapes.add(batches);
+    var run = RunStats{};
+    shapes.summarize(&run, null);
+    try std.testing.expectEqual(@as(usize, 1), run.nav_mark_batch.?.item_count);
+    try std.testing.expectEqual(@as(usize, 2), run.nav_plan_batch.?.item_count);
+    try std.testing.expectEqual(@as(usize, 3), run.nav_remask_batch.?.item_count);
+    try std.testing.expectEqual(@as(usize, 4), run.secondary_batch.?.item_count);
+    const conn = run.nav_conn.?;
+    const conn_stages = [_]BatchSummary{ conn.seed, conn.gather, conn.flood, conn.candidates, conn.closure_resolve, conn.closure_mask, conn.closure_plan, conn.closure_rows, conn.closure_land };
+    for (conn_stages, 5..) |stage, count| try std.testing.expectEqual(count, stage.item_count);
+    var details = DetailLines{};
+    shapes.print(&details, "reaction");
+    try std.testing.expectEqualStrings("reaction: mark=inline(1)[0/1] plan=inline(2)[0/1] remask=inline(3)[0/1] patch=inline(4)[0/1] conn_seed=inline(5)[0/1] conn_gather=inline(6)[0/1] conn_flood=inline(7)[0/1] closure_candidates=inline(8)[0/1] closure_resolve=inline(9)[0/1] closure_mask=inline(10)[0/1] closure_plan=inline(11)[0/1] closure_rows=inline(12)[0/1] closure_land=inline(13)[0/1]\n", details.text());
+
+    // No reaction marked: no mark shape.
+    var unmarked = NavReactionShapes{};
+    batches[0] = .{};
+    unmarked.shapes.add(batches);
+    run = .{};
+    unmarked.summarize(&run, null);
+    try std.testing.expectEqual(@as(?BatchSummary, null), run.nav_mark_batch);
+}
+
+test "a tuner census skips setup-only tuners by field name, and a tuner count walks every tuner" {
+    const Nested = struct { rebuild_tuners_note: AdaptiveWorkTuner };
+    const Inner = struct { rebuild_tuners: [1]AdaptiveWorkTuner };
+    const Note = struct { rebuild_tuners_note: Inner };
+    const Fixture = struct {
+        step: AdaptiveWorkTuner,
+        rebuild_tuners: [2]AdaptiveWorkTuner,
+        nested: Nested,
+        // The excluded field after a longer name sharing its prefix in one path.
+        note: Note,
+        unused: AdaptiveWorkTuner,
+    };
+    var learning = testSettledThreadedTuner();
+    learning.phase = .learning;
+    const fixture = Fixture{
+        .step = testSettledThreadedTuner(),
+        .rebuild_tuners = .{ learning, learning },
+        .nested = .{ .rebuild_tuners_note = learning },
+        .note = .{ .rebuild_tuners_note = .{ .rebuild_tuners = .{learning} } },
+        .unused = .init(.{}),
+    };
+    // Excluded by its field wherever it sits in the path, never by a longer name sharing its
+    // prefix.
+    const census = TunerSettle.ofExcept(Fixture, &fixture, "state", &.{"rebuild_tuners"});
+    var buffer: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try census.write(&writer);
+    try std.testing.expectEqualStrings("settled=1/2 unsettled=state.nested.rebuild_tuners_note", writer.buffered());
+    // A const value walks too, every used tuner counted.
+    try std.testing.expectEqual(@as(usize, 5), TunerSettle.of(Fixture, &fixture).used);
+    try std.testing.expectEqual(@as(usize, 6), tunerCount(Fixture, &fixture));
+}
+
+test "a tuner state names its phase and final shape, or inline" {
+    var tuner = testSettledThreadedTuner();
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeTunerState(&writer, &tuner);
+    try std.testing.expectEqualStrings("settled,4/256,x=1.21", writer.buffered());
+    tuner.has_threaded_profile = false;
+    tuner.phase = .learning;
+    writer = .fixed(&buffer);
+    try writeTunerState(&writer, &tuner);
+    try std.testing.expectEqualStrings("learning,inline", writer.buffered());
 }
 
 fn formatSteeringStagesInto(buffer: []u8, stats: RunStats) []const u8 {

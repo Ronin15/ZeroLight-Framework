@@ -34,12 +34,20 @@
 //! `steering-static-dense` prints `obstacle_visits=` (with visits per agent),
 //! `obstacle_samples=`, and `intents=`. `--details` adds each prepare stage's shape
 //! (`agents=`, `resolve=`, `claim=`, `dir=`, `bucket=` the agent grid's bucket pass, `sort=`
-//! its sort; `-` for a stage that did not run), `steer=` (the avoidance pass), and `main=`;
+//! its sort; `-` for a stage that did not run), `steer=` (the avoidance pass), each over the
+//! measured steps (`[threaded/non-empty]`), and `main=` with `main_per_item=` (per agent);
 //! the agent groups also print `band_max=`, the entries in the agent grid's largest band.
+//! `steering-static-change` adds the seam's collider sync and trigger patch stages (`seam:`),
+//! and its main share subtracts every seam stage on workers. The tuned case settles every
+//! tuner its measured step runs (`step_tuners:`: the seven steering stages, and the seam's
+//! for `steering-static-change`) and prints each steering tuner's state (`tuners:`). A fixed
+//! threaded case runs every stage of more than one range on workers; the band stages (claim,
+//! grid sort) are checked at one band per range, their fixed shape.
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
 const math = @import("../core/math.zig");
@@ -255,11 +263,26 @@ fn stagesOffMainNs(stats: SteeringStats) u64 {
         offMainNs(stats.perf.grid_bucket_batch) + offMainNs(stats.perf.grid_sort_batch) + offMainNs(stats.perf.batch);
 }
 
-// Every steering stage tuner has settled.
-fn stageTunersSettled(system: *const SteeringSystem) bool {
-    return suite.tunerSettled(&system.adaptive_tuner) and suite.tunerSettled(&system.agents_tuner) and suite.tunerSettled(&system.select_resolve_tuner) and
-        suite.tunerSettled(&system.select_claim_tuner) and suite.tunerSettled(&system.directions_tuner) and suite.tunerSettled(&system.grid_bucket_tuner) and
-        suite.tunerSettled(&system.grid_sort_tuner);
+// The steering step's stages, each under its own tuner, in run order: the six prepare
+// stages, then the avoidance pass (`steer`, the row's batch).
+const stage_names = [_][]const u8{ "agents", "resolve", "claim", "dir", "bucket", "sort", "steer" };
+
+fn stageTuners(system: *const SteeringSystem) [stage_names.len]*const AdaptiveWorkTuner {
+    return .{ &system.agents_tuner, &system.select_resolve_tuner, &system.select_claim_tuner, &system.directions_tuner, &system.grid_bucket_tuner, &system.grid_sort_tuner, &system.adaptive_tuner };
+}
+
+fn stageBatches(stats: SteeringStats) [stage_names.len]BatchStats {
+    const perf = stats.perf;
+    return .{ perf.agents_batch, perf.select_resolve_batch, perf.select_claim_batch, perf.directions_batch, perf.grid_bucket_batch, perf.grid_sort_batch, perf.batch };
+}
+
+// Every tuner a measured step runs: the steering stages', and the commit seam's when the step
+// runs one (`fixtures.addSeamTuners`).
+fn stepTunerSettle(system: *const SteeringSystem, seam: ?*const SeamFixture) suite.TunerSettle {
+    var census = suite.TunerSettle{};
+    census.addNamed(&stage_names, &stageTuners(system));
+    if (seam) |fixture| fixtures.addSeamTuners(&census, &fixture.seam.pipeline);
+    return census;
 }
 
 // Entries in the agent grid's largest band after the last step.
@@ -277,8 +300,8 @@ fn largestGridBand(system: *const SteeringSystem) usize {
 
 // Warms up, settles the stage tuners, and times `step(context)` of `system` over
 // `agent_count` agents, with the main thread's share: each iteration minus the off-main time
-// of the steering stages and, when the step runs a commit seam, the seam's
-// (`seam_off_main_ns`, read after each step). `prepare(context)` writes the step's inputs
+// of the steering stages and, when the step runs a commit seam (`seam`), the seam's
+// (`SeamFixture.seam_off_main_ns`, read after each step). `prepare(context)` writes the step's inputs
 // before each step, outside the timed region.
 fn measureCase(
     allocator: std.mem.Allocator,
@@ -288,7 +311,7 @@ fn measureCase(
     item_count: usize,
     system: *SteeringSystem,
     agent_count: usize,
-    seam_off_main_ns: ?*const u64,
+    seam: ?*const SeamFixture,
     context: anytype,
     comptime prepare: fn (@TypeOf(context)) anyerror!void,
     comptime step: fn (*SteeringSystem, @TypeOf(context), *ThreadSystem, suite.BenchmarkCase) anyerror!SteeringStats,
@@ -301,45 +324,57 @@ fn measureCase(
 
     var last_stats = SteeringStats{};
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(stageTunersSettled(system))) {
+    while (warm.next(stepTunerSettle(system, seam).all())) {
         try prepare(context);
         last_stats = try step(system, context, thread_ptr, case);
     }
-    const settled_before_measurement = if (case.adaptive) stageTunersSettled(system) else false;
-    const adaptive_tuner_start = suite.TunerStart.of(&system.adaptive_tuner, settled_before_measurement);
+    const settle = stepTunerSettle(system, seam);
+    const adaptive_tuner_start = suite.TunerStart.of(&system.adaptive_tuner, case.adaptive and settle.all());
+    const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(system));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
+    var shapes = suite.StageShapes(stage_names.len){};
+    var seam_shapes = suite.StageShapes(fixtures.seam_stage_names.len){};
+    // The band stages (claim, grid sort) take one band per range at a fixed shape; the rest
+    // the case's element range.
+    const element_range = case.stageItemsPerRange(steering_range_alignment_items);
+    const band_range: ?usize = if (element_range == null) null else 1;
     for (0..options.iterations) |_| {
         try prepare(context);
         const start_ns = suite.nowNs(io);
         last_stats = try step(system, context, thread_ptr, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        const off_main_ns = stagesOffMainNs(last_stats) + (if (seam_off_main_ns) |seam_ns| seam_ns.* else 0);
+        const off_main_ns = stagesOffMainNs(last_stats) + (if (seam) |fixture| fixture.seam_off_main_ns else 0);
         main_total += elapsed_ns -| off_main_ns;
         accumulator.record(elapsed_ns, last_stats.perf.batch);
-        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(steering_range_alignment_items), &.{
-            last_stats.perf.agents_batch,      last_stats.perf.select_resolve_batch, last_stats.perf.select_claim_batch, last_stats.perf.directions_batch,
-            last_stats.perf.grid_bucket_batch, last_stats.perf.grid_sort_batch,      last_stats.perf.batch,
+        shapes.add(stageBatches(last_stats));
+        if (seam) |fixture| seam_shapes.add(fixtures.seamBatches(&fixture.seam.pipeline));
+        try suite.checkStagesDispatched(case, thread_ptr, element_range, &.{
+            last_stats.perf.agents_batch,      last_stats.perf.select_resolve_batch, last_stats.perf.directions_batch,
+            last_stats.perf.grid_bucket_batch, last_stats.perf.batch,
         });
+        try suite.checkStagesDispatched(case, thread_ptr, band_range, &.{ last_stats.perf.select_claim_batch, last_stats.perf.grid_sort_batch });
     }
 
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.output_count = last_stats.movement_intent_count;
-    stats.secondary_batch = suite.batchSummaryFromBatch(BatchStats{});
     stats.steering_stages = .{
-        .agents = suite.batchSummaryFromBatch(last_stats.perf.agents_batch),
-        .select_resolve = suite.batchSummaryFromBatch(last_stats.perf.select_resolve_batch),
-        .select_claim = suite.batchSummaryFromBatch(last_stats.perf.select_claim_batch),
-        .directions = suite.batchSummaryFromBatch(last_stats.perf.directions_batch),
-        .grid_bucket = suite.batchSummaryFromBatch(last_stats.perf.grid_bucket_batch),
-        .grid_sort = suite.batchSummaryFromBatch(last_stats.perf.grid_sort_batch),
+        .agents = suite.batchSummaryFromShapes(&shapes, 0),
+        .select_resolve = suite.batchSummaryFromShapes(&shapes, 1),
+        .select_claim = suite.batchSummaryFromShapes(&shapes, 2),
+        .directions = suite.batchSummaryFromShapes(&shapes, 3),
+        .grid_bucket = suite.batchSummaryFromShapes(&shapes, 4),
+        .grid_sort = suite.batchSummaryFromShapes(&shapes, 5),
         .band_max = largestGridBand(system),
     };
+    if (seam != null) seam_shapes.print(&stats.details, "seam", fixtures.seam_stage_names);
     if (case.adaptive) {
+        stats.tuner_settle = settle;
         stats.work_tuning = suite.workTuningSummary(&system.adaptive_tuner, adaptive_tuner_start);
+        tuner_window.printTuning(&stats.details, stage_names, stageTuners(system));
     }
     return .{ .stats = stats, .last = last_stats };
 }
@@ -495,7 +530,7 @@ const SeamFixture = struct {
     // `commands` through the production commit seam in the frame's current step.
     fn commit(self: *SeamFixture, commands: []const StructuralCommand, thread_system: *ThreadSystem) !CommitSeamResult {
         const result = try self.seam.commit(&self.data, &self.world, commands, thread_system);
-        self.seam_off_main_ns = static_colliders_test_support.lastOffMainNs(self.colliders().*) + result.nav_update.perf.off_main_stage_ns;
+        self.seam_off_main_ns = fixtures.seamOffMainNs(&self.seam.pipeline, result.nav_update);
         return result;
     }
 
@@ -620,7 +655,7 @@ fn runStaticChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     var fixture = try createStaticChangeFixture(allocator, io, item_count);
     defer fixture.deinit(allocator);
     fixture.steering.seam.setCaseTuners(case);
-    const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering.seam.pipeline.steering, fixture.steering.agents.items.len, &fixture.steering.seam_off_main_ns, &fixture, prepareStaticChange, staticChangeOnce);
+    const measured = try measureCase(allocator, io, options, case, item_count, &fixture.steering.seam.pipeline.steering, fixture.steering.agents.items.len, &fixture.steering, &fixture, prepareStaticChange, staticChangeOnce);
     var stats = measured.stats;
     stats.candidate_pairs = measured.last.perf.obstacle_candidate_checks;
     stats.sample_count = measured.last.perf.obstacle_samples;
@@ -867,9 +902,9 @@ fn writeStaticDenseWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view:
     try writeSteerShape(writer, stats);
 }
 
-// The avoidance pass's shape and the main thread's share.
+// The avoidance pass's shape and the main thread's share, also per agent.
 fn writeSteerShape(writer: *std.Io.Writer, stats: suite.RunStats) std.Io.Writer.Error!void {
     try writer.writeAll(" steer=");
     try suite.writeStageShape(writer, stats.batch);
-    try suite.writeShare(writer, "main", stats.main_ns orelse 0, stats.mean_ns);
+    try suite.writeMainShare(writer, stats, stats.output_count);
 }

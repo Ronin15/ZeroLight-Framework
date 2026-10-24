@@ -5,9 +5,12 @@
 //! Pathfinding connectivity bench groups: component splits and the one-way closure.
 //! A config whose nav storage exceeds the bench's nav-size limit fails with its
 //! figure (`nav_size.checkNavSize`), and every config checks each part of the nav's
-//! bytes against its charge (`nav_size.checkNavBytes`). Every toggle reaction's one-way
-//! closure rows run on workers in a fixed threaded case when a round spans more than one
-//! range (`suite.checkRoundsDispatched`).
+//! bytes against its charge (`nav_size.checkNavBytes`). Every toggle reaction, block and
+//! reopen, runs each chunk-partitioned stage of more than one range on workers in a fixed
+//! threaded case, and its flood and one-way closure rows when a round spans more than one
+//! range (`suite.checkNavReactionDispatched`). The headline batch and tuner are the block
+//! reaction's flood (split) or closure rows (one-way); the tuned case settles both stage tuner
+//! sets (`step_tuners:`) before measuring.
 
 const std = @import("std");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -19,6 +22,7 @@ const PathfindingSystem = @import("../../game/systems/pathfinding.zig").Pathfind
 const PathRequest = @import("../../game/simulation.zig").PathRequest;
 const PathfindingCapacity = @import("../../game/systems/pathfinding.zig").PathfindingCapacity;
 const NavUpdateStats = @import("../../game/systems/pathfinding/types.zig").NavUpdateStats;
+const NavStage = @import("../../game/systems/pathfinding/nav_graph.zig").NavStage;
 const WorldSystem = @import("../../game/world/system.zig").WorldSystem;
 const CellCoord = @import("../../game/world/system.zig").CellCoord;
 const TileId = @import("../../game/world/system.zig").TileId;
@@ -219,12 +223,9 @@ fn writeOnewayWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suit
 }
 
 // One timed toggle: a change of `cells` and its nav reaction, then the revert and its
-// reaction, with the change reaction's plan, remask, and patch batches.
+// reaction.
 const ToggleSample = struct {
     change: Reaction,
-    // The change reaction's plan, remask, patch, connectivity seed, gather, and flood, and
-    // closure candidates, resolve, mask, plan, rows, and landing.
-    change_stages: [toggle_stage_count]BatchStats,
     revert: Reaction,
 
     fn elapsedNs(self: ToggleSample) u64 {
@@ -252,18 +253,17 @@ const ToggleChecks = struct {
 };
 
 // Fails when a reaction's closure passed what its prepare bounded: tail words past its
-// reserve or its bound, new terminals past its gross pops, or, for a block kept in place, row
-// words written past its affected rows (recomputed, left, and new) at the widest row. Reads
-// the live closure limits, so it runs before the next reaction replaces them.
+// reserved bound, new terminals past its gross pops, or, for a block kept in place, row words
+// written past its affected rows (recomputed, left, and new) at the widest row. The bounds are
+// the reaction's perf counters, folded per batch before the step's staging release can clear
+// the live limits; the row widths are the live `hcomp.k_cap`, which no release touches.
 fn checkOnewayWithinBounds(fixture: *const ReactFixture, stats: NavUpdateStats, fixed_blocks: bool) !void {
     const perf = stats.perf;
     if (perf.closure_tail_used > perf.closure_tail_bound) return error.ConnectivityOnewayTailPastReserve;
     if (perf.closure_links == 0 or stats.levels_built != 0) return;
-    const closure = &fixture.system.graph.connectivity.closure;
-    const limits = closure.limits;
-    if (perf.closure_terms_new > limits.n_gross) return error.ConnectivityOnewayTermsPastBound;
-    if (perf.closure_tail_used > limits.tail_words) return error.ConnectivityOnewayTailPastBound;
+    if (perf.closure_terms_new > perf.closure_n_gross) return error.ConnectivityOnewayTermsPastBound;
     if (!fixed_blocks) return;
+    const closure = &fixture.system.graph.connectivity.closure;
     var widest: usize = 0;
     for (closure.hcomp.k_cap) |k_cap| widest = @max(widest, connectivity_closure.rowWords(k_cap));
     if (perf.closure_words_written > (perf.closure_a_rows + perf.closure_terms_left + perf.closure_terms_new) * widest) return error.ConnectivityOnewayRowsPastBound;
@@ -288,13 +288,15 @@ fn checkOnewayReserve(stats: NavUpdateStats) !void {
     if (stats.perf.closure_tail_bound > 2 * stats.perf.closure_candidate_words + slack) return error.ConnectivityOnewayReserveRatio;
 }
 
-// Fails when a toggle reaction relocated, landed, allocated, or freed a block, or grew or
-// released the batch tail (its capacity left `tail_capacity`): a toggle in place touches only
-// its own system's rows.
-fn checkOnewayIsolated(fixture: *const ReactFixture, stats: NavUpdateStats, tail_capacity: usize) !void {
+// Fails when a toggle reaction relocated, landed, allocated, or freed a block, or its closure
+// batches grew or shrank the batch tail (the capacity the reaction's perf counters hold after
+// its last batch left `tail_capacity`, the capacity before it): a toggle in place touches only
+// its own system's rows. The counter, not the live tail, so a staging release closing the
+// reaction's step is not charged to the toggle.
+fn checkOnewayIsolated(stats: NavUpdateStats, tail_capacity: usize) !void {
     if (stats.perf.closure_landed_words != 0 or stats.perf.closure_tail_used != 0) return error.ConnectivityOnewayBallastLanded;
     if (stats.perf.closure_block_allocs != 0 or stats.perf.closure_block_frees != 0) return error.ConnectivityOnewayBallastBlocks;
-    if (fixture.system.graph.connectivity.closure.tail.capacity != tail_capacity) return error.ConnectivityOnewayBallastTail;
+    if (stats.perf.closure_tail_capacity != tail_capacity) return error.ConnectivityOnewayBallastTail;
 }
 
 // Blocks `cells` (open before) and runs the nav reaction, then reopens them and runs it again
@@ -304,22 +306,12 @@ fn runToggle(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, cell
     const change = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_system);
     try checkOnewayWithinBounds(fixture, change.stats, checks.fixed_blocks);
     if (checks.untouched) try checkOnewayUntouched(change.stats);
-    if (checks.isolated) try checkOnewayIsolated(fixture, change.stats, tail_capacity);
+    if (checks.isolated) try checkOnewayIsolated(change.stats, tail_capacity);
     const stats = change.stats;
     const perf = stats.perf;
-    const change_stages = [toggle_stage_count]BatchStats{
-        perf.plan_batch,                    stats.perf.remask_batch,            perf.patch_batch,
-        perf.conn_seed_batch,               perf.conn_gather_batch,             stats.perf.conn_flood_batch,
-        perf.conn_closure_candidates_batch, perf.conn_closure_resolve_batch,    perf.conn_closure_mask_batch,
-        perf.conn_closure_plan_batch,       stats.perf.conn_closure_rows_batch, perf.conn_closure_land_batch,
-    };
-    // Every chunk-partitioned stage but the round-folded flood and rows runs on workers in a
-    // fixed threaded case.
-    try suite.checkStagesDispatched(case, thread_system, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{
-        perf.plan_batch,              stats.perf.remask_batch,            perf.patch_batch,                perf.conn_seed_batch,
-        perf.conn_gather_batch,       perf.conn_closure_candidates_batch, perf.conn_closure_resolve_batch, perf.conn_closure_mask_batch,
-        perf.conn_closure_plan_batch, perf.conn_closure_land_batch,
-    });
+    // Every chunk-partitioned stage runs on workers in a fixed threaded case, and the
+    // round-folded flood and closure rows when a round spans more than one range.
+    try suite.checkNavReactionDispatched(case, thread_system, change.mark, stats);
     if (checks.flood_bound) |bound| {
         if (perf.conn_flood_nodes == 0 or perf.conn_flood_nodes > bound) return error.ConnectivitySplitFloodPastBound;
     }
@@ -328,17 +320,16 @@ fn runToggle(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, cell
     }
     if (checks.more_searches_than_rounds and stats.perf.conn_flood_batch.item_count <= perf.conn_rounds) return error.ConnectivitySplitPocketsRounds;
     if (checks.flood_dispatch) try suite.checkStageDispatched(case, thread_system, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), stats.perf.conn_flood_batch);
-    // The closure rows' widest round past one fixed range ran on workers.
-    try suite.checkRoundsDispatched(case, thread_system, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), stats.perf.conn_closure_rows_batch, perf.closure_rows_round_items_max);
     const revert = revert: {
         fixtures.swapNavTuners(&fixture.system, revert_tuners);
         defer fixtures.swapNavTuners(&fixture.system, revert_tuners);
         const reaction = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_system);
+        try suite.checkNavReactionDispatched(case, thread_system, reaction.mark, reaction.stats);
         try checkOnewayWithinBounds(fixture, reaction.stats, checks.fixed_blocks);
         if (checks.untouched) try checkOnewayUntouched(reaction.stats);
         break :revert reaction;
     };
-    if (checks.isolated) try checkOnewayIsolated(fixture, revert.stats, tail_capacity);
+    if (checks.isolated) try checkOnewayIsolated(revert.stats, tail_capacity);
     // An opening floods nothing.
     if (revert.stats.perf.conn_flood_nodes != 0) return error.ConnectivityOpeningFlooded;
     // A toggle and its revert never resize a one-way block.
@@ -347,24 +338,23 @@ fn runToggle(io: std.Io, case: suite.BenchmarkCase, fixture: *ReactFixture, cell
         try checkOnewayReserve(change.stats);
         try checkOnewayReserve(revert.stats);
     }
-    return .{ .change = change, .change_stages = change_stages, .revert = revert };
+    return .{ .change = change, .revert = revert };
 }
 
-const toggle_stage_count = 12;
+// The stage a toggle group is judged on, its headline: the split's flood or the one-way
+// closure's rows.
+const ToggleHeadline = enum { flood, rows };
 
 // The timed toggles' change and revert reactions: their times and main-thread share, printed
-// under --details; and, for the workload column, the change reaction's stage shapes (each
-// stage's busiest batch), its connectivity and closure summary beside the revert's flood
-// nodes, and both reactions' main-thread split.
+// under --details; and, for the workload column, the change reactions' stage shapes over the
+// samples (`NavReactionShapes`), their connectivity and closure summary beside the revert's
+// flood nodes, and both reactions' main-thread split.
 const ToggleReport = struct {
     samples: usize = 0,
     change_ns: u128 = 0,
     revert_ns: u128 = 0,
     main_ns: u128 = 0,
-    // Plan, remask, patch, connectivity seed, gather, and flood, and closure candidates,
-    // resolve, mask, plan, rows, and landing.
-    shapes: suite.StageShapes(toggle_stage_count) = .{},
-    last_change: NavUpdateStats = .{},
+    shapes: suite.NavReactionShapes = .{},
     revert_flood_nodes: usize = 0,
     // Summed over both reactions of every sample.
     closure_shrinks: usize = 0,
@@ -389,8 +379,7 @@ const ToggleReport = struct {
         self.nav_main.add(sample.change.elapsed_ns -| change_off_main_ns, change);
         self.nav_main.add(sample.revert.elapsed_ns -| revert_off_main_ns, revert);
         self.nav_main.endSample();
-        self.shapes.add(sample.change_stages);
-        self.last_change = change;
+        self.shapes.add(sample.change.mark, change);
         self.closure_rows_off_main_ns += offMainNs(change.perf.conn_closure_rows_batch);
         self.revert_flood_nodes = revert.perf.conn_flood_nodes;
         self.closure_shrinks += change.perf.closure_shrinks + revert.perf.closure_shrinks;
@@ -406,13 +395,8 @@ const ToggleReport = struct {
     // samples, the connectivity summary, and the main-thread split into `stats`.
     fn summarize(self: ToggleReport, stats: *suite.RunStats, flood_tuner_workers: ?usize) void {
         stats.nav_main = self.nav_main;
-        stats.nav_plan_batch = suite.batchSummaryFromShapes(&self.shapes, 0);
-        stats.batch = suite.batchSummaryFromShapes(&self.shapes, 1);
-        stats.secondary_batch = suite.batchSummaryFromShapes(&self.shapes, 2);
-        var conn = suite.navConnSummary(self.last_change, flood_tuner_workers);
-        const stage_summaries = [_]*suite.BatchSummary{ &conn.seed, &conn.gather, &conn.flood, &conn.candidates, &conn.closure_resolve, &conn.closure_mask, &conn.closure_plan, &conn.closure_rows, &conn.closure_land };
-        comptime std.debug.assert(3 + stage_summaries.len == toggle_stage_count);
-        for (stage_summaries, 3..) |summary, stage| summary.* = suite.batchSummaryFromShapes(&self.shapes, stage);
+        self.shapes.summarize(stats, flood_tuner_workers);
+        var conn = stats.nav_conn.?;
         conn.reopen_flood_nodes = self.revert_flood_nodes;
         conn.closure_shrinks = self.closure_shrinks;
         conn.closure_block_allocs = self.closure_block_allocs;
@@ -439,31 +423,55 @@ const ToggleReport = struct {
     }
 };
 
-// Times `options.iterations` toggles of `cells` after `options.warmup_iterations` untimed
-// ones, each toggle after an untimed retire of `ballast` when there is one. Items/s is the
-// cells flipped per second. The revert runs on its own stage tuner set, copied from the
-// fixture's, so each set learns one workload; the retire's reactions keep the tuners as
-// they were (`OnewayBallast.untimedReaction`).
-fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *ReactFixture, cells: []const CellCoord, thread_system: *ThreadSystem, checks: ToggleChecks, ballast: ?*OnewayBallast) !suite.RunStats {
+// Times `options.iterations` toggles of `cells` after the warmup and, for the tuned case, the
+// settle of both stage tuner sets; each toggle after an untimed retire of `ballast` when there
+// is one. Items/s is the cells flipped per second; the headline batch and tuner are the change
+// reaction's `headline` stage. The revert runs on its own stage tuner set, copied from the
+// fixture's, so each set learns one workload; the retire's reactions keep the tuners as they
+// were (`OnewayBallast.untimedReaction`).
+fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *ReactFixture, cells: []const CellCoord, thread_system: *ThreadSystem, checks: ToggleChecks, ballast: ?*OnewayBallast, headline: ToggleHeadline) !suite.RunStats {
     var revert_tuners = fixture.system.tuners;
-    for (0..options.warmup_iterations) |_| {
+    var warm = suite.Warmup.init(options, case, 0);
+    while (warm.next(toggleTunerSettle(fixture, &revert_tuners).all())) {
         if (ballast) |chain| try chain.retire(io, fixture, thread_system);
         _ = try runToggle(io, case, fixture, cells, thread_system, checks, &revert_tuners);
     }
+    const settle = toggleTunerSettle(fixture, &revert_tuners);
+    const headline_stage: NavStage = switch (headline) {
+        .flood => .conn_flood,
+        .rows => .conn_closure_rows,
+    };
+    const headline_tuner = fixture.system.tuners.nav.getPtrConst(headline_stage);
+    const headline_start = suite.TunerStart.of(headline_tuner, case.adaptive and settle.all());
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = ToggleReport{};
     for (0..options.iterations) |_| {
         if (ballast) |chain| try chain.retire(io, fixture, thread_system);
         const sample = try runToggle(io, case, fixture, cells, thread_system, checks, &revert_tuners);
-        accumulator.record(sample.elapsedNs(), sample.change.stats.perf.remask_batch);
+        const change_perf = sample.change.stats.perf;
+        accumulator.record(sample.elapsedNs(), switch (headline) {
+            .flood => change_perf.conn_flood_batch,
+            .rows => change_perf.conn_closure_rows_batch,
+        });
         report.add(sample);
         if (ballast) |chain| chain.addSample(sample);
     }
     var stats = accumulator.finish();
     report.write(&stats.details);
     report.summarize(&stats, fixtures.floodTunerWorkers(&fixture.system, case));
+    if (case.adaptive) {
+        stats.tuner_settle = settle;
+        stats.work_tuning = suite.workTuningSummary(headline_tuner, headline_start);
+    }
     stats.items_per_second = suite.itemsPerSecond(2 * cells.len, stats.mean_ns);
     return stats;
+}
+
+// Both stage tuner sets a toggle runs: the change reaction's (the fixture's) and the revert's.
+fn toggleTunerSettle(fixture: *const ReactFixture, revert_tuners: *const fixtures.NavTuners) suite.TunerSettle {
+    var census = fixtures.navTunerSettle("", &fixture.system.tuners);
+    fixtures.addNavTuners(&census, "revert.", revert_tuners);
+    return census;
 }
 
 const SplitVariant = enum(u8) {
@@ -711,7 +719,7 @@ fn runConnectivitySplitCase(allocator: std.mem.Allocator, io: std.Io, options: s
     fixtures.setNavTuners(&fixture.system, case);
 
     const flood_bound = config.floodBound(fixture.system.graph.levelGraph(0).?.border_stride);
-    var stats = try runToggleSamples(io, options, case, item_count, &fixture, gap, thread_ptr, .{ .flood_bound = flood_bound }, null);
+    var stats = try runToggleSamples(io, options, case, item_count, &fixture, gap, thread_ptr, .{ .flood_bound = flood_bound }, null, .flood);
     if (config.variant == .room) {
         try checkFarFillAddsNothing(allocator, io, &fixture, config, gap, stats.nav_conn.?.flood_nodes, thread_ptr);
         try checkLevelBuildFloodFolds(allocator, io, thread_ptr);
@@ -1155,7 +1163,7 @@ fn ringFlood(ctx: *const ProofCtx, config: SplitConfig) !usize {
 }
 
 fn timeProof(ctx: *const ProofCtx, proof: *ProofFixture, checks: ToggleChecks) !suite.RunStats {
-    var stats = try runToggleSamples(ctx.io, ctx.options, ctx.case, ctx.item_count, &proof.fixture, proof.gaps, ctx.threads, checks, null);
+    var stats = try runToggleSamples(ctx.io, ctx.options, ctx.case, ctx.item_count, &proof.fixture, proof.gaps, ctx.threads, checks, null, .flood);
     const size_config = proofSizeConfig(ctx, proof.config, proof.batch_chunks);
     try nav_size.checkNavBytes(connectivity_split_group.name, ctx.item_count, size_config, &proof.fixture.system);
     stats.output_count = proof.gaps.len;
@@ -1764,7 +1772,7 @@ fn runConnectivityOnewayCase(allocator: std.mem.Allocator, io: std.Io, options: 
         .far_dig => .{ .untouched = true },
         else => .{},
     };
-    var stats = try runToggleSamples(io, options, case, item_count, &fixture, cells, thread_ptr, checks, if (config.variant == .ballast) &ballast else null);
+    var stats = try runToggleSamples(io, options, case, item_count, &fixture, cells, thread_ptr, checks, if (config.variant == .ballast) &ballast else null, .rows);
     ballast.write(&stats.details);
     try nav_size.checkNavBytes(connectivity_oneway_group.name, item_count, size_config, &fixture.system);
     stats.output_count = config.links();

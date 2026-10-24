@@ -21,10 +21,12 @@
 //! each run over the think set, and the order stage over its touched words.
 //! Each prints `processed=` (memory rows stepped), `refreshed=`, and `main=` with
 //! `main_per_item=` (per processed row); `--details` adds the `translate=`, `order=`, and
-//! `visible=` stage shapes (the decay stage is the row's batch).
+//! `visible=` stage shapes over the measured steps (the decay stage is the row's batch) and,
+//! for the tuned case, each stage tuner's state (`tuners:`).
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const ConstAiAgentSlice = @import("../game/data_system.zig").ConstAiAgentSlice;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
@@ -159,16 +161,18 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer threads.deinit();
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(tunersSettled(&system))) {
+    while (warm.next(stageTunerSettle(&system).all())) {
         try prepareStep(&fixture, run);
         _ = try runOnce(&system, &fixture, run, &threads, case);
     }
-    const settled_before_measurement = if (case.adaptive) tunersSettled(&system) else false;
-    const decay_tuner_start = suite.TunerStart.of(&system.decay_tuner, settled_before_measurement);
+    const settle = stageTunerSettle(&system);
+    const decay_tuner_start = suite.TunerStart.of(&system.decay_tuner, case.adaptive and settle.all());
+    const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(&system));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = AiMemoryStats{};
     var main_total: u128 = 0;
+    var shapes = suite.StageShapes(stage_names.len){};
     for (0..options.iterations) |_| {
         try prepareStep(&fixture, run);
         const start_ns = suite.nowNs(io);
@@ -176,6 +180,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_stats.perf.batch);
+        shapes.add(.{ last_stats.perf.gather_batch, last_stats.perf.order_batch, last_stats.perf.batch, last_stats.perf.visible_batch });
         try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(ai_memory_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.perf.order_batch, last_stats.perf.batch, last_stats.perf.visible_batch });
         main_total += elapsed_ns -| (offMainNs(last_stats.perf.gather_batch) + offMainNs(last_stats.perf.order_batch) + offMainNs(last_stats.perf.batch) + offMainNs(last_stats.perf.visible_batch));
     }
@@ -190,17 +195,26 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     std.debug.assert(last_stats.perf.order_batch.item_count == run.touched_words);
     stats.candidate_pairs = system.memory_dense_indices.items.len;
     stats.output_count = fixture.frame.events.stats.entity_perceived;
-    stats.splice_batch = suite.batchSummaryFromBatch(last_stats.perf.gather_batch);
-    stats.query_splice_batch = suite.batchSummaryFromBatch(last_stats.perf.order_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.visible_batch);
+    stats.splice_batch = suite.batchSummaryFromShapes(&shapes, 0);
+    stats.query_splice_batch = suite.batchSummaryFromShapes(&shapes, 1);
+    stats.secondary_batch = suite.batchSummaryFromShapes(&shapes, 3);
     if (case.adaptive) {
+        stats.tuner_settle = settle;
         stats.work_tuning = suite.workTuningSummary(&system.decay_tuner, decay_tuner_start);
+        tuner_window.printTuning(&stats.details, stage_names, stageTuners(&system));
     }
     return stats;
 }
 
-fn tunersSettled(system: *const AiMemorySystem) bool {
-    return suite.tunerSettled(&system.gather_tuner) and suite.tunerSettled(&system.order_tuner) and suite.tunerSettled(&system.decay_tuner) and suite.tunerSettled(&system.visible_tuner);
+// The step's four stages, each under its own tuner, in run order.
+const stage_names = [_][]const u8{ "translate", "order", "decay", "visible" };
+
+fn stageTuners(system: *const AiMemorySystem) [stage_names.len]*const AdaptiveWorkTuner {
+    return .{ &system.gather_tuner, &system.order_tuner, &system.decay_tuner, &system.visible_tuner };
+}
+
+fn stageTunerSettle(system: *const AiMemorySystem) suite.TunerSettle {
+    return suite.TunerSettle.ofNamed(&stage_names, &stageTuners(system));
 }
 
 const Run = struct {

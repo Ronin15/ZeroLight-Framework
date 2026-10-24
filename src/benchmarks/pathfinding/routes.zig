@@ -30,12 +30,12 @@ const nav_size = @import("../nav_size.zig");
 const suite = @import("../suite.zig");
 const coldWarmup = @import("nav_fixtures.zig").coldWarmup;
 const coldIterations = @import("nav_fixtures.zig").coldIterations;
-const coldSettleLimit = @import("nav_fixtures.zig").coldSettleLimit;
 const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
 const coldStepConfig = @import("nav_fixtures.zig").coldStepConfig;
 const expireCachedResults = @import("nav_fixtures.zig").expireCachedResults;
 const drainPending = @import("nav_fixtures.zig").drainPending;
 const StageReport = @import("nav_fixtures.zig").StageReport;
+const stepTunerSettle = @import("nav_fixtures.zig").stepTunerSettle;
 const OpenWorld = @import("nav_fixtures.zig").OpenWorld;
 const buildOpenWorld = @import("nav_fixtures.zig").buildOpenWorld;
 const writeLevelZeroCells = @import("nav_fixtures.zig").writeLevelZeroCells;
@@ -182,7 +182,9 @@ pub const long_path_group = suite.BenchmarkGroup{
 // to the deepest level placed as the teleport group's layout 2 (`LinkFoldCode`). One timed
 // sample runs the post-commit nav reaction that applies a batch of 64 more pads, added to the
 // world untimed. Links are append-only, so every sample (warmup included) leaves its batch in
-// the world.
+// the world, and the warmup is fixed: the tuned case reports whether its nav stage tuners
+// settled within it (headline tuner: the patch) and is rerun with a larger `--warmup` when
+// they did not.
 //   - Axis 0 (uniform): 1,024, 8,192, or 32,768 background pads; every batch is uniform
 //     random pads too, so endpoints per touched chunk rise with pads held.
 //   - Axis 1 (probe): background pads keep off a probe region of chunk pairs (a level-0 chunk
@@ -1599,14 +1601,14 @@ fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_syste
 fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *RouteFixture, thread_system: *ThreadSystem, unsolved_routes: UnsolvedRoutes) !suite.RunStats {
     const system = &fixture.system;
     const cold_config = coldStepConfig(case, route_request_count, route_request_count);
-    var warm = suite.Warmup.custom(case, options.warmup_iterations, coldSettleLimit(options));
-    while (warm.next(suite.tunerSettled(&system.tuners.solve))) {
+    var warm = suite.Warmup.custom(case, options.warmup_iterations, suite.adaptiveSettleIterationLimit(options));
+    while (warm.next(stepTunerSettle(system).all())) {
         try drainPending(system, thread_system, route_request_count, cold_config);
         expireCachedResults(system);
         _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
     }
-    const settled = if (case.adaptive) suite.tunerSettled(&system.tuners.solve) else false;
-    const solve_start = suite.TunerStart.of(&system.tuners.solve, settled);
+    const settle = stepTunerSettle(system);
+    const solve_start = suite.TunerStart.of(&system.tuners.solve, case.adaptive and settle.all());
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -1628,7 +1630,10 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     stats.output_count = last_stats.perf.available_results;
     stats.candidate_pairs = abstract_nodes;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
+    if (case.adaptive) {
+        stats.tuner_settle = settle;
+        stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
+    }
     return stats;
 }
 
@@ -1691,10 +1696,16 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     try nav_size.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
     fixtures.setNavTuners(&fixture.system, case);
     var batch: usize = 0;
+    // A fixed warmup, no settle loop: every sample adds pads, so settling would grow the
+    // world past its sized pads and vary it between runs. The tuned case reports whether its
+    // tuners settled within the warmup; one that did not is rerun with a larger `--warmup`.
     for (0..options.warmup_iterations) |_| {
         _ = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
         batch += 1;
     }
+    const settle = stepTunerSettle(&fixture.system);
+    const patch_tuner = fixture.system.tuners.nav.getPtrConst(.patch);
+    const patch_start = suite.TunerStart.of(patch_tuner, case.adaptive and settle.all());
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = LinkFoldReport{};
     for (0..options.iterations) |_| {
@@ -1713,6 +1724,10 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     stats.candidate_pairs = report.chunks_patched;
     stats.nav_main = report.stages.nav_main;
     stats.items_per_second = suite.itemsPerSecond(link_fold_batch, stats.mean_ns);
+    if (case.adaptive) {
+        stats.tuner_settle = settle;
+        stats.work_tuning = suite.workTuningSummary(patch_tuner, patch_start);
+    }
     return stats;
 }
 

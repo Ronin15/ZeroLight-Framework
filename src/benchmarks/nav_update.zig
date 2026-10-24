@@ -30,8 +30,16 @@
 //! its run's tail (32 statics per chunk, created after the 64 residents, moved one chunk over
 //! and back each step in (chunk, slot) order). Passes when linear in the change count.
 //!
-//! Every group runs serial and threaded; `--details` prints the reaction's mark, plan,
-//! remask, and patch shapes.
+//! Every group runs serial and threaded; `--details` prints the main thread's share (the
+//! time outside the seam's or update's stages on workers) and the reaction's stage shapes over
+//! the measured steps (`[threaded/non-empty]`): `nav-update-scattered` the opening updates' and,
+//! under the row, the re-blocking ones' (`block_update:`); the seam groups the seam's collider
+//! sync and trigger patch stages too (`seam:`). The static-dense groups' headline batch and
+//! tuner are the sync's chunk rewrite. Every measured update runs each nav stage of more than
+//! one range on workers in a fixed threaded case (`suite.checkNavReactionDispatched`), as does
+//! every collider sync stage of the static-dense groups. The tuned case settles every tuner
+//! the measured step runs (`step_tuners:`): both toggle halves' nav stage sets, or every seam
+//! stage set (`fixtures.addSeamTuners`).
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -48,6 +56,8 @@ const PathfindingSystem = @import("../game/systems/pathfinding.zig").Pathfinding
 const NavUpdateStats = @import("../game/systems/pathfinding.zig").NavUpdateStats;
 const structuralEventHeadroom = @import("../game/simulation.zig").structuralEventHeadroom;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
+const SyncStage = @import("../game/systems/static_colliders.zig").SyncStage;
+const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const TileId = @import("../game/world/system.zig").TileId;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
@@ -78,9 +88,11 @@ pub const group = suite.BenchmarkGroup{
     .write_workload = writeNavStagesWorkload,
 };
 
-// A dig footprint's nav stages, under `--details`.
+// A dig footprint's main-thread share (per edited cell) and nav stages, under `--details`.
 fn writeNavStagesWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
-    if (view == .details) try suite.writeNavStages(writer, stats);
+    if (view == .summary) return;
+    try suite.writeNavStages(writer, stats);
+    try suite.writeMainShare(writer, stats, stats.item_count);
 }
 
 // The world, nav, and footprint one dig case toggles, built per case.
@@ -100,9 +112,11 @@ const Fixture = struct {
     events: std.ArrayList(SimulationEvent) = .empty,
     // Chunks each update must remask.
     expected_dirty_chunks: usize = 0,
-    // The stats of the most recent timed update, and of the most recent opening half.
+    // The stats of the most recent timed update, and of the most recent opening and
+    // re-blocking halves.
     last_stats: NavUpdateStats = .{},
     open_stats: NavUpdateStats = .{},
+    block_stats: NavUpdateStats = .{},
     // The re-blocking half's stage tuners (`fixtures.NavTuners`), set with the opening set.
     revert_tuners: fixtures.NavTuners = .{},
 
@@ -193,6 +207,7 @@ fn runToggle(fixture: *Fixture, io: std.Io, thread_system: *ThreadSystem) !u64 {
     defer fixtures.swapNavTuners(&fixture.system, &fixture.revert_tuners);
     try writeFootprint(fixture, fixture.tree);
     elapsed += try timeNavUpdate(fixture, io, thread_system);
+    fixture.block_stats = fixture.last_stats;
     return elapsed;
 }
 
@@ -223,9 +238,11 @@ fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: *ThreadSystem) !u
     return elapsed;
 }
 
-// A toggle stage tuner set's plan, remask, and patch tuners settled.
-fn toggleTunersSettled(tuners: *const fixtures.NavTuners) bool {
-    return suite.tunerSettled(tuners.nav.getPtrConst(.plan)) and suite.tunerSettled(tuners.nav.getPtrConst(.remask)) and suite.tunerSettled(tuners.nav.getPtrConst(.patch));
+// Both toggle halves' stage tuner sets, every tuner of each.
+fn toggleTunerSettle(fixture: *const Fixture) suite.TunerSettle {
+    var census = fixtures.navTunerSettle("", &fixture.system.tuners);
+    fixtures.addNavTuners(&census, "revert.", &fixture.revert_tuners);
+    return census;
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -249,33 +266,43 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // Warm so the abstract buffers are at high-water capacity (the steady path is
     // allocation-free) and the tuners have trained an inline baseline before timing.
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(toggleTunersSettled(&fixture.system.tuners) and toggleTunersSettled(&fixture.revert_tuners))) _ = try runToggle(&fixture, io, thread_ptr);
-    const remask_settled = if (case.adaptive) suite.tunerSettled(fixture.system.tuners.nav.getPtrConst(.remask)) else false;
-    const patch_settled = if (case.adaptive) suite.tunerSettled(fixture.system.tuners.nav.getPtrConst(.patch)) else false;
-    const remask_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.remask), remask_settled);
-    const patch_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.patch), patch_settled);
+    while (warm.next(toggleTunerSettle(&fixture).all())) _ = try runToggle(&fixture, io, thread_ptr);
+    const settle = toggleTunerSettle(&fixture);
+    const settled = case.adaptive and settle.all();
+    const remask_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.remask), settled);
+    const patch_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.patch), settled);
 
     // Throughput is over the cells edited: the footprint is capped, so a count above the cap
     // edits fewer cells.
     const edited_cells = fixture.edits.items.len;
     var accumulator = suite.StatsAccumulator.init(edited_cells);
+    var open_reactions = suite.NavReactionShapes{};
+    var block_reactions = suite.NavReactionShapes{};
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const elapsed = try runToggle(&fixture, io, thread_ptr);
         // The opening update's remask: the reported tuners' set (the revert half runs on
         // the revert set).
         accumulator.record(elapsed / 2, fixture.open_stats.perf.remask_batch);
+        try suite.checkNavReactionDispatched(case, thread_ptr, .{}, fixture.open_stats);
+        try suite.checkNavReactionDispatched(case, thread_ptr, .{}, fixture.block_stats);
+        // Main is the halves' time outside their stages on workers, per half as the mean is.
+        main_total += (elapsed -| (fixture.open_stats.perf.off_main_stage_ns + fixture.block_stats.perf.off_main_stage_ns)) / 2;
+        open_reactions.add(.{}, fixture.open_stats);
+        block_reactions.add(.{}, fixture.block_stats);
     }
-    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ fixture.open_stats.perf.plan_batch, fixture.open_stats.perf.remask_batch, fixture.open_stats.perf.patch_batch });
     // Untimed: an update with no marks applies and remasks nothing, so it reports no stale
     // remask from the toggles.
     const idle = try fixture.system.applyBufferedNavUpdates(&fixture.colliders, &fixture.world, thread_ptr);
     if (idle.incremental_rebuilds != 0 or idle.perf.remask_batch.item_count != 0) return error.NavIdleUpdateRemasked;
     var stats = accumulator.finish();
-    // The last opening update's plan and patch (the reported tuners' set), so a threaded row
-    // the tuner kept inline reads inline.
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.open_stats.perf.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.open_stats.perf.patch_batch);
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    // The opening updates' stages (the reported tuners' set) in the workload column; the
+    // re-blocking updates' under the row.
+    open_reactions.summarize(&stats, fixtures.floodTunerWorkers(&fixture.system, case));
+    block_reactions.print(&stats.details, "block_update");
     if (case.adaptive) {
+        stats.tuner_settle = settle;
         stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.remask), remask_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
@@ -439,31 +466,36 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     const nav = fixture.nav();
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(suite.tunerSettled(&nav.tuners.nav_mark) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.plan)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)))) _ = try fixture.moveAndReact(io, thread_ptr);
-    const remask_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) else false;
-    const patch_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)) else false;
-    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), remask_settled);
-    const patch_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.patch), patch_settled);
+    while (warm.next(fixtures.seamTunerSettle(&fixture.seam.pipeline).all())) _ = try fixture.moveAndReact(io, thread_ptr);
+    const settle = fixtures.seamTunerSettle(&fixture.seam.pipeline);
+    const settled = case.adaptive and settle.all();
+    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), settled);
+    const patch_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.patch), settled);
 
     var accumulator = suite.StatsAccumulator.init(other_statics + dynamic_bodies);
     var chunks_patched: usize = 0;
-    var last_stats: NavUpdateStats = .{};
+    var reactions = suite.NavReactionShapes{};
+    var seam_shapes = suite.StageShapes(fixtures.seam_stage_names.len){};
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const result = try fixture.moveAndReact(io, thread_ptr);
         chunks_patched = result.stats.chunks_patched;
-        last_stats = result.stats;
         accumulator.record(result.ns, result.stats.perf.remask_batch);
+        try suite.checkNavReactionDispatched(case, thread_ptr, nav.perf.last_mark_batch, result.stats);
+        reactions.add(nav.perf.last_mark_batch, result.stats);
+        seam_shapes.add(fixtures.seamBatches(&fixture.seam.pipeline));
+        main_total += result.ns -| fixtures.seamOffMainNs(&fixture.seam.pipeline, result.stats);
     }
-    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ last_stats.perf.plan_batch, last_stats.perf.remask_batch, last_stats.perf.patch_batch, nav.perf.last_mark_batch });
     var stats = accumulator.finish();
     stats.output_count = chunks_patched;
     stats.candidate_pairs = fixture.body_count;
     // One move per iteration.
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
-    stats.nav_mark_batch = suite.batchSummaryFromBatch(nav.perf.last_mark_batch);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.perf.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
+    reactions.summarize(&stats, fixtures.floodTunerWorkers(nav, case));
+    seam_shapes.print(&stats.details, "seam", fixtures.seam_stage_names);
     if (case.adaptive) {
+        stats.tuner_settle = settle;
         stats.work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.remask), remask_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
@@ -600,14 +632,13 @@ const StaticDenseFixture = struct {
         };
         if (recreated_at != self.recreated.items.len) return error.StaticRecreatesMissing;
         self.shifted = !self.shifted;
-        const splice_off_main_ns = static_colliders_test_support.lastOffMainNs(self.colliders().*);
         const ns = suite.elapsedNs(start_ns, end_ns);
         return .{
             .ns = ns,
             .commit_ns = ns -| (perf.seam_collider_sync_ns + perf.seam_nav_reaction_ns),
             .sync_ns = perf.seam_collider_sync_ns,
             .nav_ns = perf.seam_nav_reaction_ns,
-            .off_main_ns = splice_off_main_ns + stats.perf.off_main_stage_ns,
+            .off_main_ns = fixtures.seamOffMainNs(&self.seam.pipeline, stats),
             .stats = stats,
         };
     }
@@ -735,11 +766,12 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const nav = fixture.nav();
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(suite.tunerSettled(fixture.colliders().tuners.getPtrConst(.rewrite)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.plan)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)))) _ = try fixture.changeAndReact(io, thread_ptr);
-    const remask_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) else false;
-    const patch_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)) else false;
-    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), remask_settled);
-    const patch_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.patch), patch_settled);
+    while (warm.next(fixtures.seamTunerSettle(&fixture.seam.pipeline).all())) _ = try fixture.changeAndReact(io, thread_ptr);
+    const settle = fixtures.seamTunerSettle(&fixture.seam.pipeline);
+    const settled = case.adaptive and settle.all();
+    const rewrite_tuner = fixture.colliders().tuners.getPtrConst(.rewrite);
+    const rewrite_tuner_start = suite.TunerStart.of(rewrite_tuner, settled);
+    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), settled);
 
     const change_count = fixture.layout.chunk_count * dense_changes_per_chunk;
     var accumulator = suite.StatsAccumulator.init(change_count);
@@ -748,25 +780,29 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var nav_total: u128 = 0;
     var main_total: u128 = 0;
     var chunks_patched: usize = 0;
-    var last_stats: NavUpdateStats = .{};
+    var reactions = suite.NavReactionShapes{};
+    var seam_shapes = suite.StageShapes(fixtures.seam_stage_names.len){};
     for (0..options.iterations) |_| {
         const result = try fixture.changeAndReact(io, thread_ptr);
         chunks_patched = result.stats.chunks_patched;
-        last_stats = result.stats;
         commit_total += result.commit_ns;
         sync_total += result.sync_ns;
         nav_total += result.nav_ns;
         main_total += result.ns -| result.off_main_ns;
-        accumulator.record(result.ns, result.stats.perf.remask_batch);
+        const seam_batches = fixtures.seamBatches(&fixture.seam.pipeline);
+        // The headline is the collider sync's chunk rewrite, the stage the pass shape names.
+        accumulator.record(result.ns, seam_batches[@backingInt(SyncStage.rewrite)]);
+        try suite.checkNavReactionDispatched(case, thread_ptr, nav.perf.last_mark_batch, result.stats);
+        try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(splice_range_alignment_items), seam_batches[0..fixtures.seam_sync_stage_count]);
+        reactions.add(nav.perf.last_mark_batch, result.stats);
+        seam_shapes.add(seam_batches);
     }
-    try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ last_stats.perf.plan_batch, last_stats.perf.remask_batch, last_stats.perf.patch_batch });
     var stats = accumulator.finish();
     stats.output_count = chunks_patched;
     stats.candidate_pairs = static_colliders_test_support.liveRowCount(fixture.colliders().*);
     stats.items_per_second = suite.itemsPerSecond(change_count, stats.mean_ns);
-    stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.perf.plan_batch);
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
-    stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders().perf.last_batches.get(.rewrite));
+    reactions.summarize(&stats, fixtures.floodTunerWorkers(nav, case));
+    seam_shapes.print(&stats.details, "seam", fixtures.seam_stage_names);
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         // Plan: the commit; write: the collider sync and record; nav: the reaction.
@@ -778,25 +814,28 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         };
     }
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.remask), remask_tuner_start);
-        stats.secondary_work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.patch), patch_tuner_start);
+        stats.tuner_settle = settle;
+        stats.work_tuning = suite.workTuningSummary(rewrite_tuner, rewrite_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.remask), remask_tuner_start);
     }
     return stats;
 }
 
+// The bodies and chunks patched; under --details the seam's main-thread share (per move) and
+// the reaction's stages.
 fn writeStaticMoveWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("bodies={} chunks_patched={}", .{ stats.candidate_pairs, stats.output_count });
     if (view == .summary) return;
+    try suite.writeMainShare(writer, stats, 1);
     try writer.writeByte(' ');
     try suite.writeNavStages(writer, stats);
 }
 
 fn writeStaticDenseWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
-    const splice = stats.splice_batch orelse suite.BatchSummary{};
-    try writer.print("statics={} units={} patched={}", .{ stats.candidate_pairs, splice.item_count, stats.output_count });
+    try writer.print("statics={} units={} patched={}", .{ stats.candidate_pairs, stats.batch.item_count, stats.output_count });
     if (view == .summary) return;
     try writer.writeAll(" rewrite=");
-    try suite.writeStageShape(writer, splice);
+    try suite.writeStageShape(writer, stats.batch);
     try writer.writeByte(' ');
     try suite.writeNavStages(writer, stats);
     const phases = stats.terrain_edit_phases orelse suite.TerrainEditPhaseSummary{};

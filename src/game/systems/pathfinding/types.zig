@@ -398,12 +398,13 @@ pub const NavUpdateStats = struct {
         // The most rows (copy spans or round items) one closure rows round dispatched.
         closure_rows_round_items_max: usize = 0,
         // Each the most over the update's closure batches: the tail words a batch's bound
-        // reserved and its relocated blocks took, its candidate components' block words, and
-        // the terminals it could number.
+        // reserved and its relocated blocks took, its candidate components' block words, the
+        // terminals it could number, and the terminals it could pop (gross).
         closure_tail_bound: usize = 0,
         closure_tail_used: usize = 0,
         closure_candidate_words: usize = 0,
         closure_kb: usize = 0,
+        closure_n_gross: usize = 0,
         // The reaction's main-thread sections, the terrain records' `nav_mark` folded in.
         main: NavMainPhases = .{},
     } else struct {};

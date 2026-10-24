@@ -16,11 +16,13 @@
 //! Both print `separation_checks=`, `intents=`, `separation_fills=`, and `cohere_fills=`
 //! (neighbor-block fills per query kind); the summary adds the behavior histogram, and
 //! `--details` adds `main=` with `main_per_item=` (per intent), `gather=` and `intent=` (stage
-//! shapes; the separation stage is the row's batch), and `tuned=` when the intent stage ran
-//! inline.
+//! shapes over the measured steps; the separation stage is the row's batch), `tuned=` when the
+//! intent stage ran inline every measured step, and, for the tuned case, each stage tuner's
+//! state (`tuners:`); the tuned case settles all three before measuring.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const maxRangeCount = @import("../app/thread_system.zig").maxRangeCount;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
@@ -235,23 +237,26 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     }
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(suite.tunerSettled(&system.gather_tuner) and suite.tunerSettled(&system.separation_tuner) and suite.tunerSettled(&system.intent_tuner))) {
+    while (warm.next(stageTunerSettle(&system).all())) {
         _ = try runOnce(&system, fixture, spatial_view, think_set, &threads, case);
     }
-    const separation_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.separation_tuner) else false;
-    const intent_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.intent_tuner) else false;
-    const separation_tuner_start = suite.TunerStart.of(&system.separation_tuner, separation_settled_before_measurement);
-    const intent_tuner_start = suite.TunerStart.of(&system.intent_tuner, intent_settled_before_measurement);
+    const settle = stageTunerSettle(&system);
+    const settled = case.adaptive and settle.all();
+    const separation_tuner_start = suite.TunerStart.of(&system.separation_tuner, settled);
+    const intent_tuner_start = suite.TunerStart.of(&system.intent_tuner, settled);
+    const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(&system));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_ai_stats = AiStats{};
     var main_total: u128 = 0;
+    var shapes = suite.StageShapes(stage_names.len){};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         last_ai_stats = try runOnce(&system, fixture, spatial_view, think_set, &threads, case);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
         accumulator.record(elapsed_ns, last_ai_stats.perf.separation_batch);
+        shapes.add(.{ last_ai_stats.perf.gather_batch, last_ai_stats.perf.separation_batch, last_ai_stats.perf.intent_batch });
         try suite.checkStagesDispatched(case, &threads, case.stageItemsPerRange(ai_range_alignment_items), &.{ last_ai_stats.perf.gather_batch, last_ai_stats.perf.separation_batch, last_ai_stats.perf.intent_batch });
         main_total += elapsed_ns -| (offMainNs(last_ai_stats.perf.gather_batch) + offMainNs(last_ai_stats.perf.separation_batch) + offMainNs(last_ai_stats.perf.intent_batch));
     }
@@ -268,14 +273,27 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.secondary_neighbor_block_fills = last_ai_stats.perf.cohere_block_fills;
     stats.candidate_pairs = last_ai_stats.perf.separation_candidate_checks;
     stats.output_count = last_ai_stats.perf.entity_count;
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_ai_stats.perf.intent_batch);
-    stats.splice_batch = suite.batchSummaryFromBatch(last_ai_stats.perf.gather_batch);
+    stats.splice_batch = suite.batchSummaryFromShapes(&shapes, 0);
+    stats.secondary_batch = suite.batchSummaryFromShapes(&shapes, 2);
     stats.ai_behavior_histogram = behaviorHistogram(fixture.data.aiAgentSliceConst().behaviors);
     if (case.adaptive) {
+        stats.tuner_settle = settle;
         stats.work_tuning = suite.workTuningSummary(&system.separation_tuner, separation_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(&system.intent_tuner, intent_tuner_start);
+        tuner_window.printTuning(&stats.details, stage_names, stageTuners(&system));
     }
     return stats;
+}
+
+// The step's stages, each under its own tuner, in run order.
+const stage_names = [_][]const u8{ "gather", "separation", "intent" };
+
+fn stageTuners(system: *const AiSystem) [stage_names.len]*const AdaptiveWorkTuner {
+    return .{ &system.gather_tuner, &system.separation_tuner, &system.intent_tuner };
+}
+
+fn stageTunerSettle(system: *const AiSystem) suite.TunerSettle {
+    return suite.TunerSettle.ofNamed(&stage_names, &stageTuners(system));
 }
 
 // The runs of consecutive think rows on one index cell, over the rows with cohere gain when
@@ -338,7 +356,7 @@ fn writeAiWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.Wo
     const intent = stats.secondary_batch orelse return;
     try writer.writeAll(" intent=");
     try suite.writeStageShape(writer, intent);
-    if (intent.ran_inline or intent.active_worker_threads == 0) {
+    if (intent.threaded_batches == 0) {
         if (stats.secondary_work_tuning) |summary| try writer.print(" tuned={s}", .{if (summary.has_threaded_profile) "threaded" else "none"});
     }
 }

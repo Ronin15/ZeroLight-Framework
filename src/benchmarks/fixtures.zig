@@ -5,13 +5,16 @@
 //! Fixture builders shared by the bench groups: a case's thread system, bodies, one-range
 //! stream writes, the production commit seam on a pipeline and a static moved through it,
 //! the world tileset and banded worlds, a 4-connected flood, a coprime-stride shuffle, the nav
-//! reaction's and the static colliders' tuner setup, and the render benches' texture table
-//! and phase timers.
+//! reaction's and the static colliders' tuner setup, the settle censuses of a nav stage tuner
+//! set and of the commit seam with the seam's stage batches and worker time, and the render
+//! benches' texture table and phase timers.
 
 const std = @import("std");
 const math = @import("../core/math.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
+const BatchStats = @import("../app/thread_system.zig").BatchStats;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const rebuild_tuner_config = @import("../app/thread_system.zig").rebuild_tuner_config;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -32,14 +35,18 @@ const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const RebuildStage = @import("../game/systems/static_colliders.zig").RebuildStage;
 const SyncStage = @import("../game/systems/static_colliders.zig").SyncStage;
+const static_colliders_test_support = @import("../game/systems/static_colliders_test_support.zig");
+const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
 const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const level_z_step = @import("../game/world/system.zig").level_z_step;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
+const NavStage = @import("../game/systems/pathfinding/nav_graph.zig").NavStage;
 const SimulationPipeline = @import("../game/simulation_pipeline.zig").SimulationPipeline;
 const CollisionStats = @import("../game/systems/collision.zig").CollisionStats;
+const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
 const CollisionStrips = @import("../game/systems/collision.zig").CollisionStrips;
 const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
 const CommitSeamResult = @import("../game/simulation_pipeline.zig").CommitSeamResult;
@@ -310,6 +317,117 @@ pub fn setNavTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void 
 /// runs the revert on its own set (`swapNavTuners` around it, untimed), so each set learns
 /// one workload with one sample per step, as production's one reaction per step does.
 pub const NavTuners = @FieldType(PathfindingSystem, "tuners");
+
+/// Adds every tuner of the stage tuner set `tuners` to `census` under `prefix`, the nav
+/// stages by name: each field is a tuner or the nav stage set, so none is missed. A tuner the
+/// measured step never selects stays unused (`TunerSettle`), so the caller's setup selects
+/// none the step does not run (`setNavTuners` refreshes the reaction's after the build).
+pub fn addNavTuners(census: *suite.TunerSettle, comptime prefix: []const u8, tuners: *const NavTuners) void {
+    addNavTunersExcept(census, prefix, tuners, &.{});
+}
+
+/// `addNavTuners` but the tuner fields named in `skip`: a tuner only a setup step selected,
+/// which the caller has shown no measured step ran.
+pub fn addNavTunersExcept(census: *suite.TunerSettle, comptime prefix: []const u8, tuners: *const NavTuners, comptime skip: []const []const u8) void {
+    inline for (@typeInfo(NavTuners).@"struct".field_names, @typeInfo(NavTuners).@"struct".field_types) |name, Field| {
+        const skipped = comptime for (skip) |skip_name| {
+            if (std.mem.eql(u8, name, skip_name)) break true;
+        } else false;
+        if (comptime skipped) {
+            // A skipped field is a tuner, never the nav stage set.
+            comptime std.debug.assert(Field == AdaptiveWorkTuner);
+        } else if (comptime std.mem.eql(u8, name, "nav")) {
+            inline for (comptime std.enums.values(NavStage)) |stage| census.add(prefix ++ @tagName(stage), tuners.nav.getPtrConst(stage));
+        } else {
+            comptime std.debug.assert(Field == AdaptiveWorkTuner);
+            census.add(prefix ++ name, &@field(tuners, name));
+        }
+    }
+}
+
+/// `addNavTuners` over a fresh census.
+pub fn navTunerSettle(comptime prefix: []const u8, tuners: *const NavTuners) suite.TunerSettle {
+    var census = suite.TunerSettle{};
+    addNavTuners(&census, prefix, tuners);
+    return census;
+}
+
+/// Adds every tuner the structural-commit seam runs to `census`: the colliders' sync stages,
+/// the trigger patch's query and store stages, and the nav set (`addNavTuners`). The seam's
+/// steering reaction and growth sync dispatch nothing; the rebuild tuners run only at a
+/// rebuild and the store's refresh only at a collision step, never at the seam, so they are
+/// not walked.
+pub fn addSeamTuners(census: *suite.TunerSettle, pipeline: *const SimulationPipeline) void {
+    census.addNamed(&seam_stage_names[0..sync_stages.len].*, &syncTuners(&pipeline.static_colliders));
+    census.add("trigger.query", &pipeline.collision.trigger_query_tuner);
+    inline for (trigger_stages) |stage| census.add("trigger." ++ @tagName(stage), pipeline.collision.trigger_store.tuners.getPtrConst(stage));
+    addNavTuners(census, "nav.", &pipeline.pathfinding.tuners);
+}
+
+const TriggerTuners = @FieldType(@FieldType(CollisionSystem, "trigger_store"), "tuners");
+/// The collider sync's stages in `SyncStage` order, their names, and their tuners.
+pub const sync_stages = std.enums.values(SyncStage);
+pub const sync_stage_names: [sync_stages.len][]const u8 = blk: {
+    var names: [sync_stages.len][]const u8 = undefined;
+    for (&names, sync_stages) |*name, stage| name.* = @tagName(stage);
+    break :blk names;
+};
+
+pub fn syncTuners(colliders: *const StaticColliderSystem) [sync_stages.len]*const AdaptiveWorkTuner {
+    var tuners: [sync_stages.len]*const AdaptiveWorkTuner = undefined;
+    for (&tuners, sync_stages) |*tuner, stage| tuner.* = colliders.tuners.getPtrConst(stage);
+    return tuners;
+}
+// The trigger store's patch stages: every store stage but the collision step's refresh.
+const trigger_stages = blk: {
+    const all = std.enums.values(TriggerTuners.Key);
+    var stages: [all.len - 1]TriggerTuners.Key = undefined;
+    var count: usize = 0;
+    for (all) |stage| {
+        if (std.mem.eql(u8, @tagName(stage), "refresh")) continue;
+        stages[count] = stage;
+        count += 1;
+    }
+    std.debug.assert(count == stages.len);
+    break :blk stages;
+};
+
+/// The structural-commit seam's stages, in `seamBatches` order: the collider sync's, the
+/// trigger patch query, and the trigger store's patch stages.
+pub const seam_stage_names: [sync_stages.len + 1 + trigger_stages.len][]const u8 = blk: {
+    var names: [sync_stages.len + 1 + trigger_stages.len][]const u8 = undefined;
+    for (sync_stages, 0..) |stage, index| names[index] = "sync." ++ @tagName(stage);
+    names[sync_stages.len] = "trigger.query";
+    for (trigger_stages, sync_stages.len + 1..) |stage, index| names[index] = "trigger." ++ @tagName(stage);
+    break :blk names;
+};
+
+/// The collider sync's stages lead `seam_stage_names`, in `SyncStage` order.
+pub const seam_sync_stage_count = sync_stages.len;
+
+/// The seam's stage batches from the last commit (`seam_stage_names` order).
+pub fn seamBatches(pipeline: *const SimulationPipeline) [seam_stage_names.len]BatchStats {
+    var batches: [seam_stage_names.len]BatchStats = undefined;
+    inline for (sync_stages, 0..) |stage, index| batches[index] = pipeline.static_colliders.perf.last_batches.get(static_colliders_test_support.colliderStage(stage));
+    batches[sync_stages.len] = pipeline.collision.perf.trigger_query_batch;
+    inline for (trigger_stages, sync_stages.len + 1..) |stage, index| batches[index] = pipeline.collision.trigger_store.perf.last_batches.get(stage);
+    return batches;
+}
+
+/// The last commit seam's stage time on workers: its collider sync, trigger patch, and nav
+/// reaction (`nav`, the commit's reaction stats) stages.
+pub fn seamOffMainNs(pipeline: *const SimulationPipeline, nav: NavUpdateStats) u64 {
+    var total = nav.perf.off_main_stage_ns;
+    for (seamBatches(pipeline)) |batch| total += offMainNs(batch);
+    return total;
+}
+
+/// `addSeamTuners` over a fresh census.
+pub fn seamTunerSettle(pipeline: *const SimulationPipeline) suite.TunerSettle {
+    var census = suite.TunerSettle{};
+    addSeamTuners(&census, pipeline);
+    return census;
+}
 
 /// Swaps `system`'s stage tuners with `other`.
 pub fn swapNavTuners(system: *PathfindingSystem, other: *NavTuners) void {

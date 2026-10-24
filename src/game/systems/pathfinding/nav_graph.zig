@@ -750,6 +750,7 @@ fn addClosureStats(stats: *NavUpdateStats, conn: *const Connectivity, counters: 
         stats.perf.closure_tail_used = @max(stats.perf.closure_tail_used, counters.perf.tail_words);
         stats.perf.closure_candidate_words = @max(stats.perf.closure_candidate_words, limits.candidate_words);
         stats.perf.closure_kb = @max(stats.perf.closure_kb, limits.k_b);
+        stats.perf.closure_n_gross = @max(stats.perf.closure_n_gross, limits.n_gross);
     }
     if (counters.links == 0) return;
     accumulateBatch(&stats.perf.conn_closure_resolve_batch, conn.closure.perf.last_resolve_batch);

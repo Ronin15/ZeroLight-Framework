@@ -21,8 +21,9 @@ const suite = @import("suite.zig");
 // sits in several contacts as `a` and as `b`, written once in a scattered order. Timed:
 // one `update`; the movement columns are restored untimed before each run so every run
 // takes the same branch mix. `--details` reports intents, triggers, apply item counts,
-// the gather, place, and apply shapes and times, and the time on main outside the
-// stage batches. A worker gather's apply items are the occupied 16-row blocks
+// the gather, place, and apply shapes over the measured steps and their times, the time on
+// main outside the stage batches (`main=`) and per contact, and, for the tuned case, the
+// gather and apply tuners' states (`tuners:`). A worker gather's apply items are the occupied 16-row blocks
 // (`ceil((contacts / 2 + 2) / 16)` in this fixture). An inline gather reports the
 // intent count, because that apply stayed inside the gather.
 pub const stage_group = suite.BenchmarkGroup{
@@ -212,10 +213,18 @@ fn stageRunOnce(
 }
 
 // An inline-settled gather never dispatches the apply, so its tuner settles alone.
-fn stageTunersSettled(system: *const CollisionResponseSystem) bool {
-    const gather = &system.gather_tuner;
-    return suite.tunerSettled(gather) and (!gather.has_threaded_profile or suite.tunerSettled(&system.apply_tuner));
+// The step's tuners: the gather's, and the apply's when the gather threads (an inline gather
+// applies inside itself, so the apply does not dispatch).
+fn stageTunerSettle(system: *const CollisionResponseSystem) suite.TunerSettle {
+    var census = suite.TunerSettle{};
+    census.add("gather", &system.gather_tuner);
+    if (system.gather_tuner.has_threaded_profile) census.add("apply", &system.apply_tuner);
+    return census;
 }
+
+// The step's stages: the gather, the one-range place merge (no tuner), and the apply.
+const stage_names = [_][]const u8{ "gather", "place", "apply" };
+const tuner_names = [_][]const u8{ "gather", "apply" };
 
 fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
@@ -230,19 +239,19 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     defer system.deinit();
     try system.reserveForContacts(item_count, thread_ptr.participantSlotCount());
 
-    // A fixed threaded case with more than one range of contacts dispatches the gather.
-    const expect_dispatch = !case.adaptive and thread_ptr.workerThreadCount() > 0 and item_count > case.fixedItemsPerRange(movement_range_alignment_items);
-
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(stageTunersSettled(&system))) {
+    while (warm.next(stageTunerSettle(&system).all())) {
         fixture.restoreMovement();
         _ = try stageRunOnce(&system, &fixture, thread_ptr, case);
     }
-    const settled_before_measurement = if (case.adaptive) stageTunersSettled(&system) else false;
-    const gather_tuner_start = suite.TunerStart.of(&system.gather_tuner, settled_before_measurement);
-    const apply_tuner_start = suite.TunerStart.of(&system.apply_tuner, settled_before_measurement);
+    const settle = stageTunerSettle(&system);
+    const settled = case.adaptive and settle.all();
+    const gather_tuner_start = suite.TunerStart.of(&system.gather_tuner, settled);
+    const apply_tuner_start = suite.TunerStart.of(&system.apply_tuner, settled);
+    const tuner_window = suite.TunerWindow(tuner_names.len).begin(.{ &system.gather_tuner, &system.apply_tuner });
 
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var shapes = suite.StageShapes(stage_names.len){};
     var main_total: u128 = 0;
     var place_total: u128 = 0;
     var apply_total: u128 = 0;
@@ -254,7 +263,6 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
         place_total += last_stats.perf.place_batch.batch_duration_ns;
         apply_total += last_stats.perf.apply_batch.batch_duration_ns;
-        std.debug.assert(!expect_dispatch or (last_stats.perf.gather_batch.range_count > 1 and !last_stats.perf.gather_batch.ran_inline));
         // Occupied blocks of this fixture when the gather ran on workers; the inline
         // gather's recorded apply count is the intent count.
         const occupied_blocks = @divCeil(item_count / 2 + 2, block_rows);
@@ -264,6 +272,9 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
             std.debug.assert(last_stats.perf.apply_batch.item_count == occupied_blocks);
         }
         accumulator.record(elapsed_ns, last_stats.perf.gather_batch);
+        shapes.add(.{ last_stats.perf.gather_batch, last_stats.perf.place_batch, last_stats.perf.apply_batch });
+        // A fixed threaded case with more than one range of contacts dispatches the gather,
+        // and a worker gather's apply.
         try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRange(movement_range_alignment_items), &.{ last_stats.perf.gather_batch, last_stats.perf.apply_batch });
         // Main outside the stage batches: the main thread's own ranges inside a
         // dispatched batch are not counted (see the batch's `main_ranges`). The place
@@ -274,9 +285,9 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var stats = accumulator.finish();
     stats.candidate_pairs = last_stats.trigger_count;
     stats.output_count = last_stats.intent_count;
-    stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.apply_batch);
+    stats.secondary_batch = suite.batchSummaryFromShapes(&shapes, 2);
     // The place merge. Not a collider splice; this group has no other batch slot.
-    stats.splice_batch = suite.batchSummaryFromBatch(last_stats.perf.place_batch);
+    stats.splice_batch = suite.batchSummaryFromShapes(&shapes, 1);
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
         stats.main_ns = @intCast(main_total / iterations);
@@ -284,8 +295,10 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         if (stats.splice_batch) |*place| place.batch_duration_ns = @intCast(place_total / iterations);
     }
     if (case.adaptive) {
+        stats.tuner_settle = settle;
         stats.work_tuning = suite.workTuningSummary(&system.gather_tuner, gather_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(&system.apply_tuner, apply_tuner_start);
+        tuner_window.printTuning(&stats.details, tuner_names, .{ &system.gather_tuner, &system.apply_tuner });
     }
     return stats;
 }
@@ -304,5 +317,5 @@ fn writeResponseStageWorkload(writer: *std.Io.Writer, stats: suite.RunStats, vie
     try writer.writeAll(" apply=");
     try suite.writeStageShape(writer, apply);
     try writer.print("({f})", .{suite.formatDuration(apply.batch_duration_ns)});
-    try suite.writeShare(writer, "main_outside_stage_batches", stats.main_ns orelse 0, stats.mean_ns);
+    try suite.writeMainShare(writer, stats, stats.item_count);
 }

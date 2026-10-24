@@ -11,8 +11,9 @@
 //! Timed: the bench's own phase timers, `entity_collect` (collect plus emit), `merge`,
 //! `snapshot`, and `vertex_emit` (the threaded stage); the render window sets stay untimed.
 //! Prints `vertices=`, `sprites=`, `skipped=`, `merged_groups=`, `sparse=` (sparse tiles
-//! submitted), `dynamic_records=`, `static_groups=`, `merged_tilemap_groups=`, and the phases.
-//! Pass shape: one merged `.tilemap` group at every count and play level, so draw groups never
+//! submitted), `dynamic_records=`, `static_groups=`, `merged_tilemap_groups=`, and the phases;
+//! `--details` adds `main=` (the timed phases outside a vertex emit on workers) with
+//! `main_per_item=` (per sprite), flat across counts. Pass shape: one merged `.tilemap` group at every count and play level, so draw groups never
 //! grow with dense window depth. Asserts check that group count, that the collect returns
 //! every entity and active particle, and that a fixed threaded case dispatches the vertex
 //! emit to workers.
@@ -27,6 +28,7 @@ const std = @import("std");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const math = @import("../core/math.zig");
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
@@ -199,6 +201,7 @@ fn runCaseWithConfig(
     var last_sparse_submitted: usize = 0;
     var last_merged_groups: usize = 0;
     var last_merged_tilemap_groups: usize = 0;
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const measured = try runMeasuredOnce(
             io,
@@ -212,6 +215,8 @@ fn runCaseWithConfig(
         );
         accumulator.record(measured.timed_ns, measured.stats.perf.batch);
         try suite.checkStageDispatched(case, &threads, case.stageItemsPerRange(sprite_prep_range_alignment_items), measured.stats.perf.batch);
+        // Main is the timed phases outside a vertex emit that ran on workers.
+        main_total += measured.timed_ns -| offMainNs(measured.stats.perf.batch);
         phase_accumulator.record(measured.phases);
         last_prep = measured.stats;
         last_sparse_submitted = measured.sparse_submitted;
@@ -226,6 +231,7 @@ fn runCaseWithConfig(
     }
 
     var stats = accumulator.finish();
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.candidate_pairs = last_prep.vertex_count;
     stats.output_count = last_prep.valid_sprite_count;
     stats.deferred_count = last_prep.skipped_invalid_count;
@@ -670,7 +676,7 @@ fn benchmarkParticleDepth(index: usize) WorldDepth {
     return depths[index % depths.len];
 }
 
-fn writeRenderGamePrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
+fn writeRenderGamePrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     try writer.print("vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={}", .{
         stats.candidate_pairs,
         stats.output_count,
@@ -681,6 +687,7 @@ fn writeRenderGamePrepWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _:
         stats.render_game_prep_static_groups,
         stats.render_game_prep_merged_tilemap_groups,
     });
+    if (view == .details) try suite.writeMainShare(writer, stats, stats.output_count);
     const phases = stats.render_game_prep_phases orelse return;
     try writer.print(" phases entity_collect={f} merge={f} snapshot={f} vertex_emit={f}", .{ suite.formatDuration(phases.entity_collect_ns), suite.formatDuration(phases.merge_ns), suite.formatDuration(phases.snapshot_ns), suite.formatDuration(phases.vertex_emit_ns) });
 }

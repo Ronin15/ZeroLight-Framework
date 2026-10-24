@@ -3,6 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const Dispatch = @import("../app/thread_system.zig").Dispatch;
@@ -34,8 +35,9 @@ const suite = @import("suite.zig");
 // dispatch. Pass shape: an adaptive case's tuner demotes at most once per run (a restored
 // profile keeps its bound suppression; a demoted one waits out its inline cooldown), so a
 // steady dispatch never churns between threaded and inline.
-// `--details` prints the shape (`inline` or workers/ranges), the time per item, and the
-// time per range. On multi-CCD parts the `thread-fixed-1` and `thread-fixed-2` rows swing
+// `--details` prints the busiest shape (`inline` or workers/ranges) with its threaded over
+// measured dispatches, the time per item, the time per range (over the mean range count),
+// and the main thread's share (the dispatch outside its batch on workers) and time per item. On multi-CCD parts the `thread-fixed-1` and `thread-fixed-2` rows swing
 // with CCD placement (bimodal unpinned); a run pinned to one CCD is the diagnostic.
 pub const group = suite.BenchmarkGroup{
     .name = "thread-dispatch",
@@ -89,19 +91,21 @@ fn assertThreadedShape(batch: BatchStats, thread_system: *const ThreadSystem) vo
     std.debug.assert(!batch.forced_inline);
 }
 
-// The shape a fixed case's dispatch must have; checked against every measured batch.
-fn assertFixedShape(batch: BatchStats, thread_system: *const ThreadSystem, case: suite.BenchmarkCase) void {
+// Fails unless a fixed case's dispatch has its shape: one range per fixed range of items, on
+// workers when there is more than one range (`suite.checkStageDispatched`,
+// `suite.checkFixedRangeCount`), with every worker the case allows up to one per range past
+// the first; inline with no worker otherwise. Checked against every measured batch, in every
+// build mode.
+fn checkFixedShape(batch: BatchStats, thread_system: *const ThreadSystem, case: suite.BenchmarkCase) !void {
     const items_per_range = case.fixedItemsPerRange(range_alignment_items);
+    if (batch.items_per_range != items_per_range) return error.DispatchFixedRangeSize;
+    try suite.checkFixedRangeCount(case, thread_system, items_per_range, batch);
+    try suite.checkStageDispatched(case, thread_system, items_per_range, batch);
     const ranges = rangeCount(batch.item_count, items_per_range);
     const worker_cap = @min(case.maxWorkerThreads() orelse thread_system.workerThreadCount(), thread_system.workerThreadCount());
-    std.debug.assert(batch.items_per_range == items_per_range);
-    std.debug.assert(batch.range_count == ranges);
-    if (ranges <= 1 or worker_cap == 0) {
-        std.debug.assert(batch.ran_inline and batch.active_worker_threads == 0);
-    } else {
-        std.debug.assert(!batch.ran_inline);
-        std.debug.assert(batch.active_worker_threads == @min(worker_cap, ranges - 1));
-    }
+    const workers: usize = if (ranges <= 1 or worker_cap == 0) 0 else @min(worker_cap, ranges - 1);
+    if (batch.ran_inline != (workers == 0)) return error.DispatchFixedInlineShape;
+    if (batch.active_worker_threads != workers) return error.DispatchFixedWorkerCount;
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -128,10 +132,13 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     const tuner_start = suite.TunerStart.of(&tuner, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
+    var main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         const batch = dispatchOnce(&context, &threads, &tuner, case);
         const elapsed_ns = suite.elapsedNs(start_ns, suite.nowNs(io));
+        // The whole sample is the dispatch: main is all of it but the batch on workers.
+        main_total += elapsed_ns -| offMainNs(batch);
         dispatches += 1;
         std.debug.assert(batch.item_count == item_count);
         std.debug.assert(batch.main_thread_ranges + batch.worker_thread_ranges == batch.range_count);
@@ -140,7 +147,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         if (!case.usesThreadSystem()) {
             // No worker may take a range, so the dispatch runs one inline range.
             std.debug.assert(batch.ran_inline and batch.range_count == 1);
-        } else if (!case.adaptive) assertFixedShape(batch, &threads, case);
+        } else if (!case.adaptive) try checkFixedShape(batch, &threads, case);
         accumulator.record(elapsed_ns, batch);
     }
 
@@ -148,6 +155,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     if (case.adaptive) std.debug.assert(tuner.demotion_count <= 1);
     var stats = accumulator.finish();
     stats.output_count = item_count;
+    if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(&tuner, tuner_start);
     }
@@ -160,6 +168,8 @@ fn writeNsPer(writer: *std.Io.Writer, label: []const u8, ns: u64, count: usize) 
     try writer.print(" {s}={}.{d:0>2} ns", .{ label, hundredths / 100, hundredths % 100 });
 }
 
+// `per_range` divides by the measured dispatches' mean range count (each one's main and
+// worker ranges, averaged), not the busiest shape's.
 fn writeWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.WorkloadView) std.Io.Writer.Error!void {
     if (view == .details) {
         try writer.writeAll("shape=");
@@ -168,5 +178,6 @@ fn writeWorkload(writer: *std.Io.Writer, stats: suite.RunStats, view: suite.Work
         try writer.print("items={}", .{stats.output_count});
     }
     try writeNsPer(writer, "per_item", stats.mean_ns, stats.item_count);
-    try writeNsPer(writer, "per_range", stats.mean_ns, stats.batch.range_count);
+    try writeNsPer(writer, "per_range", stats.mean_ns, stats.batch.main_thread_ranges + stats.batch.worker_thread_ranges);
+    if (view == .details) try suite.writeMainShare(writer, stats, stats.item_count);
 }
