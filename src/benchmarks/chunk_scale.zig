@@ -1269,6 +1269,8 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     }
     const plan_settled = if (case.adaptive) suite.tunerSettled(&world.terrain_edit_plan_tuner) else false;
     const write_settled = if (case.adaptive) suite.tunerSettled(&world.terrain_edit_write_tuner) else false;
+    const terrain_edit_write_tuner_start = suite.TunerStart.of(&world.terrain_edit_write_tuner, write_settled);
+    const terrain_edit_plan_tuner_start = suite.TunerStart.of(&world.terrain_edit_plan_tuner, plan_settled);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var plan_total: u128 = 0;
@@ -1295,8 +1297,8 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     // batches' item count is the chunks one edit touched.
     stats.output_count = cells_changed;
     stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
-    // The forward edit's shapes, beside the forward tuners reported below.
-    stats.batch = suite.batchSummaryFromBatch(forward_timing.forward_write);
+    // The forward edit's shapes, beside the forward tuners reported below: the write over
+    // every measured step (the accumulator's), the plan of the last.
     stats.secondary_batch = suite.batchSummaryFromBatch(forward_timing.forward_plan);
     if (stats.iterations > 0) {
         const iterations: u128 = stats.iterations;
@@ -1307,8 +1309,8 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         };
     }
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&world.terrain_edit_write_tuner), write_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&world.terrain_edit_plan_tuner), plan_settled);
+        stats.work_tuning = suite.workTuningSummary(&world.terrain_edit_write_tuner, terrain_edit_write_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(&world.terrain_edit_plan_tuner, terrain_edit_plan_tuner_start);
     }
     return stats;
 }
@@ -1571,6 +1573,8 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     const tuners = &nav.pipeline.pathfinding.tuners;
     const remask_settled = if (case.adaptive) suite.tunerSettled(tuners.nav.getPtrConst(.remask)) else false;
     const patch_settled = if (case.adaptive) suite.tunerSettled(tuners.nav.getPtrConst(.patch)) else false;
+    const remask_tuner_start = suite.TunerStart.of(tuners.nav.getPtrConst(.remask), remask_settled);
+    const patch_tuner_start = suite.TunerStart.of(tuners.nav.getPtrConst(.patch), patch_settled);
     var accumulator = suite.StatsAccumulator.init(item_count);
     // The last timed reaction, read before the reset's reaction replaces it.
     var timed_stats: NavUpdateStats = .{};
@@ -1588,12 +1592,11 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.items_per_second = suite.itemsPerSecond(dig_cell_count, stats.mean_ns);
     stats.nav_conn = suite.navConnSummary(timed_stats, fixtures.floodTunerWorkersOf(tuners, case));
     stats.nav_main = timed_main;
-    stats.batch = suite.batchSummaryFromBatch(timed_stats.perf.remask_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(timed_stats.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(timed_stats.perf.patch_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(tuners.nav.getPtrConst(.remask)), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(tuners.nav.getPtrConst(.patch)), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(tuners.nav.getPtrConst(.remask), remask_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
     return stats;
 }
@@ -1883,6 +1886,8 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     }
     const remask_settled = if (case.adaptive) suite.tunerSettled(system.tuners.nav.getPtrConst(.remask)) else false;
     const patch_settled = if (case.adaptive) suite.tunerSettled(system.tuners.nav.getPtrConst(.patch)) else false;
+    const remask_tuner_start = suite.TunerStart.of(system.tuners.nav.getPtrConst(.remask), remask_settled);
+    const patch_tuner_start = suite.TunerStart.of(system.tuners.nav.getPtrConst(.patch), patch_settled);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var plan_total: u128 = 0;
@@ -1919,7 +1924,6 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     stats.items_per_second = suite.itemsPerSecond(cells_changed, stats.mean_ns);
     stats.nav_conn = suite.navConnSummary(forward, fixtures.floodTunerWorkers(&nav.pipeline.pathfinding, case));
     stats.nav_main = nav_main;
-    stats.batch = suite.batchSummaryFromBatch(forward.perf.remask_batch);
     stats.nav_mark_batch = suite.batchSummaryFromBatch(forward_mark);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(forward.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(forward.perf.patch_batch);
@@ -1933,8 +1937,8 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         };
     }
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(system.tuners.nav.getPtrConst(.remask)), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(system.tuners.nav.getPtrConst(.patch)), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(system.tuners.nav.getPtrConst(.remask), remask_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(system.tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
     return stats;
 }

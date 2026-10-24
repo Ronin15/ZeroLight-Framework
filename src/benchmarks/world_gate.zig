@@ -220,6 +220,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         try gate.apply(&fixture.world, &fixture.data, &fixture.player, bounds, bounds, &threads, config);
     }
     const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&gate.tuner) else false;
+    const tuner_start = suite.TunerStart.of(&gate.tuner, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
@@ -240,7 +241,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     if (options.iterations > 0 and heldRows(&fixture.data, fixture.player.entity) != fixture.held_rows) return error.WorldGateWrongHeldRows;
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&gate.tuner), settled_before_measurement);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(&gate.tuner, tuner_start);
     stats.output_count = bodies;
     stats.candidate_pairs = fixture.gated_rows;
     stats.sample_count = fixture.held_rows;

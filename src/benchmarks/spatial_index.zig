@@ -167,6 +167,8 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     while (warm.next(suite.tunerSettled(&system.bucket_tuner) and suite.tunerSettled(&system.sort_tuner) and suite.tunerSettled(&system.link_tuner))) _ = try runOnce(&system, data, geometry, thread_ptr, case);
     const bucket_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.bucket_tuner) else false;
     const sort_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.sort_tuner) else false;
+    const bucket_tuner_start = suite.TunerStart.of(&system.bucket_tuner, bucket_settled_before_measurement);
+    const sort_tuner_start = suite.TunerStart.of(&system.sort_tuner, sort_settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = SpatialIndexStats{};
@@ -187,8 +189,8 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.sort_batch);
     stats.splice_batch = suite.batchSummaryFromBatch(last_stats.perf.link_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.bucket_tuner), bucket_settled_before_measurement);
-        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.sort_tuner), sort_settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&system.bucket_tuner, bucket_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(&system.sort_tuner, sort_tuner_start);
     }
     return .{ .stats = stats, .directory_bytes = spatial_index_test_support.directoryBytes(&system) };
 }

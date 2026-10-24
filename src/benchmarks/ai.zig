@@ -240,6 +240,8 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     }
     const separation_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.separation_tuner) else false;
     const intent_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.intent_tuner) else false;
+    const separation_tuner_start = suite.TunerStart.of(&system.separation_tuner, separation_settled_before_measurement);
+    const intent_tuner_start = suite.TunerStart.of(&system.intent_tuner, intent_settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_ai_stats = AiStats{};
@@ -270,8 +272,8 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.splice_batch = suite.batchSummaryFromBatch(last_ai_stats.perf.gather_batch);
     stats.ai_behavior_histogram = behaviorHistogram(fixture.data.aiAgentSliceConst().behaviors);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.separation_tuner), separation_settled_before_measurement);
-        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.intent_tuner), intent_settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&system.separation_tuner, separation_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(&system.intent_tuner, intent_tuner_start);
     }
     return stats;
 }

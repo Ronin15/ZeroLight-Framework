@@ -107,6 +107,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         _ = try runOnce(&system, &fixture, think_set, &threads, case);
     }
     const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.compute_tuner) else false;
+    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = AffectStats{};
@@ -128,7 +129,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     stats.candidate_pairs = system.rows.len;
     stats.output_count = fixture.events.stats.affect_threshold_crossed;
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.compute_tuner), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&system.compute_tuner, compute_tuner_start);
     }
     return stats;
 }

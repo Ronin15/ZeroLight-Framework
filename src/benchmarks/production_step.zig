@@ -84,6 +84,7 @@ const cellScanRadius = @import("../game/systems/spatial_index.zig").cellScanRadi
 const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
+const TunerCounts = suite.TunerCounts;
 
 const BatchStage = runtime_perf_log.BatchStage;
 const BenchBatchStage = runtime_perf_log.BenchBatchStage;
@@ -737,27 +738,6 @@ const Census = struct {
     }
 };
 
-// A tuner's diagnostic counts (`AdaptiveWorkTuner`): its probe windows, settled demotions,
-// restores, and records skipped on an unsustained item-count shift.
-const TunerCounts = struct {
-    probes: u64 = 0,
-    demotes: u64 = 0,
-    restores: u64 = 0,
-    shift_skips: u64 = 0,
-
-    fn of(tuner: *const AdaptiveWorkTuner) TunerCounts {
-        return .{ .probes = tuner.probe_window_count, .demotes = tuner.demotion_count, .restores = tuner.restore_count, .shift_skips = tuner.shift_skip_count };
-    }
-
-    fn since(self: TunerCounts, before: TunerCounts) TunerCounts {
-        return .{ .probes = self.probes - before.probes, .demotes = self.demotes - before.demotes, .restores = self.restores - before.restores, .shift_skips = self.shift_skips - before.shift_skips };
-    }
-
-    fn any(self: TunerCounts) bool {
-        return self.probes != 0 or self.demotes != 0 or self.restores != 0 or self.shift_skips != 0;
-    }
-};
-
 // Every `GameDemoState` tuner's counts by field path, taken before the measured steps; the
 // counts after them print as deltas. The walk after the measured steps must visit the
 // snapshot's paths in the same order, or the case fails: a tuner that appeared or went away
@@ -828,7 +808,11 @@ const TunerCensus = struct {
             const delta = TunerCounts.of(tuner).since(before);
             if (!delta.any()) return;
             self.changed += 1;
-            std.debug.print("    {s} probes={} demotes={} restores={} shift_skips={}\n", .{ path, delta.probes, delta.demotes, delta.restores, delta.shift_skips });
+            // Four counts of at most 20 digits and their labels.
+            var line: [128]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&line);
+            delta.write(&writer) catch {};
+            std.debug.print("    {s} {s}\n", .{ path, writer.buffered() });
         }
     };
 };

@@ -403,6 +403,7 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
     }
     const settled = if (case.adaptive) suite.tunerSettled(&system.tuners.solve) else false;
+    const solve_start = suite.TunerStart.of(&system.tuners.solve, settled);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -418,7 +419,7 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.output_count = last_stats.perf.available_results + last_stats.perf.unavailable_results + last_stats.perf.duplicate_requests + last_stats.perf.cache_hits;
     stats.candidate_pairs = last_stats.perf.duplicate_requests + last_stats.perf.cache_hits;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), settled);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
     return stats;
 }
 
@@ -465,6 +466,7 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
     }
     const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.tuners.solve) else false;
+    const solve_start = suite.TunerStart.of(&system.tuners.solve, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -503,7 +505,7 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     }
     stats.items_per_second = suite.itemsPerSecond(serviced, stats.mean_ns);
     if (case.adaptive and mode.isCold()) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
     }
     return stats;
 }
@@ -536,6 +538,7 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         }
     }
 
+    const solve_start = suite.TunerStart.of(&system.tuners.solve, false);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     var stage_report = StageReport{};
@@ -560,7 +563,7 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.candidate_pairs = last_stats.perf.solved_requests;
     stats.deferred_count = last_stats.perf.pending_requests;
     stats.items_per_second = suite.itemsPerSecond(last_stats.perf.solved_requests, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), false);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
     return stats;
 }
 

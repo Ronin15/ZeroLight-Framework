@@ -9,11 +9,9 @@
 
 const std = @import("std");
 const AdaptiveWorkPhase = @import("../app/thread_system.zig").AdaptiveWorkPhase;
-const AdaptiveWorkProfile = @import("../app/thread_system.zig").AdaptiveWorkProfile;
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
-const DiagnosticCount = @import("../app/thread_system.zig").DiagnosticCount;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const rangeCount = @import("../app/thread_system.zig").rangeCount;
@@ -26,6 +24,7 @@ const PerfTiming = @import("../app/runtime_perf_log.zig").Timing;
 const NavMainPhases = @import("../game/systems/pathfinding/types.zig").NavMainPhases;
 const NavUpdateStats = @import("../game/systems/pathfinding/types.zig").NavUpdateStats;
 const RebuildStage = @import("../game/systems/static_colliders.zig").RebuildStage;
+const forEachTunerIn = @import("../game/simulation_pipeline_test_support.zig").forEachTunerIn;
 
 pub const default_items_per_range = (ThreadSystemConfig{}).items_per_range;
 /// The fixed partition of a chunk-partitioned stage: one chunk per range.
@@ -295,6 +294,8 @@ pub const RunStats = struct {
     steering_stages: ?SteeringStageSummary = null,
     work_tuning: ?WorkTuningSummary = null,
     secondary_work_tuning: ?WorkTuningSummary = null,
+    /// The settle state, before measurement, of the tuners the case's step runs.
+    tuner_settle: ?TunerSettle = null,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
     render_game_prep_phases: ?RenderGamePrepPhaseSummary = null,
     terrain_edit_phases: ?TerrainEditPhaseSummary = null,
@@ -430,7 +431,18 @@ pub fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
         .batch_duration_ns = batch.batch_duration_ns,
         .main_thread_wait_ns = batch.main_thread_wait_ns,
         .ran_inline = batch.ran_inline,
+        .threaded_batches = @intFromBool(batch.item_count != 0 and !batch.ran_inline and batch.active_worker_threads != 0),
+        .dispatched_batches = @intFromBool(batch.item_count != 0),
     };
+}
+
+/// Stage `index` of `shapes` (a `*const StageShapes(n)`): its busiest batch's shape, and its
+/// threaded over non-empty batches across the samples added.
+pub fn batchSummaryFromShapes(shapes: anytype, index: usize) BatchSummary {
+    var summary = batchSummaryFromBatch(shapes.busiest[index]);
+    summary.threaded_batches = shapes.threaded[index];
+    summary.dispatched_batches = shapes.dispatched[index];
+    return summary;
 }
 
 const CaseResult = struct {
@@ -453,6 +465,9 @@ pub const BatchSummary = struct {
     batch_duration_ns: u64 = 0,
     main_thread_wait_ns: u64 = 0,
     ran_inline: bool = true,
+    // Of the batches summarized, those that ran on workers and those with items.
+    threaded_batches: usize = 0,
+    dispatched_batches: usize = 0,
 };
 
 pub const RenderPrepPhaseSummary = struct {
@@ -566,6 +581,11 @@ pub const WorldCreateSummary = struct {
     destroyed_bytes: usize = 0,
 };
 
+/// Whether a case's tuners had settled when its measurement started: `fresh` is a one-off
+/// stage whose production tuner starts fresh each run (a world, level, or store rebuild),
+/// measured fresh and judged.
+pub const Settle = enum { no, yes, fresh };
+
 pub const WorkTuningSummary = struct {
     // Captures tuner state at the measurement boundary. Unsettled adaptive
     // results stay visible instead of being treated as final policy.
@@ -579,12 +599,12 @@ pub const WorkTuningSummary = struct {
     candidate_items_per_range: ?usize = null,
     sample_count: usize = 0,
     sample_window: usize = 0,
-    settled_before_measurement: bool = false,
+    settle: Settle = .no,
     baseline_mean_batch_duration_ns: u64 = 0,
     has_threaded_profile: bool = false,
     probing: bool = false,
-    probe_window_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
-    demotion_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
+    /// The tuner's counts over the measured window only.
+    measured_counts: TunerCounts = .{},
 };
 
 pub const StatsAccumulator = struct {
@@ -600,7 +620,9 @@ pub const StatsAccumulator = struct {
     total_main_thread_ranges: u128 = 0,
     total_worker_thread_ranges: u128 = 0,
     total_worker_utilization: f64 = 0,
-    last_batch: BatchStats = .{},
+    // The headline batch over every measured step: its busiest shape and threaded over
+    // non-empty batches.
+    shapes: StageShapes(1) = .{},
 
     pub fn init(item_count: usize) StatsAccumulator {
         return .{ .item_count = item_count };
@@ -616,9 +638,11 @@ pub const StatsAccumulator = struct {
         self.total_main_thread_ranges += batch.main_thread_ranges;
         self.total_worker_thread_ranges += batch.worker_thread_ranges;
         self.total_worker_utilization += batch.worker_utilization;
-        self.last_batch = batch;
+        self.shapes.add(.{batch});
     }
 
+    /// The measured steps' means; `batch` carries the headline's busiest shape and its
+    /// threaded over non-empty batches.
     pub fn finish(self: StatsAccumulator) RunStats {
         if (self.iterations == 0) return .{};
 
@@ -628,6 +652,12 @@ pub const StatsAccumulator = struct {
             @as(u64, 0)
         else
             std.math.lossyCast(u64, (total_items * std.time.ns_per_s) / self.total_ns);
+        var batch = batchSummaryFromShapes(&self.shapes, 0);
+        batch.main_thread_ranges = std.math.lossyCast(usize, self.total_main_thread_ranges / iteration_count);
+        batch.worker_thread_ranges = std.math.lossyCast(usize, self.total_worker_thread_ranges / iteration_count);
+        batch.worker_utilization_percent = @intFromFloat((self.total_worker_utilization / @as(f64, @floatFromInt(self.iterations))) * 100.0);
+        batch.batch_duration_ns = std.math.lossyCast(u64, self.total_batch_duration_ns / iteration_count);
+        batch.main_thread_wait_ns = std.math.lossyCast(u64, self.total_main_thread_wait_ns / iteration_count);
 
         return .{
             .item_count = self.item_count,
@@ -636,75 +666,79 @@ pub const StatsAccumulator = struct {
             .min_ns = self.min_ns,
             .max_ns = self.max_ns,
             .items_per_second = items_per_second,
-            .batch = .{
-                .item_count = self.last_batch.item_count,
-                .range_count = self.last_batch.range_count,
-                .items_per_range = self.last_batch.items_per_range,
-                .range_alignment_items = self.last_batch.range_alignment_items,
-                .available_worker_threads = self.last_batch.available_worker_threads,
-                .active_worker_threads = self.last_batch.active_worker_threads,
-                .main_thread_ranges = std.math.lossyCast(usize, self.total_main_thread_ranges / iteration_count),
-                .worker_thread_ranges = std.math.lossyCast(usize, self.total_worker_thread_ranges / iteration_count),
-                .worker_utilization_percent = @intFromFloat((self.total_worker_utilization / @as(f64, @floatFromInt(self.iterations))) * 100.0),
-                .batch_duration_ns = std.math.lossyCast(u64, self.total_batch_duration_ns / iteration_count),
-                .main_thread_wait_ns = std.math.lossyCast(u64, self.total_main_thread_wait_ns / iteration_count),
-                .ran_inline = self.last_batch.ran_inline,
-            },
+            .batch = batch,
         };
     }
 };
 
-/// A tuner's state as the bench reports it, read from its fields.
-pub const AdaptiveWorkReport = struct {
-    phase: AdaptiveWorkPhase = .learning,
-    initial_profile: AdaptiveWorkProfile = .{},
-    current_profile: AdaptiveWorkProfile = .{},
-    batch_multiplier: f64 = 1,
-    candidate_profile: ?AdaptiveWorkProfile = null,
-    sample_count: usize = 0,
-    sample_window: usize = 1,
-    baseline_mean_batch_duration_ns: u64 = 0,
-    has_threaded_profile: bool = false,
-    probing: bool = false,
-    probe_window_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
-    demotion_count: DiagnosticCount = if (diagnostics_enabled) 0 else {},
+/// A tuner's diagnostic counts: its probe windows, settled demotions, restores, and records
+/// skipped on an unsustained item-count shift. The tuner's are cumulative over its life, so
+/// a measured window reports `since` its start.
+pub const TunerCounts = struct {
+    probes: u64 = 0,
+    demotes: u64 = 0,
+    restores: u64 = 0,
+    shift_skips: u64 = 0,
+
+    pub fn of(tuner: *const AdaptiveWorkTuner) TunerCounts {
+        if (comptime !diagnostics_enabled) return .{};
+        return .{ .probes = tuner.probe_window_count, .demotes = tuner.demotion_count, .restores = tuner.restore_count, .shift_skips = tuner.shift_skip_count };
+    }
+
+    pub fn since(self: TunerCounts, before: TunerCounts) TunerCounts {
+        return .{ .probes = self.probes - before.probes, .demotes = self.demotes - before.demotes, .restores = self.restores - before.restores, .shift_skips = self.shift_skips - before.shift_skips };
+    }
+
+    pub fn any(self: TunerCounts) bool {
+        return self.probes != 0 or self.demotes != 0 or self.restores != 0 or self.shift_skips != 0;
+    }
+
+    /// `probes=<n> demotes=<n> restores=<n> shift_skips=<n>`.
+    pub fn write(self: TunerCounts, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("probes={} demotes={} restores={} shift_skips={}", .{ self.probes, self.demotes, self.restores, self.shift_skips });
+    }
 };
 
-pub fn tunerReport(tuner: *const AdaptiveWorkTuner) AdaptiveWorkReport {
+/// A tuner when its case's measurement starts: whether the case counts it settled, and its
+/// counts, which `workTuningSummary` subtracts so the summary reports the measured window.
+pub const TunerStart = struct {
+    settle: Settle = .no,
+    counts: TunerCounts = .{},
+
+    /// A one-off stage's tuner that production constructs fresh each run, whose counts
+    /// start at zero.
+    pub const fresh: TunerStart = .{ .settle = .fresh };
+
+    /// `tuner` now, settled per `settled` (the case's settle predicate before measurement).
+    pub fn of(tuner: *const AdaptiveWorkTuner, settled: bool) TunerStart {
+        return .{ .settle = if (settled) .yes else .no, .counts = .of(tuner) };
+    }
+};
+
+/// `tuner`'s state after measurement, its settle state at `start`, and its counts since then.
+pub fn workTuningSummary(tuner: *const AdaptiveWorkTuner, start: TunerStart) WorkTuningSummary {
+    return workTuningSummaryAt(tuner, .of(tuner), start);
+}
+
+/// `workTuningSummary` with the tuner's counts at measurement end given as `end`: the summary
+/// reports `end` less `start`'s counts.
+fn workTuningSummaryAt(tuner: *const AdaptiveWorkTuner, end: TunerCounts, start: TunerStart) WorkTuningSummary {
     return .{
         .phase = tuner.phase,
-        .initial_profile = tuner.initial_profile,
-        .current_profile = tuner.current_profile,
+        .initial_worker_threads = tuner.initial_profile.worker_threads,
+        .initial_range_items = tuner.initial_profile.items_per_range,
+        .final_worker_threads = tuner.current_profile.worker_threads,
+        .final_items_per_range = tuner.current_profile.items_per_range,
         .batch_multiplier = tuner.batch_multiplier,
-        .candidate_profile = tuner.candidate_profile,
+        .candidate_worker_threads = if (tuner.candidate_profile) |profile| profile.worker_threads else null,
+        .candidate_items_per_range = if (tuner.candidate_profile) |profile| profile.items_per_range else null,
         .sample_count = tuner.sample_count,
         .sample_window = tuner.config.sample_window,
+        .settle = start.settle,
         .baseline_mean_batch_duration_ns = tuner.baseline_mean_batch_duration_ns,
         .has_threaded_profile = tuner.has_threaded_profile,
         .probing = tuner.phase == .probing,
-        .probe_window_count = tuner.probe_window_count,
-        .demotion_count = tuner.demotion_count,
-    };
-}
-
-pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement: bool) WorkTuningSummary {
-    return .{
-        .phase = report.phase,
-        .initial_worker_threads = report.initial_profile.worker_threads,
-        .initial_range_items = report.initial_profile.items_per_range,
-        .final_worker_threads = report.current_profile.worker_threads,
-        .final_items_per_range = report.current_profile.items_per_range,
-        .batch_multiplier = report.batch_multiplier,
-        .candidate_worker_threads = if (report.candidate_profile) |profile| profile.worker_threads else null,
-        .candidate_items_per_range = if (report.candidate_profile) |profile| profile.items_per_range else null,
-        .sample_count = report.sample_count,
-        .sample_window = report.sample_window,
-        .settled_before_measurement = settled_before_measurement,
-        .baseline_mean_batch_duration_ns = report.baseline_mean_batch_duration_ns,
-        .has_threaded_profile = report.has_threaded_profile,
-        .probing = report.probing,
-        .probe_window_count = report.probe_window_count,
-        .demotion_count = report.demotion_count,
+        .measured_counts = end.since(start.counts),
     };
 }
 
@@ -718,10 +752,96 @@ pub fn adaptiveSettleIterationLimit(options: Options) usize {
     return @max(options.iterations, settle_iterations);
 }
 
-/// A tuner the bench may stop warming: settled, and, when threaded, its batch-count nudge
+/// A tuner the bench may stop warming: settled with no settled demotion awaiting its judging
+/// window and no item-count retune pending, and, when threaded, its batch-count nudge
 /// holding.
 pub fn tunerSettled(tuner: *const AdaptiveWorkTuner) bool {
-    return tuner.phase == .settled and (!tuner.has_threaded_profile or tuner.nudge_state == .holding);
+    return tuner.phase == .settled and tuner.restore_threaded_profile == null and !tuner.retune_pending and
+        (!tuner.has_threaded_profile or tuner.nudge_state == .holding);
+}
+
+/// A tuner whose stage never selected a shape (no item count learned), or a settled one. Its
+/// window's sample count is no such test: it returns to zero at every window's end.
+pub fn tunerSettledOrUnused(tuner: *const AdaptiveWorkTuner) bool {
+    return tuner.learned_item_count == 0 or tunerSettled(tuner);
+}
+
+/// The settle state of the tuners a case's step runs: `settled` of the `used` ones (a tuner
+/// that never selected a shape is unused) and the first unsettled ones' names. Built per
+/// tuner with `add`, or over every tuner a fixture holds by value with `of`.
+pub const TunerSettle = struct {
+    const listed_max = 4;
+
+    used: usize = 0,
+    settled: usize = 0,
+    unsettled_names: [listed_max][]const u8 = undefined,
+    unsettled_listed: usize = 0,
+
+    /// Every `AdaptiveWorkTuner` `value` holds by value (`forEachTunerIn`), named by path.
+    pub fn of(comptime T: type, value: *T) TunerSettle {
+        var census = TunerSettle{};
+        forEachTunerIn(T, value, "", &census);
+        return census;
+    }
+
+    pub fn add(self: *TunerSettle, name: []const u8, tuner: *const AdaptiveWorkTuner) void {
+        if (tuner.learned_item_count == 0) return;
+        self.used += 1;
+        if (tunerSettled(tuner)) {
+            self.settled += 1;
+            return;
+        }
+        if (self.unsettled_listed == listed_max) return;
+        self.unsettled_names[self.unsettled_listed] = name;
+        self.unsettled_listed += 1;
+    }
+
+    pub fn visit(self: *TunerSettle, comptime path: []const u8, tuner: *AdaptiveWorkTuner) void {
+        self.add(path, tuner);
+    }
+
+    pub fn all(self: TunerSettle) bool {
+        return self.settled == self.used;
+    }
+
+    /// `settled=<k>/<n>`, then the first unsettled names.
+    pub fn write(self: *const TunerSettle, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("settled={}/{}", .{ self.settled, self.used });
+        if (self.all()) return;
+        try writer.writeAll(" unsettled=");
+        for (self.unsettled_names[0..self.unsettled_listed], 0..) |name, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writer.writeAll(name);
+        }
+        if (self.used - self.settled > self.unsettled_listed) try writer.writeAll(",...");
+    }
+};
+
+/// Per named tuner, its counts when a case's measurement starts; `print` writes each one's
+/// counts over the measured window.
+pub fn TunerWindow(comptime n: usize) type {
+    return struct {
+        const Self = @This();
+
+        start: [n]TunerCounts = @splat(.{}),
+
+        pub fn begin(tuners: [n]*const AdaptiveWorkTuner) Self {
+            var window = Self{};
+            for (tuners, &window.start) |tuner, *start| start.* = .of(tuner);
+            return window;
+        }
+
+        /// `measured_retunes=<name>:<probes>/<demotes>/<restores>/<shift skips> ...`.
+        pub fn print(self: *const Self, details: *DetailLines, names: [n][]const u8, tuners: [n]*const AdaptiveWorkTuner) void {
+            if (comptime !diagnostics_enabled) return;
+            details.print("measured_retunes=", .{});
+            for (names, tuners, self.start) |name, tuner, start| {
+                const counts = TunerCounts.of(tuner).since(start);
+                details.print("{s}:{}/{}/{}/{} ", .{ name, counts.probes, counts.demotes, counts.restores, counts.shift_skips });
+            }
+            details.print("(probes/demotes/restores/shift_skips)\n", .{});
+        }
+    };
 }
 
 /// A case's warmup and adaptive settle, driven by `while (warm.next(tuners_settled)) step();`:
@@ -1074,6 +1194,10 @@ fn printCompactTable(results: []const CaseResult, baseline: CaseResult) void {
     }
 }
 
+// The details table's work-tuning column: fits a cell with a candidate profile and the
+// diagnostic counts (Debug/ReleaseSafe).
+const work_tuning_width = 108;
+
 fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
     printCell("case", 30);
     printCell("min", 11);
@@ -1082,7 +1206,7 @@ fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
     printCell("worker_ranges", 14);
     printCell("wait", 11);
     printCell("items_per_range", 16);
-    printCell("work_tuning", 72);
+    printCell("work_tuning", work_tuning_width);
     std.debug.print("workload\n", .{});
 
     for (results) |result| {
@@ -1094,7 +1218,7 @@ fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
             printCell("-", 14);
             printCell("-", 11);
             printCell("-", 16);
-            printCell("-", 72);
+            printCell("-", work_tuning_width);
             std.debug.print("{s}\n", .{statusText(result.stats)});
             continue;
         }
@@ -1105,7 +1229,7 @@ fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
         var main_ranges_buffer: [24]u8 = undefined;
         var worker_ranges_buffer: [24]u8 = undefined;
         var items_per_range_buffer: [24]u8 = undefined;
-        var tuning_buffer: [96]u8 = undefined;
+        var tuning_buffer: [192]u8 = undefined;
         var workload_buffer: [8192]u8 = undefined;
 
         const batch = result.stats.batch;
@@ -1117,9 +1241,18 @@ fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
         printCell(if (carried) formatRangeCellInto(&worker_ranges_buffer, batch, batch.worker_thread_ranges) else "-", 14);
         printCell(if (carried) formatDurationInto(&wait_buffer, batch.main_thread_wait_ns) else "-", 11);
         printCell(if (carried) formatRangeCellInto(&items_per_range_buffer, batch, batch.items_per_range) else "-", 16);
-        printCell(formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning), 72);
+        printCell(formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning), work_tuning_width);
         const workload = formatWorkloadInto(&workload_buffer, group, result.stats, .details);
         std.debug.print("{s}\n", .{if (workload.len == 0) "-" else workload});
+        if (result.stats.secondary_work_tuning) |secondary| {
+            std.debug.print("    secondary_tuning: {s}\n", .{formatWorkTuningInto(&tuning_buffer, secondary)});
+        }
+        if (result.stats.tuner_settle) |census| {
+            var settle_buffer: [256]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&settle_buffer);
+            census.write(&writer) catch {};
+            std.debug.print("    step_tuners: {s}\n", .{writer.buffered()});
+        }
         printDetailLines(result.stats.details.text());
     }
 }
@@ -1175,6 +1308,8 @@ fn printValidationSummary(
     }
 
     if (adaptive) |adaptive_result| {
+        var settle_buffer: [256]u8 = undefined;
+        if (formatSettleInto(&settle_buffer, adaptive_result.stats)) |settle| std.debug.print("adaptive {s}. ", .{settle});
         if (adaptive_result.stats.work_tuning) |summary| {
             if (summary.has_threaded_profile) {
                 std.debug.print(
@@ -1185,13 +1320,15 @@ fn printValidationSummary(
                 std.debug.print("adaptive phase={s} threaded_profile=none. ", .{@tagName(summary.phase)});
             }
         }
-        // A sample that carries no batch has no one stage to name worker use from.
+        // A sample that carries no batch has no one stage to name worker use from. The
+        // brackets are the headline's threaded over non-empty batches across the measured
+        // steps.
         if (adaptive_result.stats.batch_carried) {
             const batch = adaptive_result.stats.batch;
-            if (batch.active_worker_threads == 0) {
-                std.debug.print("adaptive stayed inline with {}/{} worker_threads. ", .{ batch.active_worker_threads, batch.available_worker_threads });
+            if (batch.threaded_batches == 0) {
+                std.debug.print("adaptive stayed inline [0/{}] with {} worker_threads available. ", .{ batch.dispatched_batches, batch.available_worker_threads });
             } else {
-                std.debug.print("adaptive used {}/{} worker_threads. ", .{ batch.active_worker_threads, batch.available_worker_threads });
+                std.debug.print("adaptive used {}/{} worker_threads [{}/{}]. ", .{ batch.active_worker_threads, batch.available_worker_threads, batch.threaded_batches, batch.dispatched_batches });
             }
         }
     } else {
@@ -1245,12 +1382,14 @@ fn validationAttention(fixed_auto: ?CaseResult, adaptive: ?CaseResult, threaded_
     // Attention messages flag suspicious policy gaps against fixed controls. The
     // benchmark still exits successfully so timing noise can be reviewed.
     if (adaptive) |adaptive_result| {
+        // An unsettled tuned case is never judged against the controls.
+        if (caseSettle(adaptive_result.stats) == .no) return "adaptive did not settle before measurement (settled=no): not judged, rerun with more warmup";
         if (fixed_auto) |auto| {
             if (percentDelta(adaptive_result.stats.mean_ns, auto.stats.mean_ns) > 25) {
                 return "adaptive is more than 25% slower than fixed-auto";
             }
         }
-        if (adaptive_result.stats.batch.active_worker_threads > 0) {
+        if (adaptive_result.stats.batch.threaded_batches > 0) {
             if (threaded_control) |fixed| {
                 if (percentDelta(adaptive_result.stats.mean_ns, fixed.stats.mean_ns) > 25) {
                     return "adaptive is more than 25% slower than best fixed threaded control";
@@ -1311,9 +1450,37 @@ fn formatThroughputInto(buffer: []u8, items_per_second: u64) []const u8 {
     return std.mem.print(buffer, "{}.{d:0>2}{s}", .{ whole, fraction, unit.suffix }) catch "throughput";
 }
 
+// The headline's busiest batch's workers over those available, then its threaded over
+// non-empty batches across the measured steps.
 fn formatWorkerThreadsInto(buffer: []u8, stats: RunStats) []const u8 {
     if (!stats.batch_carried) return "-";
-    return std.mem.print(buffer, "{}/{}", .{ stats.batch.active_worker_threads, stats.batch.available_worker_threads }) catch "workers";
+    const batch = stats.batch;
+    return std.mem.print(buffer, "{}/{}[{}/{}]", .{ batch.active_worker_threads, batch.available_worker_threads, batch.threaded_batches, batch.dispatched_batches }) catch "workers";
+}
+
+// A case's settle state before measurement: `no` when any tuner its step runs, or its
+// headline tuner, had not settled; null when it reports neither.
+fn caseSettle(stats: RunStats) ?Settle {
+    if (stats.tuner_settle) |census| {
+        if (!census.all()) return .no;
+        if (stats.work_tuning) |summary| return summary.settle;
+        return .yes;
+    }
+    const summary = stats.work_tuning orelse return null;
+    return summary.settle;
+}
+
+// `settled=<yes|no|fresh>`, or the step's tuner census `settled=<k>/<n>` when the case took
+// one; null when the case reports neither.
+fn formatSettleInto(buffer: []u8, stats: RunStats) ?[]const u8 {
+    var writer: std.Io.Writer = .fixed(buffer);
+    if (stats.tuner_settle) |census| {
+        census.write(&writer) catch return "settled";
+        if (stats.work_tuning) |summary| if (summary.settle == .no and census.all()) writer.writeAll(" headline=no") catch return "settled";
+        return writer.buffered();
+    }
+    const summary = stats.work_tuning orelse return null;
+    return std.mem.print(buffer, "settled={s}", .{@tagName(summary.settle)}) catch "settled";
 }
 
 // A range column of `batch`: `inline` when it ran inline (no range split), else `value`.
@@ -1335,10 +1502,10 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
     return writer.buffered();
 }
 
-/// A tuner's phase, whether it settled before measurement, its final profile, and its
-/// batch multiplier.
+/// A tuner's phase, whether it settled before measurement (or ran `fresh`), its final
+/// profile, its batch multiplier, and its counts over the measured window.
 pub fn writeWorkTuning(writer: *std.Io.Writer, summary: WorkTuningSummary) std.Io.Writer.Error!void {
-    try writer.print("{s} settled={s}", .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement) });
+    try writer.print("{s} settled={s}", .{ @tagName(summary.phase), @tagName(summary.settle) });
     if (summary.has_threaded_profile) {
         try writer.print(
             " final={}/{} x={d:.2}",
@@ -1351,7 +1518,8 @@ pub fn writeWorkTuning(writer: *std.Io.Writer, summary: WorkTuningSummary) std.I
         try writer.print(" cand={}/{}", .{ summary.candidate_worker_threads orelse 0, candidate });
     }
     if (comptime diagnostics_enabled) {
-        try writer.print(" probes={} demotes={}", .{ summary.probe_window_count, summary.demotion_count });
+        try writer.writeByte(' ');
+        try summary.measured_counts.write(writer);
     }
 }
 
@@ -1557,10 +1725,6 @@ pub fn writeSteeringStages(writer: *std.Io.Writer, stats: RunStats) std.Io.Write
         try writer.writeAll(shape[0]);
         try writeRunStageShape(writer, shape[1]);
     }
-}
-
-fn yesNo(value: bool) []const u8 {
-    return if (value) "yes" else "no";
 }
 
 fn findResult(results: []const CaseResult, name: []const u8) ?CaseResult {
@@ -1859,23 +2023,121 @@ test "benchmark case filter includes serial baseline for non-serial cases" {
     try std.testing.expect(!shouldIncludeBaselineForFilter("thread-adaptive-tuned-range", default_cases[6]));
 }
 
-test "work tuning summary preserves settled phase" {
-    const summary = workTuningSummary(.{
-        .phase = .settled,
-        .initial_profile = .{ .worker_threads = 0, .items_per_range = 64 },
-        .current_profile = .{ .worker_threads = 4, .items_per_range = 256 },
-        .batch_multiplier = 1.21,
-        .sample_window = 2,
-        .has_threaded_profile = true,
-    }, true);
+// A tuner settled on a threaded profile with its nudge holding.
+fn testSettledThreadedTuner() AdaptiveWorkTuner {
+    var tuner = AdaptiveWorkTuner.init(.{});
+    tuner.phase = .settled;
+    tuner.has_threaded_profile = true;
+    tuner.current_profile = .{ .worker_threads = 4, .items_per_range = 256 };
+    tuner.batch_multiplier = 1.21;
+    tuner.nudge_state = .holding;
+    tuner.learned_item_count = 1024;
+    return tuner;
+}
+
+test "work tuning summary preserves settled phase, or fresh" {
+    const tuner = testSettledThreadedTuner();
+    const summary = workTuningSummary(&tuner, .of(&tuner, true));
 
     try std.testing.expectEqual(AdaptiveWorkPhase.settled, summary.phase);
-    try std.testing.expect(summary.settled_before_measurement);
+    try std.testing.expectEqual(Settle.yes, summary.settle);
     try std.testing.expectEqual(@as(usize, 4), summary.final_worker_threads);
     try std.testing.expectEqual(@as(usize, 256), summary.final_items_per_range);
     try std.testing.expectEqual(@as(f64, 1.21), summary.batch_multiplier);
-    var tuning_buffer: [96]u8 = undefined;
+    var tuning_buffer: [192]u8 = undefined;
     try std.testing.expect(std.mem.startsWith(u8, formatWorkTuningInto(&tuning_buffer, summary), "settled settled=yes final=4/256 x=1.21"));
+    try std.testing.expect(std.mem.startsWith(u8, formatWorkTuningInto(&tuning_buffer, workTuningSummary(&tuner, .fresh)), "settled settled=fresh"));
+}
+
+test "tuner counts over a measured window are the counts since its start" {
+    const start = TunerCounts{ .probes = 3, .demotes = 1, .restores = 0, .shift_skips = 5 };
+    const end = TunerCounts{ .probes = 5, .demotes = 2, .restores = 1, .shift_skips = 5 };
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try end.since(start).write(&writer);
+    try std.testing.expectEqualStrings("probes=2 demotes=1 restores=1 shift_skips=0", writer.buffered());
+    try std.testing.expect(!end.since(end).any());
+
+    // The summary stores the window, not the tuner's lifetime counts.
+    const tuner = testSettledThreadedTuner();
+    const summary = workTuningSummaryAt(&tuner, end, .{ .settle = .yes, .counts = start });
+    try std.testing.expectEqual(end.since(start), summary.measured_counts);
+    try std.testing.expectEqual(end, workTuningSummaryAt(&tuner, end, .fresh).measured_counts);
+}
+
+test "the details table's work-tuning column fits a cell with a candidate and its counts" {
+    var tuner = testSettledThreadedTuner();
+    tuner.phase = .learning;
+    tuner.current_profile = .{ .worker_threads = 23, .items_per_range = 1024 };
+    tuner.candidate_profile = .{ .worker_threads = 23, .items_per_range = 1024 };
+    const counts = TunerCounts{ .probes = 999, .demotes = 99, .restores = 99, .shift_skips = 999 };
+    var buffer: [192]u8 = undefined;
+    const cell = formatWorkTuningInto(&buffer, workTuningSummaryAt(&tuner, counts, .fresh));
+    try std.testing.expect(std.mem.indexOf(u8, cell, "cand=23/1024") != null);
+    try std.testing.expect(cell.len <= work_tuning_width);
+}
+
+test "a tuner with a demotion awaiting judgment or a pending retune is not settled" {
+    var tuner = testSettledThreadedTuner();
+    try std.testing.expect(tunerSettled(&tuner));
+    tuner.retune_pending = true;
+    try std.testing.expect(!tunerSettled(&tuner));
+    tuner.retune_pending = false;
+    tuner.has_threaded_profile = false;
+    tuner.restore_threaded_profile = .{ .worker_threads = 4, .items_per_range = 256 };
+    try std.testing.expect(!tunerSettled(&tuner));
+    tuner.restore_threaded_profile = null;
+    try std.testing.expect(tunerSettled(&tuner));
+    tuner.has_threaded_profile = true;
+    tuner.nudge_state = .stepped;
+    try std.testing.expect(!tunerSettled(&tuner));
+}
+
+test "a tuner census counts used tuners only and names the unsettled" {
+    const Fixture = struct {
+        settled: AdaptiveWorkTuner,
+        unused: AdaptiveWorkTuner,
+        pair: [2]AdaptiveWorkTuner,
+    };
+    var fixture = Fixture{ .settled = testSettledThreadedTuner(), .unused = .init(.{}), .pair = .{ testSettledThreadedTuner(), testSettledThreadedTuner() } };
+    fixture.pair[1].phase = .learning;
+    const census = TunerSettle.of(Fixture, &fixture);
+    try std.testing.expect(!census.all());
+    try std.testing.expect(!tunerSettledOrUnused(&fixture.pair[1]) and tunerSettledOrUnused(&fixture.unused));
+    var buffer: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try census.write(&writer);
+    try std.testing.expectEqualStrings("settled=2/3 unsettled=.pair[1]", writer.buffered());
+
+    // The census is judged before the headline: an unsettled step never reaches the controls.
+    const unsettled: RunStats = .{ .tuner_settle = census, .work_tuning = workTuningSummary(&fixture.settled, .of(&fixture.settled, true)) };
+    try std.testing.expectEqual(@as(?Settle, .no), caseSettle(unsettled));
+    const adaptive = CaseResult{ .case = default_cases[default_cases.len - 1], .stats = unsettled };
+    const fixed = CaseResult{ .case = findBenchmarkCase("thread-fixed-auto").?, .stats = .{ .mean_ns = 1 } };
+    try std.testing.expect(std.mem.startsWith(u8, validationAttention(fixed, adaptive, fixed).?, "adaptive did not settle"));
+    const fresh: RunStats = .{ .work_tuning = workTuningSummary(&fixture.settled, .fresh) };
+    try std.testing.expectEqual(@as(?Settle, .fresh), caseSettle(fresh));
+    try std.testing.expectEqualStrings("settled=fresh", formatSettleInto(&buffer, fresh).?);
+}
+
+test "the headline batch reports its busiest shape and threaded over non-empty batches across steps" {
+    var accumulator = StatsAccumulator.init(64);
+    accumulator.record(10, .{ .item_count = 64, .range_count = 4, .available_worker_threads = 3, .active_worker_threads = 3, .ran_inline = false });
+    accumulator.record(10, .{ .item_count = 32, .available_worker_threads = 3 });
+    accumulator.record(10, .{});
+    const stats = accumulator.finish();
+    try std.testing.expectEqual(@as(usize, 1), stats.batch.threaded_batches);
+    try std.testing.expectEqual(@as(usize, 2), stats.batch.dispatched_batches);
+    try std.testing.expectEqual(@as(usize, 3), stats.batch.active_worker_threads);
+    try std.testing.expect(!stats.batch.ran_inline);
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("3/3[1/2]", formatWorkerThreadsInto(&buffer, stats));
+
+    // A stage of a multi-stage shape set reports the same busiest batch and counts.
+    const shapes_summary = batchSummaryFromShapes(&accumulator.shapes, 0);
+    try std.testing.expectEqual(@as(usize, 64), shapes_summary.item_count);
+    try std.testing.expectEqual(@as(usize, 1), shapes_summary.threaded_batches);
+    try std.testing.expectEqual(@as(usize, 2), shapes_summary.dispatched_batches);
 }
 
 test "benchmark fixed and stage range sizes align the range and null out adaptive cases" {
@@ -2026,10 +2288,12 @@ test "benchmark table formatters keep compact text" {
     try std.testing.expectEqualStrings("1.23M/s", formatThroughputInto(&throughput_buffer, 1_234_567));
     try std.testing.expectEqualStrings("3.25x", formatSpeedupInto(&speedup_buffer, 325));
     try std.testing.expectEqualStrings("-", formatWorkerThreadsInto(&worker_buffer, .{ .batch_carried = false }));
-    try std.testing.expectEqualStrings("4/10", formatWorkerThreadsInto(&worker_buffer, .{
+    try std.testing.expectEqualStrings("4/10[3/5]", formatWorkerThreadsInto(&worker_buffer, .{
         .batch = .{
             .active_worker_threads = 4,
             .available_worker_threads = 10,
+            .threaded_batches = 3,
+            .dispatched_batches = 5,
         },
     }));
     try std.testing.expect(std.mem.startsWith(
@@ -2038,7 +2302,7 @@ test "benchmark table formatters keep compact text" {
             .phase = .settled,
             .final_worker_threads = 4,
             .final_items_per_range = 256,
-            .settled_before_measurement = true,
+            .settle = .yes,
             .has_threaded_profile = true,
         }),
         "settled settled=yes final=4/256 x=1.00",
@@ -2171,7 +2435,7 @@ test "benchmark validation attention flags adaptive regressions against controls
         .case = default_cases[6],
         .stats = .{
             .mean_ns = 130,
-            .batch = .{ .active_worker_threads = 1 },
+            .batch = .{ .active_worker_threads = 1, .threaded_batches = 1, .dispatched_batches = 1 },
         },
     };
     const threaded_control = CaseResult{

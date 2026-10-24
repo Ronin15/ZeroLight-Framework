@@ -402,17 +402,17 @@ const ToggleReport = struct {
         }
     }
 
-    // The busiest plan, remask, and patch batches, the connectivity summary, and the
-    // main-thread split into `stats`.
+    // Each stage's busiest batch with its threaded over non-empty batches across the
+    // samples, the connectivity summary, and the main-thread split into `stats`.
     fn summarize(self: ToggleReport, stats: *suite.RunStats, flood_tuner_workers: ?usize) void {
-        const busiest = self.shapes.busiest;
         stats.nav_main = self.nav_main;
-        stats.nav_plan_batch = suite.batchSummaryFromBatch(busiest[0]);
-        stats.batch = suite.batchSummaryFromBatch(busiest[1]);
-        stats.secondary_batch = suite.batchSummaryFromBatch(busiest[2]);
+        stats.nav_plan_batch = suite.batchSummaryFromShapes(&self.shapes, 0);
+        stats.batch = suite.batchSummaryFromShapes(&self.shapes, 1);
+        stats.secondary_batch = suite.batchSummaryFromShapes(&self.shapes, 2);
         var conn = suite.navConnSummary(self.last_change, flood_tuner_workers);
         const stage_summaries = [_]*suite.BatchSummary{ &conn.seed, &conn.gather, &conn.flood, &conn.candidates, &conn.closure_resolve, &conn.closure_mask, &conn.closure_plan, &conn.closure_rows, &conn.closure_land };
-        for (stage_summaries, busiest[3..]) |summary, batch| summary.* = suite.batchSummaryFromBatch(batch);
+        comptime std.debug.assert(3 + stage_summaries.len == toggle_stage_count);
+        for (stage_summaries, 3..) |summary, stage| summary.* = suite.batchSummaryFromShapes(&self.shapes, stage);
         conn.reopen_flood_nodes = self.revert_flood_nodes;
         conn.closure_shrinks = self.closure_shrinks;
         conn.closure_block_allocs = self.closure_block_allocs;

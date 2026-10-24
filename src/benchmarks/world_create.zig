@@ -24,7 +24,9 @@
 //! Item count: statics, two per pitch cell of a square on the world's corner (a solid and a
 //! trigger half a tile past it, one stored trigger pair per cell). Timed: `init` and
 //! `first_seam`; the world and data build untimed. Cases: serial and tuned; the init's
-//! rebuild stages run on fresh tuners no control reaches. Per create, untimed checks: init
+//! rebuild stages run on fresh tuners no control reaches, as production's do (a pipeline per
+//! create), so the tuned case is measured fresh (`settled=fresh`, its tuning cell the collider
+//! rewrite tuner after the last measured init). Per create, untimed checks: init
 //! stored every pair at the colliders' revision and the world's strips, and `reserveFrame`
 //! declared a trigger contact bound covering them; the collider rebuild selected every slot,
 //! planned, touched and grouped every static, filled every span and installed every
@@ -359,6 +361,8 @@ const StaticsSample = struct {
     trigger_off_main_ns: u64,
     collider_batches: [collider_rebuild_stages.len]BatchStats,
     trigger_batches: [trigger_stage_count]BatchStats,
+    // The init's collider rewrite tuner, fresh with the pipeline as in production.
+    rewrite_tuning: suite.WorkTuningSummary,
 };
 
 fn triggerRebuildBatches(pipeline: *const SimulationPipeline) [trigger_stage_count]BatchStats {
@@ -416,6 +420,7 @@ fn createWithStatics(allocator: std.mem.Allocator, io: std.Io, fixture: *Statics
     const perf = pipeline.perf;
     const collider_batches = colliderRebuildBatches(pipeline);
     const trigger_batches = triggerRebuildBatches(pipeline);
+    const rewrite_tuning = suite.workTuningSummary(pipeline.static_colliders.rebuild_tuners.getPtrConst(.rewrite), .fresh);
     if (static_colliders_test_support.liveRowCount(pipeline.static_colliders) != statics) return error.WrongStaticCount;
     try suite.checkRebuildWork(collider_batches, fixture.data.slots.items.len, statics, fixture.chunks);
     try checkInitTriggerBuild(pipeline, &fixture.world, statics, fixture.cells, trigger_batches);
@@ -445,6 +450,7 @@ fn createWithStatics(allocator: std.mem.Allocator, io: std.Io, fixture: *Statics
         .trigger_off_main_ns = sumOffMainNs(&trigger_batches),
         .collider_batches = collider_batches,
         .trigger_batches = trigger_batches,
+        .rewrite_tuning = rewrite_tuning,
     };
 }
 
@@ -491,8 +497,10 @@ fn runStaticsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
     var totals = StaticsTotals{};
     var collider_shapes = suite.StageShapes(collider_rebuild_stages.len){};
     var trigger_shapes = suite.StageShapes(trigger_stage_count){};
+    var rewrite_tuning: ?suite.WorkTuningSummary = null;
     for (0..options.iterations) |_| {
         const sample = try createWithStatics(allocator, io, &fixture, statics, case, &threads);
+        rewrite_tuning = sample.rewrite_tuning;
         totals.add(sample);
         collider_shapes.add(sample.collider_batches);
         trigger_shapes.add(sample.trigger_batches);
@@ -502,6 +510,7 @@ fn runStaticsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
     stats.batch_carried = false;
     stats.sample_count = statics;
     stats.output_count = fixture.cells;
+    if (case.adaptive) stats.work_tuning = rewrite_tuning;
     if (stats.iterations > 0) {
         const n = stats.iterations;
         stats.deferred_count = StaticsTotals.mean(totals.init, n);

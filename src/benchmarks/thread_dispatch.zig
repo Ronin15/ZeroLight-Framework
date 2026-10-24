@@ -125,6 +125,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         dispatches += 1;
     }
     const settled_before_measurement = case.adaptive and suite.tunerSettled(&tuner);
+    const tuner_start = suite.TunerStart.of(&tuner, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
@@ -148,7 +149,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var stats = accumulator.finish();
     stats.output_count = item_count;
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&tuner), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&tuner, tuner_start);
     }
     return stats;
 }

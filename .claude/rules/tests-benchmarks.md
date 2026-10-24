@@ -90,7 +90,9 @@ The standard Zig layout; every change, plan, and review follows it.
   control, judged only for a worse growth order or added per-item work (a new
   scan or indirection), never for a constant gap. A tuned case whose tuners
   did not settle before measurement (`settled=no`) is rerun with more warmup,
-  never judged.
+  never judged. Exception: a one-off stage whose production tuner starts
+  fresh each run (a world, level, or store rebuild) is measured fresh, prints
+  `fresh`, and is judged.
 - Each slower case gets one verdict: noise (within spread after 3 reps),
   planned cost (work the design or a SIMD shape adds, named and reported), a
   control's gap (a path that is not production at that size; reported), or a

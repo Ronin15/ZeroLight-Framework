@@ -191,6 +191,7 @@ fn runCaseWithConfig(
         );
     }
     const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&batch.adaptive_tuner) else false;
+    const adaptive_tuner_start = suite.TunerStart.of(&batch.adaptive_tuner, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var phase_accumulator = fixtures.PhaseAccumulator(suite.RenderGamePrepPhaseSummary){};
@@ -235,7 +236,7 @@ fn runCaseWithConfig(
     stats.render_game_prep_static_groups = fixture.static_group_count;
     stats.render_game_prep_merged_tilemap_groups = last_merged_tilemap_groups;
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&batch.adaptive_tuner), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&batch.adaptive_tuner, adaptive_tuner_start);
     }
     return stats;
 }

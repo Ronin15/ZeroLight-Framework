@@ -271,7 +271,6 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.candidate_pairs = result_count;
     // Registry entries the reaction's eviction visited per second.
     stats.items_per_second = suite.itemsPerSecond(report.visited, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(last_stats.perf.remask_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
     return stats;
 }

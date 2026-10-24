@@ -239,6 +239,8 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         _ = try stageRunOnce(&system, &fixture, thread_ptr, case);
     }
     const settled_before_measurement = if (case.adaptive) stageTunersSettled(&system) else false;
+    const gather_tuner_start = suite.TunerStart.of(&system.gather_tuner, settled_before_measurement);
+    const apply_tuner_start = suite.TunerStart.of(&system.apply_tuner, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
@@ -282,8 +284,8 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         if (stats.splice_batch) |*place| place.batch_duration_ns = @intCast(place_total / iterations);
     }
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.gather_tuner), settled_before_measurement);
-        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(&system.apply_tuner), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&system.gather_tuner, gather_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(&system.apply_tuner, apply_tuner_start);
     }
     return stats;
 }

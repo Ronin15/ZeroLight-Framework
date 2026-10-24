@@ -402,6 +402,7 @@ fn runCaseImpl(
         _ = try runOnce(&system, &fixture, spatial_view, think_set, &events, &threads, case);
     }
     const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.compute_tuner) else false;
+    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     // Sensed, LOS, and found counts are the same every step; transitions occur once.
@@ -430,7 +431,7 @@ fn runCaseImpl(
     stats.neighbor_block_fills = last_stats.perf.block_fills;
     stats.splice_batch = suite.batchSummaryFromBatch(last_stats.perf.gather_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.compute_tuner), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&system.compute_tuner, compute_tuner_start);
     }
     return stats;
 }
@@ -584,6 +585,7 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         _ = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
     }
     const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.compute_tuner) else false;
+    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PerceptionStats{};
@@ -612,7 +614,7 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.candidate_pairs = last_stats.perf.candidate_checks;
     stats.neighbor_block_fills = last_stats.perf.block_fills;
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.compute_tuner), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&system.compute_tuner, compute_tuner_start);
     }
     return stats;
 }

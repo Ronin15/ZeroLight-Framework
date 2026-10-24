@@ -270,6 +270,7 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     var warm = suite.Warmup.custom(case, coldWarmup(options), coldSettleLimit(options));
     while (warm.next(suite.tunerSettled(&fixture.system.tuners.intake))) _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
     const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&fixture.system.tuners.intake) else false;
+    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -285,7 +286,7 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     var stats = accumulator.finish();
     stage_report.write(&stats.details);
     stats.output_count = last_stats.perf.unavailable_results;
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&fixture.system.tuners.intake), settled_before_measurement);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(&fixture.system.tuners.intake, intake_start);
     return stats;
 }
 
@@ -361,6 +362,7 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     var warm = suite.Warmup.custom(case, coldWarmup(options), coldSettleLimit(options));
     while (warm.next(suite.tunerSettled(&fixture.system.tuners.intake))) _ = try dig.step(io, case, &fixture, thread_ptr);
     const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&fixture.system.tuners.intake) else false;
+    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     // The update's stages and the reaction's eviction stages, each over its own span.
@@ -381,7 +383,7 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     report.write(&stats.details);
     stats.output_count = requester_count;
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(requester_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&fixture.system.tuners.intake), settled_before_measurement);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(&fixture.system.tuners.intake, intake_start);
     return stats;
 }
 
@@ -730,6 +732,7 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     var warm = suite.Warmup.custom(case, @max(1, coldWarmup(options)), coldSettleLimit(options));
     while (warm.next(suite.tunerSettled(&fixture.system.tuners.intake))) _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
     const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&fixture.system.tuners.intake) else false;
+    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var stage_report = StageReport{};
@@ -753,6 +756,6 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
         stats.candidate_pairs = burst.projections;
     }
     stats.items_per_second = suite.itemsPerSecond(config.requests, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&fixture.system.tuners.intake), settled_before_measurement);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(&fixture.system.tuners.intake, intake_start);
     return stats;
 }

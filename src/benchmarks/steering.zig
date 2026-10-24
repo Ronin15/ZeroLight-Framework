@@ -306,6 +306,7 @@ fn measureCase(
         last_stats = try step(system, context, thread_ptr, case);
     }
     const settled_before_measurement = if (case.adaptive) stageTunersSettled(system) else false;
+    const adaptive_tuner_start = suite.TunerStart.of(&system.adaptive_tuner, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
@@ -338,7 +339,7 @@ fn measureCase(
         .band_max = largestGridBand(system),
     };
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.adaptive_tuner), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&system.adaptive_tuner, adaptive_tuner_start);
     }
     return .{ .stats = stats, .last = last_stats };
 }

@@ -1606,6 +1606,7 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
         _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
     }
     const settled = if (case.adaptive) suite.tunerSettled(&system.tuners.solve) else false;
+    const solve_start = suite.TunerStart.of(&system.tuners.solve, settled);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -1627,7 +1628,7 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     stats.output_count = last_stats.perf.available_results;
     stats.candidate_pairs = abstract_nodes;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
-    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.tuners.solve), settled);
+    if (case.adaptive) stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
     return stats;
 }
 

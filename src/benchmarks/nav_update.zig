@@ -42,7 +42,6 @@ const StructuralCommand = @import("../game/data_system.zig").StructuralCommand;
 const CollisionResponseMobility = @import("../game/data_system.zig").CollisionResponseMobility;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
-const inlineBatch = @import("../app/thread_system.zig").inlineBatch;
 const SimulationEvent = @import("../game/simulation.zig").SimulationEvent;
 const TileEdit = @import("../game/systems/pathfinding/test_support.zig").TileEdit;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
@@ -253,6 +252,8 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     while (warm.next(toggleTunersSettled(&fixture.system.tuners) and toggleTunersSettled(&fixture.revert_tuners))) _ = try runToggle(&fixture, io, thread_ptr);
     const remask_settled = if (case.adaptive) suite.tunerSettled(fixture.system.tuners.nav.getPtrConst(.remask)) else false;
     const patch_settled = if (case.adaptive) suite.tunerSettled(fixture.system.tuners.nav.getPtrConst(.patch)) else false;
+    const remask_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.remask), remask_settled);
+    const patch_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.patch), patch_settled);
 
     // Throughput is over the cells edited: the footprint is capped, so a count above the cap
     // edits fewer cells.
@@ -260,7 +261,9 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var accumulator = suite.StatsAccumulator.init(edited_cells);
     for (0..options.iterations) |_| {
         const elapsed = try runToggle(&fixture, io, thread_ptr);
-        accumulator.record(elapsed / 2, inlineBatch(edited_cells, 1));
+        // The opening update's remask: the reported tuners' set (the revert half runs on
+        // the revert set).
+        accumulator.record(elapsed / 2, fixture.open_stats.perf.remask_batch);
     }
     try suite.checkStagesDispatched(case, thread_ptr, case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1), &.{ fixture.open_stats.perf.plan_batch, fixture.open_stats.perf.remask_batch, fixture.open_stats.perf.patch_batch });
     // Untimed: an update with no marks applies and remasks nothing, so it reports no stale
@@ -268,14 +271,13 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     const idle = try fixture.system.applyBufferedNavUpdates(&fixture.colliders, &fixture.world, thread_ptr);
     if (idle.incremental_rebuilds != 0 or idle.perf.remask_batch.item_count != 0) return error.NavIdleUpdateRemasked;
     var stats = accumulator.finish();
-    // The stages the opening update ran (the reported tuners' set), so a threaded row the
-    // tuner kept inline reads inline.
-    stats.batch = suite.batchSummaryFromBatch(fixture.open_stats.perf.remask_batch);
+    // The last opening update's plan and patch (the reported tuners' set), so a threaded row
+    // the tuner kept inline reads inline.
     stats.nav_plan_batch = suite.batchSummaryFromBatch(fixture.open_stats.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(fixture.open_stats.perf.patch_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.remask)), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(fixture.system.tuners.nav.getPtrConst(.patch)), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.remask), remask_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
     return stats;
 }
@@ -440,6 +442,8 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     while (warm.next(suite.tunerSettled(&nav.tuners.nav_mark) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.plan)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)))) _ = try fixture.moveAndReact(io, thread_ptr);
     const remask_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) else false;
     const patch_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)) else false;
+    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), remask_settled);
+    const patch_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.patch), patch_settled);
 
     var accumulator = suite.StatsAccumulator.init(other_statics + dynamic_bodies);
     var chunks_patched: usize = 0;
@@ -456,13 +460,12 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     stats.candidate_pairs = fixture.body_count;
     // One move per iteration.
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(last_stats.perf.remask_batch);
     stats.nav_mark_batch = suite.batchSummaryFromBatch(nav.perf.last_mark_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(nav.tuners.nav.getPtrConst(.remask)), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(nav.tuners.nav.getPtrConst(.patch)), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.remask), remask_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
     return stats;
 }
@@ -735,6 +738,8 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     while (warm.next(suite.tunerSettled(fixture.colliders().tuners.getPtrConst(.rewrite)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.plan)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)))) _ = try fixture.changeAndReact(io, thread_ptr);
     const remask_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) else false;
     const patch_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)) else false;
+    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), remask_settled);
+    const patch_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.patch), patch_settled);
 
     const change_count = fixture.layout.chunk_count * dense_changes_per_chunk;
     var accumulator = suite.StatsAccumulator.init(change_count);
@@ -759,7 +764,6 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.output_count = chunks_patched;
     stats.candidate_pairs = static_colliders_test_support.liveRowCount(fixture.colliders().*);
     stats.items_per_second = suite.itemsPerSecond(change_count, stats.mean_ns);
-    stats.batch = suite.batchSummaryFromBatch(last_stats.perf.remask_batch);
     stats.nav_plan_batch = suite.batchSummaryFromBatch(last_stats.perf.plan_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.patch_batch);
     stats.splice_batch = suite.batchSummaryFromBatch(fixture.colliders().perf.last_batches.get(.rewrite));
@@ -774,8 +778,8 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         };
     }
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(nav.tuners.nav.getPtrConst(.remask)), remask_settled);
-        stats.secondary_work_tuning = suite.workTuningSummary(suite.tunerReport(nav.tuners.nav.getPtrConst(.patch)), patch_settled);
+        stats.work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.remask), remask_tuner_start);
+        stats.secondary_work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
     return stats;
 }

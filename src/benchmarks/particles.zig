@@ -73,6 +73,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         _ = runOnce(&particles, &threads, case);
     }
     const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&particles.adaptive_tuner) else false;
+    const adaptive_tuner_start = suite.TunerStart.of(&particles.adaptive_tuner, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
@@ -91,7 +92,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var stats = accumulator.finish();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&particles.adaptive_tuner), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&particles.adaptive_tuner, adaptive_tuner_start);
     }
     return stats;
 }

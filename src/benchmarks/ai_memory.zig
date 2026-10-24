@@ -164,6 +164,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         _ = try runOnce(&system, &fixture, run, &threads, case);
     }
     const settled_before_measurement = if (case.adaptive) tunersSettled(&system) else false;
+    const decay_tuner_start = suite.TunerStart.of(&system.decay_tuner, settled_before_measurement);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = AiMemoryStats{};
@@ -193,7 +194,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     stats.query_splice_batch = suite.batchSummaryFromBatch(last_stats.perf.order_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(last_stats.perf.visible_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(suite.tunerReport(&system.decay_tuner), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(&system.decay_tuner, decay_tuner_start);
     }
     return stats;
 }
