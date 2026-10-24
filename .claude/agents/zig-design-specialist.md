@@ -4,7 +4,7 @@ description: >-
   Writes a decision-complete plan, right before implementation, for a change
   whose design is open or whose structure fails the cost model. Starts from
   the brief's files and plans the work in order: what it grows with, the
-  data, the loops, the passes and their threading, the tuners, then proof.
+  data, the loops, the passes and their threading, then proof.
   The plan opens with the chosen design, the cost model, and the file list.
   Never edits code.
 tools: Read, Grep, Glob, Bash, Write
@@ -87,23 +87,21 @@ citing where it is settled, and a step with nothing new is omitted.
    and why its count tracks the work; dispatches per step and work per
    dispatch at a small and a typical size against the gate; output capacity
    reserved on main before dispatch (§ Writes, capacity, and determinism);
-   what stays on main and the deterministic merge.
-6. **The tuners.** From step 5: a table of each pass (job, item population,
-   how often it records in play) and the tuner it gets under `threading.md`
-   § Building a stage, added and removed tuners marked. The tuner decides
-   inline or threaded and the batch count.
-7. **Budgets and capacities** (`budgets-capacities.md`): class, sizing,
+   what stays on main and the deterministic merge; and each pass's tuner,
+   planned from how often it records in play (same section), added and
+   removed tuners marked.
+6. **Budgets and capacities** (`budgets-capacities.md`): class, sizing,
    growth point, degradation path, and proofs at destruction-scale workloads.
-8. **Proof** (`tests-benchmarks.md`): fast logic tests named by behavior (a
+7. **Proof** (`tests-benchmarks.md`): fast logic tests named by behavior (a
    name without the module filter gets its own `-Dtest-filter` text); each
    claimed growth order's scaling bench group and `--grid` sizes, the tuned
    case as the verdict; stability, convergence, work-bound, and perf proofs
    as bench pass-shape asserts; a replaced structure measured first (its
    bench lands on today's code). Name each change path's cost-driver stage
    (its `runtime_perf_log` entry).
-9. **Pre-implementation check** (`engine-design.md` § Cost model, last
+8. **Pre-implementation check** (`engine-design.md` § Cost model, last
    bullet) against the live code at the design's HEAD.
-10. **Std usage** (`zig-style.md`): the `std` API each container, heap,
+9. **Std usage** (`zig-style.md`): the `std` API each container, heap,
     bitset, sort, search, hash, or parse uses (checked against the installed
     0.17 `lib/std`) or why std can't serve; hand-rolled std duplicates in the
     touched files and their replacements. **Files**: each file with estimated
@@ -115,17 +113,17 @@ citing where it is settled, and a step with nothing new is omitted.
 Run these over the finished plan; a failure goes back to the step it came
 from and is fixed there, never patched in the plan's margins.
 
-- Step 3-4: no hot loop reads through an index permutation, a pointer chase,
+- Steps 3-4: no hot loop reads through an index permutation, a pointer chase,
   or a per-row lookup into another store, keeps dense float columns that can
   take lanes scalar in a population loop, or drains lane results into
   per-item scalar calls, outside the exemptions that section names (a
   movement-column gather is not one). Inherited hot-path code is in the
   table; "same as the old loop" is not a pass. A SIMD shape slower in Debug
   stays (`build-validation.md`).
-- Step 5-6: every production dispatch runs under a tuner, no plan sets a
+- Step 5: every production dispatch runs under a tuner, no plan sets a
   batch or worker count, and a change to `ThreadSystem` or the tuner is an
   owner question.
-- Step 8: no perf or work-bound proof sits in a test.
+- Step 7: no perf or work-bound proof sits in a test.
 - A rule that blocks the design the cost model says is right: name the rule
   file and propose the edit (`engine-design.md`); never bend the design or
   the rule silently.

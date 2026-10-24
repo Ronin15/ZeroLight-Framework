@@ -57,10 +57,10 @@ Performance: find the hot path and the cause (allocation, repeated lookup,
 dispatch, logging, resource recreation, excess submissions, pacing). Check
 data shape before kernel overhead: work requesters repeat identically, run
 lengths, and a fixture or input order that changed between the sides. For
-multi-stage processors, isolate stage timing and tuner state first: what the
-tuner selected, what it learned (per-item model, learned count), and the
-stage's real cost at that selection; a tuner that learned on a different
-shape of work than it is judging is a tuner finding, not a stage defect. Check the
+multi-stage processors, isolate stage timing and tuner state first. For any
+learned or cached decision (a tuner's shape, a cache, a prediction), compare
+what it learned or predicted with the real measured cost; a decision trained
+on different work than it judges is a defect in the decider, not the stage. Check the
 MAL regression signatures (`memory-performance.md` § Dense SoA storage:
 `rows.items(.field)` in a loop, per-row `appendAssumeCapacity` in a hot
 gather) early. Measure with a targeted bench group. Attribute a Debug perf

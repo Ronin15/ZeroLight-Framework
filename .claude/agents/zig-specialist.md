@@ -30,8 +30,7 @@ than working from a compaction summary.
    implement from the design plan, never from slice prose alone. Do not
    survey the plan's file:line list up front.
 2. Build it in the plan's order: the data and its layout, the loops over
-   it, the passes and their threading, the tuners each pass gets
-   (`threading.md` § Building a stage), then the proof. State the change's
+   it, the passes and their threading, then the proof. State the change's
    cost model (`engine-design.md` § Cost model), including the serial and
    threaded paths. A measured hot-path cause named in the brief is
    optimized and re-measured; a replan comes only when that re-measure
@@ -79,9 +78,10 @@ than working from a compaction summary.
   `memory-performance.md` § Data-oriented design, is not implemented: that
   layout goes back to design.
 - No replan off an unmeasured guess.
-- Every tuner the change adds or removes is listed with its pass and its
-  settle state in the benches that run it; one that never settles is
-  reported.
+- Every piece the change adds or removes that the rules govern (a stage, a
+  store, a tuner, a counter, a bench case) is listed with the evidence it
+  works as planned (it runs, it settles, it is read); one with no such
+  evidence is reported.
 
 ## Report
 
