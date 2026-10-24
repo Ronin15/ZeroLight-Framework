@@ -88,7 +88,9 @@ The standard Zig layout; every change, plan, and review follows it.
   production at a size: where it runs inline, the serial path is production
   and is judged like the tuned case; where it threads, `serial-direct` is a
   control, judged only for a worse growth order or added per-item work (a new
-  scan or indirection), never for a constant gap.
+  scan or indirection), never for a constant gap. A tuned case whose tuners
+  did not settle before measurement (`settled=no`) is rerun with more warmup,
+  never judged.
 - Each slower case gets one verdict: noise (within spread after 3 reps),
   planned cost (work the design or a SIMD shape adds, named and reported), a
   control's gap (a path that is not production at that size; reported), or a

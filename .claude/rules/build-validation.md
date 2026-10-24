@@ -39,8 +39,9 @@ Commands and options: `docs/development-workflow.md`.
   targeted ReleaseFast run of the group that asks it
   (`tools/bench_ab.py --optimize ReleaseFast`), ReleaseFast base against
   ReleaseFast tree: false sharing between worker ranges, an inlining gain, a
-  SIMD-vs-scalar tie, or a SIMD-shaped loop slower in Debug than the code it
-  replaces. That run shows the SIMD gain Debug hides; the SIMD shape stays
+  SIMD-vs-scalar tie, a SIMD-shaped loop slower in Debug than the code it
+  replaces, or a thread-policy or tuner change (measured at sizes where each
+  touched stage threads in ReleaseFast). That run shows the SIMD gain Debug hides; the SIMD shape stays
   (`memory-performance.md` § SIMD and core math). It answers only that
   question and is never a baseline or a gate. Modes compare only with
   themselves (Debug against Debug, ReleaseFast against ReleaseFast). Any

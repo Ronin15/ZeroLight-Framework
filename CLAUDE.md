@@ -60,7 +60,10 @@ orchestrates, verifies every agent claim against live code, and reports.
   of separate landings may run together. Every real finding is reported and
   checked against live code and `docs/architecture.md`; one with a stated
   local fix goes to `zig-specialist`, one whose fix is an open choice to
-  design. A finding not fixed in its landing becomes a checklist item in the
+  design. A High structural data-layout finding in new code (a per-row
+  lookup into another store, work not grouped by its unit) is fixed in its
+  landing, never routed to a slice. A finding not fixed in its landing
+  becomes a checklist item in the
   owning slice with its `file:line`, failure scenario, and pass condition,
   never only a memory note.
 - `zig-debug-specialist` for failures.
