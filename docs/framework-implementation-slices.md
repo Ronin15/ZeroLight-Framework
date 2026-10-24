@@ -212,6 +212,7 @@ the [archive](framework-implementation-slices-archive.md).
 | [**86**](roadmap/slices/slice-86.md) | Not started | Collision Subsystem Pass — after 83, 84 |
 | [**87**](roadmap/slices/slice-87.md) | Not started | Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items |
 | [**88**](roadmap/slices/slice-88.md) | Not started | DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 |
+| [**89**](roadmap/slices/slice-89.md) | Not started | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after 88 |
 
 **Recently settled (archive only):** 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
@@ -284,7 +285,8 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    [87](roadmap/slices/slice-87.md) render prep →
    [88](roadmap/slices/slice-88.md) DataSystem, contracts, pipeline, kernels →
    inert rows (86's and 75's items) → [75](roadmap/slices/slice-75.md)'s tier mechanics; 87's render
-   backend pass closes the branch (owner 2026-10-16). Items the 64G combined
+   backend pass closes the branch (owner 2026-10-16); then
+   [89](roadmap/slices/slice-89.md) (batch-tuner and world-gate follow-ups, owner 2026-10-23). Items the 64G combined
    review routed here (refs at `e2b9b2c`):
    - Tile gate on main (area D H1): 35.
    - Halo agents sorted twice (M1): 84, then 85.
