@@ -17,16 +17,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
-const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../app/thread_system.zig").Dispatch;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const RangeSlots = @import("../../app/thread_system.zig").RangeSlots;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
+const StageShape = @import("../../app/thread_system.zig").StageShape;
 const StageThreads = @import("../../app/thread_system.zig").StageThreads;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
+const rangeForIndex = @import("../../app/thread_system.zig").rangeForIndex;
 const rebuild_tuner_config = @import("../../app/thread_system.zig").rebuild_tuner_config;
 const setRowCount = @import("../../app/thread_system.zig").setRowCount;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
@@ -300,19 +302,38 @@ const sentinel_entry = EntryRow{
 
 // One fill range's copies past each body's second strip: written unplaced to `raw` while it
 // has room, then placed by band into `placed`. Past `raw`'s capacity the range counts on in
-// `required` and the fill replays after the main thread grows both. Never reserved: only
-// bodies taller than a strip spill.
+// `required` and the fill replays after the main thread grows both. Prepared at bound 0:
+// only bodies taller than a strip spill.
 const SpillCopies = struct {
+    pub const Context = void;
+    pub const max_passes = 2;
+
     raw: std.ArrayList(SortEntry) = .empty,
     placed: std.ArrayList(SortEntry) = .empty,
     required: usize = 0,
     offsets: BandOffsets = .{},
 
-    fn clearRetainingCapacity(self: *SpillCopies) void {
+    pub fn reserve(self: *SpillCopies, allocator: std.mem.Allocator, records: usize, _: void) error{OutOfMemory}!bool {
+        if (self.raw.capacity >= records) return false;
+        try self.ensure(allocator, records);
+        return true;
+    }
+
+    pub fn clear(self: *SpillCopies) void {
         self.raw.clearRetainingCapacity();
         self.placed.clearRetainingCapacity();
         self.required = 0;
         self.offsets = .{};
+    }
+
+    pub fn grow(self: *SpillCopies, allocator: std.mem.Allocator, _: void) error{OutOfMemory}!bool {
+        if (!self.overflowed()) return false;
+        try self.ensure(allocator, self.required);
+        return true;
+    }
+
+    pub fn held(self: *const SpillCopies) usize {
+        return self.raw.capacity;
     }
 
     fn append(self: *SpillCopies, entry: SortEntry) void {
@@ -325,12 +346,12 @@ const SpillCopies = struct {
     }
 
     // Both lists hold at least `capacity` copies, grown geometrically.
-    fn grow(self: *SpillCopies, allocator: std.mem.Allocator, capacity: usize) !void {
+    fn ensure(self: *SpillCopies, allocator: std.mem.Allocator, capacity: usize) error{OutOfMemory}!void {
         try self.raw.ensureTotalCapacity(allocator, capacity);
         try self.placed.ensureTotalCapacityPrecise(allocator, self.raw.capacity);
     }
 
-    fn deinit(self: *SpillCopies, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *SpillCopies, allocator: std.mem.Allocator) void {
         self.placed.deinit(allocator);
         self.raw.deinit(allocator);
         self.* = undefined;
@@ -385,14 +406,12 @@ pub const CollisionStats = struct {
     /// refresh on a step whose allow epoch did not move, the emission count pass on a step
     /// that emits every stored pair.
     pub const Perf = if (runtime_perf_log.enabled) struct {
-        /// This reserved step outgrew the pair bound, so a main-thread grow path ran: the
-        /// candidate pairs exceeded `CollisionSystem.reserved_pair_bound`, a broadphase
-        /// range held more than `broadphase_pairs_per_item` pairs per entry its slot was
-        /// reserved for (the slot grew and the broadphase replayed), a static query range
-        /// outgrew its pair or hit rows (the slot grew and the query replayed), or the
-        /// stored and dynamic contacts exceeded the contact bound (the pair bound plus
-        /// `CollisionSystem.reserved_trigger_bound`; the contact stream grew). Set
-        /// once per step, with one `CollisionSystem.perf.pair_bound_overflows` count.
+        /// This reserved step outgrew a total bound, so a main-thread grow path ran: the
+        /// candidate pairs or the static pairs exceeded `CollisionSystem.reserved_pair_bound`,
+        /// or the stored and dynamic contacts exceeded the contact bound (the pair bound plus
+        /// `CollisionSystem.reserved_trigger_bound`; the contact stream grew). A range slot
+        /// that grew inside those bounds counts only in its set. Set once per step, with one
+        /// `CollisionSystem.perf.pair_bound_overflows` count.
         pair_bound_exceeded: bool = false,
         broadphase_visits: usize = 0,
         broadphase_batch: BatchStats = .{},
@@ -415,15 +434,34 @@ const CandidatePair = struct {
     b: u32,
 };
 
+// One broadphase range's candidate pairs. Past `pairs`' capacity the range counts on in
+// `required_capacity`, and one grow sizes the replay.
 const BroadphaseRangeBuffer = struct {
+    pub const Context = void;
+    pub const max_passes = 2;
+
     pairs: std.ArrayList(CandidatePair) = .empty,
     required_capacity: usize = 0,
     perf: SweepPerf = .{},
 
-    fn clearRetainingCapacity(self: *BroadphaseRangeBuffer) void {
+    pub fn reserve(self: *BroadphaseRangeBuffer, allocator: std.mem.Allocator, records: usize, _: void) error{OutOfMemory}!bool {
+        return reserveRecords(CandidatePair, &self.pairs, allocator, records);
+    }
+
+    pub fn clear(self: *BroadphaseRangeBuffer) void {
         self.pairs.clearRetainingCapacity();
         self.required_capacity = 0;
         self.perf = .{};
+    }
+
+    pub fn grow(self: *BroadphaseRangeBuffer, allocator: std.mem.Allocator, _: void) error{OutOfMemory}!bool {
+        if (!self.overflowed()) return false;
+        try self.pairs.ensureTotalCapacity(allocator, self.required_capacity);
+        return true;
+    }
+
+    pub fn held(self: *const BroadphaseRangeBuffer) usize {
+        return self.pairs.capacity;
     }
 
     fn appendCandidateAssumeCapacity(self: *BroadphaseRangeBuffer, pair: CandidatePair) void {
@@ -437,20 +475,11 @@ const BroadphaseRangeBuffer = struct {
         return self.required_capacity > self.pairs.capacity;
     }
 
-    fn deinit(self: *BroadphaseRangeBuffer, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *BroadphaseRangeBuffer, allocator: std.mem.Allocator) void {
         self.pairs.deinit(allocator);
         self.* = undefined;
     }
 };
-
-const BroadphaseRangeSlot = struct {
-    // Each worker writes only its assigned slot. Padding keeps hot append state
-    // from sharing cache lines across concurrently written range records.
-    buffer: BroadphaseRangeBuffer = .{},
-    padding: [paddingForCacheLine(BroadphaseRangeBuffer)]u8 = @splat(0),
-};
-
-const BroadphaseRangeSlotList = std.array_list.Aligned(BroadphaseRangeSlot, .fromByteUnits(thread_shared_record_alignment));
 
 const KeyedContact = struct {
     key: u256,
@@ -467,14 +496,12 @@ const ContactStagingList = std.array_list.Aligned(CollisionContact, .fromByteUni
 const NarrowphaseKeyList = std.array_list.Aligned(u256, .fromByteUnits(thread_shared_record_alignment));
 
 /// One narrowphase range's contact count, written once by the range's job.
-const ContactCountTally = struct {
-    // Padding keeps concurrently written tallies off shared cache lines.
+const NarrowphaseTally = struct {
     count: usize = 0,
-    padding: [paddingForCacheLine(usize)]u8 = @splat(0),
 };
 
 comptime {
-    std.debug.assert(@sizeOf(ContactCountTally) % thread_shared_record_alignment == 0);
+    std.debug.assert(@sizeOf(PaddedSlot(NarrowphaseTally)) % thread_shared_record_alignment == 0);
     std.debug.assert(@sizeOf(PaddedSlot(SpillCopies)) % thread_shared_record_alignment == 0);
     // One narrowphase range starts on a cache line when the previous one does.
     std.debug.assert(collision_range_alignment_items * @sizeOf(CollisionContact) % thread_shared_record_alignment == 0);
@@ -482,8 +509,6 @@ comptime {
     std.debug.assert(@sizeOf(PaddedSlot(TriggerQuerySlot)) % thread_shared_record_alignment == 0);
     std.debug.assert(@sizeOf(PaddedSlot(EmitRange)) % thread_shared_record_alignment == 0);
 }
-
-const ContactCountTallyList = std.array_list.Aligned(ContactCountTally, .fromByteUnits(thread_shared_record_alignment));
 
 const HitRow = struct {
     entity: u32,
@@ -536,6 +561,9 @@ fn ensureHitRows(hits: *std.MultiArrayList(HitRow), allocator: std.mem.Allocator
 // A range's static query output. `pairs` accumulates over the range's queries; `hits` is
 // one query's scratch, so it is sized to the largest single query, not the range's pairs.
 const StaticPairBuffer = struct {
+    pub const Context = *StaticSlotSizing;
+    pub const max_passes = 2;
+
     pairs: std.ArrayList(KeyedContact) = .empty,
     hits: std.MultiArrayList(HitRow) = .{},
     // The pair count the range needed past `pairs.capacity`; 0 when it fit.
@@ -550,7 +578,52 @@ const StaticPairBuffer = struct {
     ids: std.ArrayList(u32) = .empty,
     ids_required: usize = 0,
 
-    fn clear(self: *StaticPairBuffer) void {
+    // Pairs and Debug ids for `records`; one query's hit rows: `reserved_query_hits` up to
+    // the pairs, or the widest query any slot of the set grew to.
+    pub fn reserve(self: *StaticPairBuffer, allocator: std.mem.Allocator, records: usize, sizing: *StaticSlotSizing) error{OutOfMemory}!bool {
+        var grew = try reserveRecords(KeyedContact, &self.pairs, allocator, records);
+        const hit_rows = @max(@min(records, reserved_query_hits), sizing.hit_rows);
+        if (self.hits.len < hit_rows) {
+            grew = grew or self.hits.capacity < hit_rows;
+            try ensureHitRows(&self.hits, allocator, hit_rows);
+        }
+        // Same bound as the pairs: the range's walks read ids across all its queries.
+        if (comptime builtin.mode == .debug) grew = try reserveRecords(u32, &self.ids, allocator, records) or grew;
+        return grew;
+    }
+
+    // Grows what the last pass outgrew, before its replay: hit rows geometrically past the
+    // largest query, pairs and Debug ids past the range's need. Merges the need into `sizing`.
+    pub fn grow(self: *StaticPairBuffer, allocator: std.mem.Allocator, sizing: *StaticSlotSizing) error{OutOfMemory}!bool {
+        var growth = StaticSlotGrowth{};
+        if (self.hits_required > self.hits.len) {
+            // std's growth past the need, so a query that widens a little does not grow
+            // and replay again.
+            try ensureHitRows(&self.hits, allocator, std.MultiArrayList(HitRow).growCapacity(self.hits_required));
+            sizing.hit_rows = @max(sizing.hit_rows, self.hits.len);
+            growth.hits = self.hits_required;
+        }
+        if (self.required > self.pairs.capacity) {
+            try self.pairs.ensureTotalCapacity(allocator, self.required);
+            growth.pairs = self.required;
+        }
+        if (comptime builtin.mode == .debug) {
+            if (self.ids_required > self.ids.capacity) {
+                // Geometric, not the exact id count: the next step's walk can read one
+                // more row without another allocation.
+                try self.ids.ensureTotalCapacity(allocator, self.ids_required);
+                growth.ids = self.ids_required;
+            }
+        }
+        sizing.growth = sizing.growth.merge(growth);
+        return growth.grew();
+    }
+
+    pub fn held(self: *const StaticPairBuffer) usize {
+        return self.pairs.capacity;
+    }
+
+    pub fn clear(self: *StaticPairBuffer) void {
         self.pairs.clearRetainingCapacity();
         self.required = 0;
         self.hits_required = 0;
@@ -562,7 +635,7 @@ const StaticPairBuffer = struct {
         }
     }
 
-    fn deinit(self: *StaticPairBuffer, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *StaticPairBuffer, allocator: std.mem.Allocator) void {
         self.pairs.deinit(allocator);
         self.hits.deinit(allocator);
         self.ids.deinit(allocator);
@@ -599,6 +672,14 @@ const StaticSlotGrowth = struct {
     }
 };
 
+// The static query set's sizing: the widest single query's hit rows any slot grew to, which
+// every prepared slot then holds, so a retune that moves that query to another range does
+// not replay; and the largest need one run's grows showed.
+const StaticSlotSizing = struct {
+    hit_rows: usize = 0,
+    growth: StaticSlotGrowth = .{},
+};
+
 /// Hit rows `reserve` gives each static query slot: one query's overlaps, up to the pairs
 /// one alignment window of items is reserved for, and never more than the slot's pairs. A
 /// query with more overlaps grows its slot's rows geometrically past that count on the
@@ -613,10 +694,16 @@ const trigger_records_per_item: usize = broadphase_pairs_per_item;
 // rebuild).
 const TriggerQueryMode = enum { patch, rebuild };
 
+// Collision's range slot sets, by the stage each serves.
+const SlotSet = enum { spill, broadphase, static_query, trigger_patch, trigger_rebuild };
+
 // One trigger query range's edits in item order, and one query's hits and kernel contacts.
-// Grow-only across patches, so each slot keeps its lists' capacity; a rebuild frees what
-// only its query reserved (`releaseRebuildQuerySlots`).
+// A query past its hit rows counts its hits but not its records, so a run takes up to three
+// passes: the replay counts the records the grown rows let it reach.
 const TriggerQuerySlot = struct {
+    pub const Context = TriggerQueryMode;
+    pub const max_passes = 3;
+
     hits: std.MultiArrayList(HitRow) = .{},
     contacts: std.ArrayList(KeyedContact) = .empty,
     inserts: std.ArrayList(InsertEdit) = .empty,
@@ -632,7 +719,40 @@ const TriggerQuerySlot = struct {
     // its needs, so one grow sizes it for the replay.
     overflowed: bool = false,
 
-    fn clear(self: *TriggerQuerySlot) void {
+    // `records` edit records (a rebuild locates and drops nothing) and one query's hit rows
+    // with their kernel contacts.
+    pub fn reserve(self: *TriggerQuerySlot, allocator: std.mem.Allocator, records: usize, mode: TriggerQueryMode) error{OutOfMemory}!bool {
+        var grew = try reserveRecords(InsertEdit, &self.inserts, allocator, records);
+        if (mode == .patch) {
+            grew = try reserveRecords(PageLocation, &self.insert_pages, allocator, records) or grew;
+            grew = try reserveRecords(DropPiece, &self.drops, allocator, records) or grew;
+        }
+        if (self.hits.len < reserved_query_hits) {
+            try ensureHitRows(&self.hits, allocator, reserved_query_hits);
+            grew = true;
+        }
+        return try reserveRecords(KeyedContact, &self.contacts, allocator, self.hits.len) or grew;
+    }
+
+    // Grows what the last pass outgrew, before its replay: hit rows geometrically past the
+    // largest query (its contacts with them), and each record list past its need.
+    pub fn grow(self: *TriggerQuerySlot, allocator: std.mem.Allocator, mode: TriggerQueryMode) error{OutOfMemory}!bool {
+        var grew = false;
+        if (self.hits_required > self.hits.len) {
+            try ensureHitRows(&self.hits, allocator, std.MultiArrayList(HitRow).growCapacity(self.hits_required));
+            try self.contacts.ensureTotalCapacity(allocator, self.hits.len);
+            grew = true;
+        }
+        grew = try reserveRecords(InsertEdit, &self.inserts, allocator, self.insert_need) or grew;
+        if (mode == .patch) grew = try reserveRecords(PageLocation, &self.insert_pages, allocator, self.insert_need) or grew;
+        return try reserveRecords(DropPiece, &self.drops, allocator, self.drop_need) or grew;
+    }
+
+    pub fn held(self: *const TriggerQuerySlot) usize {
+        return self.inserts.capacity;
+    }
+
+    pub fn clear(self: *TriggerQuerySlot) void {
         self.contacts.clearRetainingCapacity();
         self.inserts.clearRetainingCapacity();
         self.insert_pages.clearRetainingCapacity();
@@ -643,7 +763,7 @@ const TriggerQuerySlot = struct {
         self.overflowed = false;
     }
 
-    fn deinit(self: *TriggerQuerySlot, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *TriggerQuerySlot, allocator: std.mem.Allocator) void {
         self.hits.deinit(allocator);
         self.contacts.deinit(allocator);
         self.inserts.deinit(allocator);
@@ -722,21 +842,22 @@ pub const CollisionSystem = struct {
     second_scratch: SortEntryList = .empty,
     second_staging: SortEntryList = .empty,
     second_offsets: SlotList(BandOffsets) = .empty,
-    // Per fill range; grow-only, so each slot keeps its lists' capacity.
-    spill_slots: SlotList(SpillCopies) = .empty,
+    // Per fill range, prepared at bound 0 from the fill's selection.
+    spill_slots: RangeSlots(SpillCopies) = .{},
     // In sweep order, then `simd.lane_count` sentinel rows.
     entries: std.MultiArrayList(EntryRow) = .{},
     // The last step's first copies' fill inputs in sweep order: slot p's input next step.
     warm_sources: std.ArrayList(u32) = .empty,
     // The input count `warm_sources` orders; 0 when the last step left no full order.
     warm_count: usize = 0,
-    broadphase_ranges: BroadphaseRangeSlotList = .empty,
+    // Per broadphase range, prepared from the broadphase's selection.
+    broadphase_slots: RangeSlots(BroadphaseRangeBuffer) = .{},
     candidate_pairs: std.ArrayList(CandidatePair) = .empty,
     narrowphase_staging: ContactStagingList = .empty,
     // Order keys for `narrowphase_staging`, same index. Written only when this step
     // merges static pairs; a dynamic-only step leaves it unused.
     narrowphase_keys: NarrowphaseKeyList = .empty,
-    narrowphase_tallies: ContactCountTallyList = .empty,
+    narrowphase_tallies: SlotList(NarrowphaseTally) = .empty,
     fill_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     sort_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     broadphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -753,7 +874,9 @@ pub const CollisionSystem = struct {
     /// The last `update`'s strips, or the ones the owner set before a step ran (the world's,
     /// for the pipeline's init build); the engine tile until either.
     strips: CollisionStrips = .default,
-    static_pair_slots: SlotList(StaticPairBuffer) = .empty,
+    // Per static query range, prepared from the query's selection.
+    static_slots: RangeSlots(StaticPairBuffer) = .{},
+    static_sizing: StaticSlotSizing = .{},
     static_pairs: std.ArrayList(KeyedContact) = .empty,
     // Debug distinct entity indices, the compare's scratch (one row per distinct id, each
     // range writing its own window), and its per-range flags. ReleaseFast does not touch them.
@@ -770,9 +893,11 @@ pub const CollisionSystem = struct {
     trigger_store: TriggerStore,
     // The strips the stored keys were built with.
     trigger_strips: CollisionStrips = .default,
-    // Per trigger query range; never reset through `setSlotCount`, so a slot keeps its
-    // lists. Patches only grow them; a rebuild trims them to the patches' slots.
-    trigger_query_slots: SlotList(TriggerQuerySlot) = .empty,
+    // Per trigger query range, one set per pass, each prepared from its own selection. The
+    // rebuild's is released after each successful store rebuild.
+    trigger_patch_slots: RangeSlots(TriggerQuerySlot) = .{},
+    trigger_rebuild_slots: RangeSlots(TriggerQuerySlot) = .{},
+    // One per query range: grow-only headers.
     trigger_edit_sources: std.ArrayList(EditSource) = .empty,
     emit_ranges: SlotList(EmitRange) = .empty,
     // By entity index: the `change_generation` that last stamped it as changed.
@@ -790,33 +915,29 @@ pub const CollisionSystem = struct {
     /// covers is `reserved_pair_bound +| reserved_trigger_bound`.
     reserved_trigger_bound: usize = 0,
     pair_bound_warned: bool = false,
-    static_slot_warned: bool = false,
     entry_bound_warned: bool = false,
     contact_bound_warned: bool = false,
-    trigger_slot_growth_logged: bool = false,
+    // The range slot sets whose first growth has logged.
+    slot_growth_logged: std.EnumSet(SlotSet) = .empty,
     perf: Perf = .{},
 
     /// Telemetry, kept only with `runtime_perf_log.enabled`. Every grow path it counts runs on
     /// the main thread between batches; the contacts are identical either way, and each
-    /// logs once.
+    /// logs once. Range slot growth inside the total bounds is counted by its set
+    /// (`RangeSlots.prepare_grows` and `replays`), never here.
     pub const Perf = if (runtime_perf_log.enabled) struct {
-        /// Reserved steps that outgrew the pair bound (perf metric
+        /// Reserved steps that outgrew a total bound (perf metric
         /// `collision_pair_bound_exceeded`), counted once per step. Either the candidate
         /// pairs exceeded `reserved_pair_bound`, so the merged candidates, the narrowphase
         /// staging, the contact stream and the response reserves (all sized to that bound
-        /// under the pipeline) grew, or a range's pairs outgrew its broadphase slot, so the
-        /// slot grew and the broadphase replayed, or a static query range outgrew its slot,
-        /// so the slot grew and the query replayed, or the stored and dynamic contacts
-        /// exceeded the contact bound (`reserved_pair_bound +| reserved_trigger_bound`), so
-        /// the contact stream and its emission ranges grew.
+        /// under the pipeline) grew, or the static pairs did, so `static_pairs` grew, or the
+        /// stored and dynamic contacts exceeded the contact bound
+        /// (`reserved_pair_bound +| reserved_trigger_bound`), so the contact stream and its
+        /// emission ranges grew.
         pair_bound_overflows: u64 = 0,
         /// Reserved steps whose entries exceeded `reserved_entry_bound` (the keys and entries
-        /// grew the first time) or whose fill spilled past a range's spill slot (the slot
-        /// grew and the fill replayed), counted once per step.
+        /// grew the first time), counted once per step.
         entry_bound_overflows: u64 = 0,
-        /// Trigger queries whose range slots grew, before the query or for its replay,
-        /// counted once per query.
-        trigger_slot_grows: u64 = 0,
         /// The last patch query's batch shape; `resetSeamBatches` clears it at seam entry and
         /// every rebuild clears it, so after a seam that did nothing or any rebuild it holds
         /// none.
@@ -833,8 +954,8 @@ pub const CollisionSystem = struct {
         self.change_mark.deinit(self.allocator);
         self.emit_ranges.deinit(self.allocator);
         self.trigger_edit_sources.deinit(self.allocator);
-        for (self.trigger_query_slots.items) |*slot| slot.value.deinit(self.allocator);
-        self.trigger_query_slots.deinit(self.allocator);
+        self.trigger_rebuild_slots.deinit(self.allocator);
+        self.trigger_patch_slots.deinit(self.allocator);
         self.trigger_store.deinit();
         self.sort_offsets.deinit(self.allocator);
         self.sort_staging.deinit(self.allocator);
@@ -844,17 +965,14 @@ pub const CollisionSystem = struct {
         self.rect_stamp.deinit(self.allocator);
         self.rect_scratch.deinit(self.allocator);
         self.rect_moved.deinit(self.allocator);
-        for (self.static_pair_slots.items) |*slot| slot.value.deinit(self.allocator);
-        self.static_pair_slots.deinit(self.allocator);
+        self.static_slots.deinit(self.allocator);
         self.narrowphase_tallies.deinit(self.allocator);
         self.narrowphase_keys.deinit(self.allocator);
         self.narrowphase_staging.deinit(self.allocator);
         self.candidate_pairs.deinit(self.allocator);
-        for (self.broadphase_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
-        self.broadphase_ranges.deinit(self.allocator);
+        self.broadphase_slots.deinit(self.allocator);
         self.warm_sources.deinit(self.allocator);
         self.entries.deinit(self.allocator);
-        for (self.spill_slots.items) |*slot| slot.value.deinit(self.allocator);
         self.spill_slots.deinit(self.allocator);
         self.second_offsets.deinit(self.allocator);
         self.second_staging.deinit(self.allocator);
@@ -868,24 +986,24 @@ pub const CollisionSystem = struct {
         self.* = undefined;
     }
 
-    /// Pre-sizes every step buffer for `body_capacity` bodies, so an inline or threaded
-    /// step is allocation-free from the first step under every partition the tuners can
-    /// pick. Grow-only; re-run by the pipeline's population seam.
+    /// Pre-sizes every step buffer for `body_capacity` bodies. Grow-only; re-run by the
+    /// pipeline's population seam. Window outputs and per-range records cover every
+    /// partition the tuners can pick; data-dependent range slots (broadphase pairs, static
+    /// query pairs) follow each dispatch's selection, prepared before it, and the seam
+    /// warms only the inline slot, so a serial or single-range step is allocation-free from
+    /// the first step and a threaded step at a shape it has run.
     ///
     /// A body's first and second copies write their slot's own windows, so the fill
-    /// reserves O(bodies); copies past a second strip spill to unreserved per-range slots.
-    /// Broadphase pairs are data-dependent and keep per-range slots sized for the most
-    /// entries range r of any partition covers (`@divCeil(entries, r + 1)`, r full ranges
-    /// precede it), never clamped to the total: `broadphase_pairs_per_item` pairs per entry
-    /// for every `r < maxRangeCount`. The keys, the merge buffer, and the entries hold
-    /// `entries_per_body` per body;
-    /// the merged candidates, the narrowphase staging (at most one contact per candidate
-    /// pair, one window per range), and its tallies hold the pair bound over the body
-    /// capacity (`broadphasePairBound`). Static query slots hold the same per-range pair
-    /// bound, and one query's hit rows (`reserved_query_hits`, at most the slot's pairs).
-    /// The stored-trigger emission's range records cover the contact bound's ranges (the
-    /// pair bound plus `reserved_trigger_bound`). A denser or taller scene, in total or
-    /// inside one range, takes the counted grow paths (`Perf`).
+    /// reserves O(bodies); copies past a second strip spill to per-range slots. The keys,
+    /// the merge buffer, and the entries hold `entries_per_body` per body; the merged
+    /// candidates, the narrowphase staging (at most one contact per candidate pair, one
+    /// window per range), and its tallies hold the pair bound over the body capacity
+    /// (`broadphasePairBound`). The inline broadphase and static query slots hold that
+    /// bound over the entries and the bodies, and the static slot one query's hit rows
+    /// (`reserved_query_hits`). The stored-trigger emission's range records cover the
+    /// contact bound's ranges (the pair bound plus `reserved_trigger_bound`). A denser or
+    /// taller scene takes the counted grow paths: past a total bound `Perf`'s, inside one
+    /// range its slot set's.
     pub fn reserve(self: *CollisionSystem, body_capacity: usize) !void {
         if (body_capacity == 0) return;
         // The u32 slots, sources, and pair indices are exhausted only past maxInt(u32)
@@ -905,28 +1023,14 @@ pub const CollisionSystem = struct {
         const fill_range_count = maxRangeCount(body_capacity, collision_range_alignment_items);
         try self.first_offsets.ensureTotalCapacity(self.allocator, fill_range_count);
         try self.second_offsets.ensureTotalCapacity(self.allocator, fill_range_count);
-        try self.prepareSpillSlots(fill_range_count);
+        _ = try self.spill_slots.prepare(self.allocator, StageShape.select(null, body_capacity, collision_range_alignment_items), body_capacity, 0, {});
         try self.candidate_pairs.ensureTotalCapacity(self.allocator, pair_capacity);
-        const broadphase_range_count = maxRangeCount(entry_capacity, collision_range_alignment_items);
-        try self.prepareBroadphaseRangeBuffers(broadphase_range_count);
-        for (self.broadphase_ranges.items[0..broadphase_range_count], 0..) |*slot, range_index| {
-            // Precise: the bound is exact, so no geometric slack per slot.
-            try slot.buffer.pairs.ensureTotalCapacityPrecise(self.allocator, broadphasePairBound(@divCeil(entry_capacity, range_index + 1)));
-        }
+        // The inline shape: every no-worker step's, and every fresh tuner's first.
+        _ = try self.broadphase_slots.prepare(self.allocator, StageShape.select(null, entry_capacity, collision_range_alignment_items), entry_capacity, broadphase_pairs_per_item, {});
         try self.narrowphase_staging.ensureTotalCapacityPrecise(self.allocator, pair_capacity);
         try self.narrowphase_keys.ensureTotalCapacityPrecise(self.allocator, pair_capacity);
         try self.narrowphase_tallies.ensureTotalCapacityPrecise(self.allocator, maxRangeCount(pair_capacity, collision_range_alignment_items));
-        const static_ranges = maxRangeCount(body_capacity, collision_range_alignment_items);
-        try self.prepareStaticPairSlots(static_ranges);
-        for (self.static_pair_slots.items[0..static_ranges], 0..) |*slot, range_index| {
-            const bound = broadphasePairBound(@divCeil(body_capacity, range_index + 1));
-            try slot.value.pairs.ensureTotalCapacityPrecise(self.allocator, bound);
-            // One query's scratch: the slot's rows stay O(1), so all slots are O(bodies).
-            const hit_rows = @min(bound, reserved_query_hits);
-            if (slot.value.hits.len < hit_rows) try ensureHitRows(&slot.value.hits, self.allocator, hit_rows);
-            // Same bound as the pairs: the range's walks read ids across all its queries.
-            if (comptime builtin.mode == .debug) try slot.value.ids.ensureTotalCapacityPrecise(self.allocator, bound);
-        }
+        _ = try self.static_slots.prepare(self.allocator, StageShape.select(null, body_capacity, collision_range_alignment_items), body_capacity, broadphase_pairs_per_item, &self.static_sizing);
         try self.static_pairs.ensureTotalCapacity(self.allocator, pair_capacity);
         try self.ordered.ensureTotalCapacity(self.allocator, pair_capacity);
         try self.sort_staging.ensureTotalCapacity(self.allocator, pair_capacity);
@@ -1026,9 +1130,9 @@ pub const CollisionSystem = struct {
         var narrow_ran = false;
         if (sweep) {
             const broadphase_stage = threads.stage(&self.broadphase_tuner);
-            const broadphase_selection = broadphase_stage.select(stats.entry_count, collision_range_alignment_items);
-            const broadphase = try self.buildBroadphaseCandidatesThreaded(thread_system, broadphase_selection, stats.entry_count);
-            if (broadphase_selection.active_tuner) |tuner| tuner.record(broadphase.batch);
+            const broadphase_shape = StageShape.select(broadphase_stage, stats.entry_count, collision_range_alignment_items);
+            const broadphase = try self.buildBroadphaseCandidates(broadphase_stage, broadphase_shape, stats.entry_count);
+            if (broadphase_shape.selection.?.active_tuner) |tuner| tuner.record(broadphase.batch);
             if (comptime runtime_perf_log.enabled) {
                 stats.perf.broadphase_batch = broadphase.batch;
                 stats.broadphase_simd_groups = broadphase.perf.simd_groups;
@@ -1036,7 +1140,7 @@ pub const CollisionSystem = struct {
             }
             const candidate_pair_count = self.candidate_pairs.items.len;
             stats.candidate_pair_count = candidate_pair_count;
-            self.countPairBoundOverflow(&stats, candidate_pair_count, broadphase.grew);
+            self.countPairBoundOverflow(&stats, "candidate pairs", candidate_pair_count);
             if (candidate_pair_count != 0) {
                 const narrowphase_stage = threads.stage(&self.narrowphase_tuner);
                 const narrowphase_selection = narrowphase_stage.select(candidate_pair_count, collision_range_alignment_items);
@@ -1131,14 +1235,14 @@ pub const CollisionSystem = struct {
         const fill = self.fillContext(data, scope_dense_indices, strips, input_count);
 
         const fill_stage = threads.stage(&self.fill_tuner);
-        const fill_selection = fill_stage.select(input_count, collision_range_alignment_items);
-        const range_count = fill_selection.range_count;
+        const fill_shape = StageShape.select(fill_stage, input_count, collision_range_alignment_items);
+        const range_count = fill_shape.range_count;
         try self.first_offsets.ensureTotalCapacity(self.allocator, range_count);
         setSlotCount(BandOffsets, &self.first_offsets, range_count);
         try self.second_offsets.ensureTotalCapacity(self.allocator, range_count);
         setSlotCount(BandOffsets, &self.second_offsets, range_count);
-        try self.prepareSpillSlots(range_count);
-        const spill_slots = self.spill_slots.items[0..range_count];
+        const spill_grew = try self.spill_slots.prepare(self.allocator, fill_shape, input_count, 0, {});
+        const spill_slots = self.spill_slots.slots();
         var fill_job = FillJob{
             .fill = fill,
             .splitters = chooseSplitters(&fill, input_count),
@@ -1146,29 +1250,17 @@ pub const CollisionSystem = struct {
             .staging = self.staging.items[0..input_count],
             .second_scratch = self.second_scratch.items[0..input_count],
             .second_staging = self.second_staging.items[0..input_count],
-            .items_per_range = fill_selection.items_per_range,
+            .items_per_range = fill_shape.items_per_range,
             .first_offsets = self.first_offsets.items,
             .second_offsets = self.second_offsets.items,
             .spill_slots = spill_slots,
         };
-        var fill_grew = false;
-        while (true) {
-            for (spill_slots) |*slot| slot.value.clearRetainingCapacity();
-            const batch = threads.thread_system.parallelForWithOptions(input_count, &fill_job, fillJob, .{
-                .max_worker_threads = fill_selection.worker_threads,
-                .range_alignment_items = collision_range_alignment_items,
-                .selected_profile = fill_selection.profile,
-            });
-            // Fill jobs do not allocate: a range past its spill slot grows here and the fill
-            // replays. Only the final batch reaches the tuner.
-            if (try self.growSpillSlotsIfNeeded(spill_slots)) {
-                fill_grew = true;
-                continue;
-            }
-            if (fill_selection.active_tuner) |tuner| tuner.record(batch);
-            if (comptime runtime_perf_log.enabled) stats.perf.fill_batch = batch;
-            break;
-        }
+        // Fill jobs do not allocate: a range past its spill slot grows and the fill replays.
+        // Only the final batch reaches the tuner.
+        const fill_replay = try self.spill_slots.run(self.allocator, fill_stage, fill_shape, input_count, collision_range_alignment_items, {}, &fill_job, fillJob);
+        if (fill_shape.selection.?.active_tuner) |tuner| tuner.record(fill_replay.batch);
+        if (comptime runtime_perf_log.enabled) stats.perf.fill_batch = fill_replay.batch;
+        if (spill_grew or fill_replay.replayed) self.noteSlotGrowth(.spill);
 
         const bands = bandStarts(self.first_offsets.items, self.second_offsets.items, spill_slots);
         const entry_count: usize = bands.entry_start[band_count];
@@ -1181,8 +1273,8 @@ pub const CollisionSystem = struct {
             const sort_stage = threads.stage(&self.sort_tuner);
             const sort_selection = sort_stage.select(entry_count, collision_range_alignment_items);
             var sort_job = SortJob{
-                .firsts = .{ .staging = self.staging.items, .band_offsets = self.first_offsets.items, .window_stride = fill_selection.items_per_range },
-                .seconds = .{ .staging = self.second_staging.items, .band_offsets = self.second_offsets.items, .window_stride = fill_selection.items_per_range },
+                .firsts = .{ .staging = self.staging.items, .band_offsets = self.first_offsets.items, .window_stride = fill_shape.items_per_range },
+                .seconds = .{ .staging = self.second_staging.items, .band_offsets = self.second_offsets.items, .window_stride = fill_shape.items_per_range },
                 .spills = .{ .slots = spill_slots },
                 .bands = bands,
                 .writer = self.entryWriter(),
@@ -1192,7 +1284,7 @@ pub const CollisionSystem = struct {
             const sort_batch = sort_stage.run(sort_selection, entry_count, collision_range_alignment_items, &sort_job, sortJob);
             if (comptime runtime_perf_log.enabled) stats.perf.sort_batch = sort_batch;
         }
-        return self.finishBuild(input_count, first_count, entry_count, fill_grew, stats);
+        return self.finishBuild(input_count, first_count, entry_count, stats);
     }
 
     // Sizes the keys and entries for `entry_count` entries, writes the sentinel rows past
@@ -1212,12 +1304,12 @@ pub const CollisionSystem = struct {
     }
 
     // Records the build's counts and whether its order is warm for the next step.
-    fn finishBuild(self: *CollisionSystem, input_count: usize, first_count: usize, entry_count: usize, fill_grew: bool, stats: *CollisionStats) bool {
+    fn finishBuild(self: *CollisionSystem, input_count: usize, first_count: usize, entry_count: usize, stats: *CollisionStats) bool {
         // Every input filled: `warm_sources` is a permutation of them.
         self.warm_count = if (first_count == input_count) input_count else 0;
         stats.body_count = first_count;
         stats.entry_count = entry_count;
-        self.countEntryBoundOverflow(entry_count, fill_grew);
+        self.countEntryBoundOverflow(entry_count);
         return first_count > 1;
     }
 
@@ -1228,22 +1320,6 @@ pub const CollisionSystem = struct {
             .entries = EntryColumns.of(self.entries.slice()),
             .warm_sources = self.warm_sources.items,
         };
-    }
-
-    // Spill slot records for `range_count` ranges; their lists start empty.
-    fn prepareSpillSlots(self: *CollisionSystem, range_count: usize) !void {
-        try self.spill_slots.ensureTotalCapacity(self.allocator, range_count);
-        while (self.spill_slots.items.len < range_count) self.spill_slots.appendAssumeCapacity(.{});
-    }
-
-    fn growSpillSlotsIfNeeded(self: *CollisionSystem, slots: []PaddedSlot(SpillCopies)) !bool {
-        var grew = false;
-        for (slots) |*slot| {
-            if (!slot.value.overflowed()) continue;
-            try slot.value.grow(self.allocator, slot.value.required);
-            grew = true;
-        }
-        return grew;
     }
 
     // ---- Broadphase and narrowphase -----------------------------------------------
@@ -1260,8 +1336,7 @@ pub const CollisionSystem = struct {
             self.narrowphase_keys.items.len = candidate_pair_count;
         }
         try self.narrowphase_tallies.ensureTotalCapacity(self.allocator, range_count);
-        self.narrowphase_tallies.items.len = range_count;
-        for (self.narrowphase_tallies.items) |*slot| slot.count = 0;
+        setSlotCount(NarrowphaseTally, &self.narrowphase_tallies, range_count);
     }
 
     /// Streams each range's staging window (`count` contacts at `r * items_per_range`)
@@ -1275,15 +1350,15 @@ pub const CollisionSystem = struct {
         try contacts.prepareRangeCounts(tallies.len);
         var contact_count: usize = 0;
         for (tallies, 0..) |*slot, range_index| {
-            contacts.addCount(range_index, slot.count);
-            contact_count += slot.count;
+            contacts.addCount(range_index, slot.value.count);
+            contact_count += slot.value.count;
         }
         try contacts.prefix();
         const staging = self.narrowphase_staging.items;
         for (tallies, 0..) |*slot, range_index| {
             var writer = contacts.rangeWriter(range_index);
             const window_start = range_index * items_per_range;
-            for (staging[window_start..][0..slot.count]) |contact| {
+            for (staging[window_start..][0..slot.value.count]) |contact| {
                 writer.write(contact);
             }
             writer.finish();
@@ -1292,43 +1367,9 @@ pub const CollisionSystem = struct {
         return contact_count;
     }
 
-    fn prepareBroadphaseRangeBuffers(self: *CollisionSystem, range_count: usize) !void {
-        try self.broadphase_ranges.ensureTotalCapacity(self.allocator, range_count);
-        while (self.broadphase_ranges.items.len < range_count) {
-            self.broadphase_ranges.appendAssumeCapacity(.{});
-        }
-    }
-
-    /// Warms any slot `reserve` did not size (an unreserved system, or more entries than
-    /// the reserved capacity). Returns whether any slot allocated.
-    fn reserveInitialBroadphaseRangeCapacity(self: *CollisionSystem, selection: BatchSelection, entry_count: usize) !bool {
-        var grew = false;
-        for (self.broadphase_ranges.items[0..selection.range_count], 0..) |*slot, range_index| {
-            const buffer = &slot.buffer;
-            if (buffer.pairs.capacity != 0) continue;
-            const range_len = rangeLenForIndex(entry_count, selection.items_per_range, range_index);
-            const target_capacity = estimateBroadphasePairCapacity(entry_count, range_len);
-            try buffer.pairs.ensureTotalCapacity(self.allocator, target_capacity);
-            grew = true;
-        }
-        return grew;
-    }
-
-    /// Shared broadphase pair-capacity WARM heuristic (not a combinatorial
-    /// worst-case ceiling): `broadphase_pairs_per_item` candidate pairs per swept entry
-    /// in the range, bounded below by one SIMD lane group and above by the total entry
-    /// count. Dense/clustered scenes can exceed this; the broadphase grows the range slot
-    /// and replays. Used to pre-size an empty per-range slot, including the one range a
-    /// no-worker step sweeps, when `reserve` has not run (`reserve` sizes every slot to
-    /// the unclamped `broadphasePairBound`).
-    fn estimateBroadphasePairCapacity(entry_count: usize, range_len: usize) usize {
-        return @min(entry_count, @max(simd.lane_count, broadphasePairBound(range_len)));
-    }
-
-    /// `broadphase_pairs_per_item` pairs for each of `item_count` items (saturating): over
-    /// the most entries a range can cover, the size `reserve` gives its slot; over a whole
-    /// body capacity, the bound it sizes the merged candidates, narrowphase staging and
-    /// tallies to.
+    /// `broadphase_pairs_per_item` pairs for each of `item_count` items (saturating): over a
+    /// whole body capacity, the bound `reserve` sizes the merged candidates, narrowphase
+    /// staging and tallies to.
     fn broadphasePairBound(item_count: usize) usize {
         return std.math.mul(usize, item_count, broadphase_pairs_per_item) catch std.math.maxInt(usize);
     }
@@ -1347,14 +1388,12 @@ pub const CollisionSystem = struct {
         return broadphasePairBound(body_capacity);
     }
 
-    /// Counts, once, a reserved step that outgrew the pair bound: `candidate_pair_count`
-    /// exceeds `reserved_pair_bound`, or `broadphase_grew` (a broadphase slot grew
-    /// in-stage). Main thread, after the broadphase merge and before the narrowphase
-    /// dispatch.
-    fn countPairBoundOverflow(self: *CollisionSystem, stats: *CollisionStats, candidate_pair_count: usize, broadphase_grew: bool) void {
-        if (self.reserved_pair_bound == 0) return;
-        if (!broadphase_grew and candidate_pair_count <= self.reserved_pair_bound) return;
-        self.notePairBoundOverflow(stats, candidate_pair_count);
+    /// Counts, once, a reserved step whose `pair_count` (`what`: the candidate pairs after
+    /// the broadphase merge, or the static pairs after the static query) exceeds
+    /// `reserved_pair_bound`. Main thread.
+    fn countPairBoundOverflow(self: *CollisionSystem, stats: *CollisionStats, comptime what: []const u8, pair_count: usize) void {
+        if (self.reserved_pair_bound == 0 or pair_count <= self.reserved_pair_bound) return;
+        self.notePairBoundOverflow(stats, what, pair_count);
     }
 
     // Flags the step and counts it once, however many grow paths it took.
@@ -1365,165 +1404,99 @@ pub const CollisionSystem = struct {
         self.perf.pair_bound_overflows += 1;
     }
 
-    fn notePairBoundOverflow(self: *CollisionSystem, stats: *CollisionStats, candidate_pair_count: usize) void {
+    fn notePairBoundOverflow(self: *CollisionSystem, stats: *CollisionStats, comptime what: []const u8, pair_count: usize) void {
         @branchHint(.cold);
         self.markPairBoundExceeded(stats);
         if (self.pair_bound_warned) return;
         self.pair_bound_warned = true;
         if (comptime logging.enabled(.warn)) logging.game.warn(
-            "collision: {d} candidate pairs outgrew the reserved pair bound {d} (total or per range); collision stores or contact streams grew in-stage",
-            .{ candidate_pair_count, self.reserved_pair_bound },
+            "collision: {d} " ++ what ++ " outgrew the reserved pair bound {d}; collision stores or contact streams grew in-stage",
+            .{ pair_count, self.reserved_pair_bound },
         );
     }
 
-    // A reserved step whose static query slots grew and replayed. `growth` is the largest
-    // need of any slot, so the log names the quantity that outgrew its rows.
-    fn noteStaticSlotOverflow(self: *CollisionSystem, stats: *CollisionStats, growth: StaticSlotGrowth) void {
-        @branchHint(.cold);
-        if (self.reserved_pair_bound == 0) return;
-        self.markPairBoundExceeded(stats);
-        if (self.static_slot_warned) return;
-        self.static_slot_warned = true;
-        if (comptime logging.enabled(.warn)) logging.game.warn(
-            "collision: static query slots grew in-stage: a range needed {d} pairs, one query {d} hit rows, a range {d} walked ids (0 = within its slot)",
-            .{ growth.pairs, growth.hits, growth.ids },
-        );
+    /// Counts, once, a reserved step whose `entry_count` exceeds `reserved_entry_bound`.
+    /// Main thread, after the fill.
+    fn countEntryBoundOverflow(self: *CollisionSystem, entry_count: usize) void {
+        if (self.reserved_entry_bound == 0 or entry_count <= self.reserved_entry_bound) return;
+        self.noteEntryBoundOverflow(entry_count);
     }
 
-    /// Counts, once, a reserved step whose `entry_count` exceeds `reserved_entry_bound` or
-    /// whose fill grew a spill slot in-stage (`fill_grew`). Main thread, after the fill.
-    fn countEntryBoundOverflow(self: *CollisionSystem, entry_count: usize, fill_grew: bool) void {
-        if (self.reserved_entry_bound == 0) return;
-        if (!fill_grew and entry_count <= self.reserved_entry_bound) return;
-        self.noteEntryBoundOverflow(entry_count, fill_grew);
-    }
-
-    // A spill slot growing is the designed path for bodies past their second strip (spill
-    // slots are never reserved), so it logs at info; entries past the reserved bound warn.
-    fn noteEntryBoundOverflow(self: *CollisionSystem, entry_count: usize, fill_grew: bool) void {
+    fn noteEntryBoundOverflow(self: *CollisionSystem, entry_count: usize) void {
         @branchHint(.cold);
         if (comptime runtime_perf_log.enabled) self.perf.entry_bound_overflows += 1;
         if (self.entry_bound_warned) return;
         self.entry_bound_warned = true;
-        if (entry_count > self.reserved_entry_bound) {
-            if (comptime logging.enabled(.warn)) logging.game.warn(
-                "collision: {d} sweep entries exceeded the reserved entry bound {d}; collision stores grew in-stage",
-                .{ entry_count, self.reserved_entry_bound },
-            );
-        } else if (fill_grew) {
-            if (comptime logging.enabled(.info)) logging.game.info(
-                "collision spill slots grew for bodies past their second strip ({d} sweep entries)",
-                .{entry_count},
-            );
-        }
+        if (comptime logging.enabled(.warn)) logging.game.warn(
+            "collision: {d} sweep entries exceeded the reserved entry bound {d}; collision stores grew in-stage",
+            .{ entry_count, self.reserved_entry_bound },
+        );
     }
 
-    fn growBroadphaseRangeBuffersIfNeeded(self: *CollisionSystem, range_count: usize) !bool {
-        var grew = false;
-        for (self.broadphase_ranges.items[0..range_count]) |*slot| {
-            const buffer = &slot.buffer;
-            if (buffer.overflowed()) {
-                try buffer.pairs.ensureTotalCapacity(self.allocator, buffer.required_capacity);
-                grew = true;
-            }
-        }
-        return grew;
+    // A range slot set that allocated: prepared for a selection its slots did not hold, or
+    // grown past a range's need and replayed. The designed path for data-dependent output
+    // (its set counts it), so each set logs its first growth at info.
+    fn noteSlotGrowth(self: *CollisionSystem, set: SlotSet) void {
+        @branchHint(.cold);
+        if (!self.firstSlotGrowth(set)) return;
+        if (comptime logging.enabled(.info)) logging.game.info("collision {s} range slots grew", .{@tagName(set)});
     }
 
-    fn mergeBroadphaseRangeBuffers(self: *CollisionSystem, range_count: usize) !void {
+    // The static query's set, logged with the largest need any slot showed in the run.
+    fn noteStaticSlotGrowth(self: *CollisionSystem, growth: StaticSlotGrowth) void {
+        @branchHint(.cold);
+        if (!self.firstSlotGrowth(.static_query)) return;
+        if (comptime logging.enabled(.info)) logging.game.info(
+            "collision static_query range slots grew: a range needed {d} pairs, one query {d} hit rows, a range {d} walked ids (0 = within its slot)",
+            .{ growth.pairs, growth.hits, growth.ids },
+        );
+    }
+
+    // Whether `set`'s growth has not logged yet; marks it logged.
+    fn firstSlotGrowth(self: *CollisionSystem, set: SlotSet) bool {
+        if (self.slot_growth_logged.contains(set)) return false;
+        self.slot_growth_logged.insert(set);
+        return true;
+    }
+
+    fn mergeBroadphaseRangeBuffers(self: *CollisionSystem) !void {
         self.candidate_pairs.clearRetainingCapacity();
         var total: usize = 0;
-        for (self.broadphase_ranges.items[0..range_count]) |*slot| {
-            const buffer = &slot.buffer;
+        for (self.broadphase_slots.slots()) |*slot| {
+            const buffer = &slot.value;
             total += buffer.pairs.items.len;
         }
         try self.candidate_pairs.ensureTotalCapacity(self.allocator, total);
-        for (self.broadphase_ranges.items[0..range_count]) |*slot| {
-            const buffer = &slot.buffer;
+        for (self.broadphase_slots.slots()) |*slot| {
+            const buffer = &slot.value;
             const start = self.candidate_pairs.items.len;
             self.candidate_pairs.items.len = start + buffer.pairs.items.len;
             @memcpy(self.candidate_pairs.items[start..][0..buffer.pairs.items.len], buffer.pairs.items);
         }
     }
 
-    fn buildBroadphaseCandidatesThreaded(
-        self: *CollisionSystem,
-        thread_system: *ThreadSystem,
-        selection: BatchSelection,
-        entry_count: usize,
-    ) !BroadphaseBuildResult {
-        try self.prepareBroadphaseRangeBuffers(selection.range_count);
-        var result = BroadphaseBuildResult{
-            .grew = try self.reserveInitialBroadphaseRangeCapacity(selection, entry_count),
-        };
-
+    // The sweep over `entry_count` entries at `shape`: each range's slot prepared at
+    // `broadphase_pairs_per_item` per entry, a range past it grown and the sweep replayed,
+    // then the ranges merged in order. Only the final batch is returned, for `update` to
+    // record.
+    fn buildBroadphaseCandidates(self: *CollisionSystem, stage: Dispatch, shape: StageShape, entry_count: usize) !BroadphaseBuildResult {
+        const grew = try self.broadphase_slots.prepare(self.allocator, shape, entry_count, broadphase_pairs_per_item, {});
         var context = BroadphaseJobContext{
-            .system = self,
+            .slots = self.broadphase_slots.slots(),
             .entries = ConstEntryColumns.of(self.entries.slice()),
-            .range_count = selection.range_count,
             .entry_count = entry_count,
         };
-        while (true) {
-            for (self.broadphase_ranges.items[0..selection.range_count]) |*slot| {
-                slot.buffer.clearRetainingCapacity();
-            }
-            const batch = thread_system.parallelForWithOptions(entry_count, &context, broadphaseCandidatesJob, .{
-                .max_worker_threads = selection.worker_threads,
-                .range_alignment_items = collision_range_alignment_items,
-                .selected_profile = selection.profile,
-            });
-
-            // Broadphase jobs do not allocate. If a range overflows its warmed
-            // buffer, grow after the batch and replay the stage deterministically.
-            // Failed overflow passes are NOT recorded into broadphase_tuner —
-            // only the final successful batch is returned (and recorded by update).
-            if (try self.growBroadphaseRangeBuffersIfNeeded(selection.range_count)) {
-                result.grew = true;
-                continue;
-            }
-
-            result.batch = batch;
-            if (comptime runtime_perf_log.enabled) {
-                for (self.broadphase_ranges.items[0..selection.range_count]) |*slot| {
-                    result.perf.simd_groups += slot.buffer.perf.simd_groups;
-                    result.perf.visits += slot.buffer.perf.visits;
-                }
-            }
-            try self.mergeBroadphaseRangeBuffers(selection.range_count);
-            return result;
-        }
-    }
-
-    fn prepareStaticPairSlots(self: *CollisionSystem, range_count: usize) !void {
-        try self.static_pair_slots.ensureTotalCapacity(self.allocator, range_count);
-        while (self.static_pair_slots.items.len < range_count) self.static_pair_slots.appendAssumeCapacity(.{});
-    }
-
-    // Grows each slot the last pass outgrew, before its replay: hit rows, pairs, and Debug
-    // ids geometrically past the slot's largest query, the range's pairs, and its walked ids.
-    fn growStaticPairSlots(self: *CollisionSystem, range_count: usize) !StaticSlotGrowth {
-        var growth = StaticSlotGrowth{};
-        for (self.static_pair_slots.items[0..range_count]) |*slot| {
-            if (slot.value.hits_required > slot.value.hits.len) {
-                // std's growth past the need, so a query that widens a little does not
-                // grow and replay again. `reserve` keeps its exact rows.
-                try ensureHitRows(&slot.value.hits, self.allocator, std.MultiArrayList(HitRow).growCapacity(slot.value.hits_required));
-                growth.hits = @max(growth.hits, slot.value.hits_required);
-            }
-            if (slot.value.required > slot.value.pairs.capacity) {
-                try slot.value.pairs.ensureTotalCapacity(self.allocator, slot.value.required);
-                growth.pairs = @max(growth.pairs, slot.value.required);
-            }
-            if (comptime builtin.mode == .debug) {
-                if (slot.value.ids_required > slot.value.ids.capacity) {
-                    // Geometric, not the exact id count: the next step's walk can read
-                    // one more row without another allocation.
-                    try slot.value.ids.ensureTotalCapacity(self.allocator, slot.value.ids_required);
-                    growth.ids = @max(growth.ids, slot.value.ids_required);
-                }
+        const replay = try self.broadphase_slots.run(self.allocator, stage, shape, entry_count, collision_range_alignment_items, {}, &context, broadphaseCandidatesJob);
+        if (grew or replay.replayed) self.noteSlotGrowth(.broadphase);
+        var result = BroadphaseBuildResult{ .batch = replay.batch };
+        if (comptime runtime_perf_log.enabled) {
+            for (self.broadphase_slots.slots()) |*slot| {
+                result.perf.simd_groups += slot.value.perf.simd_groups;
+                result.perf.visits += slot.value.perf.visits;
             }
         }
-        return growth;
+        try self.mergeBroadphaseRangeBuffers();
+        return result;
     }
 
     // The trigger store brought to `view` (the seam's retry) and refreshed to the allow
@@ -1539,9 +1512,9 @@ pub const CollisionSystem = struct {
         const input_count = self.proxies.len;
         if (input_count != 0) {
             const stage = threads.stage(&self.static_pair_tuner);
-            const selection = stage.select(input_count, collision_range_alignment_items);
-            try self.prepareStaticPairSlots(selection.range_count);
-            const slots = self.static_pair_slots.items[0..selection.range_count];
+            const shape = StageShape.select(stage, input_count, collision_range_alignment_items);
+            const grew = try self.static_slots.prepare(self.allocator, shape, input_count, broadphase_pairs_per_item, &self.static_sizing);
+            const slots = self.static_slots.slots();
             var job = StaticQueryJob{
                 .data = data,
                 .view = view,
@@ -1549,36 +1522,23 @@ pub const CollisionSystem = struct {
                 .strips = self.strips,
                 .slots = slots,
                 .exclude_tiers = exclude_tiers,
-                .items_per_range = selection.items_per_range,
-                .range_count = selection.range_count,
+                .items_per_range = shape.items_per_range,
+                .range_count = shape.range_count,
                 .input_count = input_count,
             };
-            var largest = StaticSlotGrowth{};
-            var batch = BatchStats{};
-            while (true) {
-                for (slots) |*slot| slot.value.clear();
-                // An overflowing range stops writing pairs at its first query that did
-                // not fit. Record only the batch that wrote every pair, so a pass that
-                // skipped the packing does not teach the tuner the query is cheaper.
-                batch = threads.thread_system.parallelForWithOptions(input_count, &job, staticQueryJob, .{
-                    .items_per_range = threads.config.items_per_range,
-                    .max_worker_threads = threads.config.max_worker_threads,
-                    .range_alignment_items = collision_range_alignment_items,
-                    .adaptive = threads.config.adaptive,
-                    .adaptive_tuner = null,
-                    .selected_profile = selection.profile,
-                });
-                const growth = try self.growStaticPairSlots(selection.range_count);
-                if (!growth.grew()) break;
-                largest = largest.merge(growth);
-            }
-            if (selection.active_tuner) |tuner| tuner.record(batch);
-            if (largest.grew()) self.noteStaticSlotOverflow(stats, largest);
-            if (comptime runtime_perf_log.enabled) stats.perf.static_pairs_batch = batch;
-            for (slots) |*slot| {
-                try self.static_pairs.ensureTotalCapacity(self.allocator, self.static_pairs.items.len + slot.value.pairs.items.len);
-                self.static_pairs.appendSliceAssumeCapacity(slot.value.pairs.items);
-            }
+            // An overflowing range stops writing pairs at its first query that did not fit.
+            // Record only the batch that wrote every pair, so a pass that skipped the
+            // packing does not teach the tuner the query is cheaper.
+            self.static_sizing.growth = .{};
+            const replay = try self.static_slots.run(self.allocator, stage, shape, input_count, collision_range_alignment_items, &self.static_sizing, &job, staticQueryJob);
+            if (shape.selection.?.active_tuner) |tuner| tuner.record(replay.batch);
+            if (grew or replay.replayed) self.noteStaticSlotGrowth(self.static_sizing.growth);
+            if (comptime runtime_perf_log.enabled) stats.perf.static_pairs_batch = replay.batch;
+            var pair_count: usize = 0;
+            for (slots) |*slot| pair_count += slot.value.pairs.items.len;
+            self.countPairBoundOverflow(stats, "static pairs", pair_count);
+            try self.static_pairs.ensureTotalCapacity(self.allocator, pair_count);
+            for (slots) |*slot| self.static_pairs.appendSliceAssumeCapacity(slot.value.pairs.items);
             if (comptime builtin.mode == .debug) {
                 try self.compactDistinctIds(view, slots);
                 if (try self.dispatchRectCompare(data, view, threads, stats)) return true;
@@ -1674,42 +1634,25 @@ pub const CollisionSystem = struct {
         if (same and view.revision == store.seen_revision) return;
         if (same and view.revision == store.seen_revision +% 1 and view.changes.len != 0) {
             try self.markChanges(view.changes);
-            const range_count = try self.runTriggerQuery(data, view, threads, .patch);
-            try store.patch(storeThreads(threads), self.triggerEditSources(range_count, .patch), view.revision);
+            const slots = try self.runTriggerQuery(data, view, threads, .patch);
+            try store.patch(storeThreads(threads), self.triggerEditSources(slots, .patch), view.revision);
             return;
         }
-        const range_count = try self.runTriggerQuery(data, view, threads, .rebuild);
-        try store.rebuild(storeThreads(threads), self.triggerEditSources(range_count, .rebuild), view.revision, data.collision_allow_epoch);
+        const slots = try self.runTriggerQuery(data, view, threads, .rebuild);
+        try store.rebuild(storeThreads(threads), self.triggerEditSources(slots, .rebuild), view.revision, data.collision_allow_epoch);
         self.trigger_strips = self.strips;
-        self.releaseRebuildQuerySlots();
-    }
-
-    // A rebuild is a cold one-off over the row pool: frees what its query reserved past the
-    // patch query's, so the slots follow changes, not rows. A patch reserves `insert_pages`
-    // with `inserts` in every range it runs, so the slots patches used are the prefix
-    // holding pages; the rest are the rebuild's alone. Cannot fail: a shrink that cannot
-    // move keeps its capacity.
-    fn releaseRebuildQuerySlots(self: *CollisionSystem) void {
-        const slots = self.trigger_query_slots.items;
-        var patch_slots: usize = 0;
-        while (patch_slots < slots.len and slots[patch_slots].value.insert_pages.capacity != 0) patch_slots += 1;
-        for (slots[0..patch_slots]) |*padded| {
-            const slot = &padded.value;
-            if (slot.inserts.capacity > slot.insert_pages.capacity) slot.inserts.clearAndFree(self.allocator);
-        }
-        for (slots[patch_slots..]) |*padded| padded.value.deinit(self.allocator);
-        self.trigger_query_slots.shrinkAndFree(self.allocator, patch_slots);
-        const sources = &self.trigger_edit_sources;
-        sources.shrinkAndFree(self.allocator, @min(patch_slots, sources.items.len));
-        sources.clearRetainingCapacity();
+        // A rebuild is a cold one-off over the row pool: its slots go with it, so the
+        // patch set's follow changes, not rows.
+        self.trigger_edit_sources.clearRetainingCapacity();
+        self.trigger_rebuild_slots.release(self.allocator);
     }
 
     // The trigger query stage over the revision's changes or the row pool, under that mode's
-    // tuner and, with `runtime_perf_log.enabled`, into that mode's batch record (a rebuild
-    // also clears the patch record, as the store's rebuild clears its patch stages); returns
-    // its range count. A range past its slot grows it and the stage replays, and only the
-    // pass that wrote every record is recorded.
-    fn runTriggerQuery(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, mode: TriggerQueryMode) error{OutOfMemory}!usize {
+    // tuner and slot set and, with `runtime_perf_log.enabled`, into that mode's batch record
+    // (a rebuild also clears the patch record, as the store's rebuild clears its patch
+    // stages); returns its ranges' slots. A range past its slot grows it and the stage
+    // replays, and only the pass that wrote every record is recorded.
+    fn runTriggerQuery(self: *CollisionSystem, data: *const DataSystem, view: ColliderView, threads: Threads, mode: TriggerQueryMode) error{OutOfMemory}![]const PaddedSlot(TriggerQuerySlot) {
         if (comptime runtime_perf_log.enabled) {
             self.triggerQueryRecord(mode).* = .{};
             if (mode == .rebuild) self.perf.trigger_query_batch = .{};
@@ -1718,14 +1661,20 @@ pub const CollisionSystem = struct {
             .patch => view.changes.len,
             .rebuild => view.row_entity.len,
         };
-        if (items == 0) return 0;
+        if (items == 0) return &.{};
         const tuner = switch (mode) {
             .patch => &self.trigger_query_tuner,
             .rebuild => &self.trigger_query_rebuild_tuner,
         };
-        const selection = threads.stage(tuner).select(items, collision_range_alignment_items);
-        var grew = try self.prepareTriggerQuerySlots(selection, items, mode);
-        const slots = self.trigger_query_slots.items[0..selection.range_count];
+        const set = switch (mode) {
+            .patch => &self.trigger_patch_slots,
+            .rebuild => &self.trigger_rebuild_slots,
+        };
+        const stage = threads.stage(tuner);
+        const shape = StageShape.select(stage, items, collision_range_alignment_items);
+        var grew = try set.prepare(self.allocator, shape, items, trigger_records_per_item, mode);
+        grew = try reserveRecords(EditSource, &self.trigger_edit_sources, self.allocator, shape.range_count) or grew;
+        const slots = set.slots();
         var job = TriggerQueryJob{
             .data = data,
             .view = view,
@@ -1735,28 +1684,18 @@ pub const CollisionSystem = struct {
             .change_mark = self.change_mark.items,
             .change_generation = self.change_generation,
             .slots = slots,
-            .items_per_range = selection.items_per_range,
-            .range_count = selection.range_count,
+            .items_per_range = shape.items_per_range,
+            .range_count = shape.range_count,
             .item_count = items,
         };
-        var batch = BatchStats{};
-        while (true) {
-            for (slots) |*slot| slot.value.clear();
-            batch = threads.thread_system.parallelForWithOptions(items, &job, triggerQueryJob, .{
-                .items_per_range = threads.config.items_per_range,
-                .max_worker_threads = threads.config.max_worker_threads,
-                .range_alignment_items = collision_range_alignment_items,
-                .adaptive = threads.config.adaptive,
-                .adaptive_tuner = null,
-                .selected_profile = selection.profile,
-            });
-            if (!try self.growTriggerQuerySlots(selection.range_count, mode)) break;
-            grew = true;
-        }
-        if (selection.active_tuner) |active| active.record(batch);
-        if (comptime runtime_perf_log.enabled) self.triggerQueryRecord(mode).* = batch;
-        if (grew) self.noteTriggerSlotGrowth();
-        return selection.range_count;
+        const replay = try set.run(self.allocator, stage, shape, items, collision_range_alignment_items, mode, &job, triggerQueryJob);
+        if (shape.selection.?.active_tuner) |active| active.record(replay.batch);
+        if (comptime runtime_perf_log.enabled) self.triggerQueryRecord(mode).* = replay.batch;
+        if (grew or replay.replayed) self.noteSlotGrowth(switch (mode) {
+            .patch => .trigger_patch,
+            .rebuild => .trigger_rebuild,
+        });
+        return slots;
     }
 
     // The batch record of the trigger query in `mode` (`runtime_perf_log.enabled` only).
@@ -1767,70 +1706,10 @@ pub const CollisionSystem = struct {
         };
     }
 
-    // A trigger query whose range slots grew. `reserve` does not size these slots (a patch's
-    // records follow its changes), so growth is their designed warm-up and logs at info, as
-    // the spill slots do.
-    fn noteTriggerSlotGrowth(self: *CollisionSystem) void {
-        @branchHint(.cold);
-        if (comptime runtime_perf_log.enabled) self.perf.trigger_slot_grows += 1;
-        if (self.trigger_slot_growth_logged) return;
-        self.trigger_slot_growth_logged = true;
-        if (comptime logging.enabled(.info)) logging.game.info("collision trigger query slots grew", .{});
-    }
-
-    // Reserves every range's slot at the selection: `trigger_records_per_item` edit records
-    // per item it covers and one query's hit rows. Grow-only; returns whether any list grew.
-    fn prepareTriggerQuerySlots(self: *CollisionSystem, selection: BatchSelection, items: usize, mode: TriggerQueryMode) error{OutOfMemory}!bool {
-        const range_count = selection.range_count;
-        var grew = false;
-        if (self.trigger_query_slots.capacity < range_count) {
-            try self.trigger_query_slots.ensureTotalCapacity(self.allocator, range_count);
-            grew = true;
-        }
-        while (self.trigger_query_slots.items.len < range_count) self.trigger_query_slots.appendAssumeCapacity(.{});
-        for (self.trigger_query_slots.items[0..range_count], 0..) |*padded, range_index| {
-            const slot = &padded.value;
-            const records = trigger_records_per_item * rangeLenForIndex(items, selection.items_per_range, range_index);
-            grew = try reserveRecords(InsertEdit, &slot.inserts, self.allocator, records) or grew;
-            if (mode == .patch) {
-                grew = try reserveRecords(PageLocation, &slot.insert_pages, self.allocator, records) or grew;
-                grew = try reserveRecords(DropPiece, &slot.drops, self.allocator, records) or grew;
-            }
-            if (slot.hits.len < reserved_query_hits) {
-                try ensureHitRows(&slot.hits, self.allocator, reserved_query_hits);
-                grew = true;
-            }
-            grew = try reserveRecords(KeyedContact, &slot.contacts, self.allocator, slot.hits.len) or grew;
-        }
-        if (self.trigger_edit_sources.capacity < range_count) {
-            try self.trigger_edit_sources.ensureTotalCapacity(self.allocator, range_count);
-            grew = true;
-        }
-        return grew;
-    }
-
-    // Grows each slot the last pass outgrew, before its replay: hit rows geometrically past
-    // its largest query (its contacts with them), and each record list past its need.
-    fn growTriggerQuerySlots(self: *CollisionSystem, range_count: usize, mode: TriggerQueryMode) error{OutOfMemory}!bool {
-        var grew = false;
-        for (self.trigger_query_slots.items[0..range_count]) |*padded| {
-            const slot = &padded.value;
-            if (slot.hits_required > slot.hits.len) {
-                try ensureHitRows(&slot.hits, self.allocator, std.MultiArrayList(HitRow).growCapacity(slot.hits_required));
-                try slot.contacts.ensureTotalCapacity(self.allocator, slot.hits.len);
-                grew = true;
-            }
-            grew = try reserveRecords(InsertEdit, &slot.inserts, self.allocator, slot.insert_need) or grew;
-            if (mode == .patch) grew = try reserveRecords(PageLocation, &slot.insert_pages, self.allocator, slot.insert_need) or grew;
-            grew = try reserveRecords(DropPiece, &slot.drops, self.allocator, slot.drop_need) or grew;
-        }
-        return grew;
-    }
-
     // One edit source per query range, in range order, within reserved capacity.
-    fn triggerEditSources(self: *CollisionSystem, range_count: usize, mode: TriggerQueryMode) []const EditSource {
+    fn triggerEditSources(self: *CollisionSystem, slots: []const PaddedSlot(TriggerQuerySlot), mode: TriggerQueryMode) []const EditSource {
         self.trigger_edit_sources.clearRetainingCapacity();
-        for (self.trigger_query_slots.items[0..range_count]) |*padded| {
+        for (slots) |*padded| {
             const slot = &padded.value;
             std.debug.assert(!slot.overflowed);
             self.trigger_edit_sources.appendAssumeCapacity(.{
@@ -1896,7 +1775,7 @@ pub const CollisionSystem = struct {
     fn compactDynamicKeys(self: *CollisionSystem, items_per_range: usize) !usize {
         const tallies = self.narrowphase_tallies.items;
         var count: usize = 0;
-        for (tallies) |slot| count += slot.count;
+        for (tallies) |slot| count += slot.value.count;
         try self.ordered.ensureTotalCapacity(self.allocator, count + self.static_pairs.items.len);
         self.ordered.items.len = count;
         const staging = self.narrowphase_staging.items;
@@ -1904,7 +1783,7 @@ pub const CollisionSystem = struct {
         var cursor: usize = 0;
         for (tallies, 0..) |slot, range_index| {
             const window_start = range_index * items_per_range;
-            const window = staging[window_start..][0..slot.count];
+            const window = staging[window_start..][0..slot.value.count];
             for (window, 0..) |contact, offset| {
                 self.ordered.items[cursor] = .{ .key = keys[window_start + offset], .contact = contact };
                 cursor += 1;
@@ -1968,7 +1847,7 @@ pub const CollisionSystem = struct {
         }
         try contacts.prepareRangeCounts(range_count);
         for (self.emit_ranges.items, 0..) |slot, range_index| {
-            contacts.addCount(range_index, if (counted) slot.value.out else rangeLenForIndex(items, selection.items_per_range, range_index));
+            contacts.addCount(range_index, if (counted) slot.value.out else rangeForIndex(items, selection.items_per_range, range_index).len());
         }
         try contacts.prefix();
         const batch = dispatch.run(selection, items, collision_range_alignment_items, &job, emitWriteJob);
@@ -3203,23 +3082,20 @@ const SweepPerf = if (runtime_perf_log.enabled) struct { simd_groups: usize = 0,
 const BroadphaseBuildResult = struct {
     perf: SweepPerf = .{},
     batch: BatchStats = .{},
-    /// A range slot allocated in-stage: an unreserved slot warmed, or a slot grew and the
-    /// broadphase replayed.
-    grew: bool = false,
 };
 
 const BroadphaseJobContext = struct {
-    system: *CollisionSystem,
+    // The dispatch's prepared slots, one per range.
+    slots: []PaddedSlot(BroadphaseRangeBuffer),
     entries: ConstEntryColumns,
-    range_count: usize,
     entry_count: usize,
 };
 
 fn broadphaseCandidatesJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *BroadphaseJobContext = @ptrCast(@alignCast(context));
-    std.debug.assert(range.index < job.range_count and range.index < job.system.broadphase_ranges.items.len);
+    std.debug.assert(range.index < job.slots.len);
     std.debug.assert(range.start <= range.end and range.end <= job.entry_count);
-    sweepEntries(job.entries, range.start, range.end, &job.system.broadphase_ranges.items[range.index].buffer);
+    sweepEntries(job.entries, range.start, range.end, &job.slots[range.index].value);
 }
 
 // Sweeps entries `[start, end)`: each tests the entries after it in lane groups of
@@ -3371,7 +3247,7 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange, 
         }
         index += group;
     }
-    system.narrowphase_tallies.items[range.index].count = count;
+    system.narrowphase_tallies.items[range.index].value.count = count;
 }
 
 fn contactForCandidate(proxies: ConstProxyColumns, a: usize, b: usize) ?CollisionContact {
@@ -3456,11 +3332,6 @@ fn contactFields(
     };
 }
 
-fn rangeLenForIndex(item_count: usize, items_per_range: usize, range_index: usize) usize {
-    const start = range_index * items_per_range;
-    if (start >= item_count) return 0;
-    return @min(start + items_per_range, item_count) - start;
-}
 // ---- Tests ----------------------------------------------------------------------------
 
 fn addBody(data: *DataSystem, position_x: f32, position_y: f32, size: f32) !EntityId {
@@ -4204,7 +4075,7 @@ test "after a spill slot grows, later multi-worker steps allocate nothing" {
     try expectSameContacts(expected, contacts.mergedItems());
 }
 
-test "after reserve, a multi-worker step over bodies on two strips allocates nothing" {
+test "after reserve and a step at its partition, a multi-worker step over bodies on two strips allocates nothing" {
     // An 8 x 8 grid (pitch 6, size 8) whose lower rows cross the strip edge at 32: within
     // one extra copy per body and four pairs per entry.
     const body_count: usize = 64;
@@ -4224,6 +4095,12 @@ test "after reserve, a multi-worker step over bodies on two strips allocates not
     try CollisionSystem.reserveContactStream(&contacts, CollisionSystem.estimateContactCapacity(body_count));
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
+    const config: CollisionConfig = .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false };
+    // The first step at the partition allocates only its range slots.
+    const seam_stores = collision_test_support.storeCapacities(&system);
+    _ = try system.update(&data, &contacts, &threads, config);
+    try std.testing.expectEqualSlices(usize, &seam_stores, &collision_test_support.storeCapacities(&system));
+    try expectSameContacts(expected, contacts.mergedItems());
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -4235,12 +4112,9 @@ test "after reserve, a multi-worker step over bodies on two strips allocates not
         contacts.allocator = original_contacts_allocator;
     }
 
-    // Cold, then warm.
-    for (0..2) |_| {
-        const stats = try system.update(&data, &contacts, &threads, .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false });
-        try std.testing.expect(stats.entry_count > body_count);
-        try expectSameContacts(expected, contacts.mergedItems());
-    }
+    const stats = try system.update(&data, &contacts, &threads, config);
+    try std.testing.expect(stats.entry_count > body_count);
+    try expectSameContacts(expected, contacts.mergedItems());
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
 }
 
@@ -4385,8 +4259,8 @@ test "narrowphase range buffers merge deterministic contacts and skip rejected c
 }
 
 test "thread-written collision range scratch uses cache-line sized slots" {
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(BroadphaseRangeSlot) % thread_shared_record_alignment);
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(ContactCountTally) % thread_shared_record_alignment);
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(PaddedSlot(BroadphaseRangeBuffer)) % thread_shared_record_alignment);
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(PaddedSlot(NarrowphaseTally)) % thread_shared_record_alignment);
     try std.testing.expectEqual(@as(usize, 0), @sizeOf(PaddedSlot(SpillCopies)) % thread_shared_record_alignment);
 
     var system = CollisionSystem.init(std.testing.allocator);
@@ -4395,10 +4269,10 @@ test "thread-written collision range scratch uses cache-line sized slots" {
     try system.prepareNarrowphaseStaging(8, 2, false);
 
     for ([_]usize{
-        @intFromPtr(system.broadphase_ranges.items.ptr),
+        @intFromPtr(system.broadphase_slots.list.items.ptr),
         @intFromPtr(system.narrowphase_tallies.items.ptr),
         @intFromPtr(system.narrowphase_staging.items.ptr),
-        @intFromPtr(system.spill_slots.items.ptr),
+        @intFromPtr(system.spill_slots.list.items.ptr),
         @intFromPtr(system.first_offsets.items.ptr),
         @intFromPtr(system.second_offsets.items.ptr),
         @intFromPtr(system.second_scratch.items.ptr),
@@ -4409,7 +4283,7 @@ test "thread-written collision range scratch uses cache-line sized slots" {
     }) |address| try std.testing.expectEqual(@as(usize, 0), address % thread_shared_record_alignment);
 }
 
-test "threaded broadphase prewarms empty range buffers before dispatch" {
+test "threaded broadphase prepares each selected range's slot at its selection before dispatch" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     for (0..64) |index| {
@@ -4435,6 +4309,13 @@ test "threaded broadphase prewarms empty range buffers before dispatch" {
     });
 
     try std.testing.expect(stats.candidate_pair_count > 0);
+    const slots = system.broadphase_slots.slots();
+    try std.testing.expectEqual(maxRangeCount(stats.entry_count, collision_range_alignment_items), slots.len);
+    try std.testing.expect(slots.len > 1);
+    for (slots, 0..) |slot, range_index| {
+        const covered = rangeForIndex(stats.entry_count, collision_range_alignment_items, range_index).len();
+        try std.testing.expect(slot.value.pairs.capacity >= broadphase_pairs_per_item * covered);
+    }
 }
 
 test "collision update reuses warmed scratch without steady state allocation" {
@@ -4618,11 +4499,11 @@ test "collision reserve makes the first single-range threaded update allocation-
     try std.testing.expectEqual(@as(usize, 2), contacts.mergedItems().len);
 }
 
-test "after reserve, threaded broad/narrowphase at 32- then 16-item ranges allocate nothing" {
-    // `reserve` alone (no warm update) covers every partition the tuners can pick: fill
-    // slots, broadphase slots reserved to the per-range bound for maxRangeCount ranges, the
-    // narrowphase staging to the candidate pairs. A sparse chain (each body overlaps only
-    // its neighbour) keeps the pair count within the reserved pair capacity.
+test "after reserve and a step at each partition, threaded broad/narrowphase at 32- then 16-item ranges allocate nothing" {
+    // `reserve` covers the window outputs and records of every partition (the narrowphase
+    // staging to the candidate pairs); a step at each partition prepares its range slots. A
+    // sparse chain (each body overlaps only its neighbour) keeps the pair count within the
+    // reserved pair capacity.
 
     const body_count: usize = 64;
     var data = DataSystem.init(std.testing.allocator);
@@ -4647,6 +4528,13 @@ test "after reserve, threaded broad/narrowphase at 32- then 16-item ranges alloc
     try contacts.reserve(maxRangeCount(body_count, collision_range_alignment_items), body_count);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
+    // The first step at each partition allocates only its range slots.
+    const seam_stores = collision_test_support.storeCapacities(&system);
+    for ([_]usize{ 32, 16 }) |items_per_range| {
+        _ = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
+        try std.testing.expectEqualSlices(usize, &seam_stores, &collision_test_support.storeCapacities(&system));
+        try expectSameContactPairs(expected, contacts.mergedItems());
+    }
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -4665,11 +4553,11 @@ test "after reserve, threaded broad/narrowphase at 32- then 16-item ranges alloc
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
 }
 
-test "after reserve, ~2 pairs per body on the multi-worker path allocate nothing" {
+test "after reserve and a step at each partition, ~2 pairs per body on the multi-worker path allocate nothing" {
     // Every body overlaps its next two neighbours (spacing 10, size 22): 125 candidate
     // pairs over 64 bodies, within the per-range slot bound, so the broadphase never
-    // replays. The merged candidates, narrowphase staging and tallies must hold them from
-    // `reserve` alone, not grow in-stage.
+    // replays. The merged candidates, narrowphase staging and tallies hold them from
+    // `reserve`; a step at each partition prepares its range slots.
 
     const body_count: usize = 64;
     var data = DataSystem.init(std.testing.allocator);
@@ -4696,6 +4584,13 @@ test "after reserve, ~2 pairs per body on the multi-worker path allocate nothing
     try contacts.reserve(maxRangeCount(pair_bound, collision_range_alignment_items), pair_bound);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
+    // The first step at each partition allocates only its range slots.
+    const seam_stores = collision_test_support.storeCapacities(&system);
+    for ([_]usize{ 32, 16 }) |items_per_range| {
+        _ = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
+        try std.testing.expectEqualSlices(usize, &seam_stores, &collision_test_support.storeCapacities(&system));
+        try expectSameContactPairs(expected, contacts.mergedItems());
+    }
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -4715,12 +4610,12 @@ test "after reserve, ~2 pairs per body on the multi-worker path allocate nothing
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
 }
 
-test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body allocate nothing" {
+test "after reserve and a step at each partition, 2- and 3-range broadphase partitions at ~3.9 pairs per body allocate nothing" {
     // 96 bodies in a row (spacing 10, 45 wide, inside one strip): each overlaps its next
     // four, so every range except the last holds exactly `broadphase_pairs_per_item` pairs
     // per item (374 pairs, 3.9 per body). A 2-range partition puts 48 entries (192 pairs) in
-    // range 0, a 3-range one 32 (128 pairs): past a slot clamped to the 96-body capacity, so
-    // range slots must be reserved per entry, not per body.
+    // range 0, a 3-range one 32 (128 pairs): each range's slot is prepared per entry it
+    // covers, so neither replays.
 
     const body_count: usize = 96;
     var data = DataSystem.init(std.testing.allocator);
@@ -4744,6 +4639,13 @@ test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body
     try CollisionSystem.reserveContactStream(&contacts, CollisionSystem.estimateContactCapacity(body_count));
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
+    // The first step at each partition allocates only its range slots.
+    const seam_stores = collision_test_support.storeCapacities(&system);
+    for ([_]usize{ 48, 32 }) |items_per_range| {
+        _ = try system.update(&data, &contacts, &threads, .{ .items_per_range = items_per_range, .max_worker_threads = 2, .adaptive = false });
+        try std.testing.expectEqualSlices(usize, &seam_stores, &collision_test_support.storeCapacities(&system));
+        try expectSameContactPairs(reference_contacts.mergedItems(), contacts.mergedItems());
+    }
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -4765,7 +4667,7 @@ test "after reserve, 2- and 3-range broadphase partitions at ~3.9 pairs per body
 
 test "a broadphase slot replay within the total pair bound matches serial and then allocates nothing" {
     // 64 bodies at a 64-body reserve (256-pair bound, 128-entry bound), four broadphase
-    // ranges of 16 entries: slot 2 holds 4 * ceil(128 / 3) = 172 pairs. Ranges 0 and 1 are
+    // ranges of 16 entries: slot 2 is prepared for 4 * 16 = 64 pairs. Ranges 0 and 1 are
     // 32 isolated bodies; range 2 is 16 wide bodies that all overlap (120 pairs) and the four
     // narrow bodies of range 3 they cover in y (64 pairs): 184, past slot 2 but inside the
     // total bound. The slot grows and the broadphase replays, contacts identical to the
@@ -4809,6 +4711,52 @@ test "a broadphase slot replay within the total pair bound matches serial and th
     _ = try system.update(&data, &contacts, &threads, config);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try expectSameContacts(reference_contacts.mergedItems(), contacts.mergedItems());
+}
+
+test "collision range slots follow every retune's selection with identical contacts" {
+    // 32 isolated bodies, then 16 wide bodies that all overlap and four narrow ones they
+    // cover: a dense cluster past the slot of any range that holds it.
+    const body_count: usize = 64;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..32) |index| _ = try addBox(&data, .{ .x = @floatFromInt(index * 100), .y = 0, .w = 22, .h = 8 });
+    for (0..16) |index| _ = try addBox(&data, .{ .x = 10_000 + @as(f32, @floatFromInt(index)), .y = 0, .w = 1000, .h = 8 });
+    for (0..16) |index| {
+        const y: f32 = if (index < 4) 4 else 10;
+        _ = try addBox(&data, .{ .x = 10_100 + @as(f32, @floatFromInt(index * 50)), .y = y, .w = 8, .h = 8 });
+    }
+    var reference = CollisionSystem.init(std.testing.allocator);
+    defer reference.deinit();
+    var reference_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer reference_contacts.deinit();
+    _ = try updateInline(&reference, &data, &reference_contacts);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(body_count);
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    // Fixed shapes 16, 64, inline (no worker), 32, then 16 again.
+    const steps = [_]CollisionConfig{
+        .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false },
+        .{ .items_per_range = 64, .max_worker_threads = 2, .adaptive = false },
+        .{ .max_worker_threads = 0, .adaptive = false },
+        .{ .items_per_range = 32, .max_worker_threads = 2, .adaptive = false },
+        .{ .items_per_range = 16, .max_worker_threads = 2, .adaptive = false },
+    };
+    for (steps) |config| {
+        const stats = try system.update(&data, &contacts, &threads, config);
+        try expectSameContacts(reference_contacts.mergedItems(), contacts.mergedItems());
+        const slots = system.broadphase_slots.slots();
+        const items_per_range = if (slots.len == 1) stats.entry_count else config.items_per_range.?;
+        try std.testing.expectEqual(maxRangeCount(stats.entry_count, items_per_range), slots.len);
+        for (slots, 0..) |slot, range_index| {
+            const covered = rangeForIndex(stats.entry_count, items_per_range, range_index).len();
+            try std.testing.expect(slot.value.pairs.capacity >= broadphase_pairs_per_item * covered);
+        }
+    }
 }
 
 test "candidate pairs past the reserved pair bound match an unreserved run, even inside the physical slack" {
@@ -5155,6 +5103,7 @@ test "strips are the tile size rounded down to a power of two" {
 }
 
 const StaticColliderSystem = @import("static_colliders.zig").StaticColliderSystem;
+const collision_test_support = @import("collision_test_support.zig");
 const ColliderGeometry = @import("static_colliders.zig").ColliderGeometry;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const StructuralCommand = @import("../data_system.zig").StructuralCommand;
@@ -6563,9 +6512,9 @@ fn expectModeOnlyOverflowPatch(workers: usize) !void {
     defer fixture.deinit();
     // Only the mode changes, so one walk serves the change's old and new parts; it outgrows
     // the patch's fresh hit rows, so the range grows its slot and replays.
-    try std.testing.expectEqual(@as(usize, 0), fixture.patched.trigger_query_slots.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.patched.trigger_patch_slots.list.items.len);
     try fixture.commit(&data, &.{.{ .set_collision_response = .{ .entity = turned, .response = .{ .mobility = .static, .mode = .solid, .restitution = 0 } } }});
-    try std.testing.expect(fixture.patched.trigger_query_slots.items[0].value.hits.len > reserved_query_hits);
+    try std.testing.expect(fixture.patched.trigger_patch_slots.list.items[0].value.hits.len > reserved_query_hits);
     try fixture.commit(&data, &.{.{ .set_collision_response = .{ .entity = turned, .response = .{ .mobility = .static, .mode = .trigger, .restitution = 0 } } }});
 }
 
@@ -6688,7 +6637,7 @@ test "collision trigger warm patch allocates nothing on a 2-worker pool" {
     try std.testing.expectEqual(fixture.colliders.view().revision, fixture.patched.trigger_store.seen_revision);
 }
 
-test "collision trigger rebuild releases its row-pool query records and keeps the patch query's" {
+test "collision trigger rebuild releases its own query slots and leaves the patch query's" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const moved = try addObstacle(&data, .{ .x = 10, .y = 10, .w = 40, .h = 40 }, .static, .trigger);
@@ -6701,19 +6650,23 @@ test "collision trigger rebuild releases its row-pool query records and keeps th
     try fixture.init(&data, 2);
     defer fixture.deinit();
     // No patch has run: the cold rebuild keeps no query slot.
-    try std.testing.expectEqual(@as(usize, 0), fixture.patched.trigger_query_slots.items.len);
+    const patch_set = &fixture.patched.trigger_patch_slots;
+    try std.testing.expectEqual(@as(usize, 0), patch_set.list.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.patched.trigger_rebuild_slots.list.capacity);
     try fixture.commit(&data, &.{movedBody(&data, moved, 20, 20)});
-    const patch_slots = fixture.patched.trigger_query_slots.items.len;
+    const patch_slots = patch_set.list.items.len;
     try std.testing.expect(patch_slots != 0);
+    var inserts: [8]usize = undefined;
+    try std.testing.expect(patch_slots <= inserts.len);
+    for (patch_set.list.items, 0..) |padded, slot| inserts[slot] = padded.value.inserts.capacity;
     // Two commits with no seam refresh skip a revision, so the next refresh rebuilds.
     try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 10, 10)});
     try commitCommands(&data, &fixture.colliders, &fixture.threads, &.{movedBody(&data, moved, 20, 20)});
     try fixture.patched.syncCommittedTriggers(&data, fixture.colliders.view(), &fixture.threads);
     try std.testing.expectEqual(fixture.colliders.view().revision, fixture.patched.trigger_store.seen_revision);
-    try std.testing.expectEqual(patch_slots, fixture.patched.trigger_query_slots.items.len);
-    for (fixture.patched.trigger_query_slots.items) |padded| {
-        try std.testing.expect(padded.value.inserts.capacity <= padded.value.insert_pages.capacity);
-    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.patched.trigger_rebuild_slots.list.capacity);
+    try std.testing.expectEqual(patch_slots, patch_set.list.items.len);
+    for (patch_set.list.items, 0..) |padded, slot| try std.testing.expectEqual(inserts[slot], padded.value.inserts.capacity);
     // The next patch re-reserves its records and still matches a rebuild.
     try fixture.commit(&data, &.{movedBody(&data, moved, 10, 10)});
 }
@@ -6866,18 +6819,20 @@ test "the debug rect reserve grows linearly in the collider index space" {
     try std.testing.expect(large_bytes * small <= 2 * small_bytes * large);
 }
 
-test "reserve gives each static query slot one query's hit rows, not its range's pairs" {
+test "the static query prepares each selected range one query's hit rows, not its range's pairs" {
     const bodies: usize = 64 * collision_range_alignment_items;
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(bodies);
-    const ranges = maxRangeCount(bodies, collision_range_alignment_items);
-    try std.testing.expect(system.static_pair_slots.items.len >= ranges);
-    for (system.static_pair_slots.items[0..ranges], 0..) |slot, range_index| {
+    // The seam warms the inline slot: every body's pairs.
+    try std.testing.expectEqual(@as(usize, 1), system.static_slots.list.items.len);
+    try std.testing.expect(system.static_slots.list.items[0].value.pairs.capacity >= CollisionSystem.broadphasePairBound(bodies));
+    const shape = StageShape{ .items_per_range = collision_range_alignment_items, .range_count = 64 };
+    _ = try system.static_slots.prepare(system.allocator, shape, bodies, broadphase_pairs_per_item, &system.static_sizing);
+    for (system.static_slots.slots()) |slot| {
         try std.testing.expect(slot.value.hits.len <= reserved_query_hits);
         try std.testing.expect(slot.value.hits.len <= slot.value.pairs.capacity);
-        // The pairs keep the range's bound, so the one-range slot still holds every body's.
-        if (range_index == 0) try std.testing.expect(slot.value.pairs.capacity >= CollisionSystem.broadphasePairBound(bodies));
+        try std.testing.expect(slot.value.pairs.capacity >= CollisionSystem.broadphasePairBound(collision_range_alignment_items));
     }
 }
 
@@ -6907,7 +6862,7 @@ fn expectWideQueryReplays(workers: usize) !void {
     // The slots' pairs and Debug walked ids hold both steps; only the hit rows outgrow
     // their reserve.
     try system.reserve(256);
-    try std.testing.expect(system.static_pair_slots.items[0].value.hits.len < expected.len);
+    try std.testing.expect(system.static_slots.list.items[0].value.hits.len < expected.len);
     var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
     defer contacts.deinit();
     _ = try updateView(&system, &data, &contacts, colliders.view(), workers, null);
@@ -6933,4 +6888,44 @@ fn expectWideQueryReplays(workers: usize) !void {
 test "a static query past its reserved hit rows grows its slot and replays to the reference" {
     try expectWideQueryReplays(0);
     try expectWideQueryReplays(2);
+}
+
+test "a static query retune gives every selected range the widest query's hit rows" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const columns: usize = 16;
+    const rows: usize = 5;
+    for (0..columns * rows) |index| {
+        _ = try addObstacle(&data, .{ .x = @as(f32, @floatFromInt(index % columns)) * 32, .y = @as(f32, @floatFromInt(index / columns)) * 32, .w = 32, .h = 32 }, .static, .solid);
+    }
+    _ = try addObstacle(&data, .{ .x = 1, .y = 1, .w = @as(f32, @floatFromInt(columns)) * 32 - 2, .h = @as(f32, @floatFromInt(rows)) * 32 - 2 }, .dynamic, .solid);
+    // Small dynamics far off, so the query runs over several ranges.
+    for (0..3 * collision_range_alignment_items) |index| {
+        _ = try addObstacle(&data, .{ .x = 2000 + @as(f32, @floatFromInt(index)) * 20, .y = 2000, .w = 8, .h = 8 }, .dynamic, .solid);
+    }
+    var colliders = StaticColliderSystem.init(std.testing.allocator);
+    defer colliders.deinit();
+    try colliders.rebuild(&data, testGeometry(), null);
+    const expected = try filteredReference(&data, .default);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expect(expected.len > reserved_query_hits);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(256);
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    var widest: usize = 0;
+    for ([_]usize{ 1, 2, 3 }, 0..) |windows, step| {
+        _ = try updateView(&system, &data, &contacts, colliders.view(), 2, windows * collision_range_alignment_items);
+        try expectSameContacts(expected, contacts.mergedItems());
+        const slots = system.static_slots.slots();
+        try std.testing.expect(slots.len > 1);
+        // From the first step's growth on, every prepared range holds the widest query.
+        for (slots) |slot| {
+            if (step != 0) try std.testing.expect(slot.value.hits.len >= widest);
+            widest = @max(widest, slot.value.hits.len);
+        }
+        try std.testing.expect(widest >= expected.len);
+    }
 }

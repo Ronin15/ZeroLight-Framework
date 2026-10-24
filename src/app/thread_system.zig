@@ -1436,8 +1436,8 @@ pub fn rangeCount(item_count: usize, items_per_range: usize) usize {
 /// `range_alignment_items`: every shape (`shapeBatch`, the single shaping path for fixed,
 /// selected, and tuner profiles) aligns its range size up to the alignment or collapses
 /// to one full-width range, so no partition can produce more ranges than this. Callers
-/// size per-range records (tallies, broadphase slots) from it at their capacity seam so
-/// a partition retune never allocates in-stage.
+/// size per-range records (tallies, offsets) from it at their capacity seam so a
+/// partition retune never allocates in-stage; data-dependent slots are `RangeSlots`.
 pub fn maxRangeCount(item_count: usize, range_alignment_items: usize) usize {
     return rangeCount(item_count, @max(range_alignment_items, @as(usize, 1)));
 }
@@ -1470,6 +1470,129 @@ pub fn SlotList(comptime T: type) type {
 pub fn setSlotCount(comptime T: type, slots: *SlotList(T), count: usize) void {
     slots.clearRetainingCapacity();
     slots.appendNTimesAssumeCapacity(.{}, count);
+}
+
+/// The final pass of a `RangeSlots.run`: its batch, which the caller records into its
+/// stage's tuner, and whether an overflowing range made the dispatch replay.
+pub const Replay = struct {
+    batch: BatchStats = .{},
+    replayed: bool = false,
+};
+
+/// Padded per-range slots for output whose size depends on the data. `prepare` sizes
+/// each range of a stage's selection at the per-item bound times the items it covers;
+/// `run` dispatches at that selection with no tuner record, grows every range that
+/// overflowed to its counted need, and replays until every range fit. Grow-only: slots
+/// past the prepared count keep their lists, and only `release` frees. Main thread, owner
+/// only; `run` never resizes the list, so a job's `slots()` stays valid across passes.
+///
+/// `Slot` declares, all `pub`:
+/// - `Context`: the caller's per-call value for `reserve` and `grow`;
+/// - `max_passes`: the passes one run takes at most (one grow sizes the next pass's
+///   counted need; a need a pass cannot count adds a pass);
+/// - `reserve(*Slot, Allocator, records, Context) error{OutOfMemory}!bool`: geometric,
+///   holds `records` primary records; whether it allocated;
+/// - `clear(*Slot) void`;
+/// - `grow(*Slot, Allocator, Context) error{OutOfMemory}!bool`: after a pass, grows to the
+///   counted need when the slot overflowed; whether it did;
+/// - `held(*const Slot) usize`: primary records held, read only by perf-log builds;
+/// - `deinit(*Slot, Allocator) void`.
+pub fn RangeSlots(comptime Slot: type) type {
+    return struct {
+        const Self = @This();
+        pub const Context = Slot.Context;
+
+        list: SlotList(Slot) = .empty,
+        /// The range count `prepare` last sized; `run`'s shape must match it.
+        range_count: usize = 0,
+        /// Prepares that allocated, replay passes, and the primary records every slot
+        /// holds (the set's memory, in `Slot.held` units).
+        prepare_grows: DiagnosticCount = zero_diagnostic_count,
+        replays: DiagnosticCount = zero_diagnostic_count,
+        held_records: DiagnosticCount = zero_diagnostic_count,
+
+        /// Sizes range r < `shape.range_count` of `item_count` items to `per_item_bound`
+        /// records per item it covers. Call after the stage's `StageShape.select`, before
+        /// `run`. O(range count); returns whether anything allocated.
+        pub fn prepare(self: *Self, allocator: std.mem.Allocator, shape: StageShape, item_count: usize, per_item_bound: usize, context: Context) error{OutOfMemory}!bool {
+            std.debug.assert(shape.range_count == rangeCount(item_count, shape.items_per_range));
+            var grew = false;
+            if (self.list.items.len < shape.range_count) {
+                grew = self.list.capacity < shape.range_count;
+                try self.list.ensureTotalCapacity(allocator, shape.range_count);
+                self.list.appendNTimesAssumeCapacity(.{}, shape.range_count - self.list.items.len);
+            }
+            for (self.list.items[0..shape.range_count], 0..) |*slot, range_index| {
+                const covered = rangeForIndex(item_count, shape.items_per_range, range_index).len();
+                if (try slot.value.reserve(allocator, per_item_bound *| covered, context)) grew = true;
+            }
+            self.range_count = shape.range_count;
+            if (comptime diagnostics_enabled) {
+                if (grew) {
+                    self.prepare_grows += 1;
+                    self.recountHeld();
+                }
+            }
+            return grew;
+        }
+
+        /// The prepared ranges' slots, for the job's context.
+        pub fn slots(self: *Self) []PaddedSlot(Slot) {
+            return self.list.items[0..self.range_count];
+        }
+
+        /// Runs `job` over `item_count` items at the prepared `shape` under `dispatch` (or
+        /// inline as one range), recording no tuner, and replays after growing every range
+        /// that overflowed. A replay dispatches the same ranges: the selection's profile is
+        /// already shaped. Returns the final pass, for the caller to record.
+        pub fn run(self: *Self, allocator: std.mem.Allocator, dispatch: ?Dispatch, shape: StageShape, item_count: usize, range_alignment_items: usize, context: Context, job_context: *anyopaque, job: JobFn) error{OutOfMemory}!Replay {
+            std.debug.assert(shape.range_count == self.range_count);
+            if (item_count == 0) return .{};
+            var untuned = shape;
+            if (untuned.selection) |*selection| selection.active_tuner = null;
+            var replay = Replay{};
+            var passes: usize = 0;
+            while (true) {
+                passes += 1;
+                std.debug.assert(passes <= Slot.max_passes);
+                for (self.slots()) |*slot| slot.value.clear();
+                replay.batch = runShaped(dispatch, untuned, item_count, range_alignment_items, job_context, job);
+                // The selection's profile is already shaped, so every pass dispatches its ranges.
+                std.debug.assert(replay.batch.range_count == shape.range_count);
+                var grew = false;
+                for (self.slots()) |*slot| {
+                    if (try slot.value.grow(allocator, context)) grew = true;
+                }
+                if (!grew) return replay;
+                replay.replayed = true;
+                if (comptime diagnostics_enabled) {
+                    self.replays += 1;
+                    self.recountHeld();
+                }
+            }
+        }
+
+        /// Frees every slot; the set prepares again afterwards.
+        pub fn release(self: *Self, allocator: std.mem.Allocator) void {
+            for (self.list.items) |*slot| slot.value.deinit(allocator);
+            self.list.clearAndFree(allocator);
+            self.range_count = 0;
+            if (comptime diagnostics_enabled) self.held_records = 0;
+        }
+
+        // Sums every slot's held records, prepared or not, after a pass that grew one: lists
+        // only grow, so a steady pass leaves the sum as it was.
+        fn recountHeld(self: *Self) void {
+            var held: usize = 0;
+            for (self.list.items) |*slot| held += slot.value.held();
+            self.held_records = held;
+        }
+
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.release(allocator);
+            self.* = undefined;
+        }
+    };
 }
 
 /// How many of a stage's scratch capacities differ between two snapshots taken in the same
@@ -1907,7 +2030,9 @@ fn inlineProfile(request: AdaptiveWorkRequest) AdaptiveWorkProfile {
     };
 }
 
-fn rangeForIndex(item_count: usize, items_per_range: usize, range_index: usize) ParallelRange {
+/// Range `range_index` of `item_count` items at `items_per_range`; callers pass an index
+/// below `rangeCount(item_count, items_per_range)`.
+pub fn rangeForIndex(item_count: usize, items_per_range: usize, range_index: usize) ParallelRange {
     const start = range_index * items_per_range;
     return .{
         .index = range_index,
@@ -2567,6 +2692,169 @@ test "stage threads with workers is null with no worker or a zero worker cap" {
     try std.testing.expectEqual(@as(?usize, 8), stage.items_per_range);
     try std.testing.expectEqual(@as(?usize, 1), stage.max_worker_threads);
     try std.testing.expect(!stage.adaptive and stage.tuner == &tuner);
+}
+
+// A data-dependent range output: item i writes `copies[i]` copies of i, counting the ones
+// past its capacity.
+const CopySlot = struct {
+    pub const Context = void;
+    pub const max_passes = 2;
+
+    out: std.ArrayList(u32) = .empty,
+    need: usize = 0,
+
+    pub fn reserve(self: *CopySlot, allocator: std.mem.Allocator, records: usize, _: void) error{OutOfMemory}!bool {
+        if (self.out.capacity >= records) return false;
+        try self.out.ensureTotalCapacity(allocator, records);
+        return true;
+    }
+
+    pub fn clear(self: *CopySlot) void {
+        self.out.clearRetainingCapacity();
+        self.need = 0;
+    }
+
+    pub fn grow(self: *CopySlot, allocator: std.mem.Allocator, _: void) error{OutOfMemory}!bool {
+        if (self.need <= self.out.capacity) return false;
+        try self.out.ensureTotalCapacity(allocator, self.need);
+        return true;
+    }
+
+    pub fn held(self: *const CopySlot) usize {
+        return self.out.capacity;
+    }
+
+    pub fn deinit(self: *CopySlot, allocator: std.mem.Allocator) void {
+        self.out.deinit(allocator);
+    }
+
+    fn append(self: *CopySlot, value: u32) void {
+        self.need += 1;
+        if (self.out.items.len < self.out.capacity) self.out.appendAssumeCapacity(value);
+    }
+};
+
+const CopyJob = struct {
+    copies: []const usize,
+    slots: []PaddedSlot(CopySlot),
+};
+
+fn copyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *CopyJob = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < job.slots.len);
+    const slot = &job.slots[range.index].value;
+    for (range.start..range.end) |item| {
+        for (0..job.copies[item]) |_| slot.append(@intCast(item));
+    }
+}
+
+// Every range's output in range order, as one inline range writes it.
+fn expectCopiesInOrder(copies: []const usize, slots: []const PaddedSlot(CopySlot)) !void {
+    var item: usize = 0;
+    var written: usize = 0;
+    for (slots) |slot| {
+        for (slot.value.out.items) |value| {
+            while (written == copies[item]) {
+                item += 1;
+                written = 0;
+            }
+            try std.testing.expectEqual(@as(u32, @intCast(item)), value);
+            written += 1;
+        }
+    }
+    while (item < copies.len and written == copies[item]) {
+        item += 1;
+        written = 0;
+    }
+    try std.testing.expectEqual(copies.len, item);
+}
+
+test "RangeSlots prepares each range at the per-item bound of its selection" {
+    var set: RangeSlots(CopySlot) = .{};
+    defer set.deinit(std.testing.allocator);
+    const bound = 3;
+    const inline_shape = StageShape.select(null, 10, 4);
+    try std.testing.expect(try set.prepare(std.testing.allocator, inline_shape, 10, bound, {}));
+    try std.testing.expectEqual(@as(usize, 1), set.slots().len);
+    try std.testing.expect(set.slots()[0].value.out.capacity >= bound * 10);
+    // Ranges of 4, 4, and 2 items.
+    const split = StageShape{ .items_per_range = 4, .range_count = 3 };
+    _ = try set.prepare(std.testing.allocator, split, 10, bound, {});
+    for (set.slots(), [_]usize{ 4, 4, 2 }) |slot, covered| try std.testing.expect(slot.value.out.capacity >= bound * covered);
+    try std.testing.expect(!try set.prepare(std.testing.allocator, split, 10, bound, {}));
+    try std.testing.expect(!try set.prepare(std.testing.allocator, inline_shape, 10, bound, {}));
+}
+
+test "RangeSlots replays an overflowing range to the inline reference and records no tuner sample" {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    var copies: [16]usize = @splat(1);
+    // The third range of four items writes far past one record per item.
+    copies[9] = 400;
+    var tuner = AdaptiveWorkTuner.init(.{});
+    // Settled on two workers at 4-item ranges: a tuner-active threaded selection, the one
+    // shape whose untuned replay shapes from different inputs than its selection.
+    var threaded_tuner = AdaptiveWorkTuner.init(.{ .threaded_batch_ns = 0, .nudge_samples = std.math.maxInt(usize) });
+    pinSettledThreadedProfile(&threaded_tuner, .{ .worker_threads = 2, .items_per_range = 4 });
+    const stages = [_]Dispatch{
+        Dispatch.init(&threads, &tuner, .{ .items_per_range = 4, .adaptive = false }),
+        Dispatch.init(&threads, &tuner, .{}),
+        Dispatch.init(&threads, &threaded_tuner, .{}),
+    };
+    for (stages, 0..) |stage, stage_index| {
+        var set: RangeSlots(CopySlot) = .{};
+        defer set.deinit(std.testing.allocator);
+        const shape = StageShape.select(stage, copies.len, 4);
+        if (stage_index == 2) {
+            try std.testing.expect(shape.selection.?.active_tuner != null);
+            try std.testing.expectEqual(@as(usize, 4), shape.range_count);
+        }
+        _ = try set.prepare(std.testing.allocator, shape, copies.len, 1, {});
+        var job = CopyJob{ .copies = &copies, .slots = set.slots() };
+        const samples = .{ tuner.sample_count, threaded_tuner.sample_count };
+        const replay = try set.run(std.testing.allocator, stage, shape, copies.len, 4, {}, &job, copyJob);
+        try std.testing.expectEqual(samples[0], tuner.sample_count);
+        try std.testing.expectEqual(samples[1], threaded_tuner.sample_count);
+        try std.testing.expect(replay.replayed);
+        try std.testing.expectEqual(shape.range_count, replay.batch.range_count);
+        try expectCopiesInOrder(&copies, set.slots());
+    }
+}
+
+// Settles `tuner` on `profile` with no count shift able to reshape it.
+fn pinSettledThreadedProfile(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void {
+    tuner.phase = .settled;
+    tuner.has_threaded_profile = true;
+    tuner.current_profile = profile;
+    tuner.candidate_profile = null;
+    tuner.learned_item_count = std.math.maxInt(usize) / 256;
+    tuner.config.item_count_reset_percent = std.math.maxInt(u8);
+}
+
+test "RangeSlots with no dispatch runs one inline range" {
+    var set: RangeSlots(CopySlot) = .{};
+    defer set.deinit(std.testing.allocator);
+    const copies = [_]usize{ 2, 0, 300, 1 };
+    const shape = StageShape.select(null, copies.len, 1);
+    _ = try set.prepare(std.testing.allocator, shape, copies.len, 1, {});
+    var job = CopyJob{ .copies = &copies, .slots = set.slots() };
+    const replay = try set.run(std.testing.allocator, null, shape, copies.len, 1, {}, &job, copyJob);
+    try std.testing.expect(replay.batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 1), replay.batch.range_count);
+    try std.testing.expect(replay.replayed);
+    try expectCopiesInOrder(&copies, set.slots());
+}
+
+test "RangeSlots release frees every slot and the set prepares again" {
+    var set: RangeSlots(CopySlot) = .{};
+    defer set.deinit(std.testing.allocator);
+    const split = StageShape{ .items_per_range = 4, .range_count = 3 };
+    _ = try set.prepare(std.testing.allocator, split, 10, 2, {});
+    set.release(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), set.list.capacity);
+    try std.testing.expectEqual(@as(usize, 0), set.slots().len);
+    try std.testing.expect(try set.prepare(std.testing.allocator, split, 10, 2, {}));
+    try std.testing.expect(set.slots()[0].value.out.capacity >= 8);
 }
 
 test "adaptive work tuner aligns and clamps selected items_per_range" {

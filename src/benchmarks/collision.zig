@@ -19,9 +19,18 @@
 //! pair, and in a fixed threaded case one broadphase range per aligned range of entries.
 //! `collision` also checks the pair-bound flag counts, untimed, on systems apart from the measured one: reserved to a
 //! quarter of the grid's bodies, every step on the case's dispatch path is flagged and
-//! counted once; and a broadphase slot that outgrows its reserve inside the total bound
-//! (a fixed four-range cluster on two workers) flags and counts its replayed step once and
-//! the next step not at all.
+//! counted once; and a broadphase slot that outgrows its prepared pairs inside the total
+//! bound (a fixed four-range cluster on two workers) counts one replay in the broadphase
+//! set, flags no step, and the next step replays nothing. Every measured step adds no
+//! pair- or entry-bound overflow, and a range slot set grows or replays only on a step
+//! whose stage changed its shape from the step before (a retune). Every measured
+//! group's `--details` prints `slot_records=`: the broadphase and static query range slots'
+//! held pairs over their items' pair bound, and the most ranges each set prepared; each is
+//! asserted at most 2 * H(ranges) (the grow-only slots' bound over every shape they
+//! followed) on a set that never replayed, past the seam's slot 0 on a reserved system;
+//! `static_hit_rows=` the static query slots' hit rows (each asserted at most the widest
+//! query's grown rows or one alignment window's pairs) and their bytes, beside the set's
+//! held pairs and their bytes; and `slot_growth=` each set's prepare growths and replays.
 //!
 //! The static groups hold the item count of one-tile statics on a two-tile pitch, so the
 //! world grows with the static count, plus a fixed 2,048 dynamic bodies, half of them
@@ -511,7 +520,8 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 // The pair-bound flag counts, untimed, on systems apart from the measured one. Through the
 // case's thread system and controls, a reserve to a quarter of the dense grid's bodies sits
 // below its candidates: every step is flagged and counted once. Then a broadphase slot that
-// outgrows its reserve inside the total bound flags its step (`checkSlotReplayFlag`).
+// outgrows its prepared pairs inside the total bound counts in its set
+// (`checkSlotReplayCounted`).
 fn checkPairBoundFlags(allocator: std.mem.Allocator, io: std.Io, case: suite.BenchmarkCase, data: *DataSystem) !void {
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
@@ -531,7 +541,7 @@ fn checkPairBoundFlags(allocator: std.mem.Allocator, io: std.Io, case: suite.Ben
         if (stats.candidate_pair_count <= system.reserved_pair_bound) return error.CollisionBoundFixtureInsideBound;
         if (!stats.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != step + 1) return error.CollisionPastBoundStepNotFlagged;
     }
-    try checkSlotReplayFlag(allocator, io);
+    try checkSlotReplayCounted(allocator, io);
 }
 
 // A body with `box`'s bounds and no collision response.
@@ -542,13 +552,14 @@ fn addBoxBody(data: *DataSystem, x: f32, y: f32, w: f32, h: f32) !void {
 }
 
 // 64 bodies at a 64-body reserve (256-pair bound, 128-entry bound), four broadphase ranges
-// of 16 entries: slot 2 holds 4 * ceil(128 / 3) = 172 pairs. Ranges 0 and 1 are 32
+// of 16 entries: slot 2 is prepared for 4 * 16 = 64 pairs. Ranges 0 and 1 are 32
 // isolated bodies; range 2 is 16 wide bodies that all overlap (120 pairs) and the four
 // narrow bodies of range 3 they cover in y (64 pairs): 184, past slot 2 but inside the
-// total bound. The slot grows and the broadphase replays: one flagged, counted step. The
-// grown slot then holds the cluster, so the next step is not flagged. The four ranges run on
-// two workers of its own thread system, whatever the case's.
-fn checkSlotReplayFlag(allocator: std.mem.Allocator, io: std.Io) !void {
+// total bound. The slot grows and the broadphase replays once, counted by the broadphase
+// set and never as a pair-bound overflow. The grown slot then holds the cluster, so the
+// next step replays nothing. The four ranges run on two workers of its own thread system,
+// whatever the case's.
+fn checkSlotReplayCounted(allocator: std.mem.Allocator, io: std.Io) !void {
     var threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 2 });
     defer threads.deinit();
     const body_count: usize = 64;
@@ -567,9 +578,11 @@ fn checkSlotReplayFlag(allocator: std.mem.Allocator, io: std.Io) !void {
     const replayed = try system.update(&data, &contacts, &threads, config);
     if (replayed.candidate_pair_count != 120 + 64 or replayed.candidate_pair_count > system.reserved_pair_bound) return error.CollisionReplayFixtureMismatch;
     if (replayed.perf.broadphase_batch.range_count != 4 or replayed.perf.broadphase_batch.ran_inline) return error.CollisionReplayFixtureMismatch;
-    if (!replayed.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 1) return error.CollisionSlotReplayNotFlagged;
+    if (system.broadphase_slots.replays != 1) return error.CollisionSlotReplayNotCounted;
+    if (replayed.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 0) return error.CollisionSlotReplayFlaggedPairBound;
     const settled = try system.update(&data, &contacts, &threads, config);
-    if (settled.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 1) return error.CollisionGrownSlotFlagged;
+    if (system.broadphase_slots.replays != 1) return error.CollisionGrownSlotReplayed;
+    if (settled.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 0) return error.CollisionGrownSlotFlagged;
 }
 
 // Contacts of `count` bodies in `mode`: a dense body overlaps its row, column, and diagonal
@@ -1664,16 +1677,14 @@ const StaticSeam = struct {
     }
 
     // Two untimed collision steps on the pipeline after its trigger seams, at the world's
-    // strips and the case's controls (`PipelineSeam.collisionStep`). The first may count a
-    // one-off slot growth (a wide dynamic's static query slot); the second counts no
-    // pair-bound overflow. Every step checks its stored and dynamic contacts against the
-    // contact bound init's reserve and the seams declared, so that bound covers the stored
-    // pairs.
+    // strips and the case's controls (`PipelineSeam.collisionStep`): neither counts a
+    // pair-bound overflow (a wide dynamic's static query hit rows grow in their set). Every
+    // step checks its stored and dynamic contacts against the contact bound init's reserve
+    // and the seams declared, so that bound covers the stored pairs.
     fn checkStoredPairsInBound(self: *StaticSeam, data: *const DataSystem, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !void {
         const collision = &self.seam.pipeline.collision;
-        _ = try self.seam.collisionStep(data, &self.world, thread_system, case);
         const before = collision.perf.pair_bound_overflows;
-        _ = try self.seam.collisionStep(data, &self.world, thread_system, case);
+        for (0..2) |_| _ = try self.seam.collisionStep(data, &self.world, thread_system, case);
         if (collision.perf.pair_bound_overflows != before) return error.TriggerSeamPairBoundOverflowed;
     }
 };
@@ -1774,14 +1785,18 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (inputs.reserved_cold_growth) {
         try system.reserve(data.movementBodySliceConst().entities.len);
         const cold = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
-        // A broadphase inside its bound cannot flag the step, so the flag is the static
-        // slot's growth, kept through the later broadphase.
         if (cold.candidate_pair_count > system.reserved_pair_bound) return error.CollisionColdBroadphaseOutgrewBound;
-        if (!cold.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 1) return error.CollisionColdSlotGrowthNotFlagged;
+        // The wide dynamic's static query outgrows its slot's hit rows: one replay in the
+        // static set, inside the pair bound.
+        if (system.static_slots.replays != 1 or system.static_sizing.hit_rows == 0) return error.CollisionColdSlotGrowthNotCounted;
+        if (cold.perf.pair_bound_exceeded or system.perf.pair_bound_overflows != 0) return error.CollisionColdSlotGrowthFlaggedPairBound;
     }
     var warm = suite.Warmup.init(options, case, 0);
+    // The last step's range slot shapes, which a measured step's slot growth must differ from.
+    var slot_shapes: ?[slot_set_count]SlotShape = null;
     while (warm.next(stageTunersSettled(system))) {
-        _ = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
+        const warm_stats = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
+        slot_shapes = slotShapes(system, warm_stats);
     }
     const fill_settled_before_measurement = case.adaptive and suite.tunerSettled(&system.fill_tuner);
     const sort_settled_before_measurement = case.adaptive and suite.tunerSettled(&system.sort_tuner);
@@ -1791,7 +1806,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_collision_stats = CollisionStats{};
     var main_total: u128 = 0;
-    // A warm system grows no slot or bound past its reserve again.
+    // A warm system grows no bound past its reserve again.
     const warm_overflows = .{ system.perf.entry_bound_overflows, system.perf.pair_bound_overflows };
     // A warm mover's sync rewrites its two chunks in place: no row or payload growth.
     const warm_collider_grows = if (inputs.mover) |static_mover| static_mover.grows() else .{ 0, 0 };
@@ -1801,9 +1816,13 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var splice_stages = suite.StageShapes(1){};
     const stage_range = case.stageItemsPerRange(collision_range_alignment_items);
     for (0..options.iterations) |_| {
+        const step_slot_growth = slotGrowth(system);
         const start_ns = suite.nowNs(io);
         last_collision_stats = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
         const end_ns = suite.nowNs(io);
+        const step_slot_shapes = slotShapes(system, last_collision_stats);
+        try checkSlotGrowthAtRetune(step_slot_growth, slotGrowth(system), slot_shapes, step_slot_shapes);
+        slot_shapes = step_slot_shapes;
         if (inputs.swept_bodies) |bodies| std.debug.assert(last_collision_stats.body_count == bodies);
         if (inputs.one_strip_per_body) std.debug.assert(last_collision_stats.entry_count == last_collision_stats.body_count);
         const perf = last_collision_stats.perf;
@@ -1841,6 +1860,8 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         .simd_groups = last_collision_stats.broadphase_simd_groups,
     };
     writeStaticStageDetails(&stats.details, &static_stages);
+    try checkSlotRecords(&stats.details, system, last_collision_stats.entry_count);
+    writeSlotGrowth(&stats.details, slotGrowth(system));
     if (inputs.mover) |static_mover| {
         var splice_buffer: [48]u8 = undefined;
         const grows = static_mover.grows();
@@ -1864,6 +1885,108 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         if (quiet.contact_count != last_collision_stats.contact_count) return error.CollisionQuietStepChangedContacts;
     }
     return stats;
+}
+
+// The broadphase and static query range slots' held pairs over their items' pair bound
+// (`slot_records=`), and the most ranges each set prepared. A slot that only `prepare`
+// sized holds at most its largest prepared range's bound with geometric slack, and range r
+// of any shape covers at most 1/(r + 1) of the items: each ratio is at most 2 * H(ranges).
+// A replay grows a slot to its range's counted need instead, past that bound by design, so
+// a set that replayed prints `replayed` and is not asserted. On a reserved system slot 0
+// is the seam's, sized to the population capacity, so the ratio counts the other slots.
+// Then the static query slots' hit rows (`static_hit_rows=`): each slot holds at most the
+// widest query's grown rows (`static_sizing.hit_rows`) or the rows `reserve` gives one
+// query, one alignment window's pairs.
+fn checkSlotRecords(details: *suite.DetailLines, system: *const CollisionSystem, entry_count: usize) !void {
+    const sets = .{
+        .{ "broad", &system.broadphase_slots, entry_count },
+        .{ "static", &system.static_slots, system.proxies.len },
+    };
+    details.print("slot_records=", .{});
+    inline for (sets) |set| {
+        const slots = set[1];
+        const seam_slot: u64 = if (system.reserved_pair_bound != 0 and slots.list.items.len != 0) slots.list.items[0].value.held() else 0;
+        const held: f64 = @floatFromInt(slots.held_records - seam_slot);
+        const bound: f64 = @floatFromInt(CollisionSystem.estimateContactCapacity(@max(set[2], 1)));
+        const ratio = held / bound;
+        const ranges = slots.list.items.len;
+        const limit = 2 * harmonic(ranges);
+        details.print("{s}:{d:.2}/{d:.2}(ranges={}{s}) ", .{ set[0], ratio, limit, ranges, if (slots.replays != 0) ",replayed" else "" });
+        if (slots.replays == 0 and set[2] != 0 and ratio > limit) return error.CollisionSlotRecordsPastBound;
+    }
+    details.print("\n", .{});
+    const query_rows = @max(system.static_sizing.hit_rows, CollisionSystem.estimateContactCapacity(collision_range_alignment_items));
+    var rows: usize = 0;
+    var bytes: usize = 0;
+    var widest: usize = 0;
+    for (system.static_slots.list.items) |*slot| {
+        const hits = &slot.value.hits;
+        if (hits.capacity > query_rows) return error.CollisionStaticHitRowsPastWidestQuery;
+        rows += hits.capacity;
+        bytes += @TypeOf(hits.*).capacityInBytes(hits.capacity);
+        widest = @max(widest, hits.capacity);
+    }
+    const pair_bytes = system.static_slots.held_records * @sizeOf(std.meta.Child(@TypeOf(system.static_pairs.items)));
+    details.print("static_hit_rows={} bytes={} slot_max={} grown_rows={} (pairs held={} bytes={})\n", .{ rows, bytes, widest, system.static_sizing.hit_rows, system.static_slots.held_records, pair_bytes });
+}
+
+// Collision's range slot sets: spill, broadphase, static query, trigger patch and rebuild.
+const slot_set_count = 5;
+const slot_set_names = [slot_set_count][]const u8{ "spill", "broad", "static", "trigger_patch", "trigger_rebuild" };
+
+// One set's prepares that allocated and its replays.
+const SlotGrowth = struct { prepare_grows: u64, replays: u64 };
+
+// The ranges a set's stage last dispatched.
+const SlotShape = struct { range_count: usize, items_per_range: usize };
+
+fn slotGrowth(system: *const CollisionSystem) [slot_set_count]SlotGrowth {
+    return .{
+        .{ .prepare_grows = system.spill_slots.prepare_grows, .replays = system.spill_slots.replays },
+        .{ .prepare_grows = system.broadphase_slots.prepare_grows, .replays = system.broadphase_slots.replays },
+        .{ .prepare_grows = system.static_slots.prepare_grows, .replays = system.static_slots.replays },
+        .{ .prepare_grows = system.trigger_patch_slots.prepare_grows, .replays = system.trigger_patch_slots.replays },
+        .{ .prepare_grows = system.trigger_rebuild_slots.prepare_grows, .replays = system.trigger_rebuild_slots.replays },
+    };
+}
+
+// The shape each set's stage dispatched in the step `stats` reports (the trigger queries'
+// from the system's last seam records).
+fn slotShapes(system: *const CollisionSystem, stats: CollisionStats) [slot_set_count]SlotShape {
+    const batches = [slot_set_count]BatchStats{
+        stats.perf.fill_batch,
+        stats.perf.broadphase_batch,
+        stats.perf.static_pairs_batch,
+        system.perf.trigger_query_batch,
+        system.perf.trigger_rebuild_query_batch,
+    };
+    var shapes: [slot_set_count]SlotShape = undefined;
+    for (batches, &shapes) |batch, *shape| shape.* = .{ .range_count = batch.range_count, .items_per_range = batch.items_per_range };
+    return shapes;
+}
+
+// A measured step's range slots grow or replay only at a retune: a set whose stage kept the
+// last step's shape held every range's need already. A warm system's first measured step
+// with no warm step before it has no shape to keep.
+fn checkSlotGrowthAtRetune(before: [slot_set_count]SlotGrowth, after: [slot_set_count]SlotGrowth, last_shapes: ?[slot_set_count]SlotShape, shapes: [slot_set_count]SlotShape) !void {
+    const last = last_shapes orelse return;
+    for (before, after, last, shapes) |old, new, last_shape, shape| {
+        if (std.meta.eql(old, new)) continue;
+        if (std.meta.eql(last_shape, shape)) return error.CollisionSlotsGrewAtAKeptShape;
+    }
+}
+
+fn writeSlotGrowth(details: *suite.DetailLines, growth: [slot_set_count]SlotGrowth) void {
+    details.print("slot_growth=", .{});
+    for (slot_set_names, growth) |name, set| details.print("{s}:{}/{} ", .{ name, set.prepare_grows, set.replays });
+    details.print("(prepare_grows/replays)\n", .{});
+}
+
+// The harmonic number H(n), 0 at n = 0.
+fn harmonic(n: usize) f64 {
+    var sum: f64 = 0;
+    for (1..n + 1) |k| sum += 1 / @as(f64, @floatFromInt(k));
+    return sum;
 }
 
 // The measured steps' static query, Debug rect compare, static sort, and stored-trigger

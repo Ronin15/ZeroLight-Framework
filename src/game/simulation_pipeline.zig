@@ -1073,9 +1073,10 @@ pub const SimulationPipeline = struct {
     /// `collision.reserve` sizes the collision stores to (dynamic contacts are a subset of
     /// candidate pairs, triggers of contacts), plus the stored trigger contacts `reserve` or
     /// the commit seam declared (`collision.reserved_trigger_bound`). Every scene within
-    /// that bound runs `collision_detect` and `collision_respond` allocation-free under
-    /// every partition; past it the main-thread grow paths run, counted by the collision
-    /// system's `pair_bound_overflows`. Grow-only.
+    /// that bound runs `collision_respond`, and `collision_detect` apart from its range
+    /// slots (prepared before each dispatch from its partition), allocation-free under every
+    /// partition; past it the main-thread grow paths run, counted by the collision system's
+    /// `pair_bound_overflows`. Grow-only.
     fn reserveContactStreams(self: *SimulationPipeline, frame: *SimulationFrame) !void {
         try self.reserveContactStreamsFor(frame, self.collision.reserved_trigger_bound);
     }
@@ -1986,6 +1987,7 @@ const data_test_support = @import("data_system/test_support.zig");
 const pathfinding_test_support = @import("systems/pathfinding/test_support.zig");
 
 const static_colliders_test_support = @import("systems/static_colliders_test_support.zig");
+const collision_test_support = @import("systems/collision_test_support.zig");
 
 test "stageContract(.ai_decide) reads affect_drives, written by affect_update one stage earlier" {
     const contract = stageContract(.ai_decide);
@@ -3744,8 +3746,9 @@ fn addContactChainBodies(data: *DataSystem, first: usize, end: usize, mode: Coll
 /// the collision pair bound (4 per body of capacity) through `reserve` and the seam, so a
 /// population that fills its grown capacity at ~2 contacts per body runs
 /// `collision_detect` and `collision_respond` on a real 2-worker partition with every
-/// allocator failing. `mode` picks the response path: `.solid` emits two intents per
-/// contact, `.trigger` one trigger event per contact.
+/// allocator failing but collision's, whose stores hold their capacities and which
+/// allocates only its range slots. `mode` picks the response path: `.solid` emits two
+/// intents per contact, `.trigger` one trigger event per contact.
 fn runContactBoundScenario(mode: CollisionResponseMode) !void {
     var world = try minimalSyncWorld();
     defer world.deinit();
@@ -3796,14 +3799,22 @@ fn runContactBoundScenario(mode: CollisionResponseMode) !void {
     pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
     const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
     frame.beginStep();
+    // Collision prepares its range slots for the step's partition; its stores and every
+    // other owner, the contact stream and the response included, hold the bound from the
+    // seam.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var collision_counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var allocators = TestAllocatorSwap.uniform(failing.allocator());
+    allocators.collision = collision_counter.allocator();
     var swap: TestAllocatorSwap = .{};
-    swap.install(targets, .uniform(failing.allocator()));
+    const collision_stores = collision_test_support.storeCapacities(&pipeline.collision);
+    swap.install(targets, allocators);
     const result = pipeline.update(context);
     swap.restore(targets);
     const stats = try result;
 
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqualSlices(usize, &collision_stores, &collision_test_support.storeCapacities(&pipeline.collision));
     try std.testing.expectEqual(@as(usize, 3 * (2 * 21 - 3)), stats.collision.contact_count);
     try std.testing.expect(stats.collision.contact_count > population);
     try std.testing.expectEqual(stats.collision.contact_count, stats.collision_response.contact_count);
@@ -6628,6 +6639,7 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     frame.beginStep();
     var counters = TestAllocatorCounters.init();
     var counting_swap: TestAllocatorSwap = .{};
+    const collision_stores = collision_test_support.storeCapacities(&pipeline.collision);
     if (prove_zero_alloc) counting_swap.install(targets, counters.allocators());
     const first_result = pipeline.update(context);
     if (prove_zero_alloc) counting_swap.restore(targets);
@@ -6636,24 +6648,41 @@ fn runPopulationGrowthScenario(max_worker_threads: usize, prove_zero_alloc: bool
     // 5 observers' stagger phases cover all four, so every step thinks at least one.
     try std.testing.expect(pipeline.perception.rows.len >= 1);
     try std.testing.expect(pipeline.affect.rows.len >= 1);
-    // The seam reserved every capacity for every partition (per-range
-    // outputs are item-count windows, tallies and broadphase slots are reserved to
-    // `maxRangeCount`), so the first post-growth step allocates nothing on any owner.
-    if (prove_zero_alloc) try counters.expectOnlyOwnersAllocated(&.{});
+    // The seam reserved every window output and per-range record for every partition and
+    // warmed collision's inline range slots, so the first post-growth step allocates
+    // nothing on any owner but collision's range slots, which it prepares for a threaded
+    // partition before dispatch.
+    if (prove_zero_alloc) {
+        if (max_worker_threads > 0) try counters.expectOnlyOwnersAllocated(&.{"collision"}) else try counters.expectOnlyOwnersAllocated(&.{});
+        try std.testing.expectEqualSlices(usize, &collision_stores, &collision_test_support.storeCapacities(&pipeline.collision));
+    }
 
     if (retune) |profile| {
-        // A partition retune to more ranges, with every allocator failing.
+        // A partition retune to more ranges: only collision's range slots allocate, then
+        // the next step at that partition allocates nothing.
         pinPipelineThreadedProfiles(&pipeline, profile);
         frame.beginStep();
-        var retune_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        var retune_counters = TestAllocatorCounters.init();
         var retune_swap: TestAllocatorSwap = .{};
-        if (prove_zero_alloc) retune_swap.install(targets, .uniform(retune_failing.allocator()));
+        if (prove_zero_alloc) retune_swap.install(targets, retune_counters.allocators());
         const retune_result = pipeline.update(context);
         if (prove_zero_alloc) retune_swap.restore(targets);
         _ = try retune_result;
         try std.testing.expect(pipeline.perception.rows.len >= 1);
         try std.testing.expect(pipeline.affect.rows.len >= 1);
-        try std.testing.expectEqual(@as(usize, 0), retune_failing.allocations);
+        if (prove_zero_alloc) {
+            try retune_counters.expectOnlyOwnersAllocated(&.{"collision"});
+            try std.testing.expectEqualSlices(usize, &collision_stores, &collision_test_support.storeCapacities(&pipeline.collision));
+        }
+
+        frame.beginStep();
+        var warm_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        var warm_swap: TestAllocatorSwap = .{};
+        if (prove_zero_alloc) warm_swap.install(targets, .uniform(warm_failing.allocator()));
+        const warm_result = pipeline.update(context);
+        if (prove_zero_alloc) warm_swap.restore(targets);
+        _ = try warm_result;
+        try std.testing.expectEqual(@as(usize, 0), warm_failing.allocations);
     }
 
     // All 24 NPCs step east into their hole this step.
@@ -6696,13 +6725,13 @@ test "population seam grows every pipeline capacity so the next step allocates n
     _ = try runPopulationGrowthScenario(0, true, null);
 }
 
-test "population growth on the multi-worker path allocates nothing on the first step after growth" {
+test "population growth on the multi-worker path allocates only collision's range slots on the first step after growth" {
     _ = try runPopulationGrowthScenario(2, true, null);
 }
 
-test "a partition retune after population growth allocates nothing" {
+test "a partition retune after population growth allocates only collision's range slots, and the next step nothing" {
     // 2 workers at 32-item ranges, then re-pinned to 16-item ranges (2 -> 3 ranges at
-    // 37 bodies): no per-range output warms in-stage on the new partition.
+    // 37 bodies): only collision's data-dependent range slots follow the new partition.
     _ = try runPopulationGrowthScenario(2, true, .{ .worker_threads = 2, .items_per_range = 16 });
 }
 
@@ -6839,11 +6868,11 @@ test "the AI movement intent apply runs on workers in the pipeline, allocation-f
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&serial.velocity_y), std.mem.sliceAsBytes(&threaded.velocity_y));
 }
 
-test "after population growth, ~2 solid contacts per body on the multi-worker path allocate nothing" {
+test "after population growth, ~2 solid contacts per body on the multi-worker path allocate nothing outside collision's range slots" {
     try runContactBoundScenario(.solid);
 }
 
-test "after population growth, ~2 trigger contacts per body on the multi-worker path allocate nothing" {
+test "after population growth, ~2 trigger contacts per body on the multi-worker path allocate nothing outside collision's range slots" {
     try runContactBoundScenario(.trigger);
 }
 
