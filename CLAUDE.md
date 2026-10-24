@@ -40,13 +40,22 @@ Non-trivial Zig design, implementation, review, and debugging goes through the
 `.claude/agents/` specialists. Spawn one with the Agent tool and
 `subagent_type` set to its name. The child does not see this session, so the
 brief file is the whole task. Trivial means a local fix in 1–2 files with no
-design question; the main session may do that inline. The main session
-orchestrates, verifies every agent claim against live code, and reports.
+design question; the main session may do that inline. The main session is
+the coordinator and the second set of eyes on every unit: it keeps the work
+on the agreed goal and order, verifies every agent claim against live code
+and the rules, calls out a direction change to the owner when one is
+needed, answers rule violations and agent questions with the decision
+criteria below, and reports.
 
 - A non-trivial brief names the files in scope, the declarations to read,
   and the change's cost-model questions (what its work and memory grow
   with). Write it to `.claude/reports/<topic>-brief.md`. The spawn prompt
-  cites that path and does not paste the brief.
+  cites that path and does not paste the brief. A brief built on a plan
+  cites the plan and lists only what overrides it, never a restated
+  shorter copy of its steps; bench sizes it names are checked to thread the
+  changed stage before spawning. A review brief names the diff, its
+  sources, and what to check, never the main session's or the author's
+  conclusions.
 - `zig-design-specialist` runs only when a design is open or the existing
   structure fails the cost model, and plans right before implementation,
   against the live code. Local fixes and calls a plan or review triage already
