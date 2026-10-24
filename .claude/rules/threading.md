@@ -38,14 +38,13 @@ How the thread system works: `docs/architecture.md` § Thread System.
   models one pass: one job over one item population. Each pass is a stage
   with its own tuner, so a rebuild and its patch, a place and its sort, and a
   count and its write never share a tuner or a selection, and no production
-  dispatch runs at a fixed shape outside a tuner. A tuner must record often
-  enough to learn: rare one-off passes running the same job (a shrink flush
-  and a rebuild-evict flush) share one one-off tuner instead of each owning
-  one that never settles, and a stage that runs only in another pass's rare
-  phase (a stall round) folds into that pass's sample. A design lists each
-  tuner it adds or removes with its pass, how often it records in play, and
-  why it cannot share; a tuner its benches show never settling is merged or
-  removed. Rounds of one pass over one
+  dispatch runs at a fixed shape outside a tuner. Tuners are planned from
+  the work: list each pass with its job, item population, and how often it
+  records in play; a pass that recurs gets its own tuner, rare one-off passes
+  of one job (a shrink flush and a rebuild-evict flush) share one one-off
+  tuner, and a round that runs only in another pass's rare phase (a stall
+  round) folds into that pass's sample. A tuner its benches show never
+  settling is merged or removed. Rounds of one pass over one
   job are one sample (`RoundDispatch`). Work that is O(1) per item on main,
   or a fixed merge, is not a stage and has no tuner. A step's
   work reaches the tuner as one sample, judged against the gate per dispatch,

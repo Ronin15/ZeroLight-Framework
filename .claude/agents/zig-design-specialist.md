@@ -108,11 +108,9 @@ section with nothing new is omitted.
 - **Stage shape on today's `ThreadSystem`**: each threaded stage fits the
   thread system and tuner as they are, never a change to them (owner). State
   the item unit and why its count tracks the work, with the dispatch figures
-  (`threading.md` § Building a stage). Give a tuner table: each tuner added
-  or removed, its pass, how often it records in play, and why it cannot
-  share (that section's one-off sharing and rare-phase folding apply); a
-  sharing that section forbids, or a dispatch at a fixed shape outside a
-  tuner, fails the plan. Give each threaded pass's work per dispatch at a
+  (`threading.md` § Building a stage). Plan the tuners from the work: a
+  table of each pass (job, item population, how often it records in play)
+  and the tuner it gets under that section, added and removed tuners marked. Give each threaded pass's work per dispatch at a
   small and a typical size against the gate; the tuner decides inline or
   threaded and the batch count; a plan never sets either.
 - **Main-thread and deferred boundaries**: what stays on the main thread and
