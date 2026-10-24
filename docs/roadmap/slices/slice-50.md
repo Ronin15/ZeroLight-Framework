@@ -101,6 +101,9 @@ instances, dispatches through this pool, so its safety is engine-wide.
 - [x] Tuner gate 250 → 60 µs, derived from the measured dispatch floor, with
       the stored-overhead demotion bound and per-half bench tuner sets
       (`58ff9e1`); a winning one-worker first probe climbs up (`65434f7`).
+      The tuner policy since changed to the batch tuner (`83ef090`:
+      upper-bound demotion, no worker-count climb;
+      `docs/architecture.md` § Thread System).
 - [x] Docs: `docs/architecture.md` Thread System (reentrancy and ownership,
       forced inline, foreign-thread panic, worker names);
       `docs/development-workflow.md` "Thread Sanitizer" and the bench group
@@ -137,6 +140,57 @@ instances, dispatches through this pool, so its safety is engine-wide.
 - [x] `zig build verify` passes at the slice tip (27/27 steps, 1,769/1,769 tests).
 - [x] Owner run on Mac: the code runs and compiles (owner).
 - [ ] Owner run on Windows: `zig build test` plus the `thread-dispatch` bench.
+
+### Open items from the batch tuner and diagnostics landings
+
+- [ ] No stage control exists only for tests and benches
+      (`.claude/rules/tests-benchmarks.md` § Test and production code 1).
+      Failure: production passes `.{}` to `WorldGateSystem.apply`
+      (`simulation_pipeline.zig:1896`), so `WorldGateConfig.items_per_range` and
+      `.max_worker_threads` (`world_gate.zig:36`) are set only by tests and
+      benches; the same holds for `MovementConfig` (`movement.zig:20`), chunk
+      derive, and the per-stage worker caps (`StageControls.max_worker_threads`,
+      `thread_system.zig`), each to be audited. Pass: fixed shapes come from
+      bench fixed-shape controls over `StageControls`, no production config
+      field is written by tests or benches alone, and the tuner-pin sites are
+      unchanged in behavior.
+- [ ] The idiom lint flags a production literal `items_per_range` or
+      `max_worker_threads` passed to `Dispatch` outside tests and benches
+      (`tools/lint_idioms.py`).
+- [ ] The 14 `pipeline_*` runtime-log timers are cost-driver stages or move
+      to the bench-only channel. Failure: `runtime_perf_log.zig:170-183`
+      (`pipeline_spatial_index` through `pipeline_chunk_derive`) time whole
+      stage calls, which `.claude/rules/threading.md` § Verification and
+      diagnostics reserves to bench output. Pass: the runtime log records only
+      cost-driver stages; the census reads the rest through `BenchTiming`.
+- [ ] Dig-path batches are tagged in the `production-step` census once a dig
+      case exists. Failure: the terrain edit plan and write dispatches
+      (`world/edit.zig:79-85`) and the nav mark dispatch
+      (`pathfinding/nav_reaction.zig:360-376`) carry no bench batch tag, so a
+      dig step's threading is invisible to the census. Pass: a dig case in
+      `production-step` whose census lists those batches with `ran=` and
+      `threaded=`.
+- [ ] Remaining diagnostic counters that tests read sit behind the perf
+      switch (`.claude/rules/tests-benchmarks.md` § Test and production code 4).
+      Failure: tests read `NavUpdateStats.dirty_chunks`, `.chunks_patched`,
+      `.records_patched` (`pathfinding/types.zig:311-321`), the
+      `PathfindingStats` `*_ns` fields (`:286-304`), and `NavGraph` pool grows.
+      Pass: those reads are bench checks or observable-result asserts.
+      `incremental_rebuilds` and `levels_built` stay live (`nav_reaction.zig:340`
+      emits `nav_region_invalidated` from them).
+- [ ] Rarely-run passes predict a good first shape. Failure:
+      `chunk-scale-nav-level-add` at 2048 tuned is 50% slower than the best
+      fixed control (measured on the batch tuner before the nudge; about 4 dispatches per stage per run, so the tuner cannot
+      learn within a run). Pass: tuned within spread of the best control, or
+      the gap attributed to a fixed cost.
+- [ ] The `movement` 4,096 Debug case against its reference. Failure:
+      tuned 30.5-42.9 us against a base of 29.3-35.0 us (overlapping ranges,
+      Debug, measured at the nudge review). Pass: one 3-rep re-measure on the final tuner reads within
+      spread, or a verdict per `.claude/rules/tests-benchmarks.md`.
+- [ ] A cold first batch seeding the nudge EMA (untested hypothesis). Failure:
+      the world gate at 65,536 (ReleaseFast) settles 1-3 steps below the pool
+      where fixed controls run far finer shapes; the cause is unmeasured. Pass: a measurement of the seed's
+      effect on the settled shape; no change without it.
 
 ### Measured and not pursued
 

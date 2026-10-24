@@ -151,7 +151,11 @@ Designs start here, then read the live structure below (rules:
   is `position_z` / `world_level`, not continuous z motion) and applies the
   step's AI movement intents as a threaded stage.
 - `src/game/systems/world_gate.zig` clamps settled bodies to world bounds and
-  gates them off solid tiles (serial, main thread).
+  gates them off solid tiles as threaded lane batches over the movement rows,
+  then the player row on the main thread. The body box is the collision bounds,
+  mirrored into movement-row columns (offset, size, `has_collision_bounds`,
+  `has_ai_agent`) that only `DataSystem` writes at the commit seam; a player
+  without bounds is neither clamped nor gated.
 - `src/game/systems/plane_entry.zig` owns `PlaneEntrySystem`, plane traversal's
   threaded per-agent cell-entry gather and classification.
 - `src/game/systems/static_colliders.zig` owns `StaticColliderSystem`, the shared
@@ -538,50 +542,78 @@ main's serial work 9–41% from a waiting SMT sibling. The flat wake floor is
 about 6.6 µs + 0.9 µs per worker in ReleaseFast, 8.5 µs at 1 worker to 29.8 µs
 at 23 in Debug (`7946511`).
 
-Adaptive work tuning chooses a complete batch profile: inline or threaded,
-worker threads, and items per claimed range. Worker count and range size remain
-distinct knobs, but `AdaptiveWorkTuner` measures them together so one controller
-owns the decision. The tuner starts inline, records that inline baseline for the
-owning batch, probes a threaded profile when the measured work is expensive
-enough, and only reports a best threaded profile after a threaded candidate wins.
-Each decision reads the median of a short sample window, so one spike or one
-near-free batch never decides alone. A batch outside the learned item-count band
-runs with the current profile without being sampled; a full window of them in a
-row on the same side is a sustained shift, which re-tunes a threaded stage at the
-new count and relearns an inline one; that retune re-bases on the incumbent profile
-at the new count and commits a climb only at the threaded commit margin (5%), while
-the periodic retune keeps the measured best and the 1% margin. A settled
-threaded-to-inline demotion remembers its threaded profile, and the first inline
-window judges it: at or above the gate, with the profile still dispatching threaded
-at that count, the profile is restored at once and the bound rule is suppressed
-until the next retune probe or sustained shift; otherwise the demotion stands. Main
-waiting on workers never demotes a stage. There are no static item-count floors
-(`.claude/rules/threading.md`);
-slower hardware or expensive small-N processors train their own threaded
-profile. The tuner counts closed probe windows and demotions for `--details`
-(`probes=`, `demotes=`); the counters compile to nothing in ReleaseFast and
+Adaptive work tuning is a batch tuner: `AdaptiveWorkTuner` decides inline or
+threaded, and for a threaded stage tunes one value, the batch count; workers
+follow the batches (at most one per batch beyond main, up to the stage's worker
+cap) and are never tuned on their own. A stage hands its tuner its items and
+sets neither (`.claude/rules/threading.md`).
+
+- Learning: a fresh tuner runs inline and records the baseline. A window median
+  below the gate settles inline; at or above it the tuner probes a threaded
+  shape, which commits only when it beats the inline baseline by the 5%
+  threaded commit margin. A lost probe stays inline for
+  `inline_probe_cooldown_windows` settled inline windows (default 120; 0 is
+  none) and halves the batch multiplier for the next probe (floor 0.25). A
+  window holds inline or threaded batches only, and each decision reads the
+  window median (a median-of-3 network at the default window of 3), so one spike
+  or near-free batch never decides alone.
+- Shape: batch count = (pool participants + 1 main) x `batch_multiplier` (start
+  1.0, the full pool), rounded and clamped to at least 2 ranges and at most
+  `maxRangeCount`, each range at least one alignment unit; workers =
+  min(batches - 1, pool). The shape is stored (`current_profile`) and rewritten
+  only when the nudge steps, a probe commits, a restore lands, or an item-count
+  shift reshapes it.
+- Nudge: each threaded batch feeds a throughput EMA (items per ns, alpha 0.15);
+  a sample is clipped to ema x [0.9, 1.1] so one outlier never decides. After 7
+  samples the first step goes to fewer batches (the multiplier divides by 1.1);
+  7 samples after each step the EMA is compared with the pre-step reference. A
+  gain beyond the stepped band, 5% x (1 - 0.85^7) = 3.4% (the EMA still carries
+  the old shape), keeps the direction and steps again; a loss flips the
+  direction and steps from the reference shape; inside the band the tuner holds.
+  A held tuner resumes stepping after 7 samples in a row whose EMA departs the
+  hold reference by more than 5%. Steps are multiplicative (x1.1), clamped to
+  0.25-4.0; a step that leaves the dispatched batch count unchanged keeps
+  stepping, and at a clamp the direction flips and the tuner holds. After a step
+  the multiplier is restated as dispatched ranges / participants. Demotion, a
+  lost probe, a restore's re-decision, and an item-count shift restart the
+  measurement (the EMA reseeds); the multiplier is kept except on a relearn,
+  which resets it to 1.
+- Item-count shift: a batch outside the 25% band of the learned count runs with
+  the current profile without being sampled; a full window in a row on the same
+  side is a sustained shift. A threaded stage keeps its profile, reshapes it
+  from the multiplier at the new count, and re-decides inline or threaded on the
+  next settled window; an inline stage relearns.
+- Demotion: a settled threaded window demotes to inline only when its median of
+  (batch duration x that batch's participants), an upper bound on the inline
+  cost, is below the gate. The demoted threaded profile is remembered and the
+  first inline window judges it: at or above the gate, with the profile still
+  dispatching threaded at that count, it is restored at once and the bound rule
+  is suppressed until a sustained item-count shift or a relearn; otherwise the
+  demotion stands and the cooldown applies. Main waiting on workers never
+  demotes a stage.
+- No timer re-probe: a settled stage re-tunes only on evidence (a sustained
+  item-count shift, a sustained 5% throughput departure while holding), never on
+  elapsed windows (`.claude/rules/threading.md`).
+- One-off first selection: a tuner built with `first_selection = .full_pool`
+  (`rebuild_tuner_config`: a world-create or static-collider rebuild whose first
+  batch is too large for main) dispatches its first batch on the full pool at 2
+  batches per participant (measured against 1 and 4 on the rebuild and
+  world-create benches); no nudge follows a one-off.
+
+There are no static item-count floors (`.claude/rules/threading.md`); slower
+hardware or expensive small-N processors train their own shape. The tuner counts
+closed probe windows and demotions for `--details` (`probes=`, `demotes=`) and
+also restores and skipped out-of-band batches (`restore_count`,
+`shift_skip_count`); the counters compile to nothing in ReleaseFast and
 ReleaseSmall and no policy reads them.
 
-The gate, `threaded_batch_ns` (60 µs), is a probe floor: an inline window
-median below it settles inline without probing, and it bounds demotion and
-restore. It never decides that threading wins; that is measured on the host,
-where a first threaded profile commits only at the 5% commit margin.
-Derivation (`58ff9e1`): break-even is T ≥ F / (0.95 − 1/P) for dispatch floor
-F at P participants, and 60 µs is twice the measured Debug full-pool floor, so
-a batch at the gate clears the margin at every worker count.
-
-A settled threaded window demotes when its inline estimate,
-(window − stored overhead) × P, is below the gate. The stored overhead is
-what the profile measured when it settled: its best mean minus the inline
-model's work split over P, clamped at 0. With none stored for the sampled
-profile the estimate is window × P, an upper bound. It clears on demote,
-restore, relearn, and a sustained item-count shift.
-
-A probe starts at the predicted worker count and climbs one worker at a time,
-descending first: a win continues from the new best, a loss reverses once
-from the best, then the tuner settles. A one-worker prediction climbs up
-instead, unless a wider threaded best exists; then it descends, so a losing
-one-worker retune probe reverses upward from the best.
+The gate, `threaded_batch_ns` (60 µs), is a probe floor: an inline window median
+below it settles inline without probing, and it bounds demotion and restore. It
+never decides that threading wins; that is measured on the host, where a first
+threaded profile commits only at the 5% commit margin. Derivation (`58ff9e1`):
+break-even is T ≥ F / (0.95 − 1/P) for dispatch floor F at P participants, and
+60 µs is twice the measured Debug full-pool floor, so a batch at the gate clears
+the margin at every worker count.
 
 Reported `worker_threads` counts are background worker threads only; the main
 thread is not included in that count and may also process ranges while waiting

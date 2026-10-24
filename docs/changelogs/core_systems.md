@@ -155,6 +155,41 @@ labelled.
   stable total-order sorts become `pdq`, tie-holding ones keep `std.mem.sort`.
   `perception` at 2,048: serial 2.62 → 2.26 ms; tuned within noise.
 
+## Thread System And World Gate
+
+- `f1fb2bd`: every stored diagnostic `BatchStats` sits behind its owner's perf
+  switch (collision, triggers, static colliders, scope, nav update, pathfinding,
+  connectivity, resize copy); tuners keep their samples as locals, tests read
+  none, and the bench build reads them through new dispatch checks (listed in
+  `docs/development-workflow.md` § Benchmarks). An update-path trigger rebuild
+  left the patch query record stale; it now clears it.
+- `f59cf3b`: the `production-step` census records every per-step dispatch
+  (bench batch tags, `BatchAggregate` min/max items), a bench-only stage-timer
+  channel (`BenchTiming`) keeps stage timing out of the runtime log, and every
+  case runs the same pre-measure steps. Debug, 16,384 tuned: `untimed`
+  13-20% to 0%.
+- `f0adc9a`: the world gate's bounds clamp and tile gate run as threaded lane
+  batches over movement rows on the collision bounds (mirrored into movement
+  columns by `DataSystem`); the player row runs on main after the join. Debug,
+  16,384 tuned step 5.13 to 3.60 ms; clamp on main 1.84 ms to 2.8 us.
+  `world-gate` serial +25% Debug, -36% ReleaseFast (lane lowering in Debug).
+- `60d7078`: the timer re-probe is removed; a settled stage re-tunes only on
+  evidence. The inline probe cooldown keeps its own field
+  (`inline_probe_cooldown_windows`). Nothing slower beyond spread (Debug).
+- `83ef090`: the tuner is a batch tuner: it tunes the batch count with a
+  continuous nudge, workers follow the batches, and demotion uses the upper
+  bound only (`docs/architecture.md` § Thread System). Debug, 3,003-step
+  `production-step` 16,384: 0 demote/restore pairs (base 13-15), steps 100+
+  median 3.21-3.39 ms (base 3.29-3.39). ReleaseFast, 65,536: steps 100+ median
+  1.394 ms (base 1.474), steps over 2.5 ms 3 (9). ReleaseFast `thread-dispatch`
+  1M 65.3 to 59.3 us; `movement` 262k 35.2 to 49.3 us and `world-gate` 65k
+  167 to 193 us (ranges overlap). Open: `world-gate` 65,536 ReleaseFast tuned
+  +31-44% over fixed controls (`slice-35.md`). `thread-adaptive-fixed-range`
+  removed from the benches.
+- `d359430`: rules: thread-policy changes get a ReleaseFast run, unsettled
+  tuned cases are rerun, layout findings in new code are fixed in their
+  landing.
+
 ## Other Changes
 
 - `7ee55b0`: `chunk-scale-nav-level-add` charges one open added level, not
@@ -277,3 +312,9 @@ labelled.
 - `b40c71e` Slice 71A: stimulus pools grow and over-budget stimuli defer
 - `908ac83` Comments: trim module docs to their contracts
 - `ad67f3c` Agents: docs-specialist on Sonnet writes docs commits and roadmap routing
+- `f1fb2bd` Diagnostics: batch records sit behind each owner's perf switch; tests never read them.
+- `f59cf3b` Benches, perf: the production-step census records every dispatch and both cases measure one state.
+- `f0adc9a` World gate: the bounds clamp and tile gate run as threaded lane batches over movement rows.
+- `60d7078` Tuner: no timer re-probe; a settled stage re-tunes only on evidence.
+- `83ef090` Tuner: a batch tuner; workers follow the batches; demote only on the upper bound.
+- `d359430` Rules: thread-policy changes get a release run; unsettled tuned cases are not judged; layout findings are not deferred.

@@ -2,9 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 55](slice-55.md), [Slice 52D](slice-52d.md) (archive [34](../archive/slice-34.md), [24](../archive/slice-24.md), [32](../archive/slice-32.md) landed) · Track: [Emergent AI](../tracks/emergent-ai.md)
 
-**Status: not started.** Measure after Slice 55 and 52D land. The
-`world_gate` items land first, on the core branch (Engine-Core Overhaul
-order), independent of 55 and 52D; the `world-gate` bench landed there.
+**Status: in progress.** The `world_gate` threaded item landed (`f0adc9a`) on
+the core branch; its whole-file cost-model check stays open. The AI decision
+math is not started: measure after Slice 55 and 52D land.
 
 Goal: AI decision math (`decideDir`, wander/seek blend, normalize) runs as
 SIMD kernels across agents, so per-agent cognition cost stays low at large
@@ -19,11 +19,13 @@ avoidance [85](slice-85.md)'s.
 - `decideDir` (`src/game/systems/ai.zig:788` at HEAD) is scalar.
 - Gather, rsqrt, normalize, sincos, and the packed-SoA-scratch idiom exist in
   `src/core/simd.zig` and `src/core/math.zig` (archive Slice 34).
-- `world_gate.apply` (`src/game/systems/world_gate.zig`, staged at
-  `simulation_pipeline.zig:1566`) runs two scalar population walks on main,
-  `gateNpcEntitiesToWalkableTiles` (`world_gate.zig:36`) and
-  `clampAiEntitiesToBounds` (`world_gate.zig:114`), with no threaded path.
-- Measured (Debug, `5d5a089`):
+- `WorldGateSystem.apply` (`src/game/systems/world_gate.zig`, staged at
+  `simulation_pipeline.zig:1896`) dispatches `gateJob` (`world_gate.zig:207`)
+  over the movement rows under the system's tuner: the bounds clamp and tile
+  gate as lane batches on the collision bounds (mirrored into movement-row
+  columns by `DataSystem`), then the player row on main
+  (`docs/architecture.md` § Source Layout).
+- Measured before the landing (Debug, `5d5a089`, scalar walks on main):
   - `world-gate`, serial: 1.48 / 5.88 / 17.19 ms at 4,096 / 16,384 / 65,536
     bodies (linear).
   - `production-step` tuned, spread P 16,384: `clamp_bounds` 1.92 ms, all on
@@ -51,9 +53,12 @@ avoidance [85](slice-85.md)'s.
 - [ ] AI decision math (`decideDir`, wander/seek blend, normalize) vectorized
       across agents with masked branches.
 - [x] `world-gate` bench group: serial baseline at three body counts
-      (`5d5a089`); its threaded cases join the threaded gate below.
-- [ ] `world_gate.apply` NPC clamp and tile gate as a threaded SIMD range
-      job with its serial path. Failure scenario: main time grows with every
+      (`5d5a089`); its threaded cases joined with the threaded gate below.
+- [x] `world_gate.apply` NPC clamp and tile gate as a threaded SIMD range
+      job with its serial path (`f0adc9a`). Parity and allocation proofs:
+      `world_gate.zig:456`, `:497`, `:530`, `:604`; the bench has uniform and
+      interleaved shapes with a dispatch check. Measured (Debug, census):
+      16,384 tuned step 5.13 to 3.60 ms, clamp main 1.84 ms to 2.8 us. Failure scenario: main time grows with every
       AI body in the world each step. Pass (group doc): linear in bodies,
       dispatched across workers with a SIMD tile test, `world-gate` gaining
       the threaded cases. Scalar/SIMD and serial/threaded parity
@@ -63,7 +68,23 @@ avoidance [85](slice-85.md)'s.
       and multi-worker steps.
 - [ ] The whole of `systems/world_gate.zig` checked against the cost model and
       the rules (owner 2026-10-16), not only the items above. Each finding
-      becomes an item here.
+      becomes an item here. Findings so far:
+      - Row order. Failure: `gateRange` (`world_gate.zig:248`) walks the
+        movement rows in store order and resolves each lane's terrain cell with
+        a data-dependent address (`blockedLanes`, `:317`), so work is not
+        grouped by the chunk `(level, cx, cy)` it reads; the `interleaved`
+        `world-gate` shape (non-AI, dormant, and gated rows across two levels)
+        costs per row what the uniform shape does, about 2x per gated row.
+        Pass: a chunk-grouped pass (its own slice, owner 2026-10-23), serial ==
+        threaded, `interleaved` per gated row within spread of `uniform`.
+      - Tuned versus fixed controls. Failure: `world-gate` 65,536 uniform,
+        ReleaseFast, the tuned case is 31-44% over fixed controls that run
+        256-1,024 batches (10-43x the pool, past the 4.0 multiplier clamp); the
+        nudge settles 1-3 steps below the pool. Pass: tuned matches or beats the
+        best control within spread at the threading sizes
+        (`.claude/rules/tests-benchmarks.md`), the cause found at the world gate
+        first (per-batch cost by row region, worker wake skew, join wait,
+        write-column sharing), not by retuning the nudge.
 - [ ] Tests: scalar/SIMD and serial/threaded parity per restructured path.
 
 ### Acceptance checks

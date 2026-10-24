@@ -38,9 +38,9 @@ traversal, and audio treat it through the same paths as any entity.
   (`simulation_pipeline.zig:1396`) beside the candidates the spatial index
   supplies.
 - Tile gate: `gatePlayerToWalkableTiles` and `Player.clampToBounds`
-  (`src/game/systems/world_gate.zig:25`) apart from the NPC gate.
+  (`src/game/systems/world_gate.zig:107`, `src/game/player.zig:76`) apart from the NPC gate.
 - Plane traversal: NPC entries exclude the player
-  (`src/game/systems/plane_entry.zig:154`); the player's ramp and fall run
+  (`src/game/systems/plane_entry.zig:405`); the player's ramp and fall run
   on their own path.
 - Audio: `AudioController.queueAmbient` (`src/game/audio_controller.zig:49`)
   places the listener at the player's center and drives a player jet loop.

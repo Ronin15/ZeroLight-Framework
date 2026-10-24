@@ -403,14 +403,12 @@ small/large-range, and adaptive cases. A group lists the cases its workload runs
 (`BenchmarkGroup.cases`, default every case): `suite.casesNamed` builds a subset in
 default-case order (`suite.serial_cases`, `suite.serial_and_tuned_cases`), and a
 case the workload has no path for is left out, never skipped.
-`thread-adaptive-fixed-range` isolates adaptive worker-count selection with a
-fixed range size; `thread-adaptive-tuned-range` uses the production
-processor-owned worker and range tuner. Fixed cases are controls for scheduler
+`thread-adaptive-tuned-range` is the production
+processor-owned batch tuner. Fixed cases are controls for scheduler
 overhead, worker scaling, and range size. Fixed range controls scale from the
 group's partition (the default range size, or one chunk for chunk-partitioned
 stages): default is the partition, small is half of it (at least 1), large is
-4×, each aligned to the stage's range alignment, and
-`thread-adaptive-fixed-range` uses the partition too. In a group that declares
+4×, each aligned to the stage's range alignment. In a group that declares
 its `fixed_range_shape` (default case list only), a fixed case that resolves to
 an earlier case's configuration reports `same shape as <case>`, untimed and out
 of the best-control pick. Groups that time an edit and its revert (terrain edits, nav
@@ -435,6 +433,31 @@ Fields shared by every group:
 - Threaded stages under `--details`: each stage's busiest shape, and the
   main-thread time and share (the iteration minus its off-main stage time). The
   tuner cell adds ` probes=N demotes=M` in Debug and ReleaseSafe.
+
+Dispatch checks (a threaded stage proven to run on workers, not inline):
+`suite.checkStageDispatched`, `checkStagesDispatched`, `checkRoundsDispatched`
+(round-folded stages), `checkRebuildOnWorkers`, and `checkFixedRangeCount` (a fixed
+threaded case splits into one range per `items_per_range`); group-owned checks
+include collision's `checkSweepWork`, `checkEmptyingSyncWork`, and
+`checkFixedPatchStages`, scope-cognition's `checkScopeStagesDispatched`, nav-update
+and `chunk-scale-nav-level-add` remask coverage, connectivity's closure rounds and
+`checkLevelBuildFloodFolds`, the registry flush's units and ranges
+(`RegistryFlushPastPairWorkers`), and the elastic-shrink flush shape
+(`checkShrinkFlushShape`). Stored batch records sit behind each owner's perf switch
+and only benches read them; tests assert observable results.
+
+`production-step --details` census: per top-level stage `wall=`, `off_main=`,
+`main=`, each of its batches as `(ran=r/n threaded=k/r)` (ran on r of n measured
+steps; on k of those every call ran on workers), and, as each case ends, every
+batch under its stage timer with `calls/step=`, `items/call=` (mean and fewest-most),
+`ns/call=`, `ran=`, `threaded=`, and every tuner, by field path, whose probe windows,
+demotions, restores, or shift skips changed over the measured steps. Stage timing
+that is not a runtime-log cost-driver stage rides a bench-only timer channel
+(`runtime_perf_log.BenchTiming`, `recordBenchTiming`, `BenchStageTimer`) compiled out of
+shipping builds, so `untimed` covers both channels. Every case runs the same
+pre-measure steps (warmup plus the settle limit), so serial and tuned measure the same
+simulated state. `world-gate` has a tuned case, fixed controls, a dispatch check, and an
+`interleaved` shape (non-AI, dormant, and gated rows across two levels).
 
 Reading results:
 
@@ -463,9 +486,15 @@ Reading results:
   `world-create`): its worker, range, and wait cells print `-`, and the summary
   names no worker use.
 - Adaptive cases run `--warmup` iterations, then a bounded settle phase before
-  timing, so the mean excludes tuner search. A tuner that fails to settle shows
-  its probing phase and candidate: an adaptive coverage failure, not a clean
-  timing. Inline batches do not reset tuner state for later processors.
+  timing, so the mean excludes tuner search. The settle limit is 16 sample
+  windows (inline/threaded decision) plus 16 nudge comparisons
+  (`suite.adaptiveSettleIterationLimit`); a tuner is settled when its phase is
+  settled and, if threaded, its nudge holds (`suite.tunerSettled`). The work-tuning
+  column prints `settled=yes|no` (settled before measurement) and, for a threaded
+  profile, `final=<workers>/<items per range> x=<batch multiplier>`. A tuner that
+  fails to settle shows its probing phase and candidate: an adaptive coverage
+  failure, not a clean timing; a tuned case with `settled=no` is rerun with more
+  warmup, never judged (`.claude/rules/tests-benchmarks.md`). Inline batches do not reset tuner state for later processors.
 - Multi-stage systems are read per stage: a primary batch may thread while a
   secondary stays `inline`. Pathfinding's request preparation can use SIMD lane
   batches while the A* solve stage owns its own tuner and row.

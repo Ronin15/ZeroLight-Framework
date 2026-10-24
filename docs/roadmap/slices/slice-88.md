@@ -96,8 +96,8 @@ in its owning slice.
       `compactCognition` (`simulation_scope.zig:396`, which reads only index
       columns), `collisionGatherJob` and `aiGatherJob`
       (`:787`, `:816`), collision `packFillRange` (`collision.zig:2547`), the
-      `world_gate` walks (`world_gate.zig:41`, `:119`), and render collect
-      (87). Failure scenario (derived): with phases striped by row, each
+      world gate's lane pass (`world_gate.zig:248`; its bounds columns are
+      already mirrored on the movement rows), and render collect (87). Failure scenario (derived): with phases striped by row, each
       step's P/4 think set touches every cache line of each AI and movement
       column it reads and uses a quarter of each, plus a slot-table, faction,
       and `world_level` lookup per row; swap-remove churn scrambles phase and
@@ -107,7 +107,11 @@ in its owning slice.
       gather (`.claude/rules/memory-performance.md` § Data-oriented design); a
       structural command's apply cost stays independent of population
       (`.claude/rules/engine-design.md` § Cost model); serial == threaded and
-      deterministic. Coordinates with 75 (tier and cadence), 73 (think
+      deterministic. Measured skew (hypothesis, untested): in the
+      `production-step` census fixture the think set fills 2 of 4 stagger
+      phases, since the phase is `dense_index % cognition_stagger_n`
+      (`simulation_scope.zig:153-154`) and AI rows sit on alternate movement
+      rows, so step load is uneven. Coordinates with 75 (tier and cadence), 73 (think
       interval), 68A (gathers off main), 86 (collision gather), and 35
       (`world_gate`). The think set arrives in the index's cell-major order
       (level, chunk, local cell, faction, slot; `docs/architecture.md`), so
@@ -118,6 +122,17 @@ in its owning slice.
       `ai-cell-ordered` and `perception-cell-ordered` measure the same stream
       as `ai` and `perception` and go; `ai-memory-shuffled` and
       `ai-affect-shuffled` stay as the swap-remove churn shape.
+- [ ] Plane entry gathers by movement row from the bounds columns. Failure:
+      `gatherRange` (`plane_entry.zig:329`) resolves `movementVisualDenseIndices`
+      per lane for every AI row (two slot resolves per row, a lookup into other
+      stores), and the body extent comes from `PrimitiveVisual.size`
+      (`plane_entry.zig:192-193`, `:356-357`), though bounds are never inferred
+      from visuals (`.claude/rules/simulation.md` § Controllers and
+      processors). Pass: a dense movement-row walk reading the mirrored
+      collision-bounds columns the world gate already uses, one masked kernel,
+      no per-row slot resolve; plane entries commit in movement-row order
+      (deterministic for any worker count, owner-accepted order change);
+      serial == threaded; the `plane-traversal` benches within spread.
 - [ ] Affect's gather leaves main. Failure: `gatherScopedIndices`
       (`systems/affect.zig:259-307`) walks the think set on the main thread,
       resolving the affect, perception, and memory rows per entity and

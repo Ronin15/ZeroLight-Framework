@@ -115,6 +115,14 @@ One world per gameplay state; nothing models a set of worlds.
       of the world's storage.
 - [ ] Every world steps each fixed step, threaded across worlds with a
       serial path and a fixed merge order.
+- [ ] Per-step passes batch across world instances: one dispatch per pass
+      over every world's rows, not one per world, so a small world's pass
+      shares a batch set with the others. Gated on multi-world stepping in the
+      pipeline (none exists today). Failure scenario: per-world dispatches
+      each pay the tuner's gate and wake floor, so many small worlds thread
+      little or not at all. Pass: a bench at three or more world counts with
+      dispatches per pass flat in worlds, results independent of world count
+      per dispatch and of worker count (`.claude/rules/threading.md`).
 - [ ] The observer (camera focus, or a player when present) and presentation
       bound to the viewed world; a mini view may show another world
       (`.claude/rules/render.md`); worlds in no view step without
