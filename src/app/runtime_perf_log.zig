@@ -292,9 +292,8 @@ pub const BenchBatchStage = enum {
     world_gate,
     // Plane traversal's entry gather.
     plane_entry,
-    // Collision response's contact gather, place, and apply.
+    // Collision response's contact gather and apply.
     collision_response_gather,
-    collision_response_place,
     collision_response_apply,
     // The collision detect fill and sort, inline or on workers. An untimed batch with no
     // workers is not a sample.

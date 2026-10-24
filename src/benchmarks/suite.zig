@@ -318,6 +318,9 @@ pub const RunStats = struct {
     /// Mean main-thread time per iteration: wall time minus the dispatch time of the
     /// stages that ran on workers.
     main_ns: ?u64 = null,
+    /// Mean time of a group's one ordered merge on main inside the sample (the response
+    /// place); part of `main_ns`.
+    main_merge_ns: ?u64 = null,
     collision_stages: ?CollisionStageSummary = null,
     render_capacities: ?RenderCapacitySummary = null,
     production_step: ?ProductionStepSummary = null,
@@ -583,6 +586,8 @@ pub const WorldCreateSummary = struct {
     stack_ns: u64 = 0,
     nav_ns: u64 = 0,
     destroy_ns: u64 = 0,
+    // The `surface` phase less the paint's worker time.
+    surface_main_ns: u64 = 0,
     // The `nav` phase less its stages' worker time.
     nav_main_ns: u64 = 0,
     surface_bytes: usize = 0,

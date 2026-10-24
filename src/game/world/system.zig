@@ -21,6 +21,7 @@ const TilemapParams = @import("../../render/renderer.zig").TilemapParams;
 const TextureDesc = @import("../../render/resources.zig").TextureDesc;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const rebuild_tuner_config = @import("../../app/thread_system.zig").rebuild_tuner_config;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const ActiveRegion = @import("../simulation_scope.zig").ActiveRegion;
 const ChunkCoord = @import("../simulation_scope.zig").ChunkCoord;
@@ -248,6 +249,8 @@ pub const WorldSystem = struct {
     // The batched edit's per-stage tuners (`applyDenseCellWrites`).
     terrain_edit_plan_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     terrain_edit_write_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // The procedural paint's tuner: fresh per world, so the paint is a one-off.
+    ground_build_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(rebuild_tuner_config),
     // Pools grow geometrically at their reserve seams; the first growth logs once.
     terrain_pool_growth_logged: bool = false,
     // The first growth of the batched edit's scratch logs once.
@@ -347,10 +350,12 @@ pub const WorldSystem = struct {
     }
 
     /// Kept only with `runtime_perf_log.enabled`: the batched edit's last plan and write
-    /// batches, and the reserves that grew a dense block or composed-bits pool.
+    /// batches, the procedural paint's batch, and the reserves that grew a dense block or
+    /// composed-bits pool.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         last_terrain_edit_plan_batch: BatchStats = .{},
         last_terrain_edit_write_batch: BatchStats = .{},
+        last_paint_batch: BatchStats = .{},
         terrain_pool_grows: u64 = 0,
     } else struct {};
 

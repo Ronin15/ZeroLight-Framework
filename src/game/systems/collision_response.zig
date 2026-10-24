@@ -7,11 +7,11 @@
 //! its range's windows of intents, triggers, and observer contacts, and runs the intent
 //! math. When the gather runs on workers, each range groups its placed intents into
 //! 16-row movement blocks on that worker's direct block table and packs the apply
-//! columns in contact order; one place range merges those runs, and `apply` streams
-//! each packed run. When the gather runs inline, including no worker threads, each
-//! range applies its own window before it returns. Either way each movement row
-//! receives its intents in contact order, so the result is independent of the
-//! partition. The main thread streams the trigger windows and compacts the observer
+//! columns in contact order; the main thread places those runs in range order, and
+//! `apply` streams each packed run. When the gather runs inline, including no worker
+//! threads, each range applies its own window before it returns. Either way each
+//! movement row receives its intents in contact order, so the result is independent of
+//! the partition. The main thread streams the trigger windows and compacts the observer
 //! windows in range order.
 
 const std = @import("std");
@@ -22,6 +22,7 @@ const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
+const StageTimer = runtime_perf_log.StageTimer;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
@@ -233,10 +234,11 @@ pub const CollisionResponseStats = struct {
     observer_contact_count: usize = 0,
     perf: Perf = .{},
 
-    /// The gather, place, and apply batches, kept only with `runtime_perf_log.enabled`.
+    /// The gather and apply batches and the place's main-thread time, kept only with
+    /// `runtime_perf_log.enabled`.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         gather_batch: BatchStats = .{},
-        place_batch: BatchStats = .{},
+        place_ns: u64 = 0,
         apply_batch: BatchStats = .{},
     } else struct {};
 };
@@ -444,13 +446,14 @@ pub const CollisionResponseSystem = struct {
         if (!inline_apply) {
             const run_count = runTotal(self.gather_rows.items);
             if (run_count > 0) {
-                // One range for every run. A one-item batch is the caller's; the merge is
-                // not split across workers. Worker 0's table is free after the gather join.
+                // The place is an ordered merge on main, O(1) per run, so it is not a
+                // stage. Worker 0's table is free after the gather join.
                 std.debug.assert(self.table_blocks > 0 and self.worker_generation.items.len > 0);
                 std.debug.assert(self.table_stride <= self.block_slots.items.len);
                 const region = self.block_slots.items[0..self.table_stride];
                 const generation = bumpGeneration(&self.worker_generation.items[0].value.value, region);
-                var place = PlaceJob{
+                const place_timer = StageTimer.begin();
+                placeRuns(.{
                     .gather_rows = self.gather_rows.items,
                     .range_runs = self.range_runs.items,
                     .grouped = self.grouped_runs.items,
@@ -459,14 +462,8 @@ pub const CollisionResponseSystem = struct {
                     .generation = generation,
                     .gather_items_per_range = selection.items_per_range,
                     .run_count = run_count,
-                };
-                const place_batch = threads.thread_system.parallelForWithOptions(1, &place, placeJob, .{
-                    .items_per_range = 1,
-                    .max_worker_threads = selection.worker_threads,
-                    .range_alignment_items = 1,
-                    .adaptive = false,
                 });
-                if (comptime runtime_perf_log.enabled) stats.perf.place_batch = place_batch;
+                if (comptime runtime_perf_log.enabled) stats.perf.place_ns = place_timer.lap();
 
                 const block_count = scanBlockItems(self.grouped_runs.items[0..run_count], self.block_items.items);
                 var apply_stage = threads.stage(&self.apply_tuner);
@@ -971,10 +968,10 @@ fn groupRangeIntents(
     return @intCast(distinct);
 }
 
-// `place`: one range, on the caller. One load of `table[block_id]` per run, then a
-// prefix of the blocks claimed here and a scatter in range order, so the earlier
-// range stays first. The runs are already in block-id order. No probe.
-const PlaceJob = struct {
+// `place`, on main: one load of `table[block_id]` per run, then a prefix of the
+// blocks claimed here and a scatter in range order, so the earlier range stays
+// first. The runs are already in block-id order. No probe.
+const PlaceRuns = struct {
     gather_rows: []const PaddedSlot(GatherRow),
     range_runs: []const Run,
     grouped: []Run,
@@ -986,9 +983,7 @@ const PlaceJob = struct {
     run_count: usize,
 };
 
-fn placeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *PlaceJob = @ptrCast(@alignCast(context));
-    std.debug.assert(range.index == 0 and range.start == 0 and range.end == 1);
+fn placeRuns(job: PlaceRuns) void {
     std.debug.assert(job.run_count <= job.grouped.len);
     std.debug.assert(job.run_count <= job.claimed.len);
     std.debug.assert(job.generation != 0);
@@ -1932,7 +1927,7 @@ test "a gather range groups placed intents by block in contact order, and place 
     var place_slots: [5]BlockSlot = @splat(.{});
     // Stamped this generation and not claimed. A table scan would add its count.
     place_slots[2] = .{ .count = 5, .stamp = generation };
-    var place = PlaceJob{
+    placeRuns(.{
         .gather_rows = &gather_rows,
         .range_runs = &range_runs,
         .grouped = &grouped,
@@ -1941,8 +1936,7 @@ test "a gather range groups placed intents by block in contact order, and place 
         .generation = generation,
         .gather_items_per_range = 2,
         .run_count = 3,
-    };
-    placeJob(&place, .{ .index = 0, .start = 0, .end = 1 }, WorkerId.main);
+    });
     var items: [3]BlockItem = undefined;
     const blocks = scanBlockItems(grouped[0..3], &items);
     try std.testing.expectEqual(@as(usize, 2), blocks);

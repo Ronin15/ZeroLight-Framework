@@ -765,7 +765,6 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_response_triggers, metric(collision_response_stats.trigger_count));
         if (comptime runtime_perf_log.enabled) {
             perf.recordBenchBatch(.collision_response_gather, collision_response_stats.perf.gather_batch);
-            perf.recordBenchBatch(.collision_response_place, collision_response_stats.perf.place_batch);
             perf.recordBenchBatch(.collision_response_apply, collision_response_stats.perf.apply_batch);
         }
 

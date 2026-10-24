@@ -12,13 +12,16 @@
 //! 1024, and 2048 at 8 levels, then 32 and 128 levels at side 256 (item code
 //! `level side * 1000 + levels`). One untimed pass per config on a zero-worker thread system
 //! counts live bytes after each create phase and after destroy. Prints each phase's mean
-//! time, `nav_main=` (the `nav` phase less the off-main time of its collider rebuild, nav
-//! build, and trigger build stages), `live_kb` after `surface`, `stack`, and `nav` (the counted
-//! pass), and `after_destroy_bytes=`. Pass shape: each phase's time and bytes at most linear in
-//! level area times levels, `nav_main` per chunk flat, memory following what exists, and zero
-//! bytes after destroy. Asserts check the zero after destroy, once per case at the smallest
-//! config that the phases build the world `initProcedural` builds, and in the tuned case with
-//! workers that the nav build's remask (a fresh full-pool tuner) ran on workers.
+//! time, `surface_main=` (the `surface` phase less the paint's off-main time), `nav_main=`
+//! (the `nav` phase less the off-main time of its collider rebuild, nav build, and trigger
+//! build stages), `live_kb` after `surface`, `stack`, and `nav` (the counted pass), and
+//! `after_destroy_bytes=`; `--details` adds the paint's shape over the measured creates
+//! (`stages: paint=`, with its `[threaded/dispatched]` census). Pass shape: each phase's time and
+//! bytes at most linear in level area times levels, `surface_main` and `nav_main` per chunk
+//! flat, memory following what exists, and zero bytes after destroy. Asserts check the zero
+//! after destroy, once per case at the smallest config that the phases build the world
+//! `initProcedural` builds, and in the tuned case with workers that the paint and the nav
+//! build's remask (each a fresh full-pool tuner) ran on workers.
 //!
 //! `world-create-statics`: a world's pipeline created over its statics and its first commit
 //! seam, through the production entries (`SimulationPipeline.init` with nav over the world on
@@ -80,7 +83,7 @@ pub const group = suite.BenchmarkGroup{
     .item_counts = &item_counts,
     .runCase = runCase,
     .write_workload = writeCreateWorkload,
-    // The paint and the nav build thread; every other control has no path of its own.
+    // The paint and the nav build thread on fresh tuners no control reaches.
     .cases = &suite.serial_and_tuned_cases,
 };
 
@@ -105,6 +108,8 @@ const PhaseTimes = struct {
     // The `nav` phase's stage time on workers: its collider rebuild, nav build, and trigger
     // build.
     nav_off_main_ns: u64 = 0,
+    // The surface's procedural paint, read before the world is destroyed.
+    paint: BatchStats = .{},
     // The nav build's remask over every level.
     nav_remask: BatchStats = .{},
 };
@@ -171,6 +176,7 @@ fn createAndDestroy(
     const nav = markPhase(io, counter);
     const nav_build = pipeline.pathfinding.perf.last_nav_build;
     const nav_off_main_ns = sumOffMainNs(&colliderRebuildBatches(&pipeline)) + nav_build.perf.off_main_stage_ns + sumOffMainNs(&triggerRebuildBatches(&pipeline));
+    const paint = world.perf.last_paint_batch;
 
     pipeline.deinit();
     data.deinit();
@@ -186,6 +192,7 @@ fn createAndDestroy(
         .nav_ns = suite.elapsedNs(stack.end_ns, nav.end_ns),
         .destroy_ns = suite.elapsedNs(nav.end_ns, destroy.end_ns),
         .nav_off_main_ns = nav_off_main_ns,
+        .paint = paint,
         .nav_remask = nav_build.perf.remask_batch,
     };
 }
@@ -259,9 +266,14 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     var accumulator = suite.StatsAccumulator.init(item_count);
     var totals: [4]u128 = @splat(0);
     var nav_main_total: u128 = 0;
+    var surface_main_total: u128 = 0;
+    var paint_shapes = suite.StageShapes(1){};
     for (0..options.iterations) |_| {
         const times = try createAndDestroy(allocator, io, &meta, config, &threads, null, &uncounted);
+        try suite.checkRebuildOnWorkers(case, &threads, times.paint);
         try suite.checkRebuildOnWorkers(case, &threads, times.nav_remask);
+        paint_shapes.add(.{times.paint});
+        surface_main_total += times.surface_ns -| offMainNs(times.paint);
         nav_main_total += times.nav_ns -| times.nav_off_main_ns;
         const phases = [_]u64{ times.surface_ns, times.stack_ns, times.nav_ns, times.destroy_ns };
         var sample_ns: u64 = 0;
@@ -278,6 +290,8 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         summary.nav_ns = @intCast(totals[2] / stats.iterations);
         summary.destroy_ns = @intCast(totals[3] / stats.iterations);
         summary.nav_main_ns = @intCast(nav_main_total / stats.iterations);
+        summary.surface_main_ns = @intCast(surface_main_total / stats.iterations);
+        paint_shapes.print(&stats.details, "stages", .{"paint"});
     }
     stats.items_per_second = suite.itemsPerSecond(@as(usize, fields.level_side) * fields.level_side * fields.levels, stats.mean_ns);
     stats.batch_carried = false;
@@ -289,11 +303,12 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 
 fn writeCreateWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     const summary = stats.world_create orelse return;
-    try writer.print("surface={f} stack={f} nav={f} destroy={f} nav_main={f} live_kb surface={} stack={} nav={} after_destroy_bytes={}", .{
+    try writer.print("surface={f} stack={f} nav={f} destroy={f} surface_main={f} nav_main={f} live_kb surface={} stack={} nav={} after_destroy_bytes={}", .{
         suite.formatDuration(summary.surface_ns),
         suite.formatDuration(summary.stack_ns),
         suite.formatDuration(summary.nav_ns),
         suite.formatDuration(summary.destroy_ns),
+        suite.formatDuration(summary.surface_main_ns),
         suite.formatDuration(summary.nav_main_ns),
         summary.surface_bytes / 1024,
         summary.stack_bytes / 1024,
