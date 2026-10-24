@@ -20,8 +20,8 @@ cost there.
 - Dispatch posts each active worker's wake in turn on main
   (`thread_system.zig:1139-1142`); main starts its own ranges after the loop
   (`:1148`).
-- `threaded_batch_ns` is 60_000 (`thread_system.zig:122`); the gate-by-formula
-  change (TS1, brief `.claude/reports/ts1-gate-brief.md`) has not landed.
+- `threaded_batch_ns` is 60_000 (`thread_system.zig:122`), set from the measured
+  dispatch floor in `58ff9e1`; it stays.
 - World gate: `world_gate.zig` `gateRange` (`:248`) walks movement rows in
   store order; plane entry gathers per slice 88's plane-entry item.
 - Already routed (not repeated here): slice 35's row-order and tuned-versus-fixed
@@ -65,10 +65,6 @@ cost there.
       Pass: main runs its ranges without waiting for every post, or woken
       workers wake the next; dispatch start skew measured down in ReleaseFast;
       serial == threaded.
-- [ ] Gate value from the wake cost (TS1). Failure: `threaded_batch_ns` is
-      60_000 (`thread_system.zig:122`). Pass: the gate set by formula per
-      `.claude/reports/ts1-gate-brief.md`, with its measured wake cost in the
-      field's comment and the test that pins the default updated.
 - [ ] World gate and plane entry under the data rules
       (`.claude/rules/memory-performance.md` § Data-oriented design,
       `.claude/rules/engine-design.md` § Target scale: the chunk is the unit).
