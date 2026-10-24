@@ -50,12 +50,17 @@ criteria below, and reports.
 - A non-trivial brief names the files in scope, the declarations to read,
   and the change's cost-model questions (what its work and memory grow
   with). Write it to `.claude/reports/<topic>-brief.md`. The spawn prompt
-  cites that path and does not paste the brief. A brief built on a plan
-  cites the plan and lists only what overrides it, never a restated
-  shorter copy of its steps; bench sizes it names are checked to thread the
-  changed stage before spawning. A review brief names the diff, its
-  sources, and what to check, never the main session's or the author's
-  conclusions.
+  cites that path and does not paste the brief. Brief standards:
+  - A brief built on a plan cites the plan and lists only what overrides
+    it, never a restated or shortened copy of its steps or validation.
+  - Every fact it states is checked against live code or a cited source
+    before spawning; a hypothesis is labelled one, never handed over as a
+    predicate, bound, or fix to implement.
+  - Every validation step and bench size it names exercises the changed
+    code (the changed stage runs its threaded path at that size, a test
+    filter matches the new tests).
+  - A review brief names the diff, its sources, and what to check, never
+    the main session's or the author's conclusions.
 - `zig-design-specialist` runs only when a design is open or the existing
   structure fails the cost model, and plans right before implementation,
   against the live code. Local fixes and calls a plan or review triage already
