@@ -2020,7 +2020,6 @@ test "the next range on a worker table does not see the previous range and does 
 // retune, or item-count reset.
 fn pinTunerProfile(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void {
     tuner.config.threaded_batch_ns = if (profile.worker_threads == 0) std.math.maxInt(u64) else 0;
-    tuner.config.retune_after_settled_windows = std.math.maxInt(usize);
     tuner.config.item_count_reset_percent = std.math.maxInt(u8);
     tuner.phase = .settled;
     tuner.has_threaded_profile = profile.worker_threads > 0;

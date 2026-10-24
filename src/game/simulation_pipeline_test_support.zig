@@ -89,7 +89,6 @@ fn holdsTuner(comptime T: type) bool {
 /// Pins one tuner as `pinTunersIn` does.
 pub fn pinThreadedProfile(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void {
     tuner.config.threaded_batch_ns = 0;
-    tuner.config.retune_after_settled_windows = std.math.maxInt(usize);
     tuner.config.item_count_reset_percent = std.math.maxInt(u8);
     tuner.phase = .settled;
     tuner.has_threaded_profile = true;

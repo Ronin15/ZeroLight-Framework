@@ -32,7 +32,9 @@ const suite = @import("suite.zig");
 // exactly when no worker is active, active workers at most min(workers, ranges - 1), every
 // range claimed once, never forced inline), fixed cases' exact shape, each job's range
 // index against the selected range count, and that every item was incremented once per
-// dispatch.
+// dispatch. Pass shape: an adaptive case's tuner demotes at most once per run (a restored
+// profile keeps its bound suppression; a demoted one waits out its inline cooldown), so a
+// steady dispatch never churns between threaded and inline.
 // `--details` prints the shape (`inline` or workers/ranges), the time per item, and the
 // time per range. On multi-CCD parts the `thread-fixed-1` and `thread-fixed-2` rows swing
 // with CCD placement (bimodal unpinned); a run pinned to one CCD is the diagnostic.
@@ -144,6 +146,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     }
 
     for (items) |item| std.debug.assert(item == dispatches);
+    if (case.adaptive) std.debug.assert(tuner.demotion_count <= 1);
     var stats = accumulator.finish();
     stats.output_count = item_count;
     if (case.adaptive) {
