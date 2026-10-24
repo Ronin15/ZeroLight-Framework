@@ -125,13 +125,16 @@ pub const InversePool = struct {
         self.node_index = columns.items(.index);
     }
 
-    /// `needed` more free nodes. Geometric. On error nothing observable changes. A node id
-    /// would pass `no_entry` only at 2^32 live nodes, which fails as `OutOfMemory`.
-    pub fn reserveNodes(self: *InversePool, allocator: std.mem.Allocator, needed: usize) error{OutOfMemory}!void {
-        if (self.node_free.items.len >= needed) return;
+    /// `needed` more free nodes. Geometric. Returns whether the node or free-list storage
+    /// grew. On error nothing observable changes. A node id would pass `no_entry` only at
+    /// 2^32 live nodes, which fails as `OutOfMemory`.
+    pub fn reserveNodes(self: *InversePool, allocator: std.mem.Allocator, needed: usize) error{OutOfMemory}!bool {
+        if (self.node_free.items.len >= needed) return false;
         const added = needed - self.node_free.items.len;
         const total = self.nodes.len + added;
         if (total >= no_entry) return error.OutOfMemory;
+        const nodes_before = self.nodes.capacity;
+        const free_before = self.node_free.capacity;
         if (total > self.nodes.capacity) {
             try self.nodes.ensureTotalCapacity(allocator, @max(total, self.nodes.capacity *| 2));
             self.refresh();
@@ -148,14 +151,18 @@ pub const InversePool = struct {
         self.refresh();
         std.debug.assert(self.nodes.capacity >= self.nodes.len);
         std.debug.assert(self.node_free.items.len >= needed);
+        return self.nodes.capacity != nodes_before or self.node_free.capacity != free_before;
     }
 
-    /// Owner ids below `owner_count` have a head. Geometric. On error nothing changes.
-    pub fn reserveOwners(self: *InversePool, allocator: std.mem.Allocator, owner_count: usize) error{OutOfMemory}!void {
-        if (self.owner_heads.items.len >= owner_count) return;
+    /// Owner ids below `owner_count` have a head. Geometric. Returns whether the head storage
+    /// grew. On error nothing changes.
+    pub fn reserveOwners(self: *InversePool, allocator: std.mem.Allocator, owner_count: usize) error{OutOfMemory}!bool {
+        if (self.owner_heads.items.len >= owner_count) return false;
+        const before = self.owner_heads.capacity;
         try self.owner_heads.ensureTotalCapacity(allocator, owner_count);
         self.owner_heads.appendNTimesAssumeCapacity(.{}, owner_count - self.owner_heads.items.len);
         std.debug.assert(self.owner_heads.capacity >= self.owner_heads.items.len);
+        return self.owner_heads.capacity != before;
     }
 
     pub fn holdsOwner(self: *const InversePool, owner: u32) bool {
@@ -387,30 +394,15 @@ pub fn reservePublish(self: *PathfindingSystem) error{OutOfMemory}!void {
 
 /// Each shard's inverse pool has room for `shard_registrations` more runs and an owner head
 /// per cache owner id, and the bucketed owner log room for any flush's ops on them. Returns
-/// whether any of it grew; the caller counts the growth. On error nothing is claimed.
+/// whether any of it grew, from the reserves' own reports, O(shards) whatever the depth; the
+/// caller counts the growth. On error nothing is claimed.
 pub fn reserveRegistryRuns(self: *PathfindingSystem, shard_registrations: [registry_shard_count]usize) error{OutOfMemory}!bool {
-    const capacity_before = registryCapacity(self);
+    var grew = false;
     for (&self.path_index.pools, shard_registrations) |*pool, count| {
-        try pool.reserveNodes(self.allocator, count);
-        try pool.reserveOwners(self.allocator, self.completed.logicalCapacity());
+        grew = try pool.reserveNodes(self.allocator, count) or grew;
+        grew = try pool.reserveOwners(self.allocator, self.completed.logicalCapacity()) or grew;
     }
-    try reserveShardOps(self);
-    return registryCapacity(self) != capacity_before;
-}
-
-// Directory block storage, inverse-node pools, owner heads, and the count windows: a reserve
-// that changed any of them grew.
-fn registryCapacity(self: *const PathfindingSystem) usize {
-    const index = &self.path_index;
-    const plan = &index.plan;
-    var capacity: usize = index.directory.levelCount() + index.directory.blocks.capacity + index.growth.capacity + index.compact.capacity + index.fresh.capacity +
-        plan.ids.capacity + plan.at.capacity + plan.origin.capacity + plan.shards.capacity + plan.rename_to.capacity + plan.ops.capacity + index.shard_ops.capacity;
-    for (0..index.directory.levelCount()) |level| capacity += index.directory.slotCount(@intCast(level));
-    for (&index.pools) |*pool| {
-        capacity += pool.nodes.capacity + pool.node_free.capacity + pool.owner_heads.capacity + pool.retired.capacity;
-        if (pool.replacement) |replacement| capacity += replacement.capacity;
-    }
-    return capacity;
+    return try reserveShardOps(self) or grew;
 }
 
 fn countRegistryGrowth(self: *PathfindingSystem, grows: u64) void {
@@ -420,12 +412,12 @@ fn countRegistryGrowth(self: *PathfindingSystem, grows: u64) void {
 /// Every inverse pool holds an owner head per cache owner id below `capacity`, and the
 /// owner log's plan has room for those ids and a log of `ops_per_entry` ops per id.
 pub fn reserveRegistryOwners(self: *PathfindingSystem, capacity: usize) !void {
-    const capacity_before = registryCapacity(self);
-    for (&self.path_index.pools) |*pool| try pool.reserveOwners(self.allocator, capacity);
+    var grew = false;
+    for (&self.path_index.pools) |*pool| grew = try pool.reserveOwners(self.allocator, capacity) or grew;
     const owners = ownerIds(self);
-    _ = try self.path_index.plan.reserve(self.allocator, owners, ops_per_entry *| owners, false);
-    try reserveShardOps(self);
-    if (registryCapacity(self) != capacity_before) countRegistryGrowth(self, 1);
+    grew = try self.path_index.plan.reserve(self.allocator, owners, ops_per_entry *| owners, false) or grew;
+    grew = try reserveShardOps(self) or grew;
+    if (grew) countRegistryGrowth(self, 1);
 }
 
 // Room for any flush's log bucketed by shard, reserved where its bound grows (the node pools
@@ -434,12 +426,14 @@ pub fn reserveRegistryOwners(self: *PathfindingSystem, capacity: usize) !void {
 // rename, then a retire), so the entries stay below `ops_per_entry` per inverse node, and
 // below `ops_per_entry` per owner id in each shard. Keyed on node capacity, not length, so a
 // step that takes nodes from a pool's slack allocates nothing here either. Geometric. The
-// plan still grows the list, counted, past this bound.
-fn reserveShardOps(self: *PathfindingSystem) error{OutOfMemory}!void {
+// plan still grows the list, counted, past this bound. Returns whether the list grew.
+fn reserveShardOps(self: *PathfindingSystem) error{OutOfMemory}!bool {
     var nodes: usize = 0;
     for (&self.path_index.pools) |*pool| nodes += pool.nodes.capacity;
     const bound = @min(ops_per_entry *| nodes, registry_shard_count *| ops_per_entry *| ownerIds(self));
-    if (bound > self.path_index.shard_ops.capacity) try self.path_index.shard_ops.ensureTotalCapacity(self.allocator, bound);
+    if (bound <= self.path_index.shard_ops.capacity) return false;
+    try self.path_index.shard_ops.ensureTotalCapacity(self.allocator, bound);
+    return true;
 }
 
 // The plan names only owner ids below the heads' count.
@@ -480,25 +474,35 @@ pub fn clearRegistry(self: *PathfindingSystem) void {
 /// Opens one directory level per nav level, each with `graph.chunkCount` slots. The same
 /// count keeps the runs (a level rebuild's eviction has not flushed yet). A different count
 /// is a full rebuild, which has already cleared the runs: the old payloads are freed and the
-/// slots reallocated.
+/// slots reallocated. O(1) at unchanged level and chunk counts; a level append touches only
+/// the new levels and a shrink only the closed ones; only a chunk-count change walks every
+/// level.
 pub fn openRegistryLevels(self: *PathfindingSystem, level_count: usize) error{OutOfMemory}!void {
     const levels: u32 = @intCast(level_count);
     const chunks = self.graph.chunkCount();
     const directory = &self.path_index.directory;
+    // Every directory level is open at one chunk count, the last call's: a shrink and a
+    // failed open drop the levels past them (`truncateLevels`). So level 0 at `chunks` proves
+    // every level is, and only the levels past the directory's count need opening.
+    const current = directory.levelCount() == 0 or directory.slotCount(0) == chunks;
+    if (current and directory.levelCount() == levels) return;
     // Held emptied chunks of a closed or emptied level leave the list while every reopened
     // slot is still empty, so the list never names a later chunk at the same place.
     var released = false;
     defer if (released) dropUnheldChunks(&self.path_index);
-    var extra = directory.levelCount();
-    while (extra > levels) {
-        extra -= 1;
-        directory.closeLevel(self.allocator, @intCast(extra));
+    if (directory.levelCount() > levels) {
+        directory.truncateLevels(self.allocator, levels);
         released = true;
     }
-    var level: u32 = 0;
+    var level: u32 = if (current) @intCast(directory.levelCount()) else 0;
+    // A level that failed to open, and every level past it, is dropped: a stale-count level
+    // holds no runs (its rebuild cleared them), and a level past it is stale or new.
+    errdefer {
+        directory.truncateLevels(self.allocator, level);
+        released = true;
+    }
     while (level < levels) : (level += 1) {
-        const current = directory.slotCount(level);
-        if (current != chunks and current != 0) {
+        if (directory.slotCount(level) != 0) {
             directory.emptyLevel(self.allocator, level);
             released = true;
         }
@@ -2082,4 +2086,108 @@ test "a shrink's registry flush at a configured range size equals the serial flu
     try expectSameCache(&serial, &threaded);
     try expectSameRegistry(&serial, &threaded);
     try expectRegistryMatchesCache(&threaded);
+}
+
+// A static nav grid of 64x64 world units in 32-unit cells (2x2 cells, one chunk) at the
+// baseline capacity, its registry levels open.
+fn openedRegistrySystem(data: *DataSystem) !PathfindingSystem {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    errdefer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGrid(data, 64, 64, 32);
+    return system;
+}
+
+// The directory holds exactly `levels` levels, each open at `chunks` slots.
+fn expectRegistryLevelsOpen(directory: *const RegistryDirectory, levels: usize, chunks: usize) !void {
+    try std.testing.expectEqual(levels, directory.levelCount());
+    for (0..levels) |level| try std.testing.expectEqual(chunks, directory.slotCount(@intCast(level)));
+}
+
+test "an inverse pool's node and owner reserves report growth only when their storage grows" {
+    const allocator = std.testing.allocator;
+    var pool: InversePool = .{};
+    defer pool.deinit(allocator);
+    try std.testing.expect(try pool.reserveNodes(allocator, 4));
+    try std.testing.expect(!try pool.reserveNodes(allocator, 4));
+    try std.testing.expect(!try pool.reserveNodes(allocator, 2));
+    // Every free node taken: the free list refills from the node storage's room, no growth.
+    while (pool.node_free.pop()) |_| {}
+    const room = pool.nodes.capacity - pool.nodes.len;
+    try std.testing.expect(room != 0);
+    try std.testing.expect(!try pool.reserveNodes(allocator, room));
+    try std.testing.expectEqual(room, pool.node_free.items.len);
+    try std.testing.expect(try pool.reserveNodes(allocator, room + 1));
+
+    try std.testing.expect(try pool.reserveOwners(allocator, 4));
+    try std.testing.expect(!try pool.reserveOwners(allocator, 4));
+    try std.testing.expect(!try pool.reserveOwners(allocator, 2));
+    try std.testing.expect(!try pool.reserveOwners(allocator, pool.owner_heads.capacity));
+    try std.testing.expect(try pool.reserveOwners(allocator, pool.owner_heads.capacity + 1));
+}
+
+test "a registry runs reserve reports node growth inside the reserved shard-op bound, and the same reserve again reports none" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var system = try openedRegistrySystem(&data);
+    defer system.deinit();
+    const index = &system.path_index;
+    var counts: [registry_shard_count]usize = @splat(0);
+    _ = try reserveRegistryRuns(&system, counts);
+    try std.testing.expect(!try reserveRegistryRuns(&system, counts));
+
+    // Shard 0's nodes past every shard's owner heads: the shard-op bound is the owner term.
+    counts[0] = registry_shard_count * ownerIds(&system) + 1;
+    try std.testing.expect(try reserveRegistryRuns(&system, counts));
+    const shard_ops = index.shard_ops.capacity;
+    try std.testing.expect(shard_ops != 0);
+
+    // Shard 1's nodes grow and the shard-op list does not: the report is the node pool's.
+    counts[1] = index.pools[1].nodes.capacity + 1;
+    try std.testing.expect(try reserveRegistryRuns(&system, counts));
+    try std.testing.expectEqual(shard_ops, index.shard_ops.capacity);
+    try std.testing.expect(index.pools[1].node_free.items.len >= counts[1]);
+    try std.testing.expect(!try reserveRegistryRuns(&system, counts));
+}
+
+test "registry levels open on a level append and drop on a shrink, a call at the open counts re-opens nothing, and a failed open drops every level from the failed one (FailingAllocator)" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var system = try openedRegistrySystem(&data);
+    defer system.deinit();
+    const directory = &system.path_index.directory;
+    const chunks = system.graph.chunkCount();
+    const built = system.graph.levelCount();
+    try std.testing.expectEqual(@as(usize, 1), chunks);
+    try expectRegistryLevelsOpen(directory, built, chunks);
+
+    // A call at the open counts re-opens no level: same columns, no allocation.
+    const slots = directory.levels.items[0].slots.ptr;
+    var quiet = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    test_support.setSystemAllocators(&system, quiet.allocator());
+    try openRegistryLevels(&system, built);
+    test_support.setSystemAllocators(&system, std.testing.allocator);
+    try std.testing.expectEqual(slots, directory.levels.items[0].slots.ptr);
+
+    // An append opens the new levels and keeps the open ones; a shrink drops the closed
+    // levels; an append opens them again.
+    try openRegistryLevels(&system, built + 2);
+    try expectRegistryLevelsOpen(directory, built + 2, chunks);
+    try std.testing.expectEqual(slots, directory.levels.items[0].slots.ptr);
+    try openRegistryLevels(&system, 1);
+    try expectRegistryLevelsOpen(directory, 1, chunks);
+    try openRegistryLevels(&system, built + 2);
+    try expectRegistryLevelsOpen(directory, built + 2, chunks);
+
+    // Every level open at another chunk count, as a rebuild to a new geometry finds it: an
+    // open that fails on level 1 (two allocations per level) leaves level 0 at the new count
+    // and drops every later level, and the retry opens them all.
+    for (0..built + 2) |level| try directory.openLevel(std.testing.allocator, @intCast(level), chunks + 1);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    test_support.setSystemAllocators(&system, failing.allocator());
+    try std.testing.expectError(error.OutOfMemory, openRegistryLevels(&system, built + 2));
+    test_support.setSystemAllocators(&system, std.testing.allocator);
+    try expectRegistryLevelsOpen(directory, 1, chunks);
+    try openRegistryLevels(&system, built + 2);
+    try expectRegistryLevelsOpen(directory, built + 2, chunks);
 }

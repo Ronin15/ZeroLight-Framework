@@ -401,7 +401,7 @@ pub fn bitSetBytesFor(bits: usize) usize {
 /// owner that keeps payload bytes in its own pool leaves `bytes` empty and claims and
 /// releases blocks by ordinal (`reserveClaims`). Such a pooled owner releases blocks only
 /// through `releaseBlockAt`, and its slots through its pool: `release`, `emptyLevel`,
-/// `closeLevel`, and `releaseAll` return no pooled slot, so Debug asserts that each block
+/// `truncateLevels`, and `releaseAll` return no pooled slot, so Debug asserts that each block
 /// they release holds none (a `Payload` names its pooled slot `slot: PayloadSlot`).
 /// `deinit` releases nothing, so it frees a pooled owner's directory before the pool.
 /// Methods take the caller's allocator; the directory does not store one. `with_pending`
@@ -465,16 +465,23 @@ pub fn ChunkDirectory(comptime Payload: type, comptime with_pending: bool) type 
             held.slots = fresh;
         }
 
-        /// Frees `level`'s slots and releases every block they hold.
-        pub fn closeLevel(self: *Self, allocator: std.mem.Allocator, level: u32) void {
-            if (level >= self.levels.items.len) return;
-            self.emptyLevel(allocator, level);
-            const held = &self.levels.items[level];
-            if (held.slots.len != 0) allocator.free(held.slots);
-            if (comptime with_pending) {
-                if (held.pending.len != 0) allocator.free(held.pending);
+        /// Closes every level at or past `count`: releases the blocks their slots hold, frees
+        /// their columns, and drops their headers, so the directory holds only the levels
+        /// below `count`. O(levels closed) plus their slots; the header list's storage is
+        /// returned once at most half of it is in use.
+        pub fn truncateLevels(self: *Self, allocator: std.mem.Allocator, count: usize) void {
+            if (self.levels.items.len <= count) return;
+            while (self.levels.items.len > count) {
+                const level = self.levels.items.len - 1;
+                self.emptyLevel(allocator, @intCast(level));
+                const held = self.levels.items[level];
+                if (held.slots.len != 0) allocator.free(held.slots);
+                if (comptime with_pending) {
+                    if (held.pending.len != 0) allocator.free(held.pending);
+                }
+                self.levels.items.len = level;
             }
-            held.* = .{};
+            if (count *| 2 <= self.levels.capacity) self.levels.shrinkAndFree(allocator, count);
         }
 
         /// Releases every block `level`'s slots hold and empties its slots and pending
@@ -758,6 +765,36 @@ test "an ordered index set reserve grows geometrically onto valid tiers, and one
     for ([_]usize{ 127, 0, 64, 63 }) |index| set.insert(index);
     for ([_]usize{ 0, 63, 64, 127 }) |expected| try std.testing.expectEqual(@as(?usize, expected), set.popMin());
     try std.testing.expect(set.isEmpty());
+}
+
+test "truncating levels releases the dropped levels' blocks, drops their headers, and returns the header storage" {
+    const allocator = std.testing.allocator;
+    const Directory = ChunkDirectory(struct { len: u32 = 0 }, true);
+    var directory: Directory = .{};
+    defer directory.deinit(allocator);
+    for (0..4) |level| {
+        try directory.openLevel(allocator, @intCast(level), 8);
+        const block = try directory.claim(allocator);
+        directory.setPayload(block, try allocator.alignedAlloc(u8, .@"4", 16), .{ .len = 1 });
+        directory.setSlot(@intCast(level), 3, block);
+    }
+    const kept = directory.slot(0, 3);
+    const free_before = directory.block_free.items.len;
+
+    directory.truncateLevels(allocator, 4);
+    try std.testing.expectEqual(@as(usize, 4), directory.levelCount());
+    directory.truncateLevels(allocator, 1);
+    try std.testing.expectEqual(@as(usize, 1), directory.levelCount());
+    try std.testing.expectEqual(@as(usize, 1), directory.levels.capacity);
+    try std.testing.expectEqual(free_before + 3, directory.block_free.items.len);
+    try std.testing.expectEqual(kept, directory.slot(0, 3));
+    try std.testing.expectEqual(@as(usize, 0), directory.slotCount(1));
+
+    try directory.openLevel(allocator, 1, 8);
+    try std.testing.expectEqual(empty_block, directory.slot(1, 3));
+    directory.truncateLevels(allocator, 0);
+    try std.testing.expectEqual(@as(usize, 0), directory.levelCount());
+    try std.testing.expectEqual(free_before + 4, directory.block_free.items.len);
 }
 
 test "emptying a level releases only that level's blocks and keeps its columns, and releasing every block empties every level and returns every block to the pool" {
