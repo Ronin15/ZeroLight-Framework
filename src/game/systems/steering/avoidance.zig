@@ -702,6 +702,7 @@ test "steering multi-level obstacle gate matches between serial and real threade
         try threaded_system.reserve(128);
         _ = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, .{
             .items_per_range = split.items_per_range,
+            .band_items_per_range = 1,
             .max_worker_threads = split.workers,
             .adaptive = false,
         });

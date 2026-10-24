@@ -9,6 +9,7 @@
 const std = @import("std");
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const BatchSelection = @import("../../../app/thread_system.zig").BatchSelection;
+const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
@@ -88,9 +89,11 @@ fn buildAgentGridBanded(self: *SteeringSystem, stage: StageThreads, selection: B
         for (&band_start, slot.value.offsets) |*start, range_offset| start.* += range_offset;
     }
 
-    // A fixed shape (an explicit range size) sorts one band per range.
-    var sort_stage = stage.stage(&self.grid_sort_tuner);
-    if (stage.config.items_per_range != null) sort_stage.items_per_range = 1;
+    const sort_stage = Dispatch.init(stage.thread_system, &self.grid_sort_tuner, .{
+        .items_per_range = stage.config.band_items_per_range,
+        .max_worker_threads = stage.config.max_worker_threads,
+        .adaptive = stage.config.adaptive,
+    });
     const sort_selection = sort_stage.select(max_bands, 1);
     setSlotCount(GridSortTally, &self.grid_sort_tallies, max_bands);
     var sort = SortJob{
@@ -364,8 +367,8 @@ const AgentSnapshotRow = @import("system.zig").AgentSnapshotRow;
 test "steering banded agent grid gives every cell the same entries as one band" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 3, .adaptive = false } };
-    const inline_ranges = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 0, .adaptive = false } };
+    const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .band_items_per_range = 1, .max_worker_threads = 3, .adaptive = false } };
+    const inline_ranges = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .band_items_per_range = 1, .max_worker_threads = 0, .adaptive = false } };
 
     for (std.meta.tags(GridTestLayout)) |layout| {
         var system = SteeringSystem.init(std.testing.allocator);
@@ -405,7 +408,7 @@ test "steering banded agent grid gives every cell the same entries as one band" 
 test "steering agent grid splits a one-row corridor and a cluster with a far outlier across bands" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 3, .adaptive = false } };
+    const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .band_items_per_range = 1, .max_worker_threads = 3, .adaptive = false } };
 
     for ([_]GridTestLayout{ .one_row, .cluster_outlier }) |layout| {
         var system = SteeringSystem.init(std.testing.allocator);
@@ -422,7 +425,7 @@ test "steering agent grid splits a one-row corridor and a cluster with a far out
 test "steering agent grid splits rows that alternate between two clusters across bands" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 3, .adaptive = false } };
+    const threaded = StageThreads{ .thread_system = &threads, .config = .{ .items_per_range = steering_range_alignment_items, .band_items_per_range = 1, .max_worker_threads = 3, .adaptive = false } };
 
     // Row counts at and near power-of-two multiples of the sample count, with the clusters
     // alternating every row and every 16 rows.

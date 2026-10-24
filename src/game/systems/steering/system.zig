@@ -89,6 +89,9 @@ pub const max_bands: usize = 64;
 
 pub const SteeringConfig = struct {
     items_per_range: ?usize = null,
+    // The band stages' range size (grid sort, selection claim), in bands; null lets their
+    // tuners pick it.
+    band_items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
 };
@@ -919,6 +922,7 @@ test "steering serial and real threaded workers produce identical movement inten
     defer threads.deinit();
     _ = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, .{
         .items_per_range = steering_range_alignment_items,
+        .band_items_per_range = 1,
         .max_worker_threads = 2,
         .adaptive = false,
     });
@@ -1007,6 +1011,7 @@ test "steering serial matches threaded intents across multiple range splits and 
         try threaded_system.reserve(128);
         _ = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, &colliders, .{
             .items_per_range = split.items_per_range,
+            .band_items_per_range = 1,
             .max_worker_threads = split.workers,
             .adaptive = false,
         });
@@ -1128,6 +1133,7 @@ test "steering threaded multi-worker update is allocation-free after reserves fr
 
     const cfg: SteeringConfig = .{
         .items_per_range = steering_range_alignment_items,
+        .band_items_per_range = 1,
         .max_worker_threads = 2,
         .adaptive = false,
     };
@@ -1250,7 +1256,7 @@ test "steering threaded prepare equals serial across range splits and worker cou
         for ([_]usize{ 1, 2, 3 }) |workers| {
             var threaded = ParityTrace{};
             defer threaded.deinit();
-            try runParityScenario(&threads, .{ .items_per_range = items_per_range, .max_worker_threads = workers, .adaptive = false }, &threaded);
+            try runParityScenario(&threads, .{ .items_per_range = items_per_range, .band_items_per_range = 1, .max_worker_threads = workers, .adaptive = false }, &threaded);
             try expectTracesEqual(&serial, &threaded);
         }
     }
@@ -1264,7 +1270,7 @@ test "steering with no worker to give matches serial" {
     var no_workers = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer no_workers.deinit();
     try std.testing.expectEqual(@as(usize, 0), no_workers.workerThreadCount());
-    for ([_]SteeringConfig{ .{ .adaptive = true }, .{ .items_per_range = 32, .adaptive = false } }) |config| {
+    for ([_]SteeringConfig{ .{ .adaptive = true }, .{ .items_per_range = 32, .band_items_per_range = 1, .adaptive = false } }) |config| {
         var trace = ParityTrace{};
         defer trace.deinit();
         try runParityScenario(&no_workers, config, &trace);
@@ -1275,14 +1281,14 @@ test "steering with no worker to give matches serial" {
     defer threads.deinit();
     var capped = ParityTrace{};
     defer capped.deinit();
-    try runParityScenario(&threads, .{ .items_per_range = 32, .max_worker_threads = 0, .adaptive = false }, &capped);
+    try runParityScenario(&threads, .{ .items_per_range = 32, .band_items_per_range = 1, .max_worker_threads = 0, .adaptive = false }, &capped);
     try expectTracesEqual(&serial, &capped);
 }
 
 test "steering runtime state follows its entity across swap-removes" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = steering_range_alignment_items });
     defer threads.deinit();
-    const threaded_config: SteeringConfig = .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 2, .adaptive = false };
+    const threaded_config: SteeringConfig = .{ .items_per_range = steering_range_alignment_items, .band_items_per_range = 1, .max_worker_threads = 2, .adaptive = false };
     for ([_]bool{ false, true }) |threaded| {
         const thread_system: ?*ThreadSystem = if (threaded) &threads else null;
         var control = RekeyOutcome{};

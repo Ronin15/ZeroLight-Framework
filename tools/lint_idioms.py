@@ -55,7 +55,35 @@ reviewer diligence:
     only `core/`. `platform/` imports only `core/` (and its own layer). No
     layer imports `src/tests.zig`, `src/benchmark_runner.zig`,
     `src/gpu_smoke.zig`, `src/gpu_smoke_impl.zig`, or `src/benchmarks/`.
-
+13. Production dispatch controls are forwards. `ThreadSystem`'s fixed-shape
+    options are the test and bench seam; production code only forwards its
+    stage's controls into them. A stage-config type is a struct declaring a
+    `?usize` `[<stage>_]items_per_range` field (`StageControls`,
+    `ParallelForOptions`, `BatchWorkRequest`, `Dispatch`, each system's
+    `*Config`) or the `T` of a `StageThreads(T)`; its seam fields are its
+    `?usize` `[<stage>_]items_per_range` / `[<stage>_]max_worker_threads` and
+    `bool` `[<stage>_]adaptive` fields. The contexts, resolved across files:
+    a stage-config literal (`T{`, `: T = .{`, `return .{` in a function
+    returning `T`), a `.{` literal assigned to a name declared with a
+    stage-config type (`self.nav_controls = .{`, `.config = .{`), a `.{`
+    argument in a stage-config parameter's position (by name, arity, and a
+    type receiver's container, as `Dispatch.init(`), and a statement setting
+    a seam field, `adaptive_tuner`, or `selected_profile`.
+    13.1: a `items_per_range` / `max_worker_threads` seam field set to
+    anything but a forward: the same control's declared seam field read from
+    `config` / `<x>_config` declared with a stage-config type (`orelse`
+    chains of them), or the selection's own (`selection.items_per_range`,
+    `selection.worker_threads`, `shape.items_per_range`).
+    13.2: an `adaptive` seam field set to anything but a forward.
+    13.3: a shape no tuner records: `adaptive_tuner` other than a selection's
+    `active_tuner`, `selected_profile` other than a selection's `profile`,
+    `selectBatchProfile(null, ...)`, or a `parallelForWithOptions` whose
+    options literal has no `adaptive_tuner`.
+    Job-context literals are not contexts. Scope: production files (rule
+    9's) minus `src/app/thread_system.zig` (the seam's owner, still read for
+    declarations), their `test` blocks, and helpers only tests reach. A
+    self-check runs the removed hit lines, one hit per context, and forwards
+    first.
 Scans every `src/**/*.zig` file plus `build.zig`. Rules in SRC_ONLY_PATTERNS
 apply to `src/` only. All rules match code with string/char-literal contents
 blanked and `//` comments removed, so text inside literals never trips a rule.
@@ -717,8 +745,18 @@ def test_block_line_indexes(lines: list[str]) -> set[int]:
     return indexes
 
 
-def test_only_helper_line_indexes(path: Path, lines: list[str]) -> set[int]:
-    """Line indexes of file-scope helpers only tests reach: the same spans rule 9 treats as test code."""
+_TEST_ONLY_HELPER_LINES: dict[Path, frozenset[int]] = {}
+
+
+def test_only_helper_line_indexes(path: Path, lines: list[str]) -> frozenset[int]:
+    """Line indexes of file-scope helpers only tests reach: the same spans rule 9 treats as test
+    code. Rules 11 and 13 both read them, so each file's set is computed once."""
+    if path not in _TEST_ONLY_HELPER_LINES:
+        _TEST_ONLY_HELPER_LINES[path] = frozenset(find_test_only_helper_lines(path, lines))
+    return _TEST_ONLY_HELPER_LINES[path]
+
+
+def find_test_only_helper_lines(path: Path, lines: list[str]) -> set[int]:
     if not is_production(path):
         return set()
     decls, refs = production_lines(path)
@@ -856,12 +894,441 @@ def lint_layer_imports(files: list[Path]) -> list[tuple[str, int, str, str]]:
     return issues
 
 
+# Rule 13. A stage-config type is a struct declaring a `?usize` `[<stage>_]items_per_range`
+# field (`StageControls`, `ParallelForOptions`, `BatchWorkRequest`, `Dispatch`, each system's
+# `*Config`) or the `T` of a `StageThreads(T)`. Its seam fields are its `?usize`
+# `[<stage>_]items_per_range` / `[<stage>_]max_worker_threads` and `bool` `[<stage>_]adaptive`
+# fields; `adaptive_tuner` and `selected_profile` are the tuner fields.
+THREAD_SYSTEM_FILE = "src/app/thread_system.zig"
+CONTROLS = ("items_per_range", "max_worker_threads", "adaptive")
+TUNER_FIELDS = ("adaptive_tuner", "selected_profile")
+IDENT = r"[A-Za-z_]\w*"
+STRUCT_DECL = re.compile(rf"\bconst\s+({IDENT})\s*=\s*(?:extern\s+|packed\s+)?struct\s*\{{")
+STAGE_THREADS_TYPE = re.compile(rf"\bStageThreads\(\s*({IDENT})\s*\)")
+BODY_FIELD = re.compile(rf"(?:^|[,{{\n])\s*(?:pub\s+)?({IDENT})\s*:\s*(\?usize|bool)\b")
+FN_DECL = re.compile(rf"\bfn\s+({IDENT})\s*\(")
+CALL = re.compile(rf"(?<![\w@])(?:({IDENT})\s*\.\s*)?({IDENT})\s*\(")
+PARAM = re.compile(rf"^\s*(?:comptime\s+|noalias\s+)?({IDENT})\s*:\s*(.+)$", re.DOTALL)
+TYPE_BASE = re.compile(rf"^(?:[?*!\s]|const\b|\[\])*(?:{IDENT}\.)*({IDENT})\s*$")
+LITERAL_FIELD = re.compile(rf"\.({IDENT})\s*=(?!=)\s*(.*)", re.DOTALL)
+FORWARD_TERM = re.compile(rf"^(?:{IDENT}\.)*({IDENT})\.({IDENT})$")
+SELECTION = rf"(?:{IDENT}\.)*(?:\w+_)?selection"
+SELECTION_FORWARD = {
+    "items_per_range": re.compile(
+        rf"^(?:{SELECTION}(?:\.profile)?|(?:{IDENT}\.)*(?:\w+_)?shape)\.items_per_range$"
+    ),
+    "max_worker_threads": re.compile(rf"^{SELECTION}(?:\.profile)?\.worker_threads$"),
+    "adaptive_tuner": re.compile(rf"^{SELECTION}\.active_tuner$"),
+    "selected_profile": re.compile(rf"^{SELECTION}\.profile$"),
+}
+CONFIG_NAME = re.compile(r"^(?:\w+_)?config$")
+
+
+class ControlModel:
+    """What rule 13 resolves across files: the stage-config types, their seam fields (name to
+    control), the names declared with a stage-config type (fields, vars, params), and each
+    function's stage-config parameters as `(container, parameter count, index)`."""
+
+    def __init__(self, texts: list[str]) -> None:
+        self.config_types: set[str] = set()
+        self.seam_fields: dict[str, str] = {}
+        structs: list[list[tuple[str, int, int]]] = []
+        for text in texts:
+            spans: list[tuple[str, int, int]] = []
+            for decl in STRUCT_DECL.finditer(text):
+                open_brace = decl.end() - 1
+                close = matching_close(text, open_brace)
+                spans.append((decl.group(1), open_brace, close))
+                if "items_per_range" not in text[open_brace:close]:
+                    continue
+                fields = BODY_FIELD.findall(flatten_body(text, open_brace, close))
+                if not any(kind == "?usize" and re.fullmatch(r"(?:\w+_)?items_per_range", name) for name, kind in fields):
+                    continue
+                self.config_types.add(decl.group(1))
+                for name, kind in fields:
+                    for control in CONTROLS:
+                        if re.fullmatch(rf"(?:\w+_)?{control}", name) and kind == ("bool" if control == "adaptive" else "?usize"):
+                            self.seam_fields[name] = control
+            structs.append(spans)
+            self.config_types.update(STAGE_THREADS_TYPE.findall(text))
+        types = "|".join(sorted(self.config_types)) or "(?!)"
+        typed = re.compile(rf"(?<![\w.])({IDENT})\s*:\s*(?:[?*\s]|const\b|\[\])*(?:{IDENT}\.)*(?:{types})\b(?!\s*\()")
+        self.typed_names: set[str] = set()
+        self.config_params: dict[str, list[tuple[str | None, int, int]]] = {}
+        for text, spans in zip(texts, structs):
+            self.typed_names.update(typed.findall(text))
+            for fn in FN_DECL.finditer(text):
+                open_paren = fn.end() - 1
+                params = top_level_parts(text, open_paren + 1, matching_close(text, open_paren))
+                for index, (_, param) in enumerate(params):
+                    parsed = PARAM.match(param)
+                    base = TYPE_BASE.match(parsed.group(2)) if parsed else None
+                    if base and base.group(1) in self.config_types and parsed.group(1) != "self":
+                        container = innermost_container(spans, fn.start())
+                        self.config_params.setdefault(fn.group(1), []).append((container, len(params), index))
+
+
+def innermost_container(spans: list[tuple[str, int, int]], position: int) -> str | None:
+    """The struct whose body holds `position`, innermost first."""
+    inside = [(start, name) for name, start, end in spans if start < position < end]
+    return max(inside)[1] if inside else None
+
+
+def flatten_body(text: str, open_brace: int, close: int) -> str:
+    """A container body with nested bracket contents blanked, so only its own members remain."""
+    out: list[str] = []
+    depth = 0
+    for char in text[open_brace + 1 : close]:
+        if char in "([{":
+            depth += 1
+            out.append(" ")
+        elif char in ")]}":
+            depth -= 1
+            out.append(" ")
+        else:
+            out.append(char if depth == 0 or char == "\n" else " ")
+    return "".join(out)
+
+
+def matching_close(text: str, open_index: int) -> int:
+    """Index of the bracket closing the one at `open_index`, or len(text) when unbalanced."""
+    depth = 0
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return len(text)
+
+
+def top_level_parts(text: str, start: int, end: int) -> list[tuple[int, str]]:
+    """The comma-separated parts of `text[start:end]` at bracket depth 0, with their offsets."""
+    parts: list[tuple[int, str]] = []
+    depth = 0
+    part_start = start
+    for index in range(start, end):
+        char = text[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append((part_start, text[part_start:index]))
+            part_start = index + 1
+    if text[part_start:end].strip():
+        parts.append((part_start, text[part_start:end]))
+    return parts
+
+
+def is_config_forward(model: ControlModel, control: str, value: str) -> bool:
+    """`value` is a seam field of `control` read from a stage-config value (`config` or
+    `<x>_config`, declared with a stage-config type), alone or in an `orelse` chain."""
+    for term in value.split(" orelse "):
+        forward = FORWARD_TERM.match(term.strip())
+        if not forward:
+            return False
+        owner, field = forward.groups()
+        if not (CONFIG_NAME.match(owner) and owner in model.typed_names and model.seam_fields.get(field) == control):
+            return False
+    return True
+
+
+def control_violation(model: ControlModel, field: str, value: str) -> str | None:
+    """The sub-rule a seam or tuner field set to `value` breaks, or None for a forward."""
+    value = " ".join(value.split())
+    if field in TUNER_FIELDS:
+        if SELECTION_FORWARD[field].match(value):
+            return None
+        source = "the selection's `active_tuner`" if field == "adaptive_tuner" else "the selection's `profile`"
+        return f"13.3: `{field} = {value}` is not {source}; a dispatch runs the shape its tuner selected and records"
+    control = model.seam_fields.get(field)
+    if control is None:
+        return None
+    if is_config_forward(model, control, value):
+        return None
+    if control != "adaptive" and SELECTION_FORWARD[control].match(value):
+        return None
+    if control == "adaptive":
+        return f"13.2: `{field} = {value}` is not a forward of a config `adaptive`; production stages stay tuned unless their config says otherwise"
+    return (
+        f"13.1: `{field} = {value}` is not a forward; production forwards its stage config "
+        f"(`config.[<stage>_]{control}`) or its selection, and a fixed shape is set only by tests and benches"
+    )
+
+
+def literal_control_hits(model: ControlModel, text: str, open_brace: int) -> list[tuple[int, str]]:
+    """Rule 13 hits among the fields of the stage-config literal opening at `open_brace`."""
+    hits: list[tuple[int, str]] = []
+    close = matching_close(text, open_brace)
+    for offset, part in top_level_parts(text, open_brace + 1, close):
+        field = LITERAL_FIELD.match(part.strip())
+        if not field:
+            continue
+        message = control_violation(model, field.group(1), field.group(2))
+        if message:
+            hits.append((offset + len(part) - len(part.lstrip()), message))
+    return hits
+
+
+def literal_field_names(text: str, open_brace: int) -> set[str]:
+    """The field names a struct literal opening at `open_brace` sets."""
+    parts = top_level_parts(text, open_brace + 1, matching_close(text, open_brace))
+    return {field.group(1) for _, part in parts if (field := LITERAL_FIELD.match(part.strip()))}
+
+
+def anonymous_literal(arg: str) -> int | None:
+    """Offset of the `{` of an anonymous `.{` literal argument, or None."""
+    literal = re.match(r"\s*\.\{", arg)
+    return literal.end() - 1 if literal else None
+
+
+def dispatch_control_hits(model: ControlModel, text: str) -> list[tuple[int, str]]:
+    """Rule 13 hits in code text (literals blanked, comments removed), as `(offset, message)`."""
+    hits: list[tuple[int, str]] = []
+    types = "|".join(sorted(model.config_types)) or "(?!)"
+    # `T{`, `: T = .{`, and a function returning `T`, whose `return .{` literals are `T`'s.
+    for literal in re.finditer(rf"(?<![\w.])(?:{types})\s*(?:\{{|=\s*\.\{{)", text):
+        if re.search(rf"\)\s*(?:{IDENT})?!?\s*\??\s*$", text[max(0, literal.start() - 64) : literal.start()]):
+            body_end = matching_close(text, literal.end() - 1)
+            for ret in re.finditer(r"\breturn\s+\.\{", text[literal.end() : body_end]):
+                hits.extend(literal_control_hits(model, text, literal.end() + ret.end() - 1))
+            continue
+        hits.extend(literal_control_hits(model, text, literal.end() - 1))
+    # A literal assigned to a name declared with a stage-config type (`.controls = .{`,
+    # `self.nav_controls = .{`).
+    for assign in re.finditer(rf"(?<![\w])\.?(?:{IDENT}\.)*({IDENT})\s*=(?!=)\s*\.\{{", text):
+        if assign.group(1) in model.typed_names:
+            hits.extend(literal_control_hits(model, text, assign.end() - 1))
+    # A literal argument in a stage-config parameter's position.
+    for call in CALL.finditer(text):
+        receiver, name = call.groups()
+        decls = model.config_params.get(name)
+        if not decls or re.search(r"\bfn\s*$", text[max(0, call.start() - 8) : call.start()]):
+            continue
+        open_paren = call.end() - 1
+        args = top_level_parts(text, open_paren + 1, matching_close(text, open_paren))
+        type_receiver = receiver is not None and receiver[0].isupper()
+        for container, count, index in decls:
+            if type_receiver and container != receiver:
+                continue
+            position = index if len(args) == count else index - 1 if len(args) == count - 1 else -1
+            if position < 0:
+                continue
+            offset, arg = args[position]
+            brace = anonymous_literal(arg)
+            if brace is not None:
+                hits.extend(literal_control_hits(model, text, offset + brace))
+        # 13.3 on the owner's dispatch calls: a null tuner, or options without the selection's.
+        if name == "selectBatchProfile" and args and args[0][1].strip() == "null":
+            hits.append((args[0][0], "13.3: `selectBatchProfile(null, ...)` selects a shape no tuner records; pass the stage's tuner"))
+        if name == "parallelForWithOptions" and args:
+            offset, options = args[-1]
+            brace = anonymous_literal(options)
+            if brace is None:
+                hits.append((offset, "13.3: `parallelForWithOptions` options must be a literal carrying the selection's `adaptive_tuner`"))
+            elif "adaptive_tuner" not in literal_field_names(text, offset + brace):
+                hits.append((call.start(), "13.3: `parallelForWithOptions` without the selection's `adaptive_tuner` runs a shape no tuner records"))
+    # A seam or tuner field assigned in a statement (`sort_stage.items_per_range = 1;`).
+    fields = "|".join(sorted(set(model.seam_fields) | set(TUNER_FIELDS)))
+    statement = rf"(?<![\w.]){IDENT}(?:\.{IDENT}|\.\*|\[[^\]\n]*\])*\.({fields})\s*[-+*]?=(?!=)\s*([^;]*);"
+    for assign in re.finditer(statement, text):
+        message = control_violation(model, assign.group(1), assign.group(2))
+        if message:
+            hits.append((assign.start(), message))
+    return sorted(set(hits))
+
+
+# Rule 13's self-check model: the seam declarations as `thread_system.zig` and the systems
+# spell them.
+DISPATCH_CONTROL_DECLS = """
+pub const StageControls = struct {
+    items_per_range: ?usize = null,
+    max_worker_threads: ?usize = null,
+    adaptive: bool = true,
+};
+pub const ParallelForOptions = struct {
+    items_per_range: ?usize = null,
+    max_worker_threads: ?usize = null,
+    range_alignment_items: usize = 1,
+    adaptive: bool = true,
+    adaptive_tuner: ?*AdaptiveWorkTuner = null,
+    selected_profile: ?AdaptiveWorkProfile = null,
+};
+pub const BatchWorkRequest = struct {
+    item_count: usize,
+    items_per_range: ?usize = null,
+    max_worker_threads: ?usize = null,
+    adaptive: bool = true,
+};
+pub const ThreadSystemConfig = struct {
+    max_worker_threads: ?usize = null,
+    items_per_range: usize = 64,
+};
+pub const ThreadSystem = struct {
+    pub fn init(allocator: Allocator, io: Io, config: ThreadSystemConfig) !ThreadSystem {}
+    pub fn selectBatchProfile(self: *const ThreadSystem, adaptive_tuner: ?*AdaptiveWorkTuner, request: BatchWorkRequest) BatchSelection {}
+    pub fn parallelForWithOptions(self: *ThreadSystem, item_count: usize, context: *anyopaque, job_fn: JobFn, options: ParallelForOptions) BatchStats {}
+};
+pub const Dispatch = struct {
+    thread_system: *ThreadSystem,
+    items_per_range: ?usize = null,
+    max_worker_threads: ?usize = null,
+    adaptive: bool = true,
+    pub fn init(thread_system: *ThreadSystem, tuner: *AdaptiveWorkTuner, controls: StageControls) Dispatch {}
+};
+pub const SteeringConfig = struct {
+    items_per_range: ?usize = null,
+    band_items_per_range: ?usize = null,
+    max_worker_threads: ?usize = null,
+    adaptive: bool = true,
+};
+pub const AiConfig = struct {
+    items_per_range: ?usize = null,
+    separation_items_per_range: ?usize = null,
+    max_worker_threads: ?usize = null,
+    adaptive: bool = true,
+};
+const ParticleUpdateConfig = struct {
+    items_per_range: ?usize = null,
+};
+const MovementThreads = StageThreads(MovementConfig);
+const SteeringSystem = struct {
+    nav_controls: StageControls = .{},
+    pub fn update(self: *SteeringSystem, data: *DataSystem, thread_system: *ThreadSystem, config: SteeringConfig) !void {}
+    fn updateParticles(self: *SteeringSystem, update_config: ParticleUpdateConfig) void {}
+};
+const EditThreads = struct {
+    controls: StageControls = .{},
+};
+"""
+# Each snippet and the sub-rules it hits. The hits are the production lines L2 and L3 removed
+# (worldgen paint, response place, trigger emit count), the steering band translations, and
+# one per context; the passes are forwards and job-context fields.
+DISPATCH_CONTROL_CASES = (
+    (
+        "_ = thread_system.parallelForWithOptions(geom.chunkCount(), &build_context, buildProceduralChunk, .{\n"
+        "    .items_per_range = 1,\n    .range_alignment_items = 1,\n    .adaptive = false,\n});",
+        ("13.1", "13.2", "13.3"),
+    ),
+    (
+        "const place_batch = threads.thread_system.parallelForWithOptions(1, &place, placeJob, .{\n"
+        "    .items_per_range = 1,\n    .max_worker_threads = selection.worker_threads,\n"
+        "    .range_alignment_items = 1,\n    .adaptive = false,\n});",
+        ("13.1", "13.2", "13.3"),
+    ),
+    (
+        "const count_batch = threads.thread_system.parallelForWithOptions(items, &job, emitCountJob, .{\n"
+        "    .items_per_range = threads.config.items_per_range,\n"
+        "    .max_worker_threads = threads.config.max_worker_threads,\n"
+        "    .range_alignment_items = collision_range_alignment_items,\n"
+        "    .adaptive = threads.config.adaptive,\n    .adaptive_tuner = null,\n"
+        "    .selected_profile = selection.profile,\n});",
+        ("13.3",),
+    ),
+    ("if (stage.config.items_per_range != null) sort_stage.items_per_range = 1;", ("13.1",)),
+    ("if (stage.config.items_per_range != null) claim_stage.items_per_range = 1;", ("13.1",)),
+    ("const d = Dispatch.init(ts, &tuner, .{ .items_per_range = config.items_per_range orelse 1 });", ("13.1",)),
+    ("splice_controls: StageControls = .{ .adaptive = false },", ("13.2",)),
+    ("const controls = StageControls{ .items_per_range = 8, .max_worker_threads = workers };", ("13.1", "13.1")),
+    ("options.max_worker_threads = 0;", ("13.1",)),
+    ("const s = threads.selectBatchProfile(&tuner, .{ .item_count = n, .items_per_range = 1 });", ("13.1",)),
+    ("const options = ParallelForOptions{ .adaptive = false };", ("13.2",)),
+    ("const request = BatchWorkRequest{ .item_count = n, .max_worker_threads = 0 };", ("13.1",)),
+    ("fn controls() StageControls {\n    return .{ .adaptive = false };\n}", ("13.2",)),
+    ("self.nav_controls = .{ .adaptive = false, .items_per_range = 1 };", ("13.1", "13.2")),
+    ("const t: EditThreads = .{ .thread_system = ts, .controls = .{ .adaptive = false } };", ("13.2",)),
+    ("step.steering = try self.steering.update(data, ts, .{ .band_items_per_range = 1, .adaptive = false });", ("13.1", "13.2")),
+    ("const s = MovementThreads{ .thread_system = ts, .config = .{ .items_per_range = 1 } };", ("13.1",)),
+    ("const c = SteeringConfig{ .items_per_range = 1 };", ("13.1",)),
+    ("_ = ts.parallelForWithOptions(n, &c, job, .{ .max_worker_threads = config.max_worker_threads });", ("13.3",)),
+    ("_ = ts.parallelForWithOptions(n, &c, job, options);", ("13.3",)),
+    ("const s = ts.selectBatchProfile(null, .{ .item_count = n });", ("13.3",)),
+    (
+        "_ = ts.parallelForWithOptions(n, &c, job, .{ .adaptive_tuner = selection.active_tuner, "
+        ".selected_profile = .{ .worker_threads = 3, .items_per_range = 1 } });",
+        ("13.3",),
+    ),
+    ("_ = Dispatch.init(ts, &t, .{ .items_per_range = fixed_config.items_per_range });", ("13.1",)),
+    ("_ = Dispatch.init(ts, &t, .{ .items_per_range = config.max_items_per_range });", ("13.1",)),
+    ("_ = Dispatch.init(ts, &t, .{ .adaptive = config.non_adaptive });", ("13.2",)),
+    ("_ = Dispatch.init(ts, &t, .{ .max_worker_threads = config.items_per_range });", ("13.1",)),
+    (
+        "const separation = Dispatch.init(thread_system, &self.separation_tuner, .{\n"
+        "    .items_per_range = config.separation_items_per_range orelse config.items_per_range,\n"
+        "    .max_worker_threads = config.max_worker_threads,\n    .adaptive = config.adaptive,\n});",
+        (),
+    ),
+    (
+        "const sort_stage = Dispatch.init(stage.thread_system, &self.grid_sort_tuner, .{\n"
+        "    .items_per_range = stage.config.band_items_per_range,\n"
+        "    .max_worker_threads = stage.config.max_worker_threads,\n    .adaptive = stage.config.adaptive,\n});",
+        (),
+    ),
+    ("const dispatch = Dispatch.init(thread_system, &self.adaptive_tuner, .{ .items_per_range = update_config.items_per_range });", ()),
+    (
+        "const batch = thread_system.parallelForWithOptions(n, &context, collisionGatherJob, .{\n"
+        "    .max_worker_threads = selection.worker_threads,\n    .adaptive_tuner = selection.active_tuner,\n"
+        "    .selected_profile = selection.profile,\n});",
+        (),
+    ),
+    ("const s = threads.selectBatchProfile(&tuner, .{ .item_count = n, .adaptive = config.adaptive });", ()),
+    ("var job = PlaneJob{ .items_per_range = selection.items_per_range, .run_count = 1 };", ()),
+    ("var job = AgentsJob{ .items_per_range = agent_count };", ()),
+    ("job.items_per_range = selection.items_per_range;", ()),
+    ("job.items_per_range = shape.items_per_range;", ()),
+    ("controls: StageControls = .{},", ()),
+    ("return Dispatch.init(self.thread_system, self.plan_tuner, self.controls);", ()),
+    ("fn controls(config: SteeringConfig) StageControls {\n    const n = 1;\n    return .{ .adaptive = config.adaptive };\n}", ()),
+    ("var threads = try ThreadSystem.init(allocator, io, .{ .max_worker_threads = 0 });", ()),
+    ("step.steering = try self.steering.update(data, ts, .{});", ()),
+)
+
+
+def check_dispatch_controls() -> None:
+    """Fails the lint when rule 13 misreads one of its self-check cases."""
+    model = ControlModel([DISPATCH_CONTROL_DECLS])
+    for snippet, expected in DISPATCH_CONTROL_CASES:
+        found = tuple(sorted(message.split(":", 1)[0] for _, message in dispatch_control_hits(model, snippet)))
+        if found != tuple(sorted(expected)):
+            print(f"idiom-lint: rule 13 self-check failed on `{snippet}` (expected {expected or 'no hit'}, got {found or 'no hit'})", file=sys.stderr)
+            raise SystemExit(1)
+
+
+def control_scan_text(path: Path) -> str:
+    """A file's code with literals blanked, comments removed, and its test blocks and the
+    helpers only tests reach blanked (the seam), line count kept."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    seam = test_block_line_indexes(lines) | test_only_helper_line_indexes(path, lines)
+    return "\n".join("" if index in seam else strip_line_comment(blank_literals(raw)) for index, raw in enumerate(lines))
+
+
+def lint_dispatch_controls(files: list[Path]) -> list[tuple[str, int, str, str]]:
+    prod = [path for path in files if is_production(path)]
+    texts = {path: control_scan_text(path) for path in prod}
+    model = ControlModel(list(texts.values()))
+    issues: list[tuple[str, int, str, str]] = []
+    for path in prod:
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel == THREAD_SYSTEM_FILE:
+            continue
+        text = texts[path]
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for offset, message in dispatch_control_hits(model, text):
+            index = text.count("\n", 0, offset)
+            issues.append((rel, index + 1, message, lines[index].strip()))
+    return issues
+
+
 def main() -> None:
     if not SRC_DIR.is_dir():
         print(f"idiom-lint: source directory not found: {SRC_DIR}", file=sys.stderr)
         raise SystemExit(1)
 
     check_perf_ref()
+    check_dispatch_controls()
     files = sorted(SRC_DIR.rglob("*.zig")) + [BUILD_FILE]
     issues: list[tuple[str, int, str, str]] = []
     for path in files:
@@ -869,6 +1336,7 @@ def main() -> None:
     issues.extend(lint_test_only_api(files))
     issues.extend(lint_test_perf(files))
     issues.extend(lint_layer_imports(files))
+    issues.extend(lint_dispatch_controls(files))
 
     if issues:
         for rel, lineno, message, snippet in issues:

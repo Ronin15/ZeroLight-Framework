@@ -42,7 +42,8 @@
 //! tuner its measured step runs (`step_tuners:`: the seven steering stages, and the seam's
 //! for `steering-static-change`) and prints each steering tuner's state (`tuners:`). A fixed
 //! threaded case runs every stage of more than one range on workers; the band stages (claim,
-//! grid sort) are checked at one band per range, their fixed shape.
+//! grid sort) run at the case's band range (`bandItemsPerRange`), and each fixed threaded case
+//! checks their range counts against it.
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -336,10 +337,8 @@ fn measureCase(
     var main_total: u128 = 0;
     var shapes = suite.StageShapes(stage_names.len){};
     var seam_shapes = suite.StageShapes(fixtures.seam_stage_names.len){};
-    // The band stages (claim, grid sort) take one band per range at a fixed shape; the rest
-    // the case's element range.
     const element_range = case.stageItemsPerRange(steering_range_alignment_items);
-    const band_range: ?usize = if (element_range == null) null else 1;
+    const band_range = bandItemsPerRange(case);
     for (0..options.iterations) |_| {
         try prepare(context);
         const start_ns = suite.nowNs(io);
@@ -356,6 +355,8 @@ fn measureCase(
             last_stats.perf.grid_bucket_batch, last_stats.perf.batch,
         });
         try suite.checkStagesDispatched(case, thread_ptr, band_range, &.{ last_stats.perf.select_claim_batch, last_stats.perf.grid_sort_batch });
+        try suite.checkFixedRangeCount(case, thread_ptr, band_range, last_stats.perf.select_claim_batch);
+        try suite.checkFixedRangeCount(case, thread_ptr, band_range, last_stats.perf.grid_sort_batch);
     }
 
     var stats = accumulator.finish();
@@ -392,10 +393,19 @@ fn runOnce(system: *SteeringSystem, fixture: *Fixture, thread_system: *ThreadSys
     return stats;
 }
 
+// The band stages' (claim, grid sort) fixed partition: one band per range.
+const band_partition_items: usize = 1;
+
+// The band stages' range control for `case`: the range modes scale from one band.
+fn bandItemsPerRange(case: suite.BenchmarkCase) ?usize {
+    return case.stageItemsPerRangeForPartition(band_partition_items, 1);
+}
+
 // The steering update for `case` over the step's navigation intents.
 fn steeringStep(system: *SteeringSystem, fixture: *Fixture, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SteeringStats {
     return try system.update(&fixture.data, &fixture.frame, thread_system, &fixture.pathfinding, &fixture.colliders, .{
         .items_per_range = case.stageItemsPerRange(steering_range_alignment_items),
+        .band_items_per_range = bandItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
     });
@@ -545,6 +555,7 @@ const SeamFixture = struct {
         const pipeline = &self.seam.pipeline;
         return try pipeline.steering.update(&self.data, &self.seam.frame, thread_system, &pipeline.pathfinding, &pipeline.static_colliders, .{
             .items_per_range = case.stageItemsPerRange(steering_range_alignment_items),
+            .band_items_per_range = bandItemsPerRange(case),
             .max_worker_threads = case.maxWorkerThreads(),
             .adaptive = case.adaptive,
         });

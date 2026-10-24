@@ -9,6 +9,7 @@
 const std = @import("std");
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const BandPartition = @import("../../../app/thread_system.zig").BandPartition;
+const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
@@ -73,9 +74,11 @@ pub fn selectIntents(
     const resolve_batch = resolve_stage.run(selection, intent_count, steering_range_alignment_items, &resolve, resolveJob);
     if (comptime runtime_perf_log.enabled) stats.perf.select_resolve_batch = resolve_batch;
 
-    // A fixed shape (an explicit range size) claims one band per range.
-    var claim_stage = stage.stage(&self.select_claim_tuner);
-    if (stage.config.items_per_range != null) claim_stage.items_per_range = 1;
+    const claim_stage = Dispatch.init(stage.thread_system, &self.select_claim_tuner, .{
+        .items_per_range = stage.config.band_items_per_range,
+        .max_worker_threads = stage.config.max_worker_threads,
+        .adaptive = stage.config.adaptive,
+    });
     const claim_selection = claim_stage.select(bands.band_count, 1);
     var claim = ClaimJob{
         .intents = intents,
@@ -343,7 +346,7 @@ test "steering threaded arbitration keeps the first appearance and the best inte
         const stats = if (run == 0)
             try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders)
         else
-            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, .{ .items_per_range = steering_range_alignment_items, .max_worker_threads = 2, .adaptive = false });
+            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, .{ .items_per_range = steering_range_alignment_items, .band_items_per_range = 1, .max_worker_threads = 2, .adaptive = false });
         try std.testing.expectEqual(@as(usize, 40), stats.selected_intent_count);
         // First appearance order, each agent steering along its best intent.
         for (output, frame.intents.mergedItems(), agents, best) |*slot, merged, agent, best_index| {
@@ -448,7 +451,7 @@ test "steering claims and intents match serial across resolve partitions" {
         frame.beginStep();
         try appendNavigationIntents(&frame, &intents);
         const stats = if (items_per_range) |range_items|
-            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, .{ .items_per_range = range_items, .max_worker_threads = 2, .adaptive = false })
+            try steering.update(&data, &frame, &threads, &pathfinding, &colliders, .{ .items_per_range = range_items, .band_items_per_range = 1, .max_worker_threads = 2, .adaptive = false })
         else
             try updateSteeringInline(&steering, &data, &frame, &pathfinding, &colliders);
         try std.testing.expectEqual(@as(usize, 40), stats.selected_intent_count);
