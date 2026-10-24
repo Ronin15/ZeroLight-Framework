@@ -306,7 +306,6 @@ comptime {
 }
 
 comptime {
-    std.debug.assert(@sizeOf(PaddedSlot(GatherRow)) % thread_shared_record_alignment == 0);
     // A gather range's claim window starts at twice its first contact. Range starts are
     // multiples of the contact alignment, so adjacent windows do not share a cache line.
     std.debug.assert((2 * collision_response_range_alignment_items * @sizeOf(usize)) % thread_shared_record_alignment == 0);

@@ -33,6 +33,9 @@ const runShaped = @import("../../../app/thread_system.zig").runShaped;
 const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const runStage = @import("../../../app/thread_system.zig").runStage;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
+const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
+const SlotList = @import("../../../app/thread_system.zig").SlotList;
+const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const ChunkBits = @import("../../world/terrain.zig").ChunkBits;
@@ -495,7 +498,6 @@ pub const LevelRuns = struct {
 const OrderedIndexSet = @import("../chunk_list_map.zig").OrderedIndexSet;
 const bitSetBytes = @import("../chunk_list_map.zig").bitSetBytes;
 const KeyList = std.array_list.Aligned(u64, .fromByteUnits(thread_shared_record_alignment));
-const PlanTallyList = std.array_list.Aligned(PlanTally, .fromByteUnits(thread_shared_record_alignment));
 pub const key_window_alignment: usize = thread_shared_record_alignment / @sizeOf(u64);
 
 // Sorts `keys` and drops repeats in place; returns the unique count. O(k log k).
@@ -537,14 +539,10 @@ const PlanWindow = struct {
     end: [plan_streams]usize = @splat(0),
 };
 
-// One plan range's unique key counts, padded to its own cache line.
+// One plan range's unique key counts (a `PaddedSlot` of `NavGraph.plan_tallies`).
 const PlanTally = struct {
-    counts: [plan_streams]usize align(thread_shared_record_alignment) = @splat(0),
+    counts: [plan_streams]usize = @splat(0),
 };
-
-comptime {
-    std.debug.assert(@sizeOf(PlanTally) % thread_shared_record_alignment == 0);
-}
 
 // One level's share of the threaded plan merge (`NavGraph.mergePlanWindows`): its patch
 // chunks in order and flags for its changed chunks and its new links' endpoint chunks
@@ -593,7 +591,7 @@ const PlanJob = struct {
     items_per_range: usize,
     windows: []const PlanWindow,
     staging: [plan_streams][]u64,
-    tallies: []PlanTally,
+    tallies: []PaddedSlot(PlanTally),
 };
 
 // SIMD verdict: scalar. Key writes over a mark's chunk span, then a pdq sort and an in-place
@@ -611,7 +609,7 @@ fn planJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     for (ends, window.end) |written, bound| std.debug.assert(written <= bound);
     var tally = PlanTally{};
     for (0..plan_streams) |stream| tally.counts[stream] = sortUnique(job.staging[stream][window.start[stream]..ends[stream]]);
-    job.tallies[range.index] = tally;
+    job.tallies[range.index].value = tally;
 }
 
 /// What a patch key needs from the reserve: its endpoint count on the level and whether it
@@ -889,7 +887,7 @@ pub const NavGraph = struct {
     // Plan stage staging (per-range key windows, one list per stream) and tallies.
     plan_staging: [plan_streams]KeyList = @splat(.empty),
     plan_windows: std.ArrayList(PlanWindow) = .empty,
-    plan_tallies: PlanTallyList = .empty,
+    plan_tallies: SlotList(PlanTally) = .empty,
     // The threaded plan merge's levels holding keys, in order (each level's chunks are in its
     // `LevelPlanSets`). Covers every level, grows at level append, and is empty between
     // batches.
@@ -970,7 +968,7 @@ pub const NavGraph = struct {
             self.patch_info.capacity * @sizeOf(PatchInfo) +
             self.changed_masks.capacity * @sizeOf(ChunkBits) +
             self.plan_windows.capacity * @sizeOf(PlanWindow) +
-            self.plan_tallies.capacity * @sizeOf(PlanTally) +
+            self.plan_tallies.capacity * @sizeOf(PaddedSlot(PlanTally)) +
             self.plan_levels.residentBytes() +
             self.level_crossings.capacity * @sizeOf(LevelCrossings);
         for (self.plan_staging) |staging| bytes += staging.capacity * @sizeOf(u64);
@@ -1467,7 +1465,7 @@ pub const NavGraph = struct {
         // Windows: each range's key bounds, starting on a cache line.
         self.staging_window.note(.ranges, selection.range_count);
         try types.resizeStaging(&self.plan_windows, self.allocator, selection.range_count, &self.pool_grows);
-        try types.resizeStaging(&self.plan_tallies, self.allocator, selection.range_count, &self.pool_grows);
+        try types.growList(&self.plan_tallies, self.allocator, selection.range_count, &self.pool_grows);
         var totals: [plan_streams]usize = @splat(0);
         for (self.plan_windows.items, 0..) |*window, range_index| {
             for (&totals) |*total| total.* = std.mem.alignForward(usize, total.*, key_window_alignment);
@@ -1485,7 +1483,7 @@ pub const NavGraph = struct {
             try types.resizeStaging(list, self.allocator, total, &self.pool_grows);
             slice.* = list.items;
         }
-        @memset(self.plan_tallies.items, .{});
+        setSlotCount(PlanTally, &self.plan_tallies, selection.range_count);
         var job = PlanJob{
             .graph = self,
             .world = world,
@@ -1505,7 +1503,7 @@ pub const NavGraph = struct {
         defer stats.addMain(.plan_ns, section.lap());
         if (selection.range_count > 1) return self.mergePlanWindows();
         // One range: its windows start at 0 and hold the sorted unique keys.
-        const counts = self.plan_tallies.items[0].counts;
+        const counts = self.plan_tallies.items[0].value.counts;
         for ([_]PlanStream{ .changed, .patch }) |stream| {
             const out = self.keyList(stream);
             std.mem.swap(KeyList, out, &self.plan_staging[@backingInt(stream)]);
@@ -1555,8 +1553,8 @@ pub const NavGraph = struct {
         std.debug.assert(self.plan_levels.isEmpty());
         std.debug.assert(self.level_graphs.items.len <= self.plan_levels.capacity());
         var totals: [plan_streams]usize = @splat(0);
-        for (self.plan_tallies.items) |tally| {
-            for (&totals, tally.counts) |*total, count| total.* += count;
+        for (self.plan_tallies.items) |slot| {
+            for (&totals, slot.value.counts) |*total, count| total.* += count;
         }
         // Dirty keys are the changed keys plus the link keys.
         totals[@backingInt(PlanStream.dirty)] += totals[@backingInt(PlanStream.changed)];
@@ -1566,7 +1564,8 @@ pub const NavGraph = struct {
         }
 
         const level_graphs = self.level_graphs.items;
-        for (self.plan_windows.items, self.plan_tallies.items) |window, tally| {
+        for (self.plan_windows.items, self.plan_tallies.items) |window, slot| {
+            const tally = slot.value;
             // Patch keys first, so a level's first key this merge finds it clear.
             for (self.planWindowKeys(.patch, window, tally)) |key| {
                 const sets = &level_graphs[keyLevel(key)].plan;
@@ -4294,7 +4293,7 @@ test "the threaded plan merge equals the sorted unique keys of every stream for 
         for (&graph.plan_staging) |*list| list.clearRetainingCapacity();
         try graph.plan_windows.resize(allocator, range_count);
         try graph.plan_tallies.resize(allocator, range_count);
-        for (graph.plan_windows.items, graph.plan_tallies.items, 0..) |*window, *tally, range_index| {
+        for (graph.plan_windows.items, graph.plan_tallies.items, 0..) |*window, *slot, range_index| {
             // Changed keys, link keys (some also changed), and patch keys holding both plus
             // neighbours, with repeats across ranges; the last range is empty.
             for (&range_keys) |*list| list.clearRetainingCapacity();
@@ -4313,7 +4312,7 @@ test "the threaded plan merge equals the sorted unique keys of every stream for 
             // The dirty keys are the changed keys plus the link keys.
             try expected[@backingInt(PlanStream.dirty)].appendSlice(allocator, range_keys[@backingInt(PlanStream.changed)].items);
             window.* = .{ .start = undefined };
-            for (&graph.plan_staging, &range_keys, &window.start, &window.end, &tally.counts) |*staging, *list, *start, *end, *count| {
+            for (&graph.plan_staging, &range_keys, &window.start, &window.end, &slot.value.counts) |*staging, *list, *start, *end, *count| {
                 count.* = sortUnique(list.items);
                 start.* = staging.items.len;
                 try staging.appendSlice(allocator, list.items[0..count.*]);

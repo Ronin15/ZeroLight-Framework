@@ -24,6 +24,8 @@ const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const StageControls = @import("../../../app/thread_system.zig").StageControls;
 const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
+const SlotList = @import("../../../app/thread_system.zig").SlotList;
+const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const rebuild_tuner_config = @import("../../../app/thread_system.zig").rebuild_tuner_config;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
 const DataSystem = @import("../../data_system.zig").DataSystem;
@@ -52,15 +54,15 @@ const group_service = @import("group_service.zig");
 const intake = @import("intake.zig");
 const nav_reaction = @import("nav_reaction.zig");
 const NavMarkList = @import("nav_reaction.zig").NavMarkList;
-const NavMarkTallyList = @import("nav_reaction.zig").NavMarkTallyList;
+const NavMarkTally = @import("nav_reaction.zig").NavMarkTally;
 const nav_mark_range_alignment_items = @import("nav_reaction.zig").nav_mark_range_alignment_items;
 const EvictItemList = @import("eviction.zig").EvictItemList;
 const HitList = @import("eviction.zig").HitList;
 const IntakeRecordList = @import("intake.zig").IntakeRecordList;
 const GroupKeyCountList = @import("intake.zig").GroupKeyCountList;
-const IntakeTallyList = @import("intake.zig").IntakeTallyList;
+const IntakeTally = @import("types.zig").IntakeTally;
 const RegRecordList = @import("publish.zig").RegRecordList;
-const PublishBandList = @import("publish.zig").PublishBandList;
+const PublishBand = @import("publish.zig").PublishBand;
 const FlushTally = @import("publish.zig").FlushTally;
 const FlushTuners = @import("publish.zig").FlushTuners;
 const flush_pair_count = @import("publish.zig").flush_pair_count;
@@ -128,7 +130,7 @@ pub const PathfindingSystem = struct {
     // capacity seam from the frame request limit.
     intake_records: IntakeRecordList = .empty,
     intake_group_counts: GroupKeyCountList = .empty,
-    intake_tallies: IntakeTallyList = .empty,
+    intake_tallies: SlotList(IntakeTally) = .empty,
     // Indexed by solve ordinal (the solve batch's item index).
     solve_results: std.ArrayList(PathSolveResult) = .empty,
     // Per solve ordinal, the pending index it solves, increasing.
@@ -177,11 +179,11 @@ pub const PathfindingSystem = struct {
     // `publish_copy` output: per range, its registration window's base and per-shard
     // counts, and the windows, shard-ordered within each range.
     publish_range_bases: std.ArrayList(usize) = .empty,
-    publish_bands: PublishBandList = .empty,
+    publish_bands: SlotList(PublishBand) = .empty,
     reg_buckets: RegRecordList = .empty,
     // Ranges of the last publish copy whose registrations the next flush adds.
     publish_ranges: usize = 0,
-    flush_tallies: [flush_pair_count]FlushTally = @splat(.{}),
+    flush_tallies: [flush_pair_count]PaddedSlot(FlushTally) = @splat(.{}),
     // Owner heads past the cache's capacity wait for the flush that applies its shrink.
     registry_truncate_pending: bool = false,
     // Path eviction scratch: one item per changed key and the hit windows, reserved before
@@ -197,7 +199,7 @@ pub const PathfindingSystem = struct {
     // `nav_mark` staging: one mark slot per event (each range writes only its own window)
     // and one padded tally per range. Reserved with the terrain record, before the write.
     nav_mark_staging: NavMarkList = .empty,
-    nav_mark_tallies: NavMarkTallyList = .empty,
+    nav_mark_tallies: SlotList(NavMarkTally) = .empty,
     // Kept only with `runtime_perf_log.enabled`: the batch shape of the most recent
     // `nav_mark` stage, the terrain records' off-main, inline, and main-section time
     // since the last reaction, folded into its stats, and the requests a resize dropped

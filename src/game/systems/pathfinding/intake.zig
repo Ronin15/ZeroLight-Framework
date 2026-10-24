@@ -17,6 +17,8 @@ const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
 const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
+const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
+const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const ResultCache = @import("caches.zig").ResultCache;
@@ -39,8 +41,6 @@ const StageThreads = @import("../../../app/thread_system.zig").StageThreads(Path
 pub const IntakeRecordList = std.array_list.Aligned(IntakeRecord, .fromByteUnits(thread_shared_record_alignment));
 /// `path_intake` group-key windows, one per range, on thread-shared record alignment.
 pub const GroupKeyCountList = std.array_list.Aligned(GroupKeyCount, .fromByteUnits(thread_shared_record_alignment));
-/// One padded `path_intake` tally per range.
-pub const IntakeTallyList = std.array_list.Aligned(IntakeTally, .fromByteUnits(thread_shared_record_alignment));
 
 /// `path_intake`: ranges (one inline range without a thread system or when the tuner keeps
 /// the stage inline) classify against step-start state into their windows (a record per
@@ -73,8 +73,7 @@ pub fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest, g
     std.debug.assert(self.intake_tallies.capacity >= shape.range_count);
     self.intake_records.items.len = item_count;
     self.intake_group_counts.items.len = item_count;
-    self.intake_tallies.items.len = shape.range_count;
-    @memset(self.intake_tallies.items, .{});
+    setSlotCount(IntakeTally, &self.intake_tallies, shape.range_count);
     var job = IntakeJob{
         .system = self,
         .requests = requests[0..item_count],
@@ -253,7 +252,8 @@ fn classifyIntakeRange(self: *const PathfindingSystem, requests: []const PathReq
 
 // Main-thread intake merge in range order (see acceptRequests).
 fn mergeIntake(self: *PathfindingSystem, items_per_range: usize, gates: StepGates, stats: *PathfindingStats) void {
-    for (self.intake_tallies.items, 0..) |tally, range_index| {
+    for (self.intake_tallies.items, 0..) |slot, range_index| {
+        const tally = slot.value;
         const window_start = range_index * items_per_range;
         for (self.intake_group_counts.items[window_start..][0..tally.group_key_count]) |entry| {
             recordGroupRequestCount(self, entry.key, entry.count, gates.group_tallies);
@@ -340,7 +340,7 @@ const IntakeJob = struct {
     items_per_range: usize,
     records: []IntakeRecord,
     group_counts: []GroupKeyCount,
-    tallies: []IntakeTally,
+    tallies: []PaddedSlot(IntakeTally),
 };
 
 fn intakeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -352,7 +352,7 @@ fn intakeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.requests.len);
     std.debug.assert(range.end <= job.records.len and range.end <= job.group_counts.len);
-    job.tallies[range.index] = classifyIntakeRange(job.system, job.requests, range.start, range.end, job.records, job.group_counts);
+    job.tallies[range.index].value = classifyIntakeRange(job.system, job.requests, range.start, range.end, job.records, job.group_counts);
 }
 
 // The window entry of each recently seen key in one intake range.
@@ -675,7 +675,7 @@ test "threaded intake folds a new goal's repeats per range and equals serial whe
         try expectRequestStateEqual(&serial, &threaded);
         // One record per range reaches the merge, not one per request.
         var merged_records: usize = 0;
-        for (threaded.intake_tallies.items) |tally| merged_records += tally.record_count;
+        for (threaded.intake_tallies.items) |slot| merged_records += slot.value.record_count;
         try std.testing.expectEqual(threaded.intake_tallies.items.len, merged_records);
         try std.testing.expectEqual(intake_test_agents / 8, threaded.intake_tallies.items.len);
     }

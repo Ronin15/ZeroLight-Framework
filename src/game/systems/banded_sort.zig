@@ -19,7 +19,6 @@ const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const runShaped = @import("../../app/thread_system.zig").runShaped;
 const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const StageShape = @import("../../app/thread_system.zig").StageShape;
-const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 
 /// Partition width of a banded sort, not a capacity: the sorted result is the same for any
 /// band count and splitters, and a range's band histogram stays on the worker stack.
@@ -35,10 +34,6 @@ const sample_fraction_step: u64 = 0x9E3779B97F4A7C15;
 pub const BandOffsets = struct {
     offsets: [band_count + 1]u32 = @splat(0),
 };
-
-comptime {
-    std.debug.assert(@sizeOf(PaddedSlot(BandOffsets)) % thread_shared_record_alignment == 0);
-}
 
 /// Sampled elements for `slot_count` slots: every slot when they fit the sample.
 pub fn sampleCount(slot_count: usize) usize {

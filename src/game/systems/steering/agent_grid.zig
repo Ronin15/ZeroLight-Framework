@@ -14,7 +14,6 @@ const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const inlineBatch = @import("../../../app/thread_system.zig").inlineBatch;
 const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
-const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const math = @import("../../../core/math.zig");
 const simd = @import("../../../core/simd.zig");
 const pdqSort = @import("../../../core/sort.zig").pdq;
@@ -116,10 +115,6 @@ fn buildAgentGridBanded(self: *SteeringSystem, stage: StageThreads, selection: B
 pub const GridSortTally = struct {
     range_count: usize = 0,
 };
-
-comptime {
-    std.debug.assert(@sizeOf(PaddedSlot(GridSortTally)) % thread_shared_record_alignment == 0);
-}
 
 // A spatial cell, ordered by (cell_y, cell_x).
 const CellKey = struct {

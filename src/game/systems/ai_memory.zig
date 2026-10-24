@@ -71,8 +71,6 @@ pub const ai_memory_order_range_alignment_items: usize = 1;
 comptime {
     std.debug.assert(ai_memory_range_alignment_items * @sizeOf(u32) % thread_shared_record_alignment == 0);
     std.debug.assert(ai_memory_order_range_alignment_items * word_bits * @sizeOf(u32) % thread_shared_record_alignment == 0);
-    // Each order range's tally owns whole lines, at any range count.
-    std.debug.assert(@sizeOf(PaddedSlot(OrderTally)) % thread_shared_record_alignment == 0);
 }
 
 const hotStoreCapacity = @import("../data_system.zig").hotStoreCapacity;

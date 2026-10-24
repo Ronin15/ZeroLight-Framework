@@ -574,12 +574,6 @@ pub const BandRow = struct {
     offsets: [max_bands + 1]u32 = @splat(0),
 };
 
-comptime {
-    for ([_]type{ AgentsTally, BandRow }) |T| {
-        std.debug.assert(@sizeOf(PaddedSlot(T)) % thread_shared_record_alignment == 0);
-    }
-}
-
 pub const SelectedWorkSlice = struct {
     start_x: HotF32Slice,
     start_y: HotF32Slice,

@@ -13,7 +13,6 @@ const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const setRowCount = @import("../../../app/thread_system.zig").setRowCount;
 const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
-const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const math = @import("../../../core/math.zig");
 const simd = @import("../../../core/simd.zig");
 const ConstScopeColumnsSlice = @import("../../data_system.zig").ConstScopeColumnsSlice;
@@ -144,10 +143,6 @@ const DirectionsPerf = if (runtime_perf_log.enabled) struct {
     backoffs: usize = 0,
     stuck_replans: usize = 0,
 } else struct {};
-
-comptime {
-    std.debug.assert(@sizeOf(PaddedSlot(DirectionsTally)) % thread_shared_record_alignment == 0);
-}
 
 const SteeringAgentView = struct {
     agent_radius: f32,

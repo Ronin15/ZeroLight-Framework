@@ -704,9 +704,10 @@ pub const GroupKeyCount = struct {
     count: usize,
 };
 
-/// One intake range's counts, written once by its job; on its own cache lines.
+/// One intake range's counts, written once by its job (a `PaddedSlot` of
+/// `PathfindingSystem.intake_tallies`).
 pub const IntakeTally = struct {
-    record_count: usize align(thread_shared_record_alignment) = 0,
+    record_count: usize = 0,
     group_key_count: usize = 0,
     perf: Perf = .{},
 
@@ -769,7 +770,6 @@ comptime {
     std.debug.assert(intake_range_alignment_items % simd.lane_count == 0);
     std.debug.assert((@sizeOf(IntakeRecord) * intake_range_alignment_items) % thread_shared_record_alignment == 0);
     std.debug.assert((@sizeOf(GroupKeyCount) * intake_range_alignment_items) % thread_shared_record_alignment == 0);
-    std.debug.assert(@sizeOf(IntakeTally) % thread_shared_record_alignment == 0);
 }
 
 pub const PendingRequest = struct {

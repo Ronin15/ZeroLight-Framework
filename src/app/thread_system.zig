@@ -1520,10 +1520,12 @@ pub fn paddingForCacheLine(comptime T: type) usize {
     return std.mem.alignForward(usize, @sizeOf(T), thread_shared_record_alignment) - @sizeOf(T);
 }
 
-/// One range's record, padded so concurrently written slots never share a cache line.
+/// One range's record on its own cache lines: aligned to at least and padded to whole
+/// `thread_shared_record_alignment` lines, so every array, list, or embedded field of slots
+/// starts each slot on a line by construction. A zero-sized `T` stays zero-sized.
 pub fn PaddedSlot(comptime T: type) type {
     return struct {
-        value: T = .{},
+        value: T align(@max(@alignOf(T), thread_shared_record_alignment)) = .{},
         padding: [paddingForCacheLine(T)]u8 = @splat(0),
     };
 }
@@ -2586,6 +2588,18 @@ test "padded slots fill whole cache lines on an aligned base and reset within ca
     try std.testing.expectEqual(thread_shared_record_alignment - @sizeOf(Odd), paddingForCacheLine(Odd));
     try std.testing.expectEqual(thread_shared_record_alignment, @sizeOf(PaddedSlot(Odd)));
     try std.testing.expectEqual(thread_shared_record_alignment, @sizeOf(PaddedSlot(Line)));
+    // Line-aligned by the type, so a fixed array or embedded field of slots is too; a
+    // zero-sized record stays zero-sized.
+    try std.testing.expectEqual(thread_shared_record_alignment, @alignOf(PaddedSlot(Odd)));
+    try std.testing.expectEqual(thread_shared_record_alignment, @alignOf(PaddedSlot(Line)));
+    try std.testing.expectEqual(@as(usize, 0), @sizeOf(PaddedSlot(struct {})));
+    // A record aligned past a line keeps its own alignment.
+    const Wide = struct { word: u64 align(2 * thread_shared_record_alignment) = 0 };
+    try std.testing.expectEqual(@as(usize, 2 * thread_shared_record_alignment), @alignOf(PaddedSlot(Wide)));
+    try std.testing.expectEqual(@as(usize, 2 * thread_shared_record_alignment), @sizeOf(PaddedSlot(Wide)));
+    try std.testing.expectEqual(@as(usize, 2 * thread_shared_record_alignment), @sizeOf([2]PaddedSlot(Odd)));
+    const Embedded = struct { flag: u8 = 0, slots: [2]PaddedSlot(Odd) = @splat(.{}) };
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Embedded, "slots") % thread_shared_record_alignment);
 
     var slots: SlotList(Odd) = .empty;
     defer slots.deinit(std.testing.allocator);

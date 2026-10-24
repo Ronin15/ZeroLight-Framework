@@ -11,7 +11,6 @@ const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
-const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const math = @import("../../../core/math.zig");
 const simd = @import("../../../core/simd.zig");
@@ -121,10 +120,6 @@ pub const MovementTally = if (runtime_perf_log.enabled) struct {
     agent_checks: usize = 0,
     obstacle_checks: usize = 0,
 } else struct {};
-
-comptime {
-    std.debug.assert(@sizeOf(PaddedSlot(MovementTally)) % thread_shared_record_alignment == 0);
-}
 
 const SteeringJobContext = struct {
     // Worker context is immutable input plus range-indexed output columns and

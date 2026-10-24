@@ -39,13 +39,8 @@ const GoalTable = @import("goal_table.zig").GoalTable;
 const GroupField = @import("group_field.zig").GroupField;
 const IntakeRecordList = @import("intake.zig").IntakeRecordList;
 const GroupKeyCountList = @import("intake.zig").GroupKeyCountList;
-const IntakeTallyList = @import("intake.zig").IntakeTallyList;
 const RegRecordList = @import("publish.zig").RegRecordList;
-const PublishBandList = @import("publish.zig").PublishBandList;
-const PublishBand = @import("publish.zig").PublishBand;
 const NavMarkList = @import("nav_reaction.zig").NavMarkList;
-const NavMarkTallyList = @import("nav_reaction.zig").NavMarkTallyList;
-const NavMarkTally = @import("nav_reaction.zig").NavMarkTally;
 const nav_mark_range_alignment_items = @import("nav_reaction.zig").nav_mark_range_alignment_items;
 const EvictItemList = @import("eviction.zig").EvictItemList;
 const HitList = @import("eviction.zig").HitList;
@@ -90,7 +85,6 @@ const NavMark = types.NavMark;
 const EvictItem = types.EvictItem;
 const IntakeRecord = types.IntakeRecord;
 const GroupKeyCount = types.GroupKeyCount;
-const IntakeTally = types.IntakeTally;
 const registry_shard_count = types.registry_shard_count;
 const reg_window_alignment_items = types.reg_window_alignment_items;
 const hit_window_alignment_items = types.hit_window_alignment_items;
@@ -1695,15 +1689,15 @@ pub fn requestResidentBytes(system: *const PathfindingSystem) RequestStorage {
         .goals = goalTableResidentBytes(&system.goals),
         .queues = system.pending.buffer.len * @sizeOf(PendingRequest) + keySetResidentBytes(&system.pending_keys) +
             system.intake_records.capacity * @sizeOf(IntakeRecord) + system.intake_group_counts.capacity * @sizeOf(GroupKeyCount) +
-            system.intake_tallies.capacity * @sizeOf(IntakeTally) + system.solve_results.capacity * @sizeOf(PathSolveResult) +
+            system.intake_tallies.capacity * @sizeOf(FieldElem(PathfindingSystem, "intake_tallies")) + system.solve_results.capacity * @sizeOf(PathSolveResult) +
             system.solve_indices.capacity * @sizeOf(usize) + system.solve_tier1_slot.capacity * @sizeOf(u32) +
             system.group_fields.capacity * @sizeOf(GroupField) + groupKeyMapResidentBytes(&system.group_field_keys) +
             system.group_field_slots.capacity * @sizeOf(usize) + system.group_requests.capacity * @sizeOf(GroupRequestTally) +
             groupKeyMapResidentBytes(&system.group_key_map) + system.publish_range_bases.capacity * @sizeOf(usize) +
-            system.publish_bands.capacity * @sizeOf(PublishBand) + system.rotate_back_scratch.capacity * @sizeOf(PendingRequest) +
+            system.publish_bands.capacity * @sizeOf(FieldElem(PathfindingSystem, "publish_bands")) + system.rotate_back_scratch.capacity * @sizeOf(PendingRequest) +
             system.resize_pending_snapshot.capacity * @sizeOf(PendingRequest) + system.resize_group_snapshot.capacity * @sizeOf(GroupRequestTally),
         .change_scratch = system.nav_marks.capacity * @sizeOf(NavMark) + system.nav_mark_staging.capacity * @sizeOf(NavMark) +
-            system.nav_mark_tallies.capacity * @sizeOf(NavMarkTally) + system.evict_items.capacity * @sizeOf(EvictItem) +
+            system.nav_mark_tallies.capacity * @sizeOf(FieldElem(PathfindingSystem, "nav_mark_tallies")) + system.evict_items.capacity * @sizeOf(EvictItem) +
             system.evict_hits.capacity * @sizeOf(u32),
     };
     for (system.scratch_slots.items) |*scratch| storage.search += searchScratchResidentBytes(scratch);
@@ -1871,15 +1865,15 @@ pub fn requestStorageBytesBound(capacity: PathfindingCapacity, shape: RequestSha
         .goals = goalTableStorageBytesBound(2 *| limits.pending_requests),
         .queues = limits.pending_requests *| @sizeOf(PendingRequest) +| keySetStorageBytesBound(limits.pending_requests) +|
             IntakeRecordList.growCapacity(frames) *| @sizeOf(IntakeRecord) +| GroupKeyCountList.growCapacity(frames) *| @sizeOf(GroupKeyCount) +|
-            IntakeTallyList.growCapacity(maxRangeCount(frames, intake_range_alignment_items)) *| @sizeOf(IntakeTally) +|
+            @FieldType(PathfindingSystem, "intake_tallies").growCapacity(maxRangeCount(frames, intake_range_alignment_items)) *| @sizeOf(FieldElem(PathfindingSystem, "intake_tallies")) +|
             listBytesBound(PathSolveResult, solves) +| listBytesBound(usize, solves) +| listBytesBound(u32, solves) +|
             listBytesBound(GroupField, capacity.max_group_fields) +| groupKeyMapStorageBytesBound(capacity.max_group_fields) +|
             listBytesBound(usize, capacity.max_group_fields) +| listBytesBound(GroupRequestTally, solves) +|
             groupKeyMapStorageBytesBound(solves) +| listBytesBound(usize, maxRangeCount(solves, 1)) +|
-            PublishBandList.growCapacity(maxRangeCount(solves, 1)) *| @sizeOf(PublishBand) +| listBytesBound(PendingRequest, solves) +|
+            @FieldType(PathfindingSystem, "publish_bands").growCapacity(maxRangeCount(solves, 1)) *| @sizeOf(FieldElem(PathfindingSystem, "publish_bands")) +| listBytesBound(PendingRequest, solves) +|
             listBytesBound(PendingRequest, limits.pending_requests) +| listBytesBound(GroupRequestTally, solves),
         .change_scratch = listBytesBound(NavMark, marks) +| NavMarkList.growCapacity(marks) *| @sizeOf(NavMark) +|
-            NavMarkTallyList.growCapacity(maxRangeCount(marks, nav_mark_range_alignment_items)) *| @sizeOf(NavMarkTally) +|
+            @FieldType(PathfindingSystem, "nav_mark_tallies").growCapacity(maxRangeCount(marks, nav_mark_range_alignment_items)) *| @sizeOf(FieldElem(PathfindingSystem, "nav_mark_tallies")) +|
             EvictItemList.growCapacity(shape.batch_keys) *| @sizeOf(EvictItem) +| HitList.growCapacity(hits) *| @sizeOf(u32),
     };
 }

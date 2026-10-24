@@ -501,13 +501,9 @@ const NarrowphaseTally = struct {
 };
 
 comptime {
-    std.debug.assert(@sizeOf(PaddedSlot(NarrowphaseTally)) % thread_shared_record_alignment == 0);
-    std.debug.assert(@sizeOf(PaddedSlot(SpillCopies)) % thread_shared_record_alignment == 0);
     // One narrowphase range starts on a cache line when the previous one does.
     std.debug.assert(collision_range_alignment_items * @sizeOf(CollisionContact) % thread_shared_record_alignment == 0);
     std.debug.assert(collision_range_alignment_items * @sizeOf(u256) % thread_shared_record_alignment == 0);
-    std.debug.assert(@sizeOf(PaddedSlot(TriggerQuerySlot)) % thread_shared_record_alignment == 0);
-    std.debug.assert(@sizeOf(PaddedSlot(EmitRange)) % thread_shared_record_alignment == 0);
 }
 
 const HitRow = struct {
@@ -4258,11 +4254,7 @@ test "narrowphase range buffers merge deterministic contacts and skip rejected c
     try std.testing.expectEqual(fourth.index, merged[1].b.index);
 }
 
-test "thread-written collision range scratch uses cache-line sized slots" {
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(PaddedSlot(BroadphaseRangeBuffer)) % thread_shared_record_alignment);
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(PaddedSlot(NarrowphaseTally)) % thread_shared_record_alignment);
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(PaddedSlot(SpillCopies)) % thread_shared_record_alignment);
-
+test "thread-written collision range scratch starts on cache lines" {
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(64);

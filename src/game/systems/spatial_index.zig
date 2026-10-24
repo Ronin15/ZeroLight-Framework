@@ -912,10 +912,6 @@ const BandTally = struct {
     max_level: u16 = 0,
 };
 
-comptime {
-    std.debug.assert(@sizeOf(PaddedSlot(BandTally)) % thread_shared_record_alignment == 0);
-}
-
 // The three stages of a threaded build, each under its own tuner.
 const BuildStages = struct {
     bucket: Dispatch,

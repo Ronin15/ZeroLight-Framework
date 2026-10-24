@@ -14,6 +14,9 @@ const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
+const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
+const SlotList = @import("../../../app/thread_system.zig").SlotList;
+const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const ElementMap = @import("connectivity.zig").ElementMap;
@@ -36,7 +39,6 @@ pub const project_range_alignment_items: usize = thread_shared_record_alignment 
 
 comptime {
     std.debug.assert(scan_range_alignment_items % simd.lane_count == 0);
-    std.debug.assert(@sizeOf(ScanTally) % thread_shared_record_alignment == 0);
 }
 
 /// Each traversal's nav graph. Every graph covers the world's extent.
@@ -61,10 +63,10 @@ fn refCell(ref: u64) u32 {
     return @truncate(ref);
 }
 
-/// One `goal_scan` range's count of distinct refs in its window and of blocked intents,
-/// on its own cache line.
+/// One `goal_scan` range's count of distinct refs in its window and of blocked intents (a
+/// `PaddedSlot` of `GoalTable.scan_tallies`).
 const ScanTally = struct {
-    count: usize align(thread_shared_record_alignment) = 0,
+    count: usize = 0,
     blocked: usize = 0,
 };
 
@@ -86,9 +88,9 @@ pub const GoalTable = struct {
     refs: std.ArrayList(u64) = .empty,
     live: LineList(u32) = .empty,
     // `goal_scan` staging: range r writes its distinct refs from `r * items_per_range`, and
-    // its tally.
+    // its padded tally.
     scan_refs: LineList(u64) = .empty,
-    scan_tallies: LineList(ScanTally) = .empty,
+    scan_tallies: SlotList(ScanTally) = .empty,
     // Intents one resolve covers without growing; assigned only after every reserve
     // succeeded.
     limit: usize = 0,
@@ -145,8 +147,7 @@ pub const GoalTable = struct {
         std.debug.assert(self.scan_refs.capacity >= item_count and self.scan_tallies.capacity >= range_count);
         self.valid = false;
         self.scan_refs.items.len = item_count;
-        self.scan_tallies.items.len = range_count;
-        @memset(self.scan_tallies.items, .{});
+        setSlotCount(ScanTally, &self.scan_tallies, range_count);
     }
 
     /// The scan's ordered merge: each range's window of distinct refs in range order, each
@@ -156,7 +157,8 @@ pub const GoalTable = struct {
         self.map.clear();
         self.refs.clearRetainingCapacity();
         var blocked: usize = 0;
-        for (self.scan_tallies.items, 0..) |tally, range_index| {
+        for (self.scan_tallies.items, 0..) |slot, range_index| {
+            const tally = slot.value;
             blocked += tally.blocked;
             for (self.scan_refs.items[range_index * items_per_range ..][0..tally.count]) |ref| {
                 const entry = self.map.getOrPut(ref);
@@ -220,7 +222,7 @@ pub fn ScanJob(comptime Intent: type) type {
         graphs: Graphs,
         items_per_range: usize,
         refs: []u64,
-        tallies: []ScanTally,
+        tallies: []PaddedSlot(ScanTally),
 
         // SIMD verdict: goal cells four-lane (`positionCells`); the blocked read is a directory
         // and bit gather and the recent-ref probe a key compare, both scalar.
@@ -250,7 +252,7 @@ pub fn ScanJob(comptime Intent: type) type {
                     tally.count += 1;
                 }
             }
-            job.tallies[range.index] = tally;
+            job.tallies[range.index].value = tally;
         }
     };
 }

@@ -35,6 +35,7 @@ const ChunkDirectory = chunk_list_map.ChunkDirectory;
 const pdq = @import("../../../core/sort.zig").pdq;
 const simd = @import("../../../core/simd.zig");
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
+const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const types = @import("types.zig");
@@ -49,27 +50,27 @@ const ops_per_entry = @import("caches.zig").ops_per_entry;
 
 /// The publish copy's registration windows, shard-ordered within each range.
 pub const RegRecordList = std.array_list.Aligned(RegRecord, .fromByteUnits(thread_shared_record_alignment));
-/// One band per publish copy range.
-pub const PublishBandList = std.array_list.Aligned(PublishBand, .fromByteUnits(thread_shared_record_alignment));
 
 /// `registry_flush` work pairs: one per path registry shard.
 pub const flush_pair_count = registry_shard_count;
 
-/// One `publish_copy` range's registrations per flush pair, padded to its own cache line.
+/// One `publish_copy` range's registrations per flush pair (a `PaddedSlot` of
+/// `PathfindingSystem.publish_bands`).
 pub const PublishBand = struct {
-    counts: [flush_pair_count]u32 align(thread_shared_record_alignment) = @splat(0),
+    counts: [flush_pair_count]u32 = @splat(0),
 };
 
-/// One `registry_flush` pair's entries removed and added, padded to its own cache line; kept
-/// only with `runtime_perf_log.enabled` (`PathfindingStats.Perf`), zero-sized without it.
+/// One `registry_flush` pair's entries removed and added (a `PaddedSlot` of
+/// `PathfindingSystem.flush_tallies`); kept only with `runtime_perf_log.enabled`
+/// (`PathfindingStats.Perf`), zero-sized without it.
 pub const FlushTally = if (runtime_perf_log.enabled) struct {
-    removed: usize align(thread_shared_record_alignment) = 0,
+    removed: usize = 0,
     added: usize = 0,
 } else struct {};
 
 comptime {
-    std.debug.assert(@sizeOf(PublishBand) % thread_shared_record_alignment == 0);
-    std.debug.assert(@sizeOf(FlushTally) % thread_shared_record_alignment == 0);
+    // Without the perf log, no flush tally bytes.
+    if (!runtime_perf_log.enabled) std.debug.assert(@sizeOf(PaddedSlot(FlushTally)) == 0);
     // A publish band counts each flush pair's registrations.
     std.debug.assert(@typeInfo(@FieldType(PublishBand, "counts")).array.len == flush_pair_count);
 }
@@ -574,7 +575,7 @@ pub fn publishCopy(self: *PathfindingSystem, dispatch: Dispatch) BatchStats {
     std.debug.assert(self.publish_range_bases.capacity >= shape.range_count);
     std.debug.assert(self.publish_bands.capacity >= shape.range_count);
     self.publish_range_bases.items.len = shape.range_count;
-    self.publish_bands.items.len = shape.range_count;
+    setSlotCount(PublishBand, &self.publish_bands, shape.range_count);
     var total: usize = 0;
     for (self.publish_range_bases.items, 0..) |*base, range_index| {
         total = std.mem.alignForward(usize, total, reg_window_alignment_items);
@@ -609,7 +610,7 @@ const PublishCopyJob = struct {
     items_per_range: usize,
     range_count: usize,
     buckets: []RegRecord,
-    bands: []PublishBand,
+    bands: []PaddedSlot(PublishBand),
 };
 
 // SIMD verdict: the path copy is `@memcpy`; bucketing is a scalar counting-sort scatter
@@ -652,7 +653,7 @@ fn publishCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             cursors[shard] += 1;
         }
     }
-    job.bands[range.index] = .{ .counts = counts };
+    job.bands[range.index].value = .{ .counts = counts };
 }
 
 /// The registry flush passes every flush runs, each a stage with its own tuner: the count and
@@ -737,7 +738,7 @@ pub fn flushRegistry(self: *PathfindingSystem, dispatch: ?FlushDispatch, stats: 
         var pair_adds: [flush_pair_count]usize = @splat(0);
         // SIMD verdict: scalar. A 16-wide sum per publish range, a tiny fixed batch.
         for (self.publish_bands.items[0..self.publish_ranges]) |band| {
-            for (&pair_adds, band.counts) |*adds, count| adds.* += count;
+            for (&pair_adds, band.value.counts) |*adds, count| adds.* += count;
         }
         const planned = try planOwnerLog(self, ops);
         count_batch = try runRegistryCount(self, if (dispatch) |flush| flush.stage(.count) else null, ops, pair_adds);
@@ -752,9 +753,9 @@ pub fn flushRegistry(self: *PathfindingSystem, dispatch: ?FlushDispatch, stats: 
         holdEmptiedChunks(self);
         if (comptime runtime_perf_log.enabled) {
             if (stats) |step| {
-                for (self.flush_tallies) |tally| {
-                    step.perf.registrations_removed += tally.removed;
-                    step.perf.registrations_added += tally.added;
+                for (self.flush_tallies) |slot| {
+                    step.perf.registrations_removed += slot.value.removed;
+                    step.perf.registrations_added += slot.value.added;
                 }
             }
         }
@@ -1263,7 +1264,8 @@ fn countShard(system: *PathfindingSystem, pair: usize, ops: []const OwnerOp, pub
     var growth = index.growth.items[index.growth_base[pair]..];
     var compact = index.compact.items[index.compact_base[pair]..];
     var grown: u32 = 0;
-    for (system.publish_bands.items[0..publish_ranges], system.publish_range_bases.items[0..publish_ranges]) |band, base| {
+    for (system.publish_bands.items[0..publish_ranges], system.publish_range_bases.items[0..publish_ranges]) |slot, base| {
+        const band = slot.value;
         var start = base;
         for (band.counts[0..pair]) |pair_count| start += pair_count;
         for (system.reg_buckets.items[start..][0..band.counts[pair]]) |record| {
@@ -1350,7 +1352,8 @@ fn applyShard(system: *PathfindingSystem, pair: usize, ops: []const OwnerOp, pub
     const compact_count = index.counts[pair].value.compact;
     for (index.compact.items[compact_base..][0..compact_count]) |ref| compactChunk(directory, pool, ref);
     var added: usize = 0;
-    for (system.publish_bands.items[0..publish_ranges], system.publish_range_bases.items[0..publish_ranges]) |band, base| {
+    for (system.publish_bands.items[0..publish_ranges], system.publish_range_bases.items[0..publish_ranges]) |slot, base| {
+        const band = slot.value;
         var start = base;
         for (band.counts[0..pair]) |pair_count| start += pair_count;
         const records = system.reg_buckets.items[start..][0..band.counts[pair]];
@@ -1358,7 +1361,7 @@ fn applyShard(system: *PathfindingSystem, pair: usize, ops: []const OwnerOp, pub
         added += records.len;
     }
     if (truncate) pool.installTruncate();
-    if (comptime runtime_perf_log.enabled) system.flush_tallies[pair] = .{ .removed = removed, .added = added };
+    if (comptime runtime_perf_log.enabled) system.flush_tallies[pair].value = .{ .removed = removed, .added = added };
 }
 
 fn markRetired(pool: *InversePool, owner: u32) void {

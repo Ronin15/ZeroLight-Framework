@@ -22,6 +22,8 @@ const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
 const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const thread_shared_record_alignment = @import("../../../app/thread_system.zig").thread_shared_record_alignment;
+const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
+const setSlotCount = @import("../../../app/thread_system.zig").setSlotCount;
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const StageTimer = runtime_perf_log.StageTimer;
 const DataSystem = @import("../../data_system.zig").DataSystem;
@@ -49,12 +51,10 @@ const NavApplyError = error{OutOfMemory};
 
 /// Pending-mark staging for `nav_mark`, on thread-shared record alignment.
 pub const NavMarkList = std.array_list.Aligned(NavMark, .fromByteUnits(thread_shared_record_alignment));
-/// `nav_mark` range tallies, on thread-shared record alignment.
-pub const NavMarkTallyList = std.array_list.Aligned(NavMarkTally, .fromByteUnits(thread_shared_record_alignment));
-
-/// One `nav_mark` range's mark count, padded to its own cache line.
+/// One `nav_mark` range's mark count (a `PaddedSlot` of
+/// `PathfindingSystem.nav_mark_tallies`).
 pub const NavMarkTally = struct {
-    count: usize align(thread_shared_record_alignment) = 0,
+    count: usize = 0,
 };
 
 /// `nav_mark` range alignment: every range's staging window (one mark slot per event)
@@ -63,7 +63,6 @@ pub const nav_mark_range_alignment_items: usize = 4 * simd.lane_count;
 
 comptime {
     std.debug.assert((nav_mark_range_alignment_items * @sizeOf(NavMark)) % thread_shared_record_alignment == 0);
-    std.debug.assert(@sizeOf(NavMarkTally) % thread_shared_record_alignment == 0);
 }
 
 /// The extent of a world-less build: one level over the bounds rect in `cell_size` cells
@@ -368,8 +367,7 @@ fn markNavEvents(self: *PathfindingSystem, events: []const SimulationEvent, worl
     std.debug.assert(self.nav_mark_staging.capacity >= events.len);
     std.debug.assert(self.nav_mark_tallies.capacity >= shape.range_count);
     self.nav_mark_staging.items.len = events.len;
-    self.nav_mark_tallies.items.len = shape.range_count;
-    @memset(self.nav_mark_tallies.items, .{});
+    setSlotCount(NavMarkTally, &self.nav_mark_tallies, shape.range_count);
     var job = NavMarkJob{
         .chunk_tiles = self.graph.geometry.chunk_tiles,
         .world = world,
@@ -382,9 +380,9 @@ fn markNavEvents(self: *PathfindingSystem, events: []const SimulationEvent, worl
     const batch = runShaped(dispatch, shape, events.len, nav_mark_range_alignment_items, &job, navMarkJob);
     section = StageTimer.begin();
     if (comptime runtime_perf_log.enabled) self.perf.last_mark_batch = batch;
-    for (self.nav_mark_tallies.items, 0..) |tally, range_index| {
+    for (self.nav_mark_tallies.items, 0..) |slot, range_index| {
         const window_start = range_index * shape.items_per_range;
-        for (self.nav_mark_staging.items[window_start .. window_start + tally.count]) |mark| appendEventMark(self, mark);
+        for (self.nav_mark_staging.items[window_start .. window_start + slot.value.count]) |mark| appendEventMark(self, mark);
     }
     if (comptime runtime_perf_log.enabled) {
         self.perf.mark_main_ns += section.lap();
@@ -521,7 +519,7 @@ const NavMarkJob = struct {
     events: []const SimulationEvent,
     items_per_range: usize,
     staging: []NavMark,
-    tallies: []NavMarkTally,
+    tallies: []PaddedSlot(NavMarkTally),
 };
 
 fn navMarkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -539,7 +537,7 @@ fn navMarkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         assertTerrainNavEvent(event);
         if (interpretNavEvent(job.world, event)) |mark| count = foldMark(window, count, mark, job.chunk_tiles);
     }
-    job.tallies[range.index] = .{ .count = count };
+    job.tallies[range.index].value = .{ .count = count };
 }
 
 // ----------------------------------------------------------------------------------------
