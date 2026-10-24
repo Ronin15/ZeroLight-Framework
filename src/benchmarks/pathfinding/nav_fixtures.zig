@@ -48,8 +48,8 @@ pub fn coldIterations(options: suite.Options) usize {
 }
 
 /// Every tuner of `system`'s stage set (`fixtures.addNavTuners`): those a pathfinding step,
-/// and its nav reaction, select. One no measured step selects stays unused, so a fixture's
-/// setup runs only the measured step's shape.
+/// and its nav reaction, select. A tuner no measured step records in is idle
+/// (`TunerSettle.measured`).
 pub fn stepTunerSettle(system: *const PathfindingSystem) suite.TunerSettle {
     return fixtures.navTunerSettle("", &system.tuners);
 }

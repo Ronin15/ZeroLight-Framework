@@ -242,7 +242,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     // A sample's blocking reaction, reopen, refill, and churn all run on the system's one
     // tuner set, every tuner of which the tuned case settles.
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(stepTunerSettle(&fixture.system).all())) {
+    while (warm.nextSettled(stepTunerSettle(&fixture.system))) {
         _ = try fixture.changeAndReact(io, cells, fixture.open.blocking, thread_ptr);
         _ = try fixture.changeAndReact(io, cells, fixture.open.walkable, thread_ptr);
         try fixture.fillCache(case, thread_ptr);
@@ -250,7 +250,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     }
     const settle = stepTunerSettle(&fixture.system);
     const evict_tuner = &fixture.system.tuners.nav_evict;
-    const evict_start = suite.TunerStart.of(evict_tuner, case.adaptive and settle.all());
+    const evict_start = suite.TunerStart.of(evict_tuner, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = EvictReport{};
     var reactions = suite.NavReactionShapes{};
@@ -286,7 +286,7 @@ fn runEvictCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     stats.items_per_second = suite.itemsPerSecond(report.visited, stats.mean_ns);
     reactions.summarize(&stats, fixtures.floodTunerWorkers(&fixture.system, case));
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(evict_tuner, evict_start);
     }
     return stats;
@@ -387,9 +387,9 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
 
     // A sample is one whole ramp; the tuned case settles every step tuner it runs.
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(stepTunerSettle(&system).all())) _ = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr, null);
+    while (warm.nextSettled(stepTunerSettle(&system))) _ = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr, null);
     const settle = stepTunerSettle(&system);
-    const solve_start = suite.TunerStart.of(&system.tuners.solve, case.adaptive and settle.all());
+    const solve_start = suite.TunerStart.of(&system.tuners.solve, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last = ElasticRamp{};
     var stage_report = StageReport{};
@@ -408,7 +408,7 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     stats.candidate_pairs = last.solves - item_count;
     stats.items_per_second = suite.itemsPerSecond(last.solves, stats.mean_ns);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
     }
     return stats;

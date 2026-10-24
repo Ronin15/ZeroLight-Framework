@@ -46,13 +46,12 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer threads.deinit();
 
     // Warm up and settle through the same decomposed path used for measurement so
-    // settled_before_measurement and work_tuning reflect the path actually timed.
+    // the tuner's settle state and work_tuning reflect the path actually timed.
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(suite.tunerSettled(&batch.adaptive_tuner))) {
         _ = try runMeasuredOnce(item_count, &batch, table.resolver(), &threads, case, io);
     }
-    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&batch.adaptive_tuner) else false;
-    const adaptive_tuner_start = suite.TunerStart.of(&batch.adaptive_tuner, settled_before_measurement);
+    const adaptive_tuner_start = suite.TunerStart.of(&batch.adaptive_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var phase_accumulator = fixtures.PhaseAccumulator(suite.RenderPrepPhaseSummary){};

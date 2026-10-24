@@ -161,12 +161,12 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer threads.deinit();
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(stageTunerSettle(&system).all())) {
+    while (warm.nextSettled(stageTunerSettle(&system))) {
         try prepareStep(&fixture, run);
         _ = try runOnce(&system, &fixture, run, &threads, case);
     }
     const settle = stageTunerSettle(&system);
-    const decay_tuner_start = suite.TunerStart.of(&system.decay_tuner, case.adaptive and settle.all());
+    const decay_tuner_start = suite.TunerStart.of(&system.decay_tuner, case);
     const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(&system));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -199,7 +199,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     stats.query_splice_batch = suite.batchSummaryFromShapes(&shapes, 1);
     stats.secondary_batch = suite.batchSummaryFromShapes(&shapes, 3);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&system.decay_tuner, decay_tuner_start);
         tuner_window.printTuning(&stats.details, stage_names, stageTuners(&system));
     }
@@ -214,7 +214,7 @@ fn stageTuners(system: *const AiMemorySystem) [stage_names.len]*const AdaptiveWo
 }
 
 fn stageTunerSettle(system: *const AiMemorySystem) suite.TunerSettle {
-    return suite.TunerSettle.ofNamed(&stage_names, &stageTuners(system));
+    return suite.TunerSettle.of(AiMemorySystem, system);
 }
 
 const Run = struct {

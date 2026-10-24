@@ -276,11 +276,11 @@ fn stageBatches(stats: SteeringStats) [stage_names.len]BatchStats {
     return .{ perf.agents_batch, perf.select_resolve_batch, perf.select_claim_batch, perf.directions_batch, perf.grid_bucket_batch, perf.grid_sort_batch, perf.batch };
 }
 
-// Every tuner a measured step runs: the steering stages', and the commit seam's when the step
-// runs one (`fixtures.addSeamTuners`).
+// Every tuner a measured step can run: the steering system's, and the commit seam's when the
+// step runs one (`fixtures.addSeamTuners`).
 fn stepTunerSettle(system: *const SteeringSystem, seam: ?*const SeamFixture) suite.TunerSettle {
     var census = suite.TunerSettle{};
-    census.addNamed(&stage_names, &stageTuners(system));
+    census.addAll(SteeringSystem, system, "");
     if (seam) |fixture| fixtures.addSeamTuners(&census, &fixture.seam.pipeline);
     return census;
 }
@@ -324,12 +324,12 @@ fn measureCase(
 
     var last_stats = SteeringStats{};
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(stepTunerSettle(system, seam).all())) {
+    while (warm.nextSettled(stepTunerSettle(system, seam))) {
         try prepare(context);
         last_stats = try step(system, context, thread_ptr, case);
     }
     const settle = stepTunerSettle(system, seam);
-    const adaptive_tuner_start = suite.TunerStart.of(&system.adaptive_tuner, case.adaptive and settle.all());
+    const adaptive_tuner_start = suite.TunerStart.of(&system.adaptive_tuner, case);
     const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(system));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -372,7 +372,7 @@ fn measureCase(
     };
     if (seam != null) seam_shapes.print(&stats.details, "seam", fixtures.seam_stage_names);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&system.adaptive_tuner, adaptive_tuner_start);
         tuner_window.printTuning(&stats.details, stage_names, stageTuners(system));
     }

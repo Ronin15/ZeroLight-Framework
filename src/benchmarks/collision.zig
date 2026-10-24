@@ -1017,7 +1017,7 @@ const TriggerPatchSamples = struct {
     accumulator: suite.StatsAccumulator,
     case: suite.BenchmarkCase,
     last: TriggerPatch,
-    // The patch tuners' settle state before measurement.
+    // The patch tuners' snapshot before measurement.
     settle: suite.TunerSettle,
     leaf_start: suite.TunerStart,
     retunes: suite.TunerWindow(trigger_patch_stage_count),
@@ -1033,7 +1033,7 @@ const TriggerPatchSamples = struct {
             .case = case,
             .last = warm,
             .settle = settle,
-            .leaf_start = .of(tuners[trigger_patch_leaf], settle.all()),
+            .leaf_start = .of(tuners[trigger_patch_leaf], case),
             .retunes = .begin(tuners),
         };
     }
@@ -1065,7 +1065,7 @@ const TriggerPatchSamples = struct {
         const tuners = triggerPatchTuners(system);
         if (self.case.adaptive) {
             stats.work_tuning = suite.workTuningSummary(tuners[trigger_patch_leaf], self.leaf_start);
-            stats.tuner_settle = self.settle;
+            stats.tuner_settle = self.settle.measured();
         }
         var buffer: [48]u8 = undefined;
         for (trigger_patch_stage_names, self.stage_ns, 0..) |name, total_ns, index| {
@@ -1240,7 +1240,7 @@ fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suit
     // At least two steps, so both directions ran.
     var warm = suite.Warmup.init(options, case, 2);
     var last_warm: ?TriggerPatch = null;
-    while (warm.next(patchTunerSettle(system).all())) last_warm = try patchChangedStatic(&seam, data, change, &threads, case, shape);
+    while (warm.nextSettled(patchTunerSettle(system))) last_warm = try patchChangedStatic(&seam, data, change, &threads, case, shape);
     var samples = TriggerPatchSamples.init(shape.stored_pairs, case, system, last_warm.?);
     for (0..options.iterations) |_| try samples.record(try patchChangedStatic(&seam, data, change, &threads, case, shape));
     const stats = try samples.finish(system, 1, shape.stored_pairs);
@@ -1714,14 +1714,12 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     // or for a spike on single-static syncs. At least two steps, so the dense statics (or
     // the single one) have been at both their tiles.
     var warm = suite.Warmup.init(options, case, 2);
-    while (warm.next(syncTunerSettle(fixture.seam.collidersConst()).all())) switch (load) {
+    while (warm.nextSettled(syncTunerSettle(fixture.seam.collidersConst()))) switch (load) {
         .sustained => _ = try fixture.changeAndSync(&threads),
         .spike => try fixture.changeOneAndSync(&threads),
     };
-    const settle = syncTunerSettle(fixture.seam.collidersConst());
-    const settled = case.adaptive and settle.all();
     // A spike is measured only from settled tuners.
-    if (load == .spike and case.adaptive and !settled) return error.DenseSpikeTunersNotSettled;
+    if (load == .spike and case.adaptive and !warm.settled()) return error.DenseSpikeTunersNotSettled;
     // The settled tuners' spike shape sizes the per-range scratch (the touch windows), so one
     // untimed spike each way grows it to the timed shape. A spike's record is skipped, but
     // these spikes set each tuner's held jump shape, which the timed spikes reuse.
@@ -1730,7 +1728,8 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
         _ = try fixture.changeAndSync(&threads);
     };
 
-    const rewrite_start = suite.TunerStart.of(fixture.seam.collidersConst().tuners.getPtrConst(.rewrite), settled);
+    const settle = syncTunerSettle(fixture.seam.collidersConst());
+    const rewrite_start = suite.TunerStart.of(fixture.seam.collidersConst().tuners.getPtrConst(.rewrite), case);
     const sync_window = suite.TunerWindow(sync_stages.len).begin(fixtures.syncTuners(fixture.seam.collidersConst()));
     var accumulator = suite.StatsAccumulator.init(change_count);
     var main_total: u128 = 0;
@@ -1740,9 +1739,10 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     const warm_grows = fixture.grows();
     for (0..options.iterations) |_| {
         if (load == .spike) {
+            const before = syncTunerSettle(fixture.seam.collidersConst());
             try fixture.changeOneAndSync(&threads);
             // Every timed spike runs on tuners settled at the single-static count.
-            if (case.adaptive and !syncTunerSettle(fixture.seam.collidersConst()).all()) return error.DenseSpikeTunersNotSettled;
+            if (case.adaptive and !before.settledSince()) return error.DenseSpikeTunersNotSettled;
         }
         const sync = try fixture.changeAndSync(&threads);
         try fixture.checkSyncWork(sync.batches);
@@ -1761,7 +1761,7 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     stats.sample_count = change_count;
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(fixture.seam.collidersConst().tuners.getPtrConst(.rewrite), rewrite_start);
     }
     printStageDetails(&stats, sync_stages, &stage_shapes, &stage_ns);
@@ -1806,7 +1806,7 @@ fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, opt
     // At least two steps, so both directions ran.
     var warm = suite.Warmup.init(options, case, 2);
     var last_warm: ?TriggerPatch = null;
-    while (warm.next(patchTunerSettle(system).all())) last_warm = try denseTriggerPatch(&fixture, &threads, case, pairs);
+    while (warm.nextSettled(patchTunerSettle(system))) last_warm = try denseTriggerPatch(&fixture, &threads, case, pairs);
     var samples = TriggerPatchSamples.init(change_count, case, system, last_warm.?);
     for (0..options.iterations) |_| try samples.record(try denseTriggerPatch(&fixture, &threads, case, pairs));
     const stats = try samples.finish(system, change_count, system.trigger_store.pair_count);
@@ -2108,20 +2108,20 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var warm = suite.Warmup.init(options, case, 0);
     // The last step's range slot shapes, which a measured step's slot growth must differ from.
     var slot_shapes: ?[slot_set_count]SlotShape = null;
-    while (warm.next(caseTunerSettle(system, inputs).all())) {
+    while (warm.nextSettled(caseTunerSettle(system, inputs))) {
         const warm_stats = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
         slot_shapes = slotShapes(system, warm_stats);
     }
     const step_settle = caseTunerSettle(system, inputs);
-    const fill_start = suite.TunerStart.of(&system.fill_tuner, case.adaptive and suite.tunerSettledOrUnused(&system.fill_tuner));
-    const sort_start = suite.TunerStart.of(&system.sort_tuner, case.adaptive and suite.tunerSettledOrUnused(&system.sort_tuner));
+    const fill_start = suite.TunerStart.of(&system.fill_tuner, case);
+    const sort_start = suite.TunerStart.of(&system.sort_tuner, case);
     // The row's tuners: the stored-trigger refresh and emission for the refresh workload
     // (`toggle`), the stage its pass shape names; the broadphase and narrowphase otherwise.
     const refreshes = inputs.toggle != null;
     const headline_tuner = if (refreshes) system.trigger_store.tuners.getPtrConst(.refresh) else &system.broadphase_tuner;
     const secondary_tuner = if (refreshes) &system.emit_tuner else &system.narrowphase_tuner;
-    const headline_start = suite.TunerStart.of(headline_tuner, case.adaptive and suite.tunerSettledOrUnused(headline_tuner));
-    const secondary_start = suite.TunerStart.of(secondary_tuner, case.adaptive and suite.tunerSettledOrUnused(secondary_tuner));
+    const headline_start = suite.TunerStart.of(headline_tuner, case);
+    const secondary_start = suite.TunerStart.of(secondary_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_collision_stats = CollisionStats{};
@@ -2205,7 +2205,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(headline_tuner, headline_start);
         stats.secondary_work_tuning = suite.workTuningSummary(secondary_tuner, secondary_start);
-        stats.tuner_settle = step_settle;
+        stats.tuner_settle = step_settle.measured();
     }
 
     if (inputs.toggle != null) {
@@ -2326,8 +2326,8 @@ fn harmonic(n: usize) f64 {
 // A collision step's static-side stages, in the order the measured steps add them.
 const static_stage_names = [_][]const u8{ "static_pairs", "static_rect", "static_place", "static_sort", "trigger_refresh" };
 
-// The step's stage tuners whose stages ran, and how many of them settled; with a mover, also
-// every tuner its commit seam runs (`fixtures.addSeamTuners`).
+// The step's stage tuners; with a mover, also every tuner its commit seam runs
+// (`fixtures.addSeamTuners`).
 fn caseTunerSettle(system: *const CollisionSystem, inputs: StepInputs) suite.TunerSettle {
     var census = suite.TunerSettle.ofNamed(&step_tuner_names, &stepTuners(system));
     if (inputs.mover) |static_mover| fixtures.addSeamTuners(&census, &static_mover.seam.seam.pipeline);

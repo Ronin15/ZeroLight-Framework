@@ -36,10 +36,10 @@
 //!
 //! Every case runs the same pre-measure steps (the warmup plus the adaptive settle limit), so
 //! the serial and tuned cases measure the same simulated state. The tuned case then reports
-//! whether every `GameDemoState` tuner a step runs had settled (`settled=k/n` and the
-//! unsettled paths; the rebuild tuners, which only a world create or rebuild selects, are not
-//! counted) and is not judged when one had not. The `--details` tuner deltas end with each
-//! tuner's phase and final shape.
+//! whether every `GameDemoState` tuner its measured steps ran had settled when measurement
+//! began (`settled=k/n idle=m` and the unsettled paths; a tuner no measured step ran, such as
+//! a rebuild tuner only a world create or rebuild selects, is idle) and is not judged when
+//! one had not. The `--details` tuner deltas end with each tuner's phase and final shape.
 //!
 //! Pass shape: step and main time linear in population for `spread` and `crowd`; in level
 //! side and in level count at a fixed population, every row advances at its tier and the cost
@@ -859,6 +859,8 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     try spawnPopulation(allocator, state, fields);
     const population = state.data.movementBodySliceConst().entities.len;
     std.debug.assert(population == rows_before + @as(usize, fields.population) * (@as(usize, fields.inert_per_agent) + 1));
+    // The step census snapshots every state tuner.
+    if (suite.tunerCount(GameDemoState, state) > suite.TunerSettle.capacity) return error.TunerCensusCapacity;
 
     var input = InputState{};
     var audio = AudioCommandBuffer.init(allocator, (AudioConfig{}).max_commands_per_step);
@@ -883,9 +885,11 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     const settle_steps = suite.adaptiveSettleIterationLimit(options);
     const warmup_steps = options.warmup_iterations + settle_steps;
     for (0..warmup_steps) |_| _ = try step.run();
-    // Whether every tuner the step runs settled in that fixed count; the rebuild tuners run
-    // only at the world's create and a nav or collider rebuild, never at a step.
-    const settle = suite.TunerSettle.ofExcept(GameDemoState, state, "state", &.{ "rebuild_tuners", "trigger_query_rebuild_tuner" });
+    // Whether every tuner the measured steps run settled in that fixed count; a tuner they do
+    // not run (the rebuild tuners run only at the world's create and a nav or collider
+    // rebuild) is idle.
+    var settle = suite.TunerSettle{};
+    settle.addAll(GameDemoState, state, "state");
     var accumulator = suite.StatsAccumulator.init(item_count);
     var census = Census{};
     var tuner_census: ?TunerCensus = if (options.details) try TunerCensus.init(allocator, state) else null;
@@ -917,7 +921,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         try record.expectRowsUnchanged(&state.data);
         try checkStackedSeparation(allocator, &stats.production_step.?, fields, record);
     }
-    if (case.adaptive) stats.tuner_settle = settle;
+    if (case.adaptive) stats.tuner_settle = settle.measured();
     if (threads.workerThreadCount() > 0) try checkPinnedDispatch(&step, &stats.details);
     return stats;
 }

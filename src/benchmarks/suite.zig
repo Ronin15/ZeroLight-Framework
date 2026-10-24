@@ -296,8 +296,9 @@ pub const RunStats = struct {
     steering_stages: ?SteeringStageSummary = null,
     work_tuning: ?WorkTuningSummary = null,
     secondary_work_tuning: ?WorkTuningSummary = null,
-    /// The settle state, before measurement, of the tuners the case's step runs.
-    tuner_settle: ?TunerSettle = null,
+    /// The tuners the case's measured steps ran, judged by their state before measurement
+    /// (`TunerSettle.measured`).
+    tuner_settle: ?SettleReport = null,
     /// The case runs a fixed number of steps no option changes (a fixed-cycle workload), so
     /// more warmup cannot settle its tuners.
     fixed_length: bool = false,
@@ -588,8 +589,9 @@ pub const WorldCreateSummary = struct {
 
 /// Whether a case's tuners had settled when its measurement started: `fresh` is a one-off
 /// stage whose production tuner starts fresh each run (a world, level, or store rebuild),
-/// measured fresh and judged.
-pub const Settle = enum { no, yes, fresh };
+/// measured fresh and judged; `idle` is a tuner that recorded no batch in the measured
+/// window, so its state shaped nothing measured, and is judged.
+pub const Settle = enum { no, yes, fresh, idle };
 
 pub const WorkTuningSummary = struct {
     // Captures tuner state at the measurement boundary. Unsettled adaptive
@@ -676,22 +678,24 @@ pub const StatsAccumulator = struct {
     }
 };
 
-/// A tuner's diagnostic counts: its probe windows, settled demotions, restores, and records
-/// skipped on an unsustained item-count shift. The tuner's are cumulative over its life, so
-/// a measured window reports `since` its start.
+/// A tuner's diagnostic counts: its probe windows, settled demotions, restores, records
+/// skipped on an unsustained item-count shift, and batches recorded. The tuner's are
+/// cumulative over its life, so a measured window reports `since` its start. `records` says
+/// whether the tuner ran, not how it tuned, so `any` and `write` leave it out.
 pub const TunerCounts = struct {
     probes: u64 = 0,
     demotes: u64 = 0,
     restores: u64 = 0,
     shift_skips: u64 = 0,
+    records: u64 = 0,
 
     pub fn of(tuner: *const AdaptiveWorkTuner) TunerCounts {
         if (comptime !diagnostics_enabled) return .{};
-        return .{ .probes = tuner.probe_window_count, .demotes = tuner.demotion_count, .restores = tuner.restore_count, .shift_skips = tuner.shift_skip_count };
+        return .{ .probes = tuner.probe_window_count, .demotes = tuner.demotion_count, .restores = tuner.restore_count, .shift_skips = tuner.shift_skip_count, .records = tuner.record_count };
     }
 
     pub fn since(self: TunerCounts, before: TunerCounts) TunerCounts {
-        return .{ .probes = self.probes - before.probes, .demotes = self.demotes - before.demotes, .restores = self.restores - before.restores, .shift_skips = self.shift_skips - before.shift_skips };
+        return .{ .probes = self.probes - before.probes, .demotes = self.demotes - before.demotes, .restores = self.restores - before.restores, .shift_skips = self.shift_skips - before.shift_skips, .records = self.records - before.records };
     }
 
     pub fn any(self: TunerCounts) bool {
@@ -714,9 +718,9 @@ pub const TunerStart = struct {
     /// start at zero.
     pub const fresh: TunerStart = .{ .settle = .fresh };
 
-    /// `tuner` now, settled per `settled` (the case's settle predicate before measurement).
-    pub fn of(tuner: *const AdaptiveWorkTuner, settled: bool) TunerStart {
-        return .{ .settle = if (settled) .yes else .no, .counts = .of(tuner) };
+    /// `tuner` now: settled when `case` is tuned and the tuner itself is settled.
+    pub fn of(tuner: *const AdaptiveWorkTuner, case: BenchmarkCase) TunerStart {
+        return .{ .settle = if (case.adaptive and tunerSettled(tuner)) .yes else .no, .counts = .of(tuner) };
     }
 };
 
@@ -726,8 +730,10 @@ pub fn workTuningSummary(tuner: *const AdaptiveWorkTuner, start: TunerStart) Wor
 }
 
 /// `workTuningSummary` with the tuner's counts at measurement end given as `end`: the summary
-/// reports `end` less `start`'s counts.
+/// reports `end` less `start`'s counts, and `idle` for a tuner (not `fresh`) that recorded no
+/// batch in the measured window.
 fn workTuningSummaryAt(tuner: *const AdaptiveWorkTuner, end: TunerCounts, start: TunerStart) WorkTuningSummary {
+    const idle = start.settle != .fresh and end.records == start.counts.records;
     return .{
         .phase = tuner.phase,
         .initial_worker_threads = tuner.initial_profile.worker_threads,
@@ -739,7 +745,7 @@ fn workTuningSummaryAt(tuner: *const AdaptiveWorkTuner, end: TunerCounts, start:
         .candidate_items_per_range = if (tuner.candidate_profile) |profile| profile.items_per_range else null,
         .sample_count = tuner.sample_count,
         .sample_window = tuner.config.sample_window,
-        .settle = start.settle,
+        .settle = if (idle) .idle else start.settle,
         .baseline_mean_batch_duration_ns = tuner.baseline_mean_batch_duration_ns,
         .has_threaded_profile = tuner.has_threaded_profile,
         .probing = tuner.phase == .probing,
@@ -765,12 +771,6 @@ pub fn tunerSettled(tuner: *const AdaptiveWorkTuner) bool {
         (!tuner.has_threaded_profile or tuner.nudge_state == .holding);
 }
 
-/// A tuner whose stage never selected a shape (no item count learned), or a settled one. Its
-/// window's sample count is no such test: it returns to zero at every window's end.
-pub fn tunerSettledOrUnused(tuner: *const AdaptiveWorkTuner) bool {
-    return tuner.learned_item_count == 0 or tunerSettled(tuner);
-}
-
 /// Every `AdaptiveWorkTuner` `value` holds by value (`forEachTunerIn`), used or not: a named
 /// tuner list's completeness check.
 pub fn tunerCount(comptime T: type, value: *const T) usize {
@@ -786,21 +786,26 @@ pub fn tunerCount(comptime T: type, value: *const T) usize {
     return counter.count;
 }
 
-/// The settle state of the tuners a case's step runs: `settled` of the `used` ones (a tuner
-/// that never selected a shape is unused) and the first unsettled ones' names. Built per
-/// tuner with `add`, or over every tuner a fixture holds by value with `of`.
+/// A snapshot of the tuners a case's step can run: each one's record count and settle state
+/// when the snapshot was taken. A tuner counts as used by a later window only when it
+/// recorded a batch since the snapshot, so tuners only setup or a one-off step ran stay idle
+/// and never hold the census. Built per tuner with `add`, or over every tuner a fixture holds
+/// by value with `of`. The entries point at the live tuners, which must stay in place and
+/// keep their counts until the snapshot's last use.
 pub const TunerSettle = struct {
-    const listed_max = 4;
+    pub const capacity = 256;
 
-    used: usize = 0,
-    settled: usize = 0,
-    unsettled_names: [listed_max][]const u8 = undefined,
-    unsettled_listed: usize = 0,
+    const Entry = struct {
+        name: []const u8,
+        tuner: *const AdaptiveWorkTuner,
+        records: u64,
+        settled: bool,
+    };
+
+    entries: [capacity]Entry = undefined,
+    len: usize = 0,
 
     /// Every `AdaptiveWorkTuner` `value` holds by value (`forEachTunerIn`), named by path.
-    /// `value` is the sub-structure whose tuners the measured step runs: a tuner only a setup
-    /// or one-off step selected counts as used and can hold the census unsettled forever, so
-    /// a fixture holding such tuners passes their parent's step-run members instead.
     pub fn of(comptime T: type, value: *const T) TunerSettle {
         var census = TunerSettle{};
         census.addAll(T, value, "");
@@ -811,41 +816,6 @@ pub const TunerSettle = struct {
     pub fn addAll(self: *TunerSettle, comptime T: type, value: *const T, comptime root: []const u8) void {
         // The walk takes mutable pointers; `visit` only reads the tuner.
         forEachTunerIn(T, @constCast(value), root, self);
-    }
-
-    /// `of` over every tuner of `value` but those whose path holds a field named in
-    /// `setup_fields` (`.name`): tuners only a setup step selects, such as a world create's
-    /// rebuild stages, which would otherwise hold the census unsettled.
-    pub fn ofExcept(comptime T: type, value: *const T, comptime root: []const u8, comptime setup_fields: []const []const u8) TunerSettle {
-        var walk = ExceptVisitor(setup_fields){};
-        forEachTunerIn(T, @constCast(value), root, &walk);
-        return walk.census;
-    }
-
-    fn ExceptVisitor(comptime setup_fields: []const []const u8) type {
-        return struct {
-            census: TunerSettle = .{},
-
-            pub fn visit(self: *@This(), comptime path: []const u8, tuner: *AdaptiveWorkTuner) void {
-                const excluded = comptime for (setup_fields) |field| {
-                    if (pathHasField(path, field)) break true;
-                } else false;
-                if (!excluded) self.census.add(path, tuner);
-            }
-        };
-    }
-
-    // Whether `path` (`forEachTunerIn`'s `.field` and `[index]` segments) has a segment named
-    // `field`: any occurrence of `.field` ending at the path's end or a segment boundary.
-    fn pathHasField(comptime path: []const u8, comptime field: []const u8) bool {
-        const segment = "." ++ field;
-        var from: usize = 0;
-        while (std.mem.indexOfPos(u8, path, from, segment)) |at| {
-            const end = at + segment.len;
-            if (end == path.len or path[end] == '.' or path[end] == '[') return true;
-            from = at + 1;
-        }
-        return false;
     }
 
     /// A census over a named tuner list: `tuners[i]` named `names[i]`.
@@ -860,29 +830,91 @@ pub const TunerSettle = struct {
         for (names, tuners) |name, tuner| self.add(name, tuner);
     }
 
+    /// `tuner` and its record count and settle state now. A census past `capacity` is a
+    /// harness bug, failed loudly in every mode.
     pub fn add(self: *TunerSettle, name: []const u8, tuner: *const AdaptiveWorkTuner) void {
-        if (tuner.learned_item_count == 0) return;
-        self.used += 1;
-        if (tunerSettled(tuner)) {
-            self.settled += 1;
-            return;
-        }
-        if (self.unsettled_listed == listed_max) return;
-        self.unsettled_names[self.unsettled_listed] = name;
-        self.unsettled_listed += 1;
+        if (self.len == capacity) std.debug.panic("tuner census holds more than {} tuners", .{capacity});
+        self.entries[self.len] = .{ .name = name, .tuner = tuner, .records = TunerCounts.of(tuner).records, .settled = tunerSettled(tuner) };
+        self.len += 1;
     }
 
     pub fn visit(self: *TunerSettle, comptime path: []const u8, tuner: *AdaptiveWorkTuner) void {
         self.add(path, tuner);
     }
 
-    pub fn all(self: TunerSettle) bool {
+    /// The census over the window since the snapshot, read from the live tuners: each tuner
+    /// that recorded since is judged by its state at the snapshot.
+    pub fn measured(self: *const TunerSettle) SettleReport {
+        var records_now: [capacity]u64 = undefined;
+        for (self.entries[0..self.len], records_now[0..self.len]) |entry, *records| records.* = TunerCounts.of(entry.tuner).records;
+        return self.reportOf(records_now[0..self.len]);
+    }
+
+    /// Whether a warm loop may stop, read from the live tuners: some tuner recorded since the
+    /// snapshot and every one that did is settled now.
+    pub fn settledSince(self: *const TunerSettle) bool {
+        var records_now: [capacity]u64 = undefined;
+        var settled_now: [capacity]bool = undefined;
+        for (self.entries[0..self.len], records_now[0..self.len], settled_now[0..self.len]) |entry, *records, *settled| {
+            records.* = TunerCounts.of(entry.tuner).records;
+            settled.* = tunerSettled(entry.tuner);
+        }
+        return self.settledSinceOf(records_now[0..self.len], settled_now[0..self.len]);
+    }
+
+    /// `measured` over each entry's record count now, `records_now[i]` for entry `i`.
+    fn reportOf(self: *const TunerSettle, records_now: []const u64) SettleReport {
+        std.debug.assert(records_now.len == self.len);
+        var report = SettleReport{};
+        for (self.entries[0..self.len], records_now) |entry, records| {
+            if (records == entry.records) {
+                report.idle += 1;
+                continue;
+            }
+            report.used += 1;
+            if (entry.settled) {
+                report.settled += 1;
+                continue;
+            }
+            if (report.unsettled_listed == SettleReport.listed_max) continue;
+            report.unsettled_names[report.unsettled_listed] = entry.name;
+            report.unsettled_listed += 1;
+        }
+        return report;
+    }
+
+    /// `settledSince` over each entry's record count and settle state now.
+    fn settledSinceOf(self: *const TunerSettle, records_now: []const u64, settled_now: []const bool) bool {
+        std.debug.assert(records_now.len == self.len and settled_now.len == self.len);
+        var any_recorded = false;
+        for (self.entries[0..self.len], records_now, settled_now) |entry, records, settled| {
+            if (records == entry.records) continue;
+            if (!settled) return false;
+            any_recorded = true;
+        }
+        return any_recorded;
+    }
+};
+
+/// A tuner census over a measured window (`TunerSettle.measured`): `settled` of the `used`
+/// tuners (those that recorded in the window, judged by their state at its start), the `idle`
+/// ones that did not record, and the first unsettled ones' names.
+pub const SettleReport = struct {
+    const listed_max = 4;
+
+    used: usize = 0,
+    settled: usize = 0,
+    idle: usize = 0,
+    unsettled_names: [listed_max][]const u8 = undefined,
+    unsettled_listed: usize = 0,
+
+    pub fn all(self: SettleReport) bool {
         return self.settled == self.used;
     }
 
-    /// `settled=<k>/<n>`, then the first unsettled names.
-    pub fn write(self: *const TunerSettle, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try writer.print("settled={}/{}", .{ self.settled, self.used });
+    /// `settled=<k>/<n> idle=<m>`, then the first unsettled names.
+    pub fn write(self: *const SettleReport, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("settled={}/{} idle={}", .{ self.settled, self.used, self.idle });
         if (self.all()) return;
         try writer.writeAll(" unsettled=");
         for (self.unsettled_names[0..self.unsettled_listed], 0..) |name, index| {
@@ -923,7 +955,6 @@ pub fn TunerWindow(comptime n: usize) type {
             }
             details.print("\n", .{});
         }
-
     };
 }
 
@@ -935,12 +966,15 @@ pub fn writeTunerState(writer: *std.Io.Writer, tuner: *const AdaptiveWorkTuner) 
     try writer.print("{}/{},x={d:.2}", .{ tuner.current_profile.worker_threads, tuner.current_profile.items_per_range, tuner.batch_multiplier });
 }
 
-/// A case's warmup and adaptive settle, driven by `while (warm.next(tuners_settled)) step();`:
-/// the warmup steps, then, for an adaptive case only, steps until the case's tuners settle or
-/// the settle limit runs out.
+/// A case's warmup and adaptive settle, driven by `while (warm.next(tuners_settled)) step();`
+/// or, over a tuner census, `while (warm.nextSettled(census)) step();`: the warmup steps,
+/// then, for an adaptive case only, steps until the case's tuners settle or the settle limit
+/// runs out.
 pub const Warmup = struct {
     warmup_left: usize,
     settle_left: usize,
+    // `nextSettled`'s census at its first settle step.
+    settle_start: ?TunerSettle = null,
 
     /// `options`' warmup (at least `min_warmup` steps) and the default settle limit.
     pub fn init(options: Options, case: BenchmarkCase, min_warmup: usize) Warmup {
@@ -958,6 +992,41 @@ pub const Warmup = struct {
             return true;
         }
         if (tuners_settled or self.settle_left == 0) return false;
+        self.settle_left -= 1;
+        return true;
+    }
+
+    /// Whether `nextSettled`'s settle phase ended with every tuner that recorded since its
+    /// snapshot settled (false for a case with no settle phase).
+    pub fn settled(self: *const Warmup) bool {
+        const start = if (self.settle_start) |*start| start else return false;
+        return start.settledSince();
+    }
+
+    /// Whether to run one more step, for a case judged by a tuner census; `current` is the
+    /// census now. The first settle step keeps `current` as the settle phase's snapshot, so
+    /// tuners only setup or the warmup steps ran never hold the loop; it then stops when
+    /// every tuner that recorded since is settled (`TunerSettle.settledSince`), or when the
+    /// settle limit runs out.
+    pub fn nextSettled(self: *Warmup, current: TunerSettle) bool {
+        const since_settled: ?bool = if (self.settle_start) |*start| start.settledSince() else null;
+        return self.nextSettledOf(current, since_settled);
+    }
+
+    /// `nextSettled` given whether the snapshot's tuners settled since it was taken
+    /// (`TunerSettle.settledSince`), null before the snapshot.
+    fn nextSettledOf(self: *Warmup, current: TunerSettle, since_settled: ?bool) bool {
+        std.debug.assert((since_settled == null) == (self.settle_start == null));
+        if (self.warmup_left != 0) {
+            self.warmup_left -= 1;
+            return true;
+        }
+        if (self.settle_left == 0) return false;
+        if (since_settled) |settled_now| {
+            if (settled_now) return false;
+        } else {
+            self.settle_start = current;
+        }
         self.settle_left -= 1;
         return true;
     }
@@ -1552,8 +1621,8 @@ fn formatWorkerThreadsInto(buffer: []u8, stats: RunStats) []const u8 {
     return std.mem.print(buffer, "{}/{}[{}/{}]", .{ batch.active_worker_threads, batch.available_worker_threads, batch.threaded_batches, batch.dispatched_batches }) catch "workers";
 }
 
-// A case's settle state before measurement: `no` when any tuner its step runs, or its
-// headline tuner, had not settled; null when it reports neither.
+// A case's settle state before measurement: `no` when any tuner its measured steps ran, or
+// its headline tuner, had not settled; null when it reports neither.
 fn caseSettle(stats: RunStats) ?Settle {
     if (stats.tuner_settle) |census| {
         if (!census.all()) return .no;
@@ -1564,8 +1633,8 @@ fn caseSettle(stats: RunStats) ?Settle {
     return summary.settle;
 }
 
-// `settled=<yes|no|fresh>`, or the step's tuner census `settled=<k>/<n>` when the case took
-// one; null when the case reports neither.
+// `settled=<yes|no|fresh|idle>`, or the step's tuner census `settled=<k>/<n> idle=<m>` when
+// the case took one; null when the case reports neither.
 fn formatSettleInto(buffer: []u8, stats: RunStats) ?[]const u8 {
     var writer: std.Io.Writer = .fixed(buffer);
     if (stats.tuner_settle) |census| {
@@ -2234,7 +2303,9 @@ fn testSettledThreadedTuner() AdaptiveWorkTuner {
 
 test "work tuning summary preserves settled phase, or fresh" {
     const tuner = testSettledThreadedTuner();
-    const summary = workTuningSummary(&tuner, .of(&tuner, true));
+    // The tuner recorded in the measured window: its start state is the summary's settle.
+    const start = TunerStart.of(&tuner, findBenchmarkCase("thread-adaptive-tuned-range").?);
+    const summary = workTuningSummaryAt(&tuner, .{ .records = start.counts.records + 1 }, start);
 
     try std.testing.expectEqual(AdaptiveWorkPhase.settled, summary.phase);
     try std.testing.expectEqual(Settle.yes, summary.settle);
@@ -2247,19 +2318,38 @@ test "work tuning summary preserves settled phase, or fresh" {
 }
 
 test "tuner counts over a measured window are the counts since its start" {
-    const start = TunerCounts{ .probes = 3, .demotes = 1, .restores = 0, .shift_skips = 5 };
-    const end = TunerCounts{ .probes = 5, .demotes = 2, .restores = 1, .shift_skips = 5 };
+    const start = TunerCounts{ .probes = 3, .demotes = 1, .restores = 0, .shift_skips = 5, .records = 40 };
+    const end = TunerCounts{ .probes = 5, .demotes = 2, .restores = 1, .shift_skips = 5, .records = 52 };
     var buffer: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     try end.since(start).write(&writer);
     try std.testing.expectEqualStrings("probes=2 demotes=1 restores=1 shift_skips=0", writer.buffered());
     try std.testing.expect(!end.since(end).any());
+    // A record is not a tuning event.
+    try std.testing.expect(!(TunerCounts{ .records = 3 }).any());
 
     // The summary stores the window, not the tuner's lifetime counts.
     const tuner = testSettledThreadedTuner();
     const summary = workTuningSummaryAt(&tuner, end, .{ .settle = .yes, .counts = start });
     try std.testing.expectEqual(end.since(start), summary.measured_counts);
     try std.testing.expectEqual(end, workTuningSummaryAt(&tuner, end, .fresh).measured_counts);
+}
+
+test "a work tuning summary reports a tuner that did not record as idle" {
+    const tuner = testSettledThreadedTuner();
+    const counts = TunerCounts{ .records = 7 };
+    // No batch recorded in the window: idle, whatever its start state, and judged.
+    const unsettled_idle = workTuningSummaryAt(&tuner, counts, .{ .settle = .no, .counts = counts });
+    try std.testing.expectEqual(Settle.idle, unsettled_idle.settle);
+    try std.testing.expectEqual(@as(?Settle, .idle), caseSettle(.{ .work_tuning = unsettled_idle }));
+    var buffer: [192]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, formatWorkTuningInto(&buffer, unsettled_idle), "settled settled=idle"));
+    const fixed = CaseResult{ .case = findBenchmarkCase("thread-fixed-auto").?, .stats = .{ .mean_ns = 1 } };
+    const adaptive = CaseResult{ .case = findBenchmarkCase("thread-adaptive-tuned-range").?, .stats = .{ .mean_ns = 1, .work_tuning = unsettled_idle } };
+    try std.testing.expectEqual(@as(?[]const u8, null), validationAttention(fixed, adaptive, fixed));
+    // A fresh tuner is never idle, and one that recorded keeps its start state.
+    try std.testing.expectEqual(Settle.fresh, workTuningSummaryAt(&tuner, .{}, .fresh).settle);
+    try std.testing.expectEqual(Settle.no, workTuningSummaryAt(&tuner, .{ .records = 8 }, .{ .settle = .no, .counts = counts }).settle);
 }
 
 test "the details table's work-tuning column fits a cell with a candidate and its counts" {
@@ -2290,24 +2380,38 @@ test "a tuner with a demotion awaiting judgment or a pending retune is not settl
     try std.testing.expect(!tunerSettled(&tuner));
 }
 
-test "a tuner census counts used tuners only and names the unsettled" {
+test "a tuner census judges only the tuners that recorded since its snapshot, by their state then" {
     const Fixture = struct {
         settled: AdaptiveWorkTuner,
-        unused: AdaptiveWorkTuner,
+        idle: AdaptiveWorkTuner,
         pair: [2]AdaptiveWorkTuner,
     };
-    var fixture = Fixture{ .settled = testSettledThreadedTuner(), .unused = .init(.{}), .pair = .{ testSettledThreadedTuner(), testSettledThreadedTuner() } };
+    var fixture = Fixture{ .settled = testSettledThreadedTuner(), .idle = .init(.{}), .pair = .{ testSettledThreadedTuner(), testSettledThreadedTuner() } };
     fixture.pair[1].phase = .learning;
     const census = TunerSettle.of(Fixture, &fixture);
-    try std.testing.expect(!census.all());
-    try std.testing.expect(!tunerSettledOrUnused(&fixture.pair[1]) and tunerSettledOrUnused(&fixture.unused));
+    try std.testing.expectEqual(@as(usize, 4), census.len);
+    try std.testing.expectEqualStrings(".pair[1]", census.entries[3].name);
+    try std.testing.expect(!census.entries[1].settled and !census.entries[3].settled);
+    // `settled` and `pair[1]` recorded since the snapshot; `idle` and `pair[0]` did not.
+    var records_now: [4]u64 = undefined;
+    for (census.entries[0..census.len], &records_now) |entry, *records| records.* = entry.records;
+    records_now[0] += 3;
+    records_now[3] += 1;
+    // Settling after the snapshot changes nothing: the entry keeps its state then.
+    fixture.pair[1].phase = .settled;
+    const report = census.reportOf(&records_now);
+    try std.testing.expectEqual(@as(usize, 2), report.used);
+    try std.testing.expectEqual(@as(usize, 1), report.settled);
+    try std.testing.expectEqual(@as(usize, 2), report.idle);
+    try std.testing.expect(!report.all());
     var buffer: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    try census.write(&writer);
-    try std.testing.expectEqualStrings("settled=2/3 unsettled=.pair[1]", writer.buffered());
+    try report.write(&writer);
+    try std.testing.expectEqualStrings("settled=1/2 idle=2 unsettled=.pair[1]", writer.buffered());
 
     // The census is judged before the headline: an unsettled step never reaches the controls.
-    const unsettled: RunStats = .{ .tuner_settle = census, .work_tuning = workTuningSummary(&fixture.settled, .of(&fixture.settled, true)) };
+    const headline = workTuningSummaryAt(&fixture.settled, .{ .records = 1 }, .{ .settle = .yes });
+    const unsettled: RunStats = .{ .tuner_settle = report, .work_tuning = headline };
     try std.testing.expectEqual(@as(?Settle, .no), caseSettle(unsettled));
     const adaptive = CaseResult{ .case = default_cases[default_cases.len - 1], .stats = unsettled };
     const fixed = CaseResult{ .case = findBenchmarkCase("thread-fixed-auto").?, .stats = .{ .mean_ns = 1 } };
@@ -2316,9 +2420,27 @@ test "a tuner census counts used tuners only and names the unsettled" {
     var fixed_length = adaptive;
     fixed_length.stats.fixed_length = true;
     try std.testing.expect(std.mem.endsWith(u8, validationAttention(fixed, fixed_length, fixed).?, "cannot settle at its fixed length"));
+    // Every tuner that ran settled at the snapshot: judged, idle ones never hold it.
+    const settled_report = census.reportOf(&.{ records_now[0], census.entries[1].records, census.entries[2].records + 1, census.entries[3].records });
+    try std.testing.expect(settled_report.all());
+    try std.testing.expectEqualStrings("settled=2/2 idle=2", formatSettleInto(&buffer, .{ .tuner_settle = settled_report, .work_tuning = headline }).?);
     const fresh: RunStats = .{ .work_tuning = workTuningSummary(&fixture.settled, .fresh) };
     try std.testing.expectEqual(@as(?Settle, .fresh), caseSettle(fresh));
     try std.testing.expectEqualStrings("settled=fresh", formatSettleInto(&buffer, fresh).?);
+}
+
+test "a tuner census settles when every tuner that recorded since its snapshot is settled" {
+    const Fixture = struct { a: AdaptiveWorkTuner, b: AdaptiveWorkTuner };
+    const fixture = Fixture{ .a = .init(.{}), .b = .init(.{}) };
+    const census = TunerSettle.of(Fixture, &fixture);
+    const before = [2]u64{ census.entries[0].records, census.entries[1].records };
+    // Nothing recorded since the snapshot: no evidence the step's tuners settled.
+    try std.testing.expect(!census.settledSinceOf(&before, &.{ true, true }));
+    // A tuner that recorded is judged by its state now.
+    try std.testing.expect(!census.settledSinceOf(&.{ before[0] + 2, before[1] }, &.{ false, true }));
+    try std.testing.expect(census.settledSinceOf(&.{ before[0] + 2, before[1] }, &.{ true, true }));
+    // An unsettled tuner that did not record never holds the loop.
+    try std.testing.expect(census.settledSinceOf(&.{ before[0] + 2, before[1] }, &.{ true, false }));
 }
 
 test "the headline batch reports its busiest shape and threaded over non-empty batches across steps" {
@@ -2440,6 +2562,45 @@ test "a warmup runs its steps, then settles an adaptive case until its tuners se
     try std.testing.expect(warm.next(true) and warm.next(false) and warm.next(false) and !warm.next(true));
     warm = Warmup.custom(adaptive, 0, 2);
     try std.testing.expect(warm.next(false) and warm.next(false) and !warm.next(false));
+}
+
+test "a census warmup snapshots at its first settle step and stops when the snapshot's tuners settle or the limit" {
+    const fixed = default_cases[0];
+    const adaptive = default_cases[default_cases.len - 1];
+    // Tuners that never record: `settledSince` is false in every perf mode, so only the limit
+    // ends the settle phase.
+    const idle_tuner = AdaptiveWorkTuner.init(.{});
+    var censuses: [6]TunerSettle = @splat(.{});
+    for (&censuses, 1..) |*census, len| {
+        for (0..len) |_| census.add("idle", &idle_tuner);
+    }
+
+    // Two warmup steps, then the three-step settle limit; the snapshot is call 3's census.
+    var warm = Warmup.custom(adaptive, 2, 3);
+    var steps: usize = 0;
+    while (warm.nextSettled(censuses[steps])) steps += 1;
+    try std.testing.expectEqual(@as(usize, 5), steps);
+    try std.testing.expectEqual(censuses[2].len, warm.settle_start.?.len);
+    try std.testing.expect(!warm.settled());
+
+    // A serial case stops after its warmup and has no settle phase.
+    warm = Warmup.custom(fixed, 2, 3);
+    steps = 0;
+    while (warm.nextSettled(censuses[steps])) steps += 1;
+    try std.testing.expectEqual(@as(usize, 2), steps);
+    try std.testing.expect(warm.settle_start == null);
+    try std.testing.expect(!warm.settled());
+
+    // The first settle step always runs and takes the snapshot; the next stops once the
+    // snapshot's tuners settled since.
+    warm = Warmup.custom(adaptive, 1, 3);
+    try std.testing.expect(warm.nextSettledOf(censuses[0], null));
+    try std.testing.expect(warm.settle_start == null);
+    try std.testing.expect(warm.nextSettledOf(censuses[1], null));
+    try std.testing.expectEqual(censuses[1].len, warm.settle_start.?.len);
+    try std.testing.expect(warm.nextSettledOf(censuses[2], false));
+    try std.testing.expect(!warm.nextSettledOf(censuses[3], true));
+    try std.testing.expectEqual(censuses[1].len, warm.settle_start.?.len);
 }
 
 test "adaptive settle budget covers multiple tuner windows and nudge comparisons" {
@@ -2638,16 +2799,12 @@ test "a nav reaction's stage shapes land on their named summaries and stage line
     try std.testing.expectEqual(@as(?BatchSummary, null), run.nav_mark_batch);
 }
 
-test "a tuner census skips setup-only tuners by field name, and a tuner count walks every tuner" {
-    const Nested = struct { rebuild_tuners_note: AdaptiveWorkTuner };
-    const Inner = struct { rebuild_tuners: [1]AdaptiveWorkTuner };
-    const Note = struct { rebuild_tuners_note: Inner };
+test "a tuner count walks every tuner a value holds, used or not" {
+    const Nested = struct { inner: [1]AdaptiveWorkTuner };
     const Fixture = struct {
         step: AdaptiveWorkTuner,
         rebuild_tuners: [2]AdaptiveWorkTuner,
         nested: Nested,
-        // The excluded field after a longer name sharing its prefix in one path.
-        note: Note,
         unused: AdaptiveWorkTuner,
     };
     var learning = testSettledThreadedTuner();
@@ -2655,20 +2812,15 @@ test "a tuner census skips setup-only tuners by field name, and a tuner count wa
     const fixture = Fixture{
         .step = testSettledThreadedTuner(),
         .rebuild_tuners = .{ learning, learning },
-        .nested = .{ .rebuild_tuners_note = learning },
-        .note = .{ .rebuild_tuners_note = .{ .rebuild_tuners = .{learning} } },
+        .nested = .{ .inner = .{learning} },
         .unused = .init(.{}),
     };
-    // Excluded by its field wherever it sits in the path, never by a longer name sharing its
-    // prefix.
-    const census = TunerSettle.ofExcept(Fixture, &fixture, "state", &.{"rebuild_tuners"});
-    var buffer: [128]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    try census.write(&writer);
-    try std.testing.expectEqualStrings("settled=1/2 unsettled=state.nested.rebuild_tuners_note", writer.buffered());
-    // A const value walks too, every used tuner counted.
-    try std.testing.expectEqual(@as(usize, 5), TunerSettle.of(Fixture, &fixture).used);
-    try std.testing.expectEqual(@as(usize, 6), tunerCount(Fixture, &fixture));
+    // A const value walks too; a census snapshots every tuner, under `root`.
+    var census = TunerSettle{};
+    census.addAll(Fixture, &fixture, "state");
+    try std.testing.expectEqual(@as(usize, 5), census.len);
+    try std.testing.expectEqualStrings("state.nested.inner[0]", census.entries[3].name);
+    try std.testing.expectEqual(@as(usize, 5), tunerCount(Fixture, &fixture));
 }
 
 test "a tuner state names its phase and final shape, or inline" {

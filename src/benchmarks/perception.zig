@@ -401,12 +401,12 @@ fn runCaseImpl(
     const think_set = (try scope.compactCognition(&spatial_view, 0, false, &threads, .{ .adaptive = false })).cognition;
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(stageTunerSettle(&system).all())) {
+    while (warm.nextSettled(stageTunerSettle(&system))) {
         events.clearRetainingCapacity();
         _ = try runOnce(&system, &fixture, spatial_view, think_set, &events, &threads, case);
     }
     const settle = stageTunerSettle(&system);
-    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, case.adaptive and settle.all());
+    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, case);
     const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(&system));
     var shapes = suite.StageShapes(stage_names.len){};
 
@@ -449,13 +449,13 @@ fn stageTuners(system: *const PerceptionSystem) [stage_names.len]*const Adaptive
 }
 
 fn stageTunerSettle(system: *const PerceptionSystem) suite.TunerSettle {
-    return suite.TunerSettle.ofNamed(&stage_names, &stageTuners(system));
+    return suite.TunerSettle.of(PerceptionSystem, system);
 }
 
 // The tuned case's census, its compute tuner (the row's), and both stage tuners' states.
 fn reportTuners(stats: *suite.RunStats, system: *const PerceptionSystem, case: suite.BenchmarkCase, settle: suite.TunerSettle, window: suite.TunerWindow(stage_names.len), compute_start: suite.TunerStart) void {
     if (!case.adaptive) return;
-    stats.tuner_settle = settle;
+    stats.tuner_settle = settle.measured();
     stats.work_tuning = suite.workTuningSummary(&system.compute_tuner, compute_start);
     window.printTuning(&stats.details, stage_names, stageTuners(system));
 }
@@ -604,12 +604,12 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const think_set = (try scope.compactCognition(&spatial_view, 0, false, &threads, .{ .adaptive = false })).cognition;
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(stageTunerSettle(&system).all())) {
+    while (warm.nextSettled(stageTunerSettle(&system))) {
         events.clearRetainingCapacity();
         _ = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
     }
     const settle = stageTunerSettle(&system);
-    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, case.adaptive and settle.all());
+    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, case);
     const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(&system));
     var shapes = suite.StageShapes(stage_names.len){};
 

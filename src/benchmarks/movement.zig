@@ -71,8 +71,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     while (warm.next(suite.tunerSettled(&system.adaptive_tuner))) {
         _ = runOnce(&system, &data, &threads, case);
     }
-    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.adaptive_tuner) else false;
-    const adaptive_tuner_start = suite.TunerStart.of(&system.adaptive_tuner, settled_before_measurement);
+    const adaptive_tuner_start = suite.TunerStart.of(&system.adaptive_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
@@ -256,8 +255,7 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     while (warm.next(suite.tunerSettled(&system.apply_intents_tuner))) {
         _ = applyIntentsOnce(&system, &fixture, thread_ptr, case);
     }
-    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.apply_intents_tuner) else false;
-    const apply_intents_tuner_start = suite.TunerStart.of(&system.apply_intents_tuner, settled_before_measurement);
+    const apply_intents_tuner_start = suite.TunerStart.of(&system.apply_intents_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;

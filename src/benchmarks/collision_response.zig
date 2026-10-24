@@ -212,13 +212,12 @@ fn stageRunOnce(
     return stats;
 }
 
-// An inline-settled gather never dispatches the apply, so its tuner settles alone.
-// The step's tuners: the gather's, and the apply's when the gather threads (an inline gather
-// applies inside itself, so the apply does not dispatch).
+// The step's tuners: the gather's and the apply's. An inline gather applies inside itself, so
+// the apply records nothing then and is idle.
 fn stageTunerSettle(system: *const CollisionResponseSystem) suite.TunerSettle {
     var census = suite.TunerSettle{};
     census.add("gather", &system.gather_tuner);
-    if (system.gather_tuner.has_threaded_profile) census.add("apply", &system.apply_tuner);
+    census.add("apply", &system.apply_tuner);
     return census;
 }
 
@@ -240,14 +239,13 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     try system.reserveForContacts(item_count, thread_ptr.participantSlotCount());
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(stageTunerSettle(&system).all())) {
+    while (warm.nextSettled(stageTunerSettle(&system))) {
         fixture.restoreMovement();
         _ = try stageRunOnce(&system, &fixture, thread_ptr, case);
     }
     const settle = stageTunerSettle(&system);
-    const settled = case.adaptive and settle.all();
-    const gather_tuner_start = suite.TunerStart.of(&system.gather_tuner, settled);
-    const apply_tuner_start = suite.TunerStart.of(&system.apply_tuner, settled);
+    const gather_tuner_start = suite.TunerStart.of(&system.gather_tuner, case);
+    const apply_tuner_start = suite.TunerStart.of(&system.apply_tuner, case);
     const tuner_window = suite.TunerWindow(tuner_names.len).begin(.{ &system.gather_tuner, &system.apply_tuner });
 
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -295,7 +293,7 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         if (stats.splice_batch) |*place| place.batch_duration_ns = @intCast(place_total / iterations);
     }
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&system.gather_tuner, gather_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(&system.apply_tuner, apply_tuner_start);
         tuner_window.printTuning(&stats.details, tuner_names, .{ &system.gather_tuner, &system.apply_tuner });

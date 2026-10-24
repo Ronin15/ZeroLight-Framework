@@ -1296,14 +1296,13 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     var unused_timing: BatchTiming = .{};
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(editTunerSettle(world, &revert_tuners).all())) {
+    while (warm.nextSettled(editTunerSettle(world, &revert_tuners))) {
         _ = try runBatchIteration(&fixture, &edit, edit_threads, &revert_tuners, &unused_timing);
         _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
     }
     const settle = editTunerSettle(world, &revert_tuners);
-    const settled = case.adaptive and settle.all();
-    const terrain_edit_write_tuner_start = suite.TunerStart.of(&world.terrain_edit_write_tuner, settled);
-    const terrain_edit_plan_tuner_start = suite.TunerStart.of(&world.terrain_edit_plan_tuner, settled);
+    const terrain_edit_write_tuner_start = suite.TunerStart.of(&world.terrain_edit_write_tuner, case);
+    const terrain_edit_plan_tuner_start = suite.TunerStart.of(&world.terrain_edit_plan_tuner, case);
     const tuner_window = suite.TunerWindow(edit_stage_names.len).begin(editTuners(world, &revert_tuners));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -1344,7 +1343,7 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         };
     }
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&world.terrain_edit_write_tuner, terrain_edit_write_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(&world.terrain_edit_plan_tuner, terrain_edit_plan_tuner_start);
         tuner_window.printTuning(&stats.details, edit_stage_names, editTuners(world, &revert_tuners));
@@ -1443,7 +1442,7 @@ const NavFixture = struct {
 
     // Adds both stage tuner sets to `census`: the forward set (the system's) and the revert
     // set, every tuner of each (`fixtures.addNavTuners`). A set or stage the workload never
-    // runs stays unused.
+    // runs is idle.
     fn addStageTuners(self: *const NavFixture, census: *suite.TunerSettle) void {
         fixtures.addNavTuners(census, "", &self.pipeline.pathfinding.tuners);
         fixtures.addNavTuners(census, "revert.", &self.revert_tuners);
@@ -1587,17 +1586,16 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     var refill = try buildDigRefillEdit(allocator, &nav.base);
     defer refill.deinit(allocator);
 
-    // The dig's reset reacts on the revert set; the ramps' never runs it, so it stays unused.
+    // The dig's reset reacts on the revert set; the ramps' never runs it, so it stays idle.
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(nav.stageTunerSettle().all())) {
+    while (warm.nextSettled(nav.stageTunerSettle())) {
         _ = try runNavIteration(io, &nav, &driver, workload);
         try resetNavWorkload(allocator, &nav, &driver, &refill, workload);
     }
     const settle = nav.stageTunerSettle();
-    const settled = case.adaptive and settle.all();
     const tuners = &nav.pipeline.pathfinding.tuners;
-    const remask_tuner_start = suite.TunerStart.of(tuners.nav.getPtrConst(.remask), settled);
-    const patch_tuner_start = suite.TunerStart.of(tuners.nav.getPtrConst(.patch), settled);
+    const remask_tuner_start = suite.TunerStart.of(tuners.nav.getPtrConst(.remask), case);
+    const patch_tuner_start = suite.TunerStart.of(tuners.nav.getPtrConst(.patch), case);
     var accumulator = suite.StatsAccumulator.init(item_count);
     // The timed reactions, each read before the reset's reaction replaces it.
     var reactions = suite.NavReactionShapes{};
@@ -1623,7 +1621,7 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     reactions.summarize(&stats, fixtures.floodTunerWorkersOf(tuners, case));
     stats.nav_main = nav_main;
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(tuners.nav.getPtrConst(.remask), remask_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
@@ -1916,13 +1914,12 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     var unused_timing: NavBatchTiming = .{};
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(navBatchTunerSettle(&nav, &revert_tuners).all())) {
+    while (warm.nextSettled(navBatchTunerSettle(&nav, &revert_tuners))) {
         _ = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, &revert_tuners, thread_ptr, &unused_timing);
     }
     const settle = navBatchTunerSettle(&nav, &revert_tuners);
-    const settled = case.adaptive and settle.all();
-    const remask_tuner_start = suite.TunerStart.of(system.tuners.nav.getPtrConst(.remask), settled);
-    const patch_tuner_start = suite.TunerStart.of(system.tuners.nav.getPtrConst(.patch), settled);
+    const remask_tuner_start = suite.TunerStart.of(system.tuners.nav.getPtrConst(.remask), case);
+    const patch_tuner_start = suite.TunerStart.of(system.tuners.nav.getPtrConst(.patch), case);
     const edit_window = suite.TunerWindow(edit_stage_names.len).begin(editTuners(world, &revert_tuners));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -1979,7 +1976,7 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         };
     }
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(system.tuners.nav.getPtrConst(.remask), remask_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(system.tuners.nav.getPtrConst(.patch), patch_tuner_start);
         edit_window.printTuning(&stats.details, edit_stage_names, editTuners(world, &revert_tuners));
@@ -2031,7 +2028,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     for (0..options.warmup_iterations) |_| _ = try levelAddIteration(io, &nav, &frame, replace);
     const settle = nav.stageTunerSettle();
     const remask_tuner = nav.pipeline.pathfinding.tuners.nav.getPtrConst(.remask);
-    const remask_tuner_start = suite.TunerStart.of(remask_tuner, case.adaptive and settle.all());
+    const remask_tuner_start = suite.TunerStart.of(remask_tuner, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var reactions = suite.NavReactionShapes{};
     var nav_main = suite.NavMainSummary{};
@@ -2053,7 +2050,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     // One level (or band) added per iteration.
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(remask_tuner, remask_tuner_start);
     }
     return stats;

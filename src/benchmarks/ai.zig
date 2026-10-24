@@ -237,13 +237,12 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     }
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(stageTunerSettle(&system).all())) {
+    while (warm.nextSettled(stageTunerSettle(&system))) {
         _ = try runOnce(&system, fixture, spatial_view, think_set, &threads, case);
     }
     const settle = stageTunerSettle(&system);
-    const settled = case.adaptive and settle.all();
-    const separation_tuner_start = suite.TunerStart.of(&system.separation_tuner, settled);
-    const intent_tuner_start = suite.TunerStart.of(&system.intent_tuner, settled);
+    const separation_tuner_start = suite.TunerStart.of(&system.separation_tuner, case);
+    const intent_tuner_start = suite.TunerStart.of(&system.intent_tuner, case);
     const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(&system));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -277,7 +276,7 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.secondary_batch = suite.batchSummaryFromShapes(&shapes, 2);
     stats.ai_behavior_histogram = behaviorHistogram(fixture.data.aiAgentSliceConst().behaviors);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&system.separation_tuner, separation_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(&system.intent_tuner, intent_tuner_start);
         tuner_window.printTuning(&stats.details, stage_names, stageTuners(&system));
@@ -293,7 +292,7 @@ fn stageTuners(system: *const AiSystem) [stage_names.len]*const AdaptiveWorkTune
 }
 
 fn stageTunerSettle(system: *const AiSystem) suite.TunerSettle {
-    return suite.TunerSettle.ofNamed(&stage_names, &stageTuners(system));
+    return suite.TunerSettle.of(AiSystem, system);
 }
 
 // The runs of consecutive think rows on one index cell, over the rows with cohere gain when

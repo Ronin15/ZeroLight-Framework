@@ -319,24 +319,12 @@ pub fn setNavTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void 
 pub const NavTuners = @FieldType(PathfindingSystem, "tuners");
 
 /// Adds every tuner of the stage tuner set `tuners` to `census` under `prefix`, the nav
-/// stages by name: each field is a tuner or the nav stage set, so none is missed. A tuner the
-/// measured step never selects stays unused (`TunerSettle`), so the caller's setup selects
-/// none the step does not run (`setNavTuners` refreshes the reaction's after the build).
+/// stages by name: each field is a tuner or the nav stage set, so none is missed. A tuner no
+/// measured step records in is idle (`TunerSettle.measured`), so setup-only tuners never
+/// hold the census.
 pub fn addNavTuners(census: *suite.TunerSettle, comptime prefix: []const u8, tuners: *const NavTuners) void {
-    addNavTunersExcept(census, prefix, tuners, &.{});
-}
-
-/// `addNavTuners` but the tuner fields named in `skip`: a tuner only a setup step selected,
-/// which the caller has shown no measured step ran.
-pub fn addNavTunersExcept(census: *suite.TunerSettle, comptime prefix: []const u8, tuners: *const NavTuners, comptime skip: []const []const u8) void {
     inline for (@typeInfo(NavTuners).@"struct".field_names, @typeInfo(NavTuners).@"struct".field_types) |name, Field| {
-        const skipped = comptime for (skip) |skip_name| {
-            if (std.mem.eql(u8, name, skip_name)) break true;
-        } else false;
-        if (comptime skipped) {
-            // A skipped field is a tuner, never the nav stage set.
-            comptime std.debug.assert(Field == AdaptiveWorkTuner);
-        } else if (comptime std.mem.eql(u8, name, "nav")) {
+        if (comptime std.mem.eql(u8, name, "nav")) {
             inline for (comptime std.enums.values(NavStage)) |stage| census.add(prefix ++ @tagName(stage), tuners.nav.getPtrConst(stage));
         } else {
             comptime std.debug.assert(Field == AdaptiveWorkTuner);

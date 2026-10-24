@@ -168,11 +168,10 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     const thread_ptr = &threads;
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(stageTunerSettle(&system).all())) _ = try runOnce(&system, data, geometry, thread_ptr, case);
+    while (warm.nextSettled(stageTunerSettle(&system))) _ = try runOnce(&system, data, geometry, thread_ptr, case);
     const settle = stageTunerSettle(&system);
-    const settled = case.adaptive and settle.all();
-    const bucket_tuner_start = suite.TunerStart.of(&system.bucket_tuner, settled);
-    const sort_tuner_start = suite.TunerStart.of(&system.sort_tuner, settled);
+    const bucket_tuner_start = suite.TunerStart.of(&system.bucket_tuner, case);
+    const sort_tuner_start = suite.TunerStart.of(&system.sort_tuner, case);
     const tuner_window = suite.TunerWindow(stage_names.len).begin(stageTuners(&system));
 
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -197,7 +196,7 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     stats.secondary_batch = suite.batchSummaryFromShapes(&shapes, 0);
     stats.splice_batch = suite.batchSummaryFromShapes(&shapes, 2);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&system.sort_tuner, sort_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(&system.bucket_tuner, bucket_tuner_start);
         tuner_window.printTuning(&stats.details, stage_names, stageTuners(&system));
@@ -213,7 +212,7 @@ fn stageTuners(system: *const SpatialIndexSystem) [stage_names.len]*const Adapti
 }
 
 fn stageTunerSettle(system: *const SpatialIndexSystem) suite.TunerSettle {
-    return suite.TunerSettle.ofNamed(&stage_names, &stageTuners(system));
+    return suite.TunerSettle.of(SpatialIndexSystem, system);
 }
 
 fn runOnce(system: *SpatialIndexSystem, data: *const DataSystem, geometry: IndexGeometry, thread_system: *ThreadSystem, case: suite.BenchmarkCase) !SpatialIndexStats {

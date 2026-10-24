@@ -219,8 +219,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     while (warm.next(suite.tunerSettled(&gate.tuner))) {
         try gate.apply(&fixture.world, &fixture.data, &fixture.player, bounds, bounds, &threads, config);
     }
-    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&gate.tuner) else false;
-    const tuner_start = suite.TunerStart.of(&gate.tuner, settled_before_measurement);
+    const tuner_start = suite.TunerStart.of(&gate.tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;

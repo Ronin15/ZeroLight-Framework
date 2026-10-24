@@ -72,8 +72,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     while (warm.next(suite.tunerSettled(&particles.adaptive_tuner))) {
         _ = runOnce(&particles, &threads, case);
     }
-    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&particles.adaptive_tuner) else false;
-    const adaptive_tuner_start = suite.TunerStart.of(&particles.adaptive_tuner, settled_before_measurement);
+    const adaptive_tuner_start = suite.TunerStart.of(&particles.adaptive_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;

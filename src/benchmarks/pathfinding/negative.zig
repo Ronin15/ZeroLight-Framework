@@ -6,8 +6,9 @@
 //! A config whose nav storage exceeds the bench's nav-size limit fails with its
 //! figure (`nav_size.checkNavSize`), and every config checks each part of the nav's
 //! bytes against its charge (`nav_size.checkNavBytes`). The tuned case settles every
-//! tuner its measured step runs before measuring (`step_tuners:`): the whole pathfinding set
-//! (`stepTunerSettle`), or the goal scan and project for the burst's dispatch variant.
+//! tuner its measured step runs before measuring (`step_tuners:`), over the whole
+//! pathfinding set (`stepTunerSettle`); the burst's dispatch variant runs only the goal scan
+//! and project, so the rest stay idle.
 
 const std = @import("std");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -270,9 +271,9 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     try nav_size.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
 
     var warm = suite.Warmup.custom(case, coldWarmup(options), suite.adaptiveSettleIterationLimit(options));
-    while (warm.next(stepTunerSettle(&fixture.system).all())) _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
+    while (warm.nextSettled(stepTunerSettle(&fixture.system))) _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
     const settle = stepTunerSettle(&fixture.system);
-    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, case.adaptive and settle.all());
+    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -289,7 +290,7 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     stage_report.write(&stats.details);
     stats.output_count = last_stats.perf.unavailable_results;
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&fixture.system.tuners.intake, intake_start);
     }
     return stats;
@@ -366,9 +367,9 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     var dig = NegativeDig{ .cell = pocketDigCell(side) };
     var warm = suite.Warmup.custom(case, coldWarmup(options), suite.adaptiveSettleIterationLimit(options));
     // A step is the nav reaction and the update: every tuner of the set.
-    while (warm.next(stepTunerSettle(&fixture.system).all())) _ = try dig.step(io, case, &fixture, thread_ptr);
+    while (warm.nextSettled(stepTunerSettle(&fixture.system))) _ = try dig.step(io, case, &fixture, thread_ptr);
     const settle = stepTunerSettle(&fixture.system);
-    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, case.adaptive and settle.all());
+    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     // The update's stages and the reaction's eviction stages, each over its own span.
@@ -390,7 +391,7 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     stats.output_count = requester_count;
     if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(requester_count, stats.mean_ns);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&fixture.system.tuners.intake, intake_start);
     }
     return stats;
@@ -701,9 +702,9 @@ fn runGoalDispatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
 
     // The resolve alone runs: its scan and project tuners.
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(goalTunerSettle(&fixture.system).all())) _ = try runDispatchResolve(io, &fixture.system, fixture.requests, thread_ptr, case);
-    const settle = goalTunerSettle(&fixture.system);
-    const scan_start = suite.TunerStart.of(&fixture.system.tuners.goal_scan, case.adaptive and settle.all());
+    while (warm.nextSettled(stepTunerSettle(&fixture.system))) _ = try runDispatchResolve(io, &fixture.system, fixture.requests, thread_ptr, case);
+    const settle = stepTunerSettle(&fixture.system);
+    const scan_start = suite.TunerStart.of(&fixture.system.tuners.goal_scan, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var resolve_report = ResolveReport{};
     var last: ?GoalResolveStats = null;
@@ -723,18 +724,10 @@ fn runGoalDispatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     }
     stats.items_per_second = suite.itemsPerSecond(config.requests, stats.mean_ns);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&fixture.system.tuners.goal_scan, scan_start);
     }
     return stats;
-}
-
-// The goal resolve's scan and project tuners.
-fn goalTunerSettle(system: *const PathfindingSystem) suite.TunerSettle {
-    var census = suite.TunerSettle{};
-    census.add("goal_scan", &system.tuners.goal_scan);
-    census.add("goal_project", &system.tuners.goal_project);
-    return census;
 }
 
 fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -756,9 +749,9 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     // At least one untimed burst: the first grows the capacity from the reserve floor.
     var warm = suite.Warmup.custom(case, @max(1, coldWarmup(options)), suite.adaptiveSettleIterationLimit(options));
     // A burst is the goal resolve and the update: every tuner of the set.
-    while (warm.next(stepTunerSettle(&fixture.system).all())) _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
+    while (warm.nextSettled(stepTunerSettle(&fixture.system))) _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
     const settle = stepTunerSettle(&fixture.system);
-    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, case.adaptive and settle.all());
+    const intake_start = suite.TunerStart.of(&fixture.system.tuners.intake, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var stage_report = StageReport{};
@@ -783,7 +776,7 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     }
     stats.items_per_second = suite.itemsPerSecond(config.requests, stats.mean_ns);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&fixture.system.tuners.intake, intake_start);
     }
     return stats;

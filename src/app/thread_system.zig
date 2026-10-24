@@ -277,6 +277,9 @@ pub const AdaptiveWorkTuner = struct {
     // band whose record was skipped (an unsustained item-count shift).
     restore_count: DiagnosticCount = zero_diagnostic_count,
     shift_skip_count: DiagnosticCount = zero_diagnostic_count,
+    // Batches with items handed to `record`, sampled or skipped (an unsustained shift):
+    // cumulative, never read by policy.
+    record_count: DiagnosticCount = zero_diagnostic_count,
 
     pub fn init(config: AdaptiveWorkTunerConfig) AdaptiveWorkTuner {
         const normalized = normalizeWorkTunerConfig(config);
@@ -347,6 +350,7 @@ pub const AdaptiveWorkTuner = struct {
 
     pub fn record(self: *AdaptiveWorkTuner, stats: BatchStats) void {
         if (stats.item_count == 0) return;
+        if (comptime diagnostics_enabled) self.record_count += 1;
         if (stats.batch_duration_ns == 0) return;
         if (self.skip_next_record) {
             self.skip_next_record = false;
@@ -4298,7 +4302,8 @@ test "a nested batch keeps a selected profile's range shape and a nested stage s
     try outer.stage_record.expectRanInlineOnCaller(nested_inner_items, untuned.range_count);
 }
 
-// The tuner state any selection or record would change.
+// The tuner policy state any selection or record would change. The perf-log diagnostic
+// counters are excluded: tests never read counters (`tests-benchmarks.md`).
 const TunerSnapshot = struct {
     phase: AdaptiveWorkPhase,
     initial_profile: AdaptiveWorkProfile,
@@ -4314,10 +4319,6 @@ const TunerSnapshot = struct {
     batch_multiplier: f64,
     throughput_ema: f64,
     nudge_samples: usize,
-    probe_window_count: DiagnosticCount,
-    demotion_count: DiagnosticCount,
-    restore_count: DiagnosticCount,
-    shift_skip_count: DiagnosticCount,
 
     fn of(tuner: *const AdaptiveWorkTuner) TunerSnapshot {
         return .{
@@ -4335,10 +4336,6 @@ const TunerSnapshot = struct {
             .batch_multiplier = tuner.batch_multiplier,
             .throughput_ema = tuner.throughput_ema,
             .nudge_samples = tuner.nudge_samples,
-            .probe_window_count = tuner.probe_window_count,
-            .demotion_count = tuner.demotion_count,
-            .restore_count = tuner.restore_count,
-            .shift_skip_count = tuner.shift_skip_count,
         };
     }
 };

@@ -192,8 +192,7 @@ fn runCaseWithConfig(
             allocator,
         );
     }
-    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&batch.adaptive_tuner) else false;
-    const adaptive_tuner_start = suite.TunerStart.of(&batch.adaptive_tuner, settled_before_measurement);
+    const adaptive_tuner_start = suite.TunerStart.of(&batch.adaptive_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var phase_accumulator = fixtures.PhaseAccumulator(suite.RenderGamePrepPhaseSummary){};

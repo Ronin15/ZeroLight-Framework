@@ -266,11 +266,10 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // Warm so the abstract buffers are at high-water capacity (the steady path is
     // allocation-free) and the tuners have trained an inline baseline before timing.
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(toggleTunerSettle(&fixture).all())) _ = try runToggle(&fixture, io, thread_ptr);
+    while (warm.nextSettled(toggleTunerSettle(&fixture))) _ = try runToggle(&fixture, io, thread_ptr);
     const settle = toggleTunerSettle(&fixture);
-    const settled = case.adaptive and settle.all();
-    const remask_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.remask), settled);
-    const patch_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.patch), settled);
+    const remask_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.remask), case);
+    const patch_tuner_start = suite.TunerStart.of(fixture.system.tuners.nav.getPtrConst(.patch), case);
 
     // Throughput is over the cells edited: the footprint is capped, so a count above the cap
     // edits fewer cells.
@@ -302,7 +301,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     open_reactions.summarize(&stats, fixtures.floodTunerWorkers(&fixture.system, case));
     block_reactions.print(&stats.details, "block_update");
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.remask), remask_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
@@ -466,11 +465,10 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     const nav = fixture.nav();
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(fixtures.seamTunerSettle(&fixture.seam.pipeline).all())) _ = try fixture.moveAndReact(io, thread_ptr);
+    while (warm.nextSettled(fixtures.seamTunerSettle(&fixture.seam.pipeline))) _ = try fixture.moveAndReact(io, thread_ptr);
     const settle = fixtures.seamTunerSettle(&fixture.seam.pipeline);
-    const settled = case.adaptive and settle.all();
-    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), settled);
-    const patch_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.patch), settled);
+    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), case);
+    const patch_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.patch), case);
 
     var accumulator = suite.StatsAccumulator.init(other_statics + dynamic_bodies);
     var chunks_patched: usize = 0;
@@ -495,7 +493,7 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     reactions.summarize(&stats, fixtures.floodTunerWorkers(nav, case));
     seam_shapes.print(&stats.details, "seam", fixtures.seam_stage_names);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.remask), remask_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.patch), patch_tuner_start);
     }
@@ -766,12 +764,11 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const nav = fixture.nav();
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(fixtures.seamTunerSettle(&fixture.seam.pipeline).all())) _ = try fixture.changeAndReact(io, thread_ptr);
+    while (warm.nextSettled(fixtures.seamTunerSettle(&fixture.seam.pipeline))) _ = try fixture.changeAndReact(io, thread_ptr);
     const settle = fixtures.seamTunerSettle(&fixture.seam.pipeline);
-    const settled = case.adaptive and settle.all();
     const rewrite_tuner = fixture.colliders().tuners.getPtrConst(.rewrite);
-    const rewrite_tuner_start = suite.TunerStart.of(rewrite_tuner, settled);
-    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), settled);
+    const rewrite_tuner_start = suite.TunerStart.of(rewrite_tuner, case);
+    const remask_tuner_start = suite.TunerStart.of(nav.tuners.nav.getPtrConst(.remask), case);
 
     const change_count = fixture.layout.chunk_count * dense_changes_per_chunk;
     var accumulator = suite.StatsAccumulator.init(change_count);
@@ -814,7 +811,7 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         };
     }
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(rewrite_tuner, rewrite_tuner_start);
         stats.secondary_work_tuning = suite.workTuningSummary(nav.tuners.nav.getPtrConst(.remask), remask_tuner_start);
     }

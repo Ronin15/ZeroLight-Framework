@@ -106,8 +106,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         fixture.events.clearRetainingCapacity();
         _ = try runOnce(&system, &fixture, think_set, &threads, case);
     }
-    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.compute_tuner) else false;
-    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, settled_before_measurement);
+    const compute_tuner_start = suite.TunerStart.of(&system.compute_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = AffectStats{};

@@ -1602,13 +1602,13 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     const system = &fixture.system;
     const cold_config = coldStepConfig(case, route_request_count, route_request_count);
     var warm = suite.Warmup.custom(case, options.warmup_iterations, suite.adaptiveSettleIterationLimit(options));
-    while (warm.next(stepTunerSettle(system).all())) {
+    while (warm.nextSettled(stepTunerSettle(system))) {
         try drainPending(system, thread_system, route_request_count, cold_config);
         expireCachedResults(system);
         _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
     }
     const settle = stepTunerSettle(system);
-    const solve_start = suite.TunerStart.of(&system.tuners.solve, case.adaptive and settle.all());
+    const solve_start = suite.TunerStart.of(&system.tuners.solve, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -1631,7 +1631,7 @@ fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCa
     stats.candidate_pairs = abstract_nodes;
     stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(&system.tuners.solve, solve_start);
     }
     return stats;
@@ -1705,7 +1705,7 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     }
     const settle = stepTunerSettle(&fixture.system);
     const patch_tuner = fixture.system.tuners.nav.getPtrConst(.patch);
-    const patch_start = suite.TunerStart.of(patch_tuner, case.adaptive and settle.all());
+    const patch_start = suite.TunerStart.of(patch_tuner, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = LinkFoldReport{};
     for (0..options.iterations) |_| {
@@ -1725,7 +1725,7 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     stats.nav_main = report.stages.nav_main;
     stats.items_per_second = suite.itemsPerSecond(link_fold_batch, stats.mean_ns);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(patch_tuner, patch_start);
     }
     return stats;

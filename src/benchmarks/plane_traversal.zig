@@ -370,13 +370,13 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 
     try fixture.resetStep(thread_ptr);
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(fixture.tunerSettle().all())) {
+    while (warm.nextSettled(fixture.tunerSettle())) {
         _ = try runStage(&fixture, thread_ptr);
         try fixture.resetStep(thread_ptr);
     }
     const settle = fixture.tunerSettle();
     const headline_tuner = fixture.stageTuners()[headline_stage];
-    const tuner_start = suite.TunerStart.of(headline_tuner, case.adaptive and settle.all());
+    const tuner_start = suite.TunerStart.of(headline_tuner, case);
     const tuner_window = suite.TunerWindow(stage_names.len).begin(fixture.stageTuners());
 
     // The banded group's size axis is its landing band count.
@@ -408,7 +408,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
     shapes.print(&stats.details, "stages", stage_names);
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(headline_tuner, tuner_start);
         tuner_window.printTuning(&stats.details, stage_names, fixture.stageTuners());
     }

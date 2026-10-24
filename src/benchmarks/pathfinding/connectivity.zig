@@ -432,7 +432,7 @@ const ToggleReport = struct {
 fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *ReactFixture, cells: []const CellCoord, thread_system: *ThreadSystem, checks: ToggleChecks, ballast: ?*OnewayBallast, headline: ToggleHeadline) !suite.RunStats {
     var revert_tuners = fixture.system.tuners;
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(toggleTunerSettle(fixture, &revert_tuners).all())) {
+    while (warm.nextSettled(toggleTunerSettle(fixture, &revert_tuners))) {
         if (ballast) |chain| try chain.retire(io, fixture, thread_system);
         _ = try runToggle(io, case, fixture, cells, thread_system, checks, &revert_tuners);
     }
@@ -442,7 +442,7 @@ fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCas
         .rows => .conn_closure_rows,
     };
     const headline_tuner = fixture.system.tuners.nav.getPtrConst(headline_stage);
-    const headline_start = suite.TunerStart.of(headline_tuner, case.adaptive and settle.all());
+    const headline_start = suite.TunerStart.of(headline_tuner, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = ToggleReport{};
     for (0..options.iterations) |_| {
@@ -460,7 +460,7 @@ fn runToggleSamples(io: std.Io, options: suite.Options, case: suite.BenchmarkCas
     report.write(&stats.details);
     report.summarize(&stats, fixtures.floodTunerWorkers(&fixture.system, case));
     if (case.adaptive) {
-        stats.tuner_settle = settle;
+        stats.tuner_settle = settle.measured();
         stats.work_tuning = suite.workTuningSummary(headline_tuner, headline_start);
     }
     stats.items_per_second = suite.itemsPerSecond(2 * cells.len, stats.mean_ns);

@@ -183,8 +183,7 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
 
     var warm = suite.Warmup.init(options, case, 0);
     while (warm.next(suite.tunerSettled(&scope.cognition_tuner))) _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
-    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&scope.cognition_tuner) else false;
-    const cognition_tuner_start = suite.TunerStart.of(&scope.cognition_tuner, settled_before_measurement);
+    const cognition_tuner_start = suite.TunerStart.of(&scope.cognition_tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var think_rows: usize = 0;

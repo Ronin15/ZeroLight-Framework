@@ -128,8 +128,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         std.debug.assert(!dispatchOnce(&context, &threads, &tuner, case).forced_inline);
         dispatches += 1;
     }
-    const settled_before_measurement = case.adaptive and suite.tunerSettled(&tuner);
-    const tuner_start = suite.TunerStart.of(&tuner, settled_before_measurement);
+    const tuner_start = suite.TunerStart.of(&tuner, case);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
