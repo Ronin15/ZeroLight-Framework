@@ -97,6 +97,7 @@ const CellCoord = @import("world/system.zig").CellCoord;
 const WorldSystem = @import("world/system.zig").WorldSystem;
 const Rect = @import("../render/renderer.zig").Rect;
 const world_gate = @import("systems/world_gate.zig");
+const WorldGateSystem = @import("systems/world_gate.zig").WorldGateSystem;
 
 /// Coarse per-step data resources stages read/write, for the stage-ordering
 /// contract below. Some tags bundle several SoA columns owned by one system
@@ -559,7 +560,8 @@ pub const SimulationPipelineStats = struct {
     /// Kept only with `runtime_perf_log.enabled`: this step's plane-traversal scratch and
     /// plane-entry window growths past their reservations (the reservation short of the
     /// live population; zero in steady state), and the batches of the stages the pipeline
-    /// runs itself: the scope passes, the plane-entry gather, and the chunk derive.
+    /// runs itself: the scope passes, the world gate, the plane-entry gather, and the chunk
+    /// derive.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         dig_plane_scratch_grows: usize = 0,
         plane_entry_window_grows: usize = 0,
@@ -567,6 +569,7 @@ pub const SimulationPipelineStats = struct {
         scope_cognition: BatchStats = .{},
         scope_collision_gather: BatchStats = .{},
         scope_tier_policy: BatchStats = .{},
+        world_gate: BatchStats = .{},
         plane_entry: BatchStats = .{},
         chunk_derive: BatchStats = .{},
     } else struct {};
@@ -606,6 +609,7 @@ pub const SimulationPipelineStats = struct {
             perf.recordBenchBatch(.scope_cognition, self.perf.scope_cognition);
             perf.recordBenchBatch(.scope_collision_gather, self.perf.scope_collision_gather);
             perf.recordBenchBatch(.scope_tier_policy, self.perf.scope_tier_policy);
+            perf.recordBenchBatch(.world_gate, self.perf.world_gate);
             perf.recordBenchBatch(.plane_entry, self.perf.plane_entry);
         }
 
@@ -846,6 +850,8 @@ pub const SimulationPipeline = struct {
     /// stage only appraises and decays them.
     affect: AffectSystem,
     dig: DigController,
+    /// The settled step's bounds clamp and solid-tile gate pass over the movement rows.
+    world_gate: WorldGateSystem = .{},
     /// The plane stage's NPC cell-entry gather; the dig controller's plane reserve and
     /// commit visit only its entries. Its windows follow the population seam.
     plane_entry: PlaneEntrySystem,
@@ -1884,10 +1890,11 @@ pub const SimulationPipeline = struct {
         );
     }
 
-    fn stageBoundsAndTileGate(_: *SimulationPipeline, step: *StepState) !void {
+    fn stageBoundsAndTileGate(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         var clamp_timer = StageTimer.start();
-        try world_gate.apply(context.world, context.data, context.player, context.bounds_width, context.bounds_height);
+        try self.world_gate.apply(context.world, context.data, context.player, context.bounds_width, context.bounds_height, context.thread_system, .{});
+        if (comptime runtime_perf_log.enabled) step.perf.world_gate = self.world_gate.perf.last_batch;
         clamp_timer.stop(context.perf, .pipeline_clamp_bounds);
     }
 
@@ -4163,6 +4170,7 @@ test "player tile gate slides along solid dirt and is a no-op on the surface" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
+    try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
     player.current_level = 1;
     placePlayerFlush(&data, player, .{ 3, 3 });
 
@@ -4714,6 +4722,8 @@ test "pipeline commits the dig stage's world edit before the tile gate reads wal
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
+    // The gate's box is the collision bounds.
+    try data.setCollisionBounds(npc, .{ .size = .{ .x = 32, .y = 32 } });
     try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(npc, 1);
     try data.setSimulationTier(npc, .locomotion);

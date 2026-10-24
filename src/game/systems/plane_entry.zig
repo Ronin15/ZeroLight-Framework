@@ -193,7 +193,6 @@ pub const PlaneEntrySystem = struct {
                 .size_y = visuals.size_y,
                 .tier = scope.tier,
                 .scope_level = scope.level,
-                .grid = CellGrid.of(world),
                 .tunnel_tile = tunnel_tile,
             },
             .entries = undefined,
@@ -243,17 +242,6 @@ pub const PlaneEntrySystem = struct {
     }
 };
 
-// The world's cell grid as the lane cell test reads it.
-const CellGrid = struct {
-    tile_size: f32,
-    width: i32,
-    height: i32,
-
-    fn of(world: *const WorldSystem) CellGrid {
-        return .{ .tile_size = world.tile_size, .width = world.width, .height = world.height };
-    }
-};
-
 // The columns one gather reads, captured once per gather.
 const GatherInput = struct {
     data: *const DataSystem,
@@ -268,7 +256,6 @@ const GatherInput = struct {
     size_y: []const f32,
     tier: []const SimulationTier,
     scope_level: []const u16,
-    grid: CellGrid,
     tunnel_tile: TileId,
 };
 
@@ -297,24 +284,6 @@ const LaneCellEntries = struct {
     cell_y: simd.Int4,
 };
 
-const LaneCells = struct {
-    x: simd.Int4,
-    y: simd.Int4,
-    inside: simd.Mask4,
-};
-
-// `WorldSystem.cellContaining` per lane: a negative center is outside, otherwise the
-// floored tile index must be inside the grid.
-fn laneCells(center_x: simd.Float4, center_y: simd.Float4, grid: CellGrid) LaneCells {
-    const zero = simd.splatFloat4(0);
-    const tile = simd.splatFloat4(grid.tile_size);
-    const x = simd.floorToI4(simd.divFloat4(center_x, tile));
-    const y = simd.floorToI4(simd.divFloat4(center_y, tile));
-    const non_negative = (center_x >= zero) & (center_y >= zero);
-    const below_extent = simd.lessThanInt4(x, simd.splatInt4(grid.width)) & simd.lessThanInt4(y, simd.splatInt4(grid.height));
-    return .{ .x = x, .y = y, .inside = non_negative & below_extent };
-}
-
 // SIMD twin of `cellEntryScalar`, same operation order.
 fn laneCellEntries(
     previous_x: simd.Float4,
@@ -323,13 +292,13 @@ fn laneCellEntries(
     position_y: simd.Float4,
     size_x: simd.Float4,
     size_y: simd.Float4,
-    grid: CellGrid,
+    world: *const WorldSystem,
 ) LaneCellEntries {
     const half = simd.splatFloat4(0.5);
     const half_x = simd.mulFloat4(size_x, half);
     const half_y = simd.mulFloat4(size_y, half);
-    const previous = laneCells(simd.addFloat4(previous_x, half_x), simd.addFloat4(previous_y, half_y), grid);
-    const current = laneCells(simd.addFloat4(position_x, half_x), simd.addFloat4(position_y, half_y), grid);
+    const previous = world.cellContaining4(simd.addFloat4(previous_x, half_x), simd.addFloat4(previous_y, half_y));
+    const current = world.cellContaining4(simd.addFloat4(position_x, half_x), simd.addFloat4(position_y, half_y));
     const moved = (current.x != previous.x) | (current.y != previous.y);
     return .{ .entered = previous.inside & current.inside & moved, .cell_x = current.x, .cell_y = current.y };
 }
@@ -386,7 +355,7 @@ fn gatherRange(input: *const GatherInput, start: usize, end: usize, window: []Pl
             simd.gatherFloat4(input.position_y, movement_rows),
             simd.gatherFloat4(input.size_x, visual_rows),
             simd.gatherFloat4(input.size_y, visual_rows),
-            input.grid,
+            input.world,
         );
         inline for (0..simd.lane_count) |lane| {
             if (active[lane] and lanes.entered[lane]) {
@@ -727,7 +696,6 @@ test "plane entry SIMD blocks match the scalar entry test" {
         .{ .previous = .{ -16, 0 }, .current = .{ 16, 0 }, .size = 32 },
     };
     comptime std.debug.assert(cases.len % simd.lane_count == 0);
-    const grid = CellGrid.of(&world);
     var block: usize = 0;
     while (block < cases.len) : (block += simd.lane_count) {
         var columns: [6][simd.lane_count]f32 = undefined;
@@ -746,7 +714,7 @@ test "plane entry SIMD blocks match the scalar entry test" {
             simd.loadFloat4(&columns[3]),
             simd.loadFloat4(&columns[4]),
             simd.loadFloat4(&columns[5]),
-            grid,
+            &world,
         );
         const entered: [simd.lane_count]bool = lanes.entered;
         const cell_x = simd.toIntArray(lanes.cell_x);
@@ -782,7 +750,6 @@ test "plane entry SIMD blocks match the scalar entry test" {
         .size_y = visuals.size_y,
         .tier = scope.tier,
         .scope_level = scope.level,
-        .grid = CellGrid.of(&fixture.world),
         .tunnel_tile = try testTunnelTile(&fixture.meta),
     };
     var simd_window: [population]PlaneEntry = undefined;

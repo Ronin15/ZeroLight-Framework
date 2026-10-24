@@ -13,6 +13,7 @@
 const std = @import("std");
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const math = @import("../../core/math.zig");
+const simd = @import("../../core/simd.zig");
 const RuntimeAssets = @import("../../assets/runtime_assets.zig").RuntimeAssets;
 const WorldTilesetMeta = @import("../../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const Rect = @import("../../render/renderer.zig").Rect;
@@ -779,6 +780,25 @@ pub const WorldSystem = struct {
         return .{ .x = @intCast(cell_x), .y = @intCast(cell_y) };
     }
 
+    /// Lane cells of `cellContaining4`: each lane's cell, valid where `inside` is set.
+    pub const LaneCells = struct {
+        x: simd.Int4,
+        y: simd.Int4,
+        inside: simd.Mask4,
+    };
+
+    /// `cellContaining` per lane: a negative coordinate is outside, otherwise the floored
+    /// tile index must lie inside the grid.
+    pub fn cellContaining4(self: *const WorldSystem, world_x: simd.Float4, world_y: simd.Float4) LaneCells {
+        const zero = simd.splatFloat4(0);
+        const tile = simd.splatFloat4(self.tile_size);
+        const x = simd.floorToI4(simd.divFloat4(world_x, tile));
+        const y = simd.floorToI4(simd.divFloat4(world_y, tile));
+        const non_negative = simd.greaterEqualFloat4(world_x, zero) & simd.greaterEqualFloat4(world_y, zero);
+        const below_extent = simd.lessThanInt4(x, simd.splatInt4(self.width)) & simd.lessThanInt4(y, simd.splatInt4(self.height));
+        return .{ .x = x, .y = y, .inside = non_negative & below_extent };
+    }
+
     /// The chunk holding cell (x, y). Pure arithmetic on the chunk edge, so it needs no
     /// level.
     pub fn chunkCoordForCell(self: *const WorldSystem, x: u16, y: u16) struct { x: i32, y: i32 } {
@@ -1056,6 +1076,39 @@ const procedural_test_config = @import("test_support.zig").procedural_test_confi
 const WorldTileChangedEvent = @import("../simulation.zig").WorldTileChangedEvent;
 const DenseCellWrite = @import("edit.zig").DenseCellWrite;
 const DenseChunkWrites = @import("edit.zig").DenseChunkWrites;
+
+test "cellContaining4 lanes match cellContaining on edges and outside points" {
+    var world = WorldSystem{ .allocator = std.testing.allocator, .width = 4, .height = 3, .tile_size = 32, .chunk_size_tiles = 4 };
+    defer world.deinit();
+    // The origin, -0.0, just below zero, exact tile multiples, the far edges, and past them.
+    const points = [_][2]f32{
+        .{ 0, 0 },    .{ -0.0, 5 }, .{ 5, -0.0 },      .{ -0.5, 5 },
+        .{ 5, -0.5 }, .{ 32, 64 },  .{ 31.75, 63.75 }, .{ 127.75, 95.75 },
+        .{ 128, 10 }, .{ 10, 96 },  .{ 200, 200 },     .{ -40, -40 },
+    };
+    comptime std.debug.assert(points.len % simd.lane_count == 0);
+    var block: usize = 0;
+    while (block < points.len) : (block += simd.lane_count) {
+        var xs: [simd.lane_count]f32 = undefined;
+        var ys: [simd.lane_count]f32 = undefined;
+        for (points[block..][0..simd.lane_count], 0..) |point, lane| {
+            xs[lane] = point[0];
+            ys[lane] = point[1];
+        }
+        const lanes = world.cellContaining4(simd.loadFloat4(&xs), simd.loadFloat4(&ys));
+        const inside: [simd.lane_count]bool = lanes.inside;
+        const cell_x = simd.toIntArray(lanes.x);
+        const cell_y = simd.toIntArray(lanes.y);
+        for (0..simd.lane_count) |lane| {
+            const want = world.cellContaining(xs[lane], ys[lane]);
+            try std.testing.expectEqual(want != null, inside[lane]);
+            if (want) |cell| {
+                try std.testing.expectEqual(@as(i32, cell.x), cell_x[lane]);
+                try std.testing.expectEqual(@as(i32, cell.y), cell_y[lane]);
+            }
+        }
+    }
+}
 
 test "world dense layer uses row-major indexing" {
     var meta = try testWorldMeta();

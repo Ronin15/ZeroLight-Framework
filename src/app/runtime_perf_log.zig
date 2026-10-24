@@ -289,6 +289,8 @@ pub const BenchBatchStage = enum {
     scope_cognition,
     scope_collision_gather,
     scope_tier_policy,
+    // The bounds clamp and solid-tile gate pass.
+    world_gate,
     // Plane traversal's entry gather.
     plane_entry,
     // Collision response's contact gather, place, and apply.

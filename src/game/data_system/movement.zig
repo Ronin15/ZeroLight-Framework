@@ -12,6 +12,7 @@ const types = @import("types.zig");
 const EntityId = types.EntityId;
 const MovementBody = types.MovementBody;
 const MovementBodyPtr = types.MovementBodyPtr;
+const CollisionBounds = types.CollisionBounds;
 const MovementBodySlice = types.MovementBodySlice;
 const ConstMovementBodySlice = types.ConstMovementBodySlice;
 const ScopeColumnsSlice = types.ScopeColumnsSlice;
@@ -40,6 +41,14 @@ const MovementBodyRow = struct {
     velocity_y: f32,
     speed: f32,
     has_primitive_visual: bool = false,
+    // Mirror of the entity's `CollisionBounds` (zero without one) and its AI membership,
+    // written only by `DataSystem` at the commit seam.
+    bounds_offset_x: f32 = 0,
+    bounds_offset_y: f32 = 0,
+    bounds_size_x: f32 = 0,
+    bounds_size_y: f32 = 0,
+    has_collision_bounds: bool = false,
+    has_ai_agent: bool = false,
     tier: SimulationTier,
     chunk_x: i32,
     chunk_y: i32,
@@ -125,6 +134,20 @@ pub const MovementBodyStore = struct {
         self.rows.slice().items(.has_primitive_visual)[index] = has_visual;
     }
 
+    /// Mirrors `bounds` onto row `index` and marks it bounded.
+    pub fn setCollisionBounds(self: *MovementBodyStore, index: usize, bounds: CollisionBounds) void {
+        const s = self.rows.slice();
+        s.items(.bounds_offset_x)[index] = bounds.offset.x;
+        s.items(.bounds_offset_y)[index] = bounds.offset.y;
+        s.items(.bounds_size_x)[index] = bounds.size.x;
+        s.items(.bounds_size_y)[index] = bounds.size.y;
+        s.items(.has_collision_bounds)[index] = true;
+    }
+
+    pub fn setHasAiAgent(self: *MovementBodyStore, index: usize, has_agent: bool) void {
+        self.rows.slice().items(.has_ai_agent)[index] = has_agent;
+    }
+
     pub fn scopeMetadataAt(self: *const MovementBodyStore, index: usize) EntitySimulationMetadata {
         const s = self.rows.slice();
         return .{
@@ -184,6 +207,12 @@ pub const MovementBodyStore = struct {
             .velocity_y = s.items(.velocity_y),
             .speed = s.items(.speed),
             .has_primitive_visual = s.items(.has_primitive_visual),
+            .bounds_offset_x = s.items(.bounds_offset_x),
+            .bounds_offset_y = s.items(.bounds_offset_y),
+            .bounds_size_x = s.items(.bounds_size_x),
+            .bounds_size_y = s.items(.bounds_size_y),
+            .has_collision_bounds = s.items(.has_collision_bounds),
+            .has_ai_agent = s.items(.has_ai_agent),
         };
     }
 
@@ -200,6 +229,12 @@ pub const MovementBodyStore = struct {
             .velocity_y = s.items(.velocity_y),
             .speed = s.items(.speed),
             .has_primitive_visual = s.items(.has_primitive_visual),
+            .bounds_offset_x = s.items(.bounds_offset_x),
+            .bounds_offset_y = s.items(.bounds_offset_y),
+            .bounds_size_x = s.items(.bounds_size_x),
+            .bounds_size_y = s.items(.bounds_size_y),
+            .has_collision_bounds = s.items(.has_collision_bounds),
+            .has_ai_agent = s.items(.has_ai_agent),
         };
     }
 

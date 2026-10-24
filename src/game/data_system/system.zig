@@ -482,6 +482,11 @@ pub const DataSystem = struct {
         if (slot.primitive_visual_index != null) {
             self.movement_bodies.setHasPrimitiveVisual(@intCast(dense_index), true);
         }
+        // Bounds and AI rows may already exist: the new row mirrors them for the world gate.
+        if (slot.collision_bounds_index) |bounds_index| {
+            self.movement_bodies.setCollisionBounds(dense_index, self.collision_bounds.get(@intCast(bounds_index)));
+        }
+        if (slot.ai_agent_index != null) self.movement_bodies.setHasAiAgent(dense_index, true);
         // A world-level row may already exist (setWorldLevel called first) —
         // sync it onto the new scope row.
         if (slot.world_level_index) |world_level_index| {
@@ -630,7 +635,7 @@ pub const DataSystem = struct {
         return self.primitive_visuals.sliceConst();
     }
 
-    /// One slot resolve → dense movement + visual row indices for SoA clamp/gate.
+    /// One slot resolve → dense movement + visual row indices for the plane-entry gather.
     /// Null if the entity is missing either component (or is not alive).
     pub fn movementVisualDenseIndices(self: *const DataSystem, id: EntityId) ?MovementVisualDenseIndices {
         const slot = self.resolveSlotConst(id) orelse return null;
@@ -686,12 +691,14 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.collision_bounds_index) |index| {
             self.collision_bounds.set(@intCast(index), bounds);
+            if (slot.movement_body_index) |movement_index| self.movement_bodies.setCollisionBounds(movement_index, bounds);
             return;
         }
 
         const dense_index = try self.collision_bounds.append(self.allocator, id, bounds);
         slot.collision_bounds_index = dense_index;
         slot.addComponent(.collision_bounds);
+        if (slot.movement_body_index) |movement_index| self.movement_bodies.setCollisionBounds(movement_index, bounds);
         // In-place size writes do not change membership. Append can complete a static obstacle.
         self.syncDynamicBounds(id);
     }
@@ -742,6 +749,7 @@ pub const DataSystem = struct {
         const dense_index = try self.ai_agents.append(self.allocator, id, agent);
         slot.ai_agent_index = dense_index;
         slot.addComponent(.ai_agent);
+        if (slot.movement_body_index) |movement_index| self.movement_bodies.setHasAiAgent(movement_index, true);
     }
 
     pub fn aiAgentSliceConst(self: *const DataSystem) ConstAiAgentSlice {
@@ -1127,6 +1135,12 @@ fn expectMovementBodyColumnsAligned(slice: ConstMovementBodySlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.velocity_y.len);
     try std.testing.expectEqual(slice.entities.len, slice.speed.len);
     try std.testing.expectEqual(slice.entities.len, slice.has_primitive_visual.len);
+    try std.testing.expectEqual(slice.entities.len, slice.bounds_offset_x.len);
+    try std.testing.expectEqual(slice.entities.len, slice.bounds_offset_y.len);
+    try std.testing.expectEqual(slice.entities.len, slice.bounds_size_x.len);
+    try std.testing.expectEqual(slice.entities.len, slice.bounds_size_y.len);
+    try std.testing.expectEqual(slice.entities.len, slice.has_collision_bounds.len);
+    try std.testing.expectEqual(slice.entities.len, slice.has_ai_agent.len);
 }
 
 fn expectPrimitiveVisualColumnsAligned(slice: ConstPrimitiveVisualSlice) !void {
@@ -1808,6 +1822,55 @@ test "render collect indices resolve drawable rows from movement dense index" {
         data.primitiveVisualSliceConst().entities.len,
     ) == null);
     try std.testing.expect(data.movementBodySliceConst().entities.len == 1);
+}
+
+// Expects `id`'s movement row to mirror its collision bounds (zero without) and AI membership.
+fn expectBoundsAndAiMirrored(data: *const DataSystem, id: EntityId) !void {
+    const row = data.movementBodyDenseIndex(id).?;
+    const movement = data.movementBodySliceConst();
+    const bounds = data.collisionBoundsConst(id) orelse CollisionBounds{ .size = .{} };
+    try std.testing.expectEqual(data.collisionBoundsConst(id) != null, movement.has_collision_bounds[row]);
+    try std.testing.expectEqual(bounds.offset.x, movement.bounds_offset_x[row]);
+    try std.testing.expectEqual(bounds.offset.y, movement.bounds_offset_y[row]);
+    try std.testing.expectEqual(bounds.size.x, movement.bounds_size_x[row]);
+    try std.testing.expectEqual(bounds.size.y, movement.bounds_size_y[row]);
+    try std.testing.expectEqual(data.hasComponents(id, component_masks.ai_agent), movement.has_ai_agent[row]);
+}
+
+test "movement rows mirror collision bounds and AI membership through bounds set, movement append, AI append, and destroy" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    // Bounds and AI before the body: the movement append syncs both.
+    const early = try data.createEntity();
+    try data.setCollisionBounds(early, .{ .offset = .{ .x = 2, .y = 3 }, .size = .{ .x = 10, .y = 12 } });
+    try data.setAiAgent(early, .{});
+    try data.setMovementBody(early, testBody(1));
+    try expectBoundsAndAiMirrored(&data, early);
+
+    // Body first: the bounds append, the bounds rewrite, and the AI append each write the row.
+    const late = try data.createEntity();
+    try data.setMovementBody(late, testBody(2));
+    try expectBoundsAndAiMirrored(&data, late);
+    try data.setCollisionBounds(late, .{ .size = .{ .x = 4, .y = 5 } });
+    try expectBoundsAndAiMirrored(&data, late);
+    try data.setCollisionBounds(late, .{ .offset = .{ .x = -1, .y = 1 }, .size = .{ .x = 6, .y = 7 } });
+    try expectBoundsAndAiMirrored(&data, late);
+    try data.setAiAgent(late, .{});
+    try expectBoundsAndAiMirrored(&data, late);
+
+    // A plain body stays unbounded and non-AI.
+    const plain = try data.createEntity();
+    try data.setMovementBody(plain, testBody(3));
+    try expectBoundsAndAiMirrored(&data, plain);
+
+    // Destroying the first row swaps the tail row in with its mirrored columns.
+    try std.testing.expect(data.destroyEntity(early));
+    try expectBoundsAndAiMirrored(&data, late);
+    try expectBoundsAndAiMirrored(&data, plain);
+    try std.testing.expect(data.destroyEntity(late));
+    try expectBoundsAndAiMirrored(&data, plain);
+    try expectMovementBodyColumnsAligned(data.movementBodySliceConst());
 }
 
 test "setMovementBody syncs has_primitive_visual when the visual row already exists" {

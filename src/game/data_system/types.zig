@@ -163,6 +163,15 @@ pub const MovementBodySlice = struct {
     speed: HotF32Slice,
     /// Dense drawable flag for render collect; movement-only rows stay false.
     has_primitive_visual: []bool,
+    /// The entity's `CollisionBounds` offset and size (zero without one), mirrored by
+    /// `DataSystem` at the commit seam; read-only here.
+    bounds_offset_x: ConstHotF32Slice,
+    bounds_offset_y: ConstHotF32Slice,
+    bounds_size_x: ConstHotF32Slice,
+    bounds_size_y: ConstHotF32Slice,
+    has_collision_bounds: []const bool,
+    /// Whether the entity carries an `AiAgent`; read-only here.
+    has_ai_agent: []const bool,
 };
 
 pub const ConstMovementBodySlice = struct {
@@ -177,6 +186,15 @@ pub const ConstMovementBodySlice = struct {
     speed: ConstHotF32Slice,
     /// Dense drawable flag for render collect; movement-only rows stay false.
     has_primitive_visual: []const bool,
+    /// The entity's `CollisionBounds` offset and size (zero without one), mirrored by
+    /// `DataSystem` at the commit seam; read-only here.
+    bounds_offset_x: ConstHotF32Slice,
+    bounds_offset_y: ConstHotF32Slice,
+    bounds_size_x: ConstHotF32Slice,
+    bounds_size_y: ConstHotF32Slice,
+    has_collision_bounds: []const bool,
+    /// Whether the entity carries an `AiAgent`; read-only here.
+    has_ai_agent: []const bool,
 };
 
 /// Dense simulation-scope columns in lockstep with the movement store rows
@@ -281,9 +299,9 @@ pub const RenderCollectIndices = struct {
     facing_index: ?usize = null,
 };
 
-/// Dense movement + primitive-visual row indices from a single entity slot resolve.
-/// Used by bounds clamp / tile gate so the hot path does one hash lookup, then pure
-/// SoA column writes (not a separate movement and visual lookup per entity).
+/// Dense movement + primitive-visual row indices from a single entity slot resolve, so
+/// the plane-entry gather does one lookup, not a separate movement and visual lookup per
+/// entity.
 pub const MovementVisualDenseIndices = struct {
     movement: usize,
     visual: usize,

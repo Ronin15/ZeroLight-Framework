@@ -177,6 +177,7 @@ fn stageBatches(stage: Timing) StageBatches {
             .bench = &.{ .collision_fill, .collision_sort, .collision_broadphase, .collision_narrowphase, .collision_static_pairs, .collision_static_rect, .collision_static_place, .collision_static_sort, .collision_trigger_emit_count, .collision_trigger_emit },
         },
         .pipeline_collision_response => .{ .bench = &.{ .collision_response_gather, .collision_response_place, .collision_response_apply } },
+        .pipeline_clamp_bounds => .{ .bench = &.{.world_gate} },
         .pipeline_chunk_derive => .{ .bench = &.{.chunk_derive} },
         .gameplay_particles => .{ .bench = &.{.particles} },
         .gameplay_structural => .{

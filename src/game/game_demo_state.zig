@@ -2004,7 +2004,7 @@ test "demo collision response handles player contacts with moving entities" {
     try std.testing.expect(square_after.velocity.x > 0);
 }
 
-test "ai squares use consistent math.clamp and zero velocity on bounds (main thread only)" {
+test "ai squares clamp their collision box to the bounds and zero velocity on clamped axes" {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2022,7 +2022,7 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     // push out of bounds so clamp runs without post-clamp collision shoving it back out.
     const ai_ent = demo.test_squares[0];
     try isolateDemoBodiesAwayFrom(&demo, ai_ent, &threads);
-    const visual = demo.data.primitiveVisualConst(ai_ent).?;
+    const box = demo.data.collisionBoundsConst(ai_ent).?;
     const body = demo.data.movementBodyPtr(ai_ent).?;
     body.position_x.* = -10;
     body.position_y.* = -10;
@@ -2042,11 +2042,12 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     });
 
     const after = demo.data.movementBodyConst(ai_ent).?;
-    // Clamped via math.clamp (pos >=0, <= bound-size), and vels zeroed for the clamped axes (AI policy).
-    try std.testing.expect(after.position.x >= 0);
-    try std.testing.expect(after.position.y >= 0);
-    try std.testing.expect(after.position.x <= demo.bounds_width - visual.size.x);
-    try std.testing.expect(after.position.y <= demo.bounds_height - visual.size.y);
+    // The box (`position + offset`, `size`) is clamped into the bounds, and velocity is
+    // zeroed on the clamped axes.
+    try std.testing.expect(after.position.x + box.offset.x >= 0);
+    try std.testing.expect(after.position.y + box.offset.y >= 0);
+    try std.testing.expect(after.position.x + box.offset.x + box.size.x <= demo.bounds_width);
+    try std.testing.expect(after.position.y + box.offset.y + box.size.y <= demo.bounds_height);
     // vels zeroed on the violated axes (was pushed out)
     try std.testing.expectEqual(@as(f32, 0), after.velocity.x);
     try std.testing.expectEqual(@as(f32, 0), after.velocity.y);
