@@ -40,11 +40,9 @@ than working from a compaction summary.
    Layout; `engine-design.md` § Changes and docs). Touch only the files the
    brief lists; a needed file outside the list stops the work and is
    reported, never edited first.
-4. Add the tests and scaling benches the rules require, placed per
-   `tests-benchmarks.md` § Test and production code. Tests are fast logic
-   tests; a stability, convergence, work-bound, or perf proof goes in its
-   bench group (`tests-benchmarks.md` § Tests). Edit no docs: put the
-   doc changes as notes in the report (`CLAUDE.md` § Agent Pipeline).
+4. Add the tests and scaling benches the rules require
+   (`tests-benchmarks.md`). Edit no docs: put the doc changes as notes in
+   the report.
 5. Validate per `build-validation.md`. While iterating, run `zig build check`
    and, when test bodies changed, `zig build test-compile` with no
    `-Dtest-filter`. A filter compiles only the tests it matches, and a filter
@@ -52,20 +50,17 @@ than working from a compaction summary.
    type-check. They are not a pass. Run the brief's module filter, and run
    each new test under its own `-Dtest-filter` when the test name does not
    contain that module text. A name like `statics committed at the seam` is
-   missed by `-Dtest-filter=collision`. The full suite, ReleaseFast, and
-   ThreadSanitizer run only when the brief says this is the branch-commit
-   check. Write that output to a file and judge it by the exit code; a
+   missed by `-Dtest-filter=collision`. Write that output to a file and
+   judge it by the exit code; a
    "failed command:" line echoing warn output is not a failure; on a real
    failure keep the failing test's name and message.
-6. When the brief says the change cannot move a hot path, skip `bench_ab` and
-   record that skip (`tests-benchmarks.md` § Benchmarks). Otherwise, after
-   validation, run the landing's one before/after with `tools/bench_ab.py`
-   on the groups the brief names. Sizes are `--grid`, not repeated
-   `--items`. `--case thread-adaptive-tuned-range` is the verdict. The
-   suite also runs the serial baseline; those lines are not judged. Read
-   only the summary lines, and give each slower tuned case its verdict. A
-   new scaling bench or a bench-gated allowance also runs tree-only
-   (`--base none --grid --all-cases`) for its pass shape.
+6. Benchmark per `tests-benchmarks.md` § Benchmarks: when the brief says the
+   change cannot move a hot path, skip `bench_ab` and record the skip;
+   otherwise run the landing's one before/after with `tools/bench_ab.py` on
+   the groups the brief names (sizes as `--grid`), read only the summary
+   lines, and give each slower case its verdict. A new scaling bench or a
+   bench-gated allowance also runs tree-only (`--base none --grid
+   --all-cases`) for its pass shape.
    Do not profile. A timing dispute is settled by the main session with
    callgrind on a ReleaseSafe bench, not by this agent. A crash, hang, or
    leak goes to zig-debug-specialist through the main session. Never tune
@@ -73,10 +68,9 @@ than working from a compaction summary.
 
 ## Checks (before the report)
 
-- A hot loop in the plan that reads through an index permutation or drains
-  lane results into per-item scalar calls, with no exemption named from
-  `memory-performance.md` § Data-oriented design, is not implemented: that
-  layout goes back to design.
+- A hot loop in the plan whose layout fails `memory-performance.md`
+  § Data-oriented design with no exemption named is not implemented: it
+  goes back to design.
 - No replan off an unmeasured guess.
 - Every piece the change adds or removes that the rules govern (a stage, a
   store, a tuner, a counter, a bench case) is listed with the evidence it

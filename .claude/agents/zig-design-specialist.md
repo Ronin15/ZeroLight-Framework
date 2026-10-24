@@ -60,13 +60,11 @@ citing where it is settled, and a step with nothing new is omitted.
    factor, marked measured or derived (same section). Near one, the sharing
    form earns its cost another way.
 3. **The data.** For every persistent and transient set: what each hot loop
-   reads and writes, in read order, as dense SoA grouped by its storage unit
-   (the chunk for terrain, nav, spatial data), with lifetime and release
-   (`memory-performance.md` § Data-oriented design). The layout is settled
+   reads and writes, its read order, its layout and grouping unit, lifetime,
+   and release, designed to `memory-performance.md` § Data-oriented design
    before any kernel. A changed order or layout lists every consumer and how
-   it reads; another store's columns a stage needs are gathered once into
-   packed scratch. A design that relies on a bench-gated allowance
-   (`threading.md` scattered writes) names its fallback layout.
+   it reads. A design that relies on a bench-gated allowance (`threading.md`)
+   names its fallback layout.
 4. **The loops.** From that layout, a hot-loop table: one row per per-step,
    per-frame, per-request, and per-change loop the change adds or changes,
    plus inherited loops whose cost, placement, or access order it changes
@@ -78,27 +76,20 @@ citing where it is settled, and a step with nothing new is omitted.
    parity tests; the serial/inline path's cost against today's code; the old
    loop it replaces and the counter that would show a new scan; the bench
    group (`--grid`, `--case thread-adaptive-tuned-range`). The SIMD shape
-   follows from step 3: columns in read order, packed once, one lane path
-   with a masked tail (a column already in that order is read in place); an
-   irreducible loop stays scalar and says why. Name the common call's length.
+   follows from step 3's layout; name the common call's length.
 5. **The passes.** The ordered processor list (reads, writes, output buffers,
-   `PipelineResource` tags, `stage_order` position). Per threaded pass on
-   today's `ThreadSystem` (`threading.md` § Building a stage): the item unit
-   and why its count tracks the work; dispatches per step and work per
-   dispatch at a small and a typical size against the gate; output capacity
-   reserved on main before dispatch (§ Writes, capacity, and determinism);
-   what stays on main and the deterministic merge; and each pass's tuner,
-   planned from how often it records in play (same section), added and
-   removed tuners marked.
+   `PipelineResource` tags, `stage_order` position; `simulation.md`). Per
+   threaded pass on today's `ThreadSystem`, what `threading.md` § Building a
+   stage and § Writes, capacity, and determinism ask a design to state: item
+   unit, dispatches per step, work per dispatch at a small and a typical size
+   against the gate, its tuner, output capacity, and the main-thread merge.
 6. **Budgets and capacities** (`budgets-capacities.md`): class, sizing,
    growth point, degradation path, and proofs at destruction-scale workloads.
-7. **Proof** (`tests-benchmarks.md`): fast logic tests named by behavior (a
-   name without the module filter gets its own `-Dtest-filter` text); each
-   claimed growth order's scaling bench group and `--grid` sizes, the tuned
-   case as the verdict; stability, convergence, work-bound, and perf proofs
-   as bench pass-shape asserts; a replaced structure measured first (its
-   bench lands on today's code). Name each change path's cost-driver stage
-   (its `runtime_perf_log` entry).
+7. **Proof** (`tests-benchmarks.md`): the tests (a name without the module
+   filter gets its own `-Dtest-filter` text), each claimed growth order's
+   scaling bench group and `--grid` sizes, a replaced structure's baseline
+   bench on today's code, and each change path's cost-driver stage (its
+   `runtime_perf_log` entry).
 8. **Pre-implementation check** (`engine-design.md` § Cost model, last
    bullet) against the live code at the design's HEAD.
 9. **Std usage** (`zig-style.md`): the `std` API each container, heap,
@@ -110,23 +101,12 @@ citing where it is settled, and a step with nothing new is omitted.
 
 ## Checks (last)
 
-Run these over the finished plan; a failure goes back to the step it came
-from and is fixed there, never patched in the plan's margins.
-
-- Steps 3-4: no hot loop reads through an index permutation, a pointer chase,
-  or a per-row lookup into another store, keeps dense float columns that can
-  take lanes scalar in a population loop, or drains lane results into
-  per-item scalar calls, outside the exemptions that section names (a
-  movement-column gather is not one). Inherited hot-path code is in the
-  table; "same as the old loop" is not a pass. A SIMD shape slower in Debug
-  stays (`build-validation.md`).
-- Step 5: every production dispatch runs under a tuner, no plan sets a
-  batch or worker count, and a change to `ThreadSystem` or the tuner is an
-  owner question.
-- Step 7: no perf or work-bound proof sits in a test.
-- A rule that blocks the design the cost model says is right: name the rule
-  file and propose the edit (`engine-design.md`); never bend the design or
-  the rule silently.
+Check the finished plan against the rules each step cites
+(`engine-design.md` § Cost model, `memory-performance.md`, `threading.md`,
+`tests-benchmarks.md`); a failure goes back to the step it came from and is
+fixed there. A change to `ThreadSystem` or the tuner is an owner question. A
+rule that blocks the design the cost model says is right gets a proposed
+edit (`engine-design.md`); never bend the design or the rule silently.
 
 Every invariant stated, no restated code, no essays; the design and its steps
 never go into the slice file. Follow-ups are checklist items in this slice or
