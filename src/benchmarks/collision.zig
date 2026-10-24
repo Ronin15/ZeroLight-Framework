@@ -116,7 +116,9 @@
 //! the movement bodies first, as the population seam reserves it. Pass shape: time per stored
 //! pair flat in pairs (the refresh and the stored-pair emission are linear in them). Asserts:
 //! the analytic contact count; every measured step refreshes every stored pair, on workers in
-//! a fixed threaded case; one step with no allow crossing refreshes nothing; and the cold step,
+//! a fixed threaded case, its static sort covers only the dynamic-by-static contacts, and its
+//! emission the stored pairs plus those contacts; one step with no allow crossing refreshes
+//! nothing; and the cold step,
 //! whose wide dynamic outgrows its static query slot's reserved hit rows while the broadphase
 //! stays inside the pair bound, is flagged and counted once. Its dormant variant (item code
 //! `1_000_000 + pairs`) makes every eighth trigger dormant (trigger B of each cell 4m + 3), so a
@@ -128,34 +130,50 @@
 //! case's thread system; one sample is the seam's trigger sync time
 //! (`SimulationPipeline.Perf.seam_trigger_sync_ns`:
 //! `CollisionSystem.syncCommittedTriggers`). The pipeline's init builds the cold store;
-//! `reserveFrame` tops up the bound. They assert fixture invariants only, not their pass
-//! shapes: the cold store's pair count, that each sync changes exactly the moved statics,
-//! that the patch queried only the changes (not a rebuild over the row pool), the stored
-//! pair count after every patch, and that after the first, untimed seam and after the last
-//! measured seam (each growing the stored-trigger contact bound as needed) a second
-//! collision step at the world's strips counts no pair-bound overflow (the first may count
-//! a one-off slot growth). They run `serial-direct` and the fixed worker-count cases only,
-//! no adaptive case. Each prints `per_change=`, and with
-//! `--details` the main share in `serial-direct` only (no worker exists, so the whole
-//! sync is main) and, under each row, the query items and the stored pairs.
+//! `reserveFrame` tops up the bound. The fixed threaded cases pin the five patch stages' tuners
+//! (the patch query, insert place and sort at the case's element range, the leaf at one
+//! aligned page range, the node at one node per range); the tuned case warms until every patch tuner that ran has settled.
+//! Asserts: the cold store's pair count; that each sync changes exactly the changed statics;
+//! that the patch queried only the changes (not a rebuild over the row pool); the stored pair
+//! count after every patch; in a pinned case every patch stage over more than one range on
+//! workers (the node pass, one round per tree height, by its widest round); that each patch
+//! writes at most two pages per edit (a drop piece or an insert, each in one page) and as
+//! many nodes per tree height (the taller of the tree before and after); on every measured
+//! patch no store page or level growth, and no patch scratch growth or growth or replay in
+//! the patch query's range slot set, except in the tuned case at a retune: the slot set at a
+//! patch whose query shape changed from the patch before, the scratch at one whose query or
+//! insert place shape changed; and after the first, untimed seam and after the last
+//! measured seam (each growing the stored-trigger contact bound as needed) two collision steps
+//! at the world's strips count no pair-bound overflow. Each prints `per_change=`, and with
+//! `--details` the main share (the sample less the patch stages' worker time) and, under each
+//! row, in the tuned case `settled=` (each unsettled patch tuner named), each patch stage's
+//! shape over the measured patches (`StageShapes.label`) and mean batch time, in the tuned
+//! case each patch tuner's probe windows and demotions over them (`measured_retunes=`), then
+//! the query items, the stored pairs, the store's patch scratch growths, and the patch slot
+//! set's prepare growths and replays.
 //! - `collision-static-trigger-change`: the `collision-static-triggers` fixture's stored pairs
 //!   in the corner of the largest count's grid, plus one solid alternating between cell 0's
-//!   and cell 1's triggers (drops two pairs, adds two; queries the solid's one change).
-//!   Pass shape: patch time and main per change flat in stored pairs.
+//!   and cell 1's triggers (drops two pairs, adds two; queries the solid's one change). Its
+//!   mode-only variant (item code `1_000_000 + pairs`) toggles the cell-0 solid between solid
+//!   and trigger in place: two stored pairs either way, one change queried, and the patch
+//!   walks once for the old and new pairs. Pass shape: patch time and main per change flat in
+//!   stored pairs, up to the tree height H.
 //! - `collision-static-trigger-dense-change`: the `collision-static-dense-change` world and
 //!   moves, with every other static (a checkerboard, the last row and column solid) a
 //!   trigger reaching half a tile into its neighbours' cells, so each overlaps its right and
 //!   lower solids and its diagonal triggers; the home pair count is checked against those
 //!   overlaps, the away count against a cold rebuild at the first away revision. Pass shape:
-//!   main per changed static flat in the change count. Last, untimed: a collision system one
-//!   revision behind the seam, stepped at the case's controls, patches one dense change; its
-//!   query covers exactly the changes, each store patch stage runs, the fixed threaded cases
-//!   dispatch them all, and the patch leaves the rebuild's stage records.
+//!   main per changed static flat in the change count. Asserts: each patch queries exactly
+//!   the changes. Last, untimed: a collision system one revision behind the seam, stepped at
+//!   the case's controls, patches one dense change; its query covers exactly the changes,
+//!   each store patch stage runs, the fixed threaded cases dispatch them all, and the patch
+//!   leaves the rebuild's stage records.
 //! - `collision-static-trigger-wide`: one trigger one chunk row tall and the world wide over
 //!   the item count of solids, in eight rows on the two-tile pitch, the world as wide as the
 //!   largest count's columns and the solids on a column stride of the largest count over the
 //!   item count; the middle solid alternates with its free diagonal tile each step (queries
-//!   its one change). Pass shape: flat in the solids under the trigger.
+//!   its one change). Pass shape: patch cost follows the store's tree height (logarithmic in
+//!   the stored pairs), flat in the solids otherwise.
 //!
 //! Every collision-step group prints `candidate_pairs=` and `contacts=`, the shape groups `per_body=`
 //! (mean time per body), the static groups `per_dynamic=` (`collision-static-triggers`
@@ -165,10 +183,13 @@
 //! state in brackets (each stage tunes on its own; the broadphase's is the row's tuning
 //! cell), then `entries=` (sweep entries), `visits_per_body=` (candidates the sweep tested,
 //! counted with the perf log only), and `main=` with `main_per_item=` per body: the time
-//! outside the stages' worker dispatches. The `--details` line under each row gives the
-//! measured steps' static query, Debug rect compare, static sort, and stored-trigger refresh
-//! shapes, and in `collision-static-index-change` the collider sync's splice shape and its
-//! `row_grows=` and `payload_grows=` counts. `collision-static-rebuild` and
+//! outside the stages' worker dispatches. The `--details` lines under each row give the
+//! measured steps' shapes (`StageShapes.label`: the busiest batch, then threaded over
+//! non-empty batches) of the fill, sort, broadphase, narrowphase, emission count, and
+//! emission (`steps:`), and of the static query, Debug rect compare, static sort, and
+//! stored-trigger refresh, in the tuned case each step tuner's probe windows and demotions
+//! over the measured steps (`measured_retunes=`), and in `collision-static-index-change` the
+//! collider sync's splice shape and its `row_grows=` and `payload_grows=` counts. `collision-static-rebuild` and
 //! `collision-static-rebuild-sparse` print `per_static=`, and with `--details` the rewrite
 //! stage and the main share per static (main is elapsed less every stage's worker time), and
 //! under each row every stage's shape and mean batch time; `collision-static-dense-change`
@@ -182,6 +203,7 @@ const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const offMainNs = @import("../app/thread_system.zig").offMainNs;
+const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const CollisionStats = @import("../game/systems/collision.zig").CollisionStats;
@@ -208,6 +230,8 @@ const tile_size = @import("../assets/world_tileset_meta.zig").required_tile_size
 const fixtures = @import("fixtures.zig");
 const suite = @import("suite.zig");
 const static_colliders_test_support = @import("../game/systems/static_colliders_test_support.zig");
+const pinThreadedProfile = @import("../game/simulation_pipeline_test_support.zig").pinThreadedProfile;
+const TriggerStore = @import("../game/systems/collision_triggers.zig").TriggerStore;
 
 pub const group = suite.BenchmarkGroup{
     .name = "collision",
@@ -320,8 +344,9 @@ pub const static_triggers_group = suite.BenchmarkGroup{
 
 pub const static_trigger_change_group = suite.BenchmarkGroup{
     .name = "collision-static-trigger-change",
-    .item_label = "stored trigger pairs",
-    .item_counts = &trigger_pair_counts,
+    .item_label = TriggerChangeCode.label,
+    .describe_item = TriggerChangeCode.describe,
+    .item_counts = &trigger_change_item_counts,
     .runCase = runStaticTriggerChangeCase,
     .write_workload = writeTriggerPatchWorkload,
     .cases = &trigger_patch_cases,
@@ -345,8 +370,8 @@ pub const static_trigger_wide_group = suite.BenchmarkGroup{
     .cases = &trigger_patch_cases,
 };
 
-// Fixed worker-count cases only: the warmup does not settle the patch stages' tuners.
-const trigger_patch_cases = suite.casesNamed(&.{ "serial-direct", "thread-fixed-1", "thread-fixed-2", "thread-fixed-auto" });
+// Fixed cases pin the patch stages; the tuned case settles them.
+const trigger_patch_cases = suite.casesNamed(&.{ "serial-direct", "thread-fixed-1", "thread-fixed-2", "thread-fixed-auto", "thread-adaptive-tuned-range" });
 
 const FixtureMode = enum {
     dense,
@@ -763,12 +788,18 @@ const TriggerFixture = struct {
     dormant_pairs: usize = 0,
     dormant_wide: usize = 0,
 
-    // The kinematic trigger's pair, the toggled trigger's pair while it is excluded, and the
-    // dormant triggers' pairs are filtered; every slot-0 dynamic is on its cell's trigger A,
-    // and the wide dynamic on both triggers of its cells less the dormant ones.
+    // The emitted stored pairs (the kinematic trigger's pair, the toggled trigger's pair while
+    // it is excluded, and the dormant triggers' pairs are filtered) and the dynamic-by-static
+    // contacts; no two dynamics overlap.
     fn contacts(self: *const TriggerFixture) usize {
         const pairs = self.toggle.stored_pairs - 1 - @intFromBool(self.toggle.excluded) - self.dormant_pairs;
-        return pairs + trigger_dynamic_count / 2 + 2 * trigger_wide_cells * trigger_wide_cells - self.dormant_wide;
+        return pairs + self.dynamicStaticContacts();
+    }
+
+    // Every slot-0 dynamic is on its cell's trigger A, and the wide dynamic on both triggers
+    // of its cells less the dormant ones.
+    fn dynamicStaticContacts(self: *const TriggerFixture) usize {
+        return trigger_dynamic_count / 2 + 2 * trigger_wide_cells * trigger_wide_cells - self.dormant_wide;
     }
 };
 
@@ -851,6 +882,7 @@ fn runStaticTriggersCase(allocator: std.mem.Allocator, io: std.Io, options: suit
         .toggle = &fixture.toggle,
         .reserved_cold_growth = true,
         .swept_bodies = trigger_dynamic_count + 1,
+        .static_contacts = fixture.dynamicStaticContacts(),
     });
     if (stats.iterations > 0 and stats.output_count != fixture.contacts()) return error.CollisionContactCountMismatch;
     // The header names the config; throughput and `per_pair=` stay per stored pair.
@@ -876,40 +908,213 @@ const trigger_wide_rows: usize = default_chunk_size_tiles / 2;
 const trigger_wide_max_columns: usize = trigger_wide_counts[trigger_wide_counts.len - 1] / trigger_wide_rows;
 const trigger_wide_tiles_x: usize = 2 * trigger_wide_max_columns;
 
-// One timed trigger sync: its time and the items its patch query ran over.
+// The trigger patch's stages, each under its own tuner: the collision system's patch query,
+// then the store's insert place, insert sort, leaf, and node passes.
+const trigger_patch_stage_count = 5;
+const trigger_patch_stage_names = [trigger_patch_stage_count][]const u8{ "query", "insert_place", "insert_sort", "leaf", "node" };
+const trigger_patch_query = 0;
+const trigger_patch_insert_place = 1;
+const trigger_patch_leaf = 3;
+const trigger_patch_node = 4;
+
+fn triggerPatchTuners(system: *const CollisionSystem) [trigger_patch_stage_count]*const AdaptiveWorkTuner {
+    const tuners = &system.trigger_store.tuners;
+    return .{ &system.trigger_query_tuner, tuners.getPtrConst(.insert_place), tuners.getPtrConst(.insert_sort), tuners.getPtrConst(.leaf), tuners.getPtrConst(.node) };
+}
+
+// Each patch tuner whose stage ran is settled.
+fn patchTunersSettled(system: *const CollisionSystem) bool {
+    for (triggerPatchTuners(system)) |tuner| {
+        if (!settledOrUnused(tuner)) return false;
+    }
+    return true;
+}
+
+// A tuner whose stage never selected a shape (no item count learned), or a settled one. Its
+// window's sample count is no such test: it returns to zero at every window's end.
+fn settledOrUnused(tuner: *const AdaptiveWorkTuner) bool {
+    return tuner.learned_item_count == 0 or suite.tunerSettled(tuner);
+}
+
+// A fixed threaded case pins the patch tuners at its controls, so the seam's sync, which
+// runs production's tuned controls, runs the fixed shape: the query and inserts at the
+// case's element range, the leaf at one aligned page range and the node at one node per
+// range, as one chunk is for the chunk stages. Serial and tuned cases keep their tuners.
+fn pinTriggerPatchStages(system: *CollisionSystem, case: suite.BenchmarkCase, threads: *const ThreadSystem) void {
+    const workers = threads.workerThreadCount();
+    if (workers == 0) return;
+    const element_range = case.stageItemsPerRange(collision_range_alignment_items) orelse return;
+    const page_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1) orelse return;
+    const tuners = &system.trigger_store.tuners;
+    for ([_]*AdaptiveWorkTuner{ &system.trigger_query_tuner, tuners.getPtr(.insert_place), tuners.getPtr(.insert_sort) }) |tuner| {
+        pinThreadedProfile(tuner, .{ .worker_threads = workers, .items_per_range = element_range });
+    }
+    for ([_]*AdaptiveWorkTuner{ tuners.getPtr(.leaf), tuners.getPtr(.node) }) |tuner| {
+        pinThreadedProfile(tuner, .{ .worker_threads = workers, .items_per_range = page_range });
+    }
+}
+
+// The tallest level tree's height: a page root is height 0, and each node level adds one.
+fn triggerTreeHeight(store: *const TriggerStore) usize {
+    var height: usize = 0;
+    for (store.levels.items) |level| height = @max(height, level.height);
+    return height;
+}
+
+// The store's page, level, and patch scratch growth counts.
+const StoreGrowth = struct { pages: u64, levels: u64, scratch: u64 };
+
+// One timed trigger sync: its time and the items its patch query ran over, the page edits
+// its query emitted (drop pieces and inserts, each in one page), each patch stage's batch
+// and their worker time, the patch query slot set's growth counts, the store's growth
+// counts, and the tallest tree after it.
 const TriggerPatch = struct {
     ns: u64,
     query_items: usize,
+    edits: usize,
+    batches: [trigger_patch_stage_count]BatchStats,
+    off_main_ns: u64,
+    slot_growth: SlotGrowth,
+    store_growth: StoreGrowth,
+    height: usize,
+
+    fn stageShape(self: TriggerPatch, stage: usize) SlotShape {
+        return .{ .range_count = self.batches[stage].range_count, .items_per_range = self.batches[stage].items_per_range };
+    }
 };
 
-// The timed syncs of one case. Main time is known only on a thread system with no
-// workers, where the whole sync runs on main.
+// A patch's work bound: a run's outputs are at most its touched pages plus one per page
+// capacity of its inserts (an underfull run absorbs one neighbour, two outputs at most), so
+// the leaf writes at most two pages per edit, and each node height as many nodes.
+fn checkPatchWorkBound(patch: TriggerPatch, height_before: usize) !void {
+    const page_bound = 2 * patch.edits;
+    if (patch.batches[trigger_patch_leaf].item_count > page_bound) return error.TriggerPatchLeafPastBound;
+    if (patch.batches[trigger_patch_node].item_count > page_bound * @max(height_before, patch.height)) return error.TriggerPatchNodePastBound;
+}
+
+// A warm patch's dispatch proof: in a pinned fixed threaded case every patch stage over
+// more than one range ran on workers. The node pass runs one round per tree height under
+// one sample, so its widest round spans at least its items over the heights it covered
+// (the taller of the tree before and after).
+fn checkPatchDispatched(case: suite.BenchmarkCase, threads: *const ThreadSystem, patch: TriggerPatch, height_before: usize) !void {
+    const element_range = case.stageItemsPerRange(collision_range_alignment_items);
+    const page_range = case.stageItemsPerRangeForPartition(suite.chunk_partition_items, 1);
+    try suite.checkStagesDispatched(case, threads, element_range, patch.batches[0..trigger_patch_leaf]);
+    try suite.checkStageDispatched(case, threads, page_range, patch.batches[trigger_patch_leaf]);
+    const node = patch.batches[trigger_patch_node];
+    const rounds = @max(height_before, patch.height, 1);
+    try suite.checkRoundsDispatched(case, threads, page_range, node, (node.item_count + rounds - 1) / rounds);
+}
+
+// Each tuner's probe windows and demotions over a case's measured steps, not its lifetime.
+fn TunerWindow(comptime n: usize) type {
+    return struct {
+        const Self = @This();
+
+        probes: [n]u64 = @splat(0),
+        demotes: [n]u64 = @splat(0),
+
+        fn begin(tuners: [n]*const AdaptiveWorkTuner) Self {
+            var window = Self{};
+            if (comptime diagnostics_enabled) for (tuners, &window.probes, &window.demotes) |tuner, *probes, *demotes| {
+                probes.* = tuner.probe_window_count;
+                demotes.* = tuner.demotion_count;
+            };
+            return window;
+        }
+
+        // `measured_retunes=<stage>:<probe windows>/<demotions> ...` since `begin`.
+        fn print(self: *const Self, details: *suite.DetailLines, names: [n][]const u8, tuners: [n]*const AdaptiveWorkTuner) void {
+            if (comptime !diagnostics_enabled) return;
+            details.print("measured_retunes=", .{});
+            for (names, tuners, self.probes, self.demotes) |name, tuner, probes, demotes| {
+                details.print("{s}:{}/{} ", .{ name, tuner.probe_window_count - probes, tuner.demotion_count - demotes });
+            }
+            details.print("(probe windows/demotions)\n", .{});
+        }
+    };
+}
+
+// The timed syncs of one case, from its last warm patch: main is each sample less the
+// patch stages' worker time. The store's pages and levels never grow on a measured patch.
+// The patch query's slot set and the patch scratch grow only in the tuned case, at a
+// retune: the slot set where the query's shape changed from the patch before, the scratch
+// (sized from the query's and insert place's range counts) where either's did.
 const TriggerPatchSamples = struct {
     accumulator: suite.StatsAccumulator,
-    last_query_items: ?usize = null,
+    case: suite.BenchmarkCase,
+    last: TriggerPatch,
+    // The patch tuners that had not settled before measurement, by stage.
+    unsettled: [trigger_patch_stage_count]bool,
+    retunes: TunerWindow(trigger_patch_stage_count),
+    main_total: u128 = 0,
+    shapes: suite.StageShapes(trigger_patch_stage_count) = .{},
+    stage_ns: [trigger_patch_stage_count]u128 = @splat(0),
 
-    fn init(item_count: usize) TriggerPatchSamples {
-        return .{ .accumulator = suite.StatsAccumulator.init(item_count) };
+    fn init(item_count: usize, case: suite.BenchmarkCase, system: *const CollisionSystem, warm: TriggerPatch) TriggerPatchSamples {
+        const tuners = triggerPatchTuners(system);
+        var unsettled: [trigger_patch_stage_count]bool = undefined;
+        for (tuners, &unsettled) |tuner, *flag| flag.* = !settledOrUnused(tuner);
+        return .{
+            .accumulator = suite.StatsAccumulator.init(item_count),
+            .case = case,
+            .last = warm,
+            .unsettled = unsettled,
+            .retunes = .begin(tuners),
+        };
     }
 
-    fn record(self: *TriggerPatchSamples, patch: TriggerPatch) void {
+    fn record(self: *TriggerPatchSamples, patch: TriggerPatch) !void {
+        const last = self.last;
+        if (patch.store_growth.pages != last.store_growth.pages or patch.store_growth.levels != last.store_growth.levels) return error.TriggerWarmPatchGrew;
+        const scratch_grew = patch.store_growth.scratch != last.store_growth.scratch;
+        if (self.case.adaptive) {
+            try checkSlotSetGrowthAtRetune(last.slot_growth, patch.slot_growth, last.stageShape(trigger_patch_query), patch.stageShape(trigger_patch_query));
+            const plan_kept = std.meta.eql(last.stageShape(trigger_patch_query), patch.stageShape(trigger_patch_query)) and
+                std.meta.eql(last.stageShape(trigger_patch_insert_place), patch.stageShape(trigger_patch_insert_place));
+            if (scratch_grew and plan_kept) return error.TriggerWarmPatchGrew;
+        } else if (scratch_grew or !std.meta.eql(patch.slot_growth, last.slot_growth)) return error.TriggerWarmPatchGrew;
         self.accumulator.record(patch.ns, .{});
-        self.last_query_items = patch.query_items;
+        self.main_total += patch.ns -| patch.off_main_ns;
+        self.shapes.add(patch.batches);
+        for (&self.stage_ns, patch.batches) |*total, batch| total.* += batch.batch_duration_ns;
+        self.last = patch;
     }
 
     // `changes` is the statics changed per patch (`per_change=`), `stored_pairs` the last
     // patch's.
-    fn finish(self: *const TriggerPatchSamples, threads: *const ThreadSystem, changes: usize, stored_pairs: usize) suite.RunStats {
+    fn finish(self: *const TriggerPatchSamples, system: *const CollisionSystem, changes: usize, stored_pairs: usize) !suite.RunStats {
         var stats = self.accumulator.finish();
         stats.batch_carried = false;
         stats.sample_count = changes;
-        if (threads.workerThreadCount() == 0 and stats.iterations > 0) stats.main_ns = stats.mean_ns;
-        if (self.last_query_items) |items| stats.details.print("query_items={} stored_pairs={}\n", .{ items, stored_pairs });
+        if (stats.iterations > 0) stats.main_ns = @intCast(self.main_total / stats.iterations);
+        const tuners = triggerPatchTuners(system);
+        const settled = std.mem.indexOfScalar(bool, &self.unsettled, true) == null;
+        if (self.case.adaptive) {
+            stats.work_tuning = suite.workTuningSummary(suite.tunerReport(tuners[trigger_patch_leaf]), settled);
+            stats.details.print("settled={s}", .{if (settled) "yes" else "no"});
+            for (trigger_patch_stage_names, self.unsettled) |name, unsettled| if (unsettled) stats.details.print(" {s}:unsettled", .{name});
+            stats.details.print("\n", .{});
+        }
+        var buffer: [48]u8 = undefined;
+        for (trigger_patch_stage_names, self.stage_ns, 0..) |name, total_ns, index| {
+            const mean_ns: u64 = if (stats.iterations > 0) @intCast(total_ns / stats.iterations) else 0;
+            stats.details.print("{s}={s}({f}) ", .{ name, self.shapes.label(index, &buffer), suite.formatDuration(mean_ns) });
+        }
+        stats.details.print("\n", .{});
+        if (self.case.adaptive) self.retunes.print(&stats.details, trigger_patch_stage_names, tuners);
+        stats.details.print("query_items={} stored_pairs={} scratch_grows={} slot_prepare_grows={} slot_replays={}\n", .{
+            self.last.query_items,
+            stored_pairs,
+            self.last.store_growth.scratch,
+            self.last.slot_growth.prepare_grows,
+            self.last.slot_growth.replays,
+        });
         return stats;
     }
 };
 
-// What one moved static's patch must show: the colliders' rows, the stored pairs after
+// What one changed static's patch must show: the colliders' rows, the stored pairs after
 // every patch (the cold rebuild's too), and the patch's query items.
 const TriggerPatchShape = struct {
     static_count: usize,
@@ -917,24 +1122,93 @@ const TriggerPatchShape = struct {
     query_items: usize,
 };
 
-fn runStaticTriggerChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, pair_count: usize) !suite.RunStats {
+// `collision-static-trigger-change`'s configs: the stored pair count, and whether the cell-0
+// solid toggles its mode in place instead of moving. The moving configs' codes are their
+// pair counts.
+const TriggerChangeCode = suite.ItemCode(struct { mode_only: bool, stored_trigger_pairs: u32 }, &.{6});
+const trigger_change_item_counts = blk: {
+    var codes: [2 * trigger_pair_counts.len]usize = undefined;
+    for (trigger_pair_counts, 0..) |pairs, index| {
+        codes[index] = TriggerChangeCode.of(.{ .mode_only = false, .stored_trigger_pairs = pairs });
+        codes[trigger_pair_counts.len + index] = TriggerChangeCode.of(.{ .mode_only = true, .stored_trigger_pairs = pairs });
+    }
+    break :blk codes;
+};
+
+// A static whose collision mode toggles in place between solid and trigger, one
+// `set_collision_response` a step; it starts solid.
+const ModeToggle = struct {
+    /// The commit seam's share for the toggle's one command a step.
+    const structural_headroom = structuralEventHeadroom(0, 1);
+
+    entity: EntityId,
+    trigger: bool = false,
+
+    fn command(self: *const ModeToggle) StructuralCommand {
+        return .{ .set_collision_response = .{ .entity = self.entity, .response = .{ .mode = if (self.trigger) .solid else .trigger, .mobility = .static } } };
+    }
+
+    fn advance(self: *ModeToggle) void {
+        self.trigger = !self.trigger;
+    }
+};
+
+// The one static a trigger patch group changes each step: moved, or its mode toggled.
+const TriggerPatchChange = union(enum) {
+    move: fixtures.StaticMove,
+    mode: ModeToggle,
+
+    comptime {
+        std.debug.assert(fixtures.StaticMove.structural_headroom == ModeToggle.structural_headroom);
+    }
+    const structural_headroom = ModeToggle.structural_headroom;
+
+    fn command(self: *const TriggerPatchChange) StructuralCommand {
+        return switch (self.*) {
+            .move => |*move| move.command(),
+            .mode => |*toggle| toggle.command(),
+        };
+    }
+
+    fn advance(self: *TriggerPatchChange) void {
+        switch (self.*) {
+            .move => |*move| move.advance(),
+            .mode => |*toggle| toggle.advance(),
+        }
+    }
+
+    fn entity(self: *const TriggerPatchChange) EntityId {
+        return switch (self.*) {
+            .move => |move| move.entity,
+            .mode => |toggle| toggle.entity,
+        };
+    }
+};
+
+fn runStaticTriggerChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const config = try TriggerChangeCode.decode(item_count);
+    const pair_count: usize = config.stored_trigger_pairs;
     var fixture = try createTriggerFixture(allocator, pair_count, false);
     defer fixture.data.deinit();
-    // One solid alternating between cell 0's and cell 1's triggers: each move drops two
-    // stored pairs and adds two.
+    // One solid on cell 0's triggers. Moving, it alternates with cell 1's: each move drops
+    // two stored pairs and adds two. Toggling, it stays over cell 0's two triggers, two
+    // stored pairs either way, and the patch walks once for the old and new pairs.
     const home = pitchCellOrigin(0, 0);
     const away = pitchCellOrigin(1, 0);
     const offset = trigger_change_solid_offset;
     const solid = try fixtures.addBody(&fixture.data, .{ .x = home.x + offset, .y = home.y + offset }, .{ .x = static_size, .y = static_size }, .static);
-    var move = fixtures.StaticMove{ .entity = solid, .positions = .{ .{ .x = home.x + offset, .y = home.y + offset }, .{ .x = away.x + offset, .y = away.y + offset } } };
-    var stats = try measureTriggerPatches(allocator, io, options, case, &fixture.data, .{ trigger_change_cells, trigger_change_cells }, &move, .{
+    var change: TriggerPatchChange = if (config.mode_only)
+        .{ .mode = .{ .entity = solid } }
+    else
+        .{ .move = .{ .entity = solid, .positions = .{ .{ .x = home.x + offset, .y = home.y + offset }, .{ .x = away.x + offset, .y = away.y + offset } } } };
+    var stats = try measureTriggerPatches(allocator, io, options, case, &fixture.data, .{ trigger_change_cells, trigger_change_cells }, &change, .{
         .static_count = 2 * pair_count + 1,
         .stored_pairs = pair_count + 2,
-        // The moved solid's change.
+        // The changed solid's change.
         .query_items = 1,
     });
-    stats.item_count = pair_count;
+    stats.item_count = item_count;
     return stats;
 }
 
@@ -961,9 +1235,9 @@ fn runStaticTriggerWideCase(allocator: std.mem.Allocator, io: std.Io, options: s
         // trigger.
         if (column == columns / 2 and cell_y == trigger_wide_rows / 2) move = .{ .entity = entity, .positions = .{ home, .{ .x = home.x + tile_size, .y = home.y + tile_size } } };
     };
-    var moved = move orelse return error.TriggerWideMissingMove;
+    var change: TriggerPatchChange = .{ .move = move orelse return error.TriggerWideMissingMove };
     // The largest count's world width and one chunk row fit u32.
-    var stats = try measureTriggerPatches(allocator, io, options, case, &data, .{ @intCast(trigger_wide_tiles_x), default_chunk_size_tiles }, &moved, .{
+    var stats = try measureTriggerPatches(allocator, io, options, case, &data, .{ @intCast(trigger_wide_tiles_x), default_chunk_size_tiles }, &change, .{
         .static_count = static_count + 1,
         .stored_pairs = static_count,
         // The moved static's change.
@@ -975,42 +1249,50 @@ fn runStaticTriggerWideCase(allocator: std.mem.Allocator, io: std.Io, options: s
 
 // Builds the pipeline over a `cells` world, whose init builds the cold trigger store (a
 // rebuild over every row; `reserveFrame` tops up the stored-trigger contact bound), then
-// moves `move`'s static through the production commit seam each step; the sample is each
-// seam's trigger sync. After the first seam and after the last measured seam, one collision
-// step emits the stored pairs with no pair-bound overflow.
-fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *DataSystem, cells: [2]u32, move: *fixtures.StaticMove, shape: TriggerPatchShape) !suite.RunStats {
+// commits `change`'s static through the production commit seam each step; the sample is
+// each seam's trigger sync. A fixed threaded case pins the patch stages; the tuned case
+// warms until they settle. After the first seam and after the last measured seam, one
+// collision step emits the stored pairs with no pair-bound overflow.
+fn measureTriggerPatches(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, data: *DataSystem, cells: [2]u32, change: *TriggerPatchChange, shape: TriggerPatchShape) !suite.RunStats {
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
-    var seam = try StaticSeam.init(allocator, io, data, cells[0], cells[1], fixtures.StaticMove.structural_headroom, case, &threads);
+    var seam = try StaticSeam.init(allocator, io, data, cells[0], cells[1], TriggerPatchChange.structural_headroom, case, &threads);
     defer seam.deinit();
     if (static_colliders_test_support.liveRowCount(seam.colliders().*) != shape.static_count) return error.WrongStaticCount;
+    const system = &seam.pipeline().collision;
+    pinTriggerPatchStages(system, case, &threads);
     // Untimed: the first seam, with the cold store built at init.
     _ = try seam.commit(data, &.{}, &threads);
-    const system = &seam.pipeline().collision;
     if (system.trigger_store.pair_count != shape.stored_pairs) return error.TriggerPairCountMismatch;
     try seam.checkStoredPairsInBound(data, &threads, case);
 
-    // Fixed worker-count cases only, so nothing settles; two steps run both directions.
+    // At least two steps, so both directions ran.
     var warm = suite.Warmup.init(options, case, 2);
-    while (warm.next(true)) _ = try patchMovedStatic(&seam, data, move, &threads, shape);
-    var samples = TriggerPatchSamples.init(shape.stored_pairs);
-    for (0..options.iterations) |_| samples.record(try patchMovedStatic(&seam, data, move, &threads, shape));
+    var last_warm: ?TriggerPatch = null;
+    while (warm.next(patchTunersSettled(system))) last_warm = try patchChangedStatic(&seam, data, change, &threads, case, shape);
+    var samples = TriggerPatchSamples.init(shape.stored_pairs, case, system, last_warm.?);
+    for (0..options.iterations) |_| try samples.record(try patchChangedStatic(&seam, data, change, &threads, case, shape));
+    const stats = try samples.finish(system, 1, shape.stored_pairs);
     try seam.checkStoredPairsInBound(data, &threads, case);
-    return samples.finish(&threads, 1, shape.stored_pairs);
+    return stats;
 }
 
-// One move through the production commit seam, whose trigger sync is the sample: the sync
-// changes only the moved static, and the warm patch queries the shape's items and keeps its
-// pair count.
-fn patchMovedStatic(seam: *StaticSeam, data: *DataSystem, move: *fixtures.StaticMove, threads: *ThreadSystem, shape: TriggerPatchShape) !TriggerPatch {
-    const commit = try seam.commit(data, &.{move.command()}, threads);
+// One change through the production commit seam, whose trigger sync is the sample: the sync
+// changes only the changed static, and the warm patch queries the shape's items, keeps its
+// pair count, stays in its work bound, and runs each stage on workers where a pinned case
+// dispatches it.
+fn patchChangedStatic(seam: *StaticSeam, data: *DataSystem, change: *TriggerPatchChange, threads: *ThreadSystem, case: suite.BenchmarkCase, shape: TriggerPatchShape) !TriggerPatch {
+    const height_before = triggerTreeHeight(&seam.pipeline().collision.trigger_store);
+    const commit = try seam.commit(data, &.{change.command()}, threads);
     if (commit.structural.components_set != 1) return error.StaticMoveNotApplied;
     const changes = seam.colliders().changesThisStep();
-    if (changes.len != 1 or !changes[0].entity.eql(move.entity)) return error.StaticChangeNotSynced;
-    move.advance();
+    if (changes.len != 1 or !changes[0].entity.eql(change.entity())) return error.StaticChangeNotSynced;
+    change.advance();
     const patch = try seam.triggerPatch();
     if (patch.query_items != shape.query_items) return error.TriggerPatchMissedQuery;
     if (seam.pipeline().collision.trigger_store.pair_count != shape.stored_pairs) return error.TriggerPairCountMismatch;
+    try checkPatchWorkBound(patch, height_before);
+    try checkPatchDispatched(case, threads, patch, height_before);
     return patch;
 }
 
@@ -1513,22 +1795,25 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
 }
 
 // The dense-change world with checkered triggers: each step's dense commit through the
-// commit seam, then the timed trigger sync.
+// commit seam, then the timed trigger sync. A fixed threaded case pins the patch stages; the
+// tuned case warms until they settle.
 fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, change_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
     var fixture = try DenseChangeFixture.init(allocator, io, change_count, case, .checkered_triggers, &threads);
     defer fixture.deinit();
+    const system = &fixture.seam.pipeline().collision;
+    pinTriggerPatchStages(system, case, &threads);
     // Untimed: the first seam, with the cold store built at init over every row, every static
     // home, and the stored-trigger contact bound topped up by `reserveFrame`.
     _ = try fixture.seam.commit(&fixture.data, &.{}, &threads);
-    const system = &fixture.seam.pipeline().collision;
     const home_pairs = denseHomeTriggerPairs(.checkered_triggers);
     if (system.trigger_store.pair_count != home_pairs) return error.TriggerPairCountMismatch;
     try fixture.seam.checkStoredPairsInBound(&fixture.data, &threads, case);
     // Untimed, once: the region moved away (its seam patches the store), then a cold rebuild
     // at that revision on a separate system is the away count every away patch keeps.
+    const home_height = triggerTreeHeight(&system.trigger_store);
     _ = try fixture.changeAndSync(&threads);
     const away_pairs = blk: {
         var cold = CollisionSystem.init(allocator);
@@ -1539,15 +1824,16 @@ fn runStaticTriggerDenseChangeCase(allocator: std.mem.Allocator, io: std.Io, opt
     };
     // Stored pairs with the region home and away.
     const pairs = [2]usize{ home_pairs, away_pairs };
-    _ = try denseTriggerSync(&fixture, pairs);
+    _ = try denseTriggerSync(&fixture, &threads, case, pairs, home_height);
 
-    // Fixed worker-count cases only, so nothing settles; two steps run both directions.
+    // At least two steps, so both directions ran.
     var warm = suite.Warmup.init(options, case, 2);
-    while (warm.next(true)) _ = try denseTriggerPatch(&fixture, &threads, pairs);
-    var samples = TriggerPatchSamples.init(change_count);
-    for (0..options.iterations) |_| samples.record(try denseTriggerPatch(&fixture, &threads, pairs));
+    var last_warm: ?TriggerPatch = null;
+    while (warm.next(patchTunersSettled(system))) last_warm = try denseTriggerPatch(&fixture, &threads, case, pairs);
+    var samples = TriggerPatchSamples.init(change_count, case, system, last_warm.?);
+    for (0..options.iterations) |_| try samples.record(try denseTriggerPatch(&fixture, &threads, case, pairs));
+    const stats = try samples.finish(system, change_count, system.trigger_store.pair_count);
     try fixture.seam.checkStoredPairsInBound(&fixture.data, &threads, case);
-    const stats = samples.finish(&threads, change_count, system.trigger_store.pair_count);
     try checkFixedPatchStages(allocator, &fixture, &threads, case);
     return stats;
 }
@@ -1595,18 +1881,22 @@ fn fixedStepConfig(fixture: *const DenseChangeFixture, case: suite.BenchmarkCase
 
 // One dense commit through the production commit seam (`changeAndSync` checks every move
 // synced), whose trigger sync is the sample.
-fn denseTriggerPatch(fixture: *DenseChangeFixture, threads: *ThreadSystem, pairs: [2]usize) !TriggerPatch {
+fn denseTriggerPatch(fixture: *DenseChangeFixture, threads: *ThreadSystem, case: suite.BenchmarkCase, pairs: [2]usize) !TriggerPatch {
+    const height_before = triggerTreeHeight(&fixture.seam.pipeline().collision.trigger_store);
     _ = try fixture.changeAndSync(threads);
-    return denseTriggerSync(fixture, pairs);
+    return denseTriggerSync(fixture, threads, case, pairs, height_before);
 }
 
 // The seam's trigger sync after a dense collider sync: the warm patch queries exactly the
-// changed statics, and keeps the stored pair count of the region's side.
-fn denseTriggerSync(fixture: *DenseChangeFixture, pairs: [2]usize) !TriggerPatch {
+// changed statics, keeps the stored pair count of the region's side, stays in its work
+// bound, and runs each stage on workers where a pinned case dispatches it.
+fn denseTriggerSync(fixture: *DenseChangeFixture, threads: *const ThreadSystem, case: suite.BenchmarkCase, pairs: [2]usize, height_before: usize) !TriggerPatch {
     const patch = try fixture.seam.triggerPatch();
     if (patch.query_items != fixture.moves.len) return error.TriggerPatchMissedQuery;
     // `changeAndSync` advanced every move, so the first move's side is the region's.
     if (fixture.seam.pipeline().collision.trigger_store.pair_count != pairs[@intFromBool(fixture.moves[0].at_second)]) return error.TriggerPairCountMismatch;
+    try checkPatchWorkBound(patch, height_before);
+    try checkPatchDispatched(case, threads, patch, height_before);
     return patch;
 }
 
@@ -1668,12 +1958,29 @@ const StaticSeam = struct {
         return self.seam.commit(data, &self.world, commands, thread_system);
     }
 
-    // The last seam's trigger sync: its time and its patch query's items. A seam that rebuilt
-    // records no patch query, so callers check the items for the warm patch.
+    // The last seam's trigger sync (`TriggerPatch`). A seam that rebuilt records no patch
+    // query or patch stage, so callers check the items for the warm patch.
     fn triggerPatch(self: *const StaticSeam) !TriggerPatch {
         const pipe = &self.seam.pipeline;
-        if (pipe.collision.trigger_store.seen_revision != pipe.static_colliders.view().revision) return error.TriggerSyncMissedRevision;
-        return .{ .ns = pipe.perf.seam_trigger_sync_ns, .query_items = pipe.collision.perf.trigger_query_batch.item_count };
+        const collision = &pipe.collision;
+        const store = &collision.trigger_store;
+        if (store.seen_revision != pipe.static_colliders.view().revision) return error.TriggerSyncMissedRevision;
+        const stages = &store.perf.last_batches;
+        const batches = [trigger_patch_stage_count]BatchStats{ collision.perf.trigger_query_batch, stages.get(.insert_place), stages.get(.insert_sort), stages.get(.leaf), stages.get(.node) };
+        var off_main_ns: u64 = 0;
+        for (batches) |batch| off_main_ns += offMainNs(batch);
+        var edits: usize = 0;
+        for (collision.trigger_edit_sources.items) |source| edits += source.drops.len + source.inserts.len;
+        return .{
+            .ns = pipe.perf.seam_trigger_sync_ns,
+            .query_items = collision.perf.trigger_query_batch.item_count,
+            .edits = edits,
+            .batches = batches,
+            .off_main_ns = off_main_ns,
+            .slot_growth = .{ .prepare_grows = collision.trigger_patch_slots.prepare_grows, .replays = collision.trigger_patch_slots.replays },
+            .store_growth = .{ .pages = store.perf.page_grows, .levels = store.perf.level_grows, .scratch = store.perf.scratch_grows },
+            .height = triggerTreeHeight(store),
+        };
     }
 
     // Two untimed collision steps on the pipeline after its trigger seams, at the world's
@@ -1770,7 +2077,36 @@ const StepInputs = struct {
     // Every step sweeps this many bodies, one strip each when `one_strip_per_body`.
     swept_bodies: ?usize = null,
     one_strip_per_body: bool = false,
+    // The fixture's dynamic-by-static contacts, with no dynamic-dynamic contact: every step's
+    // static sort covers exactly them, and with `toggle` the emission the stored pairs and
+    // them.
+    static_contacts: ?usize = null,
 };
+
+// A collision step's dynamic-side stages, in `dynamicStageBatches` order.
+const dynamic_stage_names = [_][]const u8{ "fill", "sort", "broad", "narrow", "emit_count", "emit" };
+
+fn dynamicStageBatches(perf: CollisionStats.Perf) [dynamic_stage_names.len]BatchStats {
+    return .{ perf.fill_batch, perf.sort_batch, perf.broadphase_batch, perf.narrowphase_batch, perf.trigger_emit_count_batch, perf.trigger_emit_batch };
+}
+
+// A collision step's stage tuners, in `step_tuner_names` order.
+const step_tuner_names = [_][]const u8{ "fill", "sort", "broad", "narrow", "static_pairs", "static_rect", "static_place", "static_sort", "refresh", "emit" };
+
+fn stepTuners(system: *const CollisionSystem) [step_tuner_names.len]*const AdaptiveWorkTuner {
+    return .{
+        &system.fill_tuner,
+        &system.sort_tuner,
+        &system.broadphase_tuner,
+        &system.narrowphase_tuner,
+        &system.static_pair_tuner,
+        &system.static_rect_tuner,
+        &system.static_place_tuner,
+        &system.static_sort_tuner,
+        system.trigger_store.tuners.getPtrConst(.refresh),
+        &system.emit_tuner,
+    };
+}
 
 // Warms up, settles the stage tuners, and times one step per iteration on the case's
 // `thread_ptr`: the inputs' static move or tier flip, then the collision update over `data`.
@@ -1798,10 +2134,10 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const warm_stats = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
         slot_shapes = slotShapes(system, warm_stats);
     }
-    const fill_settled_before_measurement = case.adaptive and suite.tunerSettled(&system.fill_tuner);
-    const sort_settled_before_measurement = case.adaptive and suite.tunerSettled(&system.sort_tuner);
-    const broadphase_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.broadphase_tuner) else false;
-    const narrowphase_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.narrowphase_tuner) else false;
+    const fill_settled_before_measurement = case.adaptive and settledOrUnused(&system.fill_tuner);
+    const sort_settled_before_measurement = case.adaptive and settledOrUnused(&system.sort_tuner);
+    const broadphase_settled_before_measurement = case.adaptive and settledOrUnused(&system.broadphase_tuner);
+    const narrowphase_settled_before_measurement = case.adaptive and settledOrUnused(&system.narrowphase_tuner);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_collision_stats = CollisionStats{};
@@ -1814,6 +2150,8 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     // splice.
     var static_stages = suite.StageShapes(4){};
     var splice_stages = suite.StageShapes(1){};
+    var dynamic_stages = suite.StageShapes(dynamic_stage_names.len){};
+    const retunes = TunerWindow(step_tuner_names.len).begin(stepTuners(system));
     const stage_range = case.stageItemsPerRange(collision_range_alignment_items);
     for (0..options.iterations) |_| {
         const step_slot_growth = slotGrowth(system);
@@ -1828,6 +2166,10 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const perf = last_collision_stats.perf;
         // Every flip moves the allow epoch, so every measured step refreshes the stored pairs.
         if (inputs.toggle) |toggle| if (perf.trigger_refresh_batch.item_count != toggle.stored_pairs) return error.CollisionTriggerRefreshMissed;
+        if (inputs.static_contacts) |static_contacts| {
+            if (perf.static_sort_batch.item_count != static_contacts) return error.CollisionStaticSortPastStaticContacts;
+            if (inputs.toggle) |toggle| if (perf.trigger_emit_batch.item_count != toggle.stored_pairs + static_contacts) return error.CollisionTriggerEmitMissedItems;
+        }
         try suite.checkStagesDispatched(case, thread_ptr, stage_range, &.{ perf.fill_batch, perf.sort_batch, perf.broadphase_batch, perf.narrowphase_batch, perf.static_pairs_batch, perf.static_rect_batch, perf.static_place_batch, perf.static_sort_batch, perf.trigger_refresh_batch, perf.trigger_emit_count_batch, perf.trigger_emit_batch });
         try checkSweepWork(case, thread_ptr, stage_range, last_collision_stats);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
@@ -1840,6 +2182,7 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
             offMainNs(perf.trigger_emit_count_batch) + offMainNs(perf.trigger_emit_batch);
         main_total += elapsed_ns -| off_main_ns -| seam_off_main_ns;
         static_stages.add(.{ perf.static_pairs_batch, perf.static_rect_batch, perf.static_sort_batch, perf.trigger_refresh_batch });
+        dynamic_stages.add(dynamicStageBatches(perf));
         if (inputs.mover) |static_mover| splice_stages.add(.{static_mover.seam.collidersConst().perf.last_batches.get(.rewrite)});
     }
 
@@ -1859,7 +2202,9 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         .visits = last_collision_stats.perf.broadphase_visits,
         .simd_groups = last_collision_stats.broadphase_simd_groups,
     };
+    writeDynamicStageDetails(&stats.details, &dynamic_stages);
     writeStaticStageDetails(&stats.details, &static_stages);
+    if (case.adaptive) retunes.print(&stats.details, step_tuner_names, stepTuners(system));
     try checkSlotRecords(&stats.details, system, last_collision_stats.entry_count);
     writeSlotGrowth(&stats.details, slotGrowth(system));
     if (inputs.mover) |static_mover| {
@@ -1970,10 +2315,12 @@ fn slotShapes(system: *const CollisionSystem, stats: CollisionStats) [slot_set_c
 // with no warm step before it has no shape to keep.
 fn checkSlotGrowthAtRetune(before: [slot_set_count]SlotGrowth, after: [slot_set_count]SlotGrowth, last_shapes: ?[slot_set_count]SlotShape, shapes: [slot_set_count]SlotShape) !void {
     const last = last_shapes orelse return;
-    for (before, after, last, shapes) |old, new, last_shape, shape| {
-        if (std.meta.eql(old, new)) continue;
-        if (std.meta.eql(last_shape, shape)) return error.CollisionSlotsGrewAtAKeptShape;
-    }
+    for (before, after, last, shapes) |old, new, last_shape, shape| try checkSlotSetGrowthAtRetune(old, new, last_shape, shape);
+}
+
+// One set's form of `checkSlotGrowthAtRetune`.
+fn checkSlotSetGrowthAtRetune(before: SlotGrowth, after: SlotGrowth, last_shape: SlotShape, shape: SlotShape) !void {
+    if (!std.meta.eql(before, after) and std.meta.eql(last_shape, shape)) return error.CollisionSlotsGrewAtAKeptShape;
 }
 
 fn writeSlotGrowth(details: *suite.DetailLines, growth: [slot_set_count]SlotGrowth) void {
@@ -1989,6 +2336,16 @@ fn harmonic(n: usize) f64 {
     return sum;
 }
 
+// The measured steps' dynamic-side stage shapes (`StageShapes.label`): each stage's busiest
+// batch and its threaded over non-empty batches, so a stage that flips inline or threaded
+// during measurement shows it.
+fn writeDynamicStageDetails(details: *suite.DetailLines, stages: *const suite.StageShapes(dynamic_stage_names.len)) void {
+    var buffers: [dynamic_stage_names.len][48]u8 = undefined;
+    details.print("steps:", .{});
+    for (dynamic_stage_names, &buffers, 0..) |name, *buffer, index| details.print(" {s}={s}", .{ name, stages.label(index, buffer) });
+    details.print("\n", .{});
+}
+
 // The measured steps' static query, Debug rect compare, static sort, and stored-trigger
 // refresh shapes (`StageShapes.label`).
 fn writeStaticStageDetails(details: *suite.DetailLines, stages: *const suite.StageShapes(4)) void {
@@ -2001,16 +2358,16 @@ fn writeStaticStageDetails(details: *suite.DetailLines, stages: *const suite.Sta
     });
 }
 
-/// Every stage tuner of `system` settled.
+/// Every stage tuner of `system` whose stage ran settled.
 fn stageTunersSettled(system: *const CollisionSystem) bool {
-    return suite.tunerSettled(&system.fill_tuner) and suite.tunerSettled(&system.sort_tuner) and
-        suite.tunerSettled(&system.broadphase_tuner) and suite.tunerSettled(&system.narrowphase_tuner) and
-        (system.static_pair_tuner.sample_count == 0 or suite.tunerSettled(&system.static_pair_tuner)) and
-        (system.static_rect_tuner.sample_count == 0 or suite.tunerSettled(&system.static_rect_tuner)) and
-        (system.static_place_tuner.sample_count == 0 or suite.tunerSettled(&system.static_place_tuner)) and
-        (system.static_sort_tuner.sample_count == 0 or suite.tunerSettled(&system.static_sort_tuner)) and
-        (system.trigger_store.tuners.getPtrConst(.refresh).sample_count == 0 or suite.tunerSettled(system.trigger_store.tuners.getPtrConst(.refresh))) and
-        (system.emit_tuner.sample_count == 0 or suite.tunerSettled(&system.emit_tuner));
+    return settledOrUnused(&system.fill_tuner) and settledOrUnused(&system.sort_tuner) and
+        settledOrUnused(&system.broadphase_tuner) and settledOrUnused(&system.narrowphase_tuner) and
+        settledOrUnused(&system.static_pair_tuner) and
+        settledOrUnused(&system.static_rect_tuner) and
+        settledOrUnused(&system.static_place_tuner) and
+        settledOrUnused(&system.static_sort_tuner) and
+        settledOrUnused(system.trigger_store.tuners.getPtrConst(.refresh)) and
+        settledOrUnused(&system.emit_tuner);
 }
 
 // Fails when a step's sweep batches miss their work: the broadphase covers every sweep

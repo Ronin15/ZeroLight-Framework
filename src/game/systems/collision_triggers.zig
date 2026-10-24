@@ -82,8 +82,10 @@ pub fn emits(emit: u8, exclude: bool) bool {
 const insert_range_alignment_items: usize = 16;
 // A refresh range owns the pages that start in it; P keeps it at least one page wide.
 const refresh_range_alignment_items: usize = page_capacity;
-// Leaf and node items are whole output pages and nodes, each at least a 2.5 KB slot.
-const rewrite_range_alignment_items: usize = 1;
+// Leaf items are whole output pages, each at least a 2.5 KB slot, and each also writes its
+// `LevelOutput` record, under a cache line: two items make a range span a line of those
+// records.
+const rewrite_range_alignment_items: usize = 2;
 
 // ---- Page and node layouts -----------------------------------------------------------
 
