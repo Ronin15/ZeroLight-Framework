@@ -1722,7 +1722,7 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     if (load == .spike and case.adaptive and !warm.settled()) return error.DenseSpikeTunersNotSettled;
     // The settled tuners' spike shape sizes the per-range scratch (the touch windows), so one
     // untimed spike each way grows it to the timed shape. A spike's record is skipped; a
-    // repeated jump count reuses its predicted shape.
+    // repeated jump count reuses its judged shape (final within two iterations).
     if (load == .spike) for (0..2) |_| {
         try fixture.changeOneAndSync(&threads);
         _ = try fixture.changeAndSync(&threads);

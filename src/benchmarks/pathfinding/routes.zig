@@ -186,10 +186,10 @@ pub const long_path_group = suite.BenchmarkGroup{
 // the world. A 64-pad placement is a one-off jump amid ordinary nav work, so the case runs the
 // spike shape: the nav stage tuners settle on in-band toggles (one cell at level 1's centre,
 // which holds no pad, blocked and reacted to, then reopened and reacted to on a revert stage
-// tuner set), then each warmup batch grows the per-range scratch (a repeated jump count
-// reuses its predicted shape), and each measured sample runs one in-band toggle untimed before the timed fold
-// (headline tuner: the patch). Every case runs at least two toggles and then one per batch,
-// so the world is the same in every case.
+// tuner set), then at least two warmup batches grow the per-range scratch (a repeated jump
+// count's shape is judged by its first two records), and each measured sample runs one
+// in-band toggle untimed before the timed fold (headline tuner: the patch). Every case runs
+// at least two toggles and then one per batch, so the world is the same in every case.
 //   - Axis 0 (uniform): 1,024, 8,192, or 32,768 background pads; every batch is uniform
 //     random pads too, so endpoints per touched chunk rise with pads held.
 //   - Axis 1 (probe): background pads keep off a probe region of chunk pairs (a level-0 chunk
@@ -1684,8 +1684,11 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     defer threads.deinit();
     const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
+    // A repeated jump count's shape is judged by its first two records, so at least two
+    // untimed batches run whatever the warmup count, the same in every case.
+    const warmup_batches = @max(options.warmup_iterations, 2);
     // Every sample adds a batch, so the size check holds at the most pads the run holds.
-    const samples = options.warmup_iterations + options.iterations;
+    const samples = warmup_batches + options.iterations;
     const peak_pads = config.padsAfter(samples);
     // A timed batch's pads and their endpoint chunks, or the in-band toggle's one cell; the
     // probe preload is in the build.
@@ -1711,8 +1714,8 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     while (warm.nextSettled(linkFoldTunerSettle(&fixture.system, &revert_tuners))) try toggleLinkFoldInBandCell(io, &fixture, &revert_tuners, thread_ptr);
     var batch: usize = 0;
     // Each untimed batch after an in-band toggle grows the per-range scratch to the settled
-    // tuners' jump shape; a repeated jump count reuses its predicted shape.
-    for (0..options.warmup_iterations) |_| {
+    // tuners' jump shape and lets the jump's records judge it.
+    for (0..warmup_batches) |_| {
         try toggleLinkFoldInBandCell(io, &fixture, &revert_tuners, thread_ptr);
         _ = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
         batch += 1;

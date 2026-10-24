@@ -178,11 +178,21 @@ pub const AdaptiveWorkPhase = enum {
     settled,
 };
 
-// An unsustained jump's predicted profile and the counts it was predicted between.
+// An unsustained jump's held profile and the counts it was predicted between. The held
+// profile starts at the model's prediction; the jump's own skipped records judge it
+// (`judgeJump`), final after at most two.
 const JumpProfile = struct {
     learned_item_count: usize,
     item_count: usize,
     profile: AdaptiveWorkProfile,
+    // The jump's threaded shape (`batchShape`); no workers when no two batches fit or no
+    // worker may run.
+    threaded_profile: AdaptiveWorkProfile,
+    // The jump's measured inline and threaded batch durations; 0 is not measured.
+    inline_ns: u64 = 0,
+    threaded_ns: u64 = 0,
+    // Set once the records decide `profile`; it then holds while the counts repeat.
+    judged: bool = false,
 };
 
 // The default floors the learned participant overhead in the prediction;
@@ -265,9 +275,10 @@ pub const AdaptiveWorkTuner = struct {
     // Set by a sustained item-count shift on a threaded stage: the next threaded settled
     // window re-decides inline or threaded at the new count.
     retune_pending: bool = false,
-    // The shape the last unsustained jump up predicted, reused while its learned and
-    // requested counts repeat, so the same jump dispatches alike under model jitter. A
-    // sustained shift changes the learned count and so re-predicts it.
+    // The shape the last unsustained jump up holds, reused while its learned and requested
+    // counts repeat, so the same jump dispatches alike under model jitter: the model's
+    // prediction until the jump's own records judge it. A sustained shift changes the
+    // learned count and so re-predicts it.
     jump_profile: ?JumpProfile = null,
     // Diagnostics only: cumulative over the tuner's life (no reset path clears
     // them) and never read by policy.
@@ -326,9 +337,10 @@ pub const AdaptiveWorkTuner = struct {
 
         if (fresh_full_pool) return self.poolProfile(normalized_request, @floatFromInt(full_pool_batches_per_participant));
         // An unsustained jump up on a tuner without a threaded profile runs at the shape the
-        // per-item model predicts for the new count, not inline; its record is skipped, so
-        // it teaches nothing. A tuner with a threaded profile re-normalizes that profile.
-        if (self.skip_next_record and self.shifted_up and !self.has_threaded_profile and self.model_work_ns_per_item > 0) {
+        // per-item model predicts for the new count, not inline; its record trains nothing,
+        // it judges the held shape (`judgeJump`). A tuner with a threaded profile
+        // re-normalizes that profile.
+        if (self.jumpSelected()) {
             const repeated = if (self.jump_profile) |jump|
                 jump.learned_item_count == self.learned_item_count and jump.item_count == normalized_request.item_count
             else
@@ -337,6 +349,7 @@ pub const AdaptiveWorkTuner = struct {
                 .learned_item_count = self.learned_item_count,
                 .item_count = normalized_request.item_count,
                 .profile = self.predictProfile(normalized_request),
+                .threaded_profile = self.batchShape(normalized_request),
             };
             return self.normalizedProfile(self.jump_profile.?.profile, normalized_request);
         }
@@ -353,6 +366,7 @@ pub const AdaptiveWorkTuner = struct {
         if (comptime diagnostics_enabled) self.record_count += 1;
         if (stats.batch_duration_ns == 0) return;
         if (self.skip_next_record) {
+            if (self.jumpSelected()) self.judgeJump(stats);
             self.skip_next_record = false;
             return;
         }
@@ -386,6 +400,55 @@ pub const AdaptiveWorkTuner = struct {
             .settled => self.finishSettledWindow(sample_ns),
         }
         self.resetSamples();
+    }
+
+    // Whether the selection took the unsustained-jump branch. None of its inputs change
+    // between a select and its record, so `record` reads the same answer.
+    fn jumpSelected(self: *const AdaptiveWorkTuner) bool {
+        return self.skip_next_record and self.shifted_up and !self.has_threaded_profile and self.model_work_ns_per_item > 0;
+    }
+
+    // A repeated jump's skipped record judges its held shape by the gate, the bound rule,
+    // and the commit margin; final after at most two records. An inline record under the
+    // gate holds inline; at or above it the repeat probes the threaded shape. A threaded
+    // record whose bound is under the gate holds inline, one whose duration reaches the
+    // gate holds threaded, and one under the gate whose bound is not runs inline once. With
+    // one record of each shape the threaded one holds only if the inline one reached the
+    // gate and it beats it by the commit margin. A second record of the shape already
+    // measured (a threaded probe that ran inline) holds the shape it measured, so no held
+    // shape is unmeasured.
+    fn judgeJump(self: *AdaptiveWorkTuner, stats: BatchStats) void {
+        const jump = &self.jump_profile.?; // the jump branch sets it at the select
+        const request = self.last_request.?; // the select sets it before the jump branch
+        std.debug.assert(jump.learned_item_count == self.learned_item_count and jump.item_count == request.item_count);
+        if (jump.judged) return;
+        const gate = self.config.threaded_batch_ns;
+        const duration_ns = stats.batch_duration_ns;
+        const threaded = stats.active_worker_threads > 0;
+        const measured = if (threaded) &jump.threaded_ns else &jump.inline_ns;
+        const repeat = measured.* != 0;
+        measured.* = duration_ns;
+        const inline_profile = inlineProfile(request);
+        if (repeat) {
+            // A repeated threaded record ran the held shape, so it keeps it.
+            if (!threaded) jump.profile = inline_profile;
+            jump.judged = true;
+            return;
+        }
+        if (jump.inline_ns != 0 and jump.threaded_ns != 0) {
+            const threaded_wins = jump.inline_ns >= gate and isMeaningfullyFaster(jump.threaded_ns, jump.inline_ns, self.config.threaded_commit_threshold_percent);
+            jump.profile = if (threaded_wins) jump.threaded_profile else inline_profile;
+            jump.judged = true;
+        } else if (!threaded) {
+            const probe = duration_ns >= gate and jump.threaded_profile.worker_threads > 0;
+            jump.profile = if (probe) jump.threaded_profile else inline_profile;
+            jump.judged = !probe;
+        } else {
+            // Participants >= 2, so a bound under the gate implies a duration under it.
+            const bound_under_gate = @as(u128, duration_ns) * (stats.active_worker_threads + 1) < gate;
+            if (duration_ns < gate) jump.profile = inline_profile;
+            jump.judged = bound_under_gate or duration_ns >= gate;
+        }
     }
 
     // Learning establishes the baseline for the sampled profile. Cheap inline work
@@ -3727,6 +3790,116 @@ test "adaptive work tuner a threaded-settled tuner re-normalizes its profile for
     // The settled threaded profile, re-normalized to the jump's count; no prediction.
     try std.testing.expectEqual(tuner.normalizedProfile(tuner.current_profile, jump_request), jump);
     try std.testing.expect(tuner.jump_profile == null);
+}
+
+// A jump from the inline-settled 16 items to 32: 32 us of modelled work, predicted inline.
+const inline_jump_request = tunerTestRequest(32, 64, 1, 64);
+
+// One in-band batch at the settled count and cost, as play runs between two jumps (three
+// jumps in a row would be a sustained shift).
+fn recordInBandTestBatch(tuner: *AdaptiveWorkTuner) void {
+    tuner.record(tunerTestBatchWithProfile(16, tuner.selectProfile(tunerTestRequest(16, 4, 16, 64)), 16_000));
+}
+
+// Selects `request` as a jump, records it at `duration_ns`, and checks the record trained
+// nothing: no sample and no per-item model change. Returns the jump's selection.
+fn recordTestJump(tuner: *AdaptiveWorkTuner, request: AdaptiveWorkRequest, duration_ns: u64) !AdaptiveWorkProfile {
+    return recordTestJumpRanAs(tuner, request, null, duration_ns);
+}
+
+// `recordTestJump`, with the batch run at `ran` instead of the selection when set (a
+// selection that normalized to another shape at dispatch).
+fn recordTestJumpRanAs(tuner: *AdaptiveWorkTuner, request: AdaptiveWorkRequest, ran: ?AdaptiveWorkProfile, duration_ns: u64) !AdaptiveWorkProfile {
+    recordInBandTestBatch(tuner);
+    const selected = tuner.selectProfile(request);
+    try std.testing.expect(tuner.skip_next_record and tuner.shifted_up);
+    const samples = tuner.sample_count;
+    const model = tuner.model_work_ns_per_item;
+    tuner.record(tunerTestBatchWithProfile(request.item_count, ran orelse selected, duration_ns));
+    try std.testing.expectEqual(samples, tuner.sample_count);
+    try std.testing.expectEqual(model, tuner.model_work_ns_per_item);
+    return selected;
+}
+
+// The selection a repeat of `request` jump gets, after an in-band batch.
+fn selectTestJump(tuner: *AdaptiveWorkTuner, request: AdaptiveWorkRequest) AdaptiveWorkProfile {
+    recordInBandTestBatch(tuner);
+    return tuner.selectProfile(request);
+}
+
+test "adaptive work tuner a jump whose inline record reaches the gate repeats threaded" {
+    var tuner = try inlineSettledTestTuner();
+    try std.testing.expectEqual(@as(usize, 0), (try recordTestJump(&tuner, inline_jump_request, 100_000)).worker_threads);
+    try std.testing.expect((try recordTestJump(&tuner, inline_jump_request, 40_000)).worker_threads > 0);
+    // The threaded probe beat the inline record, so the shape holds threaded.
+    try std.testing.expect(selectTestJump(&tuner, inline_jump_request).worker_threads > 0);
+}
+
+test "adaptive work tuner a probed jump that does not beat its inline record holds inline" {
+    var tuner = try inlineSettledTestTuner();
+    _ = try recordTestJump(&tuner, inline_jump_request, 100_000);
+    try std.testing.expect((try recordTestJump(&tuner, inline_jump_request, 98_000)).worker_threads > 0);
+    try std.testing.expectEqual(@as(usize, 0), selectTestJump(&tuner, inline_jump_request).worker_threads);
+}
+
+test "adaptive work tuner a threaded jump whose bound is under the gate repeats inline" {
+    var tuner = try inlineSettledTestTuner();
+    // 500 ns on 64 participants: a 32 us bound on its inline cost.
+    const first = try recordTestJump(&tuner, count_jump_request, 500);
+    try std.testing.expectEqual(@as(usize, 63), first.worker_threads);
+    // The bound rule's verdict is final: an inline repeat at 100 us, which the 0.5 us threaded
+    // record beats by the margin, does not reopen it.
+    try std.testing.expectEqual(@as(usize, 0), (try recordTestJump(&tuner, count_jump_request, 100_000)).worker_threads);
+    try std.testing.expectEqual(@as(usize, 0), selectTestJump(&tuner, count_jump_request).worker_threads);
+}
+
+test "adaptive work tuner a threaded jump under the gate runs inline once and its inline record decides" {
+    // 30 us threaded: a 1.92 ms bound, so only an inline record can show inline is cheaper.
+    var cheap = try inlineSettledTestTuner();
+    const threaded = try recordTestJump(&cheap, count_jump_request, 30_000);
+    try std.testing.expect(threaded.worker_threads > 0);
+    try std.testing.expectEqual(@as(usize, 0), (try recordTestJump(&cheap, count_jump_request, 25_000)).worker_threads);
+    try std.testing.expectEqual(@as(usize, 0), selectTestJump(&cheap, count_jump_request).worker_threads);
+
+    var costly = try inlineSettledTestTuner();
+    _ = try recordTestJump(&costly, count_jump_request, 30_000);
+    try std.testing.expectEqual(@as(usize, 0), (try recordTestJump(&costly, count_jump_request, 80_000)).worker_threads);
+    try std.testing.expectEqual(threaded, selectTestJump(&costly, count_jump_request));
+}
+
+test "adaptive work tuner a jump whose inline record is under the gate holds inline against a faster threaded record" {
+    var tuner = try inlineSettledTestTuner();
+    // 30 us threaded (a 1.92 ms bound) runs inline once; inline 50 us is under the 60 us gate,
+    // so the threaded record's margin over it does not hold threaded.
+    try std.testing.expect((try recordTestJump(&tuner, count_jump_request, 30_000)).worker_threads > 0);
+    try std.testing.expectEqual(@as(usize, 0), (try recordTestJump(&tuner, count_jump_request, 50_000)).worker_threads);
+    try std.testing.expectEqual(@as(usize, 0), selectTestJump(&tuner, count_jump_request).worker_threads);
+}
+
+test "adaptive work tuner a jump's probe that runs inline again holds the measured inline shape" {
+    var tuner = try inlineSettledTestTuner();
+    try std.testing.expectEqual(@as(usize, 0), (try recordTestJump(&tuner, inline_jump_request, 100_000)).worker_threads);
+    // The threaded probe is selected but runs inline: a second inline record judges the entry
+    // inline, the only shape measured.
+    const probe = try recordTestJumpRanAs(&tuner, inline_jump_request, inlineProfile(inline_jump_request), 100_000);
+    try std.testing.expect(probe.worker_threads > 0);
+    try std.testing.expect(tuner.jump_profile.?.judged);
+    try std.testing.expectEqual(@as(usize, 0), tuner.jump_profile.?.profile.worker_threads);
+    // Judged after two records: a later fast threaded record changes nothing.
+    _ = try recordTestJumpRanAs(&tuner, inline_jump_request, probe, 10_000);
+    try std.testing.expectEqual(@as(usize, 0), selectTestJump(&tuner, inline_jump_request).worker_threads);
+}
+
+test "adaptive work tuner a non-repeated jump keeps the predicted shape" {
+    var tuner = try inlineSettledTestTuner();
+    _ = try recordTestJump(&tuner, inline_jump_request, 100_000);
+    _ = try recordTestJump(&tuner, inline_jump_request, 40_000);
+    const judged = selectTestJump(&tuner, inline_jump_request);
+    try std.testing.expect(judged.worker_threads > 0);
+    tuner.record(tunerTestBatchWithProfile(32, judged, 40_000));
+    const other_request = tunerTestRequest(40, 64, 1, 64);
+    const predicted = tuner.normalizedProfile(tuner.predictProfile(tuner.normalizeRequest(other_request)), tuner.normalizeRequest(other_request));
+    try std.testing.expectEqual(predicted, selectTestJump(&tuner, other_request));
 }
 
 test "participant slots include main thread and worker threads" {

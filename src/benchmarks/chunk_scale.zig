@@ -81,10 +81,10 @@
 //!     ordinary nav work, so the case runs the spike shape: the stage tuners settle on
 //!     in-band cycles (the nav-dig workload's dig and reaction, then its refill and reaction
 //!     on the revert set, which return terrain and nav to their start state), then warmup
-//!     level adds each grow the per-range scratch (a repeated jump count reuses its predicted
-//!     shape), and each measured step runs one in-band cycle untimed before the timed level add. Every case
-//!     runs at least two in-band cycles and then one per level add, so the world is the same
-//!     in every case. Depth grows by one per level add, warmup included, so A/B runs use the
+//!     level adds each grow the per-range scratch (the fresh build set's full-pool first
+//!     selections), and each measured step runs one in-band cycle untimed before the timed
+//!     level add. Every case runs at least two in-band cycles and then one per level add, so
+//!     the world is the same in every case. Depth grows by one per level add, warmup included, so A/B runs use the
 //!     same `--warmup` and `--iterations`. Each reaction builds one level, its remask batch
 //!     over that level's chunks and the step's dirty chunks.
 
@@ -2039,9 +2039,9 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     // changes the measured world. At least two cycles in every case.
     var warm = suite.Warmup.custom(case, 2, suite.adaptiveSettleIterationLimit(options));
     while (warm.nextSettled(nav.stageTunerSettle())) try levelAddInBandCycle(allocator, io, &nav, &driver, &refill);
-    // Each untimed level add after an in-band cycle grows the per-range scratch to the jump
-    // shape of the fresh build set every timed level build starts from; a repeated jump count
-    // reuses its predicted shape.
+    // Each untimed level add after an in-band cycle grows the per-range scratch to the shape
+    // of the fresh build set every timed level build starts from: each build stage selects
+    // once per one-level build, so it takes its full-pool first selection, never a jump shape.
     for (0..options.warmup_iterations) |_| {
         try levelAddInBandCycle(allocator, io, &nav, &driver, &refill);
         _ = try levelAddIteration(io, &nav, &frame, replace);

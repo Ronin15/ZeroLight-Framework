@@ -86,6 +86,33 @@ cost there.
       only its profile, so the first pick is predicted from items x cost.
       Pass: measure the cause first; `nav-level-add` 1024008 ReleaseFast tuned
       within spread of the persistent-set base; serial == threaded.
+- [ ] A judged jump shape covers what it proves. Failure: the jump judgment
+      (`AdaptiveWorkTuner.judgeJump`, `thread_system.zig:419`) is keyed by the
+      exact (learned, requested) count pair (`:344-346`), so a jump to 65
+      items after a judged one to 64 discards the judgment and re-predicts
+      from the in-band model, the cause the judgment fixes; link-fold and the
+      collision spike repeat identical counts. That play rarely repeats exact
+      counts is a hypothesis. Pass: measure jump-count repetition on a
+      play-shaped workload first; if it does not repeat, a judged entry covers
+      its count band and a bench variant varies the jump count within the band.
+- [ ] A judged jump re-tunes on evidence (`.claude/rules/threading.md`
+      § Building a stage). Failure: once judged (`thread_system.zig:423`), a
+      jump ignores its later records while the counts repeat, so one judged
+      inline at 25 us stays inline at 200 us. Pass: a sustained shift in the
+      judged shape's own records reopens the judgment, without re-probing on
+      noise at the gate; tuner tests for both.
+- [ ] Movement's tuned case settles on stable worker counts. Measured:
+      `movement` 4096 Debug tuned settles anywhere from 6 to 21 workers across
+      runs (spread 12-38%), on `95b9fcd` and after; cause unmeasured.
+      Pass: the tuned case's settled shape and time within spread across runs.
+- [ ] An inline tuned case matches serial. Measured: `pathfinding-link-fold`
+      1016032768 ReleaseFast, every stage inline in the tuned case, tuned
+      13-16% slower than `serial-direct`, on `95b9fcd` and after; cause
+      unmeasured. Also: once a link-fold run has done five or more batches,
+      every case, serial included, has one timed fold at about 440-500 us
+      (Debug), which a 3-iteration mean carries. Pass: tuned within spread of
+      serial where it runs inline; the slow fold attributed and fixed or
+      reported.
 - [ ] A whole-group Debug smoke run of every bench group under the batch tuner
       (dispatch and settle checks pass or fail), since only 13 groups ran
       after `83ef090`.
