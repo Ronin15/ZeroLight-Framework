@@ -59,7 +59,8 @@
 //! revert reaction's and both edits' stage shapes. Every measured reaction, forward and
 //! revert, runs each nav stage of more than one range on workers in a fixed threaded case
 //! (`suite.checkNavReactionDispatched`). The tuned case settles every tuner both nav stage
-//! sets and both edits hold before measuring (`step_tuners:`), except level-add's (below).
+//! sets and both edits hold before measuring (`step_tuners:`); level-add's settle on its
+//! in-band cycles (below).
 //!   - `chunk-scale-nav-dig`: the dig workload through the pipeline's production dig
 //!     (`reserveDigWorldEdit` and `commitDigWorldEdit`, the nav record included), then one
 //!     post-commit reaction to the 64 cells' marks. The reset refills the cells as one batched
@@ -76,12 +77,16 @@
 //!     mouth (linear in L), each on a 1024² level.
 //!   - `chunk-scale-nav-level-add`: one level added with a solid floor band, then nav updated.
 //!     The replace case (`LevelAddCode`) first adds a walkable level and updates nav untimed,
-//!     then times a blocking band on it and the update. Depth grows by one per iteration,
-//!     warmup included, so A/B runs use the same `--warmup` and `--iterations`, and the
-//!     warmup is fixed: its tuned case reports whether its tuners settled within it and is
-//!     rerun with a larger `--warmup` when they did not. Each
-//!     reaction builds one level, its remask batch over that level's chunks and the step's
-//!     dirty chunks.
+//!     then times a blocking band on it and the update. A level add is a one-off jump amid
+//!     ordinary nav work, so the case runs the spike shape: the stage tuners settle on
+//!     in-band cycles (the nav-dig workload's dig and reaction, then its refill and reaction
+//!     on the revert set, which return terrain and nav to their start state), then warmup
+//!     level adds each grow the per-range scratch (a repeated jump count reuses its predicted
+//!     shape), and each measured step runs one in-band cycle untimed before the timed level add. Every case
+//!     runs at least two in-band cycles and then one per level add, so the world is the same
+//!     in every case. Depth grows by one per level add, warmup included, so A/B runs use the
+//!     same `--warmup` and `--iterations`. Each reaction builds one level, its remask batch
+//!     over that level's chunks and the step's dirty chunks.
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -1997,14 +2002,16 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     defer threads.deinit();
     const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
-    // Level builds only: no marks batch. The world first: its content, and the levels the run
-    // adds, size the nav. Added levels are solid, except the replace case's newest level, which
-    // is walkable until its band blocks it, so at most one added level is open at a time.
+    // The in-band cycles' dig square is the largest marks batch; level builds add none. The
+    // world first: its content, and the levels the run adds, size the nav. Added levels are
+    // solid, except the replace case's newest level, which is walkable until its band blocks
+    // it, so at most one added level is open at a time.
     var world_fixture = try buildFixture(allocator, io, side, levels);
     var world_owned = true;
     defer if (world_owned) world_fixture.deinit();
     const added_levels = options.warmup_iterations + options.iterations;
-    var size_config = navSizeConfig(side, levels + added_levels, participant_count, nav_size.NavBatch.none);
+    const dig_batch: nav_size.NavBatch = .{ .mark_chunks = dig_cell_count, .links = 0, .keys = nav_size.squareBatchKeys(dig_window_chunks) };
+    var size_config = navSizeConfig(side, levels + added_levels, participant_count, dig_batch);
     var content = pathfinding_test_support.navStorageContentOf(&world_fixture.world);
     if (replace) {
         const chunks = world_fixture.world.chunkCountPerLevel();
@@ -2022,10 +2029,22 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     nav.setTuners(case);
     var frame = SimulationFrame.init(allocator);
     defer frame.deinit();
-    // A fixed warmup, no settle loop: every step adds a level, so settling would deepen the
-    // world past its sized depth and vary it between runs. The tuned case reports whether its
-    // tuners settled within the warmup; one that did not is rerun with a larger `--warmup`.
-    for (0..options.warmup_iterations) |_| _ = try levelAddIteration(io, &nav, &frame, replace);
+    var driver = try DigDriver.init(allocator, levels - 1);
+    defer driver.deinit();
+    var refill = try buildDigRefillEdit(allocator, &nav.base);
+    defer refill.deinit(allocator);
+
+    // The stage tuners train in play on ordinary nav reactions, so the tuned case settles them
+    // on in-band cycles; the level count stays fixed meanwhile, so the settle length never
+    // changes the measured world. At least two cycles in every case.
+    var warm = suite.Warmup.custom(case, 2, suite.adaptiveSettleIterationLimit(options));
+    while (warm.nextSettled(nav.stageTunerSettle())) try levelAddInBandCycle(allocator, io, &nav, &driver, &refill);
+    // Each untimed level add after an in-band cycle grows the per-range scratch to the settled
+    // tuners' jump shape; a repeated jump count reuses its predicted shape.
+    for (0..options.warmup_iterations) |_| {
+        try levelAddInBandCycle(allocator, io, &nav, &driver, &refill);
+        _ = try levelAddIteration(io, &nav, &frame, replace);
+    }
     const settle = nav.stageTunerSettle();
     const remask_tuner = nav.pipeline.pathfinding.tuners.nav.getPtrConst(.remask);
     const remask_tuner_start = suite.TunerStart.of(remask_tuner, case);
@@ -2034,6 +2053,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     var nav_main = suite.NavMainSummary{};
     var main_total: u128 = 0;
     for (0..options.iterations) |_| {
+        try levelAddInBandCycle(allocator, io, &nav, &driver, &refill);
         const elapsed_ns = try levelAddIteration(io, &nav, &frame, replace);
         accumulator.record(elapsed_ns, nav.last_stats.perf.remask_batch);
         try suite.checkNavReactionDispatched(case, thread_ptr, .{}, nav.last_stats);
@@ -2042,6 +2062,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         main_total += elapsed_ns -| nav.last_stats.perf.off_main_stage_ns;
     }
     try nav_size.checkNavBytes(nav_level_add_group.name, item_count, size_config, &nav.pipeline.pathfinding);
+    if (nav.base.world.levelCount() != levels + added_levels) return error.LevelAddDepthMismatch;
     var stats = accumulator.finish();
     stats.output_count = nav.base.world.levelCount();
     if (stats.iterations > 0) stats.main_ns = @intCast(main_total / stats.iterations);
@@ -2054,6 +2075,14 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
         stats.work_tuning = suite.workTuningSummary(remask_tuner, remask_tuner_start);
     }
     return stats;
+}
+
+// The level-add case's in-band nav work, untimed: the nav-dig workload's digs and reaction on
+// the forward stage tuners, then its refill and reaction on the revert set, which return
+// terrain and nav to their start state.
+fn levelAddInBandCycle(allocator: std.mem.Allocator, io: std.Io, nav: *NavFixture, driver: *DigDriver, refill: *BatchEdit) !void {
+    _ = try runNavIteration(io, nav, driver, .dig);
+    try resetNavWorkload(allocator, nav, driver, refill, .dig);
 }
 
 // One level-add iteration; returns its timed span. The main case adds a level with a

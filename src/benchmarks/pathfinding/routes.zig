@@ -47,6 +47,7 @@ const Reaction = @import("nav_fixtures.zig").Reaction;
 const ReactionStages = @import("nav_fixtures.zig").ReactionStages;
 const assembleReactFixture = @import("nav_fixtures.zig").assembleReactFixture;
 const toggleSizeConfig = @import("nav_fixtures.zig").toggleSizeConfig;
+const toggle_batch_keys = @import("nav_fixtures.zig").toggle_batch_keys;
 
 // Nav scaling groups over a world-backed nav. A listed config whose nav storage exceeds the
 // bench's nav-size limit fails with its figure (`nav_size.checkNavSize`), and every config checks
@@ -182,9 +183,13 @@ pub const long_path_group = suite.BenchmarkGroup{
 // to the deepest level placed as the teleport group's layout 2 (`LinkFoldCode`). One timed
 // sample runs the post-commit nav reaction that applies a batch of 64 more pads, added to the
 // world untimed. Links are append-only, so every sample (warmup included) leaves its batch in
-// the world, and the warmup is fixed: the tuned case reports whether its nav stage tuners
-// settled within it (headline tuner: the patch) and is rerun with a larger `--warmup` when
-// they did not.
+// the world. A 64-pad placement is a one-off jump amid ordinary nav work, so the case runs the
+// spike shape: the nav stage tuners settle on in-band toggles (one cell at level 1's centre,
+// which holds no pad, blocked and reacted to, then reopened and reacted to on a revert stage
+// tuner set), then each warmup batch grows the per-range scratch (a repeated jump count
+// reuses its predicted shape), and each measured sample runs one in-band toggle untimed before the timed fold
+// (headline tuner: the patch). Every case runs at least two toggles and then one per batch,
+// so the world is the same in every case.
 //   - Axis 0 (uniform): 1,024, 8,192, or 32,768 background pads; every batch is uniform
 //     random pads too, so endpoints per touched chunk rise with pads held.
 //   - Axis 1 (probe): background pads keep off a probe region of chunk pairs (a level-0 chunk
@@ -1682,8 +1687,9 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     // Every sample adds a batch, so the size check holds at the most pads the run holds.
     const samples = options.warmup_iterations + options.iterations;
     const peak_pads = config.padsAfter(samples);
-    // A timed batch's pads and their endpoint chunks; the probe preload is in the build.
-    var size_config = toggleSizeConfig(link_fold_side, link_fold_levels, peak_pads, participant_count, .{ .mark_chunks = 0, .links = link_fold_batch, .keys = 2 * link_fold_batch });
+    // A timed batch's pads and their endpoint chunks, or the in-band toggle's one cell; the
+    // probe preload is in the build.
+    var size_config = toggleSizeConfig(link_fold_side, link_fold_levels, peak_pads, participant_count, .{ .mark_chunks = 1, .links = link_fold_batch, .keys = @max(2 * link_fold_batch, toggle_batch_keys) });
     // Every pad is bidirectional.
     size_config.oneway_links = 0;
     try nav_size.checkNavSize(link_fold_group.name, item_count, case, size_config);
@@ -1695,20 +1701,29 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     defer fixture.deinit(allocator);
     try nav_size.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
     fixtures.setNavTuners(&fixture.system, case);
+    // The in-band toggle's reopen reacts on its own stage tuner set.
+    var revert_tuners: fixtures.NavTuners = fixture.system.tuners;
+    try fixture.changed.ensureTotalCapacity(allocator, 1);
+    // The stage tuners train in play on ordinary nav reactions, so the tuned case settles them
+    // on in-band toggles; the pads stay fixed meanwhile, so the settle length never changes the
+    // measured world. At least two toggles in every case.
+    var warm = suite.Warmup.custom(case, 2, suite.adaptiveSettleIterationLimit(options));
+    while (warm.nextSettled(linkFoldTunerSettle(&fixture.system, &revert_tuners))) try toggleLinkFoldInBandCell(io, &fixture, &revert_tuners, thread_ptr);
     var batch: usize = 0;
-    // A fixed warmup, no settle loop: every sample adds pads, so settling would grow the
-    // world past its sized pads and vary it between runs. The tuned case reports whether its
-    // tuners settled within the warmup; one that did not is rerun with a larger `--warmup`.
+    // Each untimed batch after an in-band toggle grows the per-range scratch to the settled
+    // tuners' jump shape; a repeated jump count reuses its predicted shape.
     for (0..options.warmup_iterations) |_| {
+        try toggleLinkFoldInBandCell(io, &fixture, &revert_tuners, thread_ptr);
         _ = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
         batch += 1;
     }
-    const settle = stepTunerSettle(&fixture.system);
+    const settle = linkFoldTunerSettle(&fixture.system, &revert_tuners);
     const patch_tuner = fixture.system.tuners.nav.getPtrConst(.patch);
     const patch_start = suite.TunerStart.of(patch_tuner, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var report = LinkFoldReport{};
     for (0..options.iterations) |_| {
+        try toggleLinkFoldInBandCell(io, &fixture, &revert_tuners, thread_ptr);
         const sample = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
         batch += 1;
         const patch = sample.reaction.stats.perf.patch_batch;
@@ -1729,6 +1744,25 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         stats.work_tuning = suite.workTuningSummary(patch_tuner, patch_start);
     }
     return stats;
+}
+
+// The link-fold cases' census: the forward stage tuner set (the system's) and the in-band
+// toggle's revert set.
+fn linkFoldTunerSettle(system: *const PathfindingSystem, revert_tuners: *const fixtures.NavTuners) suite.TunerSettle {
+    var census = stepTunerSettle(system);
+    fixtures.addNavTuners(&census, "revert.", revert_tuners);
+    return census;
+}
+
+// The link-fold cases' in-band nav work, untimed: the cell at level 1's centre (no pad joins
+// level 1) blocked and reacted to on the forward stage tuners, then reopened and reacted to
+// on `revert_tuners` (swapped in and out), which returns terrain and nav to their state before.
+fn toggleLinkFoldInBandCell(io: std.Io, fixture: *ReactFixture, revert_tuners: *fixtures.NavTuners, thread_system: *ThreadSystem) !void {
+    const cell = [_]CellCoord{.{ .x = link_fold_side / 2, .y = link_fold_side / 2 }};
+    _ = try fixture.changeLevelAndReact(io, 1, &cell, fixture.open.blocking, thread_system);
+    fixtures.swapNavTuners(&fixture.system, revert_tuners);
+    defer fixtures.swapNavTuners(&fixture.system, revert_tuners);
+    _ = try fixture.changeLevelAndReact(io, 1, &cell, fixture.open.walkable, thread_system);
 }
 
 // The link-fold world, with no requests: `config.pads` random pads off the first

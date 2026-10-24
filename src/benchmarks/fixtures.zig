@@ -42,6 +42,7 @@ const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const level_z_step = @import("../game/world/system.zig").level_z_step;
 const default_chunk_size_tiles = @import("../game/world/system.zig").default_chunk_size_tiles;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const SteeringSystem = @import("../game/systems/steering/system.zig").SteeringSystem;
 const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
 const NavStage = @import("../game/systems/pathfinding/nav_graph.zig").NavStage;
 const SimulationPipeline = @import("../game/simulation_pipeline.zig").SimulationPipeline;
@@ -340,19 +341,31 @@ pub fn navTunerSettle(comptime prefix: []const u8, tuners: *const NavTuners) sui
     return census;
 }
 
-/// Adds every tuner the structural-commit seam runs to `census`: the colliders' sync stages,
-/// the trigger patch's query and store stages, and the nav set (`addNavTuners`). The seam's
-/// steering reaction and growth sync dispatch nothing; the rebuild tuners run only at a
-/// rebuild and the store's refresh only at a collision step, never at the seam, so they are
-/// not walked.
+/// Adds the structural-commit seam's tuner sets to `census`: the colliders' sync and rebuild
+/// stages, the trigger patch's query and store stages (`trigger_stages`) and the trigger
+/// rebuild's (`addTriggerRebuildTuners`), the steering system's, and the nav set
+/// (`addNavTuners`). The collision step's tuners (the store's refresh among them) are left
+/// to the step's census.
+/// A tuner no measured step records in is idle (`TunerSettle.measured`).
 pub fn addSeamTuners(census: *suite.TunerSettle, pipeline: *const SimulationPipeline) void {
     census.addNamed(&seam_stage_names[0..sync_stages.len].*, &syncTuners(&pipeline.static_colliders));
+    inline for (comptime std.enums.values(RebuildStage)) |stage| census.add("sync.rebuild." ++ @tagName(stage), pipeline.static_colliders.rebuild_tuners.getPtrConst(stage));
     census.add("trigger.query", &pipeline.collision.trigger_query_tuner);
     inline for (trigger_stages) |stage| census.add("trigger." ++ @tagName(stage), pipeline.collision.trigger_store.tuners.getPtrConst(stage));
+    addTriggerRebuildTuners(census, "trigger.", &pipeline.collision);
+    census.addAll(SteeringSystem, &pipeline.steering, "steering");
     addNavTuners(census, "nav.", &pipeline.pathfinding.tuners);
 }
 
+/// Adds `collision`'s trigger rebuild tuners to `census` under `prefix`: the rebuild query's
+/// and every store rebuild stage's, by name.
+pub fn addTriggerRebuildTuners(census: *suite.TunerSettle, comptime prefix: []const u8, collision: *const CollisionSystem) void {
+    census.add(prefix ++ "query_rebuild", &collision.trigger_query_rebuild_tuner);
+    inline for (comptime std.enums.values(TriggerRebuildTuners.Key)) |stage| census.add(prefix ++ "rebuild." ++ @tagName(stage), collision.trigger_store.rebuild_tuners.getPtrConst(stage));
+}
+
 const TriggerTuners = @FieldType(@FieldType(CollisionSystem, "trigger_store"), "tuners");
+const TriggerRebuildTuners = @FieldType(@FieldType(CollisionSystem, "trigger_store"), "rebuild_tuners");
 /// The collider sync's stages in `SyncStage` order, their names, and their tuners.
 pub const sync_stages = std.enums.values(SyncStage);
 pub const sync_stage_names: [sync_stages.len][]const u8 = blk: {

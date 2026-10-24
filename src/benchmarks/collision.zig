@@ -102,7 +102,7 @@
 //!   single-static sync, untimed, then, with the tuners still settled, times one dense sync of
 //!   the change count, an explosion after a quiet spell. Pass shape: main per changed static
 //!   flat in the change count; in the tuned case each stage's shape the same across the timed
-//!   spikes (the held jump shape, shown in the stage details) and the main share reported.
+//!   spikes (shown in the stage details) and the main share reported.
 //!   The tuned shapes are learned from timing, so no worker count is asserted.
 //!   Asserts are fixture invariants only: each single sync commits and syncs its one change,
 //!   and leaves the tuned case's tuners settled; each dense sync's work as
@@ -1721,8 +1721,8 @@ fn measureDenseSyncs(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     // A spike is measured only from settled tuners.
     if (load == .spike and case.adaptive and !warm.settled()) return error.DenseSpikeTunersNotSettled;
     // The settled tuners' spike shape sizes the per-range scratch (the touch windows), so one
-    // untimed spike each way grows it to the timed shape. A spike's record is skipped, but
-    // these spikes set each tuner's held jump shape, which the timed spikes reuse.
+    // untimed spike each way grows it to the timed shape. A spike's record is skipped; a
+    // repeated jump count reuses its predicted shape.
     if (load == .spike) for (0..2) |_| {
         try fixture.changeOneAndSync(&threads);
         _ = try fixture.changeAndSync(&threads);
@@ -2326,21 +2326,29 @@ fn harmonic(n: usize) f64 {
 // A collision step's static-side stages, in the order the measured steps add them.
 const static_stage_names = [_][]const u8{ "static_pairs", "static_rect", "static_place", "static_sort", "trigger_refresh" };
 
-// The step's stage tuners; with a mover, also every tuner its commit seam runs
-// (`fixtures.addSeamTuners`).
+// Every tuner the step can run: with a mover, the step's stage tuners and every tuner of the
+// systems its commit seam runs (`fixtures.addSeamTuners`, whose collision system is the
+// step's); without one, every tuner of the step's system (`collisionTunerSettle`).
 fn caseTunerSettle(system: *const CollisionSystem, inputs: StepInputs) suite.TunerSettle {
+    const static_mover = inputs.mover orelse return collisionTunerSettle(system);
+    std.debug.assert(system == &static_mover.seam.seam.pipeline.collision);
     var census = suite.TunerSettle.ofNamed(&step_tuner_names, &stepTuners(system));
-    if (inputs.mover) |static_mover| fixtures.addSeamTuners(&census, &static_mover.seam.seam.pipeline);
+    fixtures.addSeamTuners(&census, &static_mover.seam.seam.pipeline);
     return census;
 }
 
-// Fails when `CollisionSystem` holds a tuner the bench's named lists miss: every tuner is a
-// step stage's (`stepTuners`, the store's refresh among them), a trigger patch stage's
-// (`triggerPatchTuners`), or a rebuild stage's, which only a rebuild selects.
+// Every tuner of `system`, by name: the step stages' (`stepTuners`, the store's refresh among
+// them), the trigger patch stages' (`triggerPatchTuners`), and the trigger rebuild's.
+fn collisionTunerSettle(system: *const CollisionSystem) suite.TunerSettle {
+    var census = suite.TunerSettle.ofNamed(&step_tuner_names, &stepTuners(system));
+    census.addNamed(&trigger_patch_stage_names, &triggerPatchTuners(system));
+    fixtures.addTriggerRebuildTuners(&census, "", system);
+    return census;
+}
+
+// Fails when `CollisionSystem` holds a tuner its named census misses (`collisionTunerSettle`).
 fn checkTunerLists(system: *const CollisionSystem) error{CollisionTunerListStale}!void {
-    const store_rebuild_count = @FieldType(@FieldType(CollisionSystem, "trigger_store"), "rebuild_tuners").len;
-    const rebuild_count = 1 + store_rebuild_count;
-    if (suite.tunerCount(CollisionSystem, system) != step_tuner_names.len + trigger_patch_stage_count + rebuild_count) return error.CollisionTunerListStale;
+    if (collisionTunerSettle(system).len != suite.tunerCount(CollisionSystem, system)) return error.CollisionTunerListStale;
 }
 
 // Fails when a step's sweep batches miss their work: the broadphase covers every sweep

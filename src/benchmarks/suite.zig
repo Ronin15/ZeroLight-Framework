@@ -299,9 +299,6 @@ pub const RunStats = struct {
     /// The tuners the case's measured steps ran, judged by their state before measurement
     /// (`TunerSettle.measured`).
     tuner_settle: ?SettleReport = null,
-    /// The case runs a fixed number of steps no option changes (a fixed-cycle workload), so
-    /// more warmup cannot settle its tuners.
-    fixed_length: bool = false,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
     render_game_prep_phases: ?RenderGamePrepPhaseSummary = null,
     terrain_edit_phases: ?TerrainEditPhaseSummary = null,
@@ -830,9 +827,13 @@ pub const TunerSettle = struct {
         for (names, tuners) |name, tuner| self.add(name, tuner);
     }
 
-    /// `tuner` and its record count and settle state now. A census past `capacity` is a
-    /// harness bug, failed loudly in every mode.
+    /// `tuner` and its record count and settle state now. A tuner the census already holds
+    /// keeps its first entry, so builders over overlapping sets count it once. A census past
+    /// `capacity` is a harness bug, failed loudly in every mode.
     pub fn add(self: *TunerSettle, name: []const u8, tuner: *const AdaptiveWorkTuner) void {
+        for (self.entries[0..self.len]) |entry| {
+            if (entry.tuner == tuner) return;
+        }
         if (self.len == capacity) std.debug.panic("tuner census holds more than {} tuners", .{capacity});
         self.entries[self.len] = .{ .name = name, .tuner = tuner, .records = TunerCounts.of(tuner).records, .settled = tunerSettled(tuner) };
         self.len += 1;
@@ -1543,10 +1544,7 @@ fn validationAttention(fixed_auto: ?CaseResult, adaptive: ?CaseResult, threaded_
     // benchmark still exits successfully so timing noise can be reviewed.
     if (adaptive) |adaptive_result| {
         // An unsettled tuned case is never judged against the controls.
-        if (caseSettle(adaptive_result.stats) == .no) {
-            if (adaptive_result.stats.fixed_length) return "adaptive did not settle before measurement (settled=no): not judged, it cannot settle at its fixed length";
-            return "adaptive did not settle before measurement (settled=no): not judged, rerun with more warmup";
-        }
+        if (caseSettle(adaptive_result.stats) == .no) return "adaptive did not settle before measurement (settled=no): not judged, rerun with more warmup";
         if (fixed_auto) |auto| {
             if (percentDelta(adaptive_result.stats.mean_ns, auto.stats.mean_ns) > 25) {
                 return "adaptive is more than 25% slower than fixed-auto";
@@ -2416,10 +2414,6 @@ test "a tuner census judges only the tuners that recorded since its snapshot, by
     const adaptive = CaseResult{ .case = default_cases[default_cases.len - 1], .stats = unsettled };
     const fixed = CaseResult{ .case = findBenchmarkCase("thread-fixed-auto").?, .stats = .{ .mean_ns = 1 } };
     try std.testing.expect(std.mem.endsWith(u8, validationAttention(fixed, adaptive, fixed).?, "rerun with more warmup"));
-    // A fixed-length case is never told to warm up more.
-    var fixed_length = adaptive;
-    fixed_length.stats.fixed_length = true;
-    try std.testing.expect(std.mem.endsWith(u8, validationAttention(fixed, fixed_length, fixed).?, "cannot settle at its fixed length"));
     // Every tuner that ran settled at the snapshot: judged, idle ones never hold it.
     const settled_report = census.reportOf(&.{ records_now[0], census.entries[1].records, census.entries[2].records + 1, census.entries[3].records });
     try std.testing.expect(settled_report.all());
@@ -2441,6 +2435,18 @@ test "a tuner census settles when every tuner that recorded since its snapshot i
     try std.testing.expect(census.settledSinceOf(&.{ before[0] + 2, before[1] }, &.{ true, true }));
     // An unsettled tuner that did not record never holds the loop.
     try std.testing.expect(census.settledSinceOf(&.{ before[0] + 2, before[1] }, &.{ true, false }));
+}
+
+test "a tuner census holds each tuner once, under the first name it was added by" {
+    const Fixture = struct { a: AdaptiveWorkTuner, b: AdaptiveWorkTuner };
+    const fixture = Fixture{ .a = .init(.{}), .b = .init(.{}) };
+    var census = TunerSettle.of(Fixture, &fixture);
+    // A second builder over an overlapping set adds only the tuners not already held.
+    census.addNamed(&.{ "other.b", "other.a" }, &.{ &fixture.b, &fixture.a });
+    census.add("other.b", &fixture.b);
+    try std.testing.expectEqual(@as(usize, 2), census.len);
+    try std.testing.expectEqualStrings(".a", census.entries[0].name);
+    try std.testing.expectEqualStrings(".b", census.entries[1].name);
 }
 
 test "the headline batch reports its busiest shape and threaded over non-empty batches across steps" {
