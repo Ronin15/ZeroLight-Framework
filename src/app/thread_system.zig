@@ -4303,7 +4303,7 @@ test "a nested batch keeps a selected profile's range shape and a nested stage s
 }
 
 // The tuner policy state any selection or record would change. The perf-log diagnostic
-// counters are excluded: tests never read counters (`tests-benchmarks.md`).
+// counters are excluded: tests never read counters.
 const TunerSnapshot = struct {
     phase: AdaptiveWorkPhase,
     initial_profile: AdaptiveWorkProfile,

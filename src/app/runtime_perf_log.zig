@@ -212,9 +212,8 @@ pub const Timing = enum {
     render_end_frame,
 };
 
-/// The batch stages the log records: each change path's cost-driver stage only
-/// (`threading.md` § Verification). Every other stage's batch is bench output
-/// (`BenchBatchStage`).
+/// The batch stages the log records: each change path's cost-driver stage only.
+/// Every other stage's batch is bench output (`BenchBatchStage`).
 pub const BatchStage = enum {
     // The per-step spatial index build's sort, the build's cost driver.
     spatial_index_build,

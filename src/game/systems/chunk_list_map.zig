@@ -406,8 +406,8 @@ pub fn bitSetBytesFor(bits: usize) usize {
 /// `deinit` releases nothing, so it frees a pooled owner's directory before the pool.
 /// Methods take the caller's allocator; the directory does not store one. `with_pending`
 /// keeps a dense `pending` column beside each level's slots, one u32 per chunk. Workers
-/// writing `pending` on chunks of different shards write disjoint scattered elements: the
-/// sparse index maintenance `threading.md` § Writes exempts, so neither column is padded.
+/// writing `pending` on chunks of different shards write disjoint scattered elements
+/// (sparse index maintenance), so neither column is padded.
 pub fn ChunkDirectory(comptime Payload: type, comptime with_pending: bool) type {
     return struct {
         const Self = @This();
