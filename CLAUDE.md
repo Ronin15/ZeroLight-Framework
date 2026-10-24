@@ -104,8 +104,9 @@ orchestrates, verifies every agent claim against live code, and reports.
 - An explanation of a failure or bench result is a hypothesis until a
   measurement tests it; say which, and never write an untested one into a
   bench's pass condition or a comment. Run long jobs (bench sweeps, seed
-  loops) in the foreground or poll for a done marker, never `tail -f` with a
-  timeout.
+  loops) in the foreground, split into chunks under the tool's 10-minute
+  limit, or as a background command and wait for its completion
+  notification; never a shell wait or poll loop.
 
 ## Commands
 
