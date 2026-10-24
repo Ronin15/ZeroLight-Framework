@@ -16,7 +16,7 @@ const std = @import("std");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
-const flush_pair_count = @import("../../game/systems/pathfinding/publish.zig").flush_pair_count;
+const FlushTuners = @import("../../game/systems/pathfinding/publish.zig").FlushTuners;
 const pathfinding_range_alignment_items = @import("../../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const offMainNs = @import("../../app/thread_system.zig").offMainNs;
 const DataSystem = @import("../../game/data_system.zig").DataSystem;
@@ -611,11 +611,12 @@ fn runElasticShrink(
     for (system.completed.core.records.items, 0..) |record, owner| {
         if (record.live) cached.appendAssumeCapacity(.{ .key = system.completed.core.keyOf(@intCast(owner)), .owner = @intCast(owner) });
     }
+    const flush_start = ShrinkFlushStart.of(system);
     const step_start_ns = suite.nowNs(io);
     shrink.step_stats = try runHeldStep(system, stream, thread_system, case, held.len);
     shrink.step_ns = suite.elapsedNs(step_start_ns, suite.nowNs(io));
     shrink.copy_ns = offMainNs(shrink.step_stats.perf.resize_copy_batch);
-    try checkShrinkFlushShape(case, thread_system, shrink.step_stats.perf.registry_flush_batch);
+    try checkShrinkFlush(case, thread_system, system, flush_start, shrink.step_stats);
     shrink.agent_capacity_after = system.effective_agent_capacity;
     shrink.cache_capacity_after = system.completed.logicalCapacity();
     if (shrink.agent_capacity_after >= shrink.agent_capacity_before) return error.ElasticShrinkDidNotShrink;
@@ -642,14 +643,49 @@ fn runElasticShrink(
     return shrink;
 }
 
-// A shrink step's registry flush runs at its fixed shape on a thread system a worker may
-// join: the case's fixed range, or under the adaptive control one range per pair,
-// ceil(units / pairs) units each.
-fn checkShrinkFlushShape(case: suite.BenchmarkCase, thread_system: *const ThreadSystem, flush: BatchStats) !void {
-    if (flush.item_count == 0) return error.ShrinkFlushSkipped;
+// The flush tuner sets' record counts before a shrink step, and whether the one-off set was
+// fresh (no selection yet) then.
+const ShrinkFlushStart = struct {
+    one_off: [2]u64,
+    in_play: [2]u64,
+    fresh: bool,
+
+    fn of(system: *const PathfindingSystem) ShrinkFlushStart {
+        const one_off = &system.tuners.one_off_flush;
+        return .{
+            .one_off = recordsOf(one_off),
+            .in_play = recordsOf(&system.tuners.registry_flush),
+            .fresh = one_off.get(.count).learned_item_count == 0 and one_off.get(.apply).learned_item_count == 0,
+        };
+    }
+
+    fn recordsOf(tuners: *const FlushTuners) [2]u64 {
+        return .{ suite.TunerCounts.of(tuners.getPtrConst(.count)).records, suite.TunerCounts.of(tuners.getPtrConst(.apply)).records };
+    }
+};
+
+// A shrink step's registry flush ran, its count and apply on a thread system a worker may
+// join: under a fixed control at the case's fixed range; under the adaptive control on the
+// one-off flush set (`one_off_flush`), each pass recording once and the update's set
+// (`registry_flush`) recording nothing, and, when the one-off set was fresh, each pass of more
+// than one range on workers (its first selection is the full pool).
+fn checkShrinkFlush(case: suite.BenchmarkCase, thread_system: *const ThreadSystem, system: *const PathfindingSystem, start: ShrinkFlushStart, step: PathfindingStats) !void {
+    const passes = [2]BatchStats{ step.perf.registry_flush_count_batch, step.perf.registry_flush_batch };
+    if (passes[1].item_count == 0) return error.ShrinkFlushSkipped;
     if (thread_system.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
-    const range = case.stageItemsPerRange(pathfinding_range_alignment_items) orelse @divCeil(flush.item_count, flush_pair_count);
-    if (flush.range_count != rangeCount(flush.item_count, range)) return error.ShrinkFlushShape;
+    if (case.stageItemsPerRange(pathfinding_range_alignment_items)) |range| {
+        for (passes) |pass| {
+            if (pass.range_count != rangeCount(pass.item_count, range)) return error.ShrinkFlushShape;
+        }
+        return;
+    }
+    if (!case.adaptive) return;
+    const one_off = ShrinkFlushStart.recordsOf(&system.tuners.one_off_flush);
+    for (one_off, start.one_off) |now, before| {
+        if (now != before + 1) return error.ShrinkFlushOffOneOffSet;
+    }
+    if (!std.meta.eql(ShrinkFlushStart.recordsOf(&system.tuners.registry_flush), start.in_play)) return error.ShrinkFlushTrainedInPlaySet;
+    if (start.fresh) for (passes) |pass| try suite.checkRebuildOnWorkers(case, thread_system, pass);
 }
 
 // One step of the held agents, which must be served by cache hits alone.

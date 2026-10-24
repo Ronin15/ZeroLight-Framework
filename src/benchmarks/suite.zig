@@ -15,6 +15,7 @@ const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystemConfig = @import("../app/thread_system.zig").ThreadSystemConfig;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const rangeCount = @import("../app/thread_system.zig").rangeCount;
+const offMainNs = @import("../app/thread_system.zig").offMainNs;
 const diagnostics_enabled = @import("../app/runtime_perf_log.zig").enabled;
 const PerfBatchStage = @import("../app/runtime_perf_log.zig").BatchStage;
 const PerfBenchBatchStage = @import("../app/runtime_perf_log.zig").BenchBatchStage;
@@ -299,6 +300,9 @@ pub const RunStats = struct {
     /// The tuners the case's measured steps ran, judged by their state before measurement
     /// (`TunerSettle.measured`).
     tuner_settle: ?SettleReport = null,
+    /// A case with neither a headline tuner nor a census whose every tuner production starts
+    /// fresh at each run (a pipeline built per measured iteration): it is `fresh` and judged.
+    tuners_fresh: bool = false,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
     render_game_prep_phases: ?RenderGamePrepPhaseSummary = null,
     terrain_edit_phases: ?TerrainEditPhaseSummary = null,
@@ -335,11 +339,11 @@ pub const RunStats = struct {
 /// its share on workers, the flood tuner's policy after the case (null when the case runs no
 /// adaptive tuner; zero workers is inline), the chunks and records patched, and a toggle's
 /// reopen flood nodes (null without a reopen). Then the one-way
-/// closure's stage shapes (candidates, resolve, mask, plan, rows with round 0 and its rounds
-/// folded, landing) and counters: components touched, links resolved, terminals new and left,
-/// rows recomputed, rounds, words written, blocks narrowed, blocks allocated and freed, words
-/// landed, landings deferred, the live block words, the batch tail's capacity, and the rows
-/// stage's time on workers; and the
+/// closure's stage shapes (candidates, resolve, mask, plan, the relocated-span copy, rows with
+/// its rounds folded, landing) and counters: components touched, links resolved, terminals new
+/// and left, rows recomputed, rounds, words written, blocks narrowed, blocks allocated and
+/// freed, words landed, landings deferred, the live block words, the batch tail's capacity,
+/// and the closure write's time on workers (the copy and the rows); and the
 /// reserve of its busiest batch: the tail words its bound reserved and its blocks took, its
 /// candidates' block words, and the terminals it could number.
 pub const NavConnSummary = struct {
@@ -364,6 +368,7 @@ pub const NavConnSummary = struct {
     closure_resolve: BatchSummary = .{},
     closure_mask: BatchSummary = .{},
     closure_plan: BatchSummary = .{},
+    closure_copy: BatchSummary = .{},
     closure_rows: BatchSummary = .{},
     closure_land: BatchSummary = .{},
     closure_touched: usize = 0,
@@ -578,6 +583,8 @@ pub const WorldCreateSummary = struct {
     stack_ns: u64 = 0,
     nav_ns: u64 = 0,
     destroy_ns: u64 = 0,
+    // The `nav` phase less its stages' worker time.
+    nav_main_ns: u64 = 0,
     surface_bytes: usize = 0,
     stack_bytes: usize = 0,
     nav_bytes: usize = 0,
@@ -797,6 +804,8 @@ pub const TunerSettle = struct {
         tuner: *const AdaptiveWorkTuner,
         records: u64,
         settled: bool,
+        // A tuner production starts fresh at every run of its one-off pass (`addFresh`).
+        fresh: bool = false,
     };
 
     entries: [capacity]Entry = undefined,
@@ -831,11 +840,22 @@ pub const TunerSettle = struct {
     /// keeps its first entry, so builders over overlapping sets count it once. A census past
     /// `capacity` is a harness bug, failed loudly in every mode.
     pub fn add(self: *TunerSettle, name: []const u8, tuner: *const AdaptiveWorkTuner) void {
-        for (self.entries[0..self.len]) |entry| {
-            if (entry.tuner == tuner) return;
+        self.addEntry(.{ .name = name, .tuner = tuner, .records = TunerCounts.of(tuner).records, .settled = tunerSettled(tuner) });
+    }
+
+    /// A one-off pass's `tuner` that production starts fresh at every run (a level build's
+    /// stage set): it never settles and never holds the census or a warm loop; one the last
+    /// run selected (`last_request`) is reported `fresh` and judged.
+    pub fn addFresh(self: *TunerSettle, name: []const u8, tuner: *const AdaptiveWorkTuner) void {
+        self.addEntry(.{ .name = name, .tuner = tuner, .records = 0, .settled = false, .fresh = true });
+    }
+
+    fn addEntry(self: *TunerSettle, entry: Entry) void {
+        for (self.entries[0..self.len]) |held| {
+            if (held.tuner == entry.tuner) return;
         }
         if (self.len == capacity) std.debug.panic("tuner census holds more than {} tuners", .{capacity});
-        self.entries[self.len] = .{ .name = name, .tuner = tuner, .records = TunerCounts.of(tuner).records, .settled = tunerSettled(tuner) };
+        self.entries[self.len] = entry;
         self.len += 1;
     }
 
@@ -868,6 +888,10 @@ pub const TunerSettle = struct {
         std.debug.assert(records_now.len == self.len);
         var report = SettleReport{};
         for (self.entries[0..self.len], records_now) |entry, records| {
+            if (entry.fresh) {
+                if (entry.tuner.last_request != null) report.fresh += 1 else report.idle += 1;
+                continue;
+            }
             if (records == entry.records) {
                 report.idle += 1;
                 continue;
@@ -889,7 +913,7 @@ pub const TunerSettle = struct {
         std.debug.assert(records_now.len == self.len and settled_now.len == self.len);
         var any_recorded = false;
         for (self.entries[0..self.len], records_now, settled_now) |entry, records, settled| {
-            if (records == entry.records) continue;
+            if (entry.fresh or records == entry.records) continue;
             if (!settled) return false;
             any_recorded = true;
         }
@@ -899,13 +923,15 @@ pub const TunerSettle = struct {
 
 /// A tuner census over a measured window (`TunerSettle.measured`): `settled` of the `used`
 /// tuners (those that recorded in the window, judged by their state at its start), the `idle`
-/// ones that did not record, and the first unsettled ones' names.
+/// ones that did not record, the `fresh` one-off tuners the last run selected
+/// (`TunerSettle.addFresh`), and the first unsettled ones' names.
 pub const SettleReport = struct {
     const listed_max = 4;
 
     used: usize = 0,
     settled: usize = 0,
     idle: usize = 0,
+    fresh: usize = 0,
     unsettled_names: [listed_max][]const u8 = undefined,
     unsettled_listed: usize = 0,
 
@@ -913,9 +939,11 @@ pub const SettleReport = struct {
         return self.settled == self.used;
     }
 
-    /// `settled=<k>/<n> idle=<m>`, then the first unsettled names.
+    /// `settled=<k>/<n> idle=<m>`, `fresh=<f>` when a fresh one-off tuner ran, then the first
+    /// unsettled names.
     pub fn write(self: *const SettleReport, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("settled={}/{} idle={}", .{ self.settled, self.used, self.idle });
+        if (self.fresh != 0) try writer.print(" fresh={}", .{self.fresh});
         if (self.all()) return;
         try writer.writeAll(" unsettled=");
         for (self.unsettled_names[0..self.unsettled_listed], 0..) |name, index| {
@@ -1402,7 +1430,10 @@ fn printDetailTable(group: BenchmarkGroup, results: []const CaseResult) void {
         printCell(if (carried) formatRangeCellInto(&worker_ranges_buffer, batch, batch.worker_thread_ranges) else "-", 14);
         printCell(if (carried) formatDurationInto(&wait_buffer, batch.main_thread_wait_ns) else "-", 11);
         printCell(if (carried) formatRangeCellInto(&items_per_range_buffer, batch, batch.items_per_range) else "-", 16);
-        printCell(formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning), work_tuning_width);
+        // A case whose tuners all start fresh and that names no headline tuner shows its
+        // settle state in the tuning cell.
+        const tuning_cell = if (result.stats.work_tuning == null and result.stats.tuners_fresh) "settled=fresh" else formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning);
+        printCell(tuning_cell, work_tuning_width);
         const workload = formatWorkloadInto(&workload_buffer, group, result.stats, .details);
         std.debug.print("{s}\n", .{if (workload.len == 0) "-" else workload});
         if (result.stats.secondary_work_tuning) |secondary| {
@@ -1620,19 +1651,20 @@ fn formatWorkerThreadsInto(buffer: []u8, stats: RunStats) []const u8 {
 }
 
 // A case's settle state before measurement: `no` when any tuner its measured steps ran, or
-// its headline tuner, had not settled; null when it reports neither.
+// its headline tuner, had not settled; `fresh` for a case whose tuners all start fresh
+// (`tuners_fresh`); null when it reports none of them.
 fn caseSettle(stats: RunStats) ?Settle {
     if (stats.tuner_settle) |census| {
         if (!census.all()) return .no;
         if (stats.work_tuning) |summary| return summary.settle;
         return .yes;
     }
-    const summary = stats.work_tuning orelse return null;
-    return summary.settle;
+    if (stats.work_tuning) |summary| return summary.settle;
+    return if (stats.tuners_fresh) .fresh else null;
 }
 
 // `settled=<yes|no|fresh|idle>`, or the step's tuner census `settled=<k>/<n> idle=<m>` when
-// the case took one; null when the case reports neither.
+// the case took one; null when the case reports no settle state (`caseSettle`).
 fn formatSettleInto(buffer: []u8, stats: RunStats) ?[]const u8 {
     var writer: std.Io.Writer = .fixed(buffer);
     if (stats.tuner_settle) |census| {
@@ -1640,8 +1672,8 @@ fn formatSettleInto(buffer: []u8, stats: RunStats) ?[]const u8 {
         if (stats.work_tuning) |summary| if (summary.settle == .no and census.all()) writer.writeAll(" headline=no") catch return "settled";
         return writer.buffered();
     }
-    const summary = stats.work_tuning orelse return null;
-    return std.mem.print(buffer, "settled={s}", .{@tagName(summary.settle)}) catch "settled";
+    const settle = caseSettle(stats) orelse return null;
+    return std.mem.print(buffer, "settled={s}", .{@tagName(settle)}) catch "settled";
 }
 
 // A range column of `batch`: `inline` when it ran inline (no range split), else `value`.
@@ -1792,6 +1824,7 @@ fn writeNavConn(writer: *std.Io.Writer, summary: ?NavConnSummary) std.Io.Writer.
         .{ " closure_resolve=", conn.closure_resolve },
         .{ " closure_mask=", conn.closure_mask },
         .{ " closure_plan=", conn.closure_plan },
+        .{ " closure_copy=", conn.closure_copy },
         .{ " closure_rows=", conn.closure_rows },
         .{ " closure_land=", conn.closure_land },
     };
@@ -1826,7 +1859,7 @@ fn writeNavConn(writer: *std.Io.Writer, summary: ?NavConnSummary) std.Io.Writer.
 
 /// A nav reaction's stage batches over the reactions added (`StageShapes`): the mark, plan,
 /// remask, and patch, the connectivity seed, gather, and flood, and the closure candidates,
-/// resolve, mask, plan, rows, and landing; and the last reaction, for the counters.
+/// resolve, mask, plan, copy, rows, and landing; and the last reaction, for the counters.
 pub const NavReactionShapes = struct {
     // A stage after the mark: its name, its `NavUpdateStats.perf` batch field, and for a
     // round-folded stage its widest round's field (`checkNavReactionDispatched`).
@@ -1843,6 +1876,7 @@ pub const NavReactionShapes = struct {
         .{ .name = "closure_resolve", .batch = "conn_closure_resolve_batch" },
         .{ .name = "closure_mask", .batch = "conn_closure_mask_batch" },
         .{ .name = "closure_plan", .batch = "conn_closure_plan_batch" },
+        .{ .name = "closure_copy", .batch = "conn_closure_copy_batch" },
         .{ .name = "closure_rows", .batch = "conn_closure_rows_batch", .round_items_max = "closure_rows_round_items_max" },
         .{ .name = "closure_land", .batch = "conn_closure_land_batch" },
     };
@@ -1899,7 +1933,7 @@ pub const NavReactionShapes = struct {
     /// shape over the reactions added.
     pub fn connSummary(self: *const NavReactionShapes, flood_tuner_workers: ?usize) NavConnSummary {
         var conn = navConnCounters(self.last, flood_tuner_workers);
-        const stage_summaries = [_]*BatchSummary{ &conn.seed, &conn.gather, &conn.flood, &conn.candidates, &conn.closure_resolve, &conn.closure_mask, &conn.closure_plan, &conn.closure_rows, &conn.closure_land };
+        const stage_summaries = [_]*BatchSummary{ &conn.seed, &conn.gather, &conn.flood, &conn.candidates, &conn.closure_resolve, &conn.closure_mask, &conn.closure_plan, &conn.closure_copy, &conn.closure_rows, &conn.closure_land };
         comptime std.debug.assert(patch_stage + 1 + stage_summaries.len == stage_count);
         for (stage_summaries, patch_stage + 1..) |summary, stage| summary.* = batchSummaryFromShapes(&self.shapes, stage);
         return conn;
@@ -1930,9 +1964,9 @@ fn navConnCounters(stats: NavUpdateStats, flood_tuner_workers: ?usize) NavConnSu
         .flood_tuner_workers = flood_tuner_workers,
         .chunks_patched = stats.chunks_patched,
         .records_patched = stats.records_patched,
-        .closure_rows_off_main_ns = if (stats.perf.conn_closure_rows_batch.ran_inline) 0 else stats.perf.conn_closure_rows_batch.batch_duration_ns,
     };
     if (comptime diagnostics_enabled) {
+        summary.closure_rows_off_main_ns = offMainNs(stats.perf.conn_closure_copy_batch) + offMainNs(stats.perf.conn_closure_rows_batch);
         summary.families = stats.perf.conn_families;
         summary.rounds = stats.perf.conn_rounds;
         summary.round_items_min = stats.perf.conn_round_items_min;
@@ -2421,6 +2455,14 @@ test "a tuner census judges only the tuners that recorded since its snapshot, by
     const fresh: RunStats = .{ .work_tuning = workTuningSummary(&fixture.settled, .fresh) };
     try std.testing.expectEqual(@as(?Settle, .fresh), caseSettle(fresh));
     try std.testing.expectEqualStrings("settled=fresh", formatSettleInto(&buffer, fresh).?);
+    // A case with no headline tuner or census whose tuners all start fresh: judged as `fresh`.
+    const all_fresh: RunStats = .{ .tuners_fresh = true };
+    try std.testing.expectEqual(@as(?Settle, .fresh), caseSettle(all_fresh));
+    try std.testing.expectEqualStrings("settled=fresh", formatSettleInto(&buffer, all_fresh).?);
+    try std.testing.expectEqual(@as(?Settle, null), caseSettle(.{}));
+    try std.testing.expectEqual(@as(?[]const u8, null), formatSettleInto(&buffer, .{}));
+    const fresh_adaptive = CaseResult{ .case = default_cases[default_cases.len - 1], .stats = .{ .mean_ns = 1, .tuners_fresh = true } };
+    try std.testing.expect(validationAttention(fixed, fresh_adaptive, fixed) == null);
 }
 
 test "a tuner census settles when every tuner that recorded since its snapshot is settled" {
@@ -2435,6 +2477,29 @@ test "a tuner census settles when every tuner that recorded since its snapshot i
     try std.testing.expect(census.settledSinceOf(&.{ before[0] + 2, before[1] }, &.{ true, true }));
     // An unsettled tuner that did not record never holds the loop.
     try std.testing.expect(census.settledSinceOf(&.{ before[0] + 2, before[1] }, &.{ true, false }));
+}
+
+test "a tuner census reports a fresh one-off tuner the last run selected as fresh, never holding the census or a warm loop" {
+    const Fixture = struct { in_play: AdaptiveWorkTuner, ran: AdaptiveWorkTuner, unused: AdaptiveWorkTuner };
+    var fixture = Fixture{ .in_play = testSettledThreadedTuner(), .ran = .init(.{}), .unused = .init(.{}) };
+    var census = TunerSettle{};
+    census.add("in_play", &fixture.in_play);
+    census.addFresh("ran", &fixture.ran);
+    census.addFresh("unused", &fixture.unused);
+    // The run selected `ran` and left it unsettled; `unused` never ran since its reset.
+    _ = fixture.ran.selectProfile(.{ .item_count = 64, .available_worker_threads = 2, .max_worker_threads = 2, .fallback_items_per_range = 8, .range_alignment_items = 1 });
+    const records_now = [3]u64{ census.entries[0].records + 1, 7, 0 };
+    const report = census.reportOf(&records_now);
+    try std.testing.expectEqual(@as(usize, 1), report.used);
+    try std.testing.expectEqual(@as(usize, 1), report.fresh);
+    try std.testing.expectEqual(@as(usize, 1), report.idle);
+    try std.testing.expect(report.all());
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try report.write(&writer);
+    try std.testing.expectEqualStrings("settled=1/1 idle=1 fresh=1", writer.buffered());
+    // An unsettled fresh tuner that recorded never holds the warm loop.
+    try std.testing.expect(census.settledSinceOf(&records_now, &.{ true, false, false }));
 }
 
 test "a tuner census holds each tuner once, under the first name it was added by" {
@@ -2790,11 +2855,11 @@ test "a nav reaction's stage shapes land on their named summaries and stage line
     try std.testing.expectEqual(@as(usize, 3), run.nav_remask_batch.?.item_count);
     try std.testing.expectEqual(@as(usize, 4), run.secondary_batch.?.item_count);
     const conn = run.nav_conn.?;
-    const conn_stages = [_]BatchSummary{ conn.seed, conn.gather, conn.flood, conn.candidates, conn.closure_resolve, conn.closure_mask, conn.closure_plan, conn.closure_rows, conn.closure_land };
+    const conn_stages = [_]BatchSummary{ conn.seed, conn.gather, conn.flood, conn.candidates, conn.closure_resolve, conn.closure_mask, conn.closure_plan, conn.closure_copy, conn.closure_rows, conn.closure_land };
     for (conn_stages, 5..) |stage, count| try std.testing.expectEqual(count, stage.item_count);
     var details = DetailLines{};
     shapes.print(&details, "reaction");
-    try std.testing.expectEqualStrings("reaction: mark=inline(1)[0/1] plan=inline(2)[0/1] remask=inline(3)[0/1] patch=inline(4)[0/1] conn_seed=inline(5)[0/1] conn_gather=inline(6)[0/1] conn_flood=inline(7)[0/1] closure_candidates=inline(8)[0/1] closure_resolve=inline(9)[0/1] closure_mask=inline(10)[0/1] closure_plan=inline(11)[0/1] closure_rows=inline(12)[0/1] closure_land=inline(13)[0/1]\n", details.text());
+    try std.testing.expectEqualStrings("reaction: mark=inline(1)[0/1] plan=inline(2)[0/1] remask=inline(3)[0/1] patch=inline(4)[0/1] conn_seed=inline(5)[0/1] conn_gather=inline(6)[0/1] conn_flood=inline(7)[0/1] closure_candidates=inline(8)[0/1] closure_resolve=inline(9)[0/1] closure_mask=inline(10)[0/1] closure_plan=inline(11)[0/1] closure_copy=inline(12)[0/1] closure_rows=inline(13)[0/1] closure_land=inline(14)[0/1]\n", details.text());
 
     // No reaction marked: no mark shape.
     var unmarked = NavReactionShapes{};

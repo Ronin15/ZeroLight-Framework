@@ -89,18 +89,17 @@ pub fn drainPending(system: *PathfindingSystem, thread_system: *ThreadSystem, ag
 
 /// One pathfinding update under `case`; a fixed threaded case runs every update stage of
 /// more than one range on workers. A registry flush that added registrations ran at least
-/// one unit per pair and per add, on at most one worker per pair but one, and a fixed
-/// threaded case flushes one range per configured range of units.
+/// one unit per pair and per add, and a fixed threaded case flushes one range per configured
+/// range of units.
 pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: *ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
     const config = coldStepConfig(case, solve_budget, fallback_budget);
     const stats = try system.update(requests, agent_count, thread_system, config);
     try suite.checkStagesDispatched(case, thread_system, config.items_per_range, &updateBatches(stats));
-    // A shrink's registry rename pass, at its fixed shape, and the flush's bound count.
+    // A shrink's registry rename pass and the flush's bound count.
     try suite.checkStagesDispatched(case, thread_system, config.items_per_range, &.{ stats.perf.registry_rename_batch, stats.perf.registry_flush_count_batch });
     const flush = stats.perf.registry_flush_batch;
     const adds = stats.perf.registrations_added;
     if (adds != 0 and flush.item_count < flush_pair_count + adds) return error.RegistryFlushMissedUnits;
-    if (flush.active_worker_threads > flush_pair_count - 1) return error.RegistryFlushPastPairWorkers;
     try suite.checkFixedRangeCount(case, thread_system, config.items_per_range, flush);
     return stats;
 }

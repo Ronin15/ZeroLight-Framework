@@ -6,15 +6,19 @@
 //! phase: `surface` (`initProceduralFromMeta`, the threaded paint), `stack`
 //! (`addUndergroundLevelStack`), `nav` (`SimulationPipeline.init` on the world, the static
 //! colliders, the nav build, and the stored-trigger build, empty here), and `destroy`
-//! (`pipeline.deinit`, then the world), on the serial and tuned cases. Configs: sides 256,
+//! (`pipeline.deinit`, then the world), on the serial and tuned cases; every tuner runs fresh
+//! (a pipeline per create, and the nav build resets the pathfinding tuners after it), so the
+//! tuned case is measured fresh (`settled=fresh`, no headline tuner). Configs: sides 256,
 //! 1024, and 2048 at 8 levels, then 32 and 128 levels at side 256 (item code
 //! `level side * 1000 + levels`). One untimed pass per config on a zero-worker thread system
 //! counts live bytes after each create phase and after destroy. Prints each phase's mean
-//! time, `live_kb` after `surface`, `stack`, and `nav` (the counted pass), and
-//! `after_destroy_bytes=`. Pass shape: each phase's time and bytes
-//! at most linear in level area times levels, memory following what exists, and zero bytes
-//! after destroy. Asserts check the zero after destroy and, once per case at the smallest
-//! config, that the phases build the world `initProcedural` builds.
+//! time, `nav_main=` (the `nav` phase less the off-main time of its collider rebuild, nav
+//! build, and trigger build stages), `live_kb` after `surface`, `stack`, and `nav` (the counted
+//! pass), and `after_destroy_bytes=`. Pass shape: each phase's time and bytes at most linear in
+//! level area times levels, `nav_main` per chunk flat, memory following what exists, and zero
+//! bytes after destroy. Asserts check the zero after destroy, once per case at the smallest
+//! config that the phases build the world `initProcedural` builds, and in the tuned case with
+//! workers that the nav build's remask (a fresh full-pool tuner) ran on workers.
 //!
 //! `world-create-statics`: a world's pipeline created over its statics and its first commit
 //! seam, through the production entries (`SimulationPipeline.init` with nav over the world on
@@ -33,17 +37,18 @@
 //! occupied chunk; the trigger rebuild query covered every static, the insert place and sort
 //! every pair, the leaf stage their pages, the node stage at least one item, and no patch
 //! stage ran; in the tuned case with workers every rebuild stage over more than one aligned
-//! range (the collider rebuild's six, the trigger build's five) ran on workers; the first
+//! range (the collider rebuild's six, the trigger build's five, the nav build's remask) ran on
+//! workers; the first
 //! seam rebuilt nothing (its trigger rebuild records are init's, its patch query empty, its
 //! pair count kept); and a collision step after it at the world's strips emits every stored
 //! pair with no pair-bound overflow. `main=` is the create's time less the off-main time of the
-//! collider rebuild and the trigger build stages; the nav build's worker time is not split
-//! out yet, so it counts as main. Pass shape: time per static flat up to the insert sort's
-//! log factor; main per static flat (the nav build's fixed-world cost an intercept); the
+//! collider rebuild, the nav build, and the trigger build stages. Pass shape: time per static
+//! flat up to the insert sort's log factor; main per static flat (the nav build's fixed-world
+//! cost an intercept); the
 //! first seam's trigger sync O(1); every multi-range rebuild stage on workers in the tuned
 //! case; a first step with no overflow. Prints `statics=`, `stored_pairs=`, `init=`, `first_seam=`,
 //! `per_static=`, and `main=` with `main_per_item=`; `--details` adds the init's phases
-//! (`collider_rebuild=` and `trigger_build=` each with its main, `nav_build=`, and `rest=`,
+//! (`collider_rebuild=`, `nav_build=`, and `trigger_build=` each with its main, and `rest=`,
 //! the init less the three), `first_seam=` with its trigger sync, and the shapes of the
 //! trigger build's and the collider rebuild's stages (the busiest over the measured creates).
 
@@ -97,6 +102,11 @@ const PhaseTimes = struct {
     stack_ns: u64 = 0,
     nav_ns: u64 = 0,
     destroy_ns: u64 = 0,
+    // The `nav` phase's stage time on workers: its collider rebuild, nav build, and trigger
+    // build.
+    nav_off_main_ns: u64 = 0,
+    // The nav build's remask over every level.
+    nav_remask: BatchStats = .{},
 };
 
 // Live bytes of `counter` (allocated minus freed), or zero without one.
@@ -159,6 +169,8 @@ fn createAndDestroy(
         .build_thread_system = threads,
     });
     const nav = markPhase(io, counter);
+    const nav_build = pipeline.pathfinding.perf.last_nav_build;
+    const nav_off_main_ns = sumOffMainNs(&colliderRebuildBatches(&pipeline)) + nav_build.perf.off_main_stage_ns + sumOffMainNs(&triggerRebuildBatches(&pipeline));
 
     pipeline.deinit();
     data.deinit();
@@ -173,6 +185,8 @@ fn createAndDestroy(
         .stack_ns = suite.elapsedNs(surface.end_ns, stack.end_ns),
         .nav_ns = suite.elapsedNs(stack.end_ns, nav.end_ns),
         .destroy_ns = suite.elapsedNs(nav.end_ns, destroy.end_ns),
+        .nav_off_main_ns = nav_off_main_ns,
+        .nav_remask = nav_build.perf.remask_batch,
     };
 }
 
@@ -244,8 +258,11 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     }
     var accumulator = suite.StatsAccumulator.init(item_count);
     var totals: [4]u128 = @splat(0);
+    var nav_main_total: u128 = 0;
     for (0..options.iterations) |_| {
         const times = try createAndDestroy(allocator, io, &meta, config, &threads, null, &uncounted);
+        try suite.checkRebuildOnWorkers(case, &threads, times.nav_remask);
+        nav_main_total += times.nav_ns -| times.nav_off_main_ns;
         const phases = [_]u64{ times.surface_ns, times.stack_ns, times.nav_ns, times.destroy_ns };
         var sample_ns: u64 = 0;
         for (phases, &totals) |phase_ns, *total| {
@@ -260,20 +277,24 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         summary.stack_ns = @intCast(totals[1] / stats.iterations);
         summary.nav_ns = @intCast(totals[2] / stats.iterations);
         summary.destroy_ns = @intCast(totals[3] / stats.iterations);
+        summary.nav_main_ns = @intCast(nav_main_total / stats.iterations);
     }
     stats.items_per_second = suite.itemsPerSecond(@as(usize, fields.level_side) * fields.level_side * fields.levels, stats.mean_ns);
     stats.batch_carried = false;
+    // A summary of any tuner after the create would report a reset tuner, not the build's.
+    stats.tuners_fresh = case.adaptive;
     stats.world_create = summary;
     return stats;
 }
 
 fn writeCreateWorkload(writer: *std.Io.Writer, stats: suite.RunStats, _: suite.WorkloadView) std.Io.Writer.Error!void {
     const summary = stats.world_create orelse return;
-    try writer.print("surface={f} stack={f} nav={f} destroy={f} live_kb surface={} stack={} nav={} after_destroy_bytes={}", .{
+    try writer.print("surface={f} stack={f} nav={f} destroy={f} nav_main={f} live_kb surface={} stack={} nav={} after_destroy_bytes={}", .{
         suite.formatDuration(summary.surface_ns),
         suite.formatDuration(summary.stack_ns),
         suite.formatDuration(summary.nav_ns),
         suite.formatDuration(summary.destroy_ns),
+        suite.formatDuration(summary.nav_main_ns),
         summary.surface_bytes / 1024,
         summary.stack_bytes / 1024,
         summary.nav_bytes / 1024,
@@ -358,6 +379,7 @@ const StaticsSample = struct {
     trigger_build_ns: u64,
     // Each phase's stages' worker dispatch time.
     collider_off_main_ns: u64,
+    nav_off_main_ns: u64,
     trigger_off_main_ns: u64,
     collider_batches: [collider_rebuild_stages.len]BatchStats,
     trigger_batches: [trigger_stage_count]BatchStats,
@@ -418,13 +440,14 @@ fn createWithStatics(allocator: std.mem.Allocator, io: std.Io, fixture: *Statics
     const pipeline = &seam.pipeline;
     // Read before the seam, which clears `perf` and replaces the collider records.
     const perf = pipeline.perf;
+    const nav_build = pipeline.pathfinding.perf.last_nav_build;
     const collider_batches = colliderRebuildBatches(pipeline);
     const trigger_batches = triggerRebuildBatches(pipeline);
     const rewrite_tuning = suite.workTuningSummary(pipeline.static_colliders.rebuild_tuners.getPtrConst(.rewrite), .fresh);
     if (static_colliders_test_support.liveRowCount(pipeline.static_colliders) != statics) return error.WrongStaticCount;
     try suite.checkRebuildWork(collider_batches, fixture.data.slots.items.len, statics, fixture.chunks);
     try checkInitTriggerBuild(pipeline, &fixture.world, statics, fixture.cells, trigger_batches);
-    for (collider_batches ++ trigger_batches) |batch| try suite.checkRebuildOnWorkers(case, threads, batch);
+    for (collider_batches ++ trigger_batches ++ [1]BatchStats{nav_build.perf.remask_batch}) |batch| try suite.checkRebuildOnWorkers(case, threads, batch);
 
     const seam_start_ns = suite.nowNs(io);
     seam.frame.beginStep();
@@ -447,6 +470,7 @@ fn createWithStatics(allocator: std.mem.Allocator, io: std.Io, fixture: *Statics
         .nav_build_ns = perf.create_nav_build_ns,
         .trigger_build_ns = perf.create_trigger_build_ns,
         .collider_off_main_ns = sumOffMainNs(&collider_batches),
+        .nav_off_main_ns = nav_build.perf.off_main_stage_ns,
         .trigger_off_main_ns = sumOffMainNs(&trigger_batches),
         .collider_batches = collider_batches,
         .trigger_batches = trigger_batches,
@@ -463,6 +487,7 @@ const StaticsTotals = struct {
     collider_rebuild: u128 = 0,
     collider_main: u128 = 0,
     nav_build: u128 = 0,
+    nav_main: u128 = 0,
     trigger_build: u128 = 0,
     trigger_main: u128 = 0,
     rest: u128 = 0,
@@ -472,10 +497,11 @@ const StaticsTotals = struct {
         self.init += sample.init_ns;
         self.seam += sample.seam_ns;
         self.trigger_sync += sample.trigger_sync_ns;
-        self.main += ns -| (sample.collider_off_main_ns + sample.trigger_off_main_ns);
+        self.main += ns -| (sample.collider_off_main_ns + sample.nav_off_main_ns + sample.trigger_off_main_ns);
         self.collider_rebuild += sample.collider_rebuild_ns;
         self.collider_main += sample.collider_rebuild_ns -| sample.collider_off_main_ns;
         self.nav_build += sample.nav_build_ns;
+        self.nav_main += sample.nav_build_ns -| sample.nav_off_main_ns;
         self.trigger_build += sample.trigger_build_ns;
         self.trigger_main += sample.trigger_build_ns -| sample.trigger_off_main_ns;
         self.rest += sample.init_ns -| (sample.collider_rebuild_ns + sample.nav_build_ns + sample.trigger_build_ns);
@@ -516,10 +542,11 @@ fn runStaticsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
         stats.deferred_count = StaticsTotals.mean(totals.init, n);
         stats.fallback_deferred_count = StaticsTotals.mean(totals.seam, n);
         stats.main_ns = StaticsTotals.mean(totals.main, n);
-        stats.details.print("collider_rebuild={f} (main {f}) nav_build={f} trigger_build={f} (main {f}) rest={f} first_seam={f} (trigger_sync {f})\n", .{
+        stats.details.print("collider_rebuild={f} (main {f}) nav_build={f} (main {f}) trigger_build={f} (main {f}) rest={f} first_seam={f} (trigger_sync {f})\n", .{
             suite.formatDuration(StaticsTotals.mean(totals.collider_rebuild, n)),
             suite.formatDuration(StaticsTotals.mean(totals.collider_main, n)),
             suite.formatDuration(StaticsTotals.mean(totals.nav_build, n)),
+            suite.formatDuration(StaticsTotals.mean(totals.nav_main, n)),
             suite.formatDuration(StaticsTotals.mean(totals.trigger_build, n)),
             suite.formatDuration(StaticsTotals.mean(totals.trigger_main, n)),
             suite.formatDuration(StaticsTotals.mean(totals.rest, n)),

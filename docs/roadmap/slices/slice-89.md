@@ -73,6 +73,19 @@ cost there.
       (`world_gate.zig:248`, `:317`) are reported as a cost or not there; only
       if they cost, rows group by `(level, chunk)`, serial == threaded. Links
       slice 35's row-order item and slice 88's plane-entry item.
+- [ ] A fresh one-off build set's first pick fits the build. Failure: every
+      nav build starts the level build set fresh on the one-off config
+      (`Tuners.startNavBuild`, `pathfinding/system.zig:296`), so its first
+      selection starts from the full pool whatever the build's size.
+      Measured: `nav-level-add` 1024008 ReleaseFast tuned 186.6 us
+      (180.8-192.6) on the persistent set (`19fe22a`) against 201.7 us
+      (196.3-211.6) fresh, main 122 to 104 us; remask, patch, and gather
+      each 23w/48r [3/3]. Debug tuned against serial: 256008 +13%, replace
+      10256008 +16%. That the 48-range first pick causes it is a hypothesis.
+      Candidate: the reset keeps each stage's learned per-item cost and drops
+      only its profile, so the first pick is predicted from items x cost.
+      Pass: measure the cause first; `nav-level-add` 1024008 ReleaseFast tuned
+      within spread of the persistent-set base; serial == threaded.
 - [ ] A whole-group Debug smoke run of every bench group under the batch tuner
       (dispatch and settle checks pass or fail), since only 13 groups ran
       after `83ef090`.

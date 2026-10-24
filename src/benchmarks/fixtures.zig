@@ -44,7 +44,6 @@ const default_chunk_size_tiles = @import("../game/world/system.zig").default_chu
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const SteeringSystem = @import("../game/systems/steering/system.zig").SteeringSystem;
 const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
-const NavStage = @import("../game/systems/pathfinding/nav_graph.zig").NavStage;
 const SimulationPipeline = @import("../game/simulation_pipeline.zig").SimulationPipeline;
 const CollisionStats = @import("../game/systems/collision.zig").CollisionStats;
 const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
@@ -292,21 +291,22 @@ pub fn flood4(allocator: std.mem.Allocator, width: u32, height: u32, seed: [2]u3
     return .{ .reached = queue.items.len, .stopped = false };
 }
 
-/// Gives every nav reaction stage (the batch stages, connectivity and closure included, the
-/// mark stage, and the eviction stages) a fresh tuner for `case` and its control config. The
-/// stages share one control, so every stage's fixed range modes scale from one item per
-/// range, aligned per stage: a chunk for the chunk stages, an event
-/// for the mark stage, a registry entry or pair for the eviction stages. Call after the nav
-/// build, which resets tuners.
+/// Gives every nav reaction stage (the marks batch's and the level builds' stage sets,
+/// connectivity and closure included, the mark stage, and the eviction stages and flush sets)
+/// a fresh tuner at its production config for `case` and its control config. The stages share
+/// one control, so every stage's fixed range modes scale from one item per range, aligned per
+/// stage: a chunk for the chunk stages, an event for the mark stage, a registry entry or pair
+/// for the eviction stages. Call after the nav build, which resets tuners.
 pub fn setNavTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
     const partition_items = suite.chunk_partition_items;
-    const fresh = AdaptiveWorkTuner.init(.{});
-    system.tuners.nav = .initFill(fresh);
-    system.tuners.nav_mark = fresh;
-    system.tuners.nav_evict_count = fresh;
-    system.tuners.nav_evict = fresh;
-    system.tuners.evict_flush = fresh;
-    system.tuners.evict_flush_count = fresh;
+    const fresh = NavTuners{};
+    system.tuners.nav = fresh.nav;
+    system.tuners.nav_build = fresh.nav_build;
+    system.tuners.nav_mark = fresh.nav_mark;
+    system.tuners.nav_evict_count = fresh.nav_evict_count;
+    system.tuners.nav_evict = fresh.nav_evict;
+    system.tuners.evict_flush = fresh.evict_flush;
+    system.tuners.one_off_flush = fresh.one_off_flush;
     system.nav_controls = .{
         .adaptive = case.adaptive,
         .max_worker_threads = case.maxWorkerThreads(),
@@ -319,17 +319,23 @@ pub fn setNavTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void 
 /// one workload with one sample per step, as production's one reaction per step does.
 pub const NavTuners = @FieldType(PathfindingSystem, "tuners");
 
-/// Adds every tuner of the stage tuner set `tuners` to `census` under `prefix`, the nav
-/// stages by name: each field is a tuner or the nav stage set, so none is missed. A tuner no
-/// measured step records in is idle (`TunerSettle.measured`), so setup-only tuners never
-/// hold the census.
+/// Adds every tuner of the stage tuner set `tuners` to `census` under `prefix`: each field is
+/// a tuner or a stage set (the marks batch's nav stages by name, every other set's stages as
+/// `<set>.<stage>`), so none is missed. A tuner no measured step records in is idle
+/// (`TunerSettle.measured`), so setup-only tuners never hold the census. The level build set
+/// (`nav_build`), which production starts fresh at every nav build, is added fresh
+/// (`TunerSettle.addFresh`).
 pub fn addNavTuners(census: *suite.TunerSettle, comptime prefix: []const u8, tuners: *const NavTuners) void {
     inline for (@typeInfo(NavTuners).@"struct".field_names, @typeInfo(NavTuners).@"struct".field_types) |name, Field| {
-        if (comptime std.mem.eql(u8, name, "nav")) {
-            inline for (comptime std.enums.values(NavStage)) |stage| census.add(prefix ++ @tagName(stage), tuners.nav.getPtrConst(stage));
-        } else {
-            comptime std.debug.assert(Field == AdaptiveWorkTuner);
+        if (Field == AdaptiveWorkTuner) {
             census.add(prefix ++ name, &@field(tuners, name));
+        } else {
+            const set_prefix = if (comptime std.mem.eql(u8, name, "nav")) prefix else prefix ++ name ++ ".";
+            const fresh = comptime std.mem.eql(u8, name, "nav_build");
+            inline for (comptime std.enums.values(Field.Key)) |stage| {
+                const tuner = @field(tuners, name).getPtrConst(stage);
+                if (fresh) census.addFresh(set_prefix ++ @tagName(stage), tuner) else census.add(set_prefix ++ @tagName(stage), tuner);
+            }
         }
     }
 }

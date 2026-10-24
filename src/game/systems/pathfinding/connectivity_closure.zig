@@ -297,7 +297,7 @@ const MaskItem = struct {
     words: u32,
 };
 
-// One round-0 span of a block: its words `dst`, the first `src_len` copied from `src`, the
+// One copy span of a block: its words `dst`, the first `src_len` copied from `src`, the
 // rest zeroed (a zeroed span has `src_len == 0`).
 const CopyItem = struct {
     dst: []u32,
@@ -503,11 +503,12 @@ pub const Closure = struct {
     round_items: std.ArrayList(RowsItem) = .empty,
     // Usize: a batch's round items sum spans over every SCC and may pass u32.
     round_starts: std.ArrayList(usize) = .empty,
-    // The most recent batch's rows (its rounds folded into one), resolve, mask, and plan
-    // stage shapes, kept only with `runtime_perf_log.enabled`.
+    // The most recent batch's copy, rows (its rounds folded into one), resolve, mask, and
+    // plan stage shapes, kept only with `runtime_perf_log.enabled`.
     perf: Perf = .{},
 
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        last_copy_batch: BatchStats = .{},
         last_rows_batch: BatchStats = .{},
         last_resolve_batch: BatchStats = .{},
         last_mask_batch: BatchStats = .{},
@@ -1209,7 +1210,7 @@ fn addS(self: *Connectivity, touched: TouchColumns, term: u32) void {
 }
 
 // Frees `index` of touched component `touch`'s block onto its heir piece's free list (in
-// the old index map), when a piece inherits the block; recorded for round 0's zeroing.
+// the old index map), when a piece inherits the block; recorded for the copy's zeroing.
 fn freeIndex(self: *Connectivity, touched: TouchColumns, pieces: PieceColumns, touch: u32, index: u32) void {
     const closure = &self.closure;
     const piece = touched.kept_by[touch];
@@ -1384,7 +1385,7 @@ fn mergeResolved(self: *Connectivity, counters: *ClosureCounters) void {
     }
     // Every index the batch frees in an inherited block, before any is handed out: the
     // leaving terminals', then the moved-out ones' in slot order. Each goes onto its
-    // heir's free list through the old index map (round 0 zeroes its row) and may be
+    // heir's free list through the old index map (the copy zeroes its row) and may be
     // taken in this batch: its old row is in S, so every kept row reaching it is in A.
     closure.freed_indices.clearRetainingCapacity();
     for (closure.leaving.items) |term| freeIndex(self, touched, pieces, hcomp.slot[closure.term.hcomp[term]], closure.term.index[term]);
@@ -1451,7 +1452,8 @@ fn mergeResolved(self: *Connectivity, counters: *ClosureCounters) void {
 
 // The mask (`conn_closure_mask`), each piece's A list, the plan
 // (`conn_closure_plan`: CSR walk, Tarjan, SCC levels), block assignment and round lists,
-// the rows (`conn_closure_rows`, rounds under one profile), and the commit. With `preset`
+// the copy of relocated and zeroed spans (`conn_closure_copy`), the rows
+// (`conn_closure_rows`, rounds under one profile), and the commit. With `preset`
 // every relocated piece already holds its own block (a world build); else each takes the
 // tail.
 fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: ClosureThreads, preset: bool, counters: *ClosureCounters, stats: *NavUpdateStats) void {
@@ -1515,7 +1517,7 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
     stats.addStageTime(plan_batch);
     section = StageTimer.begin();
 
-    // Blocks, then the round-0 copy and zero spans, then the round lists.
+    // Blocks, then the copy and zero spans, then the round lists.
     assignBlocks(self, slots, pieces, touched, preset, counters);
     var max_level: u32 = 0;
     for (closure.plan_items.items) |piece| max_level = @max(max_level, pieces.max_level[piece]);
@@ -1547,19 +1549,26 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
     while (round > 0) : (round -= 1) closure.round_starts.items[round] = closure.round_starts.items[round - 1];
     if (rounds != 0) closure.round_starts.items[0] = 0;
 
-    // Rows: one sample for the step's copy spans and rounds; none when nothing moved.
-    if (closure.copy_items.items.len + round_total == 0) {
+    // Copy: one stage over the spans; the rows read what it writes.
+    stats.addMain(.closure_ns, section.lap());
+    var copy = CopyJob{ .items = closure.copy_items.items };
+    const copy_batch = runStage(threads.copy, closure.copy_items.items.len, 1, &copy, &copy.range_count, copyJob);
+    stats.addStageTime(copy_batch);
+    section = StageTimer.begin();
+    if (comptime runtime_perf_log.enabled) {
+        closure.perf.last_copy_batch = copy_batch;
+        for (closure.copy_items.items) |item| counters.perf.words_written += item.dst.len;
+    }
+
+    // Rows: one sample for the step's rounds; none without a round.
+    if (round_total == 0) {
         if (comptime runtime_perf_log.enabled) closure.perf.last_rows_batch = .{};
         commitClosure(self, allocator, slots, pieces, touched, preset, counters);
         stats.addMain(.closure_ns, section.lap());
         return;
     }
     stats.addMain(.closure_ns, section.lap());
-    var dispatch = RoundDispatch.begin(threads.rows, closure.copy_items.items.len + round_total);
-    if (closure.copy_items.items.len != 0) {
-        var copy = CopyJob{ .items = closure.copy_items.items };
-        dispatch.run(closure.copy_items.items.len, &copy, &copy.range_count, copyJob);
-    }
+    var dispatch = RoundDispatch.begin(threads.rows, round_total);
     for (0..rounds) |level| {
         const round_slice = closure.round_items.items[closure.round_starts.items[level]..closure.round_starts.items[level + 1]];
         if (round_slice.len == 0) continue;
@@ -1572,15 +1581,14 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
         };
         dispatch.run(round_slice.len, &rows, &rows.range_count, rowsJob);
     }
-    const rows_batch = dispatch.finish(closure.copy_items.items.len + round_total);
+    const rows_batch = dispatch.finish(round_total);
     if (comptime runtime_perf_log.enabled) closure.perf.last_rows_batch = rows_batch;
     section = StageTimer.begin();
     if (comptime runtime_perf_log.enabled) {
         stats.perf.off_main_stage_ns += dispatch.off_main_ns;
         stats.perf.inline_stage_ns += dispatch.inline_ns;
         stats.perf.closure_rows_round_items_max = @max(stats.perf.closure_rows_round_items_max, dispatch.round_items_max);
-        counters.perf.rounds = rounds + @intFromBool(closure.copy_items.items.len != 0);
-        for (closure.copy_items.items) |item| counters.perf.words_written += item.dst.len;
+        counters.perf.rounds = rounds;
         for (closure.plan_items.items) |piece| counters.perf.words_written += @as(usize, pieces.a_count[piece]) * rowWords(pieces.k_cap[piece]);
     }
 
@@ -1588,7 +1596,7 @@ fn finishClosure(self: *Connectivity, allocator: std.mem.Allocator, threads: Clo
     stats.addMain(.closure_ns, section.lap());
 }
 
-// Block assignment and round-0 spans, in piece order: a relocated piece takes its preset
+// Block assignment and copy spans, in piece order: a relocated piece takes its preset
 // block or the next tail block (its old block, if any, leaves the live words) and gets
 // copies of its kept rows outside A (widened, zero tail) and zeroed rows for every other
 // index outside A; a piece in place gets its freed indices' rows zeroed. O(1) per piece
@@ -1648,7 +1656,7 @@ fn assignBlocks(self: *Connectivity, slots: SlotColumns, pieces: PieceColumns, t
     }
 }
 
-// Zeroes `len` words of `block` from `start` in round 0, one span per item.
+// Zeroes `len` words of `block` from `start` in the copy, one span per item.
 fn zeroWords(self: *Connectivity, block: []u32, start: usize, len: usize) void {
     const words = block[start..][0..len];
     var offset: usize = 0;
@@ -1773,6 +1781,7 @@ pub const ClosureThreads = struct {
     resolve: ?Dispatch = null,
     mask: ?Dispatch = null,
     plan: ?Dispatch = null,
+    copy: ?Dispatch = null,
     rows: ?Dispatch = null,
     land: ?Dispatch = null,
 };
@@ -2351,8 +2360,8 @@ fn pushVisit(apos: APosColumns, start: u32, position: u32, counter: *u32, stack_
     depth.* += 1;
 }
 
-// The rows' round 0: copies and zeroes spans of the batch's blocks. Each item writes only its
-// span.
+// `conn_closure_copy`, before the rows: copies and zeroes spans of the batch's blocks. Each
+// item writes only its span.
 const CopyJob = struct {
     items: []const CopyItem,
     range_count: usize = 0,
@@ -2371,7 +2380,7 @@ fn copyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     }
 }
 
-// The rows' later rounds: per (SCC, span), the span of the SCC's row (its members' bits ORed with
+// The rows' rounds: per (SCC, span), the span of the SCC's row (its members' bits ORed with
 // the rows of every terminal its members reach in one link outside the SCC: earlier rounds'
 // rows or kept rows), written into each member's row. Each item writes only its members'
 // spans; it reads rows no item of its round writes.
@@ -3556,6 +3565,60 @@ test "a nav update failing after a level build left blocks in the tail lands the
         try std.testing.expectEqual(@as(usize, 4), system.graph.levelCount());
         try std.testing.expectEqual(@as(usize, 0), closure.residents.items.len);
         try std.testing.expectEqual(@as(usize, 0), closure.tail.items.len);
+        try fixture.expectMatchesRebuild(&system);
+    }
+}
+
+test "a closure tail lands on the tuner set of the batch that wrote it: a level build's on the build set, a marks batch's on the patch set" {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    {
+        var fixture = try TestWorld.init(6, 1);
+        defer fixture.deinit();
+        var system = try fixture.build(test_support.abstractCapacity());
+        defer system.deinit();
+        for (1..3) |level| {
+            _ = try fixture.world.addLevel(-16 * @as(i32, @intCast(level)));
+            _ = try fixture.world.addDenseLayer(@intCast(level), 0, .floor, fixture.grass);
+        }
+        try addOneWay(&fixture, 1, .{ 2, 2 }, 2, .{ 9, 9 });
+        // The link registers first; the second level build makes it live and leaves its new
+        // block in the tail.
+        var stats = NavUpdateStats{};
+        const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), &.{}, null, &stats)).?;
+        _ = system.graph.commitMarks(prepared, no_colliders.view(), null, &stats);
+        var nav_threads = test_support.forcedNavThreads(&system, &threads);
+        nav_threads.controls = .{};
+        try system.graph.buildLevel(no_colliders.view(), &fixture.world, 1, nav_threads, &stats);
+        try system.graph.buildLevel(no_colliders.view(), &fixture.world, 2, nav_threads, &stats);
+        try std.testing.expectEqual(@as(usize, 1), system.graph.connectivity.closure.residents.items.len);
+        system.graph.landClosure(nav_threads, &stats);
+        try std.testing.expectEqual(@as(usize, 0), system.graph.connectivity.closure.residents.items.len);
+        try std.testing.expect(system.tuners.nav_build.get(.conn_closure_land).last_request != null);
+        try std.testing.expect(system.tuners.nav.get(.conn_closure_land).last_request == null);
+        try fixture.expectMatchesRebuild(&system);
+    }
+    {
+        var fixture = try latticeWorld(8, 1);
+        defer fixture.deinit();
+        try addChain(&fixture, 8, 0, narrow_first, 128);
+        var system = try fixture.build(test_support.abstractCapacity());
+        defer system.deinit();
+        // A narrowing relocates its block into the tail.
+        for (narrow_first..narrow_first + 100) |room| try setRoom(&fixture, &system, 8, 0, room, fixture.tree);
+        var nav_threads = test_support.forcedNavThreads(&system, &threads);
+        nav_threads.controls = .{};
+        var stats = NavUpdateStats{};
+        const prepared = (try system.graph.prepareMarks(&fixture.world, no_colliders.view(), system.nav_marks.items, nav_threads, &stats)).?;
+        _ = system.graph.commitMarks(prepared, no_colliders.view(), nav_threads, &stats);
+        system.nav_marks.clearRetainingCapacity();
+        try std.testing.expectEqual(@as(usize, 1), system.graph.connectivity.closure.residents.items.len);
+        // The relocated block's spans copied on their own stage.
+        try std.testing.expect(system.tuners.nav.get(.conn_closure_copy).last_request != null);
+        system.graph.landClosure(nav_threads, &stats);
+        try std.testing.expectEqual(@as(usize, 0), system.graph.connectivity.closure.residents.items.len);
+        try std.testing.expect(system.tuners.nav.get(.conn_closure_land).last_request != null);
+        for (system.tuners.nav_build.values) |tuner| try std.testing.expect(tuner.last_request == null);
         try fixture.expectMatchesRebuild(&system);
     }
 }

@@ -24,6 +24,7 @@ const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const StageControls = @import("../../../app/thread_system.zig").StageControls;
 const StageShape = @import("../../../app/thread_system.zig").StageShape;
 const maxRangeCount = @import("../../../app/thread_system.zig").maxRangeCount;
+const rebuild_tuner_config = @import("../../../app/thread_system.zig").rebuild_tuner_config;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const EntityId = @import("../../data_system.zig").EntityId;
@@ -61,6 +62,7 @@ const IntakeTallyList = @import("intake.zig").IntakeTallyList;
 const RegRecordList = @import("publish.zig").RegRecordList;
 const PublishBandList = @import("publish.zig").PublishBandList;
 const FlushTally = @import("publish.zig").FlushTally;
+const FlushTuners = @import("publish.zig").FlushTuners;
 const flush_pair_count = @import("publish.zig").flush_pair_count;
 const solveOne = @import("solve.zig").solveOne;
 const solveJob = @import("solve.zig").solveJob;
@@ -182,9 +184,6 @@ pub const PathfindingSystem = struct {
     flush_tallies: [flush_pair_count]FlushTally = @splat(.{}),
     // Owner heads past the cache's capacity wait for the flush that applies its shrink.
     registry_truncate_pending: bool = false,
-    // A rebuilt level's eviction flush, a shrink, and a recovery flush run count and apply
-    // at one pair per range and do not sample the tuners.
-    registry_flush_fixed: bool = false,
     // Path eviction scratch: one item per changed key and the hit windows, reserved before
     // the batch commit; the eviction stage's shape is chosen with the windows.
     evict_items: EvictItemList = .empty,
@@ -262,27 +261,41 @@ pub const PathfindingSystem = struct {
     };
 
     // Every stage's tuner: the solve batch, intake, the group-field advance and begin passes
-    // and their stall re-dispatches (they see different item counts), each nav batch stage,
-    // `nav_mark`, the goal scan and projection, the publish copy, the registry flush, a
-    // shrink's resize copy, and the eviction's bound count, halo walk, and flush.
+    // (each pass's stall rounds are its one sample), each nav stage of a marks batch (`nav`)
+    // and of a level build (`nav_build`), `nav_mark`, the goal scan and projection, the
+    // publish copy, a shrink's resize copy and registry rename, the eviction's bound count and
+    // halo walk, and the registry flush sets (count, apply): the update's, the marks batch's
+    // eviction, and one for the rare one-off flushes (a cache shrink's, a level rebuild's
+    // evictions). One-offs (level builds, a shrink's passes, the one-off flushes) start on the
+    // full pool; the level build set starts fresh at every nav build (`startNavBuild`).
     const Tuners = struct {
+        const fresh_nav_build: NavStageTuners = .initFill(.init(rebuild_tuner_config));
+
         solve: AdaptiveWorkTuner = .init(.{}),
         intake: AdaptiveWorkTuner = .init(.{}),
         group_field: AdaptiveWorkTuner = .init(.{}),
         group_field_begin: AdaptiveWorkTuner = .init(.{}),
-        group_field_stall: AdaptiveWorkTuner = .init(.{}),
         nav: NavStageTuners = .initFill(.init(.{})),
+        nav_build: NavStageTuners = fresh_nav_build,
         nav_mark: AdaptiveWorkTuner = .init(.{}),
         goal_scan: AdaptiveWorkTuner = .init(.{}),
         goal_project: AdaptiveWorkTuner = .init(.{}),
         publish_copy: AdaptiveWorkTuner = .init(.{}),
-        registry_flush: AdaptiveWorkTuner = .init(.{}),
-        registry_flush_count: AdaptiveWorkTuner = .init(.{}),
-        resize_copy: AdaptiveWorkTuner = .init(.{}),
+        registry_flush: FlushTuners = .initFill(.init(.{})),
+        one_off_flush: FlushTuners = .initFill(.init(rebuild_tuner_config)),
+        resize_copy: AdaptiveWorkTuner = .init(rebuild_tuner_config),
+        registry_rename: AdaptiveWorkTuner = .init(rebuild_tuner_config),
         nav_evict_count: AdaptiveWorkTuner = .init(.{}),
         nav_evict: AdaptiveWorkTuner = .init(.{}),
-        evict_flush: AdaptiveWorkTuner = .init(.{}),
-        evict_flush_count: AdaptiveWorkTuner = .init(.{}),
+        evict_flush: FlushTuners = .initFill(.init(.{})),
+
+        /// Starts the level build set fresh on its one-off config, as at world create: a nav
+        /// build (world create, a full rebuild, or one step's level appends and content
+        /// rebuilds) samples each stage once per level, too rarely to settle a learned
+        /// profile, so every build starts from the full pool.
+        pub fn startNavBuild(self: *Tuners) void {
+            self.nav_build = fresh_nav_build;
+        }
     };
 
     // A counted growth or failure and whether its one log line was written.
@@ -333,6 +346,8 @@ pub const PathfindingSystem = struct {
     }
 
     pub const Perf = if (runtime_perf_log.enabled) struct {
+        // The last nav build over every level (`rebuildNavFromColliders`): bench output.
+        last_nav_build: types.NavUpdateStats = .{},
         // A shrink's resize copy, for the next update's stats.
         last_resize_copy_batch: BatchStats = .{},
         // The last registry flush's count dispatch and rename pass: bench output, not
@@ -395,7 +410,9 @@ pub const PathfindingSystem = struct {
     /// the new ceiling admits. On a live system the deferred requests and group tallies
     /// round-trip with their key tables as an elastic resize does, so they never desync.
     /// Fails with `PathfindingBudgetTooWide` when a field's cell cap or a result block is
-    /// past what its indices hold. Returns with the path registry flushed.
+    /// past what its indices hold. Returns with the path registry flushed. Runs its flushes and
+    /// a shrink's resize copy inline: the capacity seam at init or a re-reserve, a cold one-off
+    /// that takes no thread system; the step's elastic resize threads both.
     pub fn reserve(self: *PathfindingSystem, capacity: PathfindingCapacity) (types.BudgetError || error{OutOfMemory})!void {
         // A field's bucket links pack its block ids, which stay below its cell cap.
         if (capacity.group_field_max_cells >= group_field_cell_limit) return error.PathfindingBudgetTooWide;
@@ -599,12 +616,12 @@ pub const PathfindingSystem = struct {
             "nav_marks",             "nav_mark_staging",    "nav_mark_tallies", "resize_pending_snapshot",
             "resize_group_snapshot", "rotate_back_scratch",
         }, &.{
-            "allocator",                "capacity",                 "limits",                        "stripe_words",
-            "step_counter",             "publish_ranges",           "flush_tallies",                 "registry_truncate_pending",
-            "registry_flush_fixed",     "evict_shape",              "perf",                          "tuners",
-            "nav_controls",             "effective_agent_capacity", "low_load_steps",                "nav_mark_growth",
-            "long_block_growth",        "registry_growth",          "evict_growth",                  "group_field_pool_growth",
-            "group_field_pool_failure", "goal_table_growth",        "group_field_threshold_ceiling",
+            "allocator",                "capacity",                      "limits",                  "stripe_words",
+            "step_counter",             "publish_ranges",                "flush_tallies",           "registry_truncate_pending",
+            "evict_shape",              "perf",                          "tuners",                  "nav_controls",
+            "effective_agent_capacity", "low_load_steps",                "nav_mark_growth",         "long_block_growth",
+            "registry_growth",          "evict_growth",                  "group_field_pool_growth", "group_field_pool_failure",
+            "goal_table_growth",        "group_field_threshold_ceiling",
         });
     }
 
@@ -1055,14 +1072,14 @@ pub const PathfindingSystem = struct {
     /// finishes that flush first (`publish.recoverRegistry`).
     pub fn update(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, thread_system: *ThreadSystem, config: PathfindingConfig) error{OutOfMemory}!PathfindingStats {
         const threads = StageThreads{ .thread_system = thread_system, .config = config };
-        const flush = registryFlushDispatch(self, threads);
-        try publish.recoverRegistry(self, flush);
+        try publish.recoverRegistry(self, registryFlushDispatch(self, threads));
         var stats = PathfindingStats{};
+        // Each flush picks its phase set when it runs: the step's resize may leave a shrink.
         self.updateThreaded(requests, agent_count, threads, &stats) catch |err| {
-            _ = try publish.flushRegistry(self, flush, null);
+            _ = try publish.flushRegistry(self, registryFlushDispatch(self, threads), null);
             return err;
         };
-        const registry_flush_batch = try publish.flushRegistry(self, flush, &stats);
+        const registry_flush_batch = try publish.flushRegistry(self, registryFlushDispatch(self, threads), &stats);
         if (comptime runtime_perf_log.enabled) stats.perf.registry_flush_batch = registry_flush_batch;
         return stats;
     }
@@ -1075,18 +1092,14 @@ pub const PathfindingSystem = struct {
         self.prepareSolvePhase(solve_count, effectiveAdmissionLimit(config), stats);
 
         if (self.solve_indices.items.len != 0) {
-            // The configured participant count sized the search scratch at the capacity
-            // seam, so a correct configuration's clamp below is a no-op. A Debug assert
-            // catches a reserve/thread-system mismatch; a release build clamps the worker
-            // fan-out to the reserved scratch, so worker indices stay in range and the
-            // solve loop stays allocation-free.
-            if (builtin.mode == .debug) std.debug.assert(thread_system.participantSlotCount() <= self.scratch_slots.items.len);
-            const max_workers_for_scratch = self.scratch_slots.items.len -| 1;
-            var stage = threads.stage(&self.tuners.solve);
-            stage.max_worker_threads = if (config.max_worker_threads) |requested|
-                @min(requested, max_workers_for_scratch)
-            else
-                max_workers_for_scratch;
+            // The capacity seam reserves one search scratch per participant slot of the
+            // thread system the update dispatches on (`worker_participant_count`), so every
+            // worker index has its scratch. A mismatch is a seam bug, failed loudly in every
+            // build mode before any worker indexes past the scratch.
+            if (thread_system.participantSlotCount() > self.scratch_slots.items.len) {
+                std.debug.panic("path solve scratch holds {} participants; its thread system has {}", .{ self.scratch_slots.items.len, thread_system.participantSlotCount() });
+            }
+            const stage = threads.stage(&self.tuners.solve);
             self.resetSolvedPaths();
             // Pre-select so the job context can dual-assert range.index against the
             // dispatched range count.
@@ -1295,10 +1308,10 @@ fn abortTruncate(self: *PathfindingSystem) void {
     publish.abortRetireTruncate(self);
 }
 
-// The update's registry flush dispatches: its apply under `registry_flush` and its count
-// under `registry_flush_count`.
+// An update's registry flush under the config's controls: on `one_off_flush` when it applies
+// a shrink, else on `registry_flush` (`publish.flushSet`). Chosen at each flush.
 fn registryFlushDispatch(self: *PathfindingSystem, threads: StageThreads) publish.FlushDispatch {
-    return .{ .apply = threads.stage(&self.tuners.registry_flush), .count_tuner = &self.tuners.registry_flush_count };
+    return .{ .rename = threads.stage(&self.tuners.registry_rename), .tuners = publish.flushSet(self, &self.tuners.registry_flush) };
 }
 
 // One range of `resize_copy`: its moves' stored paths.
@@ -5233,8 +5246,7 @@ test "threaded registry flush equals serial with victims, re-puts, and renames i
     var serial_stats = PathfindingStats{};
     _ = try publish.flushRegistry(&systems[0], null, &serial_stats);
     var threaded_stats = PathfindingStats{};
-    const stage = (StageThreads{ .thread_system = &threads, .config = fixed_threads_config }).stage(&systems[1].tuners.registry_flush);
-    _ = try publish.flushRegistry(&systems[1], .{ .apply = stage, .count_tuner = &systems[1].tuners.registry_flush_count }, &threaded_stats);
+    _ = try publish.flushRegistry(&systems[1], registryFlushDispatch(&systems[1], .{ .thread_system = &threads, .config = fixed_threads_config }), &threaded_stats);
     try expectSameRegistry(&systems[0], &systems[1]);
     for (&systems) |*system| try expectRegistryMatchesCache(system);
 }
@@ -5265,8 +5277,7 @@ test "threaded registry flush over unit-weighted pairs equals serial across rang
             try prepareMixedFlush(&threaded, requester);
             var stats = PathfindingStats{};
             const config = PathfindingConfig{ .adaptive = false, .items_per_range = items_per_range };
-            const stage = (StageThreads{ .thread_system = &threads, .config = config }).stage(&threaded.tuners.registry_flush);
-            _ = try publish.flushRegistry(&threaded, .{ .apply = stage, .count_tuner = &threaded.tuners.registry_flush_count }, &stats);
+            _ = try publish.flushRegistry(&threaded, registryFlushDispatch(&threaded, .{ .thread_system = &threads, .config = config }), &stats);
             try expectSameCache(&serial, &threaded);
             try expectSameRegistry(&serial, &threaded);
             try expectRegistryMatchesCache(&threaded);
@@ -5375,7 +5386,7 @@ test "a shrink's resize copy allocates nothing after its prepare on a multi-work
     setSystemAllocators(&system, failing.allocator());
     const stage = (StageThreads{ .thread_system = &threads, .config = fixed_threads_config });
     _ = system.runResizeCopy(stage.stage(&system.tuners.resize_copy));
-    _ = try publish.flushRegistry(&system, .{ .apply = stage.stage(&system.tuners.registry_flush), .count_tuner = &system.tuners.registry_flush_count }, null);
+    _ = try publish.flushRegistry(&system, registryFlushDispatch(&system, stage), null);
     setSystemAllocators(&system, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
@@ -5531,6 +5542,31 @@ test "growing for a larger crowd while a shrink's owner-head truncation waits fo
     // Results past the shrunk capacity take owner ids past 32.
     try solveRegistryRoutes(&system, requester, 24, 16, 64, 64, null, .{});
     try std.testing.expect(system.completed.count() > 32);
+    try expectRegistryMatchesCache(&system);
+}
+
+test "a nav reaction finishing a shrink's flush records it into the one-off flush set, never the marks eviction set" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try registryWorld(&meta, 24);
+    defer fixture.world.deinit();
+    const requester = try data.createEntity();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var system = try registrySystemWith(&data, &fixture.world, 16, .{ .participants = threads.participantSlotCount() });
+    defer system.deinit();
+    try solveRegistryRoutes(&system, requester, 24, 0, 16, 16, null, .{});
+    // A shrink whose flush ran out of memory leaves its prepared truncation behind.
+    const capacity = system.capacity;
+    try prepareTruncate(&system, 32);
+    _ = try system.completed.reserve(system.allocator, 32, capacity.max_stored_path_cells, types.resultBlockWords(capacity.max_explored_nodes, capacity.max_stitched_path_cells), system.step_counter);
+    system.registry_truncate_pending = true;
+    _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expect(!publish.registryBehind(&system));
+    for (system.tuners.one_off_flush.values) |tuner| try std.testing.expect(tuner.last_request != null);
+    for (system.tuners.evict_flush.values) |tuner| try std.testing.expect(tuner.last_request == null);
     try expectRegistryMatchesCache(&system);
 }
 

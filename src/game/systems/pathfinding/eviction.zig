@@ -18,6 +18,7 @@ const navDispatch = @import("system.zig").navDispatch;
 const EvictItem = @import("types.zig").EvictItem;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
+const Dispatch = @import("../../../app/thread_system.zig").Dispatch;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const runShaped = @import("../../../app/thread_system.zig").runShaped;
@@ -76,20 +77,19 @@ pub fn evictLevel(self: *PathfindingSystem, level: u16, stats: *NavUpdateStats) 
     }
 }
 
-/// The nav reaction's registry flush dispatches: its apply under `evict_flush` and its count
-/// under `evict_flush_count`, apart from the update's flush (`publish.FlushDispatch`).
-pub fn evictFlushDispatch(self: *PathfindingSystem, thread_system: ?*ThreadSystem) ?publish.FlushDispatch {
-    const apply = navDispatch(self, thread_system, &self.tuners.evict_flush) orelse return null;
-    return .{ .apply = apply, .count_tuner = &self.tuners.evict_flush_count };
+/// A nav reaction's registry flush on `tuners` (an eviction phase's set), or on the one-off
+/// set while a shrink's truncation is pending (`publish.flushSet`), under the nav controls;
+/// null without a thread system.
+pub fn evictFlushDispatch(self: *PathfindingSystem, thread_system: ?*ThreadSystem, tuners: *publish.FlushTuners) ?publish.FlushDispatch {
+    const threads = thread_system orelse return null;
+    return .{ .rename = Dispatch.init(threads, &self.tuners.registry_rename, self.nav_controls), .tuners = publish.flushSet(self, tuners) };
 }
 
-/// The flush of the rebuilt levels' evictions: a level's worth of retires, a one-off the
-/// flush tuner has no profile for, so a tuned dispatch runs at a fixed shape of about one
-/// pair per range, outside the tuner (as a shrink's flush), and the marks batch's flush
-/// stays the stage's one sample of the step.
+/// The flush of the rebuilt levels' evictions on the one-off flush set (`one_off_flush`, a
+/// cache shrink's too): a level's worth of retires, so the marks batch's eviction flush stays
+/// its set's one sample of the step.
 pub fn flushRebuildEvictions(self: *PathfindingSystem, thread_system: ?*ThreadSystem) error{OutOfMemory}!BatchStats {
-    self.registry_flush_fixed = true;
-    return publish.flushRegistry(self, evictFlushDispatch(self, thread_system), null);
+    return publish.flushRegistry(self, evictFlushDispatch(self, thread_system, &self.tuners.one_off_flush), null);
 }
 
 /// Eviction before the batch commit, one item per changed key (a chunk with a changed
@@ -190,7 +190,7 @@ pub fn evictScoped(self: *PathfindingSystem, batch: NavBatchResult, thread_syste
         }
     }
     const flush_timer = StageTimer.begin();
-    const flush_batch = try publish.flushRegistry(self, evictFlushDispatch(self, thread_system), null);
+    const flush_batch = try publish.flushRegistry(self, evictFlushDispatch(self, thread_system, &self.tuners.evict_flush), null);
     if (comptime runtime_perf_log.enabled) {
         const count_batch = self.perf.last_flush_count_batch;
         // Both dispatches, inline or not: what remains is the flush's code outside them.
@@ -820,7 +820,7 @@ test "a nav reaction that rebuilds a level after a registry flush that ran out o
     try std.testing.expect(behind != 0);
 }
 
-test "a scoped eviction's registry flush counts under its own tuner and leaves the update flush's count tuner untouched" {
+test "a scoped eviction's registry flush runs on its own flush set and leaves the update flush's set untouched" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -833,15 +833,16 @@ test "a scoped eviction's registry flush counts under its own tuner and leaves t
     var system = try registrySystemWith(&data, &fixture.world, 64, .{ .participants = threads.participantSlotCount() });
     defer system.deinit();
     try solveRegistryRoutes(&system, requester, 24, 0, 60, 64, &threads, .{});
-    try std.testing.expect(system.tuners.registry_flush_count.last_request != null);
-    try std.testing.expect(system.tuners.evict_flush_count.last_request == null);
-    const update_count = system.tuners.registry_flush_count;
+    try std.testing.expect(system.tuners.registry_flush.get(.count).last_request != null);
+    try std.testing.expect(system.tuners.evict_flush.get(.count).last_request == null);
+    const update_flush = system.tuners.registry_flush;
     try setRegistryCells(&system, &fixture, &dense_change_cells, fixture.tree);
     const cached = system.completed.count();
     _ = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
     try std.testing.expect(system.completed.count() < cached);
-    try std.testing.expect(system.tuners.evict_flush_count.last_request != null);
-    try std.testing.expectEqualDeep(update_count, system.tuners.registry_flush_count);
+    try std.testing.expect(system.tuners.evict_flush.get(.count).last_request != null);
+    try std.testing.expect(system.tuners.evict_flush.get(.apply).last_request != null);
+    try std.testing.expectEqualDeep(update_flush, system.tuners.registry_flush);
     try expectRegistryMatchesCache(&system);
 }
 
@@ -1403,7 +1404,7 @@ test "a rebuilt start level evicts the results that leave it for a goal on anoth
     try expectLinkedCached(&system, keys, .{ false, false, true, false, false });
 }
 
-test "two levels rebuilt in one step evict each result through either once and flush once, outside the flush tuner" {
+test "two levels rebuilt in one step evict each result through either once and flush once, on the one-off flush set" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -1420,9 +1421,10 @@ test "two levels rebuilt in one step evict each result through either once and f
     try std.testing.expectEqual(@as(usize, 2), stats.levels_built);
     // Routes 0 and 4 have runs on both levels: each is evicted once.
     try expectLinkedCached(&system, keys, .{ false, true, false, false, false });
-    // The one-off flush ran at its fixed shape, so neither flush tuner selected anything.
-    try std.testing.expect(system.tuners.evict_flush.last_request == null);
-    try std.testing.expect(system.tuners.evict_flush_count.last_request == null);
+    // The one-off flush ran on its own set; the marks batch's eviction set selected nothing.
+    try std.testing.expect(system.tuners.one_off_flush.get(.count).last_request != null);
+    try std.testing.expect(system.tuners.one_off_flush.get(.apply).last_request != null);
+    for (system.tuners.evict_flush.values) |tuner| try std.testing.expect(tuner.last_request == null);
 }
 
 test "a level build that fails after an earlier level was evicted still flushes its evictions, and the retry finishes the rest" {

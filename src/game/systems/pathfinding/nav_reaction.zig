@@ -112,7 +112,9 @@ pub fn rebuildNavFromColliders(self: *PathfindingSystem, colliders: *const Stati
         try self.reserve(self.capacity);
     }
     self.goals.invalidate();
-    _ = try self.graph.rebuild(colliders.view(), extent, navUpdateThreads(self, thread_system));
+    self.tuners.startNavBuild();
+    const build_stats = try self.graph.rebuild(colliders.view(), extent, navUpdateThreads(self, thread_system));
+    if (comptime runtime_perf_log.enabled) self.perf.last_nav_build = build_stats;
     // Search scratch and group fields follow budgets reserved at the capacity seam, never
     // the level's cell count, so the build sizes nothing for them.
     // Grid versions are part of query keys. A rebuild invalidates pending
@@ -121,8 +123,8 @@ pub fn rebuildNavFromColliders(self: *PathfindingSystem, colliders: *const Stati
     try publish.openRegistryLevels(self, self.graph.levelCount());
     self.nav_marks.clearRetainingCapacity();
     // A rebuild can change cell/chunk counts and thus the per-item work cost, so the
-    // adaptive tuners' learned profiles no longer apply: they relearn against the new
-    // topology.
+    // adaptive tuners' learned profiles no longer apply: every set relearns against the new
+    // topology, the build set's one-offs from the full pool again.
     self.tuners = .{};
 }
 
@@ -131,6 +133,7 @@ fn navUpdateThreads(self: *PathfindingSystem, thread_system: ?*ThreadSystem) ?Na
     return .{
         .thread_system = threads,
         .tuners = &self.tuners.nav,
+        .build_tuners = &self.tuners.nav_build,
         .controls = self.nav_controls,
     };
 }
@@ -231,7 +234,8 @@ pub fn hasPendingNavUpdates(self: *const PathfindingSystem, world: *const WorldS
 /// and reach. Invalidates the step's goal table. A committed step stays on a later error;
 /// marks and the level, revision, and link gaps stay pending for the next call. The
 /// world-wide revision is compared once; levels are walked only when it moved. Each stage
-/// threads on `thread_system` under its tuner. Counts one step of
+/// threads on `thread_system` under its tuner, the step's level builds on a fresh build set
+/// (`startNavBuild`). Counts one step of
 /// the batch staging's release windows (`NavGraph.tickStagingStep`).
 pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const StaticColliderSystem, world: *const WorldSystem, thread_system: *ThreadSystem) NavApplyError!NavUpdateStats {
     var stats = NavUpdateStats{};
@@ -247,13 +251,15 @@ pub fn applyBufferedNavUpdates(self: *PathfindingSystem, colliders: *const Stati
     // A registry flush that failed is finished first: a level rebuild finds the results to
     // evict through their registered runs, and its retires must not land on a reused owner
     // id whose new runs still wait in the publish windows.
-    try publish.recoverRegistry(self, eviction.evictFlushDispatch(self, thread_system));
+    try publish.recoverRegistry(self, eviction.evictFlushDispatch(self, thread_system, &self.tuners.evict_flush));
     const view = colliders.view();
     if (self.graph.world_backed) {
         // Every level build of the step shares one level-sized staging, freed once at the
         // step's end (`finishStagingStep`), after the marks batch. Directory slots for the
         // world's levels open first, so a failed open leaves every level unbuilt.
         try publish.openRegistryLevels(self, world.levelCount());
+        // The step's level appends and content rebuilds are one nav build on a fresh set.
+        if (self.graph.levelCount() < world.levelCount() or world.contentRevision() != self.graph.built_world_revision) self.tuners.startNavBuild();
         while (self.graph.levelCount() < world.levelCount()) {
             try self.graph.buildLevel(view, world, @intCast(self.graph.levelCount()), threads, &stats);
         }

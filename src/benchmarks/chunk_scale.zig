@@ -2039,15 +2039,16 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     // changes the measured world. At least two cycles in every case.
     var warm = suite.Warmup.custom(case, 2, suite.adaptiveSettleIterationLimit(options));
     while (warm.nextSettled(nav.stageTunerSettle())) try levelAddInBandCycle(allocator, io, &nav, &driver, &refill);
-    // Each untimed level add after an in-band cycle grows the per-range scratch to the settled
-    // tuners' jump shape; a repeated jump count reuses its predicted shape.
+    // Each untimed level add after an in-band cycle grows the per-range scratch to the jump
+    // shape of the fresh build set every timed level build starts from; a repeated jump count
+    // reuses its predicted shape.
     for (0..options.warmup_iterations) |_| {
         try levelAddInBandCycle(allocator, io, &nav, &driver, &refill);
         _ = try levelAddIteration(io, &nav, &frame, replace);
     }
     const settle = nav.stageTunerSettle();
-    const remask_tuner = nav.pipeline.pathfinding.tuners.nav.getPtrConst(.remask);
-    const remask_tuner_start = suite.TunerStart.of(remask_tuner, case);
+    // The headline is the level build's remask, on the build set every nav build starts fresh.
+    const remask_tuner = nav.pipeline.pathfinding.tuners.nav_build.getPtrConst(.remask);
     var accumulator = suite.StatsAccumulator.init(item_count);
     var reactions = suite.NavReactionShapes{};
     var nav_main = suite.NavMainSummary{};
@@ -2072,7 +2073,7 @@ fn runNavLevelAddCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     stats.items_per_second = suite.itemsPerSecond(1, stats.mean_ns);
     if (case.adaptive) {
         stats.tuner_settle = settle.measured();
-        stats.work_tuning = suite.workTuningSummary(remask_tuner, remask_tuner_start);
+        stats.work_tuning = suite.workTuningSummary(remask_tuner, .fresh);
     }
     return stats;
 }

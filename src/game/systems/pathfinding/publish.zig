@@ -36,6 +36,7 @@ const pdq = @import("../../../core/sort.zig").pdq;
 const simd = @import("../../../core/simd.zig");
 const PaddedSlot = @import("../../../app/thread_system.zig").PaddedSlot;
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
+const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const types = @import("types.zig");
 const PathfindingStats = @import("types.zig").PathfindingStats;
 const RegRecord = @import("types.zig").RegRecord;
@@ -654,14 +655,36 @@ fn publishCopyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     job.bands[range.index] = .{ .counts = counts };
 }
 
-/// A threaded flush's dispatches: the apply stage under its caller's tuner, and the count
-/// dispatch's own tuner. The update's flush and the eviction's flush each own both: the
-/// eviction's count items are all retired inverse nodes (a chain walk and a sort of the
-/// listed chunks), the update's mostly publish adds (a bucket read and a pending increment).
+/// The registry flush passes every flush runs, each a stage with its own tuner: the count and
+/// the apply. A shrink's owner rename is a third pass with one tuner of its own.
+pub const FlushStage = enum { count, apply };
+
+/// One flush phase's count and apply tuners. The in-play phases each own a set: the update's
+/// flush (mostly publish adds: a bucket read and a pending increment) and the marks batch's
+/// eviction (retired inverse nodes: a chain walk and a sort of the listed chunks). The rare
+/// one-offs (a cache shrink's flush, a level rebuild's evictions) share one.
+pub const FlushTuners = std.EnumArray(FlushStage, AdaptiveWorkTuner);
+
+/// A threaded flush: the rename pass's dispatch (its tuner, only a shrink logs renames, under
+/// the caller's thread system and range controls) and the phase's tuner set.
 pub const FlushDispatch = struct {
-    apply: Dispatch,
-    count_tuner: *AdaptiveWorkTuner,
+    rename: Dispatch,
+    tuners: *FlushTuners,
+
+    /// `pass` under its own tuner in the phase's set, at the rename's controls.
+    pub fn stage(self: FlushDispatch, pass: FlushStage) Dispatch {
+        var dispatch = self.rename;
+        dispatch.tuner = self.tuners.getPtr(pass);
+        return dispatch;
+    }
 };
+
+/// The flush set a flush records into: the one-off set (`one_off_flush`) while a shrink's
+/// truncation is pending, so a shrink's flush trains the one-off set whichever phase runs it,
+/// else the caller's in-play set.
+pub fn flushSet(self: *PathfindingSystem, in_play: *FlushTuners) *FlushTuners {
+    return if (self.registry_truncate_pending) &self.tuners.one_off_flush else in_play;
+}
 
 /// True when a flush that ran out of memory left work for the next one: the last publish's
 /// registrations, logged owner ops, or a shrink's prepared owner heads. Every update and
@@ -673,11 +696,13 @@ pub fn registryBehind(self: *const PathfindingSystem) bool {
 /// Finishes the work a failed flush left (`registryBehind`) before anything publishes, logs
 /// more owner ops, resizes, or reads the registry: a later publish copy would overwrite the
 /// pending registrations, and a retire logged after them would leave them naming a dead
-/// owner. A one-off, so it runs at the fixed shape outside the tuners, as a shrink's flush.
-/// Does nothing when the registry is current. On `OutOfMemory` it is still behind, for retry.
+/// owner. Runs under the set the caller's dispatch picked (`flushSet`): a shrink's leftover
+/// on the one-off set, else the caller's in-play set; only an out-of-memory flush leaves work,
+/// so a recovery that crosses phases (a nav reaction finishing an update's flush) samples that
+/// set once. Does nothing when the registry is current. On `OutOfMemory` it is still behind, for
+/// retry.
 pub fn recoverRegistry(self: *PathfindingSystem, dispatch: ?FlushDispatch) error{OutOfMemory}!void {
     if (!registryBehind(self)) return;
-    self.registry_flush_fixed = true;
     _ = try flushRegistry(self, dispatch, null);
 }
 
@@ -699,13 +724,10 @@ pub fn recoverRegistry(self: *PathfindingSystem, dispatch: ?FlushDispatch) error
 /// perf-log-gated bench output (`PathfindingStats.Perf`).
 /// Count items: pair p weighs its adds + its ops + the inverse nodes its retires mark + 1.
 /// Apply items: the live lengths of the chunks it compacts + its adds + its ops + the
-/// nodes its retires mark + 1. A range runs the pairs whose first unit lies in it. A
-/// shrink, a rebuild, or a recovery flush runs both dispatches at a fixed shape of about
-/// one pair per range, outside the tuners; the rename pass always does. A dispatch wakes at
-/// most one worker fewer than the pair count. Returns the apply batch.
+/// nodes its retires mark + 1. A range runs the pairs whose first unit lies in it, so a range
+/// past the pairs runs none. Count and apply run under their tuners in the caller's phase set,
+/// the rename under its own (`FlushDispatch`). Returns the apply batch.
 pub fn flushRegistry(self: *PathfindingSystem, dispatch: ?FlushDispatch, stats: ?*PathfindingStats) error{OutOfMemory}!BatchStats {
-    // A failed flush leaves the fixed shape to the flush that finishes it, never a later one.
-    defer self.registry_flush_fixed = false;
     var batch = BatchStats{};
     const truncate = self.registry_truncate_pending;
     const ops = self.completed.core.ownerLog();
@@ -718,15 +740,14 @@ pub fn flushRegistry(self: *PathfindingSystem, dispatch: ?FlushDispatch, stats: 
             for (&pair_adds, band.counts) |*adds, count| adds.* += count;
         }
         const planned = try planOwnerLog(self, ops);
-        const fix = truncate or self.registry_flush_fixed;
-        count_batch = try runRegistryCount(self, dispatch, ops, pair_adds, fix);
+        count_batch = try runRegistryCount(self, if (dispatch) |flush| flush.stage(.count) else null, ops, pair_adds);
         try reserveRegistryPayloads(self);
-        if (planned.renamed_nodes != 0) rename_batch = runRegistryRename(self, if (dispatch) |stage| stage.apply else null);
+        if (planned.renamed_nodes != 0) rename_batch = runRegistryRename(self, if (dispatch) |flush| flush.rename else null);
         var apply_units: [flush_pair_count]usize = undefined;
         for (&apply_units, &self.path_index.counts, pair_adds, self.path_index.shard_op_count, self.path_index.retire_node_count) |*units, *counted, adds, shard_ops, retired| {
             units.* = counted.value.compact_len + adds + shard_ops + retired + 1;
         }
-        batch = runRegistryApply(self, if (dispatch) |stage| stage.apply else null, ops, apply_units, fix);
+        batch = runRegistryApply(self, if (dispatch) |flush| flush.stage(.apply) else null, ops, apply_units);
         releaseEmptiedChunks(self);
         holdEmptiedChunks(self);
         if (comptime runtime_perf_log.enabled) {
@@ -861,16 +882,6 @@ fn planOwnerLog(self: *PathfindingSystem, ops: []const OwnerOp) error{OutOfMemor
     return totals;
 }
 
-fn shapedDispatch(stage: Dispatch, units: usize, fix: bool, tuner: *AdaptiveWorkTuner) Dispatch {
-    var shaped = stage;
-    shaped.tuner = tuner;
-    shaped.max_worker_threads = @min(stage.max_worker_threads orelse flush_pair_count - 1, flush_pair_count - 1);
-    if (fix and stage.adaptive and stage.items_per_range == null) {
-        shaped.items_per_range = @divCeil(@max(units, 1), flush_pair_count);
-    }
-    return shaped;
-}
-
 // SIMD verdict: scalar. A 16-entry prefix sum, a tiny fixed batch.
 fn unitStarts(weights: [flush_pair_count]usize) struct { starts: [flush_pair_count + 1]usize, total: usize } {
     var starts: [flush_pair_count + 1]usize = undefined;
@@ -885,18 +896,16 @@ fn unitStarts(weights: [flush_pair_count]usize) struct { starts: [flush_pair_cou
 
 fn runRegistryCount(
     self: *PathfindingSystem,
-    dispatch: ?FlushDispatch,
+    dispatch: ?Dispatch,
     ops: []const OwnerOp,
     pair_adds: [flush_pair_count]usize,
-    fix: bool,
 ) error{OutOfMemory}!BatchStats {
     const index = &self.path_index;
     var weights: [flush_pair_count]usize = undefined;
     for (&weights, pair_adds, index.shard_op_count, index.retire_node_count) |*weight, adds, shard_ops, nodes| weight.* = adds + shard_ops + nodes + 1;
     const counted = unitStarts(weights);
     try reserveCountWindows(self, pair_adds, index.retire_node_count);
-    const count_dispatch: ?Dispatch = if (dispatch) |stage| shapedDispatch(stage.apply, counted.total, fix, stage.count_tuner) else null;
-    const shape = StageShape.select(count_dispatch, counted.total, 1);
+    const shape = StageShape.select(dispatch, counted.total, 1);
     var job = RegistryCountJob{
         .system = self,
         .ops = ops,
@@ -904,7 +913,7 @@ fn runRegistryCount(
         .range_count = shape.range_count,
         .unit_starts = counted.starts,
     };
-    return runShaped(count_dispatch, shape, counted.total, 1, &job, registryCountJob);
+    return runShaped(dispatch, shape, counted.total, 1, &job, registryCountJob);
 }
 
 // SIMD verdict: scalar. A 16-entry aligned prefix, a tiny fixed batch.
@@ -937,9 +946,7 @@ fn reserveCountWindows(self: *PathfindingSystem, pair_adds: [flush_pair_count]us
 // rewrite the owner of every registration in one pass over the block pool, one item per
 // block (a chunk's run), instead of walking each renamed chain. `rename_to` maps each
 // renamed chain's pre-flush owner to the id its chain ends on, set here on the main thread
-// (O(listed ids)) and reset to the identity after the join. A one-off of a cache shrink, so
-// it runs at a fixed shape of about a sixteenth of the pool per range, outside the tuners.
-// Returns the stage's batch.
+// (O(listed ids)) and reset to the identity after the join. Returns the stage's batch.
 // SIMD verdict: scalar. The `rename_to` set and reset are sparse scatters over the listed
 // ids.
 fn runRegistryRename(self: *PathfindingSystem, dispatch: ?Dispatch) BatchStats {
@@ -949,14 +956,13 @@ fn runRegistryRename(self: *PathfindingSystem, dispatch: ?Dispatch) BatchStats {
         if (origin != no_entry and origin != id) plan.rename_to.items[origin] = id;
     }
     const blocks = index.directory.blocks.items;
-    const rename_dispatch: ?Dispatch = if (dispatch) |stage| shapedDispatch(stage, blocks.len, true, stage.tuner) else null;
-    const shape = StageShape.select(rename_dispatch, blocks.len, 1);
+    const shape = StageShape.select(dispatch, blocks.len, 1);
     var job = RegistryRenameJob{
         .blocks = blocks,
         .rename_to = plan.rename_to.items,
         .range_count = shape.range_count,
     };
-    const batch = runShaped(rename_dispatch, shape, blocks.len, 1, &job, registryRenameJob);
+    const batch = runShaped(dispatch, shape, blocks.len, 1, &job, registryRenameJob);
     for (plan.ids.items, plan.origin.items) |id, origin| {
         if (origin != no_entry and origin != id) plan.rename_to.items[origin] = origin;
     }
@@ -997,11 +1003,9 @@ fn runRegistryApply(
     dispatch: ?Dispatch,
     ops: []const OwnerOp,
     weights: [flush_pair_count]usize,
-    fix: bool,
 ) BatchStats {
     const counted = unitStarts(weights);
-    const apply_dispatch: ?Dispatch = if (dispatch) |stage| shapedDispatch(stage, counted.total, fix, stage.tuner) else null;
-    const shape = StageShape.select(apply_dispatch, counted.total, 1);
+    const shape = StageShape.select(dispatch, counted.total, 1);
     var job = RegistryApplyJob{
         .system = self,
         .ops = ops,
@@ -1010,7 +1014,7 @@ fn runRegistryApply(
         .range_count = shape.range_count,
         .unit_starts = counted.starts,
     };
-    return runShaped(apply_dispatch, shape, counted.total, 1, &job, registryApplyJob);
+    return runShaped(dispatch, shape, counted.total, 1, &job, registryApplyJob);
 }
 
 // The flush's growth seam, on the main thread between the count join and the apply
@@ -1431,7 +1435,6 @@ const math = @import("../../../core/math.zig");
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const PathRequest = @import("../../simulation.zig").PathRequest;
-const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const PathfindingConfig = @import("types.zig").PathfindingConfig;
 const PathQueryKey = @import("types.zig").PathQueryKey;
 const PathStatus = @import("types.zig").PathStatus;
@@ -1999,7 +2002,7 @@ fn shrinkThroughUpdates(serial: *PathfindingSystem, threaded: *PathfindingSystem
     }
 }
 
-test "a shrink's registry flush under the adaptive control leaves the flush tuner untouched, renames included, and equals the serial flush" {
+test "a shrink's registry flush under the adaptive control runs count and apply on the one-off flush set and its rename on the rename tuner, leaves the update flush set untouched, and equals the serial flush" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -2013,13 +2016,15 @@ test "a shrink's registry flush under the adaptive control leaves the flush tune
     defer serial.deinit();
     var threaded = try shrinkFixture(&data, &fixture, requester, threads.participantSlotCount());
     defer threaded.deinit();
-    // The shrink's fixed-shape flush leaves the flush tuner untouched.
-    const tuner_before = threaded.tuners.registry_flush;
+    // The empty steps flush nothing; the shrink's flush runs count and apply on the one-off
+    // set and its renames on their own tuner.
+    const update_before = threaded.tuners.registry_flush;
+    for (threaded.tuners.one_off_flush.values) |tuner| try std.testing.expect(tuner.last_request == null);
+    try std.testing.expect(threaded.tuners.registry_rename.last_request == null);
     try shrinkThroughUpdates(&serial, &threaded, &threads, .{});
-    const tuner_after = threaded.tuners.registry_flush;
-    try std.testing.expectEqual(tuner_before.sample_count, tuner_after.sample_count);
-    try std.testing.expectEqual(tuner_before.phase, tuner_after.phase);
-    try std.testing.expectEqual(tuner_before.current_profile, tuner_after.current_profile);
+    for (threaded.tuners.one_off_flush.values) |tuner| try std.testing.expect(tuner.last_request != null);
+    try std.testing.expect(threaded.tuners.registry_rename.last_request != null);
+    try std.testing.expectEqualDeep(update_before, threaded.tuners.registry_flush);
     try std.testing.expectEqual(@as(usize, 32), threaded.completed.logicalCapacity());
     try expectSameCache(&serial, &threaded);
     try expectSameRegistry(&serial, &threaded);

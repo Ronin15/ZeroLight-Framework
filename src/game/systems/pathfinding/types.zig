@@ -330,6 +330,9 @@ pub const NavUpdateStats = struct {
         remask_batch: BatchStats = .{},
         conn_flood_batch: BatchStats = .{},
         conn_closure_rows_batch: BatchStats = .{},
+        // The one-way closure's copy of relocated spans, before its rows: bench output, not a
+        // perf-log key.
+        conn_closure_copy_batch: BatchStats = .{},
         evict_batch: BatchStats = .{},
         // Remask, patch, mark, and eviction dispatch time that ran on workers; inline stages
         // add nothing.
@@ -377,7 +380,7 @@ pub const NavUpdateStats = struct {
         conn_closure_mask_batch: BatchStats = .{},
         conn_closure_plan_batch: BatchStats = .{},
         // The closure's components touched, links resolved, terminals new and left, rows
-        // recomputed (|A|), row rounds (round 0 included), block words written, blocks
+        // recomputed (|A|), row rounds, block words written, blocks
         // narrowed, blocks allocated and freed, words landed, and landings deferred by
         // `OutOfMemory`, summed; and the live block words and the batch tail's capacity after
         // the last batch.
@@ -395,7 +398,7 @@ pub const NavUpdateStats = struct {
         closure_land_deferrals: usize = 0,
         closure_live_words: usize = 0,
         closure_tail_capacity: usize = 0,
-        // The most rows (copy spans or round items) one closure rows round dispatched.
+        // The most round items one closure rows round dispatched.
         closure_rows_round_items_max: usize = 0,
         // Each the most over the update's closure batches: the tail words a batch's bound
         // reserved and its relocated blocks took, its candidate components' block words, the

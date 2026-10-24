@@ -126,7 +126,9 @@ pub const connectivity_split_group = suite.BenchmarkGroup{
 // and its closure stages are flat in systems; the ballast's own landing and free follow its
 // block alone. `--details` as for `pathfinding-connectivity-split`, plus variant 7's ballast
 // retire (the reopen's landing and tail use, the close's free) and the split of its timed
-// block reaction (reserve, closure stages, landing, rest).
+// block reaction (reserve, closure stages through the copy and rows, landing, rest). The
+// summary's `closure_rows_off_main` is the closure write on workers: the relocated-span copy
+// and the rows.
 pub const connectivity_oneway_group = suite.BenchmarkGroup{
     .name = "pathfinding-connectivity-oneway",
     .item_label = OnewayCode.label,
@@ -274,7 +276,7 @@ fn checkOnewayWithinBounds(fixture: *const ReactFixture, stats: NavUpdateStats, 
 fn checkOnewayUntouched(stats: NavUpdateStats) !void {
     const perf = stats.perf;
     if (perf.conn_closure_candidates_batch.item_count == 0) return error.ConnectivityOnewayNoCandidateScan;
-    for ([_]BatchStats{ perf.conn_closure_resolve_batch, perf.conn_closure_mask_batch, perf.conn_closure_plan_batch, stats.perf.conn_closure_rows_batch, perf.conn_closure_land_batch }) |batch| {
+    for ([_]BatchStats{ perf.conn_closure_resolve_batch, perf.conn_closure_mask_batch, perf.conn_closure_plan_batch, perf.conn_closure_copy_batch, perf.conn_closure_rows_batch, perf.conn_closure_land_batch }) |batch| {
         if (batch.item_count != 0) return error.ConnectivityOnewayFarDigRanClosure;
     }
     if (perf.closure_words_written != 0 or perf.closure_landed_words != 0) return error.ConnectivityOnewayFarDigWroteBlock;
@@ -361,7 +363,8 @@ const ToggleReport = struct {
     closure_block_allocs: usize = 0,
     closure_block_frees: usize = 0,
     closure_landed_words: usize = 0,
-    // The change reactions' closure rows on workers, summed.
+    // The change reactions' closure write on workers (the relocated-span copy and the rows),
+    // summed.
     closure_rows_off_main_ns: u64 = 0,
     // The sample reaction with the larger closure tail bound.
     reserve: NavUpdateStats = .{},
@@ -380,7 +383,7 @@ const ToggleReport = struct {
         self.nav_main.add(sample.revert.elapsed_ns -| revert_off_main_ns, revert);
         self.nav_main.endSample();
         self.shapes.add(sample.change.mark, change);
-        self.closure_rows_off_main_ns += offMainNs(change.perf.conn_closure_rows_batch);
+        self.closure_rows_off_main_ns += offMainNs(change.perf.conn_closure_copy_batch) + offMainNs(change.perf.conn_closure_rows_batch);
         self.revert_flood_nodes = revert.perf.conn_flood_nodes;
         self.closure_shrinks += change.perf.closure_shrinks + revert.perf.closure_shrinks;
         self.closure_block_allocs += change.perf.closure_block_allocs + revert.perf.closure_block_allocs;
@@ -1543,7 +1546,7 @@ const OnewayBallast = struct {
         self.samples += 1;
         self.close_ns += sample.change.elapsed_ns;
         self.reserve_ns += change.perf.main.reserve_ns;
-        inline for (.{ change.perf.conn_closure_candidates_batch, change.perf.conn_closure_resolve_batch, change.perf.conn_closure_mask_batch, change.perf.conn_closure_plan_batch, change.perf.conn_closure_rows_batch }) |batch| {
+        inline for (.{ change.perf.conn_closure_candidates_batch, change.perf.conn_closure_resolve_batch, change.perf.conn_closure_mask_batch, change.perf.conn_closure_plan_batch, change.perf.conn_closure_copy_batch, change.perf.conn_closure_rows_batch }) |batch| {
             self.closure_stages_ns += batch.batch_duration_ns;
         }
         self.land_ns += change.perf.conn_closure_land_batch.batch_duration_ns;

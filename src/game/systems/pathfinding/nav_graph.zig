@@ -408,7 +408,7 @@ const claim_pending: u32 = no_block - 1;
 
 /// The threaded stages of a nav batch: key plan, remask and component flood, record patch,
 /// connectivity seed, gather, and flood, and the one-way closure's candidates, resolve,
-/// mask, plan, rows, and landing.
+/// mask, plan, relocated-span copy, rows, and landing.
 pub const NavStage = enum {
     plan,
     remask,
@@ -420,6 +420,7 @@ pub const NavStage = enum {
     conn_closure_resolve,
     conn_closure_mask,
     conn_closure_plan,
+    conn_closure_copy,
     conn_closure_rows,
     conn_closure_land,
 };
@@ -427,28 +428,40 @@ pub const NavStage = enum {
 /// One tuner per nav stage, owned by the nav's owner.
 pub const NavStageTuners = std.EnumArray(NavStage, AdaptiveWorkTuner);
 
-/// Threading for nav batches: the shared thread system plus each stage's tuner, all under
-/// one set of range controls. Absent: every stage runs inline.
+/// Threading for nav batches: the shared thread system, the marks patch's stage tuners
+/// (`tuners`), the level builds' (`build_tuners`: a world build, an in-play append or
+/// content rebuild), all under one set of range controls. Absent: every stage runs inline.
 pub const NavUpdateThreads = struct {
     thread_system: *ThreadSystem,
     tuners: *NavStageTuners,
+    build_tuners: *NavStageTuners,
     controls: StageControls = .{},
 };
 
-// `stage`'s dispatch, or null to run it inline.
-fn stageThreads(threads: ?NavUpdateThreads, stage: NavStage) ?Dispatch {
+// The phase a nav stage dispatches for: a marks batch (`patch`) or a level build (`build`).
+const NavSet = enum { patch, build };
+
+// `stage`'s dispatch under `set`'s tuner, or null to run it inline.
+fn stageThreads(threads: ?NavUpdateThreads, set: NavSet, stage: NavStage) ?Dispatch {
     const t = threads orelse return null;
-    return Dispatch.init(t.thread_system, t.tuners.getPtr(stage), t.controls);
+    const tuners = switch (set) {
+        .patch => t.tuners,
+        .build => t.build_tuners,
+    };
+    return Dispatch.init(t.thread_system, tuners.getPtr(stage), t.controls);
 }
 
-fn closureThreads(threads: ?NavUpdateThreads) ClosureThreads {
+// The closure stages under `set`; the landing of an earlier batch's tail under `land_set`,
+// the set that wrote it.
+fn closureThreads(threads: ?NavUpdateThreads, set: NavSet, land_set: NavSet) ClosureThreads {
     return .{
-        .candidates = stageThreads(threads, .conn_closure_candidates),
-        .resolve = stageThreads(threads, .conn_closure_resolve),
-        .mask = stageThreads(threads, .conn_closure_mask),
-        .plan = stageThreads(threads, .conn_closure_plan),
-        .rows = stageThreads(threads, .conn_closure_rows),
-        .land = stageThreads(threads, .conn_closure_land),
+        .candidates = stageThreads(threads, set, .conn_closure_candidates),
+        .resolve = stageThreads(threads, set, .conn_closure_resolve),
+        .mask = stageThreads(threads, set, .conn_closure_mask),
+        .plan = stageThreads(threads, set, .conn_closure_plan),
+        .copy = stageThreads(threads, set, .conn_closure_copy),
+        .rows = stageThreads(threads, set, .conn_closure_rows),
+        .land = stageThreads(threads, land_set, .conn_closure_land),
     };
 }
 
@@ -731,7 +744,10 @@ fn addConnectivityStats(stats: *NavUpdateStats, conn: *const Connectivity, count
 // `runtime_perf_log.enabled`.
 fn addClosureStats(stats: *NavUpdateStats, conn: *const Connectivity, counters: ClosureCounters) void {
     if (comptime !runtime_perf_log.enabled) return;
-    if (counters.links != 0) accumulateBatch(&stats.perf.conn_closure_rows_batch, conn.closure.perf.last_rows_batch);
+    if (counters.links != 0) {
+        accumulateBatch(&stats.perf.conn_closure_copy_batch, conn.closure.perf.last_copy_batch);
+        accumulateBatch(&stats.perf.conn_closure_rows_batch, conn.closure.perf.last_rows_batch);
+    }
     stats.perf.closure_touched += counters.perf.touched;
     stats.perf.closure_links += counters.links;
     stats.perf.closure_terms_new += counters.perf.terms_new;
@@ -855,6 +871,9 @@ pub const NavGraph = struct {
     connectivity: Connectivity = .{},
     // The world-wide content revision every level was last checked against.
     built_world_revision: u32 = 0,
+    // The set whose batch last left relocated closure blocks in the batch tail; their landing
+    // (`landClosure`, or the next prepare's) runs under its tuners.
+    tail_set: NavSet = .patch,
     // Batch buffers, reused across batches. `changed_masks` holds, per changed key of the
     // marks batch, the cells it flipped; it and the key lists are valid only within the
     // batch result (`NavBatchResult`), as the step's staging release may free them.
@@ -1019,7 +1038,7 @@ pub const NavGraph = struct {
         // The one-way closure over every level at once, after the levels and before the swap.
         const fresh_levels = BatchLevels{ .grids = fresh.levels.items, .graphs = fresh.level_graphs.items };
         fresh.beginBuild();
-        const closure_counters = try fresh.connectivity.buildClosure(self.allocator, fresh_levels, world, closureThreads(threads), &fresh.pool_grows, &stats);
+        const closure_counters = try fresh.connectivity.buildClosure(self.allocator, fresh_levels, world, closureThreads(threads, .build, fresh.tail_set), &fresh.pool_grows, &stats);
         fresh.endBuild();
         addClosureStats(&stats, &fresh.connectivity, closure_counters);
         // The world build's staging frees now, down to the floors.
@@ -1101,11 +1120,11 @@ pub const NavGraph = struct {
         stats.addMain(.reserve_ns, section.lap());
 
         // Commit into the fresh storage.
-        self.remaskKeys(levels, colliders, world, null, stageThreads(threads, .remask), stats);
+        self.remaskKeys(levels, colliders, world, null, stageThreads(threads, .build, .remask), stats);
         section = StageTimer.begin();
         self.claimRecords(levels);
         stats.addMain(.commit_ns, section.lap());
-        self.patchKeys(levels, world, stageThreads(threads, .patch), stats);
+        self.patchKeys(levels, world, stageThreads(threads, .build, .patch), stats);
         // Connectivity: reserves first, so an error leaves every other level as it was.
         const old_levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
         const replaced: ?*NavLevelGraph = if (appending) null else &self.level_graphs.items[level_index];
@@ -1116,13 +1135,14 @@ pub const NavGraph = struct {
             world,
             self.changed_keys.items,
             replaced,
-            stageThreads(threads, .conn_seed),
-            stageThreads(threads, .conn_gather),
-            stageThreads(threads, .conn_flood),
-            closureThreads(threads),
+            stageThreads(threads, .build, .conn_seed),
+            stageThreads(threads, .build, .conn_gather),
+            stageThreads(threads, .build, .conn_flood),
+            closureThreads(threads, .build, self.tail_set),
             &self.pool_grows,
             stats,
         );
+        self.noteTail(.build);
         addConnectivityStats(stats, &self.connectivity, counters);
         section = StageTimer.begin();
         _ = self.releaseRecords(levels);
@@ -1240,7 +1260,7 @@ pub const NavGraph = struct {
         };
         // The batch notes its needs in the release window (`finishStagingStep`).
         self.staging_window.beginBatch();
-        try self.planKeys(world, marks, new_links, stageThreads(threads, .plan), stats);
+        try self.planKeys(world, marks, new_links, stageThreads(threads, .patch, .plan), stats);
         var section = StageTimer.begin();
         try types.resizeStaging(&self.changed_masks, self.allocator, self.changed_keys.items.len, &self.pool_grows);
         if (self.patch_keys.items.len != 0) {
@@ -1257,8 +1277,8 @@ pub const NavGraph = struct {
                 self.patch_keys.items,
                 self.patch_info.items,
                 new_links,
-                stageThreads(threads, .conn_seed),
-                closureThreads(threads),
+                stageThreads(threads, .patch, .conn_seed),
+                closureThreads(threads, .patch, self.tail_set),
                 &self.pool_grows,
                 stats,
             );
@@ -1296,12 +1316,13 @@ pub const NavGraph = struct {
         if (self.patch_keys.items.len == 0) return .{ .changed = false, .dirty_keys = &.{}, .changed_keys = &.{}, .changed_masks = &.{} };
         const levels = BatchLevels{ .grids = self.levels.items, .graphs = self.level_graphs.items };
         std.debug.assert(self.changed_masks.items.len == self.changed_keys.items.len);
-        self.remaskKeys(levels, colliders, prepared.world, self.changed_masks.items, stageThreads(threads, .remask), stats);
+        self.remaskKeys(levels, colliders, prepared.world, self.changed_masks.items, stageThreads(threads, .patch, .remask), stats);
         section = StageTimer.begin();
         self.claimRecords(levels);
         stats.addMain(.commit_ns, section.lap());
-        self.patchKeys(levels, prepared.world, stageThreads(threads, .patch), stats);
-        const counters = self.connectivity.commitMarks(self.allocator, levels, prepared.world, self.patch_keys.items, new_links, stageThreads(threads, .conn_gather), stageThreads(threads, .conn_flood), closureThreads(threads), stats);
+        self.patchKeys(levels, prepared.world, stageThreads(threads, .patch, .patch), stats);
+        const counters = self.connectivity.commitMarks(self.allocator, levels, prepared.world, self.patch_keys.items, new_links, stageThreads(threads, .patch, .conn_gather), stageThreads(threads, .patch, .conn_flood), closureThreads(threads, .patch, self.tail_set), stats);
+        self.noteTail(.patch);
         addConnectivityStats(stats, &self.connectivity, counters);
         section = StageTimer.begin();
         stats.records_patched += self.releaseRecords(levels);
@@ -1330,9 +1351,10 @@ pub const NavGraph = struct {
     /// succeeds. Never fails: on `OutOfMemory` the blocks stay valid in the tail, the first
     /// deferral logs once (with the perf log, the perf-only `closure_land_deferrals` and
     /// `perf.land_deferrals` count each), and the next prepare retries the landing, failing as
-    /// an ordinary `OutOfMemory` with the graph intact. Main work O(1) per block.
+    /// an ordinary `OutOfMemory` with the graph intact. Main work O(1) per block. Lands under
+    /// the tuner set of the batch that wrote the tail (`tail_set`).
     pub fn landClosure(self: *NavGraph, threads: ?NavUpdateThreads, stats: *NavUpdateStats) void {
-        self.connectivity.landResidents(self.allocator, stageThreads(threads, .conn_closure_land), stats) catch {
+        self.connectivity.landResidents(self.allocator, stageThreads(threads, self.tail_set, .conn_closure_land), stats) catch {
             if (comptime runtime_perf_log.enabled) {
                 stats.perf.closure_land_deferrals += 1;
                 self.perf.land_deferrals += 1;
@@ -1342,6 +1364,11 @@ pub const NavGraph = struct {
             if (comptime logging.enabled(.warn))
                 logging.game.warn("nav closure landing deferred: out of memory; the next nav batch retries it", .{});
         };
+    }
+
+    // Names `set` the tail's writer when its connectivity call left relocated blocks there.
+    fn noteTail(self: *NavGraph, set: NavSet) void {
+        if (self.connectivity.closure.residents.items.len != 0) self.tail_set = set;
     }
 
     fn logPoolGrowth(self: *NavGraph) void {
@@ -2169,7 +2196,7 @@ test "threaded initial nav build matches a serial build across levels" {
     defer threaded.deinit();
     try threaded.reserve(cap);
     threaded.nav_controls = .{ .adaptive = false, .items_per_range = 1 };
-    _ = try threaded.graph.rebuild(no_colliders.view(), .{ .world = &world }, .{ .thread_system = &threads, .tuners = &threaded.tuners.nav, .controls = threaded.nav_controls });
+    _ = try threaded.graph.rebuild(no_colliders.view(), .{ .world = &world }, .{ .thread_system = &threads, .tuners = &threaded.tuners.nav, .build_tuners = &threaded.tuners.nav_build, .controls = threaded.nav_controls });
 
     var serial = PathfindingSystem.init(std.testing.allocator);
     defer serial.deinit();
@@ -3716,6 +3743,72 @@ test "a level added in play builds only its own chunks and leaves other levels a
     try std.testing.expect(try routes(&system, &data, &fixture.world, level, .{ 1, 1 }, level, .{ 10, 10 }));
 }
 
+test "an in-play level append and a level rebuild run on the build tuner set and leave the marks patch set untouched" {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try twoLevelWorld(&meta);
+    defer fixture.world.deinit();
+    var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
+    defer system.deinit();
+    const level = try fixture.world.addLevel(-32);
+    _ = try fixture.world.addDenseLayer(level, 0, .floor, fixture.grass);
+    const appended = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expectEqual(@as(usize, 1), appended.levels_built);
+    for ([_]NavStage{ .remask, .patch, .conn_gather }) |stage| {
+        try std.testing.expect(system.tuners.nav_build.get(stage).last_request != null);
+    }
+    for (system.tuners.nav.values) |tuner| try std.testing.expect(tuner.last_request == null);
+    // A content revision rebuilds the level on the same set.
+    _ = try fixture.world.addDenseLayer(1, 0, .obstacle, fixture.tree);
+    const rebuilt = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.levels_built);
+    try std.testing.expect(system.tuners.nav_build.get(.remask).last_request != null);
+    for (system.tuners.nav.values) |tuner| try std.testing.expect(tuner.last_request == null);
+}
+
+// Leaves every level build stage tuner as a trained one would: learned at a count no build
+// here reaches, so a build that kept it would run its stages inline and stay on that count.
+fn trainNavBuildTuners(system: *PathfindingSystem) void {
+    for (&system.tuners.nav_build.values) |*tuner| tuner.learned_item_count = std.math.maxInt(usize);
+}
+
+// Every level build stage tuner kept nothing a trained one held, and the remask, which every
+// build runs, recorded its fresh first selection: the full pool.
+fn expectNavBuildTunersFresh(system: *const PathfindingSystem) !void {
+    for (system.tuners.nav_build.values) |tuner| try std.testing.expect(tuner.learned_item_count != std.math.maxInt(usize));
+    try std.testing.expect(system.tuners.nav_build.get(.remask).sampled_profile.?.worker_threads > 0);
+}
+
+test "every nav step that builds levels starts its level build stage set fresh: a level append and a content rebuild" {
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var fixture = try twoLevelWorld(&meta);
+    defer fixture.world.deinit();
+    var system = try fullRebuild(&data, &fixture.world, abstractCapacity());
+    defer system.deinit();
+
+    trainNavBuildTuners(&system);
+    const level = try fixture.world.addLevel(-32);
+    _ = try fixture.world.addDenseLayer(level, 0, .floor, fixture.grass);
+    const appended = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expectEqual(@as(usize, 1), appended.levels_built);
+    try expectNavBuildTunersFresh(&system);
+
+    trainNavBuildTuners(&system);
+    _ = try fixture.world.addDenseLayer(1, 0, .obstacle, fixture.tree);
+    const rebuilt = try system.applyBufferedNavUpdates(no_colliders, &fixture.world, &threads);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.levels_built);
+    try expectNavBuildTunersFresh(&system);
+}
+
 test "a world build that runs out of memory leaves the previous graph intact; a replaced world releases its storage" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4445,7 +4538,7 @@ test "the key plan equals the plan by definition for multi-chunk marks at level 
     }
     for (&systems, [_]?*ThreadSystem{ null, &threads }) |*system, thread_system| {
         var stats = NavUpdateStats{};
-        const threads_for: ?NavUpdateThreads = if (thread_system) |ts| .{ .thread_system = ts, .tuners = &system.tuners.nav, .controls = system.nav_controls } else null;
+        const threads_for: ?NavUpdateThreads = if (thread_system) |ts| .{ .thread_system = ts, .tuners = &system.tuners.nav, .build_tuners = &system.tuners.nav_build, .controls = system.nav_controls } else null;
         const prepared = (try system.graph.prepareMarks(&world, no_colliders.view(), &marks, threads_for, &stats)).?;
         defer system.graph.abortMarks(prepared);
         if (thread_system != null) try std.testing.expect(system.graph.plan_tallies.items.len > 1);

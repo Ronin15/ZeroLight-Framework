@@ -974,6 +974,7 @@ pub fn forcedNavThreads(system: *PathfindingSystem, threads: *ThreadSystem) NavU
     return .{
         .thread_system = threads,
         .tuners = &system.tuners.nav,
+        .build_tuners = &system.tuners.nav_build,
         .controls = .{ .adaptive = false, .items_per_range = 1 },
     };
 }

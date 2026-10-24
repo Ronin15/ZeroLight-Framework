@@ -15,6 +15,7 @@ const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
+const RoundDispatch = @import("../../../app/thread_system.zig").RoundDispatch;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const GroupField = @import("group_field.zig").GroupField;
@@ -46,15 +47,7 @@ pub fn groupFieldThreshold(self: *const PathfindingSystem) usize {
 pub fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats, threads: StageThreads) void {
     if (!self.graph.valid()) return;
     const threshold = groupFieldThreshold(self);
-    std.debug.assert(self.group_field_slots.capacity >= self.group_fields.items.len);
-    self.group_field_slots.clearRetainingCapacity();
-    for (self.group_fields.items, 0..) |*field, slot| {
-        field.fresh_this_step = false;
-        if (field.state == .building and self.graph.grid(field.key.goal_level) != null) {
-            field.step_budget_left = self.capacity.group_field_build_budget;
-            self.group_field_slots.appendAssumeCapacity(slot);
-        }
-    }
+    queueAdvancePass(self);
     const advance_batch = expandGroupFieldSlots(self, threads, &self.tuners.group_field);
     if (comptime runtime_perf_log.enabled) stats.perf.group_field_batch = advance_batch;
     var slots_exhausted = false;
@@ -94,23 +87,36 @@ pub fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats, th
     }
 }
 
+// Queues the step's advance pass in `group_field_slots`: every field building at step start
+// whose goal level has a grid, each on a fresh step budget. Clears each field's begun-this-step
+// flag.
+fn queueAdvancePass(self: *PathfindingSystem) void {
+    std.debug.assert(self.group_field_slots.capacity >= self.group_fields.items.len);
+    self.group_field_slots.clearRetainingCapacity();
+    for (self.group_fields.items, 0..) |*field, slot| {
+        field.fresh_this_step = false;
+        if (field.state == .building and self.graph.grid(field.key.goal_level) != null) {
+            field.step_budget_left = self.capacity.group_field_build_budget;
+            self.group_field_slots.appendAssumeCapacity(slot);
+        }
+    }
+}
+
 // Expands every field in `group_field_slots` by the rest of its step budget; each item
 // writes only its own field. A field whose pool ran out of room stalls before its pop;
 // after the join the main thread grows each stalled field's pool (O(1) per field per
 // round, geometric, counted) and expands the stalled fields again, so a step's progress
 // never depends on pool capacity. A growth that runs out of memory leaves its field
-// stalled for the next step. Returns the first round's batch (later rounds happen only
-// while pools warm up).
+// stalled for the next step. The pass's rounds run under one selection from its fields and
+// record one sample into `tuner` (`RoundDispatch`). Returns the rounds folded into one.
 fn expandGroupFieldSlots(self: *PathfindingSystem, threads: StageThreads, tuner: *AdaptiveWorkTuner) BatchStats {
-    var first: ?BatchStats = null;
+    const fields = self.group_field_slots.items.len;
+    if (fields == 0) return .{};
+    var rounds = RoundDispatch.begin(threads.stage(tuner), fields);
     while (self.group_field_slots.items.len != 0) {
         const slots = self.group_field_slots.items;
-        const round_tuner = if (first == null) tuner else &self.tuners.group_field_stall;
-        const round = threads.stage(round_tuner);
-        const selection = round.select(slots.len, 1);
-        var job = GroupFieldJob{ .system = self, .slots = slots, .range_count = selection.range_count };
-        const batch = round.run(selection, slots.len, 1, &job, groupFieldExpandJob);
-        if (first == null) first = batch;
+        var job = GroupFieldJob{ .system = self, .slots = slots };
+        rounds.run(slots.len, &job, &job.range_count, groupFieldExpandJob);
         var stalled: usize = 0;
         for (slots) |slot| {
             const field = &self.group_fields.items[slot];
@@ -121,7 +127,7 @@ fn expandGroupFieldSlots(self: *PathfindingSystem, threads: StageThreads, tuner:
         }
         self.group_field_slots.shrinkRetainingCapacity(stalled);
     }
-    return first orelse .{};
+    return rounds.finish(fields);
 }
 
 fn expandGroupField(self: *PathfindingSystem, slot: usize) void {
@@ -303,7 +309,7 @@ pub fn groupFieldOf(self: *const PathfindingSystem, key: PathQueryKey) ?*const G
 const GroupFieldJob = struct {
     system: *PathfindingSystem,
     slots: []const usize,
-    range_count: usize,
+    range_count: usize = 0,
 };
 
 fn groupFieldExpandJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -952,6 +958,42 @@ test "threaded group-field service with stall rounds equals serial and runs on w
     var ready: usize = 0;
     for (serial.group_fields.items) |field| ready += @intFromBool(field.state == .ready);
     try std.testing.expectEqual(@as(usize, 4), ready);
+}
+
+test "a group-field pass whose fields stall records one tuner sample over all its rounds" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try data.createEntity();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
+    defer threads.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(stallingFieldCapacity(threads.participantSlotCount()));
+    try system.rebuildStaticNavGrid(&data, 2048, 2048, 32);
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try writeGroupGoals(&stream, requester, &stalling_field_goals);
+    const config = PathfindingConfig{ .max_solve_admissions_per_step = 0 };
+    _ = try system.update(&stream, intake_test_agents, &threads, config);
+    // Advance passes, each on a fresh tuner, until one stalls: its pools grow, so it ran more
+    // than one round.
+    var passes: usize = 0;
+    while (true) : (passes += 1) {
+        try std.testing.expect(passes < 80);
+        queueAdvancePass(&system);
+        const fields = system.group_field_slots.items.len;
+        try std.testing.expect(fields != 0);
+        const blocks = fieldPoolBlocks(&system);
+        var tuner = AdaptiveWorkTuner.init(.{});
+        const pass = expandGroupFieldSlots(&system, .{ .thread_system = &threads, .config = config }, &tuner);
+        try std.testing.expectEqual(@as(usize, 1), tuner.sample_count);
+        if (fieldPoolBlocks(&system) == blocks) continue;
+        // Every round folds into the pass's batch and its one sample: the stalled fields ran
+        // again past the pass's fields, and the sample is the whole pass's time.
+        try std.testing.expect(pass.item_count > fields);
+        try std.testing.expectEqual(pass.batch_duration_ns, tuner.sample_durations_ns[0]);
+        break;
+    }
 }
 
 test "a first group-field build that cannot allocate builds nothing and retries" {
