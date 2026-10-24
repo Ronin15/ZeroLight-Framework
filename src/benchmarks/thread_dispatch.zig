@@ -21,9 +21,8 @@ const suite = @import("suite.zig");
 // with as little job as possible. Items are one counter each in a line-aligned column;
 // ranges align to whole cache lines, so no two ranges share a writable line.
 // `serial-direct` runs the same dispatch on a thread system with no workers, the inline
-// path production takes on a machine with no spare core (one range over every item); fixed cases pin range size and worker cap; `thread-adaptive-fixed-range` runs the
-// suite's fixed-range tuner and `thread-adaptive-tuned-range` a stage tuner of its own
-// (`AdaptiveWorkTuner.init(.{})`, what a production stage owns). Ladder: 1, 16, 256, and 4,096 ranges at the default range size. Cost model: a
+// path production takes on a machine with no spare core (one range over every item); fixed cases pin range size and worker cap; `thread-adaptive-tuned-range` runs a stage
+// tuner of its own (`AdaptiveWorkTuner.init(.{})`, what a production stage owns). Ladder: 1, 16, 256, and 4,096 ranges at the default range size. Cost model: a
 // threaded batch costs O(ranges) claims plus O(workers) wakes plus the job, independent of
 // world size and population. At the top rung the column (1 MiB) spreads across cores'
 // caches, so its per-range time includes moving job data between cores; a before/after
@@ -115,18 +114,17 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     defer allocator.free(items);
     @memset(items, 0);
     var context = DispatchContext{ .items = items, .range_count = 0 };
-    // A fixed case never consults its tuner; an adaptive case without the suite's
-    // fixed-range tuner runs a stage tuner of its own.
-    var tuner = suite.adaptiveTunerForCase(case, range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    // A fixed case never consults its tuner; the tuned case runs a stage tuner of its own.
+    var tuner = AdaptiveWorkTuner.init(.{});
 
     var dispatches: usize = 0;
     var warm = suite.Warmup.custom(case, options.warmup_iterations, suite.adaptiveSettleIterationLimit(options));
-    while (warm.next(case.adaptive and tuner.phase == .settled)) {
+    while (warm.next(case.adaptive and suite.tunerSettled(&tuner))) {
         // No dispatch here is ever forced inline (a nested or foreign-thread call).
         std.debug.assert(!dispatchOnce(&context, &threads, &tuner, case).forced_inline);
         dispatches += 1;
     }
-    const settled_before_measurement = case.adaptive and tuner.phase == .settled;
+    const settled_before_measurement = case.adaptive and suite.tunerSettled(&tuner);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {

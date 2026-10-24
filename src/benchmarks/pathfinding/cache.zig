@@ -35,7 +35,6 @@ const suite = @import("../suite.zig");
 const coldWarmup = @import("nav_fixtures.zig").coldWarmup;
 const coldIterations = @import("nav_fixtures.zig").coldIterations;
 const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
-const setPathStageTuners = @import("nav_fixtures.zig").setPathStageTuners;
 const StageReport = @import("nav_fixtures.zig").StageReport;
 const OpenWorld = @import("nav_fixtures.zig").OpenWorld;
 const buildOpenWorld = @import("nav_fixtures.zig").buildOpenWorld;
@@ -369,7 +368,6 @@ fn runElasticRampCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
     try nav_size.checkNavBytes(elastic_ramp_group.name, item_count, size_config, &system);
-    setPathStageTuners(&system, case);
 
     for (0..options.warmup_iterations) |_| _ = try runElasticRamp(io, case, &system, capacity, &stream, requests, thread_ptr);
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -520,7 +518,6 @@ fn runElasticShrinkCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
     try nav_size.checkNavBytes(elastic_shrink_group.name, item_count, size_config, &system);
-    setPathStageTuners(&system, case);
     var cached: std.ArrayList(CachedPayload) = .empty;
     defer cached.deinit(allocator);
 

@@ -66,15 +66,12 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     defer threads.deinit();
 
     var system = MovementSystem.init();
-    if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
-        system.adaptive_tuner = tuner;
-    }
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(system.adaptive_tuner.phase == .settled)) {
+    while (warm.next(suite.tunerSettled(&system.adaptive_tuner))) {
         _ = runOnce(&system, &data, &threads, case);
     }
-    const settled_before_measurement = if (case.adaptive) (system.adaptive_tuner.phase == .settled) else false;
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.adaptive_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;
@@ -252,18 +249,15 @@ fn runApplyIntentsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     var fixture = try buildApplyIntentsFixture(allocator, item_count, order_kind);
     defer fixture.deinit();
     var system = MovementSystem.init();
-    if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
-        system.apply_intents_tuner = tuner;
-    }
 
     // A fixed threaded case with more than one range of intents dispatches the apply.
     const expect_dispatch = !case.adaptive and thread_ptr.workerThreadCount() > 0 and item_count > case.fixedItemsPerRange(movement_range_alignment_items);
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(system.apply_intents_tuner.phase == .settled)) {
+    while (warm.next(suite.tunerSettled(&system.apply_intents_tuner))) {
         _ = applyIntentsOnce(&system, &fixture, thread_ptr, case);
     }
-    const settled_before_measurement = if (case.adaptive) (system.apply_intents_tuner.phase == .settled) else false;
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.apply_intents_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;

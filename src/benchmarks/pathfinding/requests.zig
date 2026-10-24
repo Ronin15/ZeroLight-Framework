@@ -36,7 +36,6 @@ const coldIterations = @import("nav_fixtures.zig").coldIterations;
 const coldSettleLimit = @import("nav_fixtures.zig").coldSettleLimit;
 const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
 const expireCachedResults = @import("nav_fixtures.zig").expireCachedResults;
-const setPathStageTuners = @import("nav_fixtures.zig").setPathStageTuners;
 const StageReport = @import("nav_fixtures.zig").StageReport;
 const OpenWorld = @import("nav_fixtures.zig").OpenWorld;
 const buildOpenWorld = @import("nav_fixtures.zig").buildOpenWorld;
@@ -397,14 +396,13 @@ fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var fixture = try initRequestFixture(allocator, io, .common_goal, item_count, capacity, thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
-    setPathStageTuners(system, case);
 
     var warm = suite.Warmup.custom(case, 1 + coldWarmup(options), coldSettleLimit(options));
-    while (warm.next(system.tuners.solve.phase == .settled)) {
+    while (warm.next(suite.tunerSettled(&system.tuners.solve))) {
         expireCachedResults(system);
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, item_count, item_count);
     }
-    const settled = if (case.adaptive) (system.tuners.solve.phase == .settled) else false;
+    const settled = if (case.adaptive) suite.tunerSettled(&system.tuners.solve) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -453,7 +451,6 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var fixture = try initRequestFixture(allocator, io, workload, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
-    setPathStageTuners(system, case);
 
     system.clearRuntimeState();
     _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
@@ -463,11 +460,11 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     const measure_count = if (mode.isCold()) coldIterations(options) else options.iterations;
     // Only a cold mode settles: the hot cache's steps never train the solve tuner.
     var warm = suite.Warmup.custom(case, warmup_count, if (mode.isCold()) coldSettleLimit(options) else 0);
-    while (warm.next(system.tuners.solve.phase == .settled)) {
+    while (warm.next(suite.tunerSettled(&system.tuners.solve))) {
         if (mode.isCold()) expireCachedResults(system);
         _ = try runColdOnce(system, &fixture.requests, thread_ptr, case, item_count, solve_budget, fallback_budget);
     }
-    const settled_before_measurement = if (case.adaptive) (system.tuners.solve.phase == .settled) else false;
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.tuners.solve) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -523,7 +520,6 @@ fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var fixture = try initRequestFixture(allocator, io, .unique_open, item_count, requestCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
-    setPathStageTuners(system, case);
     var empty = RangeOutputStream(PathRequest).init(allocator);
     defer empty.deinit();
 
@@ -586,7 +582,7 @@ fn warmHotCache(system: *PathfindingSystem, requests: *RangeOutputStream(PathReq
         steps += 1;
         const all_hits = stats.perf.cache_hits == item_count;
         if (!all_hits and steps > fill_limit) return error.HotCacheNotWarm;
-        const tuner_ready = !case.adaptive or (system.tuners.intake.phase == .settled) or steps >= settle_limit;
+        const tuner_ready = !case.adaptive or suite.tunerSettled(&system.tuners.intake) or steps >= settle_limit;
         if (all_hits and tuner_ready) return;
     }
 }
@@ -673,8 +669,8 @@ fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     if (warm_paths != item_count) return error.QueryCacheNotWarm;
 
     var context = QueryContext{ .system = system, .starts = starts, .goals = goals, .hints = hints, .sink = sink };
-    // The query batch's own tuner: the suite's fixed-range one, else a default stage tuner.
-    var tuner = suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    // The query batch's own stage tuner.
+    var tuner = AdaptiveWorkTuner.init(.{});
     // Warmup also settles each agent's hint to its midpoint index.
     for (0..options.warmup_iterations) |_| _ = runQueries(&context, thread_ptr, &tuner, case, item_count);
 
@@ -869,7 +865,6 @@ fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options: su
     var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit(allocator);
     const system = &fixture.system;
-    setPathStageTuners(system, case);
     try writePackRequests(allocator, &fixture.stream, &fixture.scratch, &fixture.open, fixture.entities, fixture.open.cellCenter(packGoal(group_field_detour_side, 0)));
 
     var last_stats = PathfindingStats{};
@@ -935,7 +930,6 @@ fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, _: su
     var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit(allocator);
     const system = &fixture.system;
-    setPathStageTuners(system, case);
 
     var totals = MovingTotals{};
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -976,7 +970,6 @@ fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io: std
     var fixture = try initPackFixture(allocator, io, item_count, packCapacity(item_count, fixtures.participantCount(thread_ptr)), thread_ptr);
     defer fixture.deinit(allocator);
     const system = &fixture.system;
-    setPathStageTuners(system, case);
 
     const start_goal = fixture.open.cellCenter(packGoal(group_field_detour_side, 0));
     const px_per_step: f32 = fixture.open.world.tile_size / @as(f32, @floatFromInt(group_field_detour_rekey_period_steps));
@@ -1070,7 +1063,6 @@ fn runGroupFieldPacksCase(allocator: std.mem.Allocator, io: std.Io, _: suite.Opt
     capacity.max_group_fields = packs;
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &open.world, thread_ptr);
-    setPathStageTuners(&system, case);
 
     var stream = RangeOutputStream(PathRequest).init(allocator);
     defer stream.deinit();
@@ -1210,7 +1202,6 @@ fn runGroupFieldTunnelCase(allocator: std.mem.Allocator, io: std.Io, options: su
     }, thread_ptr);
     defer fixture.deinit();
     const system = &fixture.system;
-    setPathStageTuners(system, case);
 
     for (0..coldWarmup(options)) |_| _ = try buildTunnelFields(io, system, &fixture.requests, thread_ptr, case, agent_count);
     var accumulator = suite.StatsAccumulator.init(item_count);

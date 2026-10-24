@@ -257,9 +257,9 @@ fn stagesOffMainNs(stats: SteeringStats) u64 {
 
 // Every steering stage tuner has settled.
 fn stageTunersSettled(system: *const SteeringSystem) bool {
-    return (system.adaptive_tuner.phase == .settled) and (system.agents_tuner.phase == .settled) and (system.select_resolve_tuner.phase == .settled) and
-        (system.select_claim_tuner.phase == .settled) and (system.directions_tuner.phase == .settled) and (system.grid_bucket_tuner.phase == .settled) and
-        (system.grid_sort_tuner.phase == .settled);
+    return suite.tunerSettled(&system.adaptive_tuner) and suite.tunerSettled(&system.agents_tuner) and suite.tunerSettled(&system.select_resolve_tuner) and
+        suite.tunerSettled(&system.select_claim_tuner) and suite.tunerSettled(&system.directions_tuner) and suite.tunerSettled(&system.grid_bucket_tuner) and
+        suite.tunerSettled(&system.grid_sort_tuner);
 }
 
 // Entries in the agent grid's largest band after the last step.
@@ -294,17 +294,6 @@ fn measureCase(
     comptime step: fn (*SteeringSystem, @TypeOf(context), *ThreadSystem, suite.BenchmarkCase) anyerror!SteeringStats,
 ) !MeasuredCase {
     try system.reserve(agent_count);
-    if (suite.adaptiveTunerForCase(case, steering_range_alignment_items)) |tuner| {
-        system.adaptive_tuner = tuner;
-        system.agents_tuner = tuner;
-        system.select_resolve_tuner = tuner;
-        system.directions_tuner = tuner;
-        system.grid_bucket_tuner = tuner;
-        // Band stages: one band per range, so the fixed control dispatches the bands
-        // rather than keeping them in one inline range.
-        system.select_claim_tuner = suite.adaptiveTunerForPartition(case, 1, 1).?;
-        system.grid_sort_tuner = suite.adaptiveTunerForPartition(case, 1, 1).?;
-    }
 
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();

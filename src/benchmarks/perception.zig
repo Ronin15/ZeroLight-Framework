@@ -49,7 +49,6 @@ const perception_mod = @import("../game/systems/perception.zig");
 const PerceptionStats = perception_mod.PerceptionStats;
 const PerceptionSystem = perception_mod.PerceptionSystem;
 const perception_range_alignment_items = perception_mod.perception_range_alignment_items;
-const perception_gather_range_alignment_items = perception_mod.perception_gather_range_alignment_items;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const SimulationScopeSystem = @import("../game/systems/simulation_scope.zig").SimulationScopeSystem;
 const fixtures = @import("fixtures.zig");
@@ -381,10 +380,6 @@ fn runCaseImpl(
 
     var system = PerceptionSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, perception_gather_range_alignment_items)) |tuner| {
-        system.gather_tuner = tuner;
-        system.compute_tuner = suite.adaptiveTunerForCase(case, perception_range_alignment_items).?;
-    }
 
     var events = SimulationEvents.init(allocator);
     defer events.deinit();
@@ -402,11 +397,11 @@ fn runCaseImpl(
     const think_set = (try scope.compactCognition(&spatial_view, 0, false, &threads, .{ .adaptive = false })).cognition;
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next((system.gather_tuner.phase == .settled) and (system.compute_tuner.phase == .settled))) {
+    while (warm.next(suite.tunerSettled(&system.gather_tuner) and suite.tunerSettled(&system.compute_tuner))) {
         events.clearRetainingCapacity();
         _ = try runOnce(&system, &fixture, spatial_view, think_set, &events, &threads, case);
     }
-    const settled_before_measurement = if (case.adaptive) (system.compute_tuner.phase == .settled) else false;
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.compute_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     // Sensed, LOS, and found counts are the same every step; transitions occur once.
@@ -568,10 +563,6 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
 
     var system = PerceptionSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, perception_gather_range_alignment_items)) |tuner| {
-        system.gather_tuner = tuner;
-        system.compute_tuner = suite.adaptiveTunerForCase(case, perception_range_alignment_items).?;
-    }
     var events = SimulationEvents.init(allocator);
     defer events.deinit();
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
@@ -588,11 +579,11 @@ fn runCrowdCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const think_set = (try scope.compactCognition(&spatial_view, 0, false, &threads, .{ .adaptive = false })).cognition;
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next((system.gather_tuner.phase == .settled) and (system.compute_tuner.phase == .settled))) {
+    while (warm.next(suite.tunerSettled(&system.gather_tuner) and suite.tunerSettled(&system.compute_tuner))) {
         events.clearRetainingCapacity();
         _ = try runCrowdOnce(&system, &fixture, spatial_view, think_set, &events, thread_ptr, case);
     }
-    const settled_before_measurement = if (case.adaptive) (system.compute_tuner.phase == .settled) else false;
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.compute_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PerceptionStats{};

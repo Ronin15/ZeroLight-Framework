@@ -2021,12 +2021,14 @@ test "the next range on a worker table does not see the previous range and does 
 fn pinTunerProfile(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void {
     tuner.config.threaded_batch_ns = if (profile.worker_threads == 0) std.math.maxInt(u64) else 0;
     tuner.config.item_count_reset_percent = std.math.maxInt(u8);
+    tuner.config.nudge_samples = std.math.maxInt(usize);
     tuner.phase = .settled;
     tuner.has_threaded_profile = profile.worker_threads > 0;
     tuner.current_profile = profile;
-    tuner.best_profile = profile;
     tuner.candidate_profile = null;
-    tuner.learned_item_count = 0;
+    // No item count grows past this by the 255% reset band, so no count shift reshapes
+    // the pin.
+    tuner.learned_item_count = std.math.maxInt(usize) / 256;
 }
 
 // `normal != 0`, then the product. A zero normal's product is zero, so the lane

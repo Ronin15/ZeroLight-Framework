@@ -320,7 +320,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     defer fixture.deinit();
     fixtures.setNavTuners(&fixture.nav, case);
     const plane_entry = &fixture.plane_entry;
-    plane_entry.tuner = suite.adaptiveTunerForCase(case, plane_entry_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
+    plane_entry.tuner = AdaptiveWorkTuner.init(.{});
     plane_entry.config = .{
         .items_per_range = case.stageItemsPerRange(plane_entry_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
@@ -332,11 +332,11 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 
     try fixture.resetStep(thread_ptr);
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next(plane_entry.tuner.phase == .settled)) {
+    while (warm.next(suite.tunerSettled(&plane_entry.tuner))) {
         _ = try runStage(&fixture, thread_ptr);
         try fixture.resetStep(thread_ptr);
     }
-    const settled_before_measurement = if (case.adaptive) (plane_entry.tuner.phase == .settled) else false;
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&plane_entry.tuner) else false;
 
     // The banded group's size axis is its landing band count.
     var accumulator = suite.StatsAccumulator.init(if (workload == .banded_falls) landing_bands else item_count);

@@ -158,20 +158,15 @@ fn timeBuilds(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     var system = SpatialIndexSystem.init(allocator);
     defer system.deinit();
     try system.reserve(data.aiAgentSliceConst().entities.len);
-    if (suite.adaptiveTunerForCase(case, spatial_index_range_alignment_items)) |tuner| {
-        system.bucket_tuner = tuner;
-        system.sort_tuner = suite.adaptiveTunerForCase(case, spatial_index_range_alignment_items).?;
-        system.link_tuner = suite.adaptiveTunerForCase(case, spatial_index_range_alignment_items).?;
-    }
 
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
     const thread_ptr = &threads;
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next((system.bucket_tuner.phase == .settled) and (system.sort_tuner.phase == .settled) and (system.link_tuner.phase == .settled))) _ = try runOnce(&system, data, geometry, thread_ptr, case);
-    const bucket_settled_before_measurement = if (case.adaptive) (system.bucket_tuner.phase == .settled) else false;
-    const sort_settled_before_measurement = if (case.adaptive) (system.sort_tuner.phase == .settled) else false;
+    while (warm.next(suite.tunerSettled(&system.bucket_tuner) and suite.tunerSettled(&system.sort_tuner) and suite.tunerSettled(&system.link_tuner))) _ = try runOnce(&system, data, geometry, thread_ptr, case);
+    const bucket_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.bucket_tuner) else false;
+    const sort_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.sort_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = SpatialIndexStats{};

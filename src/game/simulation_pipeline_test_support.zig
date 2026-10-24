@@ -21,7 +21,7 @@ const WorldSystem = @import("world/system.zig").WorldSystem;
 const updateSteeringInline = @import("systems/steering/test_support.zig").updateSteeringInline;
 
 /// Pins every pipeline batch tuner to one settled threaded `profile` that never
-/// re-probes, demotes, or resets on item-count drift, so the multi-worker path runs a
+/// nudges, demotes, or resets on item-count drift, so the multi-worker path runs a
 /// deterministic multi-range partition. The tuners would otherwise pick the shape from
 /// timing (inline below `threaded_batch_ns`). The tuners are found by walking the
 /// pipeline's fields at comptime, so a tuner a system adds is pinned with it.
@@ -90,13 +90,14 @@ fn holdsTuner(comptime T: type) bool {
 pub fn pinThreadedProfile(tuner: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile) void {
     tuner.config.threaded_batch_ns = 0;
     tuner.config.item_count_reset_percent = std.math.maxInt(u8);
+    tuner.config.nudge_samples = std.math.maxInt(usize);
     tuner.phase = .settled;
     tuner.has_threaded_profile = true;
     tuner.current_profile = profile;
-    tuner.best_profile = profile;
     tuner.candidate_profile = null;
-    // Forget the pre-pin item count so the first pinned batch does not reset.
-    tuner.learned_item_count = 0;
+    // A learned count no item count can grow past by the 255% reset band (nor shrink
+    // past), so no count shift ever reshapes the pin.
+    tuner.learned_item_count = std.math.maxInt(usize) / 256;
 }
 
 /// One steering step for `agent` heading +x; returns its lateral (y) direction.

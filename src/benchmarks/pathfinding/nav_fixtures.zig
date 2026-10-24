@@ -23,12 +23,9 @@ const PathfindingConfig = @import("../../game/systems/pathfinding.zig").Pathfind
 const StaticColliderSystem = @import("../../game/systems/static_colliders.zig").StaticColliderSystem;
 const default_max_solves_per_frame = @import("../../game/systems/pathfinding.zig").default_max_solves_per_frame;
 const pathfinding_range_alignment_items = @import("../../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
-const intake_range_alignment_items = @import("../../game/systems/pathfinding/types.zig").intake_range_alignment_items;
 const flush_pair_count = @import("../../game/systems/pathfinding/publish.zig").flush_pair_count;
 const NavUpdateStats = @import("../../game/systems/pathfinding/types.zig").NavUpdateStats;
 const default_cache_ttl_steps = @import("../../game/systems/pathfinding/types.zig").default_cache_ttl_steps;
-const goal_scan_range_alignment_items = @import("../../game/systems/pathfinding/goal_table.zig").scan_range_alignment_items;
-const goal_project_range_alignment_items = @import("../../game/systems/pathfinding/goal_table.zig").project_range_alignment_items;
 const WorldSystem = @import("../../game/world/system.zig").WorldSystem;
 const CellCoord = @import("../../game/world/system.zig").CellCoord;
 const TileId = @import("../../game/world/system.zig").TileId;
@@ -101,21 +98,6 @@ pub fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(Path
     if (flush.active_worker_threads > flush_pair_count - 1) return error.RegistryFlushPastPairWorkers;
     try suite.checkFixedRangeCount(case, thread_system, config.items_per_range, flush);
     return stats;
-}
-
-// Gives every pathfinding update stage this case's tuner, as the solve batch gets its own.
-pub fn setPathStageTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
-    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| system.tuners.solve = tuner;
-    if (suite.adaptiveTunerForCase(case, intake_range_alignment_items)) |tuner| system.tuners.intake = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.group_field = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.group_field_begin = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.group_field_stall = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.publish_copy = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.registry_flush = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.registry_flush_count = tuner;
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| system.tuners.resize_copy = tuner;
-    if (suite.adaptiveTunerForCase(case, goal_scan_range_alignment_items)) |tuner| system.tuners.goal_scan = tuner;
-    if (suite.adaptiveTunerForCase(case, goal_project_range_alignment_items)) |tuner| system.tuners.goal_project = tuner;
 }
 
 // An update's stage batches, in `StageReport` order.

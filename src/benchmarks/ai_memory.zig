@@ -31,7 +31,6 @@ const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const AiMemoryStats = @import("../game/systems/ai_memory.zig").AiMemoryStats;
 const AiMemorySystem = @import("../game/systems/ai_memory.zig").AiMemorySystem;
-const ai_memory_order_range_alignment_items = @import("../game/systems/ai_memory.zig").ai_memory_order_range_alignment_items;
 const ai_memory_range_alignment_items = @import("../game/systems/ai_memory.zig").ai_memory_range_alignment_items;
 const word_bits = @import("../game/systems/ai_memory.zig").word_bits;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
@@ -155,12 +154,6 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer fixture.deinit();
     var system = AiMemorySystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, ai_memory_range_alignment_items)) |tuner| {
-        system.gather_tuner = tuner;
-        system.order_tuner = suite.adaptiveTunerForCase(case, ai_memory_order_range_alignment_items).?;
-        system.decay_tuner = suite.adaptiveTunerForCase(case, 1).?;
-        system.visible_tuner = suite.adaptiveTunerForCase(case, 1).?;
-    }
 
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
@@ -206,7 +199,7 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 }
 
 fn tunersSettled(system: *const AiMemorySystem) bool {
-    return (system.gather_tuner.phase == .settled) and (system.order_tuner.phase == .settled) and (system.decay_tuner.phase == .settled) and (system.visible_tuner.phase == .settled);
+    return suite.tunerSettled(&system.gather_tuner) and suite.tunerSettled(&system.order_tuner) and suite.tunerSettled(&system.decay_tuner) and suite.tunerSettled(&system.visible_tuner);
 }
 
 const Run = struct {

@@ -115,7 +115,8 @@ scope only where the diff relies on it.
    cost-driver stage has no `runtime_perf_log` entry is a finding; so is logging stages beyond the cost
    drivers (`threading.md`). A tuner or selection reached by two passes, or
    a production dispatch at a fixed shape outside a tuner, is a finding; so
-   is a threaded pass whose dispatches sit near the gate (batch shape). A
+   is a stage that sets its own batch count or worker count instead of its
+   tuner's. A
    stage that runs inline because its work is under the gate is the design,
    not main-thread work to flag.
    **Test and production code**, every review: check every touched file

@@ -95,7 +95,6 @@ pub const BenchmarkCase = struct {
     name: []const u8,
     worker_mode: WorkerMode,
     adaptive: bool = false,
-    adaptive_range_mode: AdaptiveRangeMode = .none,
     range_mode: RangeMode = .default,
     required_worker_count: usize = 0,
 
@@ -161,12 +160,6 @@ pub const RangeMode = enum {
     large,
 };
 
-pub const AdaptiveRangeMode = enum {
-    none,
-    fixed,
-    tuned,
-};
-
 pub const default_cases = [_]BenchmarkCase{
     .{
         .name = "serial-direct",
@@ -200,17 +193,9 @@ pub const default_cases = [_]BenchmarkCase{
         .required_worker_count = 1,
     },
     .{
-        .name = "thread-adaptive-fixed-range",
-        .worker_mode = .fixed_auto,
-        .adaptive = true,
-        .adaptive_range_mode = .fixed,
-        .required_worker_count = 1,
-    },
-    .{
         .name = "thread-adaptive-tuned-range",
         .worker_mode = .fixed_auto,
         .adaptive = true,
-        .adaptive_range_mode = .tuned,
         .required_worker_count = 1,
     },
 };
@@ -589,14 +574,12 @@ pub const WorkTuningSummary = struct {
     initial_range_items: usize = 0,
     final_worker_threads: usize = 0,
     final_items_per_range: usize = 0,
-    best_worker_threads: usize = 0,
-    best_items_per_range: usize = 0,
+    batch_multiplier: f64 = 1,
     candidate_worker_threads: ?usize = null,
     candidate_items_per_range: ?usize = null,
     sample_count: usize = 0,
     sample_window: usize = 0,
     settled_before_measurement: bool = false,
-    best_mean_batch_duration_ns: u64 = 0,
     baseline_mean_batch_duration_ns: u64 = 0,
     has_threaded_profile: bool = false,
     probing: bool = false,
@@ -676,11 +659,10 @@ pub const AdaptiveWorkReport = struct {
     phase: AdaptiveWorkPhase = .learning,
     initial_profile: AdaptiveWorkProfile = .{},
     current_profile: AdaptiveWorkProfile = .{},
-    best_profile: AdaptiveWorkProfile = .{},
+    batch_multiplier: f64 = 1,
     candidate_profile: ?AdaptiveWorkProfile = null,
     sample_count: usize = 0,
     sample_window: usize = 1,
-    best_mean_batch_duration_ns: u64 = 0,
     baseline_mean_batch_duration_ns: u64 = 0,
     has_threaded_profile: bool = false,
     probing: bool = false,
@@ -693,11 +675,10 @@ pub fn tunerReport(tuner: *const AdaptiveWorkTuner) AdaptiveWorkReport {
         .phase = tuner.phase,
         .initial_profile = tuner.initial_profile,
         .current_profile = tuner.current_profile,
-        .best_profile = tuner.best_profile,
+        .batch_multiplier = tuner.batch_multiplier,
         .candidate_profile = tuner.candidate_profile,
         .sample_count = tuner.sample_count,
         .sample_window = tuner.config.sample_window,
-        .best_mean_batch_duration_ns = tuner.best_mean_batch_duration_ns,
         .baseline_mean_batch_duration_ns = tuner.baseline_mean_batch_duration_ns,
         .has_threaded_profile = tuner.has_threaded_profile,
         .probing = tuner.phase == .probing,
@@ -713,14 +694,12 @@ pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement:
         .initial_range_items = report.initial_profile.items_per_range,
         .final_worker_threads = report.current_profile.worker_threads,
         .final_items_per_range = report.current_profile.items_per_range,
-        .best_worker_threads = report.best_profile.worker_threads,
-        .best_items_per_range = report.best_profile.items_per_range,
+        .batch_multiplier = report.batch_multiplier,
         .candidate_worker_threads = if (report.candidate_profile) |profile| profile.worker_threads else null,
         .candidate_items_per_range = if (report.candidate_profile) |profile| profile.items_per_range else null,
         .sample_count = report.sample_count,
         .sample_window = report.sample_window,
         .settled_before_measurement = settled_before_measurement,
-        .best_mean_batch_duration_ns = report.best_mean_batch_duration_ns,
         .baseline_mean_batch_duration_ns = report.baseline_mean_batch_duration_ns,
         .has_threaded_profile = report.has_threaded_profile,
         .probing = report.probing,
@@ -729,34 +708,20 @@ pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement:
     };
 }
 
-pub fn adaptiveTunerForCase(case: BenchmarkCase, range_alignment_items: usize) ?AdaptiveWorkTuner {
-    return adaptiveTunerForPartition(case, default_items_per_range, range_alignment_items);
-}
-
-/// `adaptiveTunerForCase` for a group whose fixed partition is `partition_items`: the
-/// fixed-adaptive case clamps its range to that partition, aligned.
-pub fn adaptiveTunerForPartition(case: BenchmarkCase, partition_items: usize, range_alignment_items: usize) ?AdaptiveWorkTuner {
-    // Fixed-adaptive cases reuse tuner reporting but clamp range probing so they
-    // can act as a stable control against fully adaptive policy.
-    if (!case.adaptive) return null;
-    return switch (case.adaptive_range_mode) {
-        .none, .tuned => null,
-        .fixed => fixed: {
-            const fixed_range = std.mem.alignForwardAnyAlign(usize, partition_items, range_alignment_items);
-            break :fixed AdaptiveWorkTuner.init(.{
-                .initial_range_items = fixed_range,
-                .smallest_range_items = fixed_range,
-                .largest_range_items = fixed_range,
-            });
-        },
-    };
-}
-
+/// The settle limit: 16 sample windows for the inline/threaded decision, then 16 nudge
+/// comparisons for the batch count to reach a hold.
 pub fn adaptiveSettleIterationLimit(options: Options) usize {
     const default_tuner_config = AdaptiveWorkTunerConfig{};
     const settle_windows: usize = 16;
-    const settle_iterations = default_tuner_config.sample_window * settle_windows;
+    const settle_nudges: usize = 16;
+    const settle_iterations = default_tuner_config.sample_window * settle_windows + default_tuner_config.nudge_samples * settle_nudges;
     return @max(options.iterations, settle_iterations);
+}
+
+/// A tuner the bench may stop warming: settled, and, when threaded, its batch-count nudge
+/// holding.
+pub fn tunerSettled(tuner: *const AdaptiveWorkTuner) bool {
+    return tuner.phase == .settled and (!tuner.has_threaded_profile or tuner.nudge_state == .holding);
 }
 
 /// A case's warmup and adaptive settle, driven by `while (warm.next(tuners_settled)) step();`:
@@ -984,7 +949,7 @@ pub fn checkStagesDispatched(case: BenchmarkCase, thread_system: ?*const ThreadS
 /// more than one aligned range: a fresh rebuild tuner's first selection is the full pool
 /// (`rebuild_tuner_config`). Other cases pass.
 pub fn checkRebuildOnWorkers(case: BenchmarkCase, threads: *const ThreadSystem, batch: BatchStats) error{RebuildStageRanInline}!void {
-    if (case.adaptive_range_mode != .tuned or threads.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
+    if (!case.adaptive or threads.workerThreadCount() == 0 or case.maxWorkerThreads() == @as(?usize, 0)) return;
     if (rangeCount(batch.item_count, batch.range_alignment_items) > 1 and batch.ran_inline) return error.RebuildStageRanInline;
 }
 
@@ -1068,7 +1033,7 @@ fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options:
     std.debug.print("\n{s}  {} {s}{s}\n\n", .{ group.name, baseline.stats.item_count, group.item_label, formatItemInto(&item_buffer, group, baseline.stats.item_count) });
     const best = bestMeasured(results) orelse baseline;
     const fixed_auto = measured(findResult(results, "thread-fixed-auto"));
-    const adaptive = measured(findResult(results, "thread-adaptive-tuned-range")) orelse measured(findResult(results, "thread-adaptive-fixed-range"));
+    const adaptive = measured(findResult(results, "thread-adaptive-tuned-range"));
 
     printCompactTable(results, baseline);
     if (options.details) {
@@ -1213,8 +1178,8 @@ fn printValidationSummary(
         if (adaptive_result.stats.work_tuning) |summary| {
             if (summary.has_threaded_profile) {
                 std.debug.print(
-                    "adaptive phase={s} best_profile={}/{} final={}/{}. ",
-                    .{ @tagName(summary.phase), summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
+                    "adaptive phase={s} final={}/{} x={d:.2}. ",
+                    .{ @tagName(summary.phase), summary.final_worker_threads, summary.final_items_per_range, summary.batch_multiplier },
                 );
             } else {
                 std.debug.print("adaptive phase={s} threaded_profile=none. ", .{@tagName(summary.phase)});
@@ -1370,13 +1335,14 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
     return writer.buffered();
 }
 
-/// A tuner's phase, whether it settled before measurement, and its best and final profiles.
+/// A tuner's phase, whether it settled before measurement, its final profile, and its
+/// batch multiplier.
 pub fn writeWorkTuning(writer: *std.Io.Writer, summary: WorkTuningSummary) std.Io.Writer.Error!void {
     try writer.print("{s} settled={s}", .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement) });
     if (summary.has_threaded_profile) {
         try writer.print(
-            " best={}/{} final={}/{}",
-            .{ summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
+            " final={}/{} x={d:.2}",
+            .{ summary.final_worker_threads, summary.final_items_per_range, summary.batch_multiplier },
         );
     } else {
         try writer.writeAll(" threaded=none");
@@ -1813,15 +1779,14 @@ pub fn ItemCode(comptime Fields: type, comptime digits: []const usize) type {
 }
 
 test "default benchmark cases cover required thread modes" {
-    try std.testing.expectEqual(@as(usize, 8), default_cases.len);
+    try std.testing.expectEqual(@as(usize, 7), default_cases.len);
     try std.testing.expectEqualStrings("serial-direct", default_cases[0].name);
     try std.testing.expectEqualStrings("thread-fixed-1", default_cases[1].name);
     try std.testing.expectEqualStrings("thread-fixed-2", default_cases[2].name);
     try std.testing.expectEqualStrings("thread-fixed-auto", default_cases[3].name);
     try std.testing.expectEqualStrings("thread-small-range", default_cases[4].name);
     try std.testing.expectEqualStrings("thread-large-range", default_cases[5].name);
-    try std.testing.expectEqualStrings("thread-adaptive-fixed-range", default_cases[6].name);
-    try std.testing.expectEqualStrings("thread-adaptive-tuned-range", default_cases[7].name);
+    try std.testing.expectEqualStrings("thread-adaptive-tuned-range", default_cases[6].name);
 }
 
 test "a group's named cases keep default-case order, and the default list is every case" {
@@ -1891,7 +1856,7 @@ test "benchmark options reject unknown case filter" {
 test "benchmark case filter includes serial baseline for non-serial cases" {
     try std.testing.expect(shouldIncludeBaselineForFilter("thread-adaptive-tuned-range", default_cases[0]));
     try std.testing.expect(!shouldIncludeBaselineForFilter("serial-direct", default_cases[0]));
-    try std.testing.expect(!shouldIncludeBaselineForFilter("thread-adaptive-tuned-range", default_cases[7]));
+    try std.testing.expect(!shouldIncludeBaselineForFilter("thread-adaptive-tuned-range", default_cases[6]));
 }
 
 test "work tuning summary preserves settled phase" {
@@ -1899,27 +1864,18 @@ test "work tuning summary preserves settled phase" {
         .phase = .settled,
         .initial_profile = .{ .worker_threads = 0, .items_per_range = 64 },
         .current_profile = .{ .worker_threads = 4, .items_per_range = 256 },
-        .best_profile = .{ .worker_threads = 4, .items_per_range = 256 },
+        .batch_multiplier = 1.21,
         .sample_window = 2,
-        .best_mean_batch_duration_ns = 42,
         .has_threaded_profile = true,
     }, true);
 
     try std.testing.expectEqual(AdaptiveWorkPhase.settled, summary.phase);
     try std.testing.expect(summary.settled_before_measurement);
-    try std.testing.expectEqual(@as(usize, 4), summary.best_worker_threads);
-    try std.testing.expectEqual(@as(usize, 256), summary.best_items_per_range);
+    try std.testing.expectEqual(@as(usize, 4), summary.final_worker_threads);
+    try std.testing.expectEqual(@as(usize, 256), summary.final_items_per_range);
+    try std.testing.expectEqual(@as(f64, 1.21), summary.batch_multiplier);
     var tuning_buffer: [96]u8 = undefined;
-    try std.testing.expect(std.mem.startsWith(u8, formatWorkTuningInto(&tuning_buffer, summary), "settled settled=yes best=4/256 final=4/256"));
-}
-
-test "fixed adaptive benchmark case disables range probing" {
-    const tuner = adaptiveTunerForCase(default_cases[6], 16).?;
-    const report = tunerReport(&tuner);
-
-    try std.testing.expectEqual(@as(usize, 64), report.initial_profile.items_per_range);
-    try std.testing.expectEqual(@as(usize, 64), report.current_profile.items_per_range);
-    try std.testing.expect(adaptiveTunerForCase(default_cases[7], 16) == null);
+    try std.testing.expect(std.mem.startsWith(u8, formatWorkTuningInto(&tuning_buffer, summary), "settled settled=yes final=4/256 x=1.21"));
 }
 
 test "benchmark fixed and stage range sizes align the range and null out adaptive cases" {
@@ -1941,15 +1897,13 @@ test "benchmark fixed and stage range sizes align the range and null out adaptiv
     const small = cases.named("thread-small-range");
     try std.testing.expectEqual(@as(?usize, small.fixedItemsPerRange(16)), small.stageItemsPerRange(16));
 
-    for ([_][]const u8{ "thread-adaptive-fixed-range", "thread-adaptive-tuned-range" }) |name| {
-        const adaptive = cases.named(name);
-        try std.testing.expect(adaptive.adaptive);
-        try std.testing.expectEqual(@as(?usize, null), adaptive.stageItemsPerRange(16));
-        try std.testing.expectEqual(wide_alignment, adaptive.fixedItemsPerRange(wide_alignment));
-    }
+    const adaptive = cases.named("thread-adaptive-tuned-range");
+    try std.testing.expect(adaptive.adaptive);
+    try std.testing.expectEqual(@as(?usize, null), adaptive.stageItemsPerRange(16));
+    try std.testing.expectEqual(wide_alignment, adaptive.fixedItemsPerRange(wide_alignment));
 }
 
-test "benchmark range modes and the fixed-adaptive range scale from the group's partition" {
+test "benchmark range modes scale from the group's partition" {
     const RangeCase = struct { name: []const u8, element: ?usize, chunk: ?usize, chunk_aligned: ?usize };
     // Element partition (the default) at alignment 16; one-chunk partition at alignment 1
     // and at an alignment above the partition.
@@ -1957,7 +1911,6 @@ test "benchmark range modes and the fixed-adaptive range scale from the group's 
         .{ .name = "thread-fixed-auto", .element = 64, .chunk = 1, .chunk_aligned = 16 },
         .{ .name = "thread-small-range", .element = 32, .chunk = 1, .chunk_aligned = 16 },
         .{ .name = "thread-large-range", .element = 256, .chunk = 4, .chunk_aligned = 16 },
-        .{ .name = "thread-adaptive-fixed-range", .element = null, .chunk = null, .chunk_aligned = null },
         .{ .name = "thread-adaptive-tuned-range", .element = null, .chunk = null, .chunk_aligned = null },
     };
     for (expected) |row| {
@@ -1968,26 +1921,8 @@ test "benchmark range modes and the fixed-adaptive range scale from the group's 
         try std.testing.expectEqual(row.chunk_aligned, case.stageItemsPerRangeForPartition(1, 16));
     }
 
-    const fixed_adaptive = findBenchmarkCase("thread-adaptive-fixed-range").?;
-    try std.testing.expectEqual(AdaptiveRangeMode.fixed, fixed_adaptive.adaptive_range_mode);
-    const ClampCase = struct { partition: usize, alignment: usize, range: usize };
-    const clamps = [_]ClampCase{
-        .{ .partition = default_items_per_range, .alignment = 16, .range = 64 },
-        .{ .partition = 1, .alignment = 1, .range = 1 },
-        .{ .partition = 1, .alignment = 16, .range = 16 },
-    };
-    for (clamps) |clamp| {
-        const config = adaptiveTunerForPartition(fixed_adaptive, clamp.partition, clamp.alignment).?.config;
-        try std.testing.expectEqual(clamp.range, config.initial_range_items);
-        try std.testing.expectEqual(clamp.range, config.smallest_range_items);
-        try std.testing.expectEqual(clamp.range, config.largest_range_items);
-    }
-    const tuned = findBenchmarkCase("thread-adaptive-tuned-range").?;
-    try std.testing.expectEqual(AdaptiveRangeMode.tuned, tuned.adaptive_range_mode);
-    try std.testing.expect(adaptiveTunerForPartition(tuned, 1, 1) == null);
-    const fixed_auto = findBenchmarkCase("thread-fixed-auto").?;
-    try std.testing.expect(!fixed_auto.adaptive);
-    try std.testing.expect(adaptiveTunerForPartition(fixed_auto, 1, 1) == null);
+    try std.testing.expect(findBenchmarkCase("thread-adaptive-tuned-range").?.adaptive);
+    try std.testing.expect(!findBenchmarkCase("thread-fixed-auto").?.adaptive);
 }
 
 test "benchmark fixed case resolving to an earlier case's configuration is reported as its duplicate" {
@@ -2009,7 +1944,6 @@ test "benchmark fixed case resolving to an earlier case's configuration is repor
         .{ .name = "thread-fixed-auto", .chunk = null, .chunk_aligned = null },
         .{ .name = "thread-small-range", .chunk = "thread-fixed-auto", .chunk_aligned = "thread-fixed-auto" },
         .{ .name = "thread-large-range", .chunk = null, .chunk_aligned = "thread-fixed-auto" },
-        .{ .name = "thread-adaptive-fixed-range", .chunk = null, .chunk_aligned = null },
         .{ .name = "thread-adaptive-tuned-range", .chunk = null, .chunk_aligned = null },
     };
     try std.testing.expectEqual(default_cases.len, expected.len);
@@ -2045,9 +1979,9 @@ test "a warmup runs its steps, then settles an adaptive case until its tuners se
     try std.testing.expect(warm.next(false) and warm.next(false) and !warm.next(false));
 }
 
-test "adaptive settle budget covers multiple tuner windows" {
-    try std.testing.expectEqual(@as(usize, 48), adaptiveSettleIterationLimit(.{}));
-    try std.testing.expectEqual(@as(usize, 100), adaptiveSettleIterationLimit(.{ .iterations = 100 }));
+test "adaptive settle budget covers multiple tuner windows and nudge comparisons" {
+    try std.testing.expectEqual(@as(usize, 160), adaptiveSettleIterationLimit(.{}));
+    try std.testing.expectEqual(@as(usize, 1000), adaptiveSettleIterationLimit(.{ .iterations = 1000 }));
 }
 
 const test_item_counts = [_]usize{ 4, 8 };
@@ -2102,14 +2036,12 @@ test "benchmark table formatters keep compact text" {
         u8,
         formatWorkTuningInto(&range_buffer, .{
             .phase = .settled,
-            .best_worker_threads = 4,
-            .best_items_per_range = 256,
             .final_worker_threads = 4,
             .final_items_per_range = 256,
             .settled_before_measurement = true,
             .has_threaded_profile = true,
         }),
-        "settled settled=yes best=4/256 final=4/256",
+        "settled settled=yes final=4/256 x=1.00",
     ));
     const group = BenchmarkGroup{
         .name = "test",

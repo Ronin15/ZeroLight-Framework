@@ -159,7 +159,6 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     var scope = SimulationScopeSystem.init(allocator);
     defer scope.deinit();
     try scope.reserve(fields.agents);
-    if (suite.adaptiveTunerForCase(case, scope_range_alignment_items)) |tuner| scope.cognition_tuner = tuner;
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
     const thread_ptr = &threads;
@@ -183,8 +182,8 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     defer allocator.free(serial_think);
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(scope.cognition_tuner.phase == .settled)) _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
-    const settled_before_measurement = if (case.adaptive) (scope.cognition_tuner.phase == .settled) else false;
+    while (warm.next(suite.tunerSettled(&scope.cognition_tuner))) _ = try runCognitionOnce(&scope, &view, thread_ptr, case);
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&scope.cognition_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var think_rows: usize = 0;

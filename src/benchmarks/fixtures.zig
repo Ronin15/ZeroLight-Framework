@@ -32,8 +32,6 @@ const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const StaticColliderSystem = @import("../game/systems/static_colliders.zig").StaticColliderSystem;
 const RebuildStage = @import("../game/systems/static_colliders.zig").RebuildStage;
 const SyncStage = @import("../game/systems/static_colliders.zig").SyncStage;
-const rebuild_range_alignment = @import("../game/systems/static_colliders.zig").rebuild_range_alignment;
-const sync_range_alignment = @import("../game/systems/static_colliders.zig").sync_range_alignment;
 const splice_range_alignment_items = @import("../game/systems/chunk_list_map.zig").splice_range_alignment_items;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
 const level_z_step = @import("../game/world/system.zig").level_z_step;
@@ -45,8 +43,6 @@ const CollisionStats = @import("../game/systems/collision.zig").CollisionStats;
 const CollisionStrips = @import("../game/systems/collision.zig").CollisionStrips;
 const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
 const CommitSeamResult = @import("../game/simulation_pipeline.zig").CommitSeamResult;
-const evict_range_alignment_items = @import("../game/systems/pathfinding/types.zig").evict_range_alignment_items;
-const nav_mark_range_alignment_items = @import("../game/systems/pathfinding/nav_reaction.zig").nav_mark_range_alignment_items;
 const suite = @import("suite.zig");
 
 /// The case's thread system, or null for the serial case.
@@ -195,10 +191,10 @@ pub const StaticMove = struct {
 /// `case`.
 pub fn setSpliceTuners(colliders: *StaticColliderSystem, case: suite.BenchmarkCase) void {
     for (std.enums.values(SyncStage)) |stage| {
-        colliders.tuners.set(stage, suite.adaptiveTunerForCase(case, sync_range_alignment.get(stage)) orelse AdaptiveWorkTuner.init(.{}));
+        colliders.tuners.set(stage, AdaptiveWorkTuner.init(.{}));
     }
     for (std.enums.values(RebuildStage)) |stage| {
-        colliders.rebuild_tuners.set(stage, suite.adaptiveTunerForCase(case, rebuild_range_alignment.get(stage)) orelse AdaptiveWorkTuner.init(rebuild_tuner_config));
+        colliders.rebuild_tuners.set(stage, AdaptiveWorkTuner.init(rebuild_tuner_config));
     }
     colliders.splice_controls = .{ .adaptive = case.adaptive, .max_worker_threads = case.maxWorkerThreads(), .items_per_range = case.stageItemsPerRange(splice_range_alignment_items) };
 }
@@ -290,19 +286,19 @@ pub fn flood4(allocator: std.mem.Allocator, width: u32, height: u32, seed: [2]u3
 
 /// Gives every nav reaction stage (the batch stages, connectivity and closure included, the
 /// mark stage, and the eviction stages) a fresh tuner for `case` and its control config. The
-/// stages share one control, so every stage's fixed range modes and fixed-adaptive range
-/// scale from one item per range, aligned per stage: a chunk for the chunk stages, an event
+/// stages share one control, so every stage's fixed range modes scale from one item per
+/// range, aligned per stage: a chunk for the chunk stages, an event
 /// for the mark stage, a registry entry or pair for the eviction stages. Call after the nav
 /// build, which resets tuners.
 pub fn setNavTuners(system: *PathfindingSystem, case: suite.BenchmarkCase) void {
     const partition_items = suite.chunk_partition_items;
     const fresh = AdaptiveWorkTuner.init(.{});
-    system.tuners.nav = .initFill(suite.adaptiveTunerForPartition(case, partition_items, 1) orelse fresh);
-    system.tuners.nav_mark = suite.adaptiveTunerForPartition(case, partition_items, nav_mark_range_alignment_items) orelse fresh;
-    system.tuners.nav_evict_count = suite.adaptiveTunerForPartition(case, partition_items, evict_range_alignment_items) orelse fresh;
-    system.tuners.nav_evict = suite.adaptiveTunerForPartition(case, partition_items, evict_range_alignment_items) orelse fresh;
-    system.tuners.evict_flush = suite.adaptiveTunerForPartition(case, partition_items, 1) orelse fresh;
-    system.tuners.evict_flush_count = suite.adaptiveTunerForPartition(case, partition_items, 1) orelse fresh;
+    system.tuners.nav = .initFill(fresh);
+    system.tuners.nav_mark = fresh;
+    system.tuners.nav_evict_count = fresh;
+    system.tuners.nav_evict = fresh;
+    system.tuners.evict_flush = fresh;
+    system.tuners.evict_flush_count = fresh;
     system.nav_controls = .{
         .adaptive = case.adaptive,
         .max_worker_threads = case.maxWorkerThreads(),

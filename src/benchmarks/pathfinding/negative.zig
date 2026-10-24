@@ -27,7 +27,6 @@ const coldWarmup = @import("nav_fixtures.zig").coldWarmup;
 const coldIterations = @import("nav_fixtures.zig").coldIterations;
 const coldSettleLimit = @import("nav_fixtures.zig").coldSettleLimit;
 const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
-const setPathStageTuners = @import("nav_fixtures.zig").setPathStageTuners;
 const StageReport = @import("nav_fixtures.zig").StageReport;
 const buildOpenWorld = @import("nav_fixtures.zig").buildOpenWorld;
 const writeLevelZeroCells = @import("nav_fixtures.zig").writeLevelZeroCells;
@@ -267,11 +266,10 @@ fn runNegativeSteadyCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     var fixture = try initPocketFixture(allocator, io, side, item_count, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try nav_size.checkNavBytes(negative_steady_group.name, item_count, size_config, &fixture.system);
-    setPathStageTuners(&fixture.system, case);
 
     var warm = suite.Warmup.custom(case, coldWarmup(options), coldSettleLimit(options));
-    while (warm.next(fixture.system.tuners.intake.phase == .settled)) _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
-    const settled_before_measurement = if (case.adaptive) (fixture.system.tuners.intake.phase == .settled) else false;
+    while (warm.next(suite.tunerSettled(&fixture.system.tuners.intake))) _ = try runPocketUpdate(io, case, &fixture, thread_ptr);
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&fixture.system.tuners.intake) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -353,7 +351,6 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
     defer fixture.deinit(allocator);
     try nav_size.checkNavBytes(negative_dig_group.name, item_count, size_config, &fixture.system);
     try fixture.changed.ensureTotalCapacity(allocator, 1);
-    setPathStageTuners(&fixture.system, case);
     fixtures.setNavTuners(&fixture.system, case);
 
     // Untimed first update: every request answered at intake, as every later one.
@@ -362,8 +359,8 @@ fn runNegativeDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.O
 
     var dig = NegativeDig{ .cell = pocketDigCell(side) };
     var warm = suite.Warmup.custom(case, coldWarmup(options), coldSettleLimit(options));
-    while (warm.next(fixture.system.tuners.intake.phase == .settled)) _ = try dig.step(io, case, &fixture, thread_ptr);
-    const settled_before_measurement = if (case.adaptive) (fixture.system.tuners.intake.phase == .settled) else false;
+    while (warm.next(suite.tunerSettled(&fixture.system.tuners.intake))) _ = try dig.step(io, case, &fixture, thread_ptr);
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&fixture.system.tuners.intake) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     // The update's stages and the reaction's eviction stages, each over its own span.
@@ -690,7 +687,6 @@ fn runGoalDispatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.
     var fixture = try initDispatchFixture(allocator, io, config, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try nav_size.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
-    setPathStageTuners(&fixture.system, case);
 
     for (0..options.warmup_iterations) |_| _ = try runDispatchResolve(io, &fixture.system, fixture.requests, thread_ptr, case);
     var accumulator = suite.StatsAccumulator.init(item_count);
@@ -729,12 +725,11 @@ fn runNegativeBurstCase(allocator: std.mem.Allocator, io: std.Io, options: suite
     var fixture = try initBurstFixture(allocator, io, config, nav_size.navSizeCapacity(size_config), thread_ptr);
     defer fixture.deinit(allocator);
     try nav_size.checkNavBytes(negative_burst_group.name, item_count, size_config, &fixture.system);
-    setPathStageTuners(&fixture.system, case);
 
     // At least one untimed burst: the first grows the capacity from the reserve floor.
     var warm = suite.Warmup.custom(case, @max(1, coldWarmup(options)), coldSettleLimit(options));
-    while (warm.next(fixture.system.tuners.intake.phase == .settled)) _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
-    const settled_before_measurement = if (case.adaptive) (fixture.system.tuners.intake.phase == .settled) else false;
+    while (warm.next(suite.tunerSettled(&fixture.system.tuners.intake))) _ = try runBurst(io, case, config.variant, &fixture, thread_ptr);
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&fixture.system.tuners.intake) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var stage_report = StageReport{};

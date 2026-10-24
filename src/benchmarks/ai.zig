@@ -30,8 +30,6 @@ const EntityId = @import("../game/data_system.zig").EntityId;
 const AiStats = @import("../game/systems/ai.zig").AiStats;
 const AiSystem = @import("../game/systems/ai.zig").AiSystem;
 const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
-const ai_gather_range_alignment_items = @import("../game/systems/ai.zig").ai_gather_range_alignment_items;
-const ai_intent_range_alignment_items = @import("../game/systems/ai.zig").ai_intent_range_alignment_items;
 const max_separation_candidate_checks = @import("../game/systems/ai.zig").max_separation_candidate_checks;
 const max_separation_neighbors = @import("../game/systems/ai.zig").max_separation_neighbors;
 const IndexGeometry = @import("../game/systems/spatial_index.zig").IndexGeometry;
@@ -219,11 +217,6 @@ pub fn runCellOrderedCase(allocator: std.mem.Allocator, io: std.Io, options: sui
 fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *Fixture, think_ascends: bool) !suite.RunStats {
     var system = AiSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, ai_gather_range_alignment_items)) |tuner| {
-        system.gather_tuner = tuner;
-        system.separation_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
-        system.intent_tuner = suite.adaptiveTunerForCase(case, ai_intent_range_alignment_items).?;
-    }
 
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
@@ -242,11 +235,11 @@ fn runFixture(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
     }
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next((system.gather_tuner.phase == .settled) and (system.separation_tuner.phase == .settled) and (system.intent_tuner.phase == .settled))) {
+    while (warm.next(suite.tunerSettled(&system.gather_tuner) and suite.tunerSettled(&system.separation_tuner) and suite.tunerSettled(&system.intent_tuner))) {
         _ = try runOnce(&system, fixture, spatial_view, think_set, &threads, case);
     }
-    const separation_settled_before_measurement = if (case.adaptive) (system.separation_tuner.phase == .settled) else false;
-    const intent_settled_before_measurement = if (case.adaptive) (system.intent_tuner.phase == .settled) else false;
+    const separation_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.separation_tuner) else false;
+    const intent_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.intent_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_ai_stats = AiStats{};

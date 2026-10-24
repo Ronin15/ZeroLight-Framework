@@ -214,7 +214,7 @@ fn stageRunOnce(
 // An inline-settled gather never dispatches the apply, so its tuner settles alone.
 fn stageTunersSettled(system: *const CollisionResponseSystem) bool {
     const gather = &system.gather_tuner;
-    return (gather.phase == .settled) and (!gather.has_threaded_profile or (system.apply_tuner.phase == .settled));
+    return suite.tunerSettled(gather) and (!gather.has_threaded_profile or suite.tunerSettled(&system.apply_tuner));
 }
 
 fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -229,11 +229,6 @@ fn runStageCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     var system = CollisionResponseSystem.init(allocator);
     defer system.deinit();
     try system.reserveForContacts(item_count, thread_ptr.participantSlotCount());
-    if (suite.adaptiveTunerForCase(case, movement_range_alignment_items)) |tuner| {
-        system.gather_tuner = tuner;
-        // Fixed-adaptive apply: one block per range. The tuned case keeps the system's tuner.
-        system.apply_tuner = suite.adaptiveTunerForPartition(case, 1, 1).?;
-    }
 
     // A fixed threaded case with more than one range of contacts dispatches the gather.
     const expect_dispatch = !case.adaptive and thread_ptr.workerThreadCount() > 0 and item_count > case.fixedItemsPerRange(movement_range_alignment_items);

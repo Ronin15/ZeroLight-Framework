@@ -208,7 +208,6 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     const bounds = fixture.world.worldWidthPixels();
 
     var gate: WorldGateSystem = .{};
-    if (suite.adaptiveTunerForCase(case, world_gate_range_alignment_items)) |tuner| gate.tuner = tuner;
     const items_per_range = case.stageItemsPerRange(world_gate_range_alignment_items);
     const config = WorldGateConfig{
         .items_per_range = items_per_range,
@@ -217,10 +216,10 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     };
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(gate.tuner.phase == .settled)) {
+    while (warm.next(suite.tunerSettled(&gate.tuner))) {
         try gate.apply(&fixture.world, &fixture.data, &fixture.player, bounds, bounds, &threads, config);
     }
-    const settled_before_measurement = if (case.adaptive) (gate.tuner.phase == .settled) else false;
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&gate.tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var main_total: u128 = 0;

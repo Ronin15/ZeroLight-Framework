@@ -226,7 +226,7 @@ fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: *ThreadSystem) !u
 
 // A toggle stage tuner set's plan, remask, and patch tuners settled.
 fn toggleTunersSettled(tuners: *const fixtures.NavTuners) bool {
-    return (tuners.nav.getPtrConst(.plan).phase == .settled) and (tuners.nav.getPtrConst(.remask).phase == .settled) and (tuners.nav.getPtrConst(.patch).phase == .settled);
+    return suite.tunerSettled(tuners.nav.getPtrConst(.plan)) and suite.tunerSettled(tuners.nav.getPtrConst(.remask)) and suite.tunerSettled(tuners.nav.getPtrConst(.patch));
 }
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -251,8 +251,8 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // allocation-free) and the tuners have trained an inline baseline before timing.
     var warm = suite.Warmup.init(options, case, 1);
     while (warm.next(toggleTunersSettled(&fixture.system.tuners) and toggleTunersSettled(&fixture.revert_tuners))) _ = try runToggle(&fixture, io, thread_ptr);
-    const remask_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.remask).phase == .settled) else false;
-    const patch_settled = if (case.adaptive) (fixture.system.tuners.nav.getPtrConst(.patch).phase == .settled) else false;
+    const remask_settled = if (case.adaptive) suite.tunerSettled(fixture.system.tuners.nav.getPtrConst(.remask)) else false;
+    const patch_settled = if (case.adaptive) suite.tunerSettled(fixture.system.tuners.nav.getPtrConst(.patch)) else false;
 
     // Throughput is over the cells edited: the footprint is capped, so a count above the cap
     // edits fewer cells.
@@ -437,9 +437,9 @@ fn runStaticMoveCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Op
     const nav = fixture.nav();
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next((nav.tuners.nav_mark.phase == .settled) and (nav.tuners.nav.getPtrConst(.plan).phase == .settled) and (nav.tuners.nav.getPtrConst(.remask).phase == .settled) and (nav.tuners.nav.getPtrConst(.patch).phase == .settled))) _ = try fixture.moveAndReact(io, thread_ptr);
-    const remask_settled = if (case.adaptive) (nav.tuners.nav.getPtrConst(.remask).phase == .settled) else false;
-    const patch_settled = if (case.adaptive) (nav.tuners.nav.getPtrConst(.patch).phase == .settled) else false;
+    while (warm.next(suite.tunerSettled(&nav.tuners.nav_mark) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.plan)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)))) _ = try fixture.moveAndReact(io, thread_ptr);
+    const remask_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) else false;
+    const patch_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)) else false;
 
     var accumulator = suite.StatsAccumulator.init(other_statics + dynamic_bodies);
     var chunks_patched: usize = 0;
@@ -732,9 +732,9 @@ fn runDenseCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     const nav = fixture.nav();
 
     var warm = suite.Warmup.init(options, case, 1);
-    while (warm.next((fixture.colliders().tuners.getPtrConst(.rewrite).phase == .settled) and (nav.tuners.nav.getPtrConst(.plan).phase == .settled) and (nav.tuners.nav.getPtrConst(.remask).phase == .settled) and (nav.tuners.nav.getPtrConst(.patch).phase == .settled))) _ = try fixture.changeAndReact(io, thread_ptr);
-    const remask_settled = if (case.adaptive) (nav.tuners.nav.getPtrConst(.remask).phase == .settled) else false;
-    const patch_settled = if (case.adaptive) (nav.tuners.nav.getPtrConst(.patch).phase == .settled) else false;
+    while (warm.next(suite.tunerSettled(fixture.colliders().tuners.getPtrConst(.rewrite)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.plan)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) and suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)))) _ = try fixture.changeAndReact(io, thread_ptr);
+    const remask_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.remask)) else false;
+    const patch_settled = if (case.adaptive) suite.tunerSettled(nav.tuners.nav.getPtrConst(.patch)) else false;
 
     const change_count = fixture.layout.chunk_count * dense_changes_per_chunk;
     var accumulator = suite.StatsAccumulator.init(change_count);

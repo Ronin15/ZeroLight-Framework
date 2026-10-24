@@ -97,19 +97,16 @@ fn runCaseImpl(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer fixture.deinit();
     var system = AffectSystem.init(allocator);
     defer system.deinit();
-    if (suite.adaptiveTunerForCase(case, affect_range_alignment_items)) |tuner| {
-        system.compute_tuner = tuner;
-    }
 
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
 
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(system.compute_tuner.phase == .settled)) {
+    while (warm.next(suite.tunerSettled(&system.compute_tuner))) {
         fixture.events.clearRetainingCapacity();
         _ = try runOnce(&system, &fixture, think_set, &threads, case);
     }
-    const settled_before_measurement = if (case.adaptive) (system.compute_tuner.phase == .settled) else false;
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.compute_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = AffectStats{};

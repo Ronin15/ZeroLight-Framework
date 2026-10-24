@@ -1186,8 +1186,8 @@ const RevertEditTuners = struct {
     plan: AdaptiveWorkTuner,
     write: AdaptiveWorkTuner,
 
-    fn forCase(case: suite.BenchmarkCase) RevertEditTuners {
-        return .{ .plan = editTunerForCase(case), .write = editTunerForCase(case) };
+    fn init() RevertEditTuners {
+        return .{ .plan = AdaptiveWorkTuner.init(.{}), .write = AdaptiveWorkTuner.init(.{}) };
     }
 
     // `forward` with its tuners replaced by these; null when it is.
@@ -1199,14 +1199,9 @@ const RevertEditTuners = struct {
     }
 
     fn settled(self: *const RevertEditTuners) bool {
-        return (self.plan.phase == .settled) and (self.write.phase == .settled);
+        return suite.tunerSettled(&self.plan) and suite.tunerSettled(&self.write);
     }
 };
-
-// A terrain-edit stage tuner for `case`, partitioned by chunk.
-fn editTunerForCase(case: suite.BenchmarkCase) AdaptiveWorkTuner {
-    return suite.adaptiveTunerForPartition(case, suite.chunk_partition_items, edit_range_alignment_items) orelse AdaptiveWorkTuner.init(.{});
-}
 
 // One timed batched change and its reversal, the reversal on `revert`'s tuners; returns the
 // cells written.
@@ -1220,7 +1215,7 @@ fn runBatchIteration(fixture: *Fixture, edit: *BatchEdit, threads: ?TerrainEditT
 }
 
 fn tunersSettled(world: *const WorldSystem, revert: *const RevertEditTuners) bool {
-    return (world.terrain_edit_plan_tuner.phase == .settled) and (world.terrain_edit_write_tuner.phase == .settled) and revert.settled();
+    return suite.tunerSettled(&world.terrain_edit_plan_tuner) and suite.tunerSettled(&world.terrain_edit_write_tuner) and revert.settled();
 }
 
 fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: BatchWorkload) !suite.RunStats {
@@ -1256,9 +1251,9 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
     }
 
     const world = &fixture.world;
-    world.terrain_edit_plan_tuner = editTunerForCase(case);
-    world.terrain_edit_write_tuner = editTunerForCase(case);
-    var revert_tuners = RevertEditTuners.forCase(case);
+    world.terrain_edit_plan_tuner = AdaptiveWorkTuner.init(.{});
+    world.terrain_edit_write_tuner = AdaptiveWorkTuner.init(.{});
+    var revert_tuners = RevertEditTuners.init();
     const edit_threads: ?TerrainEditThreads = if (threads) |*thread_system| .{
         .thread_system = thread_system,
         .plan_tuner = &world.terrain_edit_plan_tuner,
@@ -1272,8 +1267,8 @@ fn runBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options
         _ = try runBatchIteration(&fixture, &edit, edit_threads, &revert_tuners, &unused_timing);
         _ = try fixture.syncGpuTiles(fixture.gpuActiveLevel());
     }
-    const plan_settled = if (case.adaptive) (world.terrain_edit_plan_tuner.phase == .settled) else false;
-    const write_settled = if (case.adaptive) (world.terrain_edit_write_tuner.phase == .settled) else false;
+    const plan_settled = if (case.adaptive) suite.tunerSettled(&world.terrain_edit_plan_tuner) else false;
+    const write_settled = if (case.adaptive) suite.tunerSettled(&world.terrain_edit_write_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var plan_total: u128 = 0;
@@ -1513,10 +1508,10 @@ fn navFixtureOver(allocator: std.mem.Allocator, io: std.Io, fixture: Fixture, ca
 
 // `reaction`: the workload runs the post-commit reaction, so its mark stage dispatches too.
 fn navStageTunersSettled(tuners: *const fixtures.NavTuners, flood_idle: bool, reaction: bool) bool {
-    return (!reaction or (tuners.nav_mark.phase == .settled)) and (tuners.nav.getPtrConst(.plan).phase == .settled) and
-        (tuners.nav.getPtrConst(.remask).phase == .settled) and (tuners.nav.getPtrConst(.patch).phase == .settled) and
-        (tuners.nav.getPtrConst(.conn_seed).phase == .settled) and (tuners.nav.getPtrConst(.conn_gather).phase == .settled) and
-        (tuners.nav.getPtrConst(.conn_flood).phase == .settled or flood_idle);
+    return (!reaction or suite.tunerSettled(&tuners.nav_mark)) and suite.tunerSettled(tuners.nav.getPtrConst(.plan)) and
+        suite.tunerSettled(tuners.nav.getPtrConst(.remask)) and suite.tunerSettled(tuners.nav.getPtrConst(.patch)) and
+        suite.tunerSettled(tuners.nav.getPtrConst(.conn_seed)) and suite.tunerSettled(tuners.nav.getPtrConst(.conn_gather)) and
+        (suite.tunerSettled(tuners.nav.getPtrConst(.conn_flood)) or flood_idle);
 }
 
 fn runNavDigCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -1574,8 +1569,8 @@ fn runNavCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, 
         try resetNavWorkload(allocator, &nav, &driver, &refill, workload);
     }
     const tuners = &nav.pipeline.pathfinding.tuners;
-    const remask_settled = if (case.adaptive) (tuners.nav.getPtrConst(.remask).phase == .settled) else false;
-    const patch_settled = if (case.adaptive) (tuners.nav.getPtrConst(.patch).phase == .settled) else false;
+    const remask_settled = if (case.adaptive) suite.tunerSettled(tuners.nav.getPtrConst(.remask)) else false;
+    const patch_settled = if (case.adaptive) suite.tunerSettled(tuners.nav.getPtrConst(.patch)) else false;
     var accumulator = suite.StatsAccumulator.init(item_count);
     // The last timed reaction, read before the reset's reaction replaces it.
     var timed_stats: NavUpdateStats = .{};
@@ -1870,9 +1865,9 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     const world = &nav.base.world;
     const system = &nav.pipeline.pathfinding;
-    world.terrain_edit_plan_tuner = editTunerForCase(case);
-    world.terrain_edit_write_tuner = editTunerForCase(case);
-    var revert_tuners = RevertEditTuners.forCase(case);
+    world.terrain_edit_plan_tuner = AdaptiveWorkTuner.init(.{});
+    world.terrain_edit_write_tuner = AdaptiveWorkTuner.init(.{});
+    var revert_tuners = RevertEditTuners.init();
     nav.setTuners(case);
     const edit_threads = TerrainEditThreads{
         .thread_system = thread_ptr,
@@ -1886,8 +1881,8 @@ fn runNavBatchCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     while (warm.next(navTunersSettled(&nav, &revert_tuners))) {
         _ = try runNavBatchIteration(io, &nav, &edit, &frame, edit_threads, &revert_tuners, thread_ptr, &unused_timing);
     }
-    const remask_settled = if (case.adaptive) (system.tuners.nav.getPtrConst(.remask).phase == .settled) else false;
-    const patch_settled = if (case.adaptive) (system.tuners.nav.getPtrConst(.patch).phase == .settled) else false;
+    const remask_settled = if (case.adaptive) suite.tunerSettled(system.tuners.nav.getPtrConst(.remask)) else false;
+    const patch_settled = if (case.adaptive) suite.tunerSettled(system.tuners.nav.getPtrConst(.patch)) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var plan_total: u128 = 0;

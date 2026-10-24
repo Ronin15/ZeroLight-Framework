@@ -45,11 +45,13 @@ How the thread system works: `docs/architecture.md` § Thread System.
   never per step total. A design states dispatches per step, items per
   dispatch, and per-item cost at each bench size.
 - The gate decides inline or threaded: a dispatch whose work is under the
-  gate runs inline. Work over it is threaded only with enough work per
-  participant to beat that participant's wake and join cost, so participants
-  follow the work, never the pool size. A stage whose dispatches sit near the
-  gate is a batch-shape problem, fixed in the stage (fuse passes, batch
-  across units), not by threading it.
+  gate runs inline. Over it, the tuner splits the work into batches and tunes
+  the batch count by measured time; workers follow the batches (at most one
+  per batch, up to the pool), so participation follows the work, never the
+  pool size. A stage hands its tuner its items and never sets a batch count
+  or worker count itself.
+- A tuner re-tunes only on evidence: a sustained shift in item count or in
+  measured cost per item. No timers, no forced re-probes.
 - Worker participation follows measured timing, never fixed item-count
   floors. Before changing thread policy or a stage's shape, isolate that
   stage's timing and tuner state.

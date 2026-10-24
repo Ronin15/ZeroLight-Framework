@@ -45,17 +45,13 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
 
-    if (suite.adaptiveTunerForCase(case, sprite_prep_range_alignment_items)) |tuner| {
-        batch.adaptive_tuner = tuner;
-    }
-
     // Warm up and settle through the same decomposed path used for measurement so
     // settled_before_measurement and work_tuning reflect the path actually timed.
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(batch.adaptive_tuner.phase == .settled)) {
+    while (warm.next(suite.tunerSettled(&batch.adaptive_tuner))) {
         _ = try runMeasuredOnce(item_count, &batch, table.resolver(), &threads, case, io);
     }
-    const settled_before_measurement = if (case.adaptive) (batch.adaptive_tuner.phase == .settled) else false;
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&batch.adaptive_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var phase_accumulator = fixtures.PhaseAccumulator(suite.RenderPrepPhaseSummary){};

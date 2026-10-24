@@ -1682,9 +1682,7 @@ test "ai processor uses committed adaptive threaded profiles with default thread
         .worker_threads = 1,
         .items_per_range = ai_range_alignment_items,
     };
-    committed_tuner.best_profile = committed_tuner.current_profile;
     committed_tuner.has_threaded_profile = true;
-    committed_tuner.best_mean_batch_duration_ns = 1;
     ai_sys.separation_tuner = committed_tuner;
     ai_sys.intent_tuner = committed_tuner;
 

@@ -35,7 +35,6 @@ const runColdOnce = @import("nav_fixtures.zig").runColdOnce;
 const coldStepConfig = @import("nav_fixtures.zig").coldStepConfig;
 const expireCachedResults = @import("nav_fixtures.zig").expireCachedResults;
 const drainPending = @import("nav_fixtures.zig").drainPending;
-const setPathStageTuners = @import("nav_fixtures.zig").setPathStageTuners;
 const StageReport = @import("nav_fixtures.zig").StageReport;
 const OpenWorld = @import("nav_fixtures.zig").OpenWorld;
 const buildOpenWorld = @import("nav_fixtures.zig").buildOpenWorld;
@@ -1599,15 +1598,14 @@ fn runRouteStep(system: *PathfindingSystem, fixture: *RouteFixture, thread_syste
 // pending and every cached result expired, untimed (`drainPending`, `expireCachedResults`).
 fn runColdRouteSteps(io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, fixture: *RouteFixture, thread_system: *ThreadSystem, unsolved_routes: UnsolvedRoutes) !suite.RunStats {
     const system = &fixture.system;
-    setPathStageTuners(system, case);
     const cold_config = coldStepConfig(case, route_request_count, route_request_count);
     var warm = suite.Warmup.custom(case, options.warmup_iterations, coldSettleLimit(options));
-    while (warm.next(system.tuners.solve.phase == .settled)) {
+    while (warm.next(suite.tunerSettled(&system.tuners.solve))) {
         try drainPending(system, thread_system, route_request_count, cold_config);
         expireCachedResults(system);
         _ = try runRouteStep(system, fixture, thread_system, case, unsolved_routes);
     }
-    const settled = if (case.adaptive) (system.tuners.solve.phase == .settled) else false;
+    const settled = if (case.adaptive) suite.tunerSettled(&system.tuners.solve) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};

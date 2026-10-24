@@ -517,7 +517,6 @@ fn checkPairBoundFlags(allocator: std.mem.Allocator, io: std.Io, case: suite.Ben
     defer threads.deinit();
     var system = CollisionSystem.init(allocator);
     defer system.deinit();
-    useCaseTuners(&system, case);
     const bodies = data.movementBodySliceConst().entities.len;
     try system.reserve(@max(bodies / 4, 1));
     var contacts = RangeOutputStream(CollisionContact).init(allocator);
@@ -1769,7 +1768,6 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer own_system.deinit();
     // A mover's steps run on its pipeline's collision system, which its seams synced.
     const system = if (inputs.mover) |static_mover| static_mover.collision() else &own_system;
-    useCaseTuners(system, case);
     var contacts = RangeOutputStream(CollisionContact).init(allocator);
     defer contacts.deinit();
 
@@ -1785,10 +1783,10 @@ fn measureCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     while (warm.next(stageTunersSettled(system))) {
         _ = try runOnce(system, data, inputs, &contacts, thread_ptr, case);
     }
-    const fill_settled_before_measurement = case.adaptive and (system.fill_tuner.phase == .settled);
-    const sort_settled_before_measurement = case.adaptive and (system.sort_tuner.phase == .settled);
-    const broadphase_settled_before_measurement = if (case.adaptive) (system.broadphase_tuner.phase == .settled) else false;
-    const narrowphase_settled_before_measurement = if (case.adaptive) (system.narrowphase_tuner.phase == .settled) else false;
+    const fill_settled_before_measurement = case.adaptive and suite.tunerSettled(&system.fill_tuner);
+    const sort_settled_before_measurement = case.adaptive and suite.tunerSettled(&system.sort_tuner);
+    const broadphase_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.broadphase_tuner) else false;
+    const narrowphase_settled_before_measurement = if (case.adaptive) suite.tunerSettled(&system.narrowphase_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_collision_stats = CollisionStats{};
@@ -1880,23 +1878,16 @@ fn writeStaticStageDetails(details: *suite.DetailLines, stages: *const suite.Sta
     });
 }
 
-/// Gives each of `system`'s stage tuners the case's own tuner (an adaptive case only).
-fn useCaseTuners(system: *CollisionSystem, case: suite.BenchmarkCase) void {
-    for ([_]*AdaptiveWorkTuner{ &system.fill_tuner, &system.sort_tuner, &system.broadphase_tuner, &system.narrowphase_tuner, &system.static_pair_tuner, &system.static_rect_tuner, &system.static_place_tuner, &system.static_sort_tuner, system.trigger_store.tuners.getPtr(.refresh), &system.emit_tuner }) |tuner| {
-        tuner.* = suite.adaptiveTunerForCase(case, collision_range_alignment_items) orelse return;
-    }
-}
-
 /// Every stage tuner of `system` settled.
 fn stageTunersSettled(system: *const CollisionSystem) bool {
-    return (system.fill_tuner.phase == .settled) and (system.sort_tuner.phase == .settled) and
-        (system.broadphase_tuner.phase == .settled) and (system.narrowphase_tuner.phase == .settled) and
-        (system.static_pair_tuner.sample_count == 0 or system.static_pair_tuner.phase == .settled) and
-        (system.static_rect_tuner.sample_count == 0 or system.static_rect_tuner.phase == .settled) and
-        (system.static_place_tuner.sample_count == 0 or system.static_place_tuner.phase == .settled) and
-        (system.static_sort_tuner.sample_count == 0 or system.static_sort_tuner.phase == .settled) and
-        (system.trigger_store.tuners.getPtrConst(.refresh).sample_count == 0 or system.trigger_store.tuners.getPtrConst(.refresh).phase == .settled) and
-        (system.emit_tuner.sample_count == 0 or system.emit_tuner.phase == .settled);
+    return suite.tunerSettled(&system.fill_tuner) and suite.tunerSettled(&system.sort_tuner) and
+        suite.tunerSettled(&system.broadphase_tuner) and suite.tunerSettled(&system.narrowphase_tuner) and
+        (system.static_pair_tuner.sample_count == 0 or suite.tunerSettled(&system.static_pair_tuner)) and
+        (system.static_rect_tuner.sample_count == 0 or suite.tunerSettled(&system.static_rect_tuner)) and
+        (system.static_place_tuner.sample_count == 0 or suite.tunerSettled(&system.static_place_tuner)) and
+        (system.static_sort_tuner.sample_count == 0 or suite.tunerSettled(&system.static_sort_tuner)) and
+        (system.trigger_store.tuners.getPtrConst(.refresh).sample_count == 0 or suite.tunerSettled(system.trigger_store.tuners.getPtrConst(.refresh))) and
+        (system.emit_tuner.sample_count == 0 or suite.tunerSettled(&system.emit_tuner));
 }
 
 // Fails when a step's sweep batches miss their work: the broadphase covers every sweep

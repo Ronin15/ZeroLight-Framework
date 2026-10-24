@@ -177,12 +177,8 @@ fn runCaseWithConfig(
     var threads = try fixtures.initRequiredCaseThreads(allocator, io, case);
     defer threads.deinit();
 
-    if (suite.adaptiveTunerForCase(case, sprite_prep_range_alignment_items)) |tuner| {
-        batch.adaptive_tuner = tuner;
-    }
-
     var warm = suite.Warmup.init(options, case, 0);
-    while (warm.next(batch.adaptive_tuner.phase == .settled)) {
+    while (warm.next(suite.tunerSettled(&batch.adaptive_tuner))) {
         _ = try runMeasuredOnce(
             io,
             fixture,
@@ -194,7 +190,7 @@ fn runCaseWithConfig(
             allocator,
         );
     }
-    const settled_before_measurement = if (case.adaptive) (batch.adaptive_tuner.phase == .settled) else false;
+    const settled_before_measurement = if (case.adaptive) suite.tunerSettled(&batch.adaptive_tuner) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var phase_accumulator = fixtures.PhaseAccumulator(suite.RenderGamePrepPhaseSummary){};
