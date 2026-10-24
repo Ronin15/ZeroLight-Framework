@@ -51,6 +51,12 @@ scope only where the diff relies on it.
 
 ## Procedure
 
+Read the change as its plan first, in the design's order: what it grows
+with, the data each loop reads and in what order, the passes and how they
+thread, and the tuner each pass gets (`threading.md` § Building a stage).
+Then run the passes below against that picture; each finding names the step
+of the plan it breaks.
+
 1. **Scale Pass**, for each operation the diff adds or changes, against
    `engine-design.md` § Target scale and § Cost model, `threading.md`
    § What runs where, and `budgets-capacities.md`: work or memory that follows
@@ -113,11 +119,12 @@ scope only where the diff relies on it.
    tests and bench output meet `threading.md` and `tests-benchmarks.md`; an
    inline run proves no threaded parity. A change path whose named
    cost-driver stage has no `runtime_perf_log` entry is a finding; so is logging stages beyond the cost
-   drivers (`threading.md`). A tuner or selection two passes share outside
-   `threading.md` § Building a stage's one-off sharing, a new tuner that
-   records too rarely to settle, or a production dispatch at a fixed shape
-   outside a tuner, is a finding; so is a stage that sets its own batch
-   count or worker count instead of its tuner's. A
+   drivers (`threading.md`). Tuners are checked against the plan of the
+   passes: each new tuner's pass and how often it records in play; a tuner
+   two passes share outside that section's one-off sharing, a new tuner
+   that records too rarely to settle, a production dispatch at a fixed shape
+   outside a tuner, or a stage that sets its own batch or worker count is a
+   finding. A
    stage that runs inline because its work is under the gate is the design,
    not main-thread work to flag.
    **Test and production code**, every review: check every touched file

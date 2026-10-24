@@ -29,16 +29,14 @@ than working from a compaction summary.
    that only when a claim does not match the live code. For a slice,
    implement from the design plan, never from slice prose alone. Do not
    survey the plan's file:line list up front.
-2. State the change's cost model (`engine-design.md` § Cost model), including
-   the serial and threaded paths. A measured hot-path cause named in the
-   brief is optimized and re-measured. Stop for a replan only when that
-   re-measure still misses and the counters show the structure itself is
-   the cost, or the brief already says the structure failed. Do not replan
-   off an unmeasured guess. Stop, and do not implement, when a hot loop in
-   the plan reads through an index permutation or drains lane results into
-   per-item scalar calls and the plan names no exemption from
-   `memory-performance.md` § Data-oriented design. That layout goes back
-   to design.
+2. Build it in the plan's order: the data and its layout, the loops over
+   it, the passes and their threading, the tuners each pass gets
+   (`threading.md` § Building a stage), then the proof. State the change's
+   cost model (`engine-design.md` § Cost model), including the serial and
+   threaded paths. A measured hot-path cause named in the brief is
+   optimized and re-measured; a replan comes only when that re-measure
+   still misses and the counters show the structure itself is the cost, or
+   the brief already says the structure failed.
 3. Make the change in the owning module (`docs/architecture.md` § Source
    Layout; `engine-design.md` § Changes and docs). Touch only the files the
    brief lists; a needed file outside the list stops the work and is
@@ -73,6 +71,17 @@ than working from a compaction summary.
    callgrind on a ReleaseSafe bench, not by this agent. A crash, hang, or
    leak goes to zig-debug-specialist through the main session. Never tune
    for a bench number unless the brief names that case.
+
+## Checks (before the report)
+
+- A hot loop in the plan that reads through an index permutation or drains
+  lane results into per-item scalar calls, with no exemption named from
+  `memory-performance.md` § Data-oriented design, is not implemented: that
+  layout goes back to design.
+- No replan off an unmeasured guess.
+- Every tuner the change adds or removes is listed with its pass and its
+  settle state in the benches that run it; one that never settles is
+  reported.
 
 ## Report
 
