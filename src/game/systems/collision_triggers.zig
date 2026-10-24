@@ -5,39 +5,38 @@
 //! The collision system's stored static-trigger pairs: one paged order tree per level, all in
 //! one `TriggerStore` per world. A level's pairs, in contact-key order (the level is the key's
 //! top 16 bits), are split into sorted pages of up to `page_capacity` pairs held in pooled
-//! `PayloadSlabs` slots with SoA columns. Pages are the leaves of the level's B+-tree, whose
-//! inner nodes hold each child's first key and a prefix of the children's pair counts. The
-//! level table is indexed by level id; `LevelRank`, a Fenwick tree over the levels' pair
-//! counts, folds the levels into one global order, so `cursorAt(ordinal)` is a Fenwick find
-//! plus one tree descent.
+//! `PayloadSlabs` slots with SoA columns. Pages are the leaves of the level's B+-tree; each
+//! page's header masks its valid and allowed slots, and each inner node holds its children's
+//! first keys and a prefix of their counts of every `PairCount`. The level table is indexed by
+//! level id; `LevelRank`, a Fenwick tree over the levels' counts, folds the levels into one
+//! global order per count, so `cursorAt(ordinal)` and `emittedCursorAt(count, ordinal)` are a
+//! Fenwick find plus one tree descent.
 //!
 //! A patch takes its edits as data: inserts located to their page, and drop pieces naming the
 //! slots of one page. Main buckets them by level, page and node; a banded sort orders the
-//! inserts; main plans every tree height of every touched level from counts alone; one
-//! dispatch per tree height writes fresh pages and nodes; main installs. Every allocation
+//! inserts; main plans every tree height of every touched level from counts alone; one leaf
+//! dispatch writes the fresh pages; main writes the nodes and installs. Every allocation
 //! happens before the first stored mutation. A rebuild runs the same plan from empty trees.
 
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const Dispatch = @import("../../app/thread_system.zig").Dispatch;
-const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
-const RoundDispatch = @import("../../app/thread_system.zig").RoundDispatch;
 const SlotList = @import("../../app/thread_system.zig").SlotList;
 const StageControls = @import("../../app/thread_system.zig").StageControls;
 const StageThreads = @import("../../app/thread_system.zig").StageThreads;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const changedCapacities = @import("../../app/thread_system.zig").changedCapacities;
-const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
 const rebuild_tuner_config = @import("../../app/thread_system.zig").rebuild_tuner_config;
 const runShaped = @import("../../app/thread_system.zig").runShaped;
-const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const StageShape = @import("../../app/thread_system.zig").StageShape;
 const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
+const StageTimer = runtime_perf_log.StageTimer;
 const logging = @import("../../core/logging.zig");
 const pdqSort = @import("../../core/sort.zig").pdq;
+const simd = @import("../../core/simd.zig");
 const CollisionContact = @import("../simulation.zig").CollisionContact;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
@@ -49,7 +48,7 @@ const payload_slot_alignment = @import("chunk_list_map.zig").payload_slot_alignm
 
 /// Pairs per page (P). A page's drop set is one u64, and every column holds whole 64 B lines.
 pub const page_capacity: u32 = 64;
-/// Entries per inner node (F): the largest fanout whose node fits the 2560 B slot class and
+/// Entries per inner node (F): the largest fanout whose node fits the 3072 B slot class and
 /// whose touched-children set is one u64.
 const node_capacity: u32 = 62;
 // The B+-tree fill bounds of a non-root page and node.
@@ -70,18 +69,36 @@ pub fn emitBits(a_allows: bool, b_allows: bool) u8 {
     return emit_valid | if (a_allows and b_allows) emit_allowed else 0;
 }
 
-/// True when a stored pair with emit bits `emit` emits a contact: its rows resolve and, with
-/// `exclude`, both tiers allow collision. The page headers' `valid` and `allowed` sums count
-/// this without and with `exclude`.
-pub fn emits(emit: u8, exclude: bool) bool {
-    return if (exclude) emit == emit_valid | emit_allowed else emit & emit_valid != 0;
+/// What a count or an ordinal over the stored pairs counts: every pair, the pairs whose rows
+/// resolve, or those whose tiers also both allow collision.
+pub const PairCount = enum {
+    pairs,
+    valid,
+    allowed,
+
+    /// The pairs a step emits as contacts: the allowed ones with `exclude`, else the valid.
+    pub fn emitted(exclude: bool) PairCount {
+        return if (exclude) .allowed else .valid;
+    }
+};
+
+const Counts = std.EnumArray(PairCount, u32);
+
+// True when a stored pair with emit bits `emit` counts as `kind`.
+fn countsAs(emit: u8, kind: PairCount) bool {
+    return switch (kind) {
+        .pairs => true,
+        .valid => emit & emit_valid != 0,
+        .allowed => emit == emit_valid | emit_allowed,
+    };
 }
 
 // Insert place and sort ranges start on cache-line boundaries of the staging and destination
 // windows and span at least one line, as the static pair sort's ranges do.
 const insert_range_alignment_items: usize = 16;
-// A refresh range owns the pages that start in it; P keeps it at least one page wide.
-const refresh_range_alignment_items: usize = page_capacity;
+// A refresh range owns the pages that start in it and writes each one's counts or prefix into
+// its parent's entry: a cache line of u32 entries is 16 pages, 16 full pages' pairs.
+const refresh_range_alignment_items: usize = page_capacity * (thread_shared_record_alignment / @sizeOf(u32));
 // Leaf items are whole output pages, each at least a 2.5 KB slot, and each also writes its
 // `LevelOutput` record, under a cache line: two items make a range span a line of those
 // records.
@@ -93,14 +110,28 @@ const header_bytes: usize = 64;
 
 const PageHeader = struct {
     len: u32,
-    allowed: u32,
-    valid: u32,
+    // The slots whose rows resolve, and those whose tiers also both allow collision.
+    valid_mask: u64,
+    allowed_mask: u64,
+
+    // The slots that count as `kind`.
+    fn slots(self: PageHeader, kind: PairCount) u64 {
+        return switch (kind) {
+            .pairs => lowSlots(self.len),
+            .valid => self.valid_mask,
+            .allowed => self.allowed_mask,
+        };
+    }
+
+    fn counts(self: PageHeader) Counts {
+        return .init(.{ .pairs = self.len, .valid = @popCount(self.valid_mask), .allowed = @popCount(self.allowed_mask) });
+    }
 };
 
 const NodeHeader = struct {
     count: u32,
-    /// Pairs in the node's subtree.
-    total: u32,
+    /// The subtree's pairs of each count.
+    totals: Counts,
 };
 
 // Page columns in hot-loop read order, at comptime offsets past the header.
@@ -133,10 +164,13 @@ fn layoutBytes(comptime columns: anytype, comptime capacity: usize) usize {
     return offset;
 }
 
+// `start`, `valid_start` and `allowed_start`: the node's pairs of each count before the entry.
 const node_columns = .{
     .{ "first_key", u256 },
     .{ "child", u32 },
     .{ "start", u32 },
+    .{ "valid_start", u32 },
+    .{ "allowed_start", u32 },
 };
 
 const page_bytes = layoutBytes(page_columns, page_capacity);
@@ -145,7 +179,7 @@ const leaf_class: u8 = PayloadSlabs.classFor(page_bytes) catch @compileError("pa
 const node_class: u8 = PayloadSlabs.classFor(node_bytes) catch @compileError("node past the last slot class");
 
 comptime {
-    std.debug.assert(page_bytes == 4992 and node_bytes == 2544);
+    std.debug.assert(page_bytes == 4992 and node_bytes == 3040);
     std.debug.assert(@sizeOf(PageHeader) <= header_bytes and @sizeOf(NodeHeader) <= header_bytes);
     std.debug.assert(@sizeOf(EntityId) == 8 and @alignOf(u256) <= payload_slot_alignment);
     std.debug.assert(header_bytes % @alignOf(u256) == 0);
@@ -202,6 +236,8 @@ const Node = struct {
     first_key: *[node_capacity]u256,
     child: *[node_capacity]u32,
     start: *[node_capacity]u32,
+    valid_start: *[node_capacity]u32,
+    allowed_start: *[node_capacity]u32,
 
     fn of(bytes: []align(payload_slot_alignment) u8) Node {
         var view: Node = undefined;
@@ -212,10 +248,36 @@ const Node = struct {
         return view;
     }
 
-    // Pairs under entry `entry`.
-    fn entryPairs(self: Node, entry: usize) u32 {
-        const end = if (entry + 1 < self.header.count) self.start[entry + 1] else self.header.total;
-        return end - self.start[entry];
+    // The prefix column of `kind`'s counts.
+    fn starts(self: Node, kind: PairCount) *[node_capacity]u32 {
+        return switch (kind) {
+            .pairs => self.start,
+            .valid => self.valid_start,
+            .allowed => self.allowed_start,
+        };
+    }
+
+    // The prefix columns in `Counts.values` order.
+    fn prefixColumns(self: Node) [Counts.len]*[node_capacity]u32 {
+        var columns: [Counts.len]*[node_capacity]u32 = undefined;
+        for (std.enums.values(PairCount)) |kind| columns[Counts.Indexer.indexOf(kind)] = self.starts(kind);
+        return columns;
+    }
+
+    // The pairs of `kind` under entry `entry`. Reads `kind`'s column and total alone: refresh
+    // ranges write the valid and allowed columns of nodes other ranges' cursors read pairs
+    // from.
+    fn entryCount(self: Node, entry: usize, kind: PairCount) u32 {
+        const column = self.starts(kind);
+        const end = if (entry + 1 < self.header.count) column[entry + 1] else self.header.totals.getPtrConst(kind).*;
+        return end - column[entry];
+    }
+
+    // The first entry holding a pair of `kind`; the node holds one.
+    fn firstCounted(self: Node, kind: PairCount) u32 {
+        var entry: u32 = 0;
+        while (self.entryCount(entry, kind) == 0) entry += 1;
+        return entry;
     }
 };
 
@@ -287,20 +349,20 @@ const Locate = struct {
     page_len: u32,
 };
 
-// One level's tree: its root (a page at height 0), its height, and its pair count. An empty
-// level has root `no_entry`.
+// One level's tree: its root (a page at height 0), its height, and its pairs of each count.
+// An empty level has root `no_entry`.
 const LevelTree = struct {
     root: u32 = no_entry,
-    pair_count: u32 = 0,
+    counts: Counts = .initFill(0),
     height: u8 = 0,
 };
 
-// A Fenwick tree over the levels' pair counts, one node per level id: `prefix(level)` is
-// the global ordinal of the level's first pair. Hand-rolled: std has no Fenwick or
-// order-statistics structure.
+// A Fenwick tree over the levels' counts, one node per level id holding every count:
+// `prefix(kind, level)` is the global ordinal of the level's first pair of `kind`.
+// Hand-rolled: std has no Fenwick or order-statistics structure.
 const LevelRank = struct {
     // Node i (1-based) at `sums[i - 1]` holds the counts of levels `[i - lowbit(i), i)`.
-    sums: std.ArrayList(u32) = .empty,
+    sums: std.ArrayList(Counts) = .empty,
 
     fn lowbit(index: usize) usize {
         return index & (~index +% 1);
@@ -310,29 +372,30 @@ const LevelRank = struct {
         self.sums.deinit(allocator);
     }
 
-    // Adds `delta` to `level`'s count. O(log L).
-    fn add(self: *LevelRank, level: usize, delta: i64) void {
+    // Adds `deltas` to `level`'s counts. O(log L).
+    fn add(self: *LevelRank, level: usize, deltas: std.EnumArray(PairCount, i64)) void {
         var index = level + 1;
         while (index <= self.sums.items.len) : (index += lowbit(index)) {
             const sum = &self.sums.items[index - 1];
-            sum.* = @intCast(@as(i64, sum.*) + delta);
+            for (std.enums.values(PairCount)) |kind| sum.set(kind, @intCast(@as(i64, sum.get(kind)) + deltas.get(kind)));
         }
     }
 
-    // The pairs on levels below `level`. O(log L).
-    fn prefix(self: *const LevelRank, level: usize) u32 {
+    // The pairs of `kind` on levels below `level`. O(log L).
+    fn prefix(self: *const LevelRank, kind: PairCount, level: usize) u32 {
         std.debug.assert(level <= self.sums.items.len);
         var total: u32 = 0;
         var index = level;
-        while (index > 0) : (index -= lowbit(index)) total += self.sums.items[index - 1];
+        while (index > 0) : (index -= lowbit(index)) total += self.sums.items[index - 1].get(kind);
         return total;
     }
 
     const Found = struct { level: u16, local: u32 };
 
-    // The level holding global ordinal `ordinal` (below the total) and its ordinal in the
-    // level, by binary lifting: empty levels are passed over. O(log L).
-    fn find(self: *const LevelRank, ordinal: u32) Found {
+    // The level holding global ordinal `ordinal` of `kind` (below its total) and its ordinal
+    // among the level's pairs of `kind`, by binary lifting: levels holding none are passed
+    // over. O(log L).
+    fn find(self: *const LevelRank, kind: PairCount, ordinal: u32) Found {
         const count = self.sums.items.len;
         std.debug.assert(count != 0);
         var position: usize = 0;
@@ -340,9 +403,9 @@ const LevelRank = struct {
         var step = std.math.floorPowerOfTwo(usize, count);
         while (step != 0) : (step >>= 1) {
             const next = position + step;
-            if (next <= count and self.sums.items[next - 1] <= remaining) {
+            if (next <= count and self.sums.items[next - 1].get(kind) <= remaining) {
                 position = next;
-                remaining -= self.sums.items[next - 1];
+                remaining -= self.sums.items[next - 1].get(kind);
             }
         }
         std.debug.assert(position < count);
@@ -352,7 +415,8 @@ const LevelRank = struct {
     // Appends an empty level within reserved capacity. O(log L).
     fn appendAssumeCapacity(self: *LevelRank) void {
         const index = self.sums.items.len + 1;
-        const sum = self.prefix(index - 1) - self.prefix(index - lowbit(index));
+        var sum: Counts = undefined;
+        for (std.enums.values(PairCount)) |kind| sum.set(kind, self.prefix(kind, index - 1) - self.prefix(kind, index - lowbit(index)));
         self.sums.appendAssumeCapacity(sum);
     }
 
@@ -360,10 +424,12 @@ const LevelRank = struct {
     fn build(self: *LevelRank, levels: []const LevelTree) void {
         std.debug.assert(self.sums.capacity >= levels.len);
         self.sums.items.len = levels.len;
-        for (self.sums.items, levels) |*sum, tree| sum.* = tree.pair_count;
+        for (self.sums.items, levels) |*sum, tree| sum.* = tree.counts;
         for (1..levels.len + 1) |index| {
             const parent = index + lowbit(index);
-            if (parent <= levels.len) self.sums.items[parent - 1] += self.sums.items[index - 1];
+            if (parent > levels.len) continue;
+            const into = &self.sums.items[parent - 1];
+            for (std.enums.values(PairCount)) |kind| into.set(kind, into.get(kind) + self.sums.items[index - 1].get(kind));
         }
     }
 };
@@ -371,9 +437,9 @@ const LevelRank = struct {
 // ---- Stages ---------------------------------------------------------------------------
 
 // A patch or step stage of the store, each under its own tuner.
-const TriggerStage = enum { insert_place, insert_sort, leaf, node, refresh };
+const TriggerStage = enum { insert_place, insert_sort, leaf, refresh };
 // A rebuild's stages, each under its own rebuild tuner.
-const TriggerRebuildStage = enum { insert_place, insert_sort, leaf, node };
+const TriggerRebuildStage = enum { insert_place, insert_sort, leaf };
 /// The thread system and range controls the store's stages dispatch on.
 pub const StoreThreads = StageThreads(StageControls);
 
@@ -398,6 +464,8 @@ const TouchedLevel = struct {
     // Null: the level empties.
     new_root: ?Entry = null,
     new_height: u8 = 0,
+    // The planned root's counts, read at install.
+    new_counts: Counts = .initFill(0),
 };
 
 // A touched page or node, an empty level's virtual page (id `no_entry`, height 0), or a
@@ -485,40 +553,50 @@ const Growth = struct {
     run: u32,
 };
 
-// One output page or node as the next height's node items and the install read it, written
-// by the output's own item.
+// One output page or node as its parent's entry and the install read it: a page's written by
+// its own leaf item, a node's by the merge on main.
 const LevelOutput = struct {
     first_key: u256,
     id: u32,
-    pairs: u32,
-    // Pages only: the written pairs whose rows resolve, and the allowed ones.
-    valid: u32 = 0,
-    allowed: u32 = 0,
+    counts: Counts,
 };
 
-const RefreshSums = struct {
-    valid: u32 = 0,
-    allowed: u32 = 0,
+/// The node merge of a patch or rebuild, on main after the leaf join: the nodes it wrote and
+/// its time.
+pub const NodeMerge = struct {
+    outputs: usize = 0,
+    ns: u64 = 0,
+};
+
+/// A refresh's fold on main after its join: the range edges, split-node and higher-node
+/// entries, and levels it visited, and its time.
+pub const RefreshFold = struct {
+    entries: usize = 0,
+    ns: u64 = 0,
 };
 
 /// One world's stored trigger pairs. Its lifetime is the collision system's: a rebuild
 /// resets it and `deinit` frees it. Not thread-safe: patches, rebuilds and refreshes run on
-/// main and dispatch their own stages; readers (`cursorAt`, `locateKey`, `storedPiece`,
-/// `seek`) may run on workers while no patch, rebuild or refresh runs.
+/// main and dispatch their own stages; readers (`cursorAt`, `emittedCursorAt`, `locateKey`,
+/// `storedPiece`, `seek`) may run on workers while no patch, rebuild or refresh runs.
 pub const TriggerStore = struct {
     /// Kept only with `runtime_perf_log.enabled`. Growth counts: pool slabs the pages and
-    /// nodes grew by, level table growths, refresh range slot growths, and patch plan
-    /// scratch lists a patch grew (each list once per patch, on error too). Each patch or
-    /// step stage's last batch shape (`last_batches`; reset by every patch and rebuild, so
-    /// after a rebuild the patch stages hold none) and each rebuild stage's
-    /// (`last_rebuild_batches`; reset by every rebuild).
+    /// nodes grew by, level table growths, and patch plan scratch lists a patch grew (each
+    /// list once per patch, on error too). Each patch or step stage's last batch shape
+    /// (`last_batches`), the last patch's node merge (`last_node_merge`) and the last
+    /// refresh's fold (`last_refresh_fold`), reset by every patch and rebuild, so after a
+    /// rebuild the patch and step records hold none; each rebuild
+    /// stage's (`last_rebuild_batches`) and the rebuild's node merge
+    /// (`last_rebuild_node_merge`), reset by every rebuild.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         page_grows: u64 = 0,
         level_grows: u64 = 0,
-        slot_grows: u64 = 0,
         scratch_grows: u64 = 0,
         last_batches: std.EnumArray(TriggerStage, BatchStats) = .initFill(.{}),
+        last_node_merge: NodeMerge = .{},
         last_rebuild_batches: std.EnumArray(TriggerRebuildStage, BatchStats) = .initFill(.{}),
+        last_rebuild_node_merge: NodeMerge = .{},
+        last_refresh_fold: RefreshFold = .{},
     } else struct {};
 
     allocator: std.mem.Allocator,
@@ -531,7 +609,7 @@ pub const TriggerStore = struct {
     level_pending: std.ArrayList(u32) = .empty,
     leaf_pending: std.ArrayList(u32) = .empty,
     node_pending: std.ArrayList(u32) = .empty,
-    /// Store-wide sums over every page: pairs, pairs whose rows resolve, and allowed pairs.
+    /// Store-wide sums over every level: pairs, pairs whose rows resolve, and allowed pairs.
     pair_count: u32 = 0,
     valid_count: u32 = 0,
     allowed_count: u32 = 0,
@@ -545,7 +623,6 @@ pub const TriggerStore = struct {
     perf: Perf = .{},
     page_growth_logged: bool = false,
     level_growth_logged: bool = false,
-    slot_growth_logged: bool = false,
     scratch_growth_logged: bool = false,
 
     // Patch scratch, grow-only and kept warm.
@@ -568,10 +645,6 @@ pub const TriggerStore = struct {
     insert_segments: std.ArrayList([]const InsertEdit) = .empty,
     insert_segment_starts: std.ArrayList(usize) = .empty,
     band_offsets: SlotList(BandOffsets) = .empty,
-    refresh_sums: SlotList(RefreshSums) = .empty,
-    // The valid and allowed pairs of the pages a patch releases.
-    removed_valid: u32 = 0,
-    removed_allowed: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) TriggerStore {
         return .{ .allocator = allocator };
@@ -599,7 +672,6 @@ pub const TriggerStore = struct {
         self.insert_segments.deinit(allocator);
         self.insert_segment_starts.deinit(allocator);
         self.band_offsets.deinit(allocator);
-        self.refresh_sums.deinit(allocator);
         self.* = .{ .allocator = allocator };
     }
 
@@ -621,6 +693,20 @@ pub const TriggerStore = struct {
         return if (level < self.levels.items.len) self.levels.items[level] else .{};
     }
 
+    /// The stored pairs of `kind`, over every level.
+    pub fn countOf(self: *const TriggerStore, kind: PairCount) u32 {
+        return switch (kind) {
+            .pairs => self.pair_count,
+            .valid => self.valid_count,
+            .allowed => self.allowed_count,
+        };
+    }
+
+    // The counts of the tree under `root` at `height`: its page's header, or its node's totals.
+    fn subtreeCounts(self: *const TriggerStore, root: u32, height: usize) Counts {
+        return if (height == 0) self.page(root).header.counts() else self.node(root).header.totals;
+    }
+
     // ---- Readers (pure; safe on workers while no patch runs) ---------------------------
 
     /// The page `key` falls in. A level past the table end or empty locates its virtual
@@ -633,7 +719,7 @@ pub const TriggerStore = struct {
         const path = &located.page.path;
         var id = tree.root;
         var height: usize = tree.height;
-        located.page_len = tree.pair_count;
+        located.page_len = tree.counts.get(.pairs);
         while (height > 0) {
             height -= 1;
             const at = self.node(id);
@@ -642,7 +728,7 @@ pub const TriggerStore = struct {
             path.nodes[height] = id;
             path.entries[height] = @intCast(entry);
             located.page.leaf_start += at.start[entry];
-            if (height == 0) located.page_len = at.entryPairs(entry);
+            if (height == 0) located.page_len = at.entryCount(entry, .pairs);
             id = at.child[entry];
         }
         path.leaf = id;
@@ -669,7 +755,7 @@ pub const TriggerStore = struct {
     pub fn seek(self: *const TriggerStore, key: u256) Cursor {
         const level = keyLevel(key);
         if (level >= self.levels.items.len) return self.endCursor();
-        const level_start = self.level_rank.prefix(level);
+        const level_start = self.level_rank.prefix(.pairs, level);
         const located = self.locateKey(key);
         if (located.page.path.leaf == no_entry) {
             // An empty level: the next level holding pairs starts at this level's ordinal.
@@ -701,13 +787,13 @@ pub const TriggerStore = struct {
     /// order: a Fenwick find, then one descent. O(log L + H log F).
     pub fn cursorAt(self: *const TriggerStore, ordinal: u32) Cursor {
         std.debug.assert(ordinal < self.pair_count);
-        const found = self.level_rank.find(ordinal);
+        const found = self.level_rank.find(.pairs, ordinal);
         const tree = self.levels.items[found.level];
         var cursor = Cursor{
             .store = self,
             .path = .{ .level = found.level },
             .height = tree.height,
-            .page_len = tree.pair_count,
+            .page_len = tree.counts.get(.pairs),
             .leaf_start = 0,
             .page_start = ordinal - found.local,
             .offset = found.local,
@@ -721,13 +807,43 @@ pub const TriggerStore = struct {
             cursor.path.nodes[height] = id;
             cursor.path.entries[height] = @intCast(entry);
             cursor.offset -= at.start[entry];
-            if (height == 0) cursor.page_len = at.entryPairs(entry);
+            if (height == 0) cursor.page_len = at.entryCount(entry, .pairs);
             id = at.child[entry];
         }
         cursor.path.leaf = id;
         cursor.leaf_start = found.local - cursor.offset;
         cursor.page_start = ordinal - cursor.offset;
         std.debug.assert(cursor.offset < cursor.page_len);
+        return cursor;
+    }
+
+    /// A cursor on the stored pair of ordinal `ordinal` among the pairs of `kind` (below
+    /// `countOf(kind)`), over every level in key order: a Fenwick find on `kind`'s counts, one
+    /// descent on `kind`'s prefixes, and one select in the page's mask. O(log L + H log F).
+    pub fn emittedCursorAt(self: *const TriggerStore, kind: PairCount, ordinal: u32) EmittedCursor {
+        std.debug.assert(ordinal < self.countOf(kind));
+        const found = self.level_rank.find(kind, ordinal);
+        const tree = self.levels.items[found.level];
+        var cursor = EmittedCursor{ .store = self, .kind = kind, .path = .{ .level = found.level }, .height = tree.height, .rest = 0, .slot = 0 };
+        var local = found.local;
+        var id = tree.root;
+        var height: usize = tree.height;
+        while (height > 0) {
+            height -= 1;
+            const at = self.node(id);
+            const column = at.starts(kind);
+            // The last entry starting at or below `local`: entries holding none of `kind` share
+            // their successor's start and are passed over.
+            const entry = std.sort.upperBound(u32, column[0..at.header.count], local, orderU32) - 1;
+            cursor.path.nodes[height] = id;
+            cursor.path.entries[height] = @intCast(entry);
+            local -= column[entry];
+            id = at.child[entry];
+        }
+        cursor.path.leaf = id;
+        const slots = self.page(id).header.slots(kind);
+        cursor.slot = selectBit(slots, local);
+        cursor.rest = slots & ~lowSlots(cursor.slot);
         return cursor;
     }
 
@@ -739,7 +855,11 @@ pub const TriggerStore = struct {
     /// on error the store is unchanged and `seen_revision` is kept.
     pub fn patch(self: *TriggerStore, threads: StoreThreads, edits: []const EditSource, revision: u64) error{OutOfMemory}!void {
         errdefer self.discardPlan();
-        if (comptime runtime_perf_log.enabled) self.perf.last_batches = .initFill(.{});
+        if (comptime runtime_perf_log.enabled) {
+            self.perf.last_batches = .initFill(.{});
+            self.perf.last_node_merge = .{};
+            self.perf.last_refresh_fold = .{};
+        }
         const before = self.planScratchCapacities();
         defer self.countScratchGrowth(changedCapacities(&before, &self.planScratchCapacities()));
         try self.bucket(edits);
@@ -753,10 +873,10 @@ pub const TriggerStore = struct {
         try self.orderTouchedPages();
         try self.planHeights();
         try self.reservePlan();
-        const written = self.writeOutputs(threads.stage(self.tuners.getPtr(.leaf)), threads.stage(self.tuners.getPtr(.node)));
+        const written = self.writeOutputs(threads.stage(self.tuners.getPtr(.leaf)));
         if (comptime runtime_perf_log.enabled) {
             self.perf.last_batches.set(.leaf, written.leaf);
-            self.perf.last_batches.set(.node, written.node);
+            self.perf.last_node_merge = written.node_merge;
         }
         self.install(.patch);
         self.seen_revision = revision;
@@ -764,8 +884,9 @@ pub const TriggerStore = struct {
 
     /// Replaces every stored pair with `inserts` (each query range's inserts, in range
     /// order; rows and emit bits current at `allow_epoch`) and records `revision`. Each stage
-    /// dispatches under its own rebuild tuner and records into `Perf.last_rebuild_batches`.
-    /// On error the store is empty and not ready.
+    /// dispatches under its own rebuild tuner and records into `Perf.last_rebuild_batches`,
+    /// and the node merge into `Perf.last_rebuild_node_merge`. On error the store is empty
+    /// and not ready.
     pub fn rebuild(self: *TriggerStore, threads: StoreThreads, inserts: []const EditSource, revision: u64, allow_epoch: u64) error{OutOfMemory}!void {
         errdefer {
             self.discardPlan();
@@ -775,7 +896,10 @@ pub const TriggerStore = struct {
         self.ready = false;
         if (comptime runtime_perf_log.enabled) {
             self.perf.last_batches = .initFill(.{});
+            self.perf.last_node_merge = .{};
+            self.perf.last_refresh_fold = .{};
             self.perf.last_rebuild_batches = .initFill(.{});
+            self.perf.last_rebuild_node_merge = .{};
         }
         self.pool.resetClass(leaf_class);
         self.pool.resetClass(node_class);
@@ -793,10 +917,10 @@ pub const TriggerStore = struct {
         try self.touchRebuildLevels();
         try self.planHeights();
         try self.reservePlan();
-        const written = self.writeOutputs(threads.stage(self.rebuild_tuners.getPtr(.leaf)), threads.stage(self.rebuild_tuners.getPtr(.node)));
+        const written = self.writeOutputs(threads.stage(self.rebuild_tuners.getPtr(.leaf)));
         if (comptime runtime_perf_log.enabled) {
             self.perf.last_rebuild_batches.set(.leaf, written.leaf);
-            self.perf.last_rebuild_batches.set(.node, written.node);
+            self.perf.last_rebuild_node_merge = written.node_merge;
         }
         self.install(.rebuild);
         self.seen_revision = revision;
@@ -827,8 +951,6 @@ pub const TriggerStore = struct {
         self.heights = @splat(.{});
         self.height_count = 0;
         for (&self.level_outputs) |*outputs| outputs.clearRetainingCapacity();
-        self.removed_valid = 0;
-        self.removed_allowed = 0;
     }
 
     // ---- Bucket (main, O(1) per record) --------------------------------------------------
@@ -871,7 +993,7 @@ pub const TriggerStore = struct {
             .id = no_entry,
             .level_record = level_record,
             .start = 0,
-            .pairs = old.pair_count,
+            .pairs = old.counts.get(.pairs),
             .size = 1,
             .height = old.height + 1,
         });
@@ -901,7 +1023,7 @@ pub const TriggerStore = struct {
         }
         if (self.leaf_pending.items[path.leaf] != 0) return self.leaf_pending.items[path.leaf] - 1;
         const height = level.old.height;
-        const len = if (height == 0) level.old.pair_count else self.node(path.nodes[0]).entryPairs(path.entries[0]);
+        const len = if (height == 0) level.old.counts.get(.pairs) else self.node(path.nodes[0]).entryCount(path.entries[0], .pairs);
         const record = try self.addRecord(.{ .id = path.leaf, .level_record = level_record, .start = location.leaf_start, .pairs = len, .size = len, .height = 0 });
         self.leaf_pending.items[path.leaf] = record + 1;
         // Link it and each new ancestor until one already touched.
@@ -925,7 +1047,7 @@ pub const TriggerStore = struct {
                 .id = node_id,
                 .level_record = level_record,
                 .start = self.touched.items[child].start - at.start[entry],
-                .pairs = at.header.total,
+                .pairs = at.header.totals.get(.pairs),
                 .size = at.header.count,
                 .height = @intCast(child_height + 1),
             });
@@ -1211,7 +1333,7 @@ pub const TriggerStore = struct {
                 std.debug.assert(child_height > height);
                 parent = pending - 1;
             } else {
-                const pairs = at.entryPairs(entry);
+                const pairs = at.entryCount(entry, .pairs);
                 const size = if (child_height == 0) pairs else self.node(child_id).header.count;
                 const record = try self.addRecord(.{
                     .id = child_id,
@@ -1251,9 +1373,6 @@ pub const TriggerStore = struct {
                 const unit = self.touched.items[record];
                 inserts += unit.inserts;
                 if (unit.id == no_entry) continue;
-                const header = self.page(unit.id).header;
-                self.removed_valid += header.valid;
-                self.removed_allowed += header.allowed;
                 try self.segments.append(self.allocator, .{ .kind = .page, .id = unit.id, .hi = unit.size, .pos = items, .mask = unit.mask });
                 items += unit.size - @popCount(unit.mask);
             }
@@ -1364,8 +1483,7 @@ pub const TriggerStore = struct {
     }
 
     // Every allocation the write and install need: slot claims, pending coverage, the
-    // outputs' records, the level table for levels past its end, and `refresh`'s range
-    // slots for the pair count after the commit.
+    // outputs' records, and the level table and rank for levels past its end.
     fn reservePlan(self: *TriggerStore) error{OutOfMemory}!void {
         var slabs_before = self.pool.slab_count;
         try self.pool.reserve(self.allocator, leaf_class, self.heights[0].outputs);
@@ -1385,11 +1503,6 @@ pub const TriggerStore = struct {
         try self.levels.ensureTotalCapacity(self.allocator, level_end);
         try self.level_rank.sums.ensureTotalCapacity(self.allocator, level_end);
         if (self.levels.capacity != table_capacity) self.countLevelGrowth();
-        // Drops only shrink the count, so stored pairs plus inserts bound it.
-        const pair_bound = @as(usize, self.pair_count) + self.sorted_inserts.items.len;
-        const sums_capacity = self.refresh_sums.capacity;
-        try self.refresh_sums.ensureTotalCapacity(self.allocator, maxRangeCount(pair_bound, refresh_range_alignment_items));
-        if (self.refresh_sums.capacity != sums_capacity) self.countSlotGrowth();
     }
 
     fn coverPending(allocator: std.mem.Allocator, pending: *std.ArrayList(u32), limit: u32) error{OutOfMemory}!void {
@@ -1410,13 +1523,6 @@ pub const TriggerStore = struct {
         if (self.level_growth_logged) return;
         self.level_growth_logged = true;
         if (comptime logging.enabled(.info)) logging.game.info("stored trigger level table grew", .{});
-    }
-
-    fn countSlotGrowth(self: *TriggerStore) void {
-        if (comptime runtime_perf_log.enabled) self.perf.slot_grows += 1;
-        if (self.slot_growth_logged) return;
-        self.slot_growth_logged = true;
-        if (comptime logging.enabled(.info)) logging.game.info("stored trigger range slots grew", .{});
     }
 
     fn countScratchGrowth(self: *TriggerStore, lists: usize) void {
@@ -1448,18 +1554,15 @@ pub const TriggerStore = struct {
 
     // ---- Write (workers) and install (main) ----------------------------------------------
 
-    // The leaf and node stages' batches, kept only with `runtime_perf_log.enabled`.
-    const WriteBatches = if (runtime_perf_log.enabled) struct {
-        leaf: BatchStats = .{},
-        node: BatchStats = .{},
+    // The leaf stage's batch and the node merge's record, kept only with
+    // `runtime_perf_log.enabled`.
+    const WriteRecords = if (runtime_perf_log.enabled) struct {
+        leaf: BatchStats,
+        node_merge: NodeMerge,
     } else struct {};
 
-    fn writeBatches(leaf_batch: BatchStats, node_batch: BatchStats) WriteBatches {
-        return if (comptime runtime_perf_log.enabled) .{ .leaf = leaf_batch, .node = node_batch } else .{};
-    }
-
-    // The leaf stage, then one node dispatch per height under one node tuner sample.
-    fn writeOutputs(self: *TriggerStore, leaf_dispatch: Dispatch, node_dispatch: Dispatch) WriteBatches {
+    // The leaf stage writes the fresh pages, then main merges the nodes.
+    fn writeOutputs(self: *TriggerStore, leaf_dispatch: Dispatch) WriteRecords {
         const pages = self.heights[0].outputs;
         const leaf_stage = if (pages == 0) null else leaf_dispatch;
         const leaf_shape = StageShape.select(leaf_stage, pages, rewrite_range_alignment_items);
@@ -1470,37 +1573,46 @@ pub const TriggerStore = struct {
             .range_count = leaf_shape.range_count,
         };
         const leaf_batch = runShaped(leaf_stage, leaf_shape, pages, rewrite_range_alignment_items, &leaf_job, leafJob);
-        const nodes = self.nodeOutputs();
-        if (nodes == 0) return writeBatches(leaf_batch, .{});
-        var rounds = RoundDispatch.begin(node_dispatch, nodes);
+        const timer = StageTimer.begin();
+        self.mergeNodes();
+        if (comptime !runtime_perf_log.enabled) return .{};
+        return .{ .leaf = leaf_batch, .node_merge = .{ .outputs = self.nodeOutputs(), .ns = timer.lap() } };
+    }
+
+    // Writes every output node, height by height and each height's runs in output order: an
+    // ordered merge on main, O(1) per entry, each lower output or kept old entry becoming one
+    // entry of its parent. A run's outputs take its merged entries in order, so one segment
+    // cursor advances through the run.
+    fn mergeNodes(self: *TriggerStore) void {
+        if (self.height_count < 2) return;
         for (1..self.height_count) |height| {
             const plan = self.heights[height];
-            if (plan.outputs == 0) continue;
-            var node_job = NodeJob{
-                .store = self,
-                .height = height,
-                .runs = self.runs.items[plan.runs_lo..plan.runs_hi],
-                .children = self.level_outputs[height - 1].items,
-                .outputs = self.level_outputs[height].items,
-            };
-            rounds.run(plan.outputs, &node_job, &node_job.range_count, nodeJob);
+            const children = self.level_outputs[height - 1].items;
+            const outputs = self.level_outputs[height].items;
+            for (self.runs.items[plan.runs_lo..plan.runs_hi]) |run| {
+                var segments = SegmentCursor{ .segments = self.segments.items[run.seg_lo..run.seg_hi] };
+                for (0..run.m) |index| {
+                    const begin: u32 = @intCast(@as(u64, index) * run.n / run.m);
+                    const end: u32 = @intCast(@as(u64, index + 1) * run.n / run.m);
+                    const output = run.out_base + @as(u32, @intCast(index));
+                    outputs[output] = writeNode(self, self.outputId(height, output), children, &segments, end - begin);
+                }
+                std.debug.assert(run.m == 0 or segments.index == segments.segments.len);
+            }
         }
-        return writeBatches(leaf_batch, rounds.finish(nodes));
     }
 
     const InstallMode = enum { patch, rebuild };
 
-    // Commits claims and releases, the touched levels' entries and ranks, and the sums.
-    // Allocates nothing.
+    // Commits claims and releases, the touched levels' entries, counts and ranks, and the
+    // sums. Allocates nothing.
     fn install(self: *TriggerStore, mode: InstallMode) void {
-        var written_valid: u32 = 0;
-        var written_allowed: u32 = 0;
-        for (self.level_outputs[0].items) |output| {
-            written_valid += output.valid;
-            written_allowed += output.allowed;
-        }
         for (self.touched_levels.items) |*level| {
             const root = level.new_root orelse continue;
+            level.new_counts = switch (root.kind) {
+                .output => self.level_outputs[root.height].items[root.value].counts,
+                .old => self.subtreeCounts(root.value, root.height),
+            };
             level.new_root = .{ .kind = .old, .height = root.height, .value = self.entryId(root) };
         }
         self.pool.commitClaims(leaf_class, self.heights[0].outputs);
@@ -1521,60 +1633,139 @@ pub const TriggerStore = struct {
         }
         self.pool.commitReleases(leaf_class, page_releases);
         self.pool.commitReleases(node_class, node_releases);
-        var delta: i64 = 0;
+        var deltas = std.EnumArray(PairCount, i64).initFill(0);
         for (self.level_order.items) |level_record| {
             const level = self.touched_levels.items[level_record];
             while (self.levels.items.len <= level.level) {
                 self.levels.appendAssumeCapacity(.{});
                 if (mode == .patch) self.level_rank.appendAssumeCapacity();
             }
-            const level_delta = @as(i64, level.inserts) - level.dropped;
+            std.debug.assert(level.new_counts.get(.pairs) == @as(i64, level.old.counts.get(.pairs)) + level.inserts - level.dropped);
+            var level_deltas: std.EnumArray(PairCount, i64) = undefined;
+            for (std.enums.values(PairCount)) |kind| {
+                level_deltas.set(kind, @as(i64, level.new_counts.get(kind)) - level.old.counts.get(kind));
+                deltas.set(kind, deltas.get(kind) + level_deltas.get(kind));
+            }
             self.levels.items[level.level] = .{
                 .root = if (level.new_root) |root| root.value else no_entry,
                 .height = level.new_height,
-                .pair_count = @intCast(@as(i64, level.old.pair_count) + level_delta),
+                .counts = level.new_counts,
             };
-            if (mode == .patch) self.level_rank.add(level.level, level_delta);
+            if (mode == .patch) self.level_rank.add(level.level, level_deltas);
             self.level_pending.items[level.level] = 0;
-            delta += level_delta;
         }
         if (mode == .rebuild) self.level_rank.build(self.levels.items);
-        self.pair_count = @intCast(@as(i64, self.pair_count) + delta);
-        self.valid_count = self.valid_count - self.removed_valid + written_valid;
-        self.allowed_count = self.allowed_count - self.removed_allowed + written_allowed;
+        self.pair_count = @intCast(@as(i64, self.pair_count) + deltas.get(.pairs));
+        self.valid_count = @intCast(@as(i64, self.valid_count) + deltas.get(.valid));
+        self.allowed_count = @intCast(@as(i64, self.allowed_count) + deltas.get(.allowed));
         self.clearScratch();
     }
 
     // ---- Refresh (workers) ---------------------------------------------------------------
 
     /// Re-resolves every stored pair's rows and emit bits when `data`'s allow epoch moved
-    /// past `refreshed_epoch`; true when it ran. Ranges own the pages that start in them.
-    /// Never allocates: each commit reserves its range slots for the pairs it stores.
+    /// past `refreshed_epoch`; true when it ran. Ranges own the pages that start in them and
+    /// rewrite their masks. A range holding every page of a height-1 node writes its valid and
+    /// allowed prefixes and totals; a node split at a range edge gets each page's raw counts,
+    /// which main turns into prefixes before folding the nodes above, the level counts and the
+    /// rank. Never allocates.
     pub fn refresh(self: *TriggerStore, threads: StoreThreads, data: *const DataSystem) bool {
         const epoch = data.collision_allow_epoch;
         if (self.pair_count == 0 or (self.refreshed_epoch != null and self.refreshed_epoch.? == epoch)) return false;
         const dispatch = threads.stage(self.tuners.getPtr(.refresh));
         const shape = StageShape.select(dispatch, self.pair_count, refresh_range_alignment_items);
-        std.debug.assert(self.refresh_sums.capacity >= shape.range_count);
-        setSlotCount(RefreshSums, &self.refresh_sums, shape.range_count);
         var job = RefreshJob{
             .store = self,
             .data = data,
-            .sums = self.refresh_sums.items,
             .items_per_range = shape.items_per_range,
+            .range_count = shape.range_count,
         };
         const batch = runShaped(dispatch, shape, self.pair_count, refresh_range_alignment_items, &job, refreshJob);
-        if (comptime runtime_perf_log.enabled) self.perf.last_batches.set(.refresh, batch);
-        var valid: u32 = 0;
-        var allowed: u32 = 0;
-        for (self.refresh_sums.items) |slot| {
-            valid += slot.value.valid;
-            allowed += slot.value.allowed;
+        const timer = StageTimer.begin();
+        const entries = self.foldRefreshed(shape.items_per_range, shape.range_count);
+        if (comptime runtime_perf_log.enabled) {
+            self.perf.last_batches.set(.refresh, batch);
+            self.perf.last_refresh_fold = .{ .entries = entries, .ns = timer.lap() };
         }
-        self.valid_count = valid;
-        self.allowed_count = allowed;
         self.refreshed_epoch = epoch;
         return true;
+    }
+
+    // After a refresh's join, on main: each height-1 node split at a range edge turns its
+    // pages' raw counts into prefixes and totals, each node above height 1 sums its children's
+    // totals, then the level counts, the rank and the store sums follow. O(R (log L + H log F
+    // + F) + N1 + L), O(1) per entry. Returns the entries it visited (counted only with
+    // `runtime_perf_log.enabled`).
+    fn foldRefreshed(self: *TriggerStore, items_per_range: usize, range_count: usize) usize {
+        var entries: usize = 0;
+        // The nodes split at range edges, in order: a node an edge splits holds the first page
+        // starting at or past that edge at an entry past its first.
+        var last_split: u32 = no_entry;
+        for (1..range_count) |range_index| {
+            var cursor = self.cursorAt(@intCast(range_index * items_per_range));
+            if (cursor.offset != 0) cursor.nextPage();
+            if (!cursor.valid() or cursor.height == 0 or cursor.path.entries[0] == 0) continue;
+            const split = cursor.path.nodes[0];
+            if (split == last_split) continue;
+            last_split = split;
+            const at = self.node(split);
+            var valid: u32 = 0;
+            var allowed: u32 = 0;
+            for (at.valid_start[0..at.header.count], at.allowed_start[0..at.header.count]) |*valid_start, *allowed_start| {
+                const page_valid = valid_start.*;
+                const page_allowed = allowed_start.*;
+                valid_start.* = valid;
+                allowed_start.* = allowed;
+                valid += page_valid;
+                allowed += page_allowed;
+            }
+            at.header.totals.set(.valid, valid);
+            at.header.totals.set(.allowed, allowed);
+            if (comptime runtime_perf_log.enabled) entries += at.header.count;
+        }
+        var valid: u32 = 0;
+        var allowed: u32 = 0;
+        for (self.levels.items) |*tree| {
+            if (tree.root == no_entry) continue;
+            if (tree.height >= 2) {
+                const folded = self.foldNode(tree.root, tree.height);
+                if (comptime runtime_perf_log.enabled) entries += folded;
+            }
+            const counts = self.subtreeCounts(tree.root, tree.height);
+            std.debug.assert(counts.get(.pairs) == tree.counts.get(.pairs));
+            tree.counts = counts;
+            valid += counts.get(.valid);
+            allowed += counts.get(.allowed);
+        }
+        self.level_rank.build(self.levels.items);
+        self.valid_count = valid;
+        self.allowed_count = allowed;
+        if (comptime runtime_perf_log.enabled) entries += range_count + self.levels.items.len;
+        return entries;
+    }
+
+    // Node `id` at `height` (at least 2) takes its children's valid and allowed totals, each
+    // child above height 1 folded first, into its prefixes and totals. Returns the entries it
+    // and its folded children hold (counted only with `runtime_perf_log.enabled`).
+    fn foldNode(self: *TriggerStore, id: u32, height: usize) usize {
+        const at = self.node(id);
+        var entries: usize = if (comptime runtime_perf_log.enabled) at.header.count else 0;
+        var valid: u32 = 0;
+        var allowed: u32 = 0;
+        for (at.child[0..at.header.count], at.valid_start[0..at.header.count], at.allowed_start[0..at.header.count]) |child, *valid_start, *allowed_start| {
+            if (height > 2) {
+                const folded = self.foldNode(child, height - 1);
+                if (comptime runtime_perf_log.enabled) entries += folded;
+            }
+            const totals = self.node(child).header.totals;
+            valid_start.* = valid;
+            allowed_start.* = allowed;
+            valid += totals.get(.valid);
+            allowed += totals.get(.allowed);
+        }
+        at.header.totals.set(.valid, valid);
+        at.header.totals.set(.allowed, allowed);
+        return entries;
     }
 };
 
@@ -1643,7 +1834,7 @@ pub const Cursor = struct {
             self.leaf_start += self.page_len;
             self.page_start = next_start;
             self.offset = 0;
-            self.page_len = store.node(self.path.nodes[0]).entryPairs(self.path.entries[0]);
+            self.page_len = store.node(self.path.nodes[0]).entryCount(self.path.entries[0], .pairs);
             return;
         }
         if (next_start < store.pair_count) {
@@ -1651,6 +1842,72 @@ pub const Cursor = struct {
             return;
         }
         self.* = store.endCursor();
+    }
+};
+
+/// A position among the stored pairs of one `PairCount`, over every level in key order: the
+/// next counted slot of a page is one bit step in its mask; past a page's last, the lowest
+/// ancestor with a later entry holding one, then down each node's first such entry; past a
+/// level's last, an `emittedCursorAt` on the next. O(1) per pair plus O(H F) per page step.
+/// Steps only onto a counted pair: callers stop before the last. Reads page masks: valid only
+/// while no patch, rebuild or refresh runs.
+pub const EmittedCursor = struct {
+    store: *const TriggerStore,
+    kind: PairCount,
+    path: TreePath,
+    height: u8,
+    // The page's counted slots from `slot` on.
+    rest: u64,
+    slot: u32,
+
+    pub fn page(self: EmittedCursor) Page {
+        return self.store.page(self.path.leaf);
+    }
+
+    /// The cursor's pair's key.
+    pub fn key(self: EmittedCursor) u256 {
+        return self.store.pageKeys(self.path.leaf)[self.slot];
+    }
+
+    /// The next counted pair, which exists; true when it is on another page.
+    pub fn next(self: *EmittedCursor) bool {
+        self.rest &= self.rest - 1;
+        if (self.rest != 0) {
+            self.slot = @ctz(self.rest);
+            return false;
+        }
+        self.nextPage();
+        return true;
+    }
+
+    fn nextPage(self: *EmittedCursor) void {
+        const store = self.store;
+        var height: usize = 0;
+        while (height < self.height) : (height += 1) {
+            const at = store.node(self.path.nodes[height]);
+            var entry: usize = self.path.entries[height] + 1;
+            while (entry < at.header.count and at.entryCount(entry, self.kind) == 0) entry += 1;
+            if (entry == at.header.count) continue;
+            self.path.entries[height] = @intCast(entry);
+            var child = at.child[entry];
+            var below = height;
+            while (below > 0) {
+                below -= 1;
+                const under = store.node(child);
+                const first = under.firstCounted(self.kind);
+                self.path.nodes[below] = child;
+                self.path.entries[below] = @intCast(first);
+                child = under.child[first];
+            }
+            self.path.leaf = child;
+            self.rest = store.page(child).header.slots(self.kind);
+            self.slot = @ctz(self.rest);
+            return;
+        }
+        // Past the level's last counted pair: the next level's first, which exists.
+        const next_level = @as(usize, self.path.level) + 1;
+        std.debug.assert(next_level < store.levels.items.len);
+        self.* = store.emittedCursorAt(self.kind, store.level_rank.prefix(self.kind, next_level));
     }
 };
 
@@ -1722,17 +1979,21 @@ const LeafJob = struct {
 };
 
 // Scalar: a key-compare merge of kept pairs with sorted inserts, the kept spans copied per
-// column with `@memcpy`, each insert transposed from its record into the columns.
+// column with `@memcpy`, each insert transposed from its record into the columns. The range
+// finds its first output's run once and steps runs in output order.
 fn leafJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *LeafJob = @ptrCast(@alignCast(context));
     std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.end <= job.outputs.len);
-    for (range.start..range.end) |output| job.outputs[output] = writePage(job.store, job.runs, @intCast(output));
+    std.debug.assert(range.start < range.end and range.end <= job.outputs.len);
+    var run_index = std.sort.upperBound(Run, job.runs, @as(u32, @intCast(range.start)), orderRunOutput) - 1;
+    for (range.start..range.end) |output| {
+        while (output >= job.runs[run_index].out_base + job.runs[run_index].m) run_index += 1;
+        job.outputs[output] = writePage(job.store, job.runs[run_index], @intCast(output));
+    }
 }
 
-// Writes output page `output` and returns its record.
-fn writePage(store: *const TriggerStore, runs: []const Run, output: u32) LevelOutput {
-    const run = runs[std.sort.upperBound(Run, runs, output, orderRunOutput) - 1];
+// Writes output page `output` of `run` and returns its record.
+fn writePage(store: *const TriggerStore, run: Run, output: u32) LevelOutput {
     std.debug.assert(output >= run.out_base and output < run.out_base + run.m);
     const index = output - run.out_base;
     const begin: u32 = @intCast(@as(u64, index) * run.n / run.m);
@@ -1792,14 +2053,12 @@ fn writePage(store: *const TriggerStore, runs: []const Run, output: u32) LevelOu
     if (std.debug.runtime_safety) {
         for (dest.keys[1..count], dest.keys[0 .. count - 1]) |key, previous| std.debug.assert(previous < key);
     }
-    var valid: u32 = 0;
-    var allowed: u32 = 0;
-    for (dest.emit[0..count]) |emit| {
-        valid += @intFromBool(emits(emit, false));
-        allowed += @intFromBool(emits(emit, true));
-    }
-    dest.header.* = .{ .len = count, .valid = valid, .allowed = allowed };
-    return .{ .first_key = dest.keys[0], .id = id, .pairs = count, .valid = valid, .allowed = allowed };
+    dest.header.* = .{
+        .len = count,
+        .valid_mask = simd.bytesMatchingMask(dest.emit[0..count], emit_valid, emit_valid),
+        .allowed_mask = simd.bytesMatchingMask(dest.emit[0..count], emit_valid | emit_allowed, emit_valid | emit_allowed),
+    };
+    return .{ .first_key = dest.keys[0], .id = id, .counts = dest.header.counts() };
 }
 
 // The kept pairs among the first `position` merged pairs of a run: a binary search on the
@@ -1844,99 +2103,94 @@ fn storedRow(row: usize) u32 {
     return std.math.cast(u32, row) orelse no_row;
 }
 
-// ---- Node job (one output node per item) ---------------------------------------------------
+// ---- Node merge (main) ------------------------------------------------------------------
 
-const NodeJob = struct {
-    store: *const TriggerStore,
-    height: usize,
-    runs: []const Run,
-    // The height below's outputs, and this height's.
-    children: []const LevelOutput,
-    outputs: []LevelOutput,
-    range_count: usize = 0,
+// A run's merged entries consumed in order: segment `index`, `offset` items into it.
+const SegmentCursor = struct {
+    segments: []const Segment,
+    index: usize = 0,
+    offset: u32 = 0,
 };
 
-// Scalar: entry copies per segment and a running sum of at most F lengths for `start`
-// (`simd.zig` has no prefix scan).
-fn nodeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *NodeJob = @ptrCast(@alignCast(context));
-    std.debug.assert(range.index < job.range_count);
-    std.debug.assert(range.end <= job.outputs.len);
-    for (range.start..range.end) |output| job.outputs[output] = writeNode(job, @intCast(output));
-}
-
-// Writes output node `output` of the job's height and returns its record.
-fn writeNode(job: *const NodeJob, output: u32) LevelOutput {
-    const store = job.store;
-    const runs = job.runs;
-    const run = runs[std.sort.upperBound(Run, runs, output, orderRunOutput) - 1];
-    std.debug.assert(output >= run.out_base and output < run.out_base + run.m);
-    const index = output - run.out_base;
-    const begin: u32 = @intCast(@as(u64, index) * run.n / run.m);
-    const end: u32 = @intCast(@as(u64, index + 1) * run.n / run.m);
-    const segments = store.segments.items[run.seg_lo..run.seg_hi];
-    const id = store.outputId(job.height, output);
+// Writes node `id` from the next `count` merged entries at `segments` (`children` the height
+// below's outputs) and returns its record. Scalar: an old node's span is one offset add over
+// at most F entries per prefix column, a tiny fixed batch; the outputs' prefixes are a running
+// sum over their records.
+fn writeNode(store: *const TriggerStore, id: u32, children: []const LevelOutput, segments: *SegmentCursor, count: u32) LevelOutput {
     const dest = store.node(id);
-    var segment_index = std.sort.upperBound(Segment, segments, begin, orderSegmentPos) - 1;
-    var position = begin;
+    const columns = dest.prefixColumns();
+    var totals: [Counts.len]u32 = @splat(0);
     var written: u32 = 0;
-    var total: u32 = 0;
-    while (position < end) : (segment_index += 1) {
-        const segment = segments[segment_index];
-        const offset = position - segment.pos;
-        const take = @min(segment.items() - offset, end - position);
+    while (written < count) {
+        const segment = segments.segments[segments.index];
+        const take = @min(segment.items() - segments.offset, count - written);
         switch (segment.kind) {
+            // A span of an old node's entries: its prefixes rebased onto this node's.
             .entries => {
                 const source = store.node(segment.id);
-                const from = segment.lo + offset;
+                const from = segment.lo + segments.offset;
                 @memcpy(dest.first_key[written..][0..take], source.first_key[from..][0..take]);
                 @memcpy(dest.child[written..][0..take], source.child[from..][0..take]);
-                for (0..take) |step| {
-                    dest.start[written + step] = total;
-                    total += source.entryPairs(from + step);
+                const source_end = from + take == source.header.count;
+                for (columns, source.prefixColumns(), &totals, source.header.totals.values) |column, source_column, *total, source_total| {
+                    const base = source_column[from];
+                    for (column[written..][0..take], source_column[from..][0..take]) |*start, source_start| start.* = total.* + (source_start - base);
+                    total.* += (if (source_end) source_total else source_column[from + take]) - base;
                 }
             },
-            .outputs => for (job.children[segment.lo + offset ..][0..take], written..) |child, entry| {
+            .outputs => for (children[segment.lo + segments.offset ..][0..take], written..) |child, entry| {
                 dest.first_key[entry] = child.first_key;
                 dest.child[entry] = child.id;
-                dest.start[entry] = total;
-                total += child.pairs;
+                for (columns, &totals, child.counts.values) |column, *total, child_count| {
+                    column[entry] = total.*;
+                    total.* += child_count;
+                }
             },
             .page => unreachable,
         }
         written += take;
-        position += take;
+        segments.offset += take;
+        if (segments.offset == segment.items()) {
+            segments.index += 1;
+            segments.offset = 0;
+        }
     }
-    dest.header.* = .{ .count = written, .total = total };
-    return .{ .first_key = dest.first_key[0], .id = id, .pairs = total };
+    dest.header.* = .{ .count = count, .totals = .{ .values = totals } };
+    return .{ .first_key = dest.first_key[0], .id = id, .counts = .{ .values = totals } };
 }
 
-// ---- Refresh job (stored pairs; ranges own the pages starting in them) -----------------------
+// ---- Refresh job (stored pairs; ranges own the pages starting in them) ---------------------
 
 const RefreshJob = struct {
     store: *const TriggerStore,
     data: *const DataSystem,
-    sums: []PaddedSlot(RefreshSums),
     items_per_range: usize,
+    range_count: usize,
 };
 
 // Scalar: per pair two hinted row resolves into another store and two u8 tier loads; the
-// movement columns are not in pair order, and `simd.zig` has no u8 gather.
+// movement columns are not in pair order, and `simd.zig` has no u8 gather. A height-1 node
+// whose pages all start in the range gets its prefixes as a running sum over them; a node
+// split at a range edge gets each page's counts, which `foldRefreshed` prefixes.
 fn refreshJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *RefreshJob = @ptrCast(@alignCast(context));
     const store = job.store;
-    std.debug.assert(range.index < job.sums.len);
+    std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start == range.index * job.items_per_range and range.end <= store.pair_count);
     const entities = job.data.movement_bodies.sliceConst().entities;
     const tier = job.data.scopeColumnsSliceConst().tier;
     std.debug.assert(entities.len == tier.len);
-    var sums = RefreshSums{};
     var cursor = store.cursorAt(@intCast(range.start));
     if (cursor.offset != 0) cursor.nextPage();
+    // Whether the range holds every page of the cursor's height-1 node: false for a node it
+    // starts inside.
+    var whole = false;
+    var valid: u32 = 0;
+    var allowed: u32 = 0;
     while (cursor.valid() and cursor.page_start < range.end) : (cursor.nextPage()) {
         const at = cursor.page();
-        var valid: u32 = 0;
-        var allowed: u32 = 0;
+        var valid_mask: u64 = 0;
+        var allowed_mask: u64 = 0;
         for (0..cursor.page_len) |slot| {
             const a_row = job.data.movementBodyDenseIndexHinted(entities, at.a[slot], at.a_row[slot]);
             const b_row = job.data.movementBodyDenseIndexHinted(entities, at.b[slot], at.b_row[slot]);
@@ -1949,15 +2203,35 @@ fn refreshJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             at.a_row[slot] = storedRow(a_row.?);
             at.b_row[slot] = storedRow(b_row.?);
             at.emit[slot] = emitBits(tier[a_row.?].allowsCollision(), tier[b_row.?].allowsCollision());
-            valid += 1;
-            allowed += @intFromBool(emits(at.emit[slot], true));
+            const bit = @as(u64, 1) << @intCast(slot);
+            valid_mask |= bit;
+            if (countsAs(at.emit[slot], .allowed)) allowed_mask |= bit;
         }
-        at.header.valid = valid;
-        at.header.allowed = allowed;
-        sums.valid += valid;
-        sums.allowed += allowed;
+        at.header.valid_mask = valid_mask;
+        at.header.allowed_mask = allowed_mask;
+        if (cursor.height == 0) continue;
+        // Reads only the parent's pairs prefixes and count, which no range writes.
+        const parent = store.node(cursor.path.nodes[0]);
+        const entry = cursor.path.entries[0];
+        const last_entry = parent.header.count - 1;
+        if (entry == 0) {
+            whole = cursor.page_start + parent.start[last_entry] < range.end;
+            valid = 0;
+            allowed = 0;
+        }
+        if (!whole) {
+            parent.valid_start[entry] = @popCount(valid_mask);
+            parent.allowed_start[entry] = @popCount(allowed_mask);
+            continue;
+        }
+        parent.valid_start[entry] = valid;
+        parent.allowed_start[entry] = allowed;
+        valid += @popCount(valid_mask);
+        allowed += @popCount(allowed_mask);
+        if (entry < last_entry) continue;
+        parent.header.totals.set(.valid, valid);
+        parent.header.totals.set(.allowed, allowed);
     }
-    job.sums[range.index].value = sums;
 }
 
 // ---- Tests --------------------------------------------------------------------------------
@@ -2082,73 +2356,68 @@ fn rebuildKeys(store: *TriggerStore, threads: StoreThreads, keys: []const u256, 
     try store.rebuild(threads, sources, 1, 0);
 }
 
-const SubtreeSummary = struct { first_key: u256, pairs: u32, valid: u32, allowed: u32 };
+const SubtreeSummary = struct { first_key: u256, counts: Counts };
 
 // The tree under one node or page: keys stay on `level` and strictly increase past
 // `previous`, non-root pages and nodes hold at least half, a root node holds at least two
-// entries, each entry's first key and start prefix match its child, totals match the
-// subtree's pairs, and page headers count the emit bytes.
+// entries, each entry's first key and prefixes of every count match its child, totals match
+// the subtree's counts, and page masks mark the emit bytes.
 fn expectSubtreeValid(store: *const TriggerStore, level: u16, id: u32, height: u8, is_root: bool, previous: *?u256) !SubtreeSummary {
     if (height == 0) {
         const at = store.page(id);
         const len = at.header.len;
         try testing.expect(len >= 1 and len <= page_capacity);
         if (!is_root) try testing.expect(len >= page_min);
-        var valid: u32 = 0;
-        var allowed: u32 = 0;
-        for (at.keys[0..len], at.emit[0..len]) |key, emit| {
+        var valid_mask: u64 = 0;
+        var allowed_mask: u64 = 0;
+        for (at.keys[0..len], at.emit[0..len], 0..) |key, emit, slot| {
             try testing.expectEqual(level, keyLevel(key));
             if (previous.*) |before| try testing.expect(before < key);
             previous.* = key;
-            valid += emit & emit_valid;
-            allowed += @intFromBool(emit == emit_valid | emit_allowed);
+            const bit = @as(u64, 1) << @intCast(slot);
+            if (emit & emit_valid != 0) valid_mask |= bit;
+            if (emit == emit_valid | emit_allowed) allowed_mask |= bit;
         }
-        try testing.expectEqual(valid, at.header.valid);
-        try testing.expectEqual(allowed, at.header.allowed);
-        return .{ .first_key = at.keys[0], .pairs = len, .valid = valid, .allowed = allowed };
+        try testing.expectEqual(valid_mask, at.header.valid_mask);
+        try testing.expectEqual(allowed_mask, at.header.allowed_mask);
+        return .{ .first_key = at.keys[0], .counts = at.header.counts() };
     }
     const at = store.node(id);
     const count = at.header.count;
     try testing.expect(count <= node_capacity);
     try testing.expect(if (is_root) count >= 2 else count >= node_min);
-    var summary = SubtreeSummary{ .first_key = at.first_key[0], .pairs = 0, .valid = 0, .allowed = 0 };
+    var summary = SubtreeSummary{ .first_key = at.first_key[0], .counts = .initFill(0) };
     for (0..count) |entry| {
-        try testing.expectEqual(summary.pairs, at.start[entry]);
+        for (std.enums.values(PairCount)) |kind| try testing.expectEqual(summary.counts.get(kind), at.starts(kind)[entry]);
         const child = try expectSubtreeValid(store, level, at.child[entry], height - 1, false, previous);
         try testing.expectEqual(child.first_key, at.first_key[entry]);
-        summary.pairs += child.pairs;
-        summary.valid += child.valid;
-        summary.allowed += child.allowed;
+        for (std.enums.values(PairCount)) |kind| summary.counts.set(kind, summary.counts.get(kind) + child.counts.get(kind));
     }
-    try testing.expectEqual(summary.pairs, at.header.total);
+    for (std.enums.values(PairCount)) |kind| try testing.expectEqual(summary.counts.get(kind), at.header.totals.get(kind));
     return summary;
 }
 
-// Every level's tree, each level's rank prefix and pair count, the store sums, and empty
-// pending scratch.
+// Every level's tree, each level's counts and rank prefixes of every count, the store sums,
+// and empty pending scratch.
 fn expectTreeValid(store: *const TriggerStore) !void {
     try testing.expectEqual(store.levels.items.len, store.level_rank.sums.items.len);
-    var pairs: u32 = 0;
-    var valid: u32 = 0;
-    var allowed: u32 = 0;
+    var totals = Counts.initFill(0);
     for (store.levels.items, 0..) |tree, level| {
-        try testing.expectEqual(pairs, store.level_rank.prefix(level));
+        for (std.enums.values(PairCount)) |kind| try testing.expectEqual(totals.get(kind), store.level_rank.prefix(kind, level));
         if (tree.root == no_entry) {
-            try testing.expectEqual(@as(u32, 0), tree.pair_count);
+            try testing.expectEqual(Counts.initFill(0), tree.counts);
             try testing.expectEqual(@as(u8, 0), tree.height);
             continue;
         }
         var previous: ?u256 = null;
         const summary = try expectSubtreeValid(store, @intCast(level), tree.root, tree.height, true, &previous);
-        try testing.expectEqual(tree.pair_count, summary.pairs);
-        pairs += summary.pairs;
-        valid += summary.valid;
-        allowed += summary.allowed;
+        try testing.expectEqual(summary.counts, tree.counts);
+        for (std.enums.values(PairCount)) |kind| totals.set(kind, totals.get(kind) + summary.counts.get(kind));
     }
-    try testing.expectEqual(pairs, store.level_rank.prefix(store.levels.items.len));
-    try testing.expectEqual(pairs, store.pair_count);
-    try testing.expectEqual(valid, store.valid_count);
-    try testing.expectEqual(allowed, store.allowed_count);
+    for (std.enums.values(PairCount)) |kind| {
+        try testing.expectEqual(totals.get(kind), store.level_rank.prefix(kind, store.levels.items.len));
+        try testing.expectEqual(totals.get(kind), store.countOf(kind));
+    }
     for (store.leaf_pending.items) |pending| try testing.expectEqual(@as(u32, 0), pending);
     for (store.node_pending.items) |pending| try testing.expectEqual(@as(u32, 0), pending);
     for (store.level_pending.items) |pending| try testing.expectEqual(@as(u32, 0), pending);
@@ -2187,7 +2456,7 @@ fn expectReadersMatch(store: *const TriggerStore, reference: []const u256) !void
         }
         const located = store.locateKey(key);
         try testing.expectEqual(cursor.path.leaf, located.page.path.leaf);
-        try testing.expectEqual(cursor.page_start - store.level_rank.prefix(keyLevel(key)), located.page.leaf_start);
+        try testing.expectEqual(cursor.page_start - store.level_rank.prefix(.pairs, keyLevel(key)), located.page.leaf_start);
         try testing.expectEqual(located.page.leaf_start, cursor.leaf_start);
         const piece = store.storedPiece(key).?;
         try testing.expectEqual(located.page.leaf_start, piece.page.leaf_start);
@@ -2244,7 +2513,7 @@ fn sortedRemove(list: *std.ArrayList(u256), key: u256) void {
     _ = list.orderedRemove(at);
 }
 
-test "collision trigger store level rank matches a naive prefix through add, append, find and build" {
+test "collision trigger store level rank matches a naive prefix of every count through add, append, find and build" {
     var rank: LevelRank = .{};
     defer rank.deinit(testing.allocator);
     var counts: std.ArrayList(LevelTree) = .empty;
@@ -2258,27 +2527,35 @@ test "collision trigger store level rank matches a naive prefix through add, app
         try counts.append(testing.allocator, .{});
         for (0..3) |_| {
             const level = random.uintLessThan(usize, counts.items.len);
-            const delta: i64 = if (random.boolean() or counts.items[level].pair_count == 0) random.uintAtMost(u32, 9) else -@as(i64, random.uintAtMost(u32, counts.items[level].pair_count));
-            counts.items[level].pair_count = @intCast(@as(i64, counts.items[level].pair_count) + delta);
-            rank.add(level, delta);
-        }
-        var total: u32 = 0;
-        for (counts.items, 0..) |tree, level| {
-            try testing.expectEqual(total, rank.prefix(level));
-            // Every ordinal of the level finds it; empty levels are never found.
-            for (0..tree.pair_count) |local| {
-                const found = rank.find(total + @as(u32, @intCast(local)));
-                try testing.expectEqual(@as(u16, @intCast(level)), found.level);
-                try testing.expectEqual(@as(u32, @intCast(local)), found.local);
+            // Each count moves on its own, so the columns' empty levels differ.
+            var deltas: std.EnumArray(PairCount, i64) = undefined;
+            for (std.enums.values(PairCount)) |kind| {
+                const held = counts.items[level].counts.get(kind);
+                const delta: i64 = if (random.boolean() or held == 0) random.uintAtMost(u32, 9) else -@as(i64, random.uintAtMost(u32, held));
+                counts.items[level].counts.set(kind, @intCast(@as(i64, held) + delta));
+                deltas.set(kind, delta);
             }
-            total += tree.pair_count;
+            rank.add(level, deltas);
         }
-        try testing.expectEqual(total, rank.prefix(counts.items.len));
+        for (std.enums.values(PairCount)) |kind| {
+            var total: u32 = 0;
+            for (counts.items, 0..) |tree, level| {
+                try testing.expectEqual(total, rank.prefix(kind, level));
+                // Every ordinal of the level finds it; levels holding none are never found.
+                for (0..tree.counts.get(kind)) |local| {
+                    const found = rank.find(kind, total + @as(u32, @intCast(local)));
+                    try testing.expectEqual(@as(u16, @intCast(level)), found.level);
+                    try testing.expectEqual(@as(u32, @intCast(local)), found.local);
+                }
+                total += tree.counts.get(kind);
+            }
+            try testing.expectEqual(total, rank.prefix(kind, counts.items.len));
+        }
         var built: LevelRank = .{};
         defer built.deinit(testing.allocator);
         try built.sums.ensureTotalCapacity(testing.allocator, counts.items.len);
         built.build(counts.items);
-        try testing.expectEqualSlices(u32, rank.sums.items, built.sums.items);
+        try testing.expectEqualSlices(Counts, rank.sums.items, built.sums.items);
     }
 }
 
@@ -2353,7 +2630,7 @@ test "collision trigger store random patches across levels match a sorted refere
         try expectStoredKeys(&serial, reference.items);
         try expectStoredKeys(&threaded, reference.items);
         try testing.expectEqual(round + 1, serial.seen_revision);
-        if (round == 20) try testing.expectEqual(@as(u32, 0), serial.levels.items[3].pair_count);
+        if (round == 20) try testing.expectEqual(@as(u32, 0), serial.levels.items[3].counts.get(.pairs));
     }
     try expectReadersMatch(&serial, reference.items);
     try testing.expectEqual(@as(usize, 10), serial.levels.items.len);
@@ -2473,7 +2750,7 @@ test "collision trigger store page runs split, extend right and left, and merge 
     // Every page dropped but a few pairs: the root collapses to one page, then empties.
     try pair.patch(&.{}, &.{}, &.{.{ pair.reference.items[5], pair.reference.items[pair.reference.items.len - 1] }});
     try testing.expectEqual(@as(u8, 0), pair.height(0));
-    try testing.expectEqual(@as(u32, 5), pair.serial.levels.items[0].pair_count);
+    try testing.expectEqual(@as(u32, 5), pair.serial.levels.items[0].counts.get(.pairs));
     try pair.patch(&.{}, &.{}, &.{.{ 0, levelFirstKey(1) - 1 }});
     try testing.expectEqual(no_entry, pair.serial.levels.items[0].root);
     try testing.expectEqual(@as(u32, 0), pair.serial.pair_count);
@@ -2577,11 +2854,59 @@ test "collision trigger store one patch touches three levels at different height
     // Level 3 emptied: the cursor steps from level 0 straight to level 9.
     try pair.patch(&.{}, &.{}, &.{.{ levelFirstKey(3), levelFirstKey(4) - 1 }});
     try expectReadersMatch(&pair.serial, pair.reference.items);
-    const level0 = pair.serial.levels.items[0].pair_count;
+    const level0 = pair.serial.levels.items[0].counts.get(.pairs);
     var cursor = pair.serial.cursorAt(level0 - 1);
     cursor.next();
     try testing.expectEqual(@as(u16, 9), cursor.path.level);
     try testing.expectEqual(levelFirstKey(9), cursor.page().keys[cursor.offset]);
+}
+
+// The emit bits of `emittedCursorTestKeys`' pair `index` on `level`: level 2 holds pairs
+// allowed only near its start, middle and end, and valid on every fifth, so whole height-1
+// subtrees count no allowed pair; level 4 holds no valid pair.
+fn emittedCursorTestEmit(level: u16, index: usize, level_len: usize) u8 {
+    return switch (level) {
+        2 => if (index < 10 or (index >= 5000 and index < 5010) or index + 10 >= level_len) emit_valid | emit_allowed else if (index % 5 == 0) emit_valid else 0,
+        4 => 0,
+        else => if (index % 3 == 0) 0 else if (index % 3 == 1) emit_valid else emit_valid | emit_allowed,
+    };
+}
+
+test "collision trigger store emitted cursors match each count's reference by ordinal and by step, past pages, subtrees and levels counting none" {
+    var serial_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
+    defer serial_system.deinit();
+    var store = TriggerStore.init(testing.allocator);
+    defer store.deinit();
+    var inserts: std.ArrayList(InsertEdit) = .empty;
+    defer inserts.deinit(testing.allocator);
+    // Level 1 is empty and level 4 counts pairs but none valid.
+    const levels = [_]struct { level: u16, len: usize }{ .{ .level = 0, .len = 100 }, .{ .level = 2, .len = 3 * 3968 + 500 }, .{ .level = 4, .len = 70 }, .{ .level = 6, .len = 10 } };
+    for (levels) |spec| {
+        for (0..spec.len) |index| {
+            const key = testKey(spec.level, 0, @intCast(index), 0);
+            try inserts.append(testing.allocator, .{ .key = key, .contact = testContact(key), .emit = emittedCursorTestEmit(spec.level, index, spec.len) });
+        }
+    }
+    try store.rebuild(testThreads(&serial_system), &.{.{ .inserts = inserts.items }}, 1, 0);
+    try expectTreeValid(&store);
+    try testing.expectEqual(@as(u8, 2), store.levels.items[2].height);
+    var reference: std.ArrayList(u256) = .empty;
+    defer reference.deinit(testing.allocator);
+    for (std.enums.values(PairCount)) |kind| {
+        reference.clearRetainingCapacity();
+        for (inserts.items) |edit| if (countsAs(edit.emit, kind)) try reference.append(testing.allocator, edit.key);
+        try testing.expectEqual(@as(u32, @intCast(reference.items.len)), store.countOf(kind));
+        for (reference.items, 0..) |key, ordinal| {
+            const cursor = store.emittedCursorAt(kind, @intCast(ordinal));
+            try testing.expectEqual(key, cursor.key());
+            try testing.expectEqual(key, cursor.page().keys[cursor.slot]);
+        }
+        var cursor = store.emittedCursorAt(kind, 0);
+        for (reference.items, 1..) |key, taken| {
+            try testing.expectEqual(key, cursor.key());
+            if (taken < reference.items.len) _ = cursor.next();
+        }
+    }
 }
 
 test "collision trigger store rebuild bulk loads across page, node and node-squared boundaries" {
@@ -2608,6 +2933,11 @@ test "collision trigger store rebuild bulk loads across page, node and node-squa
     try expectTreeValid(&store);
     try testing.expectEqual(@as(u8, 3), store.levels.items[1].height);
     try testing.expectEqual(@as(usize, 2), store.levels.items.len);
+    // No pairs: an empty, ready store with no tree height to merge.
+    try rebuildKeys(&store, testThreads(&serial_system), &.{}, 1);
+    try expectTreeValid(&store);
+    try testing.expect(store.ready);
+    try testing.expectEqual(@as(usize, 0), store.levels.items.len);
 }
 
 test "collision trigger store growing patch under every allocation failure leaves the store unchanged, and the retry matches a rebuild" {
@@ -2721,12 +3051,21 @@ test "collision trigger store warm patches allocate nothing on a 2-worker pool" 
     try expectStoredKeys(&store, &keys);
 }
 
+// The refresh tests' pair `index`: a one-page level 0, a height-2 level 2 of three height-1
+// subtrees, and a one-page level 5.
+fn entityPairKey(index: usize) u256 {
+    const level: u16 = if (index < 100) 0 else if (index < entity_pairs_level_end) 2 else 5;
+    return testKey(level, 0, @intCast(index), 0);
+}
+
+const entity_pairs_level_end = 8600;
+
 // Stored pairs naming `entities` in a chain, every row hint stale (row 0).
 fn rebuildEntityPairs(store: *TriggerStore, threads: StoreThreads, entities: []const EntityId) !void {
     var inserts: std.ArrayList(InsertEdit) = .empty;
     defer inserts.deinit(testing.allocator);
     for (entities[0 .. entities.len - 1], entities[1..], 0..) |a, b, index| {
-        const key = testKey(@intCast(index % 3), 0, @intCast(index), 0);
+        const key = entityPairKey(index);
         var contact = testContact(key);
         contact.a = a;
         contact.b = b;
@@ -2743,7 +3082,8 @@ fn rebuildEntityPairs(store: *TriggerStore, threads: StoreThreads, entities: []c
 }
 
 // Every stored pair's rows are its entities' movement rows (or `no_row`) and its emit bits
-// their resolution and tiers; the page headers and store sums count them.
+// their resolution and tiers; the page masks, node prefixes, level counts, rank and store
+// sums count them.
 fn expectRefreshed(store: *const TriggerStore, data: *const DataSystem) !void {
     try testing.expectEqual(data.collision_allow_epoch, store.refreshed_epoch.?);
     try expectTreeValid(store);
@@ -2761,14 +3101,16 @@ fn expectRefreshed(store: *const TriggerStore, data: *const DataSystem) !void {
     }
 }
 
-test "collision trigger store refresh re-resolves rows and emit bits over several ranges, serial and 2 workers, and allocates nothing warm" {
+// Refresh ranges that start inside pages, hold some height-1 nodes whole and split others
+// (one across several ranges), over a height-2 level whose nodes fold on main.
+test "collision trigger store refresh re-resolves rows, emit bits and every count over several ranges, serial and 2 workers, and allocates nothing warm" {
     var serial_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0 });
     defer serial_system.deinit();
     var thread_system = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2 });
     defer thread_system.deinit();
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
-    var entities: [400]EntityId = undefined;
+    var entities: [entity_pairs_level_end + 400]EntityId = undefined;
     for (&entities, 0..) |*entity, index| {
         entity.* = try data.createEntity();
         const position = @as(f32, @floatFromInt(index));
@@ -2781,16 +3123,18 @@ test "collision trigger store refresh re-resolves rows and emit bits over severa
     defer threaded.deinit();
     try rebuildEntityPairs(&serial, testThreads(&serial_system), &entities);
     try rebuildEntityPairs(&threaded, testThreads(&thread_system), &entities);
+    try testing.expectEqual(@as(u8, 2), serial.levels.items[2].height);
+    try testing.expect(serial.pair_count > 2 * refresh_range_alignment_items);
     // Uneven pages, so ranges start inside pages.
     var drops: [40]u256 = undefined;
-    for (&drops, 0..) |*key, index| key.* = testKey(@intCast((index * 9) % 3), 0, @intCast(index * 9), 0);
+    for (&drops, 0..) |*key, index| key.* = entityPairKey(index * 200 + 3);
     try patchKeys(&serial, testThreads(&serial_system), &.{}, &drops, &.{}, 1, 2);
     try patchKeys(&threaded, testThreads(&thread_system), &.{}, &drops, &.{}, 1, 2);
     // Destroys swap rows and move the epoch; one entity is left without a movement row.
     try testing.expect(data.destroyEntity(entities[5]));
     try testing.expect(data.destroyEntity(entities[200]));
     try testing.expect(serial.refresh(testThreads(&serial_system), &data));
-    // The commits reserved the range slots: the first refresh allocates nothing.
+    // The refresh keeps no range slots: the first one allocates nothing.
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     threaded.allocator = failing.allocator();
     const ran = threaded.refresh(testThreads(&thread_system), &data);
@@ -2806,4 +3150,13 @@ test "collision trigger store refresh re-resolves rows and emit bits over severa
     try data.setSimulationTier(entities[11], .dormant);
     try testing.expect(threaded.refresh(testThreads(&thread_system), &data));
     try expectRefreshed(&threaded, &data);
+    // Ranges three alignments wide: some height-1 nodes lie whole in one range, whose worker
+    // writes their prefixes, and the others split at a range edge, which main prefixes.
+    try data.setSimulationTier(entities[12], .dormant);
+    const wide: StoreThreads = .{ .thread_system = &thread_system, .config = .{ .items_per_range = 3 * refresh_range_alignment_items, .max_worker_threads = thread_system.workerThreadCount(), .adaptive = false } };
+    try testing.expect(threaded.refresh(wide, &data));
+    try testing.expect(serial.refresh(testThreads(&serial_system), &data));
+    try expectRefreshed(&threaded, &data);
+    try expectRefreshed(&serial, &data);
+    try testing.expectEqual(serial.allowed_count, threaded.allowed_count);
 }

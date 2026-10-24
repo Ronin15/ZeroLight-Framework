@@ -123,6 +123,15 @@ the current bench.
       --details` the main share is the ordered merge only; serial == threaded
       across range sizes and worker counts; `FailingAllocator` proof on a
       multi-worker step; a pipeline test proves the stages ran on workers.
+- [ ] A tier toggle refreshes only the trigger pairs it changes. Failure: any
+      `collision_allow_epoch` move (`data_system/system.zig:306`, `:995`)
+      makes `TriggerStore.refresh` (`collision_triggers.zig:1672`)
+      re-resolve every stored pair's rows and emit bits, so one entity
+      crossing `allowsCollision` costs O(T) in stored pairs (local change at
+      world cost, `.claude/rules/engine-design.md` § Cost model). Pass: a
+      toggle's refresh work follows the toggled entities' pairs;
+      `collision-static-triggers` refresh work flat in T for a one-entity
+      toggle; serial == threaded.
 - [ ] Rows at rest cost no per-step collision work. Owner: after slice 88.
       Failure scenario: an
       inert row is gathered, sorted, and swept every step it sits in a

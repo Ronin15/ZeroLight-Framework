@@ -12,6 +12,9 @@ pub const lane_count: usize = vector_bytes / @sizeOf(u32);
 // Lanes of a 16-bit element type.
 const u16_lane_count: usize = vector_bytes / @sizeOf(u16);
 const Uint16x8 = @Vector(u16_lane_count, u16);
+// Lanes of an 8-bit element type.
+const u8_lane_count: usize = vector_bytes;
+const Uint8x16 = @Vector(u8_lane_count, u8);
 pub const Float4 = @Vector(lane_count, f32);
 pub const Int4 = @Vector(lane_count, i32);
 pub const Uint4 = @Vector(lane_count, u32);
@@ -406,6 +409,34 @@ pub fn countUnequalU16Scalar(lhs: []const u16, rhs: []const u16) u32 {
     var count: u32 = 0;
     for (lhs, rhs) |lhs_value, rhs_value| count += @intFromBool(lhs_value != rhs_value);
     return count;
+}
+
+/// Bit `index` set where `values[index] & care == want`, for at most 64 values: a byte
+/// compare packed into a bit set. Whole registers, then a scalar tail.
+pub fn bytesMatchingMask(values: []const u8, care: u8, want: u8) u64 {
+    std.debug.assert(values.len <= @bitSizeOf(u64));
+    const vector_end = values.len - values.len % u8_lane_count;
+    const care_lanes: Uint8x16 = @splat(care);
+    const want_lanes: Uint8x16 = @splat(want);
+    var bits: u64 = 0;
+    var index: usize = 0;
+    while (index < vector_end) : (index += u8_lane_count) {
+        const lanes: Uint8x16 = values[index..][0..u8_lane_count].*;
+        const matched: @Int(.unsigned, u8_lane_count) = @bitCast((lanes & care_lanes) == want_lanes);
+        bits |= @as(u64, matched) << @intCast(index);
+    }
+    if (vector_end == values.len) return bits;
+    return bits | bytesMatchingMaskScalar(values[vector_end..], care, want) << @intCast(vector_end);
+}
+
+/// Scalar form of `bytesMatchingMask`.
+pub fn bytesMatchingMaskScalar(values: []const u8, care: u8, want: u8) u64 {
+    std.debug.assert(values.len <= @bitSizeOf(u64));
+    var bits: u64 = 0;
+    for (values, 0..) |value, index| {
+        if (value & care == want) bits |= @as(u64, 1) << @intCast(index);
+    }
+    return bits;
 }
 
 /// Subtracts one from every value, stopping at zero. Whole registers, then a scalar tail.
@@ -900,6 +931,25 @@ test "countUnequalU16 matches its scalar form over every tail length and random,
     // Overlapping views, as a chain of adjacent cells is compared.
     for (&lhs) |*value| value.* = random.uintLessThan(u16, 2);
     try std.testing.expectEqual(countUnequalU16Scalar(lhs[0..32], lhs[1..33]), countUnequalU16(lhs[0..32], lhs[1..33]));
+}
+
+test "bytesMatchingMask matches its scalar form over every length up to 64, for masked and exact matches" {
+    var prng = std.Random.DefaultPrng.init(0x00b1_7e5a);
+    const random = prng.random();
+    var values: [64]u8 = undefined;
+    for (0..values.len + 1) |len| {
+        for (0..8) |_| {
+            // A small value range so matching and unmatched lanes both occur.
+            for (values[0..len]) |*value| value.* = random.uintLessThan(u8, 4);
+            for ([_][2]u8{ .{ 1, 1 }, .{ 0xff, 3 }, .{ 0xff, 0 }, .{ 2, 0 } }) |pair| {
+                try std.testing.expectEqual(bytesMatchingMaskScalar(values[0..len], pair[0], pair[1]), bytesMatchingMask(values[0..len], pair[0], pair[1]));
+            }
+        }
+        @memset(values[0..len], 3);
+        const all: u64 = if (len == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(len)) - 1;
+        try std.testing.expectEqual(all, bytesMatchingMask(values[0..len], 0xff, 3));
+        try std.testing.expectEqual(@as(u64, 0), bytesMatchingMask(values[0..len], 0xff, 0));
+    }
 }
 
 test "decrementSaturatingU16 matches its scalar form over every tail length, stopping at zero" {

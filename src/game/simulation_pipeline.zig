@@ -754,7 +754,6 @@ pub const SimulationPipelineStats = struct {
             perf.recordBatch(.collision_trigger_refresh, collision_stats.perf.trigger_refresh_batch);
             perf.recordBenchBatch(.collision_static_place, collision_stats.perf.static_place_batch);
             perf.recordBenchBatch(.collision_static_sort, collision_stats.perf.static_sort_batch);
-            perf.recordBenchBatch(.collision_trigger_emit_count, collision_stats.perf.trigger_emit_count_batch);
             perf.recordBenchBatch(.collision_trigger_emit, collision_stats.perf.trigger_emit_batch);
             perf.recordBenchBatch(.collision_broadphase, collision_stats.perf.broadphase_batch);
             perf.recordBenchBatch(.collision_narrowphase, collision_stats.perf.narrowphase_batch);
@@ -1098,9 +1097,9 @@ pub const SimulationPipeline = struct {
         try self.growTriggerContactBound(frame, pairs);
     }
 
-    // Reserves every contact-sized stream to the grown sum first, then declares the bound,
-    // which `reserveTriggerContacts` raises last: an OOM leaves the bound unchanged for the
-    // caller's retry (the next seam's), or fails `init` when `reserve` runs there.
+    // Reserves every contact-sized stream to the grown sum first, then declares the bound
+    // last: an OOM leaves the bound unchanged for the caller's retry (the next seam's), or
+    // fails `init` when `reserve` runs there.
     fn growTriggerContactBound(self: *SimulationPipeline, frame: *SimulationFrame, pairs: usize) !void {
         @branchHint(.cold);
         // The streams' pair bound and the one collision counts against are the same figure.
@@ -1111,7 +1110,7 @@ pub const SimulationPipeline = struct {
         std.debug.assert(frame.contacts.values.capacity >= contact_capacity);
         std.debug.assert(frame.contacts.counts.capacity >= maxRangeCount(contact_capacity, collision_range_alignment_items));
         std.debug.assert(frame.collision_triggers.values.capacity >= estimateTriggerCapacity(contact_capacity));
-        try self.collision.reserveTriggerContacts(bound);
+        self.collision.reserveTriggerContacts(bound);
         if (!self.trigger_bound_logged) {
             self.trigger_bound_logged = true;
             if (comptime logging.enabled(.info)) logging.game.info(
@@ -1411,7 +1410,6 @@ pub const SimulationPipeline = struct {
         perf.recordBenchBatch(.collision_trigger_query, self.collision.perf.trigger_query_batch);
         perf.recordBenchBatch(.collision_trigger_insert_place, trigger_batches.get(.insert_place));
         perf.recordBenchBatch(.collision_trigger_insert_sort, trigger_batches.get(.insert_sort));
-        perf.recordBenchBatch(.collision_trigger_node, trigger_batches.get(.node));
     }
 
     /// Orchestrates the post-commit nav reaction by delegating to the nav-owning
@@ -7942,7 +7940,6 @@ test "a world pipeline with build threads stores its trigger pairs at init, and 
     try std.testing.expectEqual(pair_count, @as(usize, collision.trigger_store.pair_count));
     try std.testing.expect(pair_count > collision.reserved_pair_bound);
     try std.testing.expect(collision.reserved_trigger_bound >= pair_count);
-    try std.testing.expect(collision.emit_ranges.capacity >= maxRangeCount(collision.reserved_pair_bound +| collision.reserved_trigger_bound, collision_range_alignment_items));
 
     pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
     var player_state = player;

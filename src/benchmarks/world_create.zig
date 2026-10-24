@@ -38,10 +38,10 @@
 //! declared a trigger contact bound covering them; the collider rebuild selected every slot,
 //! planned, touched and grouped every static, filled every span and installed every
 //! occupied chunk; the trigger rebuild query covered every static, the insert place and sort
-//! every pair, the leaf stage their pages, the node stage at least one item, and no patch
-//! stage ran; in the tuned case with workers every rebuild stage over more than one aligned
-//! range (the collider rebuild's six, the trigger build's five, the nav build's remask) ran on
-//! workers; the first
+//! every pair, the leaf stage their pages, the node merge on main at least one node, and no
+//! patch stage or merge ran; in the tuned case with workers every rebuild stage over more
+//! than one aligned range (the collider rebuild's six, the trigger build's four, the nav
+//! build's remask) ran on workers; the first
 //! seam rebuilt nothing (its trigger rebuild records are init's, its patch query empty, its
 //! pair count kept); and a collision step after it at the world's strips emits every stored
 //! pair with no pair-bound overflow. `main=` is the create's time less the off-main time of the
@@ -52,8 +52,10 @@
 //! case; a first step with no overflow. Prints `statics=`, `stored_pairs=`, `init=`, `first_seam=`,
 //! `per_static=`, and `main=` with `main_per_item=`; `--details` adds the init's phases
 //! (`collider_rebuild=`, `nav_build=`, and `trigger_build=` each with its main, and `rest=`,
-//! the init less the three), `first_seam=` with its trigger sync, and the shapes of the
-//! trigger build's and the collider rebuild's stages (the busiest over the measured creates).
+//! the init less the three), `first_seam=` with its trigger sync, the shapes of the trigger
+//! build's and the collider rebuild's stages (the busiest over the measured creates), and the
+//! trigger build's node merge on main (`node_merge=`, its mean nodes and time per node; pass
+//! shape: time per node flat in statics).
 
 const std = @import("std");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -70,6 +72,7 @@ const SimulationPipeline = @import("../game/simulation_pipeline.zig").Simulation
 const CollisionStrips = @import("../game/systems/collision.zig").CollisionStrips;
 const TriggerStore = @import("../game/systems/collision_triggers.zig").TriggerStore;
 const trigger_page_capacity = @import("../game/systems/collision_triggers.zig").page_capacity;
+const NodeMerge = @import("../game/systems/collision_triggers.zig").NodeMerge;
 const RebuildStage = @import("../game/systems/static_colliders.zig").RebuildStage;
 const WorldBuildConfig = @import("../game/world/system.zig").WorldBuildConfig;
 const WorldSystem = @import("../game/world/system.zig").WorldSystem;
@@ -398,6 +401,8 @@ const StaticsSample = struct {
     trigger_off_main_ns: u64,
     collider_batches: [collider_rebuild_stages.len]BatchStats,
     trigger_batches: [trigger_stage_count]BatchStats,
+    // The trigger build's node merge on main.
+    node_merge: NodeMerge,
     // The init's collider rewrite tuner, fresh with the pipeline as in production.
     rewrite_tuning: suite.WorkTuningSummary,
 };
@@ -422,7 +427,7 @@ fn sumOffMainNs(batches: []const BatchStats) u64 {
 // The init's trigger build: every pair stored at the colliders' revision and the world's
 // strips, the contact bound `reserveFrame` declared covering them, the rebuild query over
 // every static, the insert place and sort over every pair, the leaf stage over their pages,
-// the node stage over at least one item, and no patch stage.
+// the node merge over at least one node, and no patch stage or merge.
 fn checkInitTriggerBuild(pipeline: *const SimulationPipeline, world: *const WorldSystem, statics: usize, cells: usize, batches: [trigger_stage_count]BatchStats) !void {
     const collision = &pipeline.collision;
     const store = &collision.trigger_store;
@@ -436,9 +441,10 @@ fn checkInitTriggerBuild(pipeline: *const SimulationPipeline, world: *const Worl
     if (store_batches.get(.insert_sort).item_count != cells) return error.TriggerRebuildSortMissedPairs;
     const pages = std.math.divCeil(usize, cells, trigger_page_capacity) catch unreachable; // lint:allow catch-unreachable: the page capacity is a nonzero constant
     if (store_batches.get(.leaf).item_count != pages) return error.TriggerRebuildLeafMissedPages;
-    if (store_batches.get(.node).item_count < 1) return error.TriggerRebuildNodeSkipped;
+    if (store.perf.last_rebuild_node_merge.outputs < 1) return error.TriggerRebuildNodeMergeSkipped;
     if (collision.perf.trigger_query_batch.item_count != 0) return error.InitTriggerBuildPatched;
     for (store.perf.last_batches.values) |batch| if (batch.item_count != 0) return error.InitTriggerBuildPatched;
+    if (store.perf.last_node_merge.outputs != 0) return error.InitTriggerBuildPatched;
 }
 
 // One create and first seam on `threads`, timed, then a collision step and the teardown,
@@ -458,6 +464,7 @@ fn createWithStatics(allocator: std.mem.Allocator, io: std.Io, fixture: *Statics
     const nav_build = pipeline.pathfinding.perf.last_nav_build;
     const collider_batches = colliderRebuildBatches(pipeline);
     const trigger_batches = triggerRebuildBatches(pipeline);
+    const node_merge = pipeline.collision.trigger_store.perf.last_rebuild_node_merge;
     const rewrite_tuning = suite.workTuningSummary(pipeline.static_colliders.rebuild_tuners.getPtrConst(.rewrite), .fresh);
     if (static_colliders_test_support.liveRowCount(pipeline.static_colliders) != statics) return error.WrongStaticCount;
     try suite.checkRebuildWork(collider_batches, fixture.data.slots.items.len, statics, fixture.chunks);
@@ -489,6 +496,7 @@ fn createWithStatics(allocator: std.mem.Allocator, io: std.Io, fixture: *Statics
         .trigger_off_main_ns = sumOffMainNs(&trigger_batches),
         .collider_batches = collider_batches,
         .trigger_batches = trigger_batches,
+        .node_merge = node_merge,
         .rewrite_tuning = rewrite_tuning,
     };
 }
@@ -505,6 +513,8 @@ const StaticsTotals = struct {
     nav_main: u128 = 0,
     trigger_build: u128 = 0,
     trigger_main: u128 = 0,
+    node_merge_outputs: u128 = 0,
+    node_merge_ns: u128 = 0,
     rest: u128 = 0,
 
     fn add(self: *StaticsTotals, sample: StaticsSample) void {
@@ -519,6 +529,8 @@ const StaticsTotals = struct {
         self.nav_main += sample.nav_build_ns -| sample.nav_off_main_ns;
         self.trigger_build += sample.trigger_build_ns;
         self.trigger_main += sample.trigger_build_ns -| sample.trigger_off_main_ns;
+        self.node_merge_outputs += sample.node_merge.outputs;
+        self.node_merge_ns += sample.node_merge.ns;
         self.rest += sample.init_ns -| (sample.collider_rebuild_ns + sample.nav_build_ns + sample.trigger_build_ns);
     }
 
@@ -571,6 +583,8 @@ fn runStaticsCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Optio
         var label_buffer: [48]u8 = undefined;
         stats.details.print("trigger_build: query={s}", .{trigger_shapes.label(0, &label_buffer)});
         for (trigger_rebuild_stages, 1..) |stage, index| stats.details.print(" {s}={s}", .{ @tagName(stage), trigger_shapes.label(index, &label_buffer) });
+        const per_node_ns: u64 = if (totals.node_merge_outputs > 0) @intCast(totals.node_merge_ns / totals.node_merge_outputs) else 0;
+        stats.details.print(" node_merge={}x({f})", .{ StaticsTotals.mean(totals.node_merge_outputs, n), suite.formatDuration(per_node_ns) });
         stats.details.print("\ncollider_rebuild:", .{});
         for (collider_rebuild_stages, 0..) |stage, index| stats.details.print(" {s}={s}", .{ @tagName(stage), collider_shapes.label(index, &label_buffer) });
         stats.details.print("\n", .{});

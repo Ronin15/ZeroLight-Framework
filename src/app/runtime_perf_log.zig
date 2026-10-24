@@ -308,16 +308,13 @@ pub const BenchBatchStage = enum {
     // The dynamic x static pairs' banded place and sort, when the step has any.
     collision_static_place,
     collision_static_sort,
-    // The stored-trigger emission: its count pass, on a step that filters a stored pair,
-    // and its merge into the contact stream.
-    collision_trigger_emit_count,
+    // The stored-trigger emission's merge into the contact stream.
     collision_trigger_emit,
-    // The commit seam's stored-trigger stages before and after the patch plan: the query
-    // over the changes, the insert place and sort, and the node rewrite.
+    // The commit seam's stored-trigger stages before the patch plan: the query over the
+    // changes, and the insert place and sort.
     collision_trigger_query,
     collision_trigger_insert_place,
     collision_trigger_insert_sort,
-    collision_trigger_node,
     particles,
     // The commit seam's collider sync stages after its plan: row claims and touch emission,
     // the grouped touches, the row writes, the chunk-list splice, and the directory install.

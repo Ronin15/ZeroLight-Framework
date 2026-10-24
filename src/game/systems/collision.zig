@@ -65,6 +65,8 @@ const EditSource = collision_triggers.EditSource;
 const InsertEdit = collision_triggers.InsertEdit;
 const PageLocation = collision_triggers.PageLocation;
 const DropPiece = collision_triggers.DropPiece;
+const EmittedCursor = collision_triggers.EmittedCursor;
+const PairCount = collision_triggers.PairCount;
 
 pub const collision_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -403,8 +405,7 @@ pub const CollisionStats = struct {
     /// the entries the sweep tested against an earlier entry of its run inside that entry's
     /// x span, and the batches of the stages the step ran. A stage that did not run leaves
     /// its batch zero: the Debug stored-rect compare in every other mode, the stored-trigger
-    /// refresh on a step whose allow epoch did not move, the emission count pass on a step
-    /// that emits every stored pair.
+    /// refresh on a step whose allow epoch did not move.
     pub const Perf = if (runtime_perf_log.enabled) struct {
         /// This reserved step outgrew a total bound, so a main-thread grow path ran: the
         /// candidate pairs or the static pairs exceeded `CollisionSystem.reserved_pair_bound`,
@@ -423,7 +424,6 @@ pub const CollisionStats = struct {
         static_place_batch: BatchStats = .{},
         static_sort_batch: BatchStats = .{},
         trigger_refresh_batch: BatchStats = .{},
-        trigger_emit_count_batch: BatchStats = .{},
         trigger_emit_batch: BatchStats = .{},
     } else struct {};
 };
@@ -797,16 +797,6 @@ const TriggerQuerySlot = struct {
     }
 };
 
-// One emission range's split of the merged order: its stored pairs, its dynamic-side
-// contacts, and the contacts it writes. Written once by its range's count job.
-const EmitRange = struct {
-    stored_start: u32 = 0,
-    stored_end: u32 = 0,
-    dynamic_start: usize = 0,
-    dynamic_end: usize = 0,
-    out: usize = 0,
-};
-
 const no_static_row: u32 = std.math.maxInt(u32);
 
 // A fill's band starts: band b's entries are `[entry_start[b], entry_start[b + 1])`.
@@ -895,7 +885,6 @@ pub const CollisionSystem = struct {
     trigger_rebuild_slots: RangeSlots(TriggerQuerySlot) = .{},
     // One per query range: grow-only headers.
     trigger_edit_sources: std.ArrayList(EditSource) = .empty,
-    emit_ranges: SlotList(EmitRange) = .empty,
     // By entity index: the `change_generation` that last stamped it as changed.
     change_mark: std.ArrayList(u32) = .empty,
     change_generation: u32 = 1,
@@ -928,8 +917,8 @@ pub const CollisionSystem = struct {
         /// staging, the contact stream and the response reserves (all sized to that bound
         /// under the pipeline) grew, or the static pairs did, so `static_pairs` grew, or the
         /// stored and dynamic contacts exceeded the contact bound
-        /// (`reserved_pair_bound +| reserved_trigger_bound`), so the contact stream and its
-        /// emission ranges grew.
+        /// (`reserved_pair_bound +| reserved_trigger_bound`), so the contact stream's values and
+        /// range counts grew.
         pair_bound_overflows: u64 = 0,
         /// Reserved steps whose entries exceeded `reserved_entry_bound` (the keys and entries
         /// grew the first time), counted once per step.
@@ -948,7 +937,6 @@ pub const CollisionSystem = struct {
 
     pub fn deinit(self: *CollisionSystem) void {
         self.change_mark.deinit(self.allocator);
-        self.emit_ranges.deinit(self.allocator);
         self.trigger_edit_sources.deinit(self.allocator);
         self.trigger_rebuild_slots.deinit(self.allocator);
         self.trigger_patch_slots.deinit(self.allocator);
@@ -996,8 +984,8 @@ pub const CollisionSystem = struct {
     /// window per range), and its tallies hold the pair bound over the body capacity
     /// (`broadphasePairBound`). The inline broadphase and static query slots hold that
     /// bound over the entries and the bodies, and the static slot one query's hit rows
-    /// (`reserved_query_hits`). The stored-trigger emission's range records cover the
-    /// contact bound's ranges (the pair bound plus `reserved_trigger_bound`). A denser or
+    /// (`reserved_query_hits`). The stored-trigger emission keeps no records: its windows
+    /// are its ranges' own items in the contact stream. A denser or
     /// taller scene takes the counted grow paths: past a total bound `Perf`'s, inside one
     /// range its slot set's.
     pub fn reserve(self: *CollisionSystem, body_capacity: usize) !void {
@@ -1033,7 +1021,6 @@ pub const CollisionSystem = struct {
         // The static place runs over up to the pair bound's items.
         const pair_ranges = maxRangeCount(pair_capacity, collision_range_alignment_items);
         try self.sort_offsets.ensureTotalCapacity(self.allocator, pair_ranges);
-        try self.emit_ranges.ensureTotalCapacity(self.allocator, maxRangeCount(pair_capacity +| self.reserved_trigger_bound, collision_range_alignment_items));
         self.reserved_pair_bound = @max(self.reserved_pair_bound, pair_capacity);
         self.reserved_entry_bound = @max(self.reserved_entry_bound, entry_capacity);
     }
@@ -1047,25 +1034,22 @@ pub const CollisionSystem = struct {
         try contacts.reserve(maxRangeCount(contact_capacity, collision_range_alignment_items), contact_capacity);
     }
 
-    /// Declares `bound` stored trigger contacts on top of the pair bound: grows the emission's
-    /// range records to the summed contact bound, then raises `reserved_trigger_bound` last,
-    /// so an OOM leaves it unchanged. The caller reserves the contact-sized streams to the
-    /// same sum first. Grow-only; main thread, at the commit seam.
-    pub fn reserveTriggerContacts(self: *CollisionSystem, bound: usize) error{OutOfMemory}!void {
-        if (bound <= self.reserved_trigger_bound) return;
-        const range_bound = maxRangeCount(self.reserved_pair_bound +| bound, collision_range_alignment_items);
-        try self.emit_ranges.ensureTotalCapacity(self.allocator, range_bound);
-        std.debug.assert(self.emit_ranges.capacity >= range_bound);
-        self.reserved_trigger_bound = bound;
+    /// Declares `bound` stored trigger contacts on top of the pair bound. The caller reserves
+    /// the contact-sized streams to the summed contact bound first: the emission keeps no
+    /// storage of its own. Grow-only; main thread, at the commit seam.
+    pub fn reserveTriggerContacts(self: *CollisionSystem, bound: usize) void {
+        self.reserved_trigger_bound = @max(self.reserved_trigger_bound, bound);
     }
 
-    /// Clears the seam's trigger batch records (the patch query's and the store's stages), so
-    /// a seam that fails, rebuilds, or does nothing leaves none from an earlier seam. A no-op
-    /// without `runtime_perf_log.enabled`, which keeps no records.
+    /// Clears the seam's trigger batch records (the patch query's, the store's stages', its
+    /// node merge's and refresh fold's), so a seam that fails, rebuilds, or does nothing leaves none from an
+    /// earlier seam. A no-op without `runtime_perf_log.enabled`, which keeps no records.
     pub fn resetSeamBatches(self: *CollisionSystem) void {
         if (comptime !runtime_perf_log.enabled) return;
         self.perf.trigger_query_batch = .{};
         self.trigger_store.perf.last_batches = .initFill(.{});
+        self.trigger_store.perf.last_node_merge = .{};
+        self.trigger_store.perf.last_refresh_fold = .{};
     }
 
     /// Brings the trigger store up to `view` after a collider sync; a view with no geometry
@@ -1118,9 +1102,8 @@ pub const CollisionSystem = struct {
         const moved = try self.gatherStaticPairs(data, view, threads, exclude, &stats);
         if (moved) return error.StaticMovedOutsideCommit;
         const store = &self.trigger_store;
-        const stored_emitted: u32 = if (view.geometry == null or store.pair_count == 0) 0 else if (exclude) store.allowed_count else store.valid_count;
-        // A step that emits no stored pair merges none.
-        const stored: u32 = if (stored_emitted == 0) 0 else store.pair_count;
+        const emitted = PairCount.emitted(exclude);
+        const stored_emitted: u32 = if (view.geometry == null) 0 else store.countOf(emitted);
         const write_keys = self.static_pairs.items.len != 0 or stored_emitted != 0;
         var narrow_items: usize = 0;
         var narrow_ran = false;
@@ -1165,7 +1148,7 @@ pub const CollisionSystem = struct {
         }
         try self.sortStaticPairs(threads, &stats);
         const dynamic = try self.mergeOrdered(narrow_ran, narrow_items);
-        stats.contact_count = try self.emitContacts(contacts, dynamic, stored, stored_emitted, exclude, threads, &stats);
+        stats.contact_count = try self.emitContacts(contacts, dynamic, stored_emitted, emitted, threads, &stats);
         return stats;
     }
 
@@ -1788,17 +1771,16 @@ pub const CollisionSystem = struct {
         return count;
     }
 
-    // Merges the first `stored` stored pairs with `dynamic` by key straight into the contact
-    // stream's range windows, on workers. Each range finds its split by merge path; a count
-    // pass at the write's selection sizes the windows when some stored pair is filtered.
-    // Main work is O(ranges). Returns the contacts written.
+    // Merges the `stored` stored pairs of `emitted` with `dynamic` by key straight into the
+    // contact stream's range windows, on workers. The items are the emitted contacts, so each
+    // range's window is its own item count, and each range finds its split by merge path over
+    // the emitted ordinals. Main work is O(ranges). Returns the contacts written.
     fn emitContacts(
         self: *CollisionSystem,
         contacts: *RangeOutputStream(CollisionContact),
         dynamic: []const KeyedContact,
         stored: u32,
-        stored_emitted: u32,
-        exclude: bool,
+        emitted: PairCount,
         threads: Threads,
         stats: *CollisionStats,
     ) !usize {
@@ -1807,53 +1789,33 @@ pub const CollisionSystem = struct {
             contacts.clearRetainingCapacity();
             return 0;
         }
-        // Covers both grows below: the values are at most `items`, and the ranges at most
-        // `maxRangeCount(items, collision_range_alignment_items)`.
+        // Covers the stream's grows below: the values are at most `items`, and the ranges at
+        // most `maxRangeCount(items, collision_range_alignment_items)`.
         if (self.reserved_pair_bound != 0 and items > self.reserved_pair_bound +| self.reserved_trigger_bound) self.noteContactBoundOverflow(stats, items);
         const dispatch = threads.stage(&self.emit_tuner);
         const selection = dispatch.select(items, collision_range_alignment_items);
         const range_count = selection.range_count;
-        try self.emit_ranges.ensureTotalCapacity(self.allocator, range_count);
-        setSlotCount(EmitRange, &self.emit_ranges, range_count);
-        const counted = stored_emitted < stored;
         var job = EmitJob{
             .store = &self.trigger_store,
+            .emitted = emitted,
             .dynamic = dynamic,
             .stored = stored,
-            .exclude = exclude,
-            .counted = counted,
-            .ranges = self.emit_ranges.items,
             .contacts = contacts,
             .items_per_range = selection.items_per_range,
             .range_count = range_count,
             .item_count = items,
         };
-        if (counted) {
-            // Rides the write's selection unrecorded: its O(pages + ranges x page) is small
-            // next to the write it sizes.
-            const count_batch = threads.thread_system.parallelForWithOptions(items, &job, emitCountJob, .{
-                .items_per_range = threads.config.items_per_range,
-                .max_worker_threads = threads.config.max_worker_threads,
-                .range_alignment_items = collision_range_alignment_items,
-                .adaptive = threads.config.adaptive,
-                .adaptive_tuner = null,
-                .selected_profile = selection.profile,
-            });
-            if (comptime runtime_perf_log.enabled) stats.perf.trigger_emit_count_batch = count_batch;
-        }
         try contacts.prepareRangeCounts(range_count);
-        for (self.emit_ranges.items, 0..) |slot, range_index| {
-            contacts.addCount(range_index, if (counted) slot.value.out else rangeForIndex(items, selection.items_per_range, range_index).len());
-        }
+        for (0..range_count) |range_index| contacts.addCount(range_index, rangeForIndex(items, selection.items_per_range, range_index).len());
         try contacts.prefix();
-        const batch = dispatch.run(selection, items, collision_range_alignment_items, &job, emitWriteJob);
+        const batch = dispatch.run(selection, items, collision_range_alignment_items, &job, emitJob);
         if (comptime runtime_perf_log.enabled) stats.perf.trigger_emit_batch = batch;
         contacts.finishWrite();
-        return stored_emitted + dynamic.len;
+        return items;
     }
 
     // A step whose stored and dynamic contacts outgrew the reserved contact bound: the
-    // contact stream and the emission ranges grow on main.
+    // contact stream's values and range counts grow on main.
     fn noteContactBoundOverflow(self: *CollisionSystem, stats: *CollisionStats, items: usize) void {
         @branchHint(.cold);
         self.markPairBoundExceeded(stats);
@@ -2072,108 +2034,68 @@ fn stripOf(strips: CollisionStrips, y: f32) u32 {
 const EmitJob = struct {
     // Read only: the emission runs after every refresh and patch.
     store: *const TriggerStore,
+    emitted: PairCount,
     dynamic: []const KeyedContact,
+    // The stored pairs of `emitted`.
     stored: u32,
-    exclude: bool,
-    counted: bool,
-    ranges: []PaddedSlot(EmitRange),
     contacts: *RangeOutputStream(CollisionContact),
     items_per_range: usize,
     range_count: usize,
     item_count: usize,
 
     fn assertRange(self: *const EmitJob, range: ParallelRange) void {
-        std.debug.assert(range.index < self.range_count and range.index < self.ranges.len);
+        std.debug.assert(range.index < self.range_count);
         std.debug.assert(range.start == range.index * self.items_per_range);
         std.debug.assert(range.start <= range.end and range.end <= self.item_count);
     }
 
-    // The stored pairs among the first `position` merged positions: a binary search on the
-    // merge path, comparing stored pair i with dynamic contact `position - i - 1`. Keys are
-    // distinct across the streams (static-static against dynamic-involving pairs).
+    // The emitted stored pairs among the first `position` merged contacts: a binary search on
+    // the merge path, comparing emitted stored pair i with dynamic contact `position - i - 1`.
+    // Keys are distinct across the streams (static-static against dynamic-involving pairs).
     // Hand-rolled: `std.sort.partitionPoint` needs a slice, and one side is a tree select.
     fn split(self: *const EmitJob, position: usize) u32 {
         var lo: usize = position -| self.dynamic.len;
         var hi: usize = @min(position, self.stored);
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            const cursor = self.store.cursorAt(@intCast(mid));
-            if (cursor.page().keys[cursor.offset] < self.dynamic[position - mid - 1].key) lo = mid + 1 else hi = mid;
+            if (self.store.emittedCursorAt(self.emitted, @intCast(mid)).key() < self.dynamic[position - mid - 1].key) lo = mid + 1 else hi = mid;
         }
         return @intCast(lo);
     }
-
-    fn rangeSplit(self: *const EmitJob, range: ParallelRange) EmitRange {
-        const stored_start = self.split(range.start);
-        const stored_end = self.split(range.end);
-        return .{ .stored_start = stored_start, .stored_end = stored_end, .dynamic_start = range.start - stored_start, .dynamic_end = range.end - stored_end };
-    }
 };
 
-// Sizes each range's window: its dynamic contacts plus its stored pairs that pass the
-// filter, whole pages from their header sums.
-// SIMD verdict: scalar. One header load per whole page and at most two partial pages of u8
-// emit bytes; `simd.zig` has no u8 lanes.
-fn emitCountJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+// Merges the range's emitted stored pairs and dynamic contacts by key into its window, the
+// stored ones transposed from the page columns. Filtered stored pairs are never read: the
+// cursor steps the pages' masks.
+// SIMD verdict: scalar. A compare-driven merge, and a SoA-to-AoS transpose with usize
+// widening.
+fn emitJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *EmitJob = @ptrCast(@alignCast(context));
     job.assertRange(range);
-    var bounds = job.rangeSplit(range);
-    var stored: usize = 0;
-    var at = bounds.stored_start;
-    if (at < bounds.stored_end) {
-        var cursor = job.store.cursorAt(at);
-        while (true) {
-            const page = cursor.page();
-            const take: u32 = @min(cursor.page_len - cursor.offset, bounds.stored_end - at);
-            if (cursor.offset == 0 and take == cursor.page_len) {
-                stored += if (job.exclude) page.header.allowed else page.header.valid;
-            } else {
-                for (page.emit[cursor.offset..][0..take]) |emit| stored += @intFromBool(collision_triggers.emits(emit, job.exclude));
-            }
-            at += take;
-            if (at == bounds.stored_end) break;
-            cursor.nextPage();
-        }
-    }
-    bounds.out = stored + (bounds.dynamic_end - bounds.dynamic_start);
-    job.ranges[range.index].value = bounds;
-}
-
-// Merges the range's stored pairs and dynamic contacts by key into its window, the stored
-// ones that pass the filter transposed from the page columns.
-// SIMD verdict: scalar. A compare-driven merge with a byte filter, and a SoA-to-AoS
-// transpose with usize widening.
-fn emitWriteJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *EmitJob = @ptrCast(@alignCast(context));
-    job.assertRange(range);
-    const bounds = if (job.counted) job.ranges[range.index].value else job.rangeSplit(range);
+    const stored_end = job.split(range.end);
+    var stored = job.split(range.start);
+    var dynamic = range.start - stored;
+    const dynamic_end = range.end - stored_end;
     var writer = job.contacts.rangeWriter(range.index);
-    var stored = bounds.stored_start;
-    var dynamic = bounds.dynamic_start;
-    var cursor: collision_triggers.Cursor = undefined;
+    var cursor: EmittedCursor = undefined;
     // The cursor's page view, built once per page: building it per pair is two pool slot
     // resolves and a column-pointer set per merged item.
     var page: collision_triggers.Page = undefined;
-    if (stored < bounds.stored_end) {
-        cursor = job.store.cursorAt(stored);
+    if (stored < stored_end) {
+        cursor = job.store.emittedCursorAt(job.emitted, stored);
         page = cursor.page();
     }
-    while (stored < bounds.stored_end or dynamic < bounds.dynamic_end) {
-        const take_stored = stored < bounds.stored_end and
-            (dynamic == bounds.dynamic_end or page.keys[cursor.offset] < job.dynamic[dynamic].key);
+    while (stored < stored_end or dynamic < dynamic_end) {
+        const take_stored = stored < stored_end and
+            (dynamic == dynamic_end or page.keys[cursor.slot] < job.dynamic[dynamic].key);
         if (!take_stored) {
             writer.write(job.dynamic[dynamic].contact);
             dynamic += 1;
             continue;
         }
-        const slot = cursor.offset;
-        if (collision_triggers.emits(page.emit[slot], job.exclude)) writer.write(page.contactAt(slot));
+        writer.write(page.contactAt(cursor.slot));
         stored += 1;
-        if (stored < bounds.stored_end) {
-            cursor.next();
-            // `next` leaves offset 0 only when it stepped onto a new page.
-            if (cursor.offset == 0) page = cursor.page();
-        }
+        if (stored < stored_end and cursor.next()) page = cursor.page();
     }
     writer.finish();
 }
@@ -5532,7 +5454,7 @@ test "collision stored trigger refresh and emission over several ranges match se
     try expectSameContacts(kept, contacts.mergedItems());
 
     // The first allow cross after the cold rebuild moves the epoch and keeps exclusion on:
-    // the rebuild reserved the refresh's range slots, so this step allocates nothing.
+    // the refresh and the emission keep no range slots, so this step allocates nothing.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     setTestAllocator(&system, failing.allocator());
     defer setTestAllocator(&system, std.testing.allocator);
@@ -6516,9 +6438,10 @@ test "collision trigger patch of a mode-only change over more partners than a qu
 }
 
 // A chain of 81 overlapping triggers (80 stored pairs) and 24 dynamics on every third one:
-// 104 merged positions in one strip, so 112-, 64- and 16-item ranges give one, two and
+// 104 emitted contacts in one strip, so 112-, 64- and 16-item ranges give one, two and
 // seven ranges. With `dormant`, every third trigger from the second is dormant, so two in
-// three stored pairs are filtered, some at range edges.
+// three stored pairs are filtered and 50 contacts emit: 64-, 32- and 16-item ranges give
+// one, two and four ranges, with filtered pairs between their edges.
 fn expectEmissionAcrossRanges(dormant: bool) !void {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -6546,7 +6469,9 @@ fn expectEmissionAcrossRanges(dormant: bool) !void {
     try std.testing.expectEqual(@as(usize, 104), all.len);
     const expected = try contactsNotNamingAny(all, excluded.items);
     defer std.testing.allocator.free(expected);
-    for ([_]usize{ 112, 64, 16 }) |items_per_range| {
+    try std.testing.expectEqual(@as(usize, if (dormant) 50 else 104), expected.len);
+    const range_sizes: [3]usize = if (dormant) .{ 64, 32, 16 } else .{ 112, 64, 16 };
+    for (range_sizes) |items_per_range| {
         for ([_]usize{ 0, 2 }) |workers| {
             var system = CollisionSystem.init(std.testing.allocator);
             defer system.deinit();
@@ -6559,15 +6484,15 @@ fn expectEmissionAcrossRanges(dormant: bool) !void {
     }
 }
 
-test "collision trigger emission matches the reference at one, two and seven ranges, with disallowed pairs at range edges" {
+test "collision trigger emission matches the reference at one, two and several ranges, with disallowed pairs between range edges" {
     try expectEmissionAcrossRanges(false);
     try expectEmissionAcrossRanges(true);
 }
 
 // Two levels, each a chain of 70 overlapping triggers (69 stored pairs: a full page and a
 // partial one) and 20 dynamics, every third trigger from the second dormant. Level 1's
-// stored pairs and dynamic contacts follow level 0's in key order, so 16-item ranges split,
-// count, and page across the level end.
+// stored pairs and dynamic contacts follow level 0's in key order, so 16-item ranges split
+// and step pages across the level end.
 fn expectEmissionAcrossLevels(workers: usize) !void {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

@@ -179,7 +179,7 @@ fn stageBatches(stage: Timing) StageBatches {
         .pipeline_movement => .{ .bench = &.{.movement} },
         .pipeline_collision => .{
             .logged = &.{.collision_trigger_refresh},
-            .bench = &.{ .collision_fill, .collision_sort, .collision_broadphase, .collision_narrowphase, .collision_static_pairs, .collision_static_rect, .collision_static_place, .collision_static_sort, .collision_trigger_emit_count, .collision_trigger_emit },
+            .bench = &.{ .collision_fill, .collision_sort, .collision_broadphase, .collision_narrowphase, .collision_static_pairs, .collision_static_rect, .collision_static_place, .collision_static_sort, .collision_trigger_emit },
         },
         .pipeline_collision_response => .{ .bench = &.{ .collision_response_gather, .collision_response_apply } },
         .pipeline_clamp_bounds => .{ .bench = &.{.world_gate} },
@@ -187,7 +187,7 @@ fn stageBatches(stage: Timing) StageBatches {
         .gameplay_particles => .{ .bench = &.{.particles} },
         .gameplay_structural => .{
             .logged = &.{ .static_collider_plan, .collision_trigger_rewrite, .nav_remask, .nav_connect, .nav_closure, .nav_evict },
-            .bench = &.{ .static_collider_touch, .static_collider_group, .static_collider_apply, .static_collider_rewrite, .static_collider_install, .collision_trigger_query, .collision_trigger_insert_place, .collision_trigger_insert_sort, .collision_trigger_node },
+            .bench = &.{ .static_collider_touch, .static_collider_group, .static_collider_apply, .static_collider_rewrite, .static_collider_install, .collision_trigger_query, .collision_trigger_insert_place, .collision_trigger_insert_sort },
         },
         else => .{},
     };
