@@ -61,9 +61,8 @@ multi-stage processors, isolate stage timing and tuner state first. For any
 learned or cached decision (a tuner's shape, a cache, a prediction), compare
 what it learned or predicted with the real measured cost; a decision trained
 on different work than it judges is a defect in the decider, not the stage. Check the
-MAL regression signatures (`memory-performance.md` § Dense SoA storage:
-`rows.items(.field)` in a loop, per-row `appendAssumeCapacity` in a hot
-gather) early. Measure with a targeted bench group. Attribute a Debug perf
+MAL regression signatures (`memory-performance.md` § Dense SoA storage)
+early. Measure with a targeted bench group. Attribute a Debug perf
 regression, as `tests-benchmarks.md` defines one, to functions with callgrind
 on a small serial case (`docs/development-workflow.md` § Profiling).
 
@@ -89,7 +88,6 @@ the stage's declared reads/writes or its `stage_order` position
 
 ## Report
 
-Concisely: layer, root cause, fix, validation run. Recommend
-**zig-review-specialist** when regression risk, ownership drift, lifetime, or
-performance impact warrants it, and **zig-design-specialist** when the fix is
-an open design choice.
+Concisely: layer, root cause, fix, validation run. A code fix is a landing:
+the main session reviews it before commit (`CLAUDE.md` § Agent Pipeline).
+Recommend **zig-design-specialist** when the fix is an open design choice.

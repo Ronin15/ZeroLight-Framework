@@ -7,10 +7,10 @@ paths:
 
 # Budgets, Capacities, And Thresholds
 
-- The unit of change owns its storage and work: for terrain and nav, the chunk.
-  A level or world holds only a directory of its units; nothing is sized to a
-  level's area or a world's extent. Everything lives per world instance
-  (`engine-design.md` § Target scale): no global or cross-world caps or tables.
+- The unit of change owns its storage and work (`engine-design.md` § Target
+  scale). A level or world holds only a directory of its units; nothing is
+  sized to a level's area or a world's extent, and there are no global or
+  cross-world caps or tables.
 - A local change (one dig, ramp, or chunk) costs work proportional to what it
   changed, never to level size, depth, or world count. The one exception is
   reachability maintenance: after a removed connection it costs the smaller
@@ -37,7 +37,8 @@ paths:
   proven unreachable for everything the world can grow to (growth paths
   included, not only initial sizes) and failing loudly when the world is
   created or loaded, and presentation-only pools no simulation reads
-  (particles, text labels) with deterministic overflow drop. A pool's row
+  (particles, text labels) and diagnostic streams (`simulation.md` § Events
+  and streams) with deterministic overflow drop and a count. A pool's row
   index may be `u32` when exhausting it requires 2^32 live rows of that pool;
   exhaustion fails at the growth seam as `OutOfMemory`, never as a refusal or
   a distinct error.
@@ -46,8 +47,8 @@ paths:
   per step.
 - Heuristic thresholds derive from the cost of the operation they gate, never
   world size.
-- Pick per structure as an engine programmer would: pools, free lists, and
-  generational handles for churn; SoA contiguity over footprint.
+- Churned populations use pools or free lists with generational handles;
+  dense data prefers SoA contiguity over a smaller footprint.
 - Changing a budget, capacity, or threshold, in either direction, states its
   benefit against hot-path cost, format churn, and determinism.
 - Process-global state only where the OS passes no context (signal handlers,

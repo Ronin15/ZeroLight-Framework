@@ -6,9 +6,13 @@ boundaries, contract types, tools, and stable APIs it guards; implementation
 detail (helper sets, fields, stages, benches, examples) lives in the doc it
 cites, which docs commits keep current. The rules and `docs/architecture.md`
 win over code: code that disagrees is wrong and is fixed, never a pattern to
-copy or extend or an excuse for a departure. A rule that blocks a sound design gets a
+copy or extend or an excuse for a departure. A call may depart from a rule's
+letter only where the letter would cost a decision criterion (`CLAUDE.md`),
+never to ease work; it is reported with its reasoning, and one that would
+recur becomes a proposed rule edit. A rule that blocks a sound design gets a
 proposed edit with its reason; once the owner approves it, it lands in its
-rule file in the same change. Never loosen a rule to ease work. Owner decisions are not reopened.
+rule file in the same change. Never loosen a rule to ease work. Owner
+decisions are not reopened.
 
 ## Target scale
 
@@ -122,8 +126,9 @@ Every design, and every fix touching storage or per-change work, states:
   mechanism with the rest offered later.
 - A small local defect found in passing (a stale comment, a noisy test, dead
   code, a callerless `pub`) is fixed on the branch, in the landing that
-  touches its file or its own commit, never only mentioned. This covers
-  defects, not refactors.
+  touches its file or its own commit, never only mentioned; an agent whose
+  role cannot fix it reports it and the main session routes the fix. This
+  covers defects, not refactors.
 - `README.md` is an overview (what it is, one-line feature bullets,
   requirements, quick start, commands, layout, doc links); how things work
   belongs in `docs/`.

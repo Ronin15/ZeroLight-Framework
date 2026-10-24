@@ -63,8 +63,7 @@ citing where it is settled, and a step with nothing new is omitted.
    reads and writes, its read order, its layout and grouping unit, lifetime,
    and release, designed to `memory-performance.md` § Data-oriented design
    before any kernel. A changed order or layout lists every consumer and how
-   it reads. A design that relies on a bench-gated allowance (`threading.md`)
-   names its fallback layout.
+   it reads.
 4. **The loops.** From that layout, a hot-loop table: one row per per-step,
    per-frame, per-request, and per-change loop the change adds or changes,
    plus inherited loops whose cost, placement, or access order it changes
@@ -75,7 +74,7 @@ citing where it is settled, and a step with nothing new is omitted.
    scalar with the reason, `memory-performance.md` § SIMD and core math);
    parity tests; the serial/inline path's cost against today's code; the old
    loop it replaces and the counter that would show a new scan; the bench
-   group (`--grid`, `--case thread-adaptive-tuned-range`). The SIMD shape
+   group and sizes (`--grid` for a scaling group). The SIMD shape
    follows from step 3's layout; name the common call's length.
 5. **The passes.** The ordered processor list (reads, writes, output buffers,
    `PipelineResource` tags, `stage_order` position; `simulation.md`). Per
@@ -104,15 +103,15 @@ citing where it is settled, and a step with nothing new is omitted.
 Check the finished plan against the rules each step cites
 (`engine-design.md` § Cost model, `memory-performance.md`, `threading.md`,
 `tests-benchmarks.md`); a failure goes back to the step it came from and is
-fixed there. A change to `ThreadSystem` or the tuner is an owner question. A
+fixed there. A `ThreadSystem` or tuner redesign is an owner question. A
 rule that blocks the design the cost model says is right gets a proposed
 edit (`engine-design.md`); never bend the design or the rule silently.
 
 Every invariant stated, no restated code, no essays; the design and its steps
-never go into the slice file. Follow-ups are checklist items in this slice or
-an owning slice, or a new slice file stated as intent and constraints
-(roadmap index § Standard slice section shape; Status may be "gated on
-<trigger>"); an item you cannot plan fully is an open question. Cite an
+never go into the slice file. Follow-ups are listed in the plan as proposed
+checklist items for an owning slice, or a proposed new slice for the owner
+(roadmap index § Standard slice section shape); an item you cannot plan fully
+is an open question. Cite an
 existing **Deferred By Owner** entry, never add one.
 
 ## Output

@@ -3,6 +3,10 @@ paths:
   - "src/app/**"
   - "src/game/*_state.zig"
   - "src/game/menu_view.zig"
+  - "src/game/player.zig"
+  - "src/game/dig_controller.zig"
+  - "src/game/audio_controller.zig"
+  - "src/game/simulation_pipeline.zig"
   - "src/main.zig"
 ---
 

@@ -83,7 +83,8 @@ How the thread system works: `docs/architecture.md` § Thread System.
 - Results merge in range order and never depend on worker count, timing, IDs,
   or global atomics. A batched stream commits once per batch, never per record.
 - Events derived from worker-written state are emitted by the main thread
-  after the join, in row order. A capped stream emits in canonical order
+  after the join, in row order. A capped stream (diagnostic or presentation
+  only, `budgets-capacities.md`) emits in canonical order
   before the cap, with parity tests that cross ranges and hit the cap.
 - Hot loops iterate dense columns; membership masks never become dynamic
   joins.

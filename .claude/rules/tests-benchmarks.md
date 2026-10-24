@@ -12,16 +12,17 @@ The standard Zig layout; every change, plan, and review follows it.
 
 1. Production code holds only what production runs: no entry point,
    parameter, branch, field, stage, hook, path, or work that only tests or
-   benches use, and no separate serial entry.
+   benches use, and no separate serial entry (the serial path:
+   `threading.md` § What runs where).
 2. Tests are `test` blocks in the owning file, named by behavior. A helper
    only that file's tests use is a private file-scope function in that file.
 3. A module's `*test_support.zig` holds only what tests in other files or
    benches need (benches are a separate root and see nothing private),
    including byte bounds production does not use, built from `@sizeOf`.
-4. Diagnostic counters sit behind the comptime perf-log switch, which
-   removes their code and storage from shipping builds; the bench build
-   always enables it. Benches read counters; tests never do and never skip,
-   so every test is a logic test that runs in every build mode.
+4. Diagnostic counters sit behind the comptime perf-log switch
+   (`zig-style.md` § Logging); the bench build always enables it. Benches
+   read counters; tests never do and never skip, so every test is a logic
+   test that runs in every build mode.
 
 `tools/lint_idioms.py` enforces what it can; the rest is a review finding.
 
@@ -33,7 +34,8 @@ The standard Zig layout; every change, plan, and review follows it.
   every perf check are bench pass-shape asserts, never tests.
 - Prefer focused window-free contract tests; display/GPU checks belong in
   `gpu-smoke`.
-- A fix ships with a test that would fail without it, judged from the code,
+- A correctness fix ships with a test that would fail without it, and a perf
+  or work-bound fix with its bench pass-shape assert, judged from the code,
   never by revert-and-rerun runs. Never drop a proof test or
   `FailingAllocator` proof to save time; a work-bound proof moves to its
   bench group, never away.
@@ -51,7 +53,7 @@ The standard Zig layout; every change, plan, and review follows it.
 - Tests assert behavior through production's observable results, driving the
   production functions with private helpers, fixtures, mocks, or real
   payloads. A work bound is proven by a bench pass-shape assert that reads
-  the counters (`zig-style.md` § Logging).
+  the counters (§ Test and production code, 4).
 - Tests never time anything and never call `src/benchmarks/` (except the
   shared harness's tests of its own pure utilities); bench-fixture
   correctness relies on internal asserts firing during a real bench run.
@@ -71,8 +73,9 @@ The standard Zig layout; every change, plan, and review follows it.
   covering case gets a new case under `src/benchmarks/`.
 - Bench only changes that can move a hot path, targeted to the groups the
   change touches (`--group <name> --items N`): one right-sized config per
-  group plus each scaling bench's sizes, never the full suite (full sweeps
-  only when the owner or a slice asks).
+  group, plus `--grid` only for a scaling bench's sizes. Never the full suite
+  or a whole-suite smoke, except once for a change to the tuner or
+  `ThreadSystem`, or when the owner or a slice asks.
 - A landing's before/after runs once, after its code is done: the base
   commit against the tree in Debug (ReleaseFast only per `build-validation.md`), one run per
   side (`tools/bench_ab.py`). A case more than 10% slower is rerun alone with
@@ -83,16 +86,21 @@ The standard Zig layout; every change, plan, and review follows it.
   item stays flat across sizes; its serial case is the production function
   run inline (`threading.md`). The stage is judged on its
   `thread-adaptive-tuned-range` case (the production tuner) against its base;
-  the other cases are controls, and the tuned case matches or beats the best
-  of them within spread. The tuned case's report says which path is
+  the other cases are controls (run with `--all-cases` when the verdict needs
+  them), and the tuned case matches or beats the best of them within spread. The tuned case's report says which path is
   production at a size: where it runs inline, the serial path is production
   and is judged like the tuned case; where it threads, `serial-direct` is a
   control, judged only for a worse growth order or added per-item work (a new
   scan or indirection), never for a constant gap. A tuned case whose tuners
   did not settle before measurement (`settled=no`) is rerun with more warmup,
-  never judged. Exception: a one-off stage whose production tuner starts
+  never judged; one still unsettled at four times the default warmup is a
+  tuner that never settles (`threading.md` § Building a stage). Exception: a one-off stage whose production tuner starts
   fresh each run (a world, level, or store rebuild) is measured fresh, prints
   `fresh`, and is judged.
+- A perf report gives both sides' times per case, each with its entity count,
+  both sides built at the same CPU. An explanation of a bench result or
+  failure is a hypothesis until a measurement tests it; say which, and never
+  write an untested one into a pass condition or a comment.
 - Each slower case gets one verdict: noise (within spread after 3 reps),
   planned cost (work the design or a SIMD shape adds, named and reported), a
   control's gap (a path that is not production at that size; reported), or a
@@ -131,6 +139,4 @@ The standard Zig layout; every change, plan, and review follows it.
   A cost that grows with world size on a local change is a design defect
   regardless of the absolute number, except reachability maintenance, whose
   benches pass when each change's cost follows its own bound in
-  `budgets-capacities.md` (a removal's own smaller side or detour reach; a
-  one-way change's own system and affected rows), never another change, the
-  level around it, or another one-way system.
+  `budgets-capacities.md`.

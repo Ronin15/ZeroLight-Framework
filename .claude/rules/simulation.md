@@ -71,8 +71,6 @@ How the pipeline works: `docs/simulation-tiers-and-pipeline.md`,
   state for any worker count, range size, tuner decision, render cadence, or
   wall-clock timing. No wall-clock value, worker ID, batch or tuner state, or
   render state feeds simulation state.
-- No relaxed float modes (`@setFloatMode(.optimized)`) or fused multiply-add
-  (`@mulAdd`) in `src/`; both change results across targets.
 - A partition-dependent result is fixed in its owning module, with a
   serial-vs-threaded parity test there.
 

@@ -46,8 +46,7 @@ than working from a compaction summary.
 5. Validate per `build-validation.md`. While iterating, run `zig build check`
    and, when test bodies changed, `zig build test-compile` with no
    `-Dtest-filter`. A filter compiles only the tests it matches, and a filter
-   that matches nothing does not type-check the rest. Those commands
-   type-check. They are not a pass. Run the brief's module filter, and run
+   that matches nothing does not type-check the rest. Run the brief's module filter, and run
    each new test under its own `-Dtest-filter` when the test name does not
    contain that module text. A name like `statics committed at the seam` is
    missed by `-Dtest-filter=collision`. Write that output to a file and
@@ -57,12 +56,12 @@ than working from a compaction summary.
 6. Benchmark per `tests-benchmarks.md` § Benchmarks: when the brief says the
    change cannot move a hot path, skip `bench_ab` and record the skip;
    otherwise run the landing's one before/after with `tools/bench_ab.py` on
-   the groups the brief names (sizes as `--grid`), read only the summary
-   lines, and give each slower case its verdict. A new scaling bench or a
-   bench-gated allowance also runs tree-only (`--base none --grid
+   the groups the brief names (`--items N`; `--grid` only for a scaling
+   group), read only the summary lines, and give each slower case its
+   verdict. A new scaling bench also runs tree-only (`--base none --grid
    --all-cases`) for its pass shape.
-   Do not profile. A timing dispute is settled by the main session with
-   callgrind on a ReleaseSafe bench, not by this agent. A crash, hang, or
+   Do not profile: a timing dispute goes to the main session, which settles
+   it per DW § Profiling. A crash, hang, or
    leak goes to zig-debug-specialist through the main session. Never tune
    for a bench number unless the brief names that case.
 
@@ -89,5 +88,5 @@ that could not run. The chat return is that path plus those verdicts,
 decisions, and gaps. Name **zig-design-specialist** when a design is open or
 the structure fails the cost model, and **zig-debug-specialist** when a
 failure needs diagnosis. The main session starts **zig-review-specialist**
-from this report before the unit is done. That review is not optional and
+on this landing's diff before the unit is done. That review is not optional and
 not a second round after fixes; fixes fold into the landing's commit.

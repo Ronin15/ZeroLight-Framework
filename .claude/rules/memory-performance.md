@@ -139,8 +139,9 @@ paths:
   SIMD onto a loop whose shape cannot use it.
 - SIMD or scalar is decided by the loop's shape, never by Debug timings (SIMD
   gains come with scale and release builds; benches run in Debug), so a Debug
-  slowdown never reverts a SIMD-shaped loop. A SIMD-shaped loop that is only
-  a little slower stays. A choice that needs a number gets the targeted
-  ReleaseFast run (`build-validation.md`), with the reason at the site.
+  slowdown never reverts a SIMD-shaped loop; its Debug gap gets a verdict per
+  `tests-benchmarks.md` (planned cost). A choice that needs a number gets the
+  targeted ReleaseFast run (`build-validation.md`), with the reason at the
+  site.
 - A new or restructured hot float loop ships scalar/SIMD and serial/threaded
   parity tests.

@@ -69,9 +69,8 @@ decision criteria, and reports.
   Explore/Plan) for Zig work here.
 - **Decision criteria**: uniformity, scalability, best practice, efficiency,
   speed; never what today's code happens to produce or less work. Make calls
-  without asking and report them. A departure from a rule's letter is allowed
-  only where the letter costs a criterion, never to ease work; it is reported,
-  and one that would recur becomes a proposed rule edit. The owner decides
+  without asking and report them; a departure from a rule's letter follows
+  `engine-design.md`'s first paragraph. The owner decides
   scope added or dropped, product/gameplay behavior, rule edits, a major or
   `ThreadSystem`/tuner redesign, and anything that doesn't make sense. No
   model/effort overrides unless the owner asks.
@@ -83,11 +82,8 @@ decision criteria, and reports.
 - Agents work from live code and the sources the brief names, never memory or
   chat summaries; they report what is outside their role and the main session
   routes it.
-- Reports are terse and drop no findings; a perf report gives both sides'
-  times per case with entity counts, both sides built at the same CPU. An
-  explanation of a failure or bench result is a hypothesis until a
-  measurement tests it; say which, and never write an untested one into a
-  pass condition or a comment.
+- Reports are terse and drop no findings; perf reports and explanations of
+  results follow `tests-benchmarks.md` § Benchmarks.
 - Long jobs run in the foreground (in chunks under the tool's 10-minute
   limit) or as a background command awaiting its notification; never a shell
   wait or poll loop.

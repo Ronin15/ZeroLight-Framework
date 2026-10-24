@@ -32,7 +32,8 @@ paths:
   bitsets (`std.bit_set`), sorts, searches, hashing, and parsing. Write your
   own only when std has no API for the job or a bench shows it beats std on a
   hot path, stating that reason at the site; code duplicating std without it
-  is replaced with the std version as soon as it is found.
+  is replaced with the std version in a change that touches its file, and
+  found elsewhere becomes a slice item.
 - Sorts on a production path use `src/core/sort.zig` (`pdq`, `insertion`):
   std's sorts swap through `std.mem.swap`, a per-byte loop (measured). A stable
   `std.mem.sort` whose comparator is a total order moves to `pdq`; where ties
@@ -74,6 +75,9 @@ paths:
   assert-resolved at the use boundary.
 - A validator bounds each scalar on both ends where its siblings do; a
   present-but-wrong-typed optional field is an error, not absent.
+- No relaxed float modes (`@setFloatMode(.optimized)`) or fused multiply-add
+  (`@mulAdd`) anywhere in `src/`; both change results across targets
+  (`simulation.md` § Determinism).
 
 ## Comments
 
@@ -88,8 +92,9 @@ paths:
   and history go in the commit message.
 - Comments describe the code they sit on and nothing else: no roadmap or slice
   references, review tags, history, process notes, or pointers to docs and rule
-  files; no broad claims not enforced by code or tests; describe content by its
-  role (walkable, blocking), never by a specific art asset.
+  files; no broad claims not enforced by code or tests (except a bench
+  group's pass shape, `tests-benchmarks.md` § Benchmarks); describe content
+  by its role (walkable, blocking), never by a specific art asset.
 
 ## Logging
 

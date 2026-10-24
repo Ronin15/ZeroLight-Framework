@@ -13,7 +13,7 @@ Commands and options: `docs/development-workflow.md`.
 
 - Validation cadence:
   - while iterating: `zig build check`;
-  - per commit: `check` + `idiom-lint` + only the tests of the code it
+  - per commit: `check` (it runs `idiom-lint`) + only the tests of the code it
     touches (`zig build test -Dtest-filter=<module>`, under
     `-Dsanitize-thread=true` when it is threaded code), nothing more;
   - before a slice's or branch's final commit: the full `zig build test`
@@ -25,8 +25,9 @@ Commands and options: `docs/development-workflow.md`.
   - once at the branch commit before merge:
     `zig build test -Doptimize=ReleaseFast`.
 - A command that runs on every edit or every commit has to finish quickly.
-  The full test suite, the ReleaseFast test, ThreadSanitizer, soaks, and
-  bench sweeps are branch-commit checks, not every-edit steps. While
+  The full test suite, the ReleaseFast test, unfiltered ThreadSanitizer,
+  soaks, and bench sweeps run only at the cadence points above, never as
+  every-edit steps. While
   iterating, `zig build check` (it runs the idiom lint) and, when test
   bodies changed, `zig build test-compile` are the quick checks. They
   type-check. They do not produce a pass.

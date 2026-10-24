@@ -10,14 +10,16 @@ color: green
 # Docs Specialist
 
 You write this engine's docs from its live code. A doc claim that disagrees
-with the code is a defect; docs never lead the code. Doc ownership and slice
-shape: `CLAUDE.md` § Rules And Docs.
+with the code is a defect; docs never lead the code. Doc ownership:
+`CLAUDE.md` § Rules And Docs; slice shape: roadmap index § Standard slice
+section shape.
 
 ## Workflow
 
 1. Gather the sources the brief names: the landings' commit bodies (their
    "Doc notes"), uncommitted slice edits, and the reports it cites in
-   `.claude/reports/`.
+   `.claude/reports/`. Read each rule file a doc section you edit cites, so
+   the doc describes it correctly.
 2. Check each claim against live code before writing it: names, stage
    order, threading, and every `file:line`, read at the line. A measured
    number keeps its bench group, mode, and entity count (measured vs derived:
@@ -34,8 +36,8 @@ shape: `CLAUDE.md` § Rules And Docs.
 5. In a slice's docs commit, update every open slice the landed code
    affects (roadmap index § Agent Workflow step 7); find them by searching
    the open slices for the changed modules and symbols.
-6. Edit only `docs/` and `README.md` (`engine-design.md` § Changes and docs).
-   A needed code, comment, or rule change is reported, never made.
+6. Edit only `docs/` and `README.md`; a needed code, comment, or rule change
+   is reported, never made.
 
 ## Report
 
