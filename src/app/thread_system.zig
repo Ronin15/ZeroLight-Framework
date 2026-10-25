@@ -155,12 +155,19 @@ const nudge_band: f64 = 0.05;
 const nudge_stepped_band: f64 = nudge_band * (1 - std.math.pow(f64, 1 - nudge_ema_alpha, @floatFromInt(default_nudge_samples)));
 const nudge_step: f64 = 1.1;
 const min_batch_multiplier: f64 = 0.25;
-// The first step goes to fewer batches. Up from the whole pool, workers stay capped and
-// only the batch size shrinks, which rarely moves throughput past the band, so a stage
+// The first local step goes to fewer batches. Up from the whole pool, workers stay capped
+// and only the batch size shrinks, which rarely moves throughput past the band, so a stage
 // that wants fewer workers would hold at the pool; down, workers drop with the batches,
 // and a loss flips the nudge up past the start (measured: light stages ran 9-16 workers
 // on the old climb and held at the full pool when the nudge stepped up first).
 const initial_nudge_direction: i8 = -1;
+// After each (re)start the EMA seeds from the median of the first threaded batches, so
+// one cold or fast batch never sets the level later comparisons judge against; the
+// first comparison then trials the clamp top in one jump, a gain no local step can see,
+// with the EMA restarted at the median of the last threaded batches at the measured shape
+// (the settled EMA still carries the warm-up the seed saw), and a win steps from the
+// median of the trial's last batches.
+const nudge_seed_samples: usize = 3;
 /// The batch-count clamp's top: the most batches per participant a tuner selects.
 pub const max_batch_multiplier: f64 = 4.0;
 
@@ -169,6 +176,9 @@ const NudgeState = enum {
     measuring,
     stepped,
     holding,
+    // The first comparison: the clamp top's shape against the measured one, whose median
+    // level and restated multiplier the reference holds.
+    clamp_trial,
 };
 
 // Batches per participant of a fresh `full_pool` tuner's first selection, a one-off no
@@ -266,6 +276,11 @@ pub const AdaptiveWorkTuner = struct {
     throughput_ema: f64 = 0,
     reference_ema: f64 = 0,
     reference_multiplier: f64 = 1,
+    // The last threaded throughputs while measuring or trialing, a ring indexed by
+    // `nudge_samples`: the first ones after a (re)start, whose median seeds the EMA, then
+    // the latest ones, whose median is the clamp trial's reference and, on a win, the top's
+    // level.
+    seed_throughputs: [nudge_seed_samples]f64 = @splat(0),
     nudge_direction: i8 = initial_nudge_direction,
     nudge_state: NudgeState = .measuring,
     // Threaded samples since the last step (or, holding, in a row beyond the band).
@@ -485,6 +500,7 @@ pub const AdaptiveWorkTuner = struct {
             self.inline_probe_cooldown_windows = 0;
         } else {
             self.inline_probe_cooldown_windows = self.config.inline_probe_cooldown_windows;
+            self.abandonClampTrial();
             // A threaded probe that lost to inline: the next probe tries half the batches.
             if (sampled_threaded) self.batch_multiplier = @max(self.batch_multiplier / 2, min_batch_multiplier);
             self.restartNudge();
@@ -602,22 +618,48 @@ pub const AdaptiveWorkTuner = struct {
         return self.sampleBoundNs(left) < self.sampleBoundNs(right);
     }
 
-    // One threaded batch: its throughput (items per ns), clipped to within twice the band
-    // of the EMA so one outlier batch never decides a comparison, feeds the EMA.
-    // `nudge_samples` threaded samples after each step, the EMA is compared with the
-    // reference taken just before it: better by more than the band keeps the direction and
-    // steps again, worse flips it and steps from the reference past it, inside the band
-    // holds. A held tuner resumes stepping after `nudge_samples` samples in a row beyond the
-    // band.
+    // One threaded batch: its throughput (items per ns) feeds the EMA, which the median of
+    // the first `nudge_seed_samples` after a (re)start seeds; later ones are clipped to
+    // within twice the band of the EMA so one outlier batch never decides a comparison.
+    // Once measured, the first comparison trials the clamp top's shape (`startClampTrial`)
+    // with the EMA and reference at the median of the last `nudge_seed_samples` measured
+    // throughputs: a win beyond the stepped band steps down from the top's median level,
+    // otherwise the measured shape and its median level come back and take the first local
+    // step. `nudge_samples` threaded samples
+    // after each step, the EMA is compared with the reference taken just before it: better
+    // by more than the band keeps the direction and steps again, worse flips it and steps
+    // from the reference past it, inside the band holds. A held tuner resumes stepping
+    // after `nudge_samples` samples in a row beyond the band.
     fn nudge(self: *AdaptiveWorkTuner, stats: BatchStats) void {
         const throughput = @as(f64, @floatFromInt(stats.item_count)) / @as(f64, @floatFromInt(stats.batch_duration_ns));
-        self.throughput_ema = if (self.throughput_ema <= 0)
-            throughput
-        else
-            ewma(self.throughput_ema, std.math.clamp(throughput, self.throughput_ema * (1 - 2 * nudge_band), self.throughput_ema * (1 + 2 * nudge_band)), nudge_ema_alpha);
+        if (self.nudge_state == .measuring or self.nudge_state == .clamp_trial) {
+            self.seed_throughputs[self.nudge_samples % nudge_seed_samples] = throughput;
+        }
+        if (self.throughput_ema <= 0) {
+            // Unseeded only while measuring after a (re)start, before the seed completes.
+            std.debug.assert(self.nudge_state == .measuring and self.nudge_samples < nudge_seed_samples);
+            if (self.nudge_samples + 1 == nudge_seed_samples) {
+                self.throughput_ema = self.seed_throughputs[medianIndexOfThree(f64, self.seed_throughputs)];
+            }
+        } else {
+            self.throughput_ema = ewma(self.throughput_ema, std.math.clamp(throughput, self.throughput_ema * (1 - 2 * nudge_band), self.throughput_ema * (1 + 2 * nudge_band)), nudge_ema_alpha);
+        }
         self.nudge_samples +|= 1;
         switch (self.nudge_state) {
-            .measuring => if (self.nudge_samples >= self.config.nudge_samples) self.stepMultiplier(self.batch_multiplier),
+            .measuring => if (self.nudge_samples >= self.config.nudge_samples) self.startClampTrial(),
+            .clamp_trial => if (self.nudge_samples >= self.config.nudge_samples) {
+                const change = (self.throughput_ema - self.reference_ema) / self.reference_ema;
+                if (change > nudge_stepped_band) {
+                    // Down is the only local direction from the top. The floor on
+                    // `nudge_samples` filled the ring at the top; its median is the level
+                    // the first local step judges against, which the clipped EMA trails.
+                    self.nudge_direction = -1;
+                    self.throughput_ema = self.seed_throughputs[medianIndexOfThree(f64, self.seed_throughputs)];
+                } else {
+                    self.returnFromClampTrial();
+                }
+                self.stepMultiplier(self.batch_multiplier);
+            },
             .stepped => if (self.nudge_samples >= self.config.nudge_samples) {
                 const change = (self.throughput_ema - self.reference_ema) / self.reference_ema;
                 if (change > nudge_stepped_band) {
@@ -678,16 +720,59 @@ pub const AdaptiveWorkTuner = struct {
         // alignment never leave it far from that shape for a later count shift.
         if (self.nudge_state == .stepped) {
             const shape = self.batchShape(shaped_request);
-            if (shape.worker_threads > 0) {
-                const ranges: f64 = @floatFromInt(rangeCount(shaped_request.item_count, shape.items_per_range));
-                const participants: f64 = @floatFromInt(shaped_request.max_worker_threads + 1);
-                self.batch_multiplier = std.math.clamp(ranges / participants, min_batch_multiplier, max_batch_multiplier);
-            }
+            if (shape.worker_threads > 0) self.batch_multiplier = restatedMultiplier(shaped_request, shape);
         }
     }
 
-    // Starts the nudge's measurement over: the next threaded batch reseeds the EMA, which
-    // settles before the first step. The multiplier and direction are kept.
+    // The first comparison after a (re)start: restates the multiplier to the dispatched
+    // shape, then jumps to the clamp top and holds the measured shape's level (the median
+    // of its last `nudge_seed_samples` raw throughputs, which the lagging EMA trails while
+    // a warm-up ramps) and multiplier as the reference, restarting the EMA at that level so
+    // the trial judges only the EMA's movement over its own samples. Takes the first local
+    // step instead when nothing is dispatched or the top's shape is the dispatched one.
+    fn startClampTrial(self: *AdaptiveWorkTuner) void {
+        // The floor on `nudge_samples` fills the ring at the measured shape first.
+        std.debug.assert(self.nudge_state == .measuring and self.nudge_samples >= nudge_seed_samples);
+        const request = self.last_request orelse return self.stepMultiplier(self.batch_multiplier);
+        const dispatched = (if (self.has_threaded_profile) self.current_profile else self.candidate_profile) orelse
+            return self.stepMultiplier(self.batch_multiplier);
+        const measured = self.normalizedProfile(dispatched, request);
+        if (measured.worker_threads == 0) return self.stepMultiplier(self.batch_multiplier);
+        // A fresh `full_pool` tuner dispatched more batches than its multiplier states.
+        self.batch_multiplier = restatedMultiplier(request, measured);
+        const top = self.poolProfile(request, max_batch_multiplier);
+        if (top.worker_threads == 0 or profilesEqual(top, measured)) return self.stepMultiplier(self.batch_multiplier);
+        self.reference_ema = self.seed_throughputs[medianIndexOfThree(f64, self.seed_throughputs)];
+        self.throughput_ema = self.reference_ema;
+        self.reference_multiplier = self.batch_multiplier;
+        self.nudge_samples = 0;
+        self.nudge_state = .clamp_trial;
+        self.batch_multiplier = max_batch_multiplier;
+        self.reshapeThreaded(request);
+        self.batch_multiplier = restatedMultiplier(request, self.batchShape(request));
+    }
+
+    // A trial that did not win: the measured shape comes back with its median level as the
+    // EMA. A restated multiplier reproduces its pool shape at the item count it was
+    // restated for, so at the measured request's count the shape is the one measured.
+    fn returnFromClampTrial(self: *AdaptiveWorkTuner) void {
+        std.debug.assert(self.nudge_state == .clamp_trial);
+        self.throughput_ema = self.reference_ema;
+        self.batch_multiplier = self.reference_multiplier;
+        if (self.last_request) |request| self.reshapeThreaded(request);
+    }
+
+    // A restart during a trial (demotion, count-shift retune, lost probe) starts from the
+    // measured shape's multiplier, never the top's.
+    fn abandonClampTrial(self: *AdaptiveWorkTuner) void {
+        if (self.nudge_state != .clamp_trial) return;
+        self.batch_multiplier = self.reference_multiplier;
+        if (self.last_request) |request| self.reshapeThreaded(request);
+    }
+
+    // Starts the nudge's measurement over: the next `nudge_seed_samples` threaded batches
+    // seed the EMA, which settles before the first comparison. The multiplier and direction
+    // are kept.
     fn restartNudge(self: *AdaptiveWorkTuner) void {
         self.throughput_ema = 0;
         self.reference_ema = 0;
@@ -809,6 +894,9 @@ pub const AdaptiveWorkTuner = struct {
     // off a stale slow sample. The multiplier is kept; its measurement restarts.
     fn demoteToInline(self: *AdaptiveWorkTuner) void {
         if (comptime diagnostics_enabled) self.demotion_count += 1;
+        // Before the restore captures the profile, so it holds the measured multiplier's
+        // shape at the last request.
+        self.abandonClampTrial();
         self.restore_threaded_profile = if (self.has_threaded_profile and self.current_profile.worker_threads > 0)
             self.current_profile
         else
@@ -838,6 +926,7 @@ pub const AdaptiveWorkTuner = struct {
     // A sustained item-count shift keeps a won threaded profile, reshapes it from the
     // multiplier at the new count, and re-decides inline or threaded on the next window.
     fn requestRetune(self: *AdaptiveWorkTuner, request: AdaptiveWorkRequest) void {
+        self.abandonClampTrial();
         if (self.phase != .settled) self.settle();
         self.reshapeThreaded(request);
         self.retune_pending = true;
@@ -2084,6 +2173,14 @@ fn roundedUsize(value: f64) usize {
     return @max(1, std.math.lossyCast(usize, @round(value)));
 }
 
+// The multiplier `shape` states at `request`: its batches per participant, clamped. A pool
+// shape at the restated multiplier and the same item count is `shape` again.
+fn restatedMultiplier(request: AdaptiveWorkRequest, shape: AdaptiveWorkProfile) f64 {
+    const ranges: f64 = @floatFromInt(rangeCount(request.item_count, shape.items_per_range));
+    const participants: f64 = @floatFromInt(request.max_worker_threads + 1);
+    return std.math.clamp(ranges / participants, min_batch_multiplier, max_batch_multiplier);
+}
+
 fn ewma(current: f64, observed: f64, alpha: f64) f64 {
     if (current <= 0) return observed;
     return current * (1.0 - alpha) + observed * alpha;
@@ -2095,7 +2192,7 @@ fn normalizeWorkTunerConfig(config: AdaptiveWorkTunerConfig) AdaptiveWorkTunerCo
     normalized.largest_range_items = @max(normalized.largest_range_items, normalized.smallest_range_items);
     normalized.initial_range_items = std.math.clamp(normalized.initial_range_items, normalized.smallest_range_items, normalized.largest_range_items);
     normalized.sample_window = std.math.clamp(normalized.sample_window, 1, max_sample_window);
-    normalized.nudge_samples = @max(normalized.nudge_samples, @as(usize, 1));
+    normalized.nudge_samples = @max(normalized.nudge_samples, nudge_seed_samples);
     normalized.threaded_commit_threshold_percent = @min(normalized.threaded_commit_threshold_percent, @as(u8, 100));
     normalized.item_count_reset_percent = @min(normalized.item_count_reset_percent, @as(u8, 100));
     return normalized;
@@ -3329,28 +3426,193 @@ test "median of three picks the middle key in every order, ties included" {
     };
 }
 
-test "adaptive work tuner seeds the throughput EMA on its first threaded batch and clips later ones to twice the band" {
+test "adaptive work tuner seeds the throughput EMA from the median of its first three threaded batches and clips later ones to twice the band" {
     var tuner = AdaptiveWorkTuner.init(.{ .sample_window = 1, .threaded_batch_ns = 1000 });
+    // Slow, fast, mid: neither outlier sets the level; the EMA stays unseeded until the third.
+    tuner.record(tunerTestBatchWithProfile(4096, pool_shape, 400_000));
     tuner.record(tunerTestBatchWithProfile(4096, pool_shape, 200_000));
-    const seeded: f64 = 4096.0 / 200_000.0;
+    try std.testing.expectEqual(@as(f64, 0), tuner.throughput_ema);
+    tuner.record(tunerTestBatchWithProfile(4096, pool_shape, 300_000));
+    const seeded: f64 = 4096.0 / 300_000.0;
     try std.testing.expectEqual(seeded, tuner.throughput_ema);
     // Inside the clip the sample blends as it is; twice as fast blends at 1.1 x the EMA.
-    tuner.record(tunerTestBatchWithProfile(4096, pool_shape, 190_000));
-    const blended = seeded * 0.85 + 4096.0 / 190_000.0 * 0.15;
+    tuner.record(tunerTestBatchWithProfile(4096, pool_shape, 290_000));
+    const blended = seeded * 0.85 + 4096.0 / 290_000.0 * 0.15;
     try std.testing.expectEqual(blended, tuner.throughput_ema);
-    tuner.record(tunerTestBatchWithProfile(4096, pool_shape, 95_000));
+    tuner.record(tunerTestBatchWithProfile(4096, pool_shape, 145_000));
     try std.testing.expectEqual(blended * 0.85 + blended * 1.1 * 0.15, tuner.throughput_ema);
 }
 
-test "adaptive work tuner nudges the multiplier down once the EMA settles, and the threaded shape follows" {
+test "adaptive work tuner floors nudge samples at the seed's three" {
+    try std.testing.expectEqual(nudge_seed_samples, AdaptiveWorkTuner.init(.{ .nudge_samples = 1 }).config.nudge_samples);
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), AdaptiveWorkTuner.init(.{ .nudge_samples = std.math.maxInt(usize) }).config.nudge_samples);
+}
+
+// The pool tuner at the start of its clamp trial: the probe batch and six more at 300 us
+// settled the EMA at the pool's 16 batches.
+fn clampTrialPoolTuner() !AdaptiveWorkTuner {
     var tuner = try threadedPoolTuner(1);
-    // The probe window was the EMA's first sample; six more settle it.
-    recordThreadedBatches(&tuner, tuner.config.nudge_samples - 2, 300_000);
+    recordThreadedBatches(&tuner, tuner.config.nudge_samples - 1, 300_000);
+    try std.testing.expectEqual(NudgeState.clamp_trial, tuner.nudge_state);
+    return tuner;
+}
+
+// The clamp top at the pool request: 4 x 16 = 64 batches of 64 on the whole pool.
+const pool_top_shape = AdaptiveWorkProfile{ .worker_threads = 15, .items_per_range = 64 };
+
+// Records a warm-up ramp at the pool tuner's measured shape, short of the 300 us batch that
+// ends its measuring: after the 300 us probe batch, three at 400 us seed the EMA low, then a
+// fast and a slow batch, so the median of the last three is that 300 us batch's level.
+fn recordMeasuringRamp(tuner: *AdaptiveWorkTuner) void {
+    recordThreadedBatches(tuner, tuner.config.nudge_samples - 4, 400_000);
+    recordThreadedBatches(tuner, 1, 250_000);
+    recordThreadedBatches(tuner, 1, 330_000);
+}
+
+const ramp_median_level = @as(f64, 4096) / @as(f64, 300_000);
+
+test "adaptive work tuner trials the clamp top's shape once the EMA settles, from the median of the last three measured batches" {
+    var tuner = try threadedPoolTuner(1);
+    recordMeasuringRamp(&tuner);
+    try std.testing.expectEqual(NudgeState.measuring, tuner.nudge_state);
     try std.testing.expectEqual(@as(f64, 1), tuner.batch_multiplier);
+    const lagging_ema = tuner.throughput_ema;
     recordThreadedBatches(&tuner, 1, 300_000);
-    try std.testing.expectApproxEqRel(pool_first_step, tuner.batch_multiplier, 1e-12);
-    // round(16 / 1.1) = 15 batches: workers follow, 14 of them.
-    try std.testing.expectEqual(AdaptiveWorkProfile{ .worker_threads = 14, .items_per_range = 288 }, tuner.selectProfile(pool_request));
+    try std.testing.expectEqual(NudgeState.clamp_trial, tuner.nudge_state);
+    try std.testing.expectEqual(max_batch_multiplier, tuner.batch_multiplier);
+    try std.testing.expectEqual(pool_top_shape, tuner.selectProfile(pool_request));
+    try std.testing.expectEqual(@as(f64, 1), tuner.reference_multiplier);
+    // Fast, slow, mid: the reference is the mid one, and the EMA restarts there.
+    try std.testing.expect(lagging_ema < ramp_median_level);
+    try std.testing.expectEqual(ramp_median_level, tuner.reference_ema);
+    try std.testing.expectEqual(tuner.reference_ema, tuner.throughput_ema);
+}
+
+test "adaptive work tuner a clamp trial that wins beyond the band steps down locally from the top's median level" {
+    // A tuner that flipped up before its restart trials at direction +1 and still steps down.
+    for ([_]i8{ -1, 1 }) |direction| {
+        var tuner = try clampTrialPoolTuner();
+        tuner.nudge_direction = direction;
+        // 25% more throughput at the top: the clipped EMA rises about 11% above the reference.
+        recordThreadedBatches(&tuner, tuner.config.nudge_samples, 240_000);
+        try std.testing.expectEqual(NudgeState.stepped, tuner.nudge_state);
+        try std.testing.expectEqual(@as(i8, -1), tuner.nudge_direction);
+        try std.testing.expectEqual(max_batch_multiplier, tuner.reference_multiplier);
+        // The first local step judges against the top's raw median, not the clipped EMA.
+        try std.testing.expectEqual(@as(f64, 4096) / @as(f64, 240_000), tuner.reference_ema);
+        try std.testing.expectEqual(tuner.throughput_ema, tuner.reference_ema);
+        // 4 / 1.1 x 16 rounds to 58 batches, aligned to 52 of 80: restated as 52 per 16.
+        try std.testing.expectApproxEqRel(@as(f64, 52.0 / 16.0), tuner.batch_multiplier, 1e-12);
+        try std.testing.expectEqual(AdaptiveWorkProfile{ .worker_threads = 15, .items_per_range = 80 }, tuner.selectProfile(pool_request));
+    }
+}
+
+test "adaptive work tuner a clamp trial that does not win returns to the measured shape and its median level, then steps in the kept direction" {
+    for ([_]struct { duration_ns: u64, direction: i8, multiplier: f64, shape: AdaptiveWorkProfile }{
+        // A tie and a loss step down from the pool; a kept up direction steps up.
+        .{ .duration_ns = 300_000, .direction = -1, .multiplier = pool_first_step, .shape = .{ .worker_threads = 14, .items_per_range = 288 } },
+        .{ .duration_ns = 375_000, .direction = -1, .multiplier = pool_first_step, .shape = .{ .worker_threads = 14, .items_per_range = 288 } },
+        .{ .duration_ns = 300_000, .direction = 1, .multiplier = pool_flip_step, .shape = .{ .worker_threads = 15, .items_per_range = 240 } },
+    }) |case| {
+        var tuner = try clampTrialPoolTuner();
+        const measured_ema = tuner.reference_ema;
+        tuner.nudge_direction = case.direction;
+        recordThreadedBatches(&tuner, tuner.config.nudge_samples, case.duration_ns);
+        try std.testing.expectEqual(NudgeState.stepped, tuner.nudge_state);
+        try std.testing.expectEqual(case.direction, tuner.nudge_direction);
+        try std.testing.expectEqual(measured_ema, tuner.reference_ema);
+        try std.testing.expectEqual(@as(f64, 1), tuner.reference_multiplier);
+        try std.testing.expectApproxEqRel(case.multiplier, tuner.batch_multiplier, 1e-12);
+        try std.testing.expectEqual(case.shape, tuner.selectProfile(pool_request));
+    }
+    // The return alone restores the measured shape, multiplier, and median level.
+    var tuner = try clampTrialPoolTuner();
+    const measured_ema = tuner.reference_ema;
+    recordThreadedBatches(&tuner, 2, 200_000);
+    tuner.returnFromClampTrial();
+    try std.testing.expectEqual(@as(f64, 1), tuner.batch_multiplier);
+    try std.testing.expectEqual(measured_ema, tuner.throughput_ema);
+    try std.testing.expectEqual(pool_shape, tuner.selectProfile(pool_request));
+
+    // After a warm-up ramp the median level comes back, not the lagging measuring EMA nor
+    // the trial's ring: a loss at the top steps down judged against it.
+    var ramped = try threadedPoolTuner(1);
+    recordMeasuringRamp(&ramped);
+    const lagging_ema = ramped.throughput_ema;
+    recordThreadedBatches(&ramped, 1, 300_000);
+    try std.testing.expect(lagging_ema < ramp_median_level);
+    recordThreadedBatches(&ramped, ramped.config.nudge_samples, 375_000);
+    try std.testing.expectEqual(NudgeState.stepped, ramped.nudge_state);
+    try std.testing.expectEqual(ramp_median_level, ramped.reference_ema);
+    try std.testing.expectEqual(ramped.reference_ema, ramped.throughput_ema);
+    try std.testing.expectApproxEqRel(pool_first_step, ramped.batch_multiplier, 1e-12);
+}
+
+test "adaptive work tuner skips the clamp trial when the top's shape is the dispatched one" {
+    // A range-capped count: 1,024 items aligned to 64 fit 16 batches at most, the probe's
+    // shape and the top's alike; the first comparison steps down to 8 batches of 128.
+    const capped_request = tunerTestRequest(1024, 23, 64, 64);
+    var capped = AdaptiveWorkTuner.init(.{ .sample_window = 1, .threaded_batch_ns = 1000 });
+    capped.record(tunerTestBatchWithProfile(1024, capped.selectProfile(capped_request), 10_000_000));
+    for (0..capped.config.nudge_samples) |_| capped.record(tunerTestBatchWithProfile(1024, capped.selectProfile(capped_request), 300_000));
+    try std.testing.expectEqual(NudgeState.stepped, capped.nudge_state);
+    try std.testing.expectEqual(AdaptiveWorkProfile{ .worker_threads = 7, .items_per_range = 128 }, capped.selectProfile(capped_request));
+
+    // Restarted at the top: the first comparison takes the first step down from it.
+    var top = try threadedPoolTuner(1);
+    top.batch_multiplier = max_batch_multiplier;
+    top.current_profile = top.batchShape(pool_request);
+    top.restartNudge();
+    recordThreadedBatches(&top, top.config.nudge_samples, 300_000);
+    try std.testing.expectEqual(NudgeState.stepped, top.nudge_state);
+    try std.testing.expectEqual(max_batch_multiplier, top.reference_multiplier);
+    try std.testing.expectApproxEqRel(@as(f64, 52.0 / 16.0), top.batch_multiplier, 1e-12);
+}
+
+test "adaptive work tuner a demotion, count shift, or lost probe during a clamp trial undoes it" {
+    // A demotion remembers the measured shape for its restore.
+    var demoted = try clampTrialPoolTuner();
+    demoted.demoteToInline();
+    try std.testing.expectEqual(@as(f64, 1), demoted.batch_multiplier);
+    try std.testing.expectEqual(pool_shape, demoted.restore_threaded_profile.?);
+    try std.testing.expectEqual(NudgeState.measuring, demoted.nudge_state);
+
+    // A sustained count shift reshapes from the measured multiplier: 16 batches of 512.
+    var shifted = try clampTrialPoolTuner();
+    const shifted_request = tunerTestRequest(8192, 15, 16, 64);
+    try std.testing.expectEqual(AdaptiveWorkProfile{ .worker_threads = 15, .items_per_range = 512 }, shifted.selectProfile(shifted_request));
+    try std.testing.expectEqual(@as(f64, 1), shifted.batch_multiplier);
+    try std.testing.expectEqual(NudgeState.measuring, shifted.nudge_state);
+
+    // A probe window longer than the EMA's settle trials during the probe; losing it halves
+    // the measured multiplier, not the top's.
+    var probed = AdaptiveWorkTuner.init(.{ .smallest_range_items = 16, .sample_window = 10, .threaded_batch_ns = 1000 });
+    for (0..probed.config.sample_window) |_| probed.record(tunerTestBatchWithProfile(4096, probed.selectProfile(pool_request), 10_000_000));
+    try std.testing.expectEqual(AdaptiveWorkPhase.probing, probed.phase);
+    recordThreadedBatches(&probed, probed.config.nudge_samples, 9_800_000);
+    try std.testing.expectEqual(NudgeState.clamp_trial, probed.nudge_state);
+    try std.testing.expectEqual(pool_top_shape, probed.selectProfile(pool_request));
+    recordThreadedBatches(&probed, probed.config.sample_window - probed.config.nudge_samples, 9_800_000);
+    try std.testing.expect(probed.phase == .settled and !probed.has_threaded_profile);
+    try std.testing.expectEqual(@as(f64, 0.5), probed.batch_multiplier);
+    try std.testing.expectEqual(NudgeState.measuring, probed.nudge_state);
+}
+
+test "adaptive work tuner a fresh full-pool tuner's clamp trial returns to its dispatched batches per participant" {
+    // The first selection dispatches 2 batches per participant at a multiplier of 1.
+    const two_per_participant = AdaptiveWorkProfile{ .worker_threads = 15, .items_per_range = 128 };
+    var tuner = AdaptiveWorkTuner.init(.{ .smallest_range_items = 16, .sample_window = 1, .threaded_batch_ns = 1000, .first_selection = .full_pool });
+    const first = tuner.selectProfile(pool_request);
+    try std.testing.expectEqual(two_per_participant, first);
+    tuner.record(tunerTestBatchWithProfile(pool_request.item_count, first, 300_000));
+    recordThreadedBatches(&tuner, tuner.config.nudge_samples - 1, 300_000);
+    try std.testing.expectEqual(NudgeState.clamp_trial, tuner.nudge_state);
+    try std.testing.expectEqual(@as(f64, 2), tuner.reference_multiplier);
+    // A tie returns to the 2-per-participant shape, then steps down from it: 29 of 144.
+    recordThreadedBatches(&tuner, tuner.config.nudge_samples, 300_000);
+    try std.testing.expectEqual(NudgeState.stepped, tuner.nudge_state);
+    try std.testing.expectEqual(@as(f64, 2), tuner.reference_multiplier);
+    try std.testing.expectEqual(AdaptiveWorkProfile{ .worker_threads = 15, .items_per_range = 144 }, tuner.selectProfile(pool_request));
 }
 
 // The pool tuner's multipliers after a step, restated as dispatched batches per
@@ -3360,11 +3622,14 @@ const pool_first_step: f64 = 15.0 / 16.0;
 const pool_second_step: f64 = 14.0 / 16.0;
 const pool_flip_step: f64 = 18.0 / 16.0;
 
-// A pool tuner that has just taken its first step, down, from a 300 us reference.
+// A pool tuner that has just taken its first local step, down, from a 300 us reference: its
+// clamp trial tied at 300 us and returned.
 fn steppedPoolTuner() !AdaptiveWorkTuner {
-    var tuner = try threadedPoolTuner(1);
-    recordThreadedBatches(&tuner, tuner.config.nudge_samples - 1, 300_000);
+    var tuner = try clampTrialPoolTuner();
+    recordThreadedBatches(&tuner, tuner.config.nudge_samples, 300_000);
     try std.testing.expectApproxEqRel(pool_first_step, tuner.batch_multiplier, 1e-12);
+    // round(16 / 1.1) = 15 batches: workers follow, 14 of them.
+    try std.testing.expectEqual(AdaptiveWorkProfile{ .worker_threads = 14, .items_per_range = 288 }, tuner.selectProfile(pool_request));
     return tuner;
 }
 
