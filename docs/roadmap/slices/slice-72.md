@@ -101,7 +101,7 @@ content across world sizes.
       Today's tie-break kept; `destructible-resolve` flat in destructible
       count at three counts; 61, 63, and 71D resolve text updated.
 - [x] D3 · LOS visit limit from the ray's own length.
-- [x] D4 · AI scan radius from the live spatial cell size. Queries take a
+- [x] D4 · AI scan radius from the live spatial cell size (`c52a5ff`). Queries take a
       world radius and the index derives the scan box
       (`spatial_index.zig:535`); `grid_cell_size` is gone.
 - [ ] E1 · A pathfinding shrink never drops accepted work.

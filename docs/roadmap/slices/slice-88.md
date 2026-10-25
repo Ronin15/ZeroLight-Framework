@@ -2,7 +2,7 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 87](slice-87.md)'s collect items (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: not started.** Owner 2026-10-16: every system on the core branch
+**Status: in progress.** Landed: u32 row caps as `OutOfMemory`, one `hotStoreCapacity`, the `production-step` world leak, the stagger-phase overwrite, and the slimmed runtime-log `BatchStage`. Owner 2026-10-16: every system on the core branch
 gets a whole-subsystem pass against the cost model and the rules. This slice
 covers the shared layers no other core slice owns. It runs after 87's
 collect items and before the inert-row items and 75's tier mechanics, both
@@ -16,7 +16,7 @@ in its owning slice.
 ### Current foundation
 
 - `DataSystem`: `src/game/data_system.zig` and `src/game/data_system/`
-  (`system.zig` 2,890 lines, `structural.zig`, `types.zig`, and the
+  (`system.zig` 3,162 lines, `structural.zig`, `types.zig`, and the
   component stores `movement`, `agents`, `collision`, `destructible`,
   `visual`, `faction_level`, `affect`, `memory`, `perception`). The AI stores
   (`affect`, `memory`, `perception`) are reviewed with their systems on the
@@ -38,18 +38,18 @@ in its owning slice.
 
 - [ ] Every agent keeps a spread stagger phase. Landed in `5c4babb`: the
       overwrite is fixed; `stagger_phase` defaults to `keep_stagger_phase`
-      (`src/game/simulation_scope.zig:15`, `:157`), so
+      (`src/game/simulation_scope.zig:16`, `:158`), so
       `setSimulationMetadata` without a phase keeps the append-assigned phase
       (tests `a simulation metadata write keeps the row's stagger phase and
       level unless it names them` and `a simulation metadata write takes the
       level from the entity's world level row`,
-      `src/game/data_system/system.zig:1357`, `:1385`). Still open, the
+      `src/game/data_system/system.zig:1416`, `:1444`). Still open, the
       assignment: the append stripes `stagger_phase = dense_index %
-      cognition_stagger_n` (`data_system/movement.zig:76`, n = 4,
+      cognition_stagger_n` (`data_system/movement.zig:86`, n = 4,
       `src/game/simulation_scope.zig:12`), which aliases with any spawn order
       whose period shares a factor with n. The `production-step` spread
       fixture places agents round-robin over levels (`level = agent %
-      fields.levels`, `src/benchmarks/production_step.zig:229`), so with 8
+      fields.levels`, `src/benchmarks/production_step.zig:298`), so with 8
       levels every agent on one level gets the same phase. Measured (Debug,
       `production-step --items 1024008002048`, spread, 2,048 agents, 2,053
       rows, serial, 3 iterations, tree at `0bcaa2f`,
@@ -71,8 +71,8 @@ in its owning slice.
       and thinking per step (`--details` prints only per-stage means today,
       so a per-step spike cannot be read), so "max falls, mean unchanged" is
       checkable. Phase is the think set's one membership test
-      (`cognitionJob`, `src/game/systems/simulation_scope.zig:858`, over the
-      phase the index stores, `src/game/systems/spatial_index.zig:394`), so
+      (`cognitionJob`, `src/game/systems/simulation_scope.zig:735`, over the
+      phase the index stores, `src/game/systems/spatial_index.zig:392`), so
       spreading the phases changes membership only; per-entity phases stay
       (`src/game/simulation_scope.zig:153-158`).
       Neighbor-block sharing per step then falls to agents per cell ÷
@@ -83,19 +83,19 @@ in its owning slice.
       dense SoA; the stagger assignment and the cross-store reads are fixed in
       the layout (`.claude/rules/memory-performance.md` § Data-oriented
       design). Failure: every component store appends and swap-removes
-      (`data_system/movement.zig:168`, `agents.zig:159`,
-      `faction_level.zig:61`, `:122`), so no store is ordered by the keys
+      (`data_system/movement.zig:67`, `:189`, `agents.zig:160`,
+      `faction_level.zig:57`, `:110`), so no store is ordered by the keys
       tiered passes filter on. Tier, stagger phase, chunk, and level sit in
       the movement scope columns (the scope level is kept equal to
       `world_level`, `data_system/system.zig:944-950`); faction and
       `world_level` are separate stores (`faction_level.zig:17`, `:22`); each
       cross-store read resolves through the entity slot table
       (`data_system/system.zig:445-455`, `:756-760`). Consumers: the
-      windowed threaded gathers `gatherAiData` (`systems/ai.zig:509`) and
-      `gatherPerceptionData` (`perception.zig:373`), the think-set compaction
-      `compactCognition` (`simulation_scope.zig:396`, which reads only index
+      windowed threaded gathers `gatherAiData` (`systems/ai.zig:502`) and
+      `gatherPerceptionData` (`perception.zig:362`), the think-set compaction
+      `compactCognition` (`systems/simulation_scope.zig:338`, which reads only index
       columns), `collisionGatherJob` and `aiGatherJob`
-      (`:787`, `:816`), collision `packFillRange` (`collision.zig:2547`), the
+      (`:663`, `:693`), collision `packFillRange` (`collision.zig:2706`), the
       world gate's lane pass (`world_gate.zig:248`; its bounds columns are
       already mirrored on the movement rows), and render collect (87). Failure scenario (derived): with phases striped by row, each
       step's P/4 think set touches every cache line of each AI and movement
@@ -134,7 +134,7 @@ in its owning slice.
       (deterministic for any worker count, owner-accepted order change);
       serial == threaded; the `plane-traversal` benches within spread.
 - [ ] Affect's gather leaves main. Failure: `gatherScopedIndices`
-      (`systems/affect.zig:259-307`) walks the think set on the main thread,
+      (`systems/affect.zig:229-285`) walks the think set on the main thread,
       resolving the affect, perception, and memory rows per entity and
       appending one row each, per-item work beyond an ordered merge
       (`.claude/rules/threading.md`); the AI, perception, and memory gathers
@@ -144,7 +144,7 @@ in its owning slice.
       `FailingAllocator` proof on a multi-worker step, and the pipeline
       workers test (`simulation_pipeline.zig:5445-5467`) covering it.
 - [ ] AI memory's visibility pass reads perception in row order. Failure:
-      `refreshVisibleTargets` (`systems/ai_memory.zig:681-709`) walks members
+      `refreshVisibleTargets` (`systems/ai_memory.zig:664`) walks members
       in ascending memory row and reads `target_visible`, `nearest_threat`,
       and `last_seen_*` at each member's perception row, which ascends only
       while the perception and memory stores share a row order
@@ -158,20 +158,10 @@ in its owning slice.
       rules: row layout and growth seams, the structural applier's per-commit
       cost, handle and generation churn, and per-step walks a store forces on
       its consumers. Each finding becomes an item here.
-- [ ] A store's `u32` row cap fails as `OutOfMemory` at its growth seam
-      (`.claude/rules/budgets-capacities.md`). Failure: past `maxInt(u32)`
-      rows the stores return distinct errors: `data_system/movement.zig:59`,
-      `agents.zig:102`, `:220`, `collision.zig:55`, `:129`,
-      `faction_level.zig:35`, `:96`, `affect.zig:79`, `destructible.zig:31`,
-      `perception.zig:64`, `visual.zig:79`, `:180`, `:311`; entity slots at
-      `system.zig:185`; the `validateLimits` arms at `structural.zig:84-98`
-      but `:96`; and `TooManyWorldLevelRows` in `PlaneStageError`
-      (`src/game/dig_controller.zig:101`). Memory already does
-      (`memory.zig:87`, `structural.zig:96`). Failure scenario: a caller that
-      retries `OutOfMemory` with state intact meets an unhandled
-      `TooMany*Rows` at the cap. Pass: each returns `error.OutOfMemory`, the
-      `TooMany*` members leave the error sets, and a cap test per store like
-      memory's (`structural.zig:786`).
+- [x] A store's `u32` row cap fails as `OutOfMemory` at its growth seam
+      (`.claude/rules/budgets-capacities.md`; `fce97cd`). No `TooMany*` member
+      remains in `src/game/data_system/` or `dig_controller.zig`; cap tests at
+      `structural.zig:772-774`.
 - [ ] Step contracts (`simulation.zig`): per-step stream capacity and reserve
       against population and per-world load, event caps that simulation reads,
       `finishWrite` cost. Each finding becomes an item here.
@@ -179,8 +169,10 @@ in its owning slice.
       a later step at the commit seam, one deferral every producer uses (56,
       57, 61, 62, 76, and 77 depend on it;
       `.claude/rules/budgets-capacities.md`; docs audit M7). Failure: a commit
-      past the share fails before mutation (`simulation.zig:491`) and the
-      error fails the step (`game_demo_state.zig:689`, through `:647`).
+      past the share fails before mutation (`simulation.zig:483-484`) and the
+      error fails the step (`SimulationPipeline.commitStructuralAndReact`,
+      called from `applyStructuralCommandsAndPostCommitEvents`,
+      `game_demo_state.zig:633`).
       Failure scenario (derived, no bench): a kill burst, collapse, or
       explosion over the share stops the step. Pass: a contract test where an
       over-share burst defers and the step succeeds, identical serial and
@@ -197,44 +189,28 @@ in its owning slice.
 - [ ] The population seam sizes the neighbor index and the per-AI scratch by
       AI rows, never every movement body (code audit M2; the index is 84's).
       Failure: `spatial_index.reserve` takes the movement body capacity at
-      init and at the growth seam (`simulation_pipeline.zig:791`, `:992`),
+      init and at the growth seam (`simulation_pipeline.zig:976`, `:1236`),
       which is the max of bodies, steering, AI, and bounds
       (`PopulationRowCounts.population`, `data_system/types.zig:46`); the
       index only ever holds AI halo rows, and the perception, AI, affect, and
-      AI-memory scratch reserve the same (`:810-813`)
+      AI-memory scratch reserve the same (`:995-998`)
       (`.claude/rules/engine-design.md` § Cost model,
       `.claude/rules/budgets-capacities.md`). Failure scenario (derived): a
       colony with 1M items at rest and 10k agents reserves index storage for
       1M slots. Pass: a logical AI-row capacity at the seam sizes the index
       and the per-AI scratch; a reserve test shows their bytes follow AI
       rows.
-- [ ] The runtime perf log carries only change-path cost-driver stages (code
-      audit L1, its log-policy remainder; `.claude/rules/threading.md`).
-      Failure: `BatchStage` (`src/app/runtime_perf_log.zig:225-252`) carries
-      non-driver stages (perception, AI, steering, movement, particles, and
-      others), recorded each step (`simulation_pipeline.zig:548-633` in the 84
-      tree; `particle.zig:55`). Failure scenario: the 60 s log mixes stages no
-      change path names with the drivers, hiding the one a regression moves.
-      Pass: every logged stage is a design-named cost driver and the rest are
-      bench-only (`--details`), with `production-step`'s census keeping its
-      per-stage attribution and 68A's soak row schema
-      (`docs/roadmap/scaling-gaps.md:28`) reading only the kept stages.
-- [ ] `production-step` leaks the world on OOM (code audit L3). Failure:
-      `world` has no errdefer across `allocator.create(GameDemoState)`
-      (`src/benchmarks/production_step.zig:384-390`). Failure scenario: a
-      bench OOM or leak sweep reports the fixture's leak. Pass: the state is
-      created first, or a guarded errdefer covers `world` until
-      `initWithWorld` takes ownership
-      (`.claude/rules/memory-performance.md` § Allocator discipline).
-- [ ] One `hotStoreCapacity` (code audit L8). Failure: eight private copies
-      wrap `std.mem.alignForwardAnyAlign` (`systems/ai.zig:81`,
-      `perception.zig:106`, `affect.zig:92`, `ai_memory.zig:71`,
-      `particle.zig:31`, `collision.zig:76`, `collision_response.zig:59`,
-      `steering/system.zig:67`) beside the shared
-      `data_system/types.zig:28` (`.claude/rules/memory-performance.md`,
-      `.claude/rules/engine-design.md` § Changes and docs). Failure scenario:
-      an alignment change lands in one copy, and a stage's scratch aligns
-      differently from its store. Pass: every site calls the shared helper.
+- [x] The runtime perf log carries only change-path cost-driver stages (code
+      audit L1; `.claude/rules/threading.md`). Landed for `BatchStage`
+      (`005cdae`): 11 change-path drivers, the rest `BenchBatchStage`
+      (`src/app/runtime_perf_log.zig:217-300`). The `pipeline_*` timers are
+      [slice 50](slice-50.md)'s open item.
+- [x] `production-step` leaks the world on OOM (code audit L3). Landed in
+      `f1d836e`: the state is created first
+      (`src/benchmarks/production_step.zig:837-839`).
+- [x] One `hotStoreCapacity` (code audit L8). Landed in `fce97cd`: one helper
+      (`data_system/types.zig:28`); no private `alignForwardAnyAlign` copy
+      remains in the systems.
 - [ ] Benches at the worst-case shape each finding's bound names, with the
       shape asserts landing with each fix (`.claude/rules/tests-benchmarks.md`).
 - [ ] AI memory's scratch reserve covers the population it is reserved for.

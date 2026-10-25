@@ -21,7 +21,7 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
 - 49 (spec, not live) provides `StateHasher` with raw-bytes floats, checksum
   v1 over `DataSystem`, `WorldSystem`, player, seed, and step, comptime
   completeness lists, and the `simulation-checksum` bench. 50 makes owner-thread
-  `parallelFor` safe; 64A makes pause simulation-invisible, so no field needs a
+  dispatch safe (`parallelForWithOptions`, `thread_system.zig:1118`); 64A makes pause simulation-invisible, so no field needs a
   pause exemption.
 - Live carried history outside `DataSystem`/`WorldSystem`
   (`simulation_pipeline.zig` and its subsystems): `interact_held_last`;

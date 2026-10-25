@@ -4,7 +4,7 @@
 
 **Status: not started.**
 
-Goal: a low-priority background lane, separate from fork-join `parallelFor`,
+Goal: a low-priority background lane, separate from the pool's fork-join batch dispatch (`parallelForWithOptions`, the stage `Dispatch`),
 runs coarse jobs off the main thread and hands each result back on a fixed
 simulation step chosen at submit, so no simulation outcome depends on how fast
 a job ran. Its consumers are 46 (save/load, app-layer), 65B (deferred nav
@@ -26,8 +26,10 @@ with tests, and its consumers land with their slices.
   commit, post-commit reactions) → `finished`.
 - `LoadingState.loadGameDemo` builds gameplay with `UpdateContext` in reach;
   `assets.validateRelativePath` is the traversal-safe path validator.
-- Needed and not landed: 49's `simulationChecksum()`; 50's foreign-thread `parallelFor` panic, thread
-  self-naming, and `-Dsanitize-thread`; 64A's FP-environment assertion.
+- Landed from 50: the foreign-thread panic (`thread_system.zig:1063`;
+  `4e62442`), worker names (test at `:4840`; `4e62442`), and
+  `-Dsanitize-thread` (`build.zig:113`; `4ae3d60`). Still needed: 49's
+  `simulationChecksum()`; 64A's FP-environment assertion.
 
 ### Architecture notes
 

@@ -10,8 +10,9 @@ determinism proof.
 1. Perception and AI stop walking the sensed population serially on the main
    thread: main-thread work is proportional to decide rows over the whole
    population 75 indexes. The threaded spatial-index gather produces one
-   per-step entity table and a self-validating map from AI row to table row;
-   perception and AI then walk only their own think or decide rows.
+   per-step entity table and a self-validating map from AI row to table row;   perception and AI then walk only their own think or decide rows. The
+   entity-column part landed with Slice 84 (view columns, `spatial_index.zig:224-230`,
+   `entityAt` `:247`); the checklist's open items are the remaining pieces.
 2. The shared action bus keeps its fixed per-step counts; Slice 56's
    rotating deferral gains a deterministic deferral-age priority, so a
    deferred actor waits a bounded number of its qualifying steps under any
@@ -29,18 +30,18 @@ sensing (Slice 55 rejects it).
   builds the unstaggered halo's index on workers into per-chunk records keyed
   by level and faction; `view()` carries each entry's position, entity
   (`entity_index`, `entity_generation`), `population_row` (its AI row), and
-  `cognition_phase`; `buildSerial` is the serial twin. `spatial_index_build`
+  `cognition_phase`; `build` runs inline on a zero-worker `ThreadSystem` (no separate serial entry). `spatial_index_build`
   carries `movement_positions` and `world_level`.
 - `PerceptionSystem.gatherPerceptionData`
-  (`src/game/systems/perception.zig:373`) and `AiSystem.gatherAiData`
-  (`src/game/systems/ai.zig:509`) keep no candidate tables and walk no halo:
+  (`src/game/systems/perception.zig:362`) and `AiSystem.gatherAiData`
+  (`src/game/systems/ai.zig:502`) keep no candidate tables and walk no halo:
   each walks only its think rows on workers, in windows main merges in range
   order, resolving movement, faction, and level per row through the entity
   slot table. The think set comes from the index on workers
-  (`compactCognition`, `src/game/systems/simulation_scope.zig:396`).
+  (`compactCognition`, `src/game/systems/simulation_scope.zig:338`).
 - `DataSystem.movementVisualDenseIndices` (`src/game/data_system/system.zig`)
   is the single-resolve precedent.
-- From earlier slices: 55's decide set and `ai-idle-*` benches; 75's
+- From earlier slices: 55's decide set (its `ai-idle-stagger` and `ai-idle-coast` benches do not exist yet); 75's
   whole-population spatial index; 56's emitter, per-step budget with
   rotating deferral, and `ai_actions_deferred`.
 - Perf log: 60 s intervals with summed and max metrics, compiled out of
@@ -83,7 +84,8 @@ sensing (Slice 55 rejects it).
 - [ ] Single-resolve halo row lookup on `DataSystem` with unit tests.
 - [ ] Spatial index emits the entity table and the AI-row map, reserved with
       the AI population and grown at the seam; view columns and the
-      self-validating lookup; module doc updated.
+      self-validating lookup; module doc updated. The view columns landed
+      with Slice 84 (`08e4799`, `3efa1e4`, `c52a5ff`); the rest is open.
 - [ ] Perception and AI drop their candidate tables and halo walks; config
       fields that described the pairing are deleted; pairing asserts added.
       Slice 84 removed the tables, the halo walks, and the dual-list config

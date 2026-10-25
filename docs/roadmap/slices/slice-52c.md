@@ -25,12 +25,16 @@ digests at every size.
   run `test` / `bench` / `run` / `gpu-smoke` with the PATH prepend.
 - `gpu-smoke` needs a display.
 - Benches: groups register in `src/benchmarks/runner.zig`; the suite accepts
-  `--group`, `--case`, `--items`, `--iterations`, `--details`; outputs are
-  gitignored. `tools/bench_ab.py` runs Debug by default.
-- No bench drives the full fixed step; groups are per system, and
-  `render-game-prep` covers CPU render prep on synthetic fixtures. The only
-  full-frame reference is manual ReleaseSafe perf-log dumps at one demo
-  population, which reproduce across neither machines nor commits.
+  `--group`, `--group-prefix`, `--case`, `--items`, `--warmup`, `--iterations`,
+  `--fallback-budget`, `--details` (`suite.zig:1074-1116`); outputs are
+  gitignored. `tools/bench_ab.py` runs Debug by default, warmup 1, iterations
+  3 (`bench_ab.py:53`).
+- `production-step` (`src/benchmarks/production_step.zig`, registered in
+  `runner.zig`) drives the production fixed step (`GameDemoState.update`
+  through the structural-commit seam) on a directly built population ladder
+  with a fixed pre-measure and a tuner-settled check, but no CPU render prep,
+  no state digest, and no NaN count; `render-game-prep` covers CPU render prep
+  on synthetic fixtures.
 - `GameDemoState` builds headless: `update(UpdateContext)` runs input, the
   pipeline, audio queueing, particles, camera, and the structural commit;
   `RuntimeAssets` can be seeded with metadata only; a serial `ThreadSystem` is

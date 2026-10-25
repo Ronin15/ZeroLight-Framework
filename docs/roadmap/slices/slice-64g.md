@@ -308,14 +308,14 @@ a design open for this slice):
       load (`4b15d88`); publish copies and registry flushes thread (`870ac61`,
       `8b59c3c`, `9f7de20`); the step's goal projections thread (`2c1a9c1`).
 - [x] Tuner resets learning when an inline batch's item count changes
-      (`thread_system.zig:1134-1137`, `:229-237`: the inline shape's range size
-      is the item count, so `record` sees a new profile): nav intake and group
+      (the inline shape's range size was the item count, so `record` saw a new
+      profile; policy since replaced by the batch tuner, `83ef090`): nav intake and group
       fields stay inline whenever the request or field count varies, e.g. the
       elastic ramp at 4,000 agents runs intake inline every ramp step.
       Landed (TS1): inline batches are one profile; an out-of-band batch is
       not sampled; a sustained same-side shift re-tunes a threaded stage.
-- [x] Tuner window-minimum demotion (`thread_system.zig:241-249`, `:399-410`,
-      `:599-610`): four lockstep group fields finish in one near-empty batch, the
+- [x] Tuner window-minimum demotion (policy since replaced by the batch tuner,
+      `83ef090`): four lockstep group fields finish in one near-empty batch, the
       advance pass demotes to inline and stays there for 360 batches.
       Landed (TS1): windows read the median batch.
 - [x] Tuner judges a demotion and a shift correctly: the first inline window
@@ -325,13 +325,15 @@ a design open for this slice):
       wait-dominated demotion no longer drops a threaded profile (`ff670b4`).
 - [x] The runtime perf log records each change path's cost-driver stage:
       `path_intake`, `path_registry_flush`, `nav_remask`, `nav_evict`,
-      `static_collider_splice` (`69dba4f`), `nav_connect` (`e793590`),
-      `nav_closure` (`a294a7a`). Group-field batches stay bench-only: they drive
+      `static_collider_plan` (`6045eda`), `nav_connect` (`e793590`),
+      `nav_closure` (`a294a7a`); since landed: `spatial_index_build`,
+      `path_resize_copy`, `collision_trigger_rewrite`,
+      `collision_trigger_refresh` (`src/app/runtime_perf_log.zig:217-240`). Group-field batches stay bench-only: they drive
       no change path (`threading.md`).
 - [x] One shared static-collider structure, synced once per entity per step,
       with nav as its first consumer; a static add, move, or destroy costs its
       own rows and chunks (`5db9025`); steering reads it through a size-class
-      query map (`173cc17`). Collision moves onto it in 71B.1.
+      query map (`173cc17`). Collision reads it (86, `b126599`).
 - [x] Steering's prepare phase, its agent grid, AI movement-intent apply, and
       collision response run as threaded stages with main O(1) per item
       (`ede5509`, `df7f1ea`, `cc58f38`, `ff670b4`); plane traversal's per-agent

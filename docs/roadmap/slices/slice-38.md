@@ -23,7 +23,9 @@ symmetrically.
   - `dig_controller.zig`: the hole-vs-tunnel branch (`plan.level == 0`), the
     ramp early-return on level 0, `setEntityLevel`'s `level == 0` return, and
     `digRamp` treating `level - 1` as the plane above;
-  - `systems/world_gate.zig`: both walk gates return on `level == 0`;
+  - `systems/world_gate.zig`: the lane pass marks a row gated only when its
+    level is not 0 (`:265`), and the scalar player gate
+    `gateBodyToWalkableTiles` returns on `level == 0` (`:117`);
   - `game_demo_state.placeDemoInterestMarkers` places markers on level 0.
 - Nav takes static collision bodies on every level from `StaticColliderSystem`
   (64G).
@@ -69,7 +71,7 @@ symmetrically.
 - [ ] Render window with levels above and below in elevation terms; the
       default reproduces today's window exactly.
 - [ ] Surface special cases (dig hole vs tunnel, ramp early-return,
-      `setEntityLevel`, both walk gates, nav static bodies, demo interest
+      `setEntityLevel`, the world-gate lane mask and the player gate, nav static bodies, demo interest
       markers) migrated to elevation.
 - [ ] `digRamp`'s "nothing above" check becomes an elevation-adjacency lookup.
 - [ ] Slice 49 / 46 classification and save section for elevation; loader

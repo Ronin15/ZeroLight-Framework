@@ -51,9 +51,9 @@ Scope comes from one camera and puts far entities to sleep.
 - Full-active fallback: a world with no chunks yields no region, so no halo,
   stagger, or demotion applies and everything runs at full cost.
 - One observer, one view, one world (74).
-- Movement integrates every row (`src/game/systems/movement.zig:49`) and the
+- Movement integrates every row (`src/game/systems/movement.zig:55`) and the
   tier policy scans every row (`scanTierPolicy`,
-  `src/game/systems/simulation_scope.zig:686`), rows at rest included.
+  `src/game/systems/simulation_scope.zig:576`), rows at rest included.
 - Measured, `production-step` tuned (Debug, `5d5a089`):
   - At the base config (spread P 4,096, 1024², 8 levels), half the rows are
     dormant and 101 think per step. At L 32, 87% are dormant; at side
@@ -98,7 +98,7 @@ Scope comes from one camera and puts far entities to sleep.
   world extent × world count; serial and threaded paths with parity
   (`.claude/rules/threading.md`).
 - The think set's membership is one phase test over the indexed rows
-  (`cognitionJob`, `src/game/systems/simulation_scope.zig:866`), and band
+  (`cognitionJob`, `src/game/systems/simulation_scope.zig:735`), and band
   cadence replaces that test. With the whole population indexed, that pass
   costs one compare per indexed row every step on workers, so to meet the
   cost line above it walks only rows that can think this step, or an
@@ -127,13 +127,18 @@ Scope comes from one camera and puts far entities to sleep.
 - [ ] `dormant` reserved for inert rows, which still advance (57 schedules
       item decay); agents are never dormant.
 - [ ] Rows at rest cost no per-step movement or tier-scan work
-      (`movement.zig:49`, `simulation_scope.zig:686`). Failure scenario: items
+      (`movement.zig:55`, `systems/simulation_scope.zig:576`). Failure scenario: items
       and resource nodes at rest raise every step's cost (measured above).
       Pass: `production-step` flat in inert rows. Collision's share is
       [86](slice-86.md); render collect's is [87](slice-87.md).
 - [ ] Bench-only (`--details`) timers for the untimed stages, so the
       `production-step` census attributes the 2–20% `untimed` share before
-      this slice's policy change (`.claude/rules/threading.md`).
+      this slice's policy change (`.claude/rules/threading.md`). Landed
+      (`f59cf3b`) for scope gather, cognition order, collision scope, plane
+      traversal, tier policy, and action react (`BenchTiming`,
+      `src/app/runtime_perf_log.zig:331-338`; census
+      `benchmarks/production_step.zig:668-689`). Open: `dig_world_edit` has no
+      timer in `Timing` or `BenchTiming`.
 - [ ] A deterministic far-from-observer signal for 62's ambient
       recycling.
 - [ ] Far path requests over the whole-world nav within the fixed request

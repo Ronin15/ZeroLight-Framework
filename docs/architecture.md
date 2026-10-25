@@ -260,7 +260,7 @@ Designs start here, then read the live structure below (rules:
   whole-element swaps; production sorts use them (`.claude/rules/zig-style.md`
   § Style).
 - `src/core/rng.zig` provides a deterministic, stateless, seeded per-entity RNG
-  facility (`mix64`/`uniformF32`/`boundedU32`/`unitVec2`) for reproducible
+  facility (`mix64`/`uniformF32`/`unitVec2`) for reproducible
   gameplay randomness (AI wander, etc.).
 - `src/core/logging.zig` owns scoped logging categories and build-option-driven log filtering.
 - `src/root.zig` stays minimal for math aliases and compile coverage; feature

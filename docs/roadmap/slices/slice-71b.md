@@ -23,8 +23,10 @@ Goal:
 
 - `StaticColliderSystem` (`src/game/systems/static_colliders.zig`, 64G): one
   row per static navigation obstacle (AABB, level, cell span) listed per
-  (level, chunk) in entity order, synced at the commit seam with O(1) main work
-  per change, plus a size-class query tier with per-chunk anchor bitmaps.
+  (level, chunk) in entity order, held as contiguous span and float columns
+  per chunk (`dfc6ad8`); the commit-seam sync runs plan, touch, group, apply,
+  rewrite, and install as tuned worker stages (`6045eda`,
+  `static_colliders.zig` `RebuildStage` tuners), plus a size-class query tier with per-chunk anchor bitmaps.
   Nav, steering, and collision read it through `ColliderView`; steering's box
   query (`queryBox`) visits at most 64 hits and 512 probes per agent, so a
   static change costs steering nothing (`steering-static-change` flat in

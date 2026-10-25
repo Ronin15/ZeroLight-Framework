@@ -4,9 +4,9 @@
 
 **Status: in progress.** The Windows LTO-off item landed 2026-10-05
 (`01754ec`); 64G set the release-mode CPU default (`46d3b7f`, `83f36a6`); Debug
-moved to the same floor on the core branch (owner 2026-10-16);
+moved to the same floor on the core branch (owner 2026-10-16, `1a50197`);
 everything else is not started. First of 52A → 52B → 52C; 52D
-needs its `-Dcpu-baseline`. Rebases on Slice 50's `build.zig` edits.
+needs its `-Dcpu-baseline`.
 
 Goal: a release build means the same ISA, Zig, SDL, and shader bytes on every
 machine that produces it. The shipped ISA is `x86_64_v2` (SSE4.2 + POPCNT) on
@@ -24,11 +24,12 @@ Linux and macOS; no shader compilers are needed for a normal build.
   default CPU (derived, not run).
 - `core/simd.zig` derives every lane count from one 16-byte register constant
   (`vector_bytes`, the SSE2/NEON width): `lane_count = 4` (`@Vector(4, f32)`) and
-  a private 8 × u16 vector behind `countUnequalU16`; nothing is wider than 128
-  bits. `src/` has no
+  private 8 × u16 (`Uint16x8`, `simd.zig:14`) and 16 × u8 (`Uint8x16`, `:17`)
+  vectors behind `countUnequalU16`, `bytesMatchingMask`, and
+  `decrementSaturatingU16`; nothing is wider than 128 bits. `src/` has no
   `@setFloatMode` or `@mulAdd`, so strict float mode keeps results
   bit-identical across `x86_64`, `x86_64_v2`, and native. Scalar==SIMD and
-  serial==threaded parity tests exist in about 18 modules.
+  serial==threaded parity tests exist across the simulation modules.
 - Windows SDL: `build.zig` / `build.zig.zon` pin SDL 3.4.10, SDL_ttf 3.2.2, and
   SDL_mixer 3.2.4 as lazy VC zips with per-file `CheckFile` validation,
   `fetch-sdl`, and a DLL install plus host PATH prepend.
@@ -103,7 +104,7 @@ Linux and macOS; no shader compilers are needed for a normal build.
 
 - [ ] `-Dcpu-baseline` with `ship` / `compat` / `native` resolution, `-Dcpu`
       precedence, and the configure-time conflict error.
-- [ ] `tools/bench_ab.py` `shipped_cpu_floor` (`:97`) mirrors `build.zig`
+- [ ] `tools/bench_ab.py` `shipped_cpu_floor` (`tools/bench_ab.py:73`) mirrors `build.zig`
       `shippedCpuFloor`. Failure scenario: `-Dcpu-baseline` lands or the floor
       moves, and bench_ab keeps A/B-ing at the old CPU with no error. Pass:
       bench_ab takes the baseline from the build (or the same option), never a
@@ -128,7 +129,7 @@ Linux and macOS; no shader compilers are needed for a normal build.
       excludes `.coff`; windows-gnu ReleaseFast `check` passes.
 - [ ] (added by Slice 66) "windows-gnu LTO links" on the upgrade re-check list.
 - [ ] The `addCallgrindBenchRun` doc comment points to
-      `docs/development-workflow.md § Profiling` (`build.zig:789`) (code
+      `docs/development-workflow.md § Profiling` (`build.zig:821`) (code
       audit L9, docs audit L14; `.claude/rules/zig-style.md` § Comments).
       Failure scenario: the section moves or is renamed, and the comment
       sends readers to nothing. Pass: the comment states the step's contract

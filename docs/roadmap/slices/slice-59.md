@@ -62,7 +62,7 @@ observer's environment; low-volume transition events feed audio and camera.
 - Sky exposure is a per-level fact set at the level-append seam; Slice 38
   derives it from elevation.
 - One new stage at the front of `stage_order`; perception and AI movement
-  read its resource (`.claude/rules/simulation.md` § Pipeline). Transition
+  read its resource (`.claude/rules/simulation.md` § One scheduler, declared dependencies). Transition
   events are bounded per step and published as one range.
 - Weather particles extend the existing particle system with drag and wind
   (no fork); a separate presentation pool sized from the authored emitter

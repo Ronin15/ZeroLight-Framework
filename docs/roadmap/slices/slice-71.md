@@ -11,10 +11,10 @@ static fast paths, as four independently landable sections:
 - **71A**: patrol, follow, guard (home, leash, return home), and the guard
   help call, as Slice 73 behavior content plus the signals they need
   (after 55, 56, 61, 62, 63, 73).
-- **71B**: one chunk-owned static-collider structure shared by steering and
-  collision, the collision static/dynamic split (bench-gated), and
-  fixed-budget path prewarm for authored shared goals; its fixed group-field
-  threshold has landed (after 62, 71A, 64G for the prewarm part).
+- **71B**: one chunk-owned static-collider structure shared by steering
+  (landed with 64G; collision's move onto it and the static/dynamic split
+  moved to Slice 86), and fixed-budget path prewarm for authored shared goals;
+  its fixed group-field threshold has landed (after 62, 71A, 64G for the prewarm part).
 - **71C**: `cover` markers in flee and ranged-pursue goals (after 56B, 73).
 - **71D**: AI merchant selling on Slice 63's trade substrate (after 63, 61,
   71A, 73).

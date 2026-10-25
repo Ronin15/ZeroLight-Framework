@@ -22,7 +22,9 @@ Nav is chunk-owned (64G).
   (`applyBufferedNavUpdates`) as one prepare/commit transaction over dirty
   chunks, threaded per stage, and emits at most one `nav_region_invalidated`.
   It runs at the commit seam, outside `stage_order`, from
-  `GameDemoState`'s `commitStructuralAndReact` through `SimulationPipeline`.
+  `SimulationPipeline.commitStructuralAndReact`
+  (`simulation_pipeline.zig:1358`), which `GameDemoState` calls
+  (`game_demo_state.zig:634`).
 - `PathfindingSystem.graph` is read every step by `pathfinding_update`
   workers and steering, and written only by the full build and the
   post-commit apply. Movement and collision read the world, never the graph.

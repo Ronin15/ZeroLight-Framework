@@ -15,8 +15,9 @@ frame.
 - Pipeline stage order is checked at build time (`stageContract()` and
   `stage_order` in `src/game/simulation_pipeline.zig`).
 - Build-time drift checks (`@compileError`) guard layouts and bounds, for
-  example the AI memory ring against `simd.lane_count` and the nav memory
-  estimate against the group-field layout.
+  example the AI memory ring against `simd.lane_count` (`ai_memory.zig:544`)
+  and the pathfinding abstract node refs against a 64-bit `usize`
+  (`pathfinding/types.zig:198`).
 - Shipping builds compile instrumentation away (`src/app/runtime_perf_log.zig`).
 - Comptime-built tables and `inline for` over fields and enums are in use
   across `src/`.

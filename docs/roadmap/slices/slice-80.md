@@ -21,21 +21,22 @@ traversal, and audio treat it through the same paths as any entity.
 - The rule already states the target: a player entity is optional, and the
   observer is the camera focus or a player when a game has one
   (`.claude/rules/engine-design.md` § Target scale).
-- `Player` (`src/game/player.zig:16`) holds `entity` and `current_level`;
+- `Player` (`src/game/player.zig:15`) holds `entity` and `current_level`;
   `GameDemoState` always spawns one.
-- Camera: `cameraForPlayer` (`src/game/game_demo_state.zig:634`) always
-  follows the player's body; `simViewRect()` (`:618`) derives `sim_view`
+- Camera: `cameraForPlayer` (`src/game/game_demo_state.zig:619`) always
+  follows the player's body; `simViewRect()` (`:603`) derives `sim_view`
   from that camera, and scope is anchored at `player.current_level`.
 - Render: `setVisibleChunksForWorldRect(..., player.current_level)`
-  (`game_demo_state.zig:557`) and `render_prep.GameplayScene`
+  (`game_demo_state.zig:542`) and `render_prep.GameplayScene`
   (`player_entity`, `player_level`) pick the drawn level from the player.
-- Dig: `DigController` (`src/game/dig_controller.zig:155`) captures dig
+- Dig: `DigController` (`src/game/dig_controller.zig:158`) captures dig
   presses and plans the cell the player faces on the player's level.
 - Interact: `SimulationPipeline.captureActionIntent`
-  (`src/game/simulation_pipeline.zig:1159`) builds intents for
+  (`src/game/simulation_pipeline.zig:1475`) builds intents for
   `player.entity`.
 - Perception: a separate `PlayerPerceptionCandidate`
-  (`simulation_pipeline.zig:1396`) beside the candidates the spatial index
+  (`systems/perception.zig:132`, built at
+  `simulation_pipeline.zig:1713`) beside the candidates the spatial index
   supplies.
 - Tile gate: `gatePlayerToWalkableTiles` and `Player.clampToBounds`
   (`src/game/systems/world_gate.zig:107`, `src/game/player.zig:76`) apart from the NPC gate.
@@ -45,7 +46,7 @@ traversal, and audio treat it through the same paths as any entity.
 - Audio: `AudioController.queueAmbient` (`src/game/audio_controller.zig:49`)
   places the listener at the player's center and drives a player jet loop.
 - AI: the tier-3 pursue fallback reads an optional player target
-  (`src/game/systems/ai.zig:329`); decide steers to a demo constant when no
+  (`src/game/systems/ai.zig:331`); decide steers to a demo constant when no
   player exists (index AI findings).
 - `Faction.player` (`src/game/faction.zig:7`) is a faction value, not a
   singleton.

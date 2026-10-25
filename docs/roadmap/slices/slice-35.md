@@ -16,11 +16,11 @@ avoidance [85](slice-85.md)'s.
 
 ### Current foundation
 
-- `decideDir` (`src/game/systems/ai.zig:788` at HEAD) is scalar.
+- `decideDir` (`src/game/systems/ai.zig:831` at HEAD) is scalar.
 - Gather, rsqrt, normalize, sincos, and the packed-SoA-scratch idiom exist in
   `src/core/simd.zig` and `src/core/math.zig` (archive Slice 34).
 - `WorldGateSystem.apply` (`src/game/systems/world_gate.zig`, staged at
-  `simulation_pipeline.zig:1896`) dispatches `gateJob` (`world_gate.zig:207`)
+  `simulation_pipeline.zig:1894`) dispatches `gateJob` (`world_gate.zig:207`)
   over the movement rows under the system's tuner: the bounds clamp and tile
   gate as lane batches on the collision bounds (mirrored into movement-row
   columns by `DataSystem`), then the player row on main

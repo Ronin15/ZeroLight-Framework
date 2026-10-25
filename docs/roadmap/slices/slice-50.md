@@ -3,9 +3,9 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: landed on `core_systems` (`e56e37b`..`987b342`); TSan and `verify` pass.**
-Open before the archive move: the ReleaseFast `zig build test` (once, at the
-branch commit) and the owner's Windows run (Acceptance). Mac runs and
-compiles (owner). Opened the
+The ReleaseFast `zig build test` passed (`750ce0a`). Open before the archive
+move: the owner's Windows run and the open items below (Acceptance). Mac runs
+and compiles (owner). Opened the
 core-systems branch (owner 2026-10-12). Prerequisite for 51 (the lane thread
 relies on the foreign-thread rule, naming, and TSan workflow). 52C adds a TSan
 job.
@@ -21,13 +21,13 @@ instances, dispatches through this pool, so its safety is engine-wide.
 ### Current foundation
 
 - `ThreadSystem` (`src/app/thread_system.zig`) is a fork-join pool with
-  pre-spawned workers; `parallelFor` forwards to `parallelForWithOptions`;
+  pre-spawned workers; `parallelForWithOptions` is the one dispatch entry;
   `JobFn` returns `void`, so jobs cannot propagate errors. There are about 39
   production call sites.
 - Reentrancy is guarded only by `std.debug.assert`s that ReleaseFast strips. A
   nested threaded call from inside a job would overwrite the shared batch
-  while workers read it, and a nested call on a worker mutates the stage or
-  shared tuner concurrently (`selectBatchProfile`, `record`). The inline path
+  while workers read it, and a nested call on a worker mutates the stage
+  tuner concurrently (`selectBatchProfile`, `record`). The inline path
   never touches the shared batch but still touches the tuner.
 - `Batch` packs the read-mostly descriptor with the hot `next_range` claim
   atomic and two per-range telemetry atomics (`main_thread_ranges`,
@@ -61,7 +61,6 @@ instances, dispatches through this pool, so its safety is engine-wide.
   composition mistake, never on a correct hot path).
 - The claim counter stops sharing a line with the descriptor and completion
   data; the only shared RMW left in the claim loop is the claim itself.
-  `WorkerRecord` padding is 65A's.
 - Workers name themselves (Darwin's only supported form); the main thread is
   never renamed (on Linux that renames the process).
 - `-Dsanitize-thread` instruments the unit-test and bench artifacts only (SDL
@@ -114,9 +113,10 @@ instances, dispatches through this pool, so its safety is engine-wide.
 
 ### Acceptance checks
 
-- [ ] `zig build test` passes, and once with `-Doptimize=ReleaseFast`
+- [x] `zig build test` passes, and once with `-Doptimize=ReleaseFast`
       (forced inline identical with asserts stripped). Debug passes in
-      `verify` at the slice tip; ReleaseFast runs once at the branch commit.
+      `verify` at the slice tip; `zig build test -Doptimize=ReleaseFast`
+      passed 1982/1982 at `750ce0a` (2026-10-24).
 - [x] `zig build test -Dsanitize-thread=true` reports zero races on x86_64
       Linux, and the threaded quick bench groups run clean under it; any
       narrowing from the probe is recorded with the exact error. Full suite
@@ -149,27 +149,21 @@ instances, dispatches through this pool, so its safety is engine-wide.
       sanctioned test and bench seam, and production code may only forward its
       stage's controls. The steering band stages forward
       `SteeringConfig.band_items_per_range` (`steering/system.zig:94`),
-      null in production. Original failure text kept below.
-      Failure: production passes `.{}` to `WorldGateSystem.apply`
-      (`simulation_pipeline.zig:1896`), so `WorldGateConfig.items_per_range` and
-      `.max_worker_threads` (`world_gate.zig:36`) are set only by tests and
-      benches; the same holds for `MovementConfig` (`movement.zig:20`), chunk
-      derive, and the per-stage worker caps (`StageControls.max_worker_threads`,
-      `thread_system.zig`), each to be audited. Pass: fixed shapes come from
-      bench fixed-shape controls over `StageControls`, no production config
-      field is written by tests or benches alone, and the tuner-pin sites are
-      unchanged in behavior.
+      null in production.
 - [x] The idiom lint flags a production literal `items_per_range` or
       `max_worker_threads` passed to `Dispatch` outside tests and benches
       (`tools/lint_idioms.py`). Rule 13 (`166075c`): 13.1 range and worker
       fields, 13.2 `adaptive`, 13.3 a dispatch no tuner records; production is
       hit-free with no exemptions.
 - [ ] The 14 `pipeline_*` runtime-log timers are cost-driver stages or move
-      to the bench-only channel. Failure: `runtime_perf_log.zig:170-183`
+      to the bench-only channel. Failure: `src/app/runtime_perf_log.zig:170-183`
       (`pipeline_spatial_index` through `pipeline_chunk_derive`) time whole
       stage calls, which `.claude/rules/threading.md` § Verification and
-      diagnostics reserves to bench output. Pass: the runtime log records only
-      cost-driver stages; the census reads the rest through `BenchTiming`.
+      diagnostics reserves to bench output. `BatchStage` itself is already
+      the 11 change-path cost drivers (`005cdae`,
+      `src/app/runtime_perf_log.zig:217-240`); only these timers remain. Pass:
+      the runtime log records only cost-driver stages; the census reads the
+      rest through `BenchTiming`.
 - [ ] Dig-path batches are tagged in the `production-step` census once a dig
       case exists. Failure: the terrain edit plan and write dispatches
       (`world/edit.zig:79-85`) and the nav mark dispatch
@@ -181,7 +175,7 @@ instances, dispatches through this pool, so its safety is engine-wide.
       switch (`.claude/rules/tests-benchmarks.md` § Test and production code 4).
       Failure: tests read `NavUpdateStats.dirty_chunks`, `.chunks_patched`,
       `.records_patched` (`pathfinding/types.zig:311-321`), the
-      `PathfindingStats` `*_ns` fields (`:286-304`), and `NavGraph` pool grows.
+      `PathfindingStats` `*_ns` fields (`types.zig:550`), and `NavGraph` pool grows.
       Pass: those reads are bench checks or observable-result asserts.
       `incremental_rebuilds` and `levels_built` stay live (`nav_reaction.zig:340`
       emits `nav_region_invalidated` from them).

@@ -21,8 +21,10 @@ Slice 75's distance bands are another.
   movement-body append (`src/game/simulation_scope.zig`); the tier and LOD
   distance helpers live there too.
 - `SimulationScopeSystem` (`src/game/systems/simulation_scope.zig`) gathers
-  the unstaggered halo (`gatherAiPopulations`, with a serial twin, padded
-  per-range slots, range-ordered merge); `compactCognition` picks the
+  the unstaggered halo (`gatherAiPopulations`, `systems/simulation_scope.zig:287`, one tuned stage
+  under `ai_gather_tuner` that runs inline below the tuner's gate, per-range
+  padded `SlotList(GatherTally)` tallies `:123`, range-ordered window
+  compaction); `compactCognition` picks the
   staggered think set from the index built over it (`ai_cognition_order`).
 - `simViewRegion(context)` in `src/game/simulation_pipeline.zig` is the one
   scope-band source; `stageTierPolicy` already reads it.
@@ -64,8 +66,8 @@ Slice 75's distance bands are another.
   no cap or deferral (`.claude/rules/budgets-capacities.md`).
 - The decide set never depends on the render window
   (`.claude/rules/simulation.md` § Scope and tiers).
-- Threaded gather with a serial twin, range-ordered merge
-  (`.claude/rules/threading.md`).
+- Decide-set gather as a tuned stage with its own tuner, inline below the
+  gate, range-ordered merge (`.claude/rules/threading.md` § Building a stage).
 - Provides: idle coasting as one input to 73's per-agent think interval
   (75's distance bands are another); the decide set that Slice 68A's shared
   table is walked by. 75 replaces the halo bound on the think set.
@@ -78,7 +80,8 @@ Slice 75's distance bands are another.
 - [ ] Pure coast contract (classes, intervals, phase, decide-on-tick) with
       unit tests: each alert input alone, band boundary, agitation override,
       phase spread, exact decisions per cycle.
-- [ ] Threaded decide-set gather with a serial twin, fed from the think set.
+- [ ] Decide-set gather as a tuned stage with its own tuner, inline below the
+      gate, fed from the think set.
 - [ ] Pipeline: new stage between affect and AI decide with its resource tag
       and contract; AI decide reads the decide set; scope stats count coast
       skips.

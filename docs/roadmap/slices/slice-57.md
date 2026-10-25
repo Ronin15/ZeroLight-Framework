@@ -19,8 +19,12 @@ it is deterministic and allocation-free after reserve.
 - Strict JSON-to-table authoring precedent: `ai_archetypes.zig` and the
   tileset and sprite metadata loaders.
 - `assets/sprites/grim_items.json` holds item icons (weapons, armor, potions,
-  coins, keys, gems, tools); `RuntimeAssets.spriteAtlasMeta(.grim_items)` and
-  `SpriteAtlasMeta.spriteByName` resolve them; `AssetReference { sprite,
+  coins, keys, gems, tools); `RuntimeAssets.spriteAtlasMeta(.grim_items)`
+  (`assets/runtime_assets.zig:130`) and `SpriteAtlasMeta.sourceRectForId`
+  (`assets/sprite_atlas_meta.zig:94`) resolve an icon id; the name-to-id map
+  (`name_to_id`) has no public lookup since `spriteByName` was removed
+  callerless (`c1313b1`), so the catalog loader adds its production name
+  lookup; `AssetReference { sprite,
   atlas_entry_id }` (`data_system/types.zig`) carries them in sim data.
 - `ActionKind.use` exists in `simulation.zig` with no consumer.
 - The collision-trigger stream (`systems/collision_response.zig`) emits one

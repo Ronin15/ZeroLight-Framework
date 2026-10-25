@@ -96,7 +96,7 @@ sized to today's four drives and five behaviors:
 - The interval decides think-set membership, never its order: due agents
   reach the think-set stages in the index's cell-major order (Slice 84;
   `docs/architecture.md`). A test inside the think set's phase test
-  (`cognitionJob`, `src/game/systems/simulation_scope.zig:866`) keeps that
+  (`cognitionJob`, `src/game/systems/simulation_scope.zig:735`) keeps that
   order; a schedule that emits due agents unordered (a timing wheel) buckets
   them by index cell first, O(due agents). An unordered think set stays
   correct but loses neighbor-block reuse.
@@ -142,8 +142,8 @@ sized to today's four drives and five behaviors:
       fingerprint; relative version bumps; stages and components stated for
       Tables T4/T5.
 - [ ] Appraisal and memory decay use one masked kernel. Failure: the four
-      drive loops (`affect.zig:466`, `:509`, `:558`, `:605`) and the memory
-      decay (`ai_memory.zig:537`) run the lane kernel, then repeat that
+      drive loops (`affect.zig:464`, `:507`, `:556`, `:603`) and the memory
+      decay (`ai_memory.zig:533`) run the lane kernel, then repeat that
       math one row at a time (`memory-performance.md` § SIMD and core math).
       The per-drive loops go away with the content appraisal. Pass: each
       loop that remains ends in that kernel with a mask. Inactive lanes do

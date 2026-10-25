@@ -2,8 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 84](../archive/slice-84.md), [Slice 86](slice-86.md) (branch order) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
-**Status: not started.** Routed by the 64G combined review (area D M1, M4,
-L10) and the movement intent measurement.
+**Status: in progress.** Routed by the 64G combined review (area D M1, M4,
+L10) and the movement intent measurement. Landed: the movement and particle
+masked last batch (`da2adfb`); the rest is open.
 
 Goal: steering queries 84's shared index instead of building and sorting a
 private grid; an entity create or destroy invalidates only what it changed in
@@ -13,23 +14,27 @@ keeps the apply local.
 ### Current foundation
 
 - Private grid, whole in `src/game/systems/steering/agent_grid.zig`:
-  `buildAgentGrid` (`:35`), banded build (`:62`), `sortCellEntries` (`:263`).
+  `buildAgentGrid` (`:37`), `buildAgentGridDirect` (`:49`), banded build
+  (`:64`), `sortCellEntries` (`:265`).
   It sorts the positions the spatial index already sorted.
 - Grid state outside `agent_grid.zig` that goes with it (`steering/system.zig`):
-  - the grid buffers' `deinit` (`:198`, `:203-205`) and reserve (`:507-509`,
-    `:512`; `band_rows` at `:519-520` is shared with `select_resolve`);
-  - the grid tuners (`:190-191`), stats (`:127-129`, `:135`), and step timer
-    (`:317-319`);
-  - `spatial_cell_size` in the `agents` stage (`:395-397`), `largestReach`
-    (`:730`), and `AgentsTally.largest_reach` (`:584`);
-  - test expectations at `system.zig:1256-1263` and `:1391-1420`, and
-    `steering/test_support.zig:21`.
-- `changeInvalidatesSteeringMovementIndexCache` (`system.zig:747`) drops the
+  - the grid buffers' `deinit` (`:203-210`) and reserve (`:494-499`;
+    `band_rows` at `:507` is shared with `select_resolve`);
+  - the grid tuners (`:195-196`), stats (`grid_ns` `:112`), and step timer
+    (`:313`);
+  - `spatial_cell_size` (`:181`, `:382-384`), `largestReach` (`:711`), and
+    `AgentsTally.largest_reach` (`:571`);
+  - test expectations on the grid tuners and `grid_ns` (`system.zig:1226-1233`,
+    `:1354`).
+- The grid sort and claim stages forward `SteeringConfig.band_items_per_range`
+  (null in production; `system.zig:94`, `166075c`). The obstacle push is
+  lane-kept (`65c60ab`).
+- `changeInvalidatesSteeringMovementIndexCache` (`system.zig:728`, used at `:236`) drops the
   whole movement-index cache on any `entity_created`.
-- `accumulateAgentAvoidanceBounded` (`steering/avoidance.zig:360`) is scalar
+- `accumulateAgentAvoidanceBounded` (`steering/avoidance.zig:386`) is scalar
   over up to 64 candidates per agent and states no SIMD verdict; the sibling
   obstacle push is SIMD.
-- Steering writes the movement intents (`avoidance.zig:216`) that
+- Steering writes the movement intents (`avoidance.zig:213`) that
   `apply_ai_movement_intents` applies.
 - 84's shared index (`docs/architecture.md`, `SpatialIndexSystem`): a query
   reads one level and a faction set within a world radius, skips `self`
@@ -62,11 +67,11 @@ keeps the apply local.
 
 - [ ] Steering reads 84's index; its grid and sort are deleted. Failure
       scenario: two sorts of the same positions every step. The grid has no
-      level key: entries hold only cell and row index (`agent_grid.zig:247`),
-      sorted by `(cell_y, cell_x, row)` (`:263`, `:339`), and
+      level key: entries hold only cell and row index (`agent_grid.zig:249`),
+      sorted by `(cell_y, cell_x, row)` (`:265`), and
       `accumulateAgentAvoidanceBounded` counts each entry against
-      `max_agent_candidate_checks` (64, `avoidance.zig:44`) at `:395`, before
-      its level gate at `:400`, then reads 5 snapshot columns per candidate
+      `max_agent_candidate_checks` (64, `avoidance.zig:41`) at `:421`, before
+      its level gate at `:426`, then reads 5 snapshot columns per candidate
       through the row index (contiguity audit H1, code audit H2;
       `.claude/rules/memory-performance.md` § Data-oriented design,
       `.claude/rules/simulation.md` § Controllers and processors). Failure
@@ -77,16 +82,16 @@ keeps the apply local.
       sort per step in the `production-step` census; `steering` within spread
       or faster; a levels axis on the `steering` bench with avoidance samples
       and checks per agent flat in L. The grid's false "nearly sorted"
-      comment (`agent_grid.zig:266`; keys are rebuilt in slot order every
+      comment (`agent_grid.zig:267`; keys are rebuilt in slot order every
       build) goes with it.
 - [ ] A create or destroy invalidates only the cache entries it affects
-      (`system.zig:747`). Failure scenario (derived): a spawn burst makes every
+      (`system.zig:728`). Failure scenario (derived): a spawn burst makes every
       steering row re-resolve its movement index that step, nanoseconds per
       row, threaded. Pass: a test that unrelated rows keep their cached
       index; a spawn-churn `steering` case flat in population for a fixed
       churn.
 - [ ] The agent avoidance accumulate is vectorized (moved from 35; docs audit
-      M9). Failure: `accumulateAgentAvoidanceBounded` (`avoidance.zig:360`),
+      M9). Failure: `accumulateAgentAvoidanceBounded` (`avoidance.zig:386`),
       which this slice rewrites onto 84's index, runs its per-neighbor float
       math scalar with no verdict at the site; the rewritten loop is a
       gather-bound per-agent loop, so it ships SIMD
@@ -100,32 +105,30 @@ keeps the apply local.
       (`.claude/rules/memory-performance.md` § Allocator discipline).
 - [ ] Movement intents reach the apply in movement-row order. Failure
       scenario: `frame.intents` is written in steering's selected order
-      (`avoidance.zig:216`), so the apply resolves each intent's movement row
-      (`movement.zig:133`) and writes the rows scattered (contiguity audit M3;
+      (`avoidance.zig:213`), so the apply resolves each intent's movement row
+      (`movement.zig:132`) and writes the rows scattered (contiguity audit M3;
       `.claude/rules/memory-performance.md` § Data-oriented design,
       `.claude/rules/threading.md`). Measured gain above (ReleaseFast only;
       Debug numbers come first, `.claude/rules/build-validation.md`). Pass:
       the apply walks its intents in row order with no per-intent row lookup;
       `movement-apply-intents` within spread of `-sorted`, with the ordering
       cost counted in steering.
-- [ ] Movement and particle updates drop the scalar remainder. Failure:
-      `processRange` (`movement.zig:261`) and the particle update
-      (`particle.zig:507`) run the lane kernel, then repeat that math one
-      row at a time (`memory-performance.md` § SIMD and core math). Pass:
-      the remainder is that kernel with a mask. Inactive lanes do not
-      write past the range.
+- [x] Movement and particle updates drop the scalar remainder (`da2adfb`).
+      The last batch is the lane kernel with a mask, inactive lanes do not
+      write past the range (`movement.zig:255-276`, `particle.zig:456-514`,
+      `IntentLanes.flush` masked).
 - [ ] `steering_update` declares its carried inputs (84's audit). Failure:
       steering reads the previous step's positions and levels
-      (`steering/system.zig:350`) before `apply_ai_movement_intents` writes
-      positions, but its arm (`simulation_pipeline.zig:236`) declares no
-      `carried` (`.claude/rules/simulation.md` § Pipeline and stage
+      (`steering/system.zig:352`) before `apply_ai_movement_intents` writes
+      positions, but its arm (`simulation_pipeline.zig:246`) declares only
+      `carried static_colliders` (`.claude/rules/simulation.md` § Pipeline and stage
       ordering). Failure scenario: moved after a position or level writer, it
       still compiles and reads this step's poses against the previous step's
       index. Pass: the arm carries `movement_positions` and `world_level`
       (and reads `spatial_index` once steering queries it), so the reorder
       fails the comptime check.
 - [ ] No per-step width error (84's L1 review). Failure: the step returns
-      `error.Overflow` past `max_step_items` (`steering/system.zig:298-299`)
+      `error.Overflow` past `max_step_items` (`steering/system.zig:293`)
       behind an assert, a distinct per-step error where the bound is a format
       width (`.claude/rules/budgets-capacities.md`). Failure scenario: a
       caller that handles growth failures as `OutOfMemory` meets a different
@@ -133,7 +136,7 @@ keeps the apply local.
       (the population seam or `reserve`, as `OutOfMemory`) and the step keeps
       only the assert.
 - [ ] `select_claim` dispatches items that track its work (84's audit).
-      Failure: its items are bands (`steering/selection.zig:77`, `:89`), at
+      Failure: its items are bands (`steering/selection.zig:82`, `claim_stage.select(bands.band_count, 1)`), at
       most a fixed band count of `BandPartition` at scale, whatever the
       intents behind them (`.claude/rules/threading.md`: never a fixed
       partition count whose work varies behind it). Failure scenario: at
@@ -147,17 +150,17 @@ keeps the apply local.
       movement-intent write), `systems/movement.zig`, `systems/particle.zig`,
       and the `data_system/movement.zig` and `data_system/agents.zig` stores.
       Each finding becomes an item here.
-- [ ] `buildAgentGridDirect` (`steering/agent_grid.zig:38-59`) is a separate
+- [ ] `buildAgentGridDirect` (`steering/agent_grid.zig:49`) is a separate
       no-worker entry from `buildAgentGrid` (`.claude/rules/tests-benchmarks.md`
       § Test and production code, point 1). If this slice keeps the grid it is
       deleted; the grid itself goes with the first item. Deleting it makes the
-      one-band fast path (`steering/avoidance.zig:389`) dead, and
-      `src/benchmarks/steering.zig:262` (`largestGridBand`) counts bands from
+      one-band fast path (`steering/avoidance.zig:406-410`) dead, and
+      `src/benchmarks/steering.zig:290` (`largestGridBand`) counts bands from
       the one-band form; both move to the banded form. Deleting it adds a
       constant band search per avoidance cell lookup. Pass: that cost checked
       by `steering` at three sizes, inline and threaded, same mode.
 - [ ] A no-worker serial branch in steering selection
-      (`steering/selection.zig:52`, the `orelse` of `withWorkers` calling
+      (`steering/selection.zig:53`, the `orelse` of `withWorkers` calling
       `resolveAndClaim` once;
       `.claude/rules/tests-benchmarks.md` § Test and production code, point
       1). Pass: removed after a cost check that the stage run inline does no

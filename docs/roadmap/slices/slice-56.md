@@ -37,8 +37,9 @@ projectiles (56B), equipment modifiers (57), knockback and retaliation
 - Components: `Component = enum(u5)` with 14 tags
   (`src/game/data_system/types.zig`); MAL store pattern in
   `data_system/destructible.zig`.
-- RNG: stateless `mix64` / `uniformF32` / `boundedU32`
-  (`src/core/rng.zig`); AI keys draws off `AiConfig.intent_seed`. Slice 49
+- RNG: stateless `mix64` / `uniformF32` / `unitVec2`
+  (`src/core/rng.zig`; `boundedU32` was removed callerless, `c1313b1`, so a
+  bounded integer draw is added with this slice's first caller); AI keys draws off `AiConfig.intent_seed`. Slice 49
   supplies `SimulationSeed` / `SeedDomain` and `StepIndex = u64`; today
   `step_count` is `u32` (`src/game/systems/simulation_scope.zig`).
 - Affect gathers optional inputs with "no signal" defaults

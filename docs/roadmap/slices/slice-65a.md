@@ -22,13 +22,13 @@ of CPU count with no core reserved for the lane; no dispatch regression.
   (`4998400`), so `SlotList`s and embedded slot fields need no per-type assert;
   the collision, nav reaction, and pathfinding range records use it (the old
   `RowCountTally`, `BroadphaseRangeSlot`, and `ContactCountTally` are gone).
-  `GatherTallySlot` (`simulation_scope.zig:499`) still hand-builds the same
-  shape under its own assert, and the tier-1 corridor pool entries pad
-  separately.
-- `WorkerRecord` (`thread_system.zig`, `{ id, shared, wake, thread }`) is
-  56 B with alignment 8 on x86_64-linux (Zig 0.17 probe) and allocated as one
-  slice, so records straddle lines and main's post to one worker contends
-  with its neighbor's wake.
+  `GatherTallySlot` is `PaddedSlot(GatherTally)`
+  (`systems/simulation_scope.zig:500`, `750ce0a`). Records still hand-aligned
+  to `thread_shared_record_alignment`: `pathfinding/scratch.zig:352` and
+  `:394`, `pathfinding/connectivity.zig:315`; the tier-1 corridor pool
+  entries pad separately.
+- `WorkerRecord` starts its own line, comptime-asserted
+  (`thread_system.zig:1440-1455`, `fce97cd`).
 - `SimulationEvents.range_stats` (`simulation.zig`) is one unpadded record per
   range; `RangeOutputStream`'s per-range counts and write offsets are dense
   `usize` arrays. Every production event producer writes from the main thread
@@ -68,12 +68,13 @@ of CPU count with no core reserved for the lane; no dispatch regression.
 - [ ] Shared quantum, padding helper, and layout gate in `thread_system.zig`;
       every padded slot site imports them and gates its types; private copies
       deleted. Quantum, helper, and the deletions landed with 64G (`819d8d8`);
-      the layout gate and its use at every site remain.
+      `PaddedSlot` (`4998400`, `thread_system.zig:1526`) is the gate for slot
+      types; the sites above remain hand-aligned.
 - [ ] `idiom-lint` rule rejecting a private quantum or helper outside the
       owner.
-- [ ] `WorkerRecord` padded to exactly one line, comptime-asserted, with a
+- [x] `WorkerRecord` padded to exactly one line, comptime-asserted, with a
       test that records sit one line apart and a batch still covers every
-      item.
+      item (`fce97cd`; comptime `thread_system.zig:1453-1454`, test `:3993`).
 - [ ] `src/platform/thread_priority.zig` lowering the calling thread per OS;
       a readback test shows other threads unchanged (skips on sandboxed
       builders).

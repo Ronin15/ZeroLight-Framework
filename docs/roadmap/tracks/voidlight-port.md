@@ -187,7 +187,7 @@ rebuild are `normalized` (64B) and rebuilt on load.
 65B, 65C, 67C (beyond its header bump), 69A, 69B, 69E, 70A, 70B, 71B, and 71C
 add no saved state.
 
-### T4. Merged `stage_order` (live 20, plus 55/56/56B/57/59/62/63, plus 64–71)
+### T4. Merged `stage_order` (live 21, plus 55/56/56B/57/59/62/63, plus 64–71)
 
 | # | Stage | Origin |
 | --- | --- | --- |
@@ -195,32 +195,33 @@ add no saved state.
 | 1 | dig_world_edit | live |
 | 2 | scope_advance_and_ai_gather | live |
 | 3 | spatial_index_build | live; 68A entity table columns |
-| 4 | perception_update | live |
-| 5 | ai_memory_update | live; 68B `carried combat_state` |
-| 6 | affect_update | live; 42 `+reads environment` (caution) |
-| 7 | ai_decide_gather | 55 |
-| 8 | ai_decide | live; 71A `carried spawn_anchors`; 71D `carried inventory_state`, `faction_relations` |
-| 9 | path_goal_resolve | live (64G); reads `navigation_intents`, writes `path_goals` |
-| 10 | steering_update | live; 71B.1 `carried static_colliders` |
-| 11 | pathfinding_update | live; 71B.3 `carried interest_markers, spawn_anchors` |
-| 12 | apply_ai_movement_intents | live |
-| 13 | movement_integrate | live |
-| 14 | **knockback_apply** | 68B; writes `movement_positions`, `movement_knockback` |
-| 15 | collision_scope_gather | live |
-| 16 | collision_detect | live; 71B `carried static_colliders` |
-| 17 | collision_respond | live |
-| 18 | bounds_and_tile_gate | live |
-| 19 | plane_traversal | live |
-| 20 | chunk_derive | live |
-| 21 | ai_action_select | 56; 68A writes `ai_action_deferrals` |
-| 22 | action_react | live |
-| 23 | projectile_update | 56B |
-| 24 | combat_resolve | 56; 68B `+writes movement_knockback`; 68C `+reads/writes inventory_transfers`, `+carried inventory_state` |
-| 25 | inventory_update | 57 |
-| 26 | social_react | 63 |
-| 27 | **guard_alarm** | 71A; writes `affect_impulses` |
-| 28 | tier_policy | live |
-| 29 | population_update | 62 |
+| 4 | ai_cognition_order | live (84); reads `spatial_index`, writes `ai_cognition_indices` |
+| 5 | perception_update | live; reads `ai_cognition_indices` |
+| 6 | ai_memory_update | live; 68B `carried combat_state` |
+| 7 | affect_update | live; 42 `+reads environment` (caution) |
+| 8 | ai_decide_gather | 55 |
+| 9 | ai_decide | live; 71A `carried spawn_anchors`; 71D `carried inventory_state`, `faction_relations` |
+| 10 | path_goal_resolve | live (64G); reads `navigation_intents`, writes `path_goals` |
+| 11 | steering_update | live |
+| 12 | pathfinding_update | live; 71B.3 `carried interest_markers, spawn_anchors` |
+| 13 | apply_ai_movement_intents | live |
+| 14 | movement_integrate | live |
+| 15 | **knockback_apply** | 68B; writes `movement_positions`, `movement_knockback` |
+| 16 | collision_scope_gather | live |
+| 17 | collision_detect | live |
+| 18 | collision_respond | live |
+| 19 | bounds_and_tile_gate | live |
+| 20 | plane_traversal | live |
+| 21 | chunk_derive | live |
+| 22 | ai_action_select | 56; 68A writes `ai_action_deferrals` |
+| 23 | action_react | live |
+| 24 | projectile_update | 56B |
+| 25 | combat_resolve | 56; 68B `+writes movement_knockback`; 68C `+reads/writes inventory_transfers`, `+carried inventory_state` |
+| 26 | inventory_update | 57 |
+| 27 | social_react | 63 |
+| 28 | **guard_alarm** | 71A; writes `affect_impulses` |
+| 29 | tier_policy | live |
+| 30 | population_update | 62 |
 
 - **External resources:** `action_intents`, `interest_markers`,
   `structural_events`, plus `time_skip_request` (69C), `weather_overrides`

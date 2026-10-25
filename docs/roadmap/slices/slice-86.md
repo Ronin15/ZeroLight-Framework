@@ -4,17 +4,18 @@
 
 **Status: in progress.** Owner direction 2026-10-11: collision as a whole
 subsystem against the current cost model and rules. 71B.1's collision queries
-and 71B.2's static split moved here (owner 2026-10-16). Its inert-row item
-lands after 88 (index, merged order 9b). Landed on `core_systems` through
-`28f6b61`: banded sweep merge, one collision path, contiguous static and
+and 71B.2's static split moved here (owner 2026-10-16). Landed on
+`core_systems`: banded sweep merge, one collision path, contiguous static and
 path-registry runs, statics out of the per-step sweep, response apply as
-occupied 16-row blocks streaming packed columns (`intent_order` is gone),
-and the hot-loop packs checked below. The static-query masked compare
-landed in `483d88e`. The owner closed it: the ReleaseFast gaps were inside
-the spread. Gather and sort are off main on the `collision` group, and the
-tall, stacked, and thin shapes meet their pass. Still open: `zig build
-the inert-row half of `production-step`. `zig build verify` passed. Rows at
-rest stay after slice 88.
+occupied 16-row blocks streaming packed columns (`intent_order` is gone), the
+hot-loop packs and the static-query masked compare (`483d88e`), per-range
+slots sized from the selection (`42192b2`), the stored-trigger store
+(`a8e0a33`, `de8d308`), and response place merged on main (`faa3200`). The
+owner closed the ReleaseFast gaps as inside the spread. Gather and sort are
+off main on the `collision` group, and the tall, stacked, and thin shapes
+meet their pass. Still open: tier-toggle trigger refresh, static query hit
+rows, tuned slot trim, and rows at rest (after slice 88, index merged order
+9b). `zig build verify` passed.
 
 Goal: each body's broadphase work follows its local same-level density,
 never column height or level count. Gather and sort leave the main thread.
@@ -32,19 +33,21 @@ the current bench.
   workers those same functions run inline. The sweep key includes level and
   strip. Statics are not sweep entries. Dynamic×static pairs come from
   `StaticColliderSystem` query columns. Solid static×static pairs are
-  dropped. A static trigger over a static is stored until the collider
-  revision changes, and that refresh runs at the collider sync.
+  dropped. Stored triggers live in per-level page trees (`TriggerStore`,
+  `collision_triggers.zig`; `4b44ca6`, `a8e0a33`), patched at the commit seam
+  and refreshed when the allow epoch moves (`refresh`, `:1672`); emission is
+  one dispatch by emitted cursor with no count pass (`de8d308`).
 - `CollisionResponseSystem.gatherRange` stays scalar. `computeIntentMath`
   streams the intent columns in lanes, and the remainder is that multiply
   on a prefix. With workers, each range groups placed intents on a direct
   table keyed by `movement_row >> 4` and scatters the apply columns in
   that order. Apply items are the occupied 16-row blocks. Each run is a
-  unit-stride prefix; movement position and velocity are gathered at the
-  flush. `intent_order` is gone.
+  unit-stride prefix; movement position and velocity are gathered at the  flush. `intent_order` is gone. `placeRuns` (`collision_response.zig:986`)
+  runs on main after the gather join (`faa3200`).
 - The fill packs each slot's lane inputs before `fillSlots`. `writeSorted`
   copies proxy bounds into the entry columns; the sweep loads those columns
   unit-stride. Narrowphase and static-hit overlap keep the speed squares in
-  lanes. A stored trigger pair carries an allow word. The Debug rect
+  lanes. The Debug rect
   compare runs after the query joins. The static query's overlap test is
   one masked compare over the column span the box covers (`483d88e`).
 - Collision runs on `locomotion` and `cognition` tier rows.
@@ -78,8 +81,7 @@ the current bench.
   bound at the seam (`.claude/rules/threading.md`,
   `.claude/rules/budgets-capacities.md`).
 - The static split landed in `b126599`. Solid static×static pairs are not
-  contacts. A static trigger over a static keeps its trigger event
-  (`collision_response.zig:684`). Dynamic × static capacity terms from 61
+  contacts. A static trigger over a static keeps its trigger event (`collision_response.zig:691-693`). Dynamic × static capacity terms from 61
   and 62 stay.
 - A static body moves only through structural commands
   (`.claude/rules/simulation.md` § Controllers and processors); a Debug
@@ -186,7 +188,7 @@ the current bench.
       consumers; the path registry item and the two items below build on this
       structure.
 - [x] Collision's static queries read `StaticColliderSystem`
-      (`queryBox` `static_colliders.zig:372`, `collectOverlaps` `:392`) instead of gathering statics every
+      (`queryBox` `static_colliders.zig:422`, `collectOverlaps` `:442`) instead of gathering statics every
       step (moved from 71B.1). Failure scenario: every static row is
       gathered and sorted each step (`collision.zig:473`, `:684`). Pass:
       `collision-static-index-change` flat in static count.
@@ -218,27 +220,27 @@ the current bench.
       destructible cell scan is 72 D1, which replaces that scan. The other
       hits are the items below.
 - [x] Warm fill packs each slot before the lane kernel. Landed in
-      `6670f2e`. `packFillRange` (`collision.zig:2547`) writes position,
+      `6670f2e`. `packFillRange` (`collision.zig:2706`) writes position,
       offset, size, level, entity index, and `filled` (`u32`, 0 or 1).
-      `fillSlots` (`:2593`) loads those columns: a full group with
+      `fillSlots` (`:2754`) loads those columns: a full group with
       `loadFloat4`, a short tail with `loadFloat4Prefix`.
-      `chooseSplitters` (`:2655`) still resolves its fixed sample on main.
+      `chooseSplitters` (`:2815`) still resolves its fixed sample on main.
       Failure: a warm step read `warm_sources`, bounds, and movement
       position and velocity per lane (`memory-performance.md` § Data-oriented
       design, § SIMD and core math). Pass: the fill job packs those columns
       once in slot order, and `fillSlots` loads that scratch with the lane
       kernel and a masked tail.
 - [x] `writeSorted` stores proxy bounds in entry order. Landed in
-      `9f15071`. After the band merge, `writeSorted` (`collision.zig:2792`)
+      `9f15071`. After the band merge, `writeSorted` (`collision.zig:2952`)
       copies `min_x/min_y/max_x/max_y` from the proxy at `entry.slot` into
-      the entry columns. `SortEntry` stays 32 bytes (`:178`). The sweep
-      (`sweepEntries`, `:2867`) loads those columns unit-stride.
+      the entry columns. `SortEntry` stays 32 bytes (`:199`). The sweep
+      (`sweepEntries`, `:3024`) loads those columns unit-stride.
       Failure: after the band is in key order, each lane group gathered
       those columns and the warm source by slot
       (`memory-performance.md` § Data-oriented design). Pass: the values
       ride in the entry columns, and the sweep loads them unit-stride.
 - [x] Intent math's remainder is the lane multiply. Landed in `d9e5f13`.
-      `computeIntentMath` (`collision_response.zig:770`) stores a full group
+      `computeIntentMath` (`collision_response.zig:774`) stores a full group
       with `storeFloat4Slice`. The leftover intents use `loadFloat4Prefix`
       and `storeFloat4Prefix`, so the store does not run past the window.
       Failure: the correction and velocity scale ran in lanes, then repeated
@@ -246,62 +248,57 @@ the current bench.
       Pass: the remainder is that kernel with a mask. Inactive lanes do not
       write past the window.
 - [x] Narrowphase keeps speed squares in the lane kernel. Landed in
-      `bc5c518`. `writeNarrowphaseContactsSimd` (`collision.zig:2928`)
+      `bc5c518`. `writeNarrowphaseContactsSimd` (`collision.zig:3085`)
       gathers velocity with the AABBs and stores the squares from the lanes.
       A short group repeats the last in-range pair and the store mask drops
       it. Compaction walks the emit mask. `contactForResolved` is gone.
-      `contactForCandidate` (`:3014`) is the test oracle.
+      `contactForCandidate` (`:3171`) is the test oracle.
       Failure: overlap, normal, and penetration were lanes, then each valid
       lane called `contactForResolved`
       (`memory-performance.md` § SIMD and core math). Pass: velocity and the
       speed squares stay in that lane loop. Compaction into the window may
       stay scalar.
 - [x] Static-pair hits are packed before the contact loop. Landed in
-      `ee92e92`. `packStaticHits` (`collision.zig:1844`) writes movement
+      `ee92e92`. `packStaticHits` (`collision.zig:2152`) writes movement
       index, generation, allow (0 or 1), and velocity onto the hit row.
-      `writeStaticHitContacts` (`:1889`) streams those columns.
+      `writeStaticHitContacts` (`:2197`) streams those columns.
       Failure: after the search, every hit indexed `row_of_index`, tier, and
       the movement row (`memory-performance.md` § Data-oriented design).
       Pass: the contact loop streams hit columns that already hold entity,
       movement index, allow bit, and velocity.
-- [x] Stored trigger pairs read a packed allow word. Landed in `af44a86`.
-      `trigger_allow` is one `u32` per stored pair, 0 or 1, in pair order.
-      `packTriggerAllow` (`collision.zig:1673`) reserves once and packs the
-      column when exclusion is on and the column is stale, on the
-      trigger-allow stage or inline below its gate. `appendTriggerContacts`
-      (`:1654`) does not call `tierAt`. `collision_allow_epoch` moves when a
-      tier crosses `allowsCollision` (`data_system/system.zig:305`) and when
-      a movement row is removed (`:937`). A new body does not move it.
+- [x] Stored trigger pairs read a packed allow word (`af44a86`). Superseded
+      by `de8d308`: per-page valid and allowed masks and node prefixes replace
+      the allow word (`trigger_allow`, `packTriggerAllow`,
+      `appendTriggerContacts`, and `writeTriggerRow` are gone).
+      `collision_allow_epoch` moves when a tier crosses `allowsCollision`
+      (`data_system/system.zig:306`) and when a movement row is removed
+      (`:995`). A new body does not move it.
       Failure: every step walked every stored pair and sliced the movement
       store per pair (`memory-performance.md` § Data-oriented design;
       `threading.md` § What runs where). Pass: main does not call `tierAt`.
       The allow bit is packed before that pass, and main reserves once.
 - [x] Static hit contacts use the narrowphase overlap lanes. Landed in
-      `ee92e92`. `writeStaticHitContacts` (`collision.zig:1889`) is that
+      `ee92e92`. `writeStaticHitContacts` (`collision.zig:2197`) is that
       kernel, including a 1–3 hit tail via prefix loads. A shared edge stays
       a query hit and is not a contact. The search stays scalar.
-      `writeTriggerRow` (`:2214`) still builds stored-trigger contacts one
-      at a time.
       Failure: each hit ran `contactForAabbs` on a dense hit buffer that the
       next body reuses (`memory-performance.md` § SIMD and core math). Pass:
       the overlap math on that buffer is one masked lane loop. The search
       stays scalar.
 - [x] Static query overlap. The masked compare landed in `483d88e`.
-      `scanUncapped` (`static_colliders.zig:601`) and `queryBox`'s
-      capped walk (`scanCapped`, `:626`) share `overlapMaskLanes` (`:742`).
+      `scanUncapped` (`static_colliders.zig:650`) and `queryBox`'s
+      capped walk (`scanCapped`, `:676`) share `overlapMaskLanes` (`:792`).
       A full group loads with `loadFloat4`; a short slice uses
       `loadFloat4Prefix`. The anchor walk and the chunk search stay scalar.
-      The scan reads the column span the box covers. `queryBox` (`:372`)
-      uses that compare and still stops on the work budget and the hit cap.
+      The scan reads the column span the box covers. `queryBox` (`:422`) uses that compare and still stops on the work budget and the hit cap.
       A copy of short runs into a side group is not this kernel. ReleaseFast
       `collision-static-heavy`, one static per cell, 30 iterations, 3 reps,
       both sides inline: 4,096 110.2 → 127.4 µs (+17 µs), 16,384 123.6 →
       110.9 µs (−13 µs), 65,536 151.4 → 104.7 µs (−47 µs), all inside wide
       spreads. The owner closed it on that pair.
 - [x] Debug static scan does not read `DataSystem`. Landed in `28f6b61`.
-      The overlap scan records the entity ids it walked (`recordSpan`,
-      `static_colliders.zig:608`). After the query joins,
-      `compareStoredRects` (`collision.zig:2059`) checks each distinct
+      The overlap scan records the entity ids it walked (`recordSpan`, `static_colliders.zig:660`). After the query joins,
+      `compareStoredRects` (`collision.zig:2374`) checks each distinct
       static's stored bounds against the live rect. A mismatch is
       `StaticMovedOutsideCommit`. ReleaseFast calls `collectOverlaps` and
       does not record, stamp, or compare.
@@ -345,12 +342,11 @@ the current bench.
 - [x] Response apply streams packed columns. Landed in `24970f0`.
       Gather scatters correction, normal, velocity scale, kind, and movement
       row into `packed_intents` in apply order (`collision_response.zig:952`).
-      `intent_order` is gone. `applyBlockJob` (`:1104`) walks each run as a
-      unit-stride prefix. `applyGroup` (`:1066`) prefix-loads it. A repeated
+      `intent_order` is gone. `applyBlockJob` (`:1106`) walks each run as a
+      unit-stride prefix. `applyGroup` (`:1068`) prefix-loads it. A repeated
       row flushes first. A short group is that kernel with a mask. The open
       group ends at the run. Movement position and velocity are gathered at
-      the flush. Inline apply copies the same intent fields into `ApplyLanes`
-      (`:1168`) and calls `applyGroup`. Contact order stays. The 16-row block
+      the flush. Inline apply copies the same intent fields into `ApplyLanes` (`:1170`) and calls `applyGroup`. Contact order stays. The 16-row block
       stays.
       Failure: the hot read was an index permutation through `order[]`, and
       a short group called `applyIntentScalar` per row

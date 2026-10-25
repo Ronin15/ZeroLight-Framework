@@ -24,7 +24,7 @@ render pick it up the same step as any other terrain change.
   chunk on the thread system, serial equals threaded, and OOM changes nothing.
   Benches `chunk-scale-cave-in` and `chunk-scale-explosion-fill` time it at 4,
   64, and 256 chunks; plane traversal's fall carves are its only gameplay caller
-  (`dig_controller.zig:476`).
+  (`dig_controller.zig:478`).
 - Terrain writers reach nav through a two-call contract (64G): reserve the nav
   record before the world write (`PathfindingSystem.reserveTerrainNavRecord`,
   sized by the writer's `maxEventsPerStep`), then record the appended events

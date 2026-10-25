@@ -132,14 +132,14 @@ the [archive](framework-implementation-slices-archive.md).
 | Slice | Status | Open work (see the slice file for the full Checklist) |
 | --- | --- | --- |
 | [**33**](roadmap/slices/slice-33.md) | Landed (visual verification pending) | Data-Driven AI Archetypes And Debug Introspection |
-| [**35**](roadmap/slices/slice-35.md) | Not started | AI Decision Math And World-Gate SIMD Restructure — after 55, 52D |
+| [**35**](roadmap/slices/slice-35.md) | In progress | AI Decision Math And World-Gate SIMD Restructure — after 55, 52D |
 | [**38**](roadmap/slices/slice-38.md) | Not started | Elevation Above The Surface — after 64G |
 | [**42**](roadmap/slices/slice-42.md) | Not started | Affect Expansion — More Feelings, Coupling, And Mood — after 73, 56, 61, 59 |
 | [**43**](roadmap/slices/slice-43.md) | Landed (hardware verification pending) | SDL3 Gamepad/Controller Support |
 | [**44**](roadmap/slices/slice-44.md) | Not started | Input Rebinding And Extended Gamepad Controls — after 53B, 54 |
 | [**46**](roadmap/slices/slice-46.md) | Not started | Save/Load Persistence — after 49, 51, 53B, 54, 64B, 64G, 74 |
 | [**49**](roadmap/slices/slice-49.md) | In progress | Session Seed And Determinism Checksum Harness — after 64G |
-| [**50**](roadmap/slices/slice-50.md) | Landed (acceptance runs pending) | Thread System Hardening |
+| [**50**](roadmap/slices/slice-50.md) | Landed (Windows run pending) | Thread System Hardening |
 | [**51**](roadmap/slices/slice-51.md) | Not started | Background Job Lane With Deterministic Step Handoff — after 49, 50, 64A |
 | [**52**](roadmap/slices/slice-52.md) | Not started (umbrella) | Release Build Baseline, Pinned Dependencies, And CI — after 49 |
 | [**52A**](roadmap/slices/slice-52a.md) | In progress | Release CPU Baseline, Toolchain Pins, Pinned SDL, Committed Shaders |
@@ -208,13 +208,13 @@ the [archive](framework-implementation-slices-archive.md).
 | [**78**](roadmap/slices/slice-78.md) | Not started | Comptime Assessment — independent |
 | [**79**](roadmap/slices/slice-79.md) | Not started | Fixed-Step Input Edges, Frame-Time Snapping, And TimeLoop Cap Invariant — independent |
 | [**80**](roadmap/slices/slice-80.md) | Not started | Observer And Optional Player Character — before 75 and 74 bind the observer |
-| [**85**](roadmap/slices/slice-85.md) | Not started | Steering On The Shared Neighbor Index — after 84, 86 |
-| [**86**](roadmap/slices/slice-86.md) | Not started | Collision Subsystem Pass — after 83, 84 |
+| [**85**](roadmap/slices/slice-85.md) | In progress | Steering On The Shared Neighbor Index — after 84, 86 |
+| [**86**](roadmap/slices/slice-86.md) | In progress | Collision Subsystem Pass — four items open, inert rows after 88 |
 | [**87**](roadmap/slices/slice-87.md) | Not started | Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items |
-| [**88**](roadmap/slices/slice-88.md) | Not started | DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 |
+| [**88**](roadmap/slices/slice-88.md) | In progress | DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 |
 | [**89**](roadmap/slices/slice-89.md) | Not started | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after 88 |
 
-**Recently settled (archive only):** 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
 **Benches:** `.claude/rules/tests-benchmarks.md`. `frame-battle` (Slice 52C:
 full fixed step plus CPU render-prep) tracks scaling shape across commits; 66E
@@ -271,12 +271,11 @@ roadmap flow (Suggested Order) resumes after the AI branch.
 2. **Core systems:** opens with [50](roadmap/slices/slice-50.md) (owner
    2026-10-12), so the branch's threaded rework runs under the race
    detector. Slice 50 landed on `core_systems` (`e56e37b`..`987b342`); TSan
-   and `verify` pass. Its ReleaseFast test and the owner's Windows run are
+   and `verify` pass. Its ReleaseFast test passed (`750ce0a`); the owner's Windows run is
    still open. Mac runs and compiles. The measuring landing (`5d5a089`) benched today's code; each
    finding, with its `file:line` re-checked there, its measured number, and
    its pass shape, lives in its slice. 83 landed (`3c42b4f`, `176ed03`,
-   `13e88ad`; `verify` passes); 84's programming landed (`c52a5ff`,
-   `08e4799`, `3efa1e4`, `320023a`). Order:
+   `13e88ad`; `verify` passes); 84 landed (archived). Order:
    [83](roadmap/archive/slice-83.md) prep →
    [84](roadmap/archive/slice-84.md) spatial index →
    [86](roadmap/slices/slice-86.md) collision →
@@ -288,15 +287,15 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    backend pass closes the branch (owner 2026-10-16); then
    [89](roadmap/slices/slice-89.md) (batch-tuner and world-gate follow-ups, owner 2026-10-23). Items the 64G combined
    review routed here (refs at `e2b9b2c`):
-   - Tile gate on main (area D H1): 35.
+   - Tile gate on main (area D H1): 35 (threaded, `f0adc9a`).
    - Halo agents sorted twice (M1): 84, then 85.
-   - Missing SIMD verdicts (M4): agent avoidance 85, response gather 86.
+   - Missing SIMD verdicts (M4): agent avoidance 85, response gather 86 (landed: slice 86's `gatherRange` verdict).
    - Commit-seam order in the demo state (L5): 74.
    - Any create re-resolves every steering row (L10): 85.
    - File splits (L11) and per-system tuner fields: 83 (landed).
    - Render collect and GPU sync copying (area C): 87.
    - Movement intent order: 85.
-   - World creation and worldgen: measured; its findings are in 74.
+   - World creation and worldgen: measured; its findings are in 74; the world paint's first pick: 89.
    - Collision, whole subsystem: 86.
    - Render backend pass: 87, last.
 
@@ -304,32 +303,16 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    (tags name findings in the local `.claude/reports/` audit files). Every
    ref is re-checked right before implementation
    (`.claude/rules/engine-design.md` § Cost model).
-   - 84: index order and its fragment paths (code H1, review 1 and 8);
-     cohere's check budget (code H1); TSan before merge (review open
-     question); carried stage inputs (code M1); the vectorized separation
-     accumulate, moved from 35 (code M4); scalar reasons (code L7, review 6);
-     query group doc and off-main asserts (review 2 and 3, code L2); comments
-     and module doc (code L9, review 4 and 9); cell-radius overflow (review
-     5); empty-build tail (review 7); the docs commit's foundation,
-     changelog, 68A cross-edit, one place per explanation, and DW fields
-     (docs M3, M12, L3, L4, L12, L13, code L10); done in the tree (code L1, L6).
-   - 86: sweep order and proxy gather (contiguity H2); static-collider lists
-     (contiguity H3); path registry lists (contiguity L1).
    - 85: steering grid level key (contiguity H1, code H2); the vectorized
      avoidance accumulate, moved from 35 (docs M9); intent order
      (contiguity M3).
    - 87: visible-chunk source (contiguity H4); sparse tile lists (contiguity
-     M1); submit reads in sort order (contiguity M2); bench review tags
-     (code L9).
-   - 88: stagger phase overwritten at spawn (roadmap verify); DataSystem
+     M1); submit reads in sort order (contiguity M2).
+   - 88: stagger phase stripe by dense index (roadmap verify); DataSystem
      hot-pass data layout (contiguity H5); structural-share
-     deferral (docs M7); index and AI scratch sized by AI rows (code M2);
-     perf-log policy (code L1); `production-step` OOM leak (code L3);
-     `hotStoreCapacity` copies (code L8).
+     deferral (docs M7); index and AI scratch sized by AI rows (code M2).
    - 74: the steering seam copy (code M3); `production-step` spawn path (code
      L4).
-   - 68A: think-set compact on main (contiguity audit, noticed in passing;
-     closed by 84).
    - 52A: `build.zig` doc pointer (code L9, docs L14).
    - 75: census timers (docs L18).
 
@@ -343,6 +326,7 @@ roadmap flow (Suggested Order) resumes after the AI branch.
      - 87: render prep, GPU tile sync, world render, and the render backend;
      - 88: `DataSystem`, step contracts, pipeline, `src/core` kernels;
      - 75: simulation scope;
+     - 89: batch tuner follow-ups, world gate under the data rules;
      - 50 (landed): `ThreadSystem`.
    - World creation (`world/system.zig`, `worldgen.zig`): 74.
    - Pathfinding branch (sealed, combined-reviewed): `systems/pathfinding/`,
@@ -370,7 +354,7 @@ writes the findings into slice checklists or new slice files.
 
 **Core findings** (measured at `5d5a089`; detail in each slice):
 - **High:** spatial index and perception check budget (84, landed); collision
-  broadphase (86); tile gate (35); render collect (87); inert rows (86 for
+  broadphase (86, landed); tile gate (35, landed); render collect (87); inert rows (86 for
   collision, 75 for movement and tiers, 87 for render collect).
 - **Medium:** destructible resolve (72 D1); structural commands past the
   fixed share (88's deferral; 56, 57, 61, 62, 76, 77 use it).

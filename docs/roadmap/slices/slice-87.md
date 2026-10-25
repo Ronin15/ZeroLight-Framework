@@ -14,13 +14,13 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
 
 ### Current foundation
 
-- `render_prep.collectDynamicRecords` (`src/game/render_prep.zig:374`) walks
-  every movement body (`:397`) on main each frame. For each row it tests the
+- `render_prep.collectDynamicRecords` (`src/game/render_prep.zig:362`) walks
+  every movement body (`:385`) on main each frame. For each row it tests the
   level window and the visible chunks.
-- `dynamicRecordCapacity` (`:314`) and `spriteCommandCapacity` (`:323`) size
+- `dynamicRecordCapacity` (`:302`) and `spriteCommandCapacity` (`:311`) size
   to every primitive visual in the world.
 - GPU tile sync: `GpuTileMirror.plan` and `commit`
-  (`src/game/world/gpu_tiles.zig:265`, `:445`) copy a batched change's
+  (`src/game/world/gpu_tiles.zig:266`, `:446`) copy a batched change's
   written layers serially; the batched `chunk-scale-gpu-sync-dig` variant is
   serial only.
 - Measured:
@@ -49,9 +49,9 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
 - [ ] Collect walks the visible chunks' rows. Failure scenario: off-view
       population raises frame cost and reserved vertex memory with nothing
       more drawn. The visible rows are scattered over the movement store
-      (append and swap-remove order, `data_system/movement.zig:168`), and
-      collect resolves each row's level by slot (`render_prep.zig:400`)
-      before its chunk test (`:407`). Constraint: the per-visible-chunk
+      (append and swap-remove order, `data_system/movement.zig:67`, `removeAt` `:189`), and
+      collect resolves each row's level by slot (`render_prep.zig:388`)
+      before its chunk test (`:395`). Constraint: the per-visible-chunk
       source reads each (level, chunk)'s rows as one contiguous run
       (contiguity audit H4; `.claude/rules/memory-performance.md`
       § Data-oriented design); the source is this slice's design.
@@ -63,26 +63,26 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
       2 ms for 32 layers. Pass: main keeps only the ordered upload commit;
       serial == threaded; `chunk-scale-gpu-sync-dig` gains threaded cases.
 - [ ] Sparse tiles read as contiguous runs per (level, chunk) (contiguity
-      audit M1). Failure: `sparse_tiles` (`world/system.zig:280`) links its
+      audit M1). Failure: `sparse_tiles` (`world/system.zig:275`) links its
       rows newest-first per (level, chunk) through `chunk_next` and
-      `chunk_prev` (`:191-192`) over one world-wide pool, and
-      `walkWindowSparseTiles` (`world/render.zig:177`) walks each window
+      `chunk_prev` (`:194-195`) over one world-wide pool, and
+      `walkWindowSparseTiles` (`world/render.zig:178`) walks each window
       chunk's list, reading `cell_index` from scattered pool rows;
-      `addSparseTile` appends in call order (`world/edit.zig:757-768`), so
+      `addSparseTile` appends in call order (`world/edit.zig:726`), so
       worldgen order already interleaves chunks
       (`.claude/rules/memory-performance.md` § Data-oriented design). Failure
       scenario: the walk reruns whenever the window crosses a tile edge
-      (`world/system.zig:284-285`), walking fragments, more scattered after
+      (`world/system.zig:277-280`), walking fragments, more scattered after
       dig and build churn. Pass: the window walk reads each chunk's sparse
       rows as one contiguous run; churned and interleaved-creation
       `render-sparse-window-pan` cases match a chunk-ordered one.
 - [ ] Render submit reads its records in sort order (contiguity audit M2).
       Failure: `DynamicScenePrep` sorts an index array, `sort_indices`, by
-      (depth, sequence) (`render_prep.zig:278`), its comparator loading two
-      records per compare (`:738-742`), and submit reads
-      `records[record_index]` through it (`:527-530`); the sparse window sorts
-      row ids over three pool columns (`world/render.zig:230`), and
-      `emitSparseRange` reads each row by id (`:631-635`)
+      (depth, sequence) (`render_prep.zig:216`, sorted at `:266`), its comparator loading two
+      records per compare (`:726-731`), and submit reads
+      `records[record_index]` through it (`:270-271`); the sparse window sorts
+      row ids over three pool columns (`world/render.zig:231`), and
+      `emitSparseRange` (`:627`) reads each row by id
       (`.claude/rules/memory-performance.md` § Data-oriented design, § Hot
       paths). Failure scenario: every frame reads the visible records out of
       order, and the sort chases two records per compare. Pass: the dynamic
@@ -99,10 +99,9 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
       the GPU tile sync (`src/game/world/gpu_tiles.zig`), `world/render.zig`,
       `render_depth.zig`, and the `data_system/visual.zig` store. Each finding
       becomes an item here.
-- [ ] The `render_game_prep` bench's module doc carries review tags
-      "(R29/R32)" (`src/benchmarks/render_game_prep.zig:5`) (code audit L9;
-      `.claude/rules/zig-style.md` § Comments). Pass: the doc states what the
-      group measures, with no tags.
+- [x] The `render_game_prep` bench's module doc carries no review tags
+      (`baa4e62`; `src/benchmarks/render_game_prep.zig:5-10` states what the
+      group measures).
 - [ ] Tests: collect output matches today's for in-view rows (order
       included); allocation-free warmed collect.
 - [ ] Docs: `docs/rendering-assets-shaders.md` collect and capacities.

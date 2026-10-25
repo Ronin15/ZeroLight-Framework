@@ -28,9 +28,9 @@ and an app-level fade-in on state replacement.
   and first. Menus use the `.ui` domain.
 - `src/app/state.zig` `TransitionApplyResult { quit_requested }`;
   `engine.zig` `applyTransitions`.
-- `systems/spatial_index.zig` reserves a fixed dense window
-  (`max_expected_visible_window_cells`, `max_dense_window_side_cells`)
-  around the camera-derived region, assuming zoom 1.
+- `systems/spatial_index.zig` sizes its grid from the world's extent
+  (`IndexGeometry.ofWorld`, `spatial_index.zig:93`), not from the camera
+  region.
 
 ### Architecture notes
 

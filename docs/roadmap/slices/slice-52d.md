@@ -19,18 +19,26 @@ groups measure it.
 
 ### Current foundation
 
-- `core/simd.zig` (25 importing files): lane counts derive from one 16-byte
-  register constant (`lane_count = 4` for 32-bit lanes; a private 8 × u16 vector
-  behind `countUnequalU16` and its scalar twin); every helper is a plain
-  `pub fn`. `floorToI4` calls `@floor` plus four saturation patches; `divInt4`
+- `core/simd.zig` (37 importing files): lane counts derive from one 16-byte
+  register constant (`lane_count = 4` for 32-bit lanes; private 8 × u16 and 16 × u8
+  vectors behind `countUnequalU16`, `bytesMatchingMask`, and
+  `decrementSaturatingU16` and their scalar twins); leaf helpers are
+  `pub inline fn` (67, `08e4799`), while `floorToI4` (`:216`),
+  `worldPosToCell4` (`:188`), `lastCellOfSpan4` (`:197`), and the u16/u8
+  count and gather helpers stay plain `pub fn`. `floorToI4` calls `@floor` plus four saturation patches; `divInt4`
   divides per lane; `minFloat4`/`maxFloat4` use `@min`/`@max`;
-  `sinFloat4`/`cosFloat4`/`sinCosFloat4` use `@sin`/`@cos` and have no callers.
-  `core/math.zig`: branchy `floorToI32`, `clampMinMax` as `@min(@max(..))`,
+  `sinFloat4`/`cosFloat4`/`sinCosFloat4` were deleted as callerless (`c1313b1`).
+  `core/math.zig`: `floorToI32` is `std.math.lossyCast(i32, @floor(v))`
+  (`:36`), `clampMinMax` as `@min(@max(..))`,
   `sinCos` via `@sin`/`@cos`, `atan2` as pure-Zig `std.math.atan2` (no libm,
   no FMA on its scalar path).
-- Callers: `divInt4` only in `deriveChunkJob` (`systems/simulation_scope.zig`)
-  with a runtime power-of-two `chunk_size_tiles` divisor (at most 16);
-  `floorToI4` in the spatial index and steering; `math.sinCos` in `rng.unitVec2`
+- Callers: `divInt4` in `deriveChunkJob` (`systems/simulation_scope.zig:558-559`,
+  divisor `chunk_size_tiles`) and in the spatial index build
+  (`systems/spatial_index.zig:1347-1348`, divisor `grid.cells_per_chunk`, any
+  integer in `[1, 64]`, not a power of two); `floorToI4` through
+  `worldPosToCell4` (spatial index, scope, `static_colliders.zig:1473-1474`)
+  and directly in `steering/agent_grid.zig:324-325`,
+  `pathfinding/goal_table.zig:204-205`, `world/system.zig:800`; `math.sinCos` in `rng.unitVec2`
   (AI wander), perception `cos_half_fov`, sprite rotation, and the debug
   overlay; raw `@sin` in `ai_debug_overlay.zig`; runtime-bound
   `math.clampMinMax` in steering.
@@ -105,7 +113,10 @@ groups measure it.
 - [ ] `simd-*` bench groups (floor-cell, world-to-chunk, clamp-select,
       normalize, sincos, sincos-scalar, gather-scatter, count-true) registered,
       with a `ship` and `compat` baseline recorded; no production change.
-- [ ] Mask4 helpers `inline` and the `MASK_FN_NOT_INLINE` rule.
+- [ ] The `MASK_FN_NOT_INLINE` lint rule (neither it nor `LIBM_BUILTIN` is in
+      `tools/lint_idioms.py`). The inline half landed (`08e4799`): every
+      `pub` fn carrying `Mask4` is `inline`; one private non-inline remains,
+      `finiteAboveEpsilon` (`simd.zig:489`).
 - [ ] Upstream Zig issue filed (or an existing one joined)
       with the minimal repro, its URL in Status, and the repro in
       `tools/README.md`; the lint rule cites it and stays after a fix.
@@ -114,8 +125,11 @@ groups measure it.
       sweep.
 - [ ] Select-form `min`/`max`/`clamp` and `clampMinMax`, tested on runtime
       inputs for ±0 and NaN bits, scalar equal to lane 0.
-- [ ] Uniform divisor, `deriveChunkJob` migration, `divInt4` removed; divisor
-      tests and a non-power-of-two chunk-size scope test; existing scope parity
+- [ ] Uniform divisor, `deriveChunkJob` and spatial index build
+      (`spatial_index.zig:1347`) migration, `divInt4` removed; divisor tests
+      exact for every non-negative dividend below 2^31 over divisors 1..64
+      (the index's cells are clamped non-negative, `:1349`) and a
+      non-power-of-two chunk-size scope test; existing scope parity
       and `FailingAllocator` tests pass.
 - [ ] Polynomial sin/cos and `math.sinCos` delegation, the debug-overlay swap,
       and `LIBM_BUILTIN`; golden-bit, f64-reference, symmetry, signed-zero,
@@ -137,11 +151,9 @@ groups measure it.
       `compat`, and ReleaseSafe `x86_64_v3` (informational).
 - [ ] `zig build check -Doptimize=ReleaseFast -Dcpu-baseline=compat` compiles.
 - [ ] Each new lint rule fires on a temporary, uncommitted edit.
-- [ ] Bench gate on adjacent commits (ReleaseFast, `serial-direct`, pinned
-      core, interleaved repetitions, medians, at `ship` and `compat`): the
-      floor, chunk-division, clamp, and sin/cos kernels improve beyond
-      run-to-run spread across the ladder; normalize and gather-scatter stay
-      within spread; system groups (spatial index, scope-cognition, perception,
+- [ ] Bench gate per `.claude/rules/tests-benchmarks.md` § Benchmarks, at
+      `ship` and `compat`, numbers in the landing commit: the kernels this
+      slice rewrites improve across the ladder; normalize and gather-scatter
+      hold; the system groups (spatial index, scope-cognition, perception,
       steering, collision, affect, particles, movement, AI, render prep) show
-      no regression beyond spread unless the hot function's disassembly is
-      identical or a strict subset (layout noise). Tables in Status.
+      no regression.

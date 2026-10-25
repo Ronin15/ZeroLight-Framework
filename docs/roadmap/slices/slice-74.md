@@ -49,22 +49,31 @@ One world per gameplay state; nothing models a set of worlds.
 - No load-time check refuses a world: 64G deleted the nav memory gate, band
   lists grow, the GPU store keeps only the render window, and ids that grow in
   play fail only as `OutOfMemory` at their growth seam.
-- The commit seam's order lives in the demo state:
-  `commitStructuralAndReact` (`src/game/game_demo_state.zig:675`) orders the
-  structural commit, population sync, collider sync, and nav and steering
-  reactions.
-- Measured, `world-create` tuned (Debug, `5d5a089`):
-  - 10.3 / 44.9 / 141.7 ms at 256² / 1024² / 2048² × 8 levels, of which the
-    nav phase is 7.5 / 35.3 / 117.5 ms; 10.3 / 16.1 / 34.7 ms at 8 / 32 / 128
-    levels of 256². Time and bytes are at most linear in level area × levels,
-    and 0 bytes stay live after destroy.
-  - The nav phase (`SimulationPipeline.init`: static colliders, nav build, and
-    each processor's init) holds about 12.4 MB at 256² × 8 and about 18.9 MB at
-    2048² × 8; cause not identified.
-  - The nav build barely gains from workers: 117.5 ms tuned against
-    127.9 ms serial at 2048² × 8, while the surface paint goes 182.7 →
-    18.1 ms. Its batches are not exposed (`nav_reaction.zig:113` discards the
-    rebuild result), so its main share is unmeasured.
+- The commit seam's order lives in
+  `SimulationPipeline.commitStructuralAndReact`
+  (`src/game/simulation_pipeline.zig:1358`: collider reserve, structural
+  commit, collider capture, population sync, collider sync, nav reaction,
+  steering reaction); `GameDemoState` calls it from
+  `applyStructuralCommandsAndPostCommitEvents`
+  (`game_demo_state.zig:633-634`).
+- Measured at HEAD (`8eaa19a`), `world-create` (Debug, `zig build bench --
+  --group world-create --details`, warmup 5, 30 iterations, one run; tuned
+  case `settled=fresh`):
+  - Total tuned 7.19 / 30.83 / 98.36 ms at 256² / 1024² / 2048² × 8 levels
+    (serial 11.56 / 89.33 / 341.36 ms), of which the nav phase is 4.27 / 21.34
+    / 70.34 ms; 13.13 / 36.26 ms at 32 / 128 levels of 256². Time and bytes are
+    at most linear in level area × levels, and 0 bytes stay live after destroy.
+  - Nav-phase live bytes (`live_kb` nav less stack; the nav phase is
+    `SimulationPipeline.init`: static colliders, nav build, and each
+    processor's init): 5,529 KB at 256² × 8, 7,408 KB at 1024² × 8, 13,015 KB
+    at 2048² × 8, 5,718 KB at 256² × 32, 6,476 KB at 256² × 128; cause of the
+    floor not identified.
+  - The nav build gains less than the paint: nav phase 70.34 ms tuned against
+    121.12 ms serial at 2048² × 8, with `nav_main` 61.56 ms (88% of the
+    phase), while the surface paint goes 214.83 → 21.85 ms. The bench reports
+    `nav_main` and asserts the nav build's remask ran on workers
+    (`world_create.zig:17-31`); `nav_reaction.zig:116` keeps the rebuild
+    result only as `perf.last_nav_build` under the perf switch.
 
 ### Architecture notes
 
@@ -155,21 +164,24 @@ One world per gameplay state; nothing models a set of worlds.
       `.claude/rules/tests-benchmarks.md` § Tests). Both fixtures call the
       moved seam once it exists.
 - [ ] A world's create-time memory follows its content. Failure scenario:
-      every small dungeon pays the nav phase's ~12.4 MB floor (measured
-      above; cause not identified, so the first step is finding it). Pass:
+      every small dungeon pays the nav phase's ~5.5 MB floor at 256² × 8
+      (measured above; 6.5 MB at 256² × 128, 13.0 MB at 2048² × 8; cause not
+      identified, so the first step is finding it). Pass:
       `world-create` nav-phase bytes follow what exists (group doc).
-- [ ] The create-time nav build reports its batches and threads its
-      per-chunk work. Failure scenario: a world created in play spends most of
-      its nav build on one thread (measured above). Pass: `world-create`
-      shows the nav phase's main share as the ordered merge only; serial ==
-      threaded.
+- [ ] The create-time nav build threads its per-chunk work. Reporting landed
+      (`perf.last_nav_build`, bench `nav_main`, the remask-on-workers assert).
+      Failure scenario: a world created in play spends most of its nav build
+      on main: `nav_main` is 61.56 of 70.34 ms nav at 2048² × 8 (measured
+      above). Pass: `world-create` shows the nav phase's main share as the
+      ordered merge only; serial == threaded.
 - [ ] `production-step` spawns through production functions (code audit L4).
-      Failure: `spawnPopulation`
-      (`src/benchmarks/production_step.zig:220-280`) repeats
-      `spawnDemoMover`'s post-create steps (`snapZ` and the metadata write,
-      `:264-269`; `game_demo_state.zig:1008-1014`) and commits through
-      `DataSystem.applyStructuralCommands` outside the commit seam (`:258`),
-      syncing only the population seam (`:279`)
+      Partly landed (`0843bdb`): `spawnPopulation`
+      (`src/benchmarks/production_step.zig:339-420`) places each mover through
+      `placeSpawnedMover` (`game_demo_state.zig:955`), which `spawnDemoMover`
+      (`:879`) shares. Failure: it commits through
+      `DataSystem.applyStructuralCommands` outside the commit seam (`:377`),
+      syncing only the population seam (`:398`), and the `stacked` shape
+      writes `always_active` and `stagger_phase` itself (`:386-387`)
       (`.claude/rules/tests-benchmarks.md` § Tests). Failure scenario: a
       change to the spawn defaults or the seam order drifts the census with no
       failure. Pass: the bench sets no post-create field itself; it calls the

@@ -17,7 +17,7 @@ these outcomes.
 ### Current foundation
 
 - `core/rng.zig` `mix64(seed, entity_index, step, salt)` is a stateless keyed
-  mixer; `uniformF32`, `boundedU32`, and `unitVec2` build on it and are already
+  mixer; `uniformF32` and `unitVec2` build on it and are already
   partition-independent (archive Slice 27). Its only consumer is AI wander,
   with the seed hard-coded as `.intent_seed = 0xfeedf00d` in
   `simulation_pipeline.zig` and the step from
@@ -36,9 +36,12 @@ these outcomes.
 - `RangeOutputStream` merges in range order. Design-time audit: no
   `@setFloatMode`, `@mulAdd`, wall-clock read, or atomic in simulation paths.
 - Processor configs carry `items_per_range`, `max_worker_threads`, and
-  `adaptive`; `ThreadSystemConfig` has no system-wide adaptive switch, and the
-  tuner keeps small batches inline, so a small fixture never threads unless
-  pinned.
+  `adaptive`; `ThreadSystemConfig` has no system-wide adaptive switch, and the  tuner keeps small batches inline, so a small fixture never threads unless
+  pinned through the fixed-shape dispatch options (`adaptive = false`,
+  `items_per_range`, `max_worker_threads`; `thread_system.zig:65-70`,
+  `:83-90`), the one sanctioned test and bench seam
+  (`.claude/rules/tests-benchmarks.md` § Test and production code 1);
+  production only forwards a stage's controls (lint rule 13).
 - `GameDemoState.onPause`/`onResume` call `syncInterpolatedState`, which
   overwrites `previous_x/previous_y` and the camera the simulation reads, so a
   paused run diverges from an unpaused one (Slice 64A makes pause
@@ -84,8 +87,8 @@ these outcomes.
 - `StepIndex = u64` lands here (decision: no `u32` session end); rng step keys
   truncate to `u32` (repeats every 2^32 steps, harmless).
 - No new `StageId` or `PipelineResource`; `sim_view` is a borrowed
-  update-context input. `ThreadSystemConfig.adaptive` defaults on, so
-  production is unchanged; Slice 50 edits the same file.
+  update-context input. `ThreadSystemConfig` has no `adaptive` field
+  (`thread_system.zig:54`); pinning is per dispatch.
 - Out of scope: the random New Game root (64C), deterministic trig (52D, 64D), pipeline history in the checksum (64B).
 - VoidLight: nothing structural to port; do not port its `thread_local
   std::mt19937` wander RNG seeded from hardware entropy.
@@ -111,11 +114,15 @@ these outcomes.
       completeness on both systems; tests that each store, a dig, and marker
       churn change it and render visibility does not.
 - [ ] `GameDemoState.simulationChecksum()`.
-- [ ] `ThreadSystemConfig.adaptive` with a test that non-adaptive batches pin
-      range size and workers and leave the tuner untouched.
+- [x] Superseded: no `ThreadSystemConfig.adaptive`. A system-wide switch only
+      tests would set is rejected by `.claude/rules/tests-benchmarks.md`
+      § Test and production code 1; pinning exists per dispatch, with its test
+      (`parallel for options cap active workers and align ranges`,
+      `thread_system.zig:2446`; `19fe22a`, `166075c`).
 - [ ] Determinism harness in `game_demo_state.zig` with a pinned input script:
-      repeat, worker-count/range-split (serial, inline, multi-worker, pinned and
-      adaptive) and seed-change tests.
+      repeat, worker-count/range-split (zero-worker, multi-worker, and shapes
+      pinned through the fixed-shape dispatch options, plus tuned) and
+      seed-change tests.
 - [ ] `simulation-checksum` bench over hashed-state size (level size, depth,
       population).
 - [ ] Docs: "Determinism Contract" in `docs/simulation-tiers-and-pipeline.md`;

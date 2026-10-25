@@ -61,8 +61,8 @@ behaviors on it.
 | `AiSystem` | `systems/ai.zig` | Gathers `Signals`, runs arbitration, emits `NavigationIntent` at `ai_decide` |
 | Archetypes | `ai_archetypes.zig`, `assets/ai/archetypes.json` | Strict load-time personalities |
 
-Stage order `perception → ai_memory → affect → ai_decide → steering →
-pathfinding` (`simulation_pipeline.zig` `stage_order`). Pursue/flee prefer
+Stage order `spatial_index_build → ai_cognition_order → perception →
+ai_memory → affect → ai_decide → steering → pathfinding` (`simulation_pipeline.zig` `stage_order`). Pursue/flee prefer
 perception's faction-generic `nearest_threat`, then fresh memory, then the
 opt-in focus fallback; investigate prefers heard stimuli, then interest
 markers, then memory-ring contacts; cohere reads the shared spatial index.

@@ -28,8 +28,8 @@ allies (Slice 71A's help call).
 - `MovementSystem.applyIntents` (`src/game/systems/movement.zig`) overwrites
   AI velocity only from this step's intents; velocity otherwise persists,
   which coasting relies on. Player velocity is set from input every step
-  (`src/game/player.zig`). `movement_integrate` is SIMD with a scalar tail
-  over the full range.
+  (`src/game/player.zig`). `movement_integrate` runs lane batches whose last
+  batch is the same kernel masked to the remaining rows (`movement.zig:253`).
 - Settle order: collision scope gather → detect → respond → bounds and tile
   gate → plane traversal → chunk derive (`src/game/simulation_pipeline.zig`);
   the tile gate reverts an axis to the pre-step pose and zeroes that axis's
@@ -37,8 +37,10 @@ allies (Slice 71A's help call).
   pass-through. Tiles are 32 px.
 - `chunk_derive` derives chunk columns from positions, which is why knockback
   cannot be written in `combat_resolve`.
-- Memory (`src/game/systems/ai_memory.zig`): decay gather/scatter, a 4-slot
-  sighting ring (`upsertRingContact`), and the visible-target refresh.
+- Memory (`src/game/systems/ai_memory.zig:188`): `update` runs four tuned
+  stages over the think set (translate, member order, decay, visible:
+  `:222-244`), a 4-slot sighting ring (`upsertRingContact`), and the
+  visible-target refresh.
 - Arbitration (`src/game/systems/arbitration.zig`): with a configured focus
   target, fresh memory of a different entity never gives pursue a goal, so
   an NPC hit by another NPC never fights back today.
