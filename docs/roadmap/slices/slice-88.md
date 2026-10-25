@@ -237,6 +237,17 @@ in its owning slice.
       differently from its store. Pass: every site calls the shared helper.
 - [ ] Benches at the worst-case shape each finding's bound names, with the
       shape asserts landing with each fix (`.claude/rules/tests-benchmarks.md`).
+- [ ] AI memory's scratch reserve covers the population it is reserved for.
+      Measured: the whole-suite Debug baseline at `750ce0a`
+      (`.claude/reports/bench-baseline-750ce0a.txt`) logs "reservation short of
+      the live population" 63 times, first in `ai-cell-ordered` (1,024 think /
+      1,024 memory rows grew to 1,536), from `growPastReserve`
+      (`systems/ai_memory.zig:355`, called at `:217`) after
+      `AiMemorySystem.reserve` (`:166`). Failure: either the reserve undersizes
+      what its population needs, or the bench fixtures reserve less than they
+      run. Pass: the cause attributed; a population reserved at the seam runs
+      with no scratch growth, or the fixture reserves its population; the warning
+      stays the once-per-system growth signal.
 - [ ] Docs: `docs/architecture.md` (DataSystem, pipeline);
       `docs/simulation-tiers-and-pipeline.md`.
 
