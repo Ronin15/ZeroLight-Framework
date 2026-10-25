@@ -69,14 +69,16 @@ avoidance [85](slice-85.md)'s.
 - [ ] The whole of `systems/world_gate.zig` checked against the cost model and
       the rules (owner 2026-10-16), not only the items above. Each finding
       becomes an item here. Findings so far:
-      - Row order. Failure: `gateRange` (`world_gate.zig:248`) walks the
+      - Row order: moved to slice 89's world-gate item (measure first; a
+        per-row terrain read at the row's position is an exempt point lookup,
+        owner 2026-10-24, `.claude/rules/memory-performance.md` § Data-oriented
+        design). Failure kept for reference: `gateRange` (`world_gate.zig:248`) walks the
         movement rows in store order and resolves each lane's terrain cell with
         a data-dependent address (`blockedLanes`, `:317`), so work is not
         grouped by the chunk `(level, cx, cy)` it reads; the `interleaved`
         `world-gate` shape (non-AI, dormant, and gated rows across two levels)
         costs per row what the uniform shape does, about 2x per gated row.
-        Pass: a chunk-grouped pass (its own slice, owner 2026-10-23), serial ==
-        threaded, `interleaved` per gated row within spread of `uniform`.
+        Pass: slice 89's item.
       - Tuned versus fixed controls: moved to slice 89's tuner item (owner
         2026-10-24; the measured cause points at the nudge).
 - [ ] Tests: scalar/SIMD and serial/threaded parity per restructured path.

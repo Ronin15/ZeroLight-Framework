@@ -212,12 +212,12 @@ the [archive](framework-implementation-slices-archive.md).
 | [**86**](roadmap/slices/slice-86.md) | In progress | Collision Subsystem Pass — four items open, inert rows after 88 |
 | [**87**](roadmap/slices/slice-87.md) | Not started | Render Collect By Visible Chunks — after 83, 85, 35's `world_gate` items |
 | [**88**](roadmap/slices/slice-88.md) | In progress | DataSystem, Step Contracts, Pipeline, And Core Kernels Pass — after 87 |
-| [**89**](roadmap/slices/slice-89.md) | Not started | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after 88 |
+| [**89**](roadmap/slices/slice-89.md) | Not started | Thread-System Batch Follow-Ups And The World Gate Under The Rules — after the core-branch review work (`f4c4844`); runs first in the core branch |
 
 **Recently settled (archive only):** 84, 83, 82, 81, 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 
-**Benches:** `.claude/rules/tests-benchmarks.md`. `frame-battle` (Slice 52C:
-full fixed step plus CPU render-prep) tracks scaling shape across commits; 66E
+**Benches:** `.claude/rules/tests-benchmarks.md`. `production-step` (extended by Slice 52C with CPU render prep, a state digest,
+and a NaN count) tracks the full fixed step's scaling shape across commits; 66E
 adds the self-hosted perf runner.
 
 ## Next Priority Tracks
@@ -229,8 +229,8 @@ residual only); open work grows beside that loop.
 | Track | Slices | Focus |
 | --- | --- | --- |
 | **Fully simulated worlds** | **64G** → **73** → **75** → **74** (74 after 50) | Chunk-owned terrain and nav, data-driven cognition, fidelity by distance from the observer, and world instances created, stepped, and destroyed in play. |
-| **Determinism & threading** | **49** → **50** → **52A–52D** → **64A** → **51** → **65A** → **64B** → **64C** → **65B** (65C after 58 and 74; 64D gated) | Seeded sessions, checksum over every world, serial == threaded results, and lane consumers. |
-| **Perf** | **72**, **55**, **35**, **70A**, **71B**, **68A** | Behavior independent of physical capacity, decision cadence, AI/steering math, sprite bandwidth, shared entity tables, static fast paths. |
+| **Determinism & threading** | **49** → **50** → **89** → **52A–52D** → **64A** → **51** → **65A** → **64B** → **64C** → **65B** (65C after 58 and 74; 64D gated) | Seeded sessions, checksum over every world, serial == threaded results, and lane consumers. |
+| **Perf** | **89**, **72**, **55**, **35**, **70A**, **71B**, **68A** | Batch tuner and world gate, behavior independent of physical capacity, decision cadence, AI/steering math, sprite bandwidth, shared entity tables, static fast paths. |
 | **Release & platform** | **52A** → **52B** → **52C** → **66A**; **52D** after 52A; **66B–66E** gated | Pinned baseline, packaging, CI, crash triage; 52A before games fork, 66A before any build leaves the team. |
 | **Shipping UI / settings / input / persistence** | **53A** → **53B** → **54** → **44** → **46** → **67A** / **67B** → (60) → **67C** → **67E** | UI, settings, rebinding, and saves; bindings live in settings, never saves; no 67 work touches simulation or the checksum. |
 | **Gameplay domains** | **56** → **56B** → **59** → **57** → **57B** → **61** → **58** → **63** → **62** → **71A** → **71C** / **71D** → **69A**; **42**; **68B** → **68C** | Combat, items, time, harvesting, worldgen, social, population, and AI behavior, built on 73's data-driven cognition. |
@@ -278,16 +278,19 @@ roadmap flow (Suggested Order) resumes after the AI branch.
    `13e88ad`; `verify` passes); 84 landed (archived). Order:
    [83](roadmap/archive/slice-83.md) prep →
    [84](roadmap/archive/slice-84.md) spatial index →
+   [89](roadmap/slices/slice-89.md) batch-tuner and world-gate follow-ups (runs
+   first among the open core-branch slices: its tuner fixes change how every later
+   slice's tuned cases are judged, `.claude/rules/tests-benchmarks.md` § Benchmarks) →
    [86](roadmap/slices/slice-86.md) collision →
    [85](roadmap/slices/slice-85.md) steering → tile gate
    ([35](roadmap/slices/slice-35.md)'s `world_gate` items) →
    [87](roadmap/slices/slice-87.md) render prep →
    [88](roadmap/slices/slice-88.md) DataSystem, contracts, pipeline, kernels →
    inert rows (86's and 75's items) → [75](roadmap/slices/slice-75.md)'s tier mechanics; 87's render
-   backend pass closes the branch (owner 2026-10-16); then
-   [89](roadmap/slices/slice-89.md) (batch-tuner and world-gate follow-ups, owner 2026-10-23). Items the 64G combined
+   backend pass closes the branch (owner 2026-10-16). 89 was added by the owner
+   2026-10-23 and ordered first 2026-10-24. Items the 64G combined
    review routed here (refs at `e2b9b2c`):
-   - Tile gate on main (area D H1): 35 (threaded, `f0adc9a`).
+   - Tile gate on main (area D H1): 35 (threaded, `f0adc9a`); row order and chunk grouping: 89.
    - Halo agents sorted twice (M1): 84, then 85.
    - Missing SIMD verdicts (M4): agent avoidance 85, response gather 86 (landed: slice 86's `gatherRange` verdict).
    - Commit-seam order in the demo state (L5): 74.
@@ -432,6 +435,7 @@ order.
 4. **50** Thread System Hardening (opens the core-systems branch) — landed on `core_systems`.
 5. **83** Core-Branch Prep — Steering And Pipeline Splits, Stage-Owned Tuners — landed on `core_systems` (archived).
 6. **84** Level-Aware Shared Neighbor Index — after 83 (core-systems branch).
+6a. **89** Thread-System Batch Follow-Ups And The World Gate Under The Rules — runs first among the open core-branch slices (core-systems branch).
 7. **86** Collision Subsystem Pass — after 83, 84 (core-systems branch).
 8. **85** Steering On The Shared Neighbor Index — after 84, 86 (core-systems branch).
 8a. **35's `world_gate` items** — after 85 (core-systems branch; the rest of 35 is line 22).

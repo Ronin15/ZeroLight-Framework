@@ -22,7 +22,7 @@ observer's environment; low-volume transition events feed audio and camera.
 - `systems/simulation_scope.zig` `step_count: u32` (Slice 49 makes it
   `StepIndex = u64`) is the canonical step; absolute-step schedules (56, 57,
   61, 62) use it, never calendar time.
-- `src/core/rng.zig`: stateless `mix64` / `uniformF32` / `boundedU32` /
+- `src/core/rng.zig`: stateless `mix64` / `uniformF32` /
   `unitVec2` keyed by `(seed, index, step, salt)`. No `SeedDomain` exists
   until 49.
 - Perception gather rows carry `vision_range`, `hearing_range`, and `level`

@@ -1,9 +1,12 @@
 ## Slice 89: Thread-System Batch Follow-Ups And The World Gate Under The Rules
 
-> [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 88](slice-88.md) (branch order: runs after the core-branch review work) · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
+> [Roadmap index](../../framework-implementation-slices.md) · Depends on: the core-branch review work (`f4c4844`); runs first in the core branch, ahead of 86, 85, 35's tile gate, 87, and 88 · Track: standalone (engine core; [Engine-Core Overhaul](../../framework-implementation-slices.md#engine-core-overhaul))
 
 **Status: not started; re-checked at 750ce0a (2026-10-24).** Owner 2026-10-23: a slice for the world-gate and
-batch-tuner follow-ups, to complete after the core-branch review work.
+batch-tuner follow-ups. Ordered first in the core branch (owner delegated to the
+criteria 2026-10-24): its tuner fixes change how every later slice's tuned cases
+are judged (`.claude/rules/tests-benchmarks.md` § Benchmarks). The `750ce0a`
+baseline predates its tuner change, which gets its own whole-suite run.
 
 Goal: the batch tuner settles near the best fixed batch shape at the sizes
 that thread, the dispatch posts its wakes without delaying main's own ranges,
@@ -26,8 +29,8 @@ fixture and grouped by chunk only if they cost there.
   dispatch floor in `58ff9e1`; it stays (`49620d9`).
 - World gate: `world_gate.zig` `gateRange` (`:248`) walks movement rows in
   store order; plane entry gathers per slice 88's plane-entry item.
-- Already routed (not repeated here): slice 35's row-order item
-  ([35](slice-35.md)), slice 50's other open tuner items ([50](slice-50.md)),
+- Already routed (not repeated here): slice 35's row-order item moved here
+  (the world-gate item below), slice 50's other open tuner items ([50](slice-50.md)),
   slice 88's plane-entry gather item ([88](slice-88.md)). Merged here (owner
   2026-10-24): slice 35's tuned-versus-fixed item, and slice 50's first-shape,
   movement, and cold-seed

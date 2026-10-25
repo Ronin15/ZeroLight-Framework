@@ -41,8 +41,10 @@ continuing session.
   UI/theme, and render/audio/thread state are excluded (Slice 54 owns
   settings).
 - The saved set is exactly 64B's hashed set plus the header, step count, and
-  seed root. Derived state (the nav graph and all path state, caches, indices,
-  any in-flight deferred nav work, environment snapshots) is rebuilt on load,
+  seed root. Derived state (the nav graph and all path state, including the path
+  registry, caches, indices, the static-collider store and the per-level
+  stored-trigger trees, any in-flight deferred nav work, environment
+  snapshots) is rebuilt on load,
   never saved. Save capture never normalizes the live session; the load-parity
   reference is the uninterrupted run normalized at the save step (64B).
 - Terrain saves per chunk, every chunk of every world (64G): save and load

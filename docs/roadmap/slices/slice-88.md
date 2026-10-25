@@ -232,5 +232,7 @@ in its owning slice.
 - [ ] Every finding is fixed or is an item with its `file:line` and failure
       scenario in its owning slice.
 - [ ] `production-step` main share and step time no worse than at
-      `5d5a089` on any config; touched groups within run-to-run spread.
+      `5d5a089` on any config; touched groups within run-to-run spread
+      (tuned-versus-control measured after slice 89's tuner change, which gets
+      its own whole-suite run; the `750ce0a` baseline predates it).
 - [ ] `zig build verify` passes.

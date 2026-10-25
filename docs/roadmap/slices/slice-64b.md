@@ -30,7 +30,9 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
   snapped goal; `SteeringSystem.runtime_rows` (per-entity history);
   `PathfindingSystem` request queues, result cache with TTL eviction and its
   path registry, group fields, and the nav graph with its connectivity ids and
-  one-way closure; `StaticColliderSystem` rows; steering's movement-index cache;
+  one-way closure; `StaticColliderSystem` rows; `CollisionSystem.trigger_store`
+  (per-level stored-trigger page trees, `collision.zig:879`,
+  `collision_triggers.zig`); steering's movement-index cache;
   tuners, scratch, and the audio controller. Perception holds no LOS state.
 - Terrain is chunk-owned (64G), so the chunk is the hashing unit.
 
@@ -61,7 +63,11 @@ state rebuilt to equal a fresh init) and the single `buildFingerprint()`.
   snapped goal, steering runtime rows, and any seam-raised ceiling that changes
   request intake are hashed. All derived nav state (graph, path requests and
   results, caches, group fields, dirty sets, any deferred rebuild) is
-  normalized, not cache, because cache warmth changes outcomes. Derived
+  normalized, not cache, because cache warmth changes outcomes. The
+  static-collider store, the per-level stored-trigger trees
+  (`CollisionSystem.trigger_store`), and the path registry are derived and
+  normalized: rebuilt on load from world and statics data, never saved
+  (`.claude/rules/simulation.md` § Persistent data). Derived
   perception state is normalized.
 - `normalizeDerivedState`: afterwards every normalized field equals a freshly
   initialized pipeline's over the same `DataSystem`, `WorldSystem`, and config,

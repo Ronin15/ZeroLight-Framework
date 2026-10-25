@@ -24,7 +24,7 @@ tags pass it before Steam `staging` is promoted to `default`.
   optimize and CPU-baseline options.
 - Size lists: `suite.event_scale_counts` is `{1024, 4096, 10000}`;
   `steering` and the pathfinding fallback group use their own smaller
-  ladders; 52C's `frame-battle` runs one fixed size.
+  ladders; 52C's extended `production-step` runs one fixed size.
 - Reference machine: AMD Ryzen 9 7900X3D, 12 cores / 24 threads, two CCDs
   (CCD0 `0-5,12-17` with the 96 MiB V-Cache L3; CCD1 `6-11,18-23` with
   32 MiB); `amd-pstate-epp`, dev default `powersave` with boost on.

@@ -148,21 +148,25 @@ One world per gameplay state; nothing models a set of worlds.
       and the connections its links carried are removed at the reachability
       maintenance cost (`.claude/rules/budgets-capacities.md`), never a
       world-wide rebuild.
-- [ ] The commit-seam order moves out of the demo state into the per-world
-      step, so every world (and any second gameplay state) runs the same
-      order. Failure scenario (derived): a stepper that reorders the seam's
-      calls desyncs the collider or nav sync. The pipeline test fixture
-      `commitAndSyncLikeDemo` (`src/game/simulation_pipeline.zig:3136-3151`) copies
-      the seam step by step, so a reorder of the demo seam leaves every
-      growth, OOM, and nav-seam pipeline test passing on the old order. The
-      steering fixture `commitStaticsForTest`
-      (`steering/test_support.zig:102-116`) is a second copy (collider
-      reserve, commit, capture, sync), so the multi-level and static-move
-      avoidance tests and the steering cache-invalidate test
-      (`avoidance.zig:546`, `:680`; `system.zig:879`) also pass on the old
-      order (code audit M3;
-      `.claude/rules/tests-benchmarks.md` § Tests). Both fixtures call the
-      moved seam once it exists.
+- [ ] The per-world step itself runs the commit seam, so every world (and any
+      second gameplay state) runs the same order with no caller to replicate
+      (`.claude/rules/engine-design.md` § Target scale: every world advances,
+      worlds are created and destroyed in play; § Ownership boundaries:
+      gameplay sequencing lives in the pipeline's controllers, not a state;
+      `.claude/rules/simulation.md` § One scheduler). Today the seam is
+      `SimulationPipeline.commitStructuralAndReact`
+      (`simulation_pipeline.zig:1358`) but `GameDemoState` calls it after the
+      step (`game_demo_state.zig:634`), so the step is not self-contained.
+      Failure scenario (derived): a second world's stepper that omits or
+      reorders the call desyncs the collider or nav sync. Pipeline tests call the
+      seam through `commitSeamInline` (`simulation_pipeline.zig:3374`) and
+      benches through `benchmarks/fixtures.zig:135`; the steering fixture
+      `commitStaticsForTest` (`steering/test_support.zig:97-111`) still copies
+      the collider reserve, commit, capture, and sync, so its users
+      (`avoidance.zig:623`, `:750`; `steering/system.zig:861`) pass on an old
+      order (`.claude/rules/tests-benchmarks.md` § Tests). Pass: the per-world
+      step runs the seam; the demo state's call and the fixture copy go; every
+      caller steps through it.
 - [ ] A world's create-time memory follows its content. Failure scenario:
       every small dungeon pays the nav phase's ~5.5 MB floor at 256² × 8
       (measured above; 6.5 MB at 256² × 128, 13.0 MB at 2048² × 8; cause not

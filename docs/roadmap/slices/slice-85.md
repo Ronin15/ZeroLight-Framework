@@ -172,6 +172,8 @@ keeps the apply local.
 
 ### Acceptance checks
 
-- [ ] `steering` at three sizes shows no regression beyond run-to-run spread;
+- [ ] `steering` at three sizes shows no regression beyond run-to-run spread
+      (tuned-versus-control measured after slice 89's tuner change, which gets
+      its own whole-suite run; the `750ce0a` baseline predates it);
       `production-step` steering main time no higher than at `5d5a089`.
 - [ ] `zig build verify` passes.

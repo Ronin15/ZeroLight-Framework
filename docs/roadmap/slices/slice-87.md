@@ -109,6 +109,8 @@ text, and GPU buffers meet the cost model and `.claude/rules/render.md`.
 ### Acceptance checks
 
 - [ ] `render-game-prep-offview` meets its pass shape; `render-game-prep`
-      shows no regression beyond run-to-run spread.
+      shows no regression beyond run-to-run spread (tuned-versus-control
+      measured after slice 89's tuner change, which gets its own whole-suite
+      run; the `750ce0a` baseline predates it).
 - [ ] `zig build gpu-smoke` on each available backend (display-gated).
 - [ ] `zig build verify` passes.

@@ -85,7 +85,11 @@ groups measure it.
   - A uniform-divisor reciprocal multiply replaces `divInt4`, exact for every
     non-negative dividend below 2^31; `divInt4` is deleted.
   - sin/cos become a deterministic polynomial with a fixed op order pinned by
-    golden-bit tests; `math.sinCos` delegates to lane 0.
+    golden-bit tests, landed as a paired scalar and SIMD form (`math.sinCos`
+    and a `simd.zig` `sinCos` over lanes) with parity tests, so the scalar
+    delegates to lane 0 (`.claude/rules/memory-performance.md` § SIMD and core
+    math: a missing primitive goes into `core` as a paired scalar and SIMD
+    form; determinism per `.claude/rules/simulation.md` § Determinism).
   - Kept: true division and sqrt (no estimates, which differ between vendors),
     scalar-load gather, unaligned loads, SSE2 integer emulations on `compat`,
     unfused lerp/dot.
@@ -132,8 +136,9 @@ groups measure it.
       non-power-of-two chunk-size scope test; existing scope parity
       and `FailingAllocator` tests pass.
 - [ ] Polynomial sin/cos and `math.sinCos` delegation, the debug-overlay swap,
-      and `LIBM_BUILTIN`; golden-bit, f64-reference, symmetry, signed-zero,
-      non-finite, and lane-equality tests.
+      and `LIBM_BUILTIN`; the paired scalar and SIMD `sinCos`; golden-bit,
+      f64-reference, symmetry, signed-zero, non-finite, and scalar-versus-SIMD
+      lane-equality parity tests.
 - [ ] `simd-asm-check` probe, checker, and `verify` wiring.
 - [ ] Determinism contract header on `simd.zig` and corrected doc comments.
 - [ ] Docs: Determinism Contract (scalar/SIMD identity; residual hazards

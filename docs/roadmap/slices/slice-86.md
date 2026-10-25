@@ -414,6 +414,8 @@ the current bench.
       305 µs / 1.18 ms at 1,024 / 4,096 / 16,384 contacts, with main outside
       the stage batches 11 / 25 / 118 µs. No paired pre-slice run; the groups
       completed and their asserts held.
+- [ ] Tuned-versus-control measurements here are taken after slice 89's tuner
+      change (the `750ce0a` baseline predates it; 89 runs its own whole-suite run).
 - [ ] `production-step`: collision main time is the ordered merge only, and
       flat in inert rows. The ordered-merge half is the gather-and-sort item.
       Flat in inert rows is the rows-at-rest item, after slice 88.
