@@ -196,7 +196,7 @@ pub const AdaptiveWorkPhase = enum {
 
 // An unsustained jump's held profile and the counts it was predicted between. The held
 // profile starts at the model's prediction; the jump's own skipped records judge it
-// (`judgeJump`), final after at most two.
+// (`judgeJump`) within at most two.
 const JumpProfile = struct {
     learned_item_count: usize,
     item_count: usize,
@@ -207,8 +207,10 @@ const JumpProfile = struct {
     // The jump's measured inline and threaded batch durations; 0 is not measured.
     inline_ns: u64 = 0,
     threaded_ns: u64 = 0,
-    // Set once the records decide `profile`; it then holds while the counts repeat.
+    // Set once the records decide `profile`; it then holds across the count band, until
+    // `sample_window` held-shape records in a row contradict it (`judgeJump`).
     judged: bool = false,
+    contradicting_records: usize = 0,
 };
 
 // The default floors the learned participant overhead in the prediction;
@@ -296,10 +298,10 @@ pub const AdaptiveWorkTuner = struct {
     // Set by a sustained item-count shift on a threaded stage: the next threaded settled
     // window re-decides inline or threaded at the new count.
     retune_pending: bool = false,
-    // The shape the last unsustained jump up holds, reused while its learned and requested
-    // counts repeat, so the same jump dispatches alike under model jitter: the model's
-    // prediction until the jump's own records judge it. A sustained shift changes the
-    // learned count and so re-predicts it.
+    // The shape the last unsustained jump up holds, reused while its learned count repeats
+    // and the requested count stays in the reset band of the jump's, so the same jump
+    // dispatches alike under model jitter: the model's prediction until the jump's own
+    // records judge it. A sustained shift changes the learned count and so re-predicts it.
     jump_profile: ?JumpProfile = null,
     // Diagnostics only: cumulative over the tuner's life (no reset path clears
     // them) and never read by policy.
@@ -362,10 +364,7 @@ pub const AdaptiveWorkTuner = struct {
         // it judges the held shape (`judgeJump`). A tuner with a threaded profile
         // re-normalizes that profile.
         if (self.jumpSelected()) {
-            const repeated = if (self.jump_profile) |jump|
-                jump.learned_item_count == self.learned_item_count and jump.item_count == normalized_request.item_count
-            else
-                false;
+            const repeated = if (self.jump_profile) |jump| self.jumpCovers(jump, normalized_request) else false;
             if (!repeated) self.jump_profile = .{
                 .learned_item_count = self.learned_item_count,
                 .item_count = normalized_request.item_count,
@@ -429,23 +428,39 @@ pub const AdaptiveWorkTuner = struct {
         return self.skip_next_record and self.shifted_up and !self.has_threaded_profile and self.model_work_ns_per_item > 0;
     }
 
-    // A repeated jump's skipped record judges its held shape by the gate, the bound rule,
-    // and the commit margin; final after at most two records. An inline record under the
+    // Whether `jump`'s judgment answers `request`: the same learned count, and a requested
+    // count inside the reset band of the jump's own (the band the tuner treats as one
+    // workload).
+    fn jumpCovers(self: *const AdaptiveWorkTuner, jump: JumpProfile, request: AdaptiveWorkRequest) bool {
+        return jump.learned_item_count == self.learned_item_count and !outsideBand(jump.item_count, request.item_count, self.config.item_count_reset_percent);
+    }
+
+    // A covered jump's skipped record judges its held shape by the gate, the bound rule,
+    // and the commit margin, within at most two records. An inline record under the
     // gate holds inline; at or above it the repeat probes the threaded shape. A threaded
     // record whose bound is under the gate holds inline, one whose duration reaches the
     // gate holds threaded, and one under the gate whose bound is not runs inline once. With
     // one record of each shape the threaded one holds only if the inline one reached the
     // gate and it beats it by the commit margin. A second record of the shape already
     // measured (a threaded probe that ran inline) holds the shape it measured, so no held
-    // shape is unmeasured.
+    // shape is unmeasured. A judged shape reopens on a sustained shift in its own records:
+    // `sample_window` in a row that each could change the verdict (`contradictsJudgment`); the
+    // record that completes the run is the reopened judgment's first.
     fn judgeJump(self: *AdaptiveWorkTuner, stats: BatchStats) void {
         const jump = &self.jump_profile.?; // the jump branch sets it at the select
         const request = self.last_request.?; // the select sets it before the jump branch
-        std.debug.assert(jump.learned_item_count == self.learned_item_count and jump.item_count == request.item_count);
-        if (jump.judged) return;
+        std.debug.assert(self.jumpCovers(jump.*, request));
         const gate = self.config.threaded_batch_ns;
         const duration_ns = stats.batch_duration_ns;
         const threaded = stats.active_worker_threads > 0;
+        if (jump.judged) {
+            jump.contradicting_records = if (self.contradictsJudgment(jump.*, stats)) jump.contradicting_records + 1 else 0;
+            if (jump.contradicting_records < self.config.sample_window) return;
+            jump.inline_ns = 0;
+            jump.threaded_ns = 0;
+            jump.judged = false;
+            jump.contradicting_records = 0;
+        }
         const measured = if (threaded) &jump.threaded_ns else &jump.inline_ns;
         const repeat = measured.* != 0;
         measured.* = duration_ns;
@@ -470,6 +485,27 @@ pub const AdaptiveWorkTuner = struct {
             if (duration_ns < gate) jump.profile = inline_profile;
             jump.judged = bound_under_gate or duration_ns >= gate;
         }
+    }
+
+    // Whether a record of a judged jump moves its held shape's cost the way that could change
+    // the verdict, past the commit margin of the measurement the verdict rests on. Held
+    // inline: a slower inline record at or above the gate (one the gate alone judges when the
+    // bound rule held inline unmeasured). Held threaded over a measured inline: a slower
+    // threaded record. Held threaded by its duration at the gate: a faster one under it. A
+    // record of the other shape (a held shape normalized at dispatch) never contradicts.
+    fn contradictsJudgment(self: *const AdaptiveWorkTuner, jump: JumpProfile, stats: BatchStats) bool {
+        std.debug.assert(jump.judged);
+        const held_threaded = jump.profile.worker_threads > 0;
+        const threaded = stats.active_worker_threads > 0;
+        if (threaded != held_threaded) return false;
+        const gate = self.config.threaded_batch_ns;
+        const margin = self.config.threaded_commit_threshold_percent;
+        const duration_ns = stats.batch_duration_ns;
+        if (!held_threaded) return duration_ns >= gate and (jump.inline_ns == 0 or isMeaningfullyFaster(jump.inline_ns, duration_ns, margin));
+        // A held threaded shape is always measured: only a threaded record holds it.
+        std.debug.assert(jump.threaded_ns != 0);
+        if (jump.inline_ns != 0) return isMeaningfullyFaster(jump.threaded_ns, duration_ns, margin);
+        return duration_ns < gate and isMeaningfullyFaster(duration_ns, jump.threaded_ns, margin);
     }
 
     // Learning establishes the baseline for the sampled profile. Cheap inline work
@@ -598,6 +634,8 @@ pub const AdaptiveWorkTuner = struct {
         std.debug.assert(profile.worker_threads > 0);
         self.has_threaded_profile = true;
         self.current_profile = profile;
+        // A threaded profile takes no jump; a later demotion predicts afresh.
+        self.jump_profile = null;
     }
 
     // The median over the window of each batch's duration x its participants.
@@ -948,6 +986,8 @@ pub const AdaptiveWorkTuner = struct {
         self.inline_probe_cooldown_windows = 0;
         self.batch_multiplier = 1;
         self.nudge_direction = initial_nudge_direction;
+        // A relearn's model is new, so no jump judged on the old one is reused.
+        self.jump_profile = null;
         self.restartNudge();
         self.resetSamples();
     }
@@ -4347,8 +4387,8 @@ test "adaptive work tuner a threaded jump whose bound is under the gate repeats 
     // 500 ns on 64 participants: a 32 us bound on its inline cost.
     const first = try recordTestJump(&tuner, count_jump_request, 500);
     try std.testing.expectEqual(@as(usize, 63), first.worker_threads);
-    // The bound rule's verdict is final: an inline repeat at 100 us, which the 0.5 us threaded
-    // record beats by the margin, does not reopen it.
+    // One inline repeat at 100 us, which the 0.5 us threaded record beats by the margin, does
+    // not reopen the bound rule's verdict.
     try std.testing.expectEqual(@as(usize, 0), (try recordTestJump(&tuner, count_jump_request, 100_000)).worker_threads);
     try std.testing.expectEqual(@as(usize, 0), selectTestJump(&tuner, count_jump_request).worker_threads);
 }
@@ -4390,16 +4430,131 @@ test "adaptive work tuner a jump's probe that runs inline again holds the measur
     try std.testing.expectEqual(@as(usize, 0), selectTestJump(&tuner, inline_jump_request).worker_threads);
 }
 
-test "adaptive work tuner a non-repeated jump keeps the predicted shape" {
+test "adaptive work tuner a jump outside its count band re-predicts" {
     var tuner = try inlineSettledTestTuner();
     _ = try recordTestJump(&tuner, inline_jump_request, 100_000);
     _ = try recordTestJump(&tuner, inline_jump_request, 40_000);
     const judged = selectTestJump(&tuner, inline_jump_request);
     try std.testing.expect(judged.worker_threads > 0);
     tuner.record(tunerTestBatchWithProfile(32, judged, 40_000));
+    // 40 items is at the 25% band's edge around the jump's 32, so outside it.
     const other_request = tunerTestRequest(40, 64, 1, 64);
+    try std.testing.expect(outsideBand(32, 40, tuner.config.item_count_reset_percent));
     const predicted = tuner.normalizedProfile(tuner.predictProfile(tuner.normalizeRequest(other_request)), tuner.normalizeRequest(other_request));
     try std.testing.expectEqual(predicted, selectTestJump(&tuner, other_request));
+}
+
+test "adaptive work tuner a jump inside its count band reuses the judgment" {
+    var tuner = try inlineSettledTestTuner();
+    _ = try recordTestJump(&tuner, inline_jump_request, 100_000);
+    _ = try recordTestJump(&tuner, inline_jump_request, 40_000);
+    try std.testing.expect(tuner.jump_profile.?.judged);
+    // 36 items is inside the band around 32 and predicted inline (36 us under the 60 us gate);
+    // it takes the judged threaded shape, re-normalized to its count.
+    const in_band_request = tuner.normalizeRequest(tunerTestRequest(36, 64, 1, 64));
+    try std.testing.expect(!outsideBand(32, 36, tuner.config.item_count_reset_percent));
+    try std.testing.expectEqual(@as(usize, 0), tuner.predictProfile(in_band_request).worker_threads);
+    const held = tuner.jump_profile.?.profile;
+    const selected = selectTestJump(&tuner, in_band_request);
+    try std.testing.expect(selected.worker_threads > 0);
+    try std.testing.expectEqual(tuner.normalizedProfile(held, in_band_request), selected);
+    // Its record judges the same entry: one fast record leaves it judged.
+    tuner.record(tunerTestBatchWithProfile(36, selected, 40_000));
+    try std.testing.expectEqual(@as(usize, 32), tuner.jump_profile.?.item_count);
+    try std.testing.expect(tuner.jump_profile.?.judged);
+}
+
+test "adaptive work tuner a judged jump reopens on a sustained shift in its held shape's records" {
+    // Held inline at 25 us; a window of 200 us inline records reopens it and the last one
+    // probes the threaded shape.
+    var held_inline = try inlineSettledTestTuner();
+    try std.testing.expectEqual(@as(usize, 0), (try recordTestJump(&held_inline, inline_jump_request, 25_000)).worker_threads);
+    try std.testing.expect(held_inline.jump_profile.?.judged);
+    for (0..held_inline.config.sample_window) |_| {
+        try std.testing.expectEqual(@as(usize, 0), (try recordTestJump(&held_inline, inline_jump_request, 200_000)).worker_threads);
+    }
+    try std.testing.expect(!held_inline.jump_profile.?.judged);
+    try std.testing.expect(selectTestJump(&held_inline, inline_jump_request).worker_threads > 0);
+
+    // Held threaded at 80 us; a window of 0.5 us threaded records (a 32 us bound on 64
+    // participants) reopens it and the last one holds inline.
+    var held_threaded = try inlineSettledTestTuner();
+    try std.testing.expect((try recordTestJump(&held_threaded, count_jump_request, 80_000)).worker_threads > 0);
+    try std.testing.expect(held_threaded.jump_profile.?.judged);
+    for (0..held_threaded.config.sample_window) |_| {
+        try std.testing.expect((try recordTestJump(&held_threaded, count_jump_request, 500)).worker_threads > 0);
+    }
+    try std.testing.expect(held_threaded.jump_profile.?.judged);
+    try std.testing.expectEqual(@as(usize, 0), selectTestJump(&held_threaded, count_jump_request).worker_threads);
+}
+
+test "adaptive work tuner a judged jump does not reopen on records equal to its evidence" {
+    // A threaded probe that lost by the margin: inline held at 100 us, at or above the gate.
+    var lost_probe = try inlineSettledTestTuner();
+    _ = try recordTestJump(&lost_probe, inline_jump_request, 100_000);
+    _ = try recordTestJump(&lost_probe, inline_jump_request, 98_000);
+    for (0..2 * lost_probe.config.sample_window) |_| {
+        try std.testing.expectEqual(@as(usize, 0), (try recordTestJump(&lost_probe, inline_jump_request, 100_000)).worker_threads);
+    }
+    try std.testing.expect(lost_probe.jump_profile.?.judged);
+
+    // A probe that ran inline: inline held from two 100 us inline records.
+    var inline_probe = try inlineSettledTestTuner();
+    _ = try recordTestJump(&inline_probe, inline_jump_request, 100_000);
+    _ = try recordTestJumpRanAs(&inline_probe, inline_jump_request, inlineProfile(inline_jump_request), 100_000);
+    for (0..2 * inline_probe.config.sample_window) |_| {
+        try std.testing.expectEqual(@as(usize, 0), (try recordTestJump(&inline_probe, inline_jump_request, 100_000)).worker_threads);
+    }
+    try std.testing.expect(inline_probe.jump_profile.?.judged);
+}
+
+test "adaptive work tuner a bound-rule inline jump whose inline cost reaches the gate settles once measured" {
+    // The bound rule holds inline unmeasured (0.5 us on 64 participants); inline then runs
+    // 100 us. Each jump records at the shape it was selected: the first inline window reopens
+    // it, the threaded probe beats the measured inline by the margin, and threaded then holds.
+    var tuner = try inlineSettledTestTuner();
+    _ = try recordTestJump(&tuner, count_jump_request, 500);
+    try std.testing.expectEqual(@as(usize, 0), tuner.jump_profile.?.profile.worker_threads);
+    const settle_jumps = tuner.config.sample_window + 1;
+    for (0..settle_jumps + 4 * tuner.config.sample_window) |jump_index| {
+        recordInBandTestBatch(&tuner);
+        const selected = tuner.selectProfile(count_jump_request);
+        if (jump_index >= settle_jumps) try std.testing.expect(selected.worker_threads > 0);
+        tuner.record(tunerTestBatchWithProfile(count_jump_request.item_count, selected, if (selected.worker_threads > 0) 500 else 100_000));
+    }
+    try std.testing.expect(tuner.jump_profile.?.judged);
+}
+
+test "adaptive work tuner a held threaded jump ignores records of the inline shape" {
+    // Held threaded at 80 us; its selection runs inline at dispatch at 1 us, a cost that would
+    // reopen it as a threaded record.
+    var tuner = try inlineSettledTestTuner();
+    const held = try recordTestJump(&tuner, count_jump_request, 80_000);
+    try std.testing.expect(held.worker_threads > 0);
+    for (0..tuner.config.sample_window) |_| {
+        _ = try recordTestJumpRanAs(&tuner, count_jump_request, inlineProfile(count_jump_request), 1_000);
+    }
+    try std.testing.expect(tuner.jump_profile.?.judged);
+    try std.testing.expectEqual(held, selectTestJump(&tuner, count_jump_request));
+}
+
+test "adaptive work tuner a judged jump does not reopen on one record or alternating records across the gate" {
+    var held_inline = try inlineSettledTestTuner();
+    _ = try recordTestJump(&held_inline, inline_jump_request, 25_000);
+    // Alternating 200 us and 25 us inline records, then one more across the gate: each run
+    // across it is shorter than a window.
+    for (0..2 * held_inline.config.sample_window) |index| {
+        _ = try recordTestJump(&held_inline, inline_jump_request, if (index % 2 == 0) 200_000 else 25_000);
+    }
+    _ = try recordTestJump(&held_inline, inline_jump_request, 200_000);
+    try std.testing.expect(held_inline.jump_profile.?.judged);
+    try std.testing.expectEqual(@as(usize, 0), selectTestJump(&held_inline, inline_jump_request).worker_threads);
+
+    var held_threaded = try inlineSettledTestTuner();
+    _ = try recordTestJump(&held_threaded, count_jump_request, 80_000);
+    _ = try recordTestJump(&held_threaded, count_jump_request, 500);
+    try std.testing.expect(held_threaded.jump_profile.?.judged);
+    try std.testing.expect(selectTestJump(&held_threaded, count_jump_request).worker_threads > 0);
 }
 
 test "participant slots include main thread and worker threads" {

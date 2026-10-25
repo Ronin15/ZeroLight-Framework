@@ -8,6 +8,7 @@
 const std = @import("std");
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const inlineBatch = @import("../../app/thread_system.zig").inlineBatch;
 const DataSystem = @import("../../game/data_system.zig").DataSystem;
 const PathRequest = @import("../../game/simulation.zig").PathRequest;
@@ -186,8 +187,8 @@ pub const long_path_group = suite.BenchmarkGroup{
 // the world. A 64-pad placement is a one-off jump amid ordinary nav work, so the case runs the
 // spike shape: the nav stage tuners settle on in-band toggles (one cell at level 1's centre,
 // which holds no pad, blocked and reacted to, then reopened and reacted to on a revert stage
-// tuner set), then at least two warmup batches grow the per-range scratch (a repeated jump
-// count's shape is judged by its first two records), and each measured sample runs one
+// tuner set), then at least two warmup batches grow the per-range scratch (a jump's shape,
+// held across its count band, is judged by its first two records), and each measured sample runs one
 // in-band toggle untimed before the timed fold (headline tuner: the patch). Every case runs
 // at least two toggles and then one per batch, so the world is the same in every case.
 //   - Axis 0 (uniform): 1,024, 8,192, or 32,768 background pads; every batch is uniform
@@ -201,10 +202,15 @@ pub const long_path_group = suite.BenchmarkGroup{
 // reaction patched; items/s is pads applied per second. Passes when the reaction's `commit`
 // section (the link fold) is flat per pad in pads held on both axes, the whole reaction is flat
 // in background pads at a fixed preload, and it grows at most linearly in endpoints per
-// touched chunk at a fixed background. `--details` prints the reaction's plan, patch, and
+// touched chunk at a fixed background, and when every timed patch batch of the tuned case is
+// a jump that reuses the judgment its count band holds (re-predicts none), with uniform
+// batches at varying chunk counts (some off the entry's count). Every batch is 64 pads, so its
+// patch count stays inside the entry's band; a count outside it would re-predict and fail
+// the run as a fixture that left the band. `--details` prints the reaction's plan, patch, and
 // connectivity gather shapes, the per-pad and per-pad `commit` cost, the mean endpoints per
 // touched chunk, the mean pads held over the timed samples, the main-thread share, and its
-// split by section.
+// split by section, and for the tuned case the patch jumps' count range, those at a count
+// other than their judgment entry's, and those re-predicted.
 pub const link_fold_group = suite.BenchmarkGroup{
     .name = "pathfinding-link-fold",
     .item_label = LinkFoldCode.label,
@@ -1684,8 +1690,8 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     defer threads.deinit();
     const thread_ptr = &threads;
     const participant_count = fixtures.participantCount(thread_ptr);
-    // A repeated jump count's shape is judged by its first two records, so at least two
-    // untimed batches run whatever the warmup count, the same in every case.
+    // A jump's shape, held across its count band, is judged by its first two records, so at
+    // least two untimed batches run whatever the warmup count, the same in every case.
     const warmup_batches = @max(options.warmup_iterations, 2);
     // Every sample adds a batch, so the size check holds at the most pads the run holds.
     const samples = warmup_batches + options.iterations;
@@ -1727,14 +1733,23 @@ fn runLinkFoldCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var report = LinkFoldReport{};
     for (0..options.iterations) |_| {
         try toggleLinkFoldInBandCell(io, &fixture, &revert_tuners, thread_ptr);
+        const jump_before = patch_tuner.jump_profile;
+        const skips_before = patch_tuner.shift_skip_count;
         const sample = try foldPadBatch(io, &fixture, random, config, probe_pairs, batch, thread_ptr);
         batch += 1;
         const patch = sample.reaction.stats.perf.patch_batch;
         accumulator.record(sample.reaction.elapsed_ns, patch);
         report.add(sample, sample.reaction.stats.perf.plan_batch, patch, fixture.open.world.levelLinks().len);
+        // A skipped record on a tuner with no threaded profile and a jump entry took the jump.
+        const jumped = patch_tuner.shift_skip_count != skips_before and !patch_tuner.has_threaded_profile;
+        if (case.adaptive and jumped) report.addPatchJump(jump_before, patch_tuner.jump_profile, patch.item_count);
     }
     const pads_held = fixture.open.world.levelLinks().len;
     if (pads_held != peak_pads) return error.LinkFoldDrift;
+    if (case.adaptive and report.patch_jumps != options.iterations) return error.LinkFoldPatchNotJump;
+    if (report.patch_jump_repredicted != 0) return error.LinkFoldJumpRepredicted;
+    // Uniform batches touch varying chunk counts, so the band, not a repeated count, is reused.
+    if (case.adaptive and config.axis == .uniform and report.patch_jump_off_count == 0) return error.LinkFoldJumpCountFixed;
     try nav_size.checkNavBytes(link_fold_group.name, item_count, size_config, &fixture.system);
     var stats = accumulator.finish();
     report.write(&stats.details);
@@ -1865,15 +1880,39 @@ fn foldPadBatch(io: std.Io, fixture: *ReactFixture, random: std.Random, config: 
     return sample;
 }
 
+// A tuner's held jump entry, as the link-fold report reads it.
+const PatchJump = @FieldType(AdaptiveWorkTuner, "jump_profile");
+
 // The timed link-fold reactions' plan, patch, and connectivity gather shapes and main-thread
 // share and split, the chunks the last reaction patched, the endpoints of the chunks the
 // reactions touched summed with those chunks, and the pads held after each reaction, summed.
+
 const LinkFoldReport = struct {
     stages: ReactionStages = .{},
     chunks_patched: usize = 0,
     touched_chunks: usize = 0,
     touched_endpoints: usize = 0,
     pads_held: usize = 0,
+    // The tuned case's timed patch jumps: their item count range, those at a count other than
+    // their judgment entry's, and those that took a new entry (re-predicted) rather than the
+    // judged one their count band covers.
+    patch_jumps: usize = 0,
+    patch_jump_min_items: usize = std.math.maxInt(usize),
+    patch_jump_max_items: usize = 0,
+    patch_jump_off_count: usize = 0,
+    patch_jump_repredicted: usize = 0,
+
+    // A timed patch batch that took the jump branch, which reads or sets the tuner's jump
+    // entry; one without a per-item model holds none.
+    fn addPatchJump(self: *LinkFoldReport, before: PatchJump, after: PatchJump, item_count: usize) void {
+        const entry = after orelse return;
+        self.patch_jumps += 1;
+        self.patch_jump_min_items = @min(self.patch_jump_min_items, item_count);
+        self.patch_jump_max_items = @max(self.patch_jump_max_items, item_count);
+        if (entry.item_count != item_count) self.patch_jump_off_count += 1;
+        const reused = if (before) |held| held.learned_item_count == entry.learned_item_count and held.item_count == entry.item_count else false;
+        if (!reused) self.patch_jump_repredicted += 1;
+    }
 
     fn add(self: *LinkFoldReport, sample: LinkFoldSample, plan: BatchStats, patch: BatchStats, pads_held: usize) void {
         self.stages.add(sample.reaction, .{ plan, patch, sample.reaction.stats.perf.conn_gather_batch });
@@ -1905,5 +1944,6 @@ const LinkFoldReport = struct {
             self.chunks_patched,
             suite.formatNavMainInto(&main_buffer, stages.nav_main),
         });
+        if (self.patch_jumps != 0) details.print("patch_jumps={} patch_jump_items={}-{} patch_jump_off_count={} patch_jump_repredicted={}\n", .{ self.patch_jumps, self.patch_jump_min_items, self.patch_jump_max_items, self.patch_jump_off_count, self.patch_jump_repredicted });
     }
 };
