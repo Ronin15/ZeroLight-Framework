@@ -18,6 +18,14 @@
 //!   level 1, and one on level 2, so lane batches mix gated and skipped rows and gated
 //!   lanes alternate levels: the store order the pass meets when membership and level do
 //!   not order the rows.
+//! - `scattered` (2): every row a gated AI body on the grid, its level (1 or 2) drawn from
+//!   a seeded RNG and the rows stored in a seeded random order, so neighbouring lanes read
+//!   terrain bits on other levels and chunks.
+//! - `scattered-sorted` (3): the identical row set stored in `(level, chunk)` order.
+//!
+//! The scattered pair measures what scattered store order costs the per-row terrain
+//! lookups against the same rows grouped by level and chunk. Its pass shape (scattered
+//! within spread of scattered-sorted) is reported, not asserted.
 //!
 //! Pass shape: time linear in bodies and main per body flat in each shape;
 //! `thread-adaptive-tuned-range` is the production tuner and matches or beats the best
@@ -30,6 +38,7 @@ const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const EntityId = @import("../game/data_system.zig").EntityId;
 const Player = @import("../game/player.zig").Player;
+const ChunkCoord = @import("../game/simulation_scope.zig").ChunkCoord;
 const SimulationTier = @import("../game/simulation_scope.zig").SimulationTier;
 const WorldGateConfig = @import("../game/systems/world_gate.zig").WorldGateConfig;
 const WorldGateSystem = @import("../game/systems/world_gate.zig").WorldGateSystem;
@@ -47,7 +56,7 @@ pub const group = suite.BenchmarkGroup{
     .write_workload = writeGateWorkload,
 };
 
-const GateShape = enum(u8) { uniform, interleaved };
+const GateShape = enum(u8) { uniform, interleaved, scattered, scattered_sorted };
 const GateFields = struct { shape: GateShape, bodies: u32 };
 const GateCode = suite.ItemCode(GateFields, &.{6});
 
@@ -58,6 +67,12 @@ const item_counts = [_]usize{
     GateCode.of(.{ .shape = .interleaved, .bodies = 4_096 }),
     GateCode.of(.{ .shape = .interleaved, .bodies = 16_384 }),
     GateCode.of(.{ .shape = .interleaved, .bodies = 65_536 }),
+    GateCode.of(.{ .shape = .scattered, .bodies = 4_096 }),
+    GateCode.of(.{ .shape = .scattered, .bodies = 16_384 }),
+    GateCode.of(.{ .shape = .scattered, .bodies = 65_536 }),
+    GateCode.of(.{ .shape = .scattered_sorted, .bodies = 4_096 }),
+    GateCode.of(.{ .shape = .scattered_sorted, .bodies = 16_384 }),
+    GateCode.of(.{ .shape = .scattered_sorted, .bodies = 65_536 }),
 };
 
 // The fixed world: a surface and the gated levels, each of this side in tiles.
@@ -68,15 +83,19 @@ const body_size: f32 = 20;
 const player_size: f32 = 32;
 // Each body's settled step from its previous position, so both gate axes test a move.
 const step_offset = math.Vec2{ .x = 3, .y = 2 };
+// Seeds the scattered shapes' levels and store order; mixed with the body count so each
+// size has its own deterministic layout, the same in both scattered shapes.
+const scatter_seed: u64 = 0x5ca7_7e2d_0b0d_1e5;
 
 // What one body row is: whether the pass gates it, and on which level.
 const RowKind = enum { non_ai, dormant, gated };
 
 const BodyRow = struct { kind: RowKind, level: u16 };
 
+// The scattered shapes draw each row's level in `placeBodies`.
 fn bodyRow(shape: GateShape, index: usize) BodyRow {
     return switch (shape) {
-        .uniform => .{ .kind = .gated, .level = gate_levels[0] },
+        .uniform, .scattered, .scattered_sorted => .{ .kind = .gated, .level = gate_levels[0] },
         .interleaved => switch (index % 4) {
             0 => .{ .kind = .non_ai, .level = gate_levels[0] },
             1 => .{ .kind = .dormant, .level = gate_levels[0] },
@@ -89,7 +108,7 @@ fn bodyRow(shape: GateShape, index: usize) BodyRow {
 fn levelCount(shape: GateShape) u16 {
     return switch (shape) {
         .uniform => gate_levels[0] + 1,
-        .interleaved => gate_levels[1] + 1,
+        .interleaved, .scattered, .scattered_sorted => gate_levels[1] + 1,
     };
 }
 
@@ -130,6 +149,66 @@ fn buildWorld(allocator: std.mem.Allocator, io: std.Io, shape: GateShape) !World
     return world;
 }
 
+// One body row in store order: its previous position, the chunk it steps into, whether
+// its start tile is solid, and what the row is. `grid_index` is its place on the grid.
+const Placement = struct {
+    previous: math.Vec2,
+    chunk: ChunkCoord,
+    solid: bool,
+    body: BodyRow,
+    grid_index: usize,
+
+    // `(level, chunk row, chunk column)`, then the grid order inside a chunk.
+    fn levelChunkLessThan(_: void, a: Placement, b: Placement) bool {
+        if (a.body.level != b.body.level) return a.body.level < b.body.level;
+        if (a.chunk.y != b.chunk.y) return a.chunk.y < b.chunk.y;
+        if (a.chunk.x != b.chunk.x) return a.chunk.x < b.chunk.x;
+        return a.grid_index < b.grid_index;
+    }
+};
+
+// The bodies on a grid over the level, in the shape's store order. Caller owns the slice.
+fn placeBodies(allocator: std.mem.Allocator, world: *const WorldSystem, shape: GateShape, bodies: usize) ![]Placement {
+    const grid_side = suite.ceilSqrt(bodies);
+    if (grid_side > gate_level_side) return error.WorldGateGridPastLevel;
+    const pitch_tiles = gate_level_side / grid_side;
+    const tile = world.tile_size;
+    var prng = std.Random.DefaultPrng.init(scatter_seed ^ bodies);
+    const random = prng.random();
+    const placements = try allocator.alloc(Placement, bodies);
+    errdefer allocator.free(placements);
+    for (placements, 0..) |*placement, index| {
+        const column = index % grid_side;
+        const row = index / grid_side;
+        // Checkerboard of bodies: odd ones start on a solid tile, even ones on a walkable one.
+        const solid = (column + row) % 2 == 1;
+        var tile_x = column * pitch_tiles;
+        const tile_y = row * pitch_tiles;
+        // The floor is walkable where the tile parity is even; a body whose pitch tile has the
+        // other parity shifts one tile along x, back from the level's last column.
+        if (((tile_x + tile_y) % 2 == 1) != solid) tile_x = if (tile_x + 1 < gate_level_side) tile_x + 1 else tile_x - 1;
+        var body = bodyRow(shape, index);
+        if (shape == .scattered or shape == .scattered_sorted) body.level = gate_levels[random.uintLessThan(usize, gate_levels.len)];
+        const previous = math.Vec2{
+            .x = @as(f32, @floatFromInt(tile_x)) * tile,
+            .y = @as(f32, @floatFromInt(tile_y)) * tile,
+        };
+        placement.* = .{
+            .previous = previous,
+            .chunk = world.chunkCoordForWorldPos(previous.x + step_offset.x, previous.y + step_offset.y),
+            .solid = solid,
+            .body = body,
+            .grid_index = index,
+        };
+    }
+    switch (shape) {
+        .uniform, .interleaved => {},
+        .scattered => random.shuffle(Placement, placements),
+        .scattered_sorted => std.mem.sort(Placement, placements, {}, Placement.levelChunkLessThan),
+    }
+    return placements;
+}
+
 fn buildFixture(allocator: std.mem.Allocator, io: std.Io, shape: GateShape, bodies: usize) !Fixture {
     var world = try buildWorld(allocator, io, shape);
     errdefer world.deinit();
@@ -141,28 +220,15 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, shape: GateShape, bodi
     const tile = world.tile_size;
     // A body and its step stay inside its start tile on both axes.
     std.debug.assert(body_size + step_offset.x < tile and body_size + step_offset.y < tile);
-    const grid_side = suite.ceilSqrt(bodies);
-    if (grid_side > gate_level_side) return error.WorldGateGridPastLevel;
-    const pitch_tiles = gate_level_side / grid_side;
+    const placements = try placeBodies(allocator, &world, shape, bodies);
+    defer allocator.free(placements);
     var gated_rows: usize = 0;
     var held_rows: usize = 0;
-    for (0..bodies) |index| {
-        const column = index % grid_side;
-        const row = index / grid_side;
-        // Checkerboard of bodies: odd ones start on a solid tile, even ones on a walkable one.
-        const solid = (column + row) % 2 == 1;
-        var tile_x = column * pitch_tiles;
-        const tile_y = row * pitch_tiles;
-        // The floor is walkable where the tile parity is even; a body whose pitch tile has the
-        // other parity shifts one tile along x, back from the level's last column.
-        if (((tile_x + tile_y) % 2 == 1) != solid) tile_x = if (tile_x + 1 < gate_level_side) tile_x + 1 else tile_x - 1;
-        const body = bodyRow(shape, index);
+    for (placements) |placement| {
+        const body = placement.body;
         gated_rows += @intFromBool(body.kind == .gated);
-        held_rows += @intFromBool(body.kind == .dormant or (body.kind == .gated and solid));
-        const previous = math.Vec2{
-            .x = @as(f32, @floatFromInt(tile_x)) * tile,
-            .y = @as(f32, @floatFromInt(tile_y)) * tile,
-        };
+        held_rows += @intFromBool(body.kind == .dormant or (body.kind == .gated and placement.solid));
+        const previous = placement.previous;
         const position = math.Vec2{ .x = previous.x + step_offset.x, .y = previous.y + step_offset.y };
         const entity = try data.createEntity();
         try data.setMovementBody(entity, .{ .position = position, .previous_position = previous, .velocity = step_offset, .speed = 40 });
@@ -178,7 +244,7 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, shape: GateShape, bodi
         const tier: SimulationTier = if (body.kind == .dormant) .dormant else .locomotion;
         try data.setSimulationMetadata(entity, .{
             .tier = tier,
-            .chunk = world.chunkCoordForWorldPos(position.x, position.y),
+            .chunk = placement.chunk,
             .level = body.level,
         });
     }
