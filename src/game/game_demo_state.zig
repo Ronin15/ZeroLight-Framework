@@ -853,9 +853,7 @@ fn carveUndergroundSpawnPocket(world: *WorldSystem, tunnel_tile: world_system.Ti
     _ = try world.setDenseTile(floor_layer, cell.x, cell.y, tunnel_tile);
 }
 
-/// Places durable investigate POIs on the surface level (index 0 today).
-/// If elevation stacks above the surface are added, rebind this to the
-/// level whose `levelElevation` is 0 rather than hardcoding storage index 0.
+/// Places durable investigate POIs on the surface level (storage index 0).
 fn placeDemoInterestMarkers(world: *WorldSystem) !void {
     const w = world.worldWidthPixels();
     const h = world.worldHeightPixels();
