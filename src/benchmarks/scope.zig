@@ -205,7 +205,7 @@ fn runCognitionCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
         std.debug.assert(result.perf.batch.range_count == scope.range_tallies.items.len);
         for (scope.range_tallies.items, 0..) |slot, range_index| {
             const range_start = range_index * result.perf.batch.items_per_range;
-            std.debug.assert(slot.tally.count + slot.tally.perf.stagger_skips == @min(result.perf.batch.items_per_range, indexed - range_start));
+            std.debug.assert(slot.value.count + slot.value.perf.stagger_skips == @min(result.perf.batch.items_per_range, indexed - range_start));
         }
     }
 

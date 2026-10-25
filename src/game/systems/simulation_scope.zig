@@ -29,7 +29,9 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const maxRangeCount = @import("../../app/thread_system.zig").maxRangeCount;
-const paddingForCacheLine = @import("../../app/thread_system.zig").paddingForCacheLine;
+const PaddedSlot = @import("../../app/thread_system.zig").PaddedSlot;
+const SlotList = @import("../../app/thread_system.zig").SlotList;
+const setSlotCount = @import("../../app/thread_system.zig").setSlotCount;
 const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
@@ -118,7 +120,7 @@ pub const SimulationScopeSystem = struct {
     /// Per-range tallies (count + diagnostics) for the threaded passes, one padded
     /// record per range. Each worker writes only its own record; the main thread reads
     /// them after the batch. The three passes run sequentially, so they share it.
-    range_tallies: GatherTallyList = .empty,
+    range_tallies: SlotList(GatherTally) = .empty,
     /// One adaptive tuner per independently-timed threaded pass.
     chunk_derive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     collision_gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -425,7 +427,7 @@ pub const SimulationScopeSystem = struct {
 
         const tallies = self.range_tallies.items;
         var total: usize = 0;
-        for (tallies) |*slot| total += slot.tally.count;
+        for (tallies) |*slot| total += slot.value.count;
         // No tier crossed a band this step → leave the stream untouched so other
         // structural producers' append protocol is unaffected.
         if (total == 0) return batch;
@@ -433,13 +435,13 @@ pub const SimulationScopeSystem = struct {
         const windows = self.scope_tier_commands.items;
         const range_base = try stream.appendRangeCounts(tallies.len);
         for (tallies, 0..) |*slot, range_index| {
-            stream.addCount(range_base + range_index, slot.tally.count);
+            stream.addCount(range_base + range_index, slot.value.count);
         }
         try stream.prefixAppendedRanges(range_base);
         for (tallies, 0..) |*slot, range_index| {
             var writer = stream.rangeWriter(range_base + range_index);
             const window_start = range_index * selection.items_per_range;
-            for (windows[window_start..][0..slot.tally.count]) |command| writer.write(command);
+            for (windows[window_start..][0..slot.value.count]) |command| writer.write(command);
             writer.finish();
         }
         stream.finishWrite();
@@ -462,8 +464,7 @@ pub const SimulationScopeSystem = struct {
         try out.ensureTotalCapacity(self.allocator, item_count);
         out.items.len = item_count;
         try self.range_tallies.ensureTotalCapacity(self.allocator, range_count);
-        self.range_tallies.items.len = range_count;
-        for (self.range_tallies.items) |*slot| slot.tally = .{};
+        setSlotCount(GatherTally, &self.range_tallies, range_count);
     }
 };
 
@@ -496,17 +497,7 @@ const GatherPerf = if (runtime_perf_log.enabled) struct {
     stagger_skips: usize = 0,
 } else struct {};
 
-const GatherTallySlot = struct {
-    // Padding keeps concurrently written tallies off shared cache lines.
-    tally: GatherTally = .{},
-    padding: [paddingForCacheLine(GatherTally)]u8 = @splat(0),
-};
-
-comptime {
-    std.debug.assert(@sizeOf(GatherTallySlot) % thread_shared_record_alignment == 0);
-}
-
-const GatherTallyList = std.array_list.Aligned(GatherTallySlot, .fromByteUnits(thread_shared_record_alignment));
+const GatherTallySlot = PaddedSlot(GatherTally);
 
 /// Compacts the per-range windows of `list` (range r's `count` records at
 /// `r * items_per_range`) into one contiguous prefix in range order and sums the
@@ -517,7 +508,7 @@ fn compactIndexWindows(list: *IndexList, tallies: []const GatherTallySlot, items
     var result: IndexMergeResult = .{};
     var dst: usize = 0;
     for (tallies, 0..) |*slot, range_index| {
-        const tally = slot.tally;
+        const tally = slot.value;
         if (tally.any_excluded) result.any_excluded = true;
         if (comptime runtime_perf_log.enabled) {
             result.perf.chunk_filtered += tally.perf.chunk_filtered;
@@ -684,7 +675,7 @@ fn collisionGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) vo
             tally.any_excluded = true;
         }
     }
-    job.tallies[range.index].tally = tally;
+    job.tallies[range.index].value = tally;
 }
 
 const AiGatherContext = struct {
@@ -725,7 +716,7 @@ fn aiGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
         window[tally.count] = @intCast(i);
         tally.count += 1;
     }
-    job.tallies[range.index].tally = tally;
+    job.tallies[range.index].value = tally;
 }
 
 const CognitionContext = struct {
@@ -759,7 +750,7 @@ fn cognitionJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
             }
         }
     }
-    job.tallies[range.index].tally = tally;
+    job.tallies[range.index].value = tally;
 }
 
 const TierPolicyContext = struct {
@@ -775,7 +766,7 @@ fn tierPolicyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *TierPolicyContext = @ptrCast(@alignCast(context));
     assertRangeWindow(range, job.items_per_range, job.tallies.len, job.out.len);
     const count = scanTierPolicy(job.scope, job.region, range.start, range.end, job.out[range.start..range.end]);
-    job.tallies[range.index].tally = .{ .count = count };
+    job.tallies[range.index].value = .{ .count = count };
 }
 
 // ---- Tests ------------------------------------------------------------------
@@ -1597,10 +1588,6 @@ test "real worker threads match serial across every scope pass" {
         try std.testing.expectEqual(s.set_simulation_tier.entity.index, t.set_simulation_tier.entity.index);
         try std.testing.expectEqual(s.set_simulation_tier.tier, t.set_simulation_tier.tier);
     }
-}
-
-test "thread-written scope range tallies use cache-line sized slots" {
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(GatherTallySlot) % thread_shared_record_alignment);
 }
 
 test "warmed scope threaded gathers and tier policy do not allocate (FailingAllocator)" {
