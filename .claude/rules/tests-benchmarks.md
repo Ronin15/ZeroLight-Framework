@@ -79,8 +79,9 @@ The standard Zig layout; every change, plan, and review follows it.
 - Bench only changes that can move a hot path, targeted to the groups the
   change touches (`--group <name> --items N`): one right-sized config per
   group, plus `--grid` only for a scaling bench's sizes. Never the full suite
-  or a whole-suite smoke, except once for a change to the tuner or
-  `ThreadSystem`, or when the owner or a slice asks.
+  or a whole-suite smoke unless the owner asks; a change to the tuner or
+  `ThreadSystem` runs the targeted groups whose tuned cases it can move,
+  named in its brief.
 - A landing's before/after runs once, after its code is done: the base
   commit against the tree in Debug (ReleaseFast only per `build-validation.md`), one run per
   side (`tools/bench_ab.py`). A case more than 10% slower is rerun alone with

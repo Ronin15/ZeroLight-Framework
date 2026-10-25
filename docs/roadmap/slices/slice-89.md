@@ -6,7 +6,8 @@
 batch-tuner follow-ups. Ordered first in the core branch (owner delegated to the
 criteria 2026-10-24): its tuner fixes change how every later slice's tuned cases
 are judged (`.claude/rules/tests-benchmarks.md` § Benchmarks). The `750ce0a`
-baseline predates its tuner change, which gets its own whole-suite run.
+baseline predates its tuner change; the one whole-suite Debug run after it is
+`.claude/reports/bench-suite-6b7138e.txt` (later tuner changes run targeted groups).
 
 Goal: the batch tuner settles near the best fixed batch shape at the sizes
 that thread, the dispatch posts its wakes without delaying main's own ranges,
@@ -79,7 +80,7 @@ fixture and grouped by chunk only if they cost there.
       then nudges locally from the winner. Pass: the cause measured at the world
       gate first; `world-gate` 65,536 ReleaseFast tuned within spread of the
       best fixed shape, the 4x control included; tuner tests for the changed
-      first comparison; the once-per-tuner-change whole-suite Debug run gives
+      first comparison; the whole-suite Debug run at `6b7138e` gives
       each slower tuned case a verdict (`.claude/rules/tests-benchmarks.md`),
       light stages that stepped down first (`movement`, `particles`; the
       down-first comment `:153-157`) included; ReleaseFast at the sizes where
@@ -107,8 +108,8 @@ fixture and grouped by chunk only if they cost there.
       a dispatch start-skew counter in `thread-dispatch` `--details` (behind the
       perf switch); skew measured down in ReleaseFast at 1,024 and 16,384 items
       fixed-auto and at `world-gate` 65,536; serial == threaded; ThreadSanitizer
-      clean (`.claude/rules/threading.md` § Verification); the whole-suite Debug
-      run (a `ThreadSystem` change).
+      clean (`.claude/rules/threading.md` § Verification); the targeted groups
+      whose tuned cases it can move (a `ThreadSystem` change).
 - [ ] World gate and plane entry under the data rules
       (`.claude/rules/memory-performance.md` § Data-oriented design,
       `.claude/rules/engine-design.md` § Target scale: the chunk is the unit).
@@ -243,6 +244,6 @@ fixture and grouped by chunk only if they cost there.
 - [ ] Every item is landed or is routed with its `file:line` and failure
       scenario.
 - [ ] Touched groups within run-to-run spread, ReleaseFast for thread-policy
-      changes; one whole-suite Debug run for a tuner or `ThreadSystem` change;
+      changes; the targeted groups a tuner or `ThreadSystem` change can move;
       ThreadSanitizer clean for a `ThreadSystem` change.
 - [ ] `zig build verify` passes.
